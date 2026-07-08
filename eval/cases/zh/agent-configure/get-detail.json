@@ -1,0 +1,31 @@
+{
+  "id": "agent-get-detail",
+  "lang": "zh",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "查看单个 agent 的详细配置（覆盖 `heramind agent get`，此前仅 list 有覆盖）",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "agents": [
+        {
+          "name": "demo-agent",
+          "user_prompt": "demo",
+          "schedule": { "schedule_type": "interval", "interval_seconds": 60 },
+          "execution_mode": "free"
+        }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "demo-agent 的详细配置信息是什么？包括 schedule、resources、LLM 后端这些。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 解析 demo-agent 的 id 后调用 `heramind agent get <id>`（或 GET /api/agents/<id>），并尝试总结关键字段"
+    ],
+    "overall": "必须基于工具结果作答"
+  }
+}

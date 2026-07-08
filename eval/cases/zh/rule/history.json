@@ -1,0 +1,19 @@
+{
+  "id": "rule-history",
+  "lang": "zh",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "single_turn",
+  "description": "查询规则的触发历史（覆盖 `heramind rule history` — 规则执行的读取路径）",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "请帮我看看 rule-battery-low 这条规则的触发历史。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind rule history rule-battery-low`（或 GET /api/rules/rule-battery-low/history）"
+    ],
+    "overall": "必须实际查询历史；空历史也合法，但要明确说明"
+  }
+}

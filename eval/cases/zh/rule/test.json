@@ -1,0 +1,19 @@
+{
+  "id": "rule-test",
+  "lang": "zh",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "single_turn",
+  "description": "对一个已存在的规则做 dry-run 评估（覆盖 `heramind rule test` — 生产上线前必用，此前 0 覆盖）",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "用输入数据 {\"value\": 15} 测试一下 rule-battery-low 会不会触发。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 解析规则 id（rule-battery-low 的实际 id）后调用 `heramind rule test <id> --input '{\"value\":15}'`（或 POST /api/rules/<id>/test）"
+    ],
+    "overall": "必须实际执行 test，并基于结果说明触发与否（15 < 20 应触发）"
+  }
+}

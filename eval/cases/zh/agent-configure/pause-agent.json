@@ -1,0 +1,31 @@
+{
+  "id": "agent-pause-existing",
+  "lang": "zh",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "暂停一个已存在的 agent",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "agents": [
+        {
+          "name": "demo-agent",
+          "user_prompt": "demo",
+          "schedule": { "schedule_type": "interval", "interval_seconds": 60 },
+          "execution_mode": "free"
+        }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "把 demo-agent 这个 agent 暂停掉" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind agent control <id> paused`"
+    ],
+    "overall": "应先获取 agent id 再执行控制"
+  }
+}

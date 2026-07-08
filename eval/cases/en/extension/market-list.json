@@ -1,0 +1,19 @@
+{
+  "id": "extension-market-list",
+  "lang": "en",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "single_turn",
+  "description": "List extensions available in the official marketplace (covers `heramind extension market-list`; no .nep file needed).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "What extensions are currently available in the official marketplace?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind extension market-list` (or GET /api/extensions/marketplace)"
+    ],
+    "overall": "Marketplace unconfigured or network failure is a valid answer, but the tool must actually be invoked"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "connector-create-mqtt",
+  "lang": "en",
+  "category": "connector",
+  "workflow": "connector-management",
+  "scenario_type": "single_turn",
+  "description": "Create an MQTT connector and verify (covers `heramind connector create` write path; previously only list was covered).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Add an external MQTT broker: name factory-broker, host 192.168.1.100, port 1883, subscribing to topics 'sensor/#,device/#'. After creating, list connectors to confirm." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind connector create --type mqtt --name factory-broker --host 192.168.1.100 --port 1883 --topics 'sensor/#,device/#'` (flag order varies, --type defaults to mqtt so may be omitted), then calls `heramind connector list` to verify"
+    ],
+    "overall": "Must actually execute create + list, not just restate in reply"
+  }
+}

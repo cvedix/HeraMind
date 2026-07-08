@@ -1,0 +1,22 @@
+{
+  "id": "smoke-bad-001",
+  "lang": "zh",
+  "category": "smoke",
+  "workflow": "smoke",
+  "scenario_type": "single_turn",
+  "description": "Negative test: agent is asked to create a device but the test captures whether it actually invokes device create. If agent just chatters, expected to score low on tool_accuracy.",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "请帮我添加一个新设备：名称 'Office Sensor'，类型 ne101_camera，MQTT 连接" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 应该调用 shell 工具执行 `heramind device create` 来真正创建设备"
+    ],
+    "overall": "如果 agent 只描述流程而不调用工具，则 tool_accuracy 应打低分（≤4）"
+  },
+  "state_queries": [
+    { "type": "device_count", "params": {}, "expected": 1 }
+  ]
+}

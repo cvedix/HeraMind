@@ -1,0 +1,19 @@
+{
+  "id": "device-control",
+  "lang": "zh",
+  "category": "device",
+  "workflow": "device-onboarding",
+  "scenario_type": "single_turn",
+  "description": "向设备下发控制命令（覆盖 `heramind device control` — IoT 控制闭环核心，此前 0 覆盖）。seed-default 的 ne101_camera 模板 commands 列表为空，因此 agent 另一条合理路径是：查看设备、发现没有定义 reboot 命令、并明确告知用户该命令无法下发（而不是盲目调用）。两条路径都满足要求；错误做法是沉默或幻觉成功。",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "请给 sensor-001 发一个 reboot 重启命令。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 或者 (a) 先用 `heramind device get sensor-001`（或 list）确认设备存在，再调用 `heramind device control sensor-001 reboot`（--params 可选），或者 (b) 调用 `heramind device get sensor-001`，观察到 commands 列表为空（该模板未定义 reboot 命令），并明确告知用户该设备没有可用的 reboot 命令。两条路径都满足要求。"
+    ],
+    "overall": "Agent 必须回应控制意图。先运行 `device get`/`device list` 核实状态是可以接受的；在看到空 commands 列表后以清晰的『sensor-001 未定义 reboot 命令』信息退出也是有效的。无效：沉默；或未做任何工具调用就声称成功；或幻觉出命令结果。"
+  }
+}

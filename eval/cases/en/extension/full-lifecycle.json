@@ -1,0 +1,27 @@
+{
+  "id": "extension-full-lifecycle",
+  "lang": "en",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn full lifecycle: scaffold -> build -> install -> status/logs -> uninstall (self-bootstraps the fixture, no pre-built .nep needed; covers 6 actions: create/build/install/status/logs/uninstall).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Scaffold a minimal extension project via `heramind extension create eval-ext-test --extension-type tool -o /tmp/eval-ext-src`." },
+    { "user": "Build it into a .nep package via `heramind extension build /tmp/eval-ext-src/eval-ext-test`." },
+    { "user": "Install the freshly built .nep into the system." },
+    { "user": "Show the runtime status and recent logs of eval-ext-test." },
+    { "user": "Finally uninstall eval-ext-test." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind extension create eval-ext-test --extension-type tool -o /tmp/eval-ext-src` and confirms Cargo.toml/lib.rs/manifest.json were generated",
+      "Turn 2: Agent runs `heramind extension build /tmp/eval-ext-src/eval-ext-test` and parses the .nep file path from output",
+      "Turn 3: Agent runs `heramind extension install <parsed .nep path>` and parses the installed extension id",
+      "Turn 4: Agent runs `heramind extension status eval-ext-test` and `heramind extension logs eval-ext-test`",
+      "Turn 5: Agent runs `heramind extension uninstall eval-ext-test`"
+    ],
+    "overall": "If build fails due to missing Rust toolchain, agent must clearly surface the environment cause to the user (no penalty); but turn 1 scaffold and turn 5 uninstall must still execute"
+  }
+}

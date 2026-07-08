@@ -1,0 +1,22 @@
+{
+  "id": "device-create-camera",
+  "lang": "zh",
+  "category": "device",
+  "workflow": "device-onboarding",
+  "scenario_type": "single_turn",
+  "description": "通过对话创建 ne101 摄像头设备",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "帮我添加一个新设备 cam-office，名称 '办公室摄像头'，类型 ne101_camera，MQTT 连接" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 应该调用 shell 工具执行 `heramind device create`，参数包含 device_id=cam-office, name=办公室摄像头, device_type=ne101_camera, adapter_type=mqtt"
+    ],
+    "overall": "无探索性调用；创建后应反馈成功"
+  },
+  "state_queries": [
+    { "type": "device_exists", "params": { "id": "cam-office" }, "expected": true }
+  ]
+}

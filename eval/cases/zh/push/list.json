@@ -1,0 +1,19 @@
+{
+  "id": "push-list",
+  "lang": "zh",
+  "category": "push",
+  "workflow": "data-push-management",
+  "scenario_type": "single_turn",
+  "description": "列出已配置的数据推送目标（覆盖 `heramind push list` — data-push-management skill，此前 0 覆盖）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "现在系统里配置了哪些数据推送目标？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind push list`（或 GET /api/data-push）"
+    ],
+    "overall": "即使没有推送目标也要明确反馈"
+  }
+}

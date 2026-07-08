@@ -1,0 +1,23 @@
+{
+  "id": "message-read",
+  "lang": "en",
+  "category": "message",
+  "workflow": "message-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: send message -> list -> mark read (covers `heramind message read` ack path; previously uncovered).",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Send a severity=info message: 'Daily inspection complete'." },
+    { "user": "List recent messages." },
+    { "user": "Mark that message as read." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind message send --severity info --message 'Daily inspection complete'` (or POST /api/messages), parses message id",
+      "Turn 2: Agent runs `heramind message list`",
+      "Turn 3: Agent runs `heramind message read <id>` (or POST /api/messages/<id>/read)"
+    ],
+    "overall": "Turn 3 must reuse the message id from Turn 1/2"
+  }
+}

@@ -1,0 +1,239 @@
+/** @type {import('tailwindcss').Config} */
+export default {
+  darkMode: ["class"],
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: ['"Plus Jakarta Sans"', '"Noto Sans SC"', 'system-ui', '-apple-system', 'sans-serif'],
+        mono: ['"JetBrains Mono"', '"Fira Code"', 'ui-monospace', 'SFMono-Regular', '"SF Mono"', 'Menlo', 'Consolas', 'monospace'],
+      },
+      colors: {
+        border: "var(--border)",
+        input: "var(--input)",
+        ring: "var(--ring)",
+        background: "var(--background)",
+        foreground: "var(--foreground)",
+        primary: {
+          DEFAULT: "var(--primary)",
+          foreground: "var(--primary-foreground)",
+          hover: "var(--primary-hover)",
+          light: "var(--primary-bg)",
+          lightHover: "var(--primary-bg-hover)",
+        },
+        secondary: {
+          DEFAULT: "var(--secondary)",
+          foreground: "var(--secondary-foreground)",
+          hover: "var(--secondary-hover)",
+        },
+        destructive: {
+          DEFAULT: "var(--destructive)",
+          foreground: "var(--destructive-foreground)",
+          hover: "var(--destructive-hover)",
+          light: "var(--destructive-bg)",
+        },
+        muted: {
+          DEFAULT: "var(--muted)",
+          foreground: "var(--muted-foreground)",
+          20: "var(--muted-20)",
+          30: "var(--muted-30)",
+          50: "var(--muted-50)",
+        },
+        accent: {
+          DEFAULT: "var(--accent)",
+          foreground: "var(--accent-foreground)",
+        },
+        popover: {
+          DEFAULT: "var(--popover)",
+          foreground: "var(--popover-foreground)",
+        },
+        card: {
+          DEFAULT: "var(--card)",
+          foreground: "var(--card-foreground)",
+        },
+        success: {
+          DEFAULT: "var(--color-success)",
+          light: "var(--color-success-bg)",
+        },
+        warning: {
+          DEFAULT: "var(--color-warning)",
+          light: "var(--color-warning-bg)",
+        },
+        error: {
+          DEFAULT: "var(--color-error)",
+          foreground: "var(--error-foreground)",
+          light: "var(--color-error-bg)",
+        },
+        info: {
+          DEFAULT: "var(--color-info)",
+          light: "var(--color-info-bg)",
+        },
+        // Accent category colors (OKLCH-harmonized)
+        "accent-purple": {
+          DEFAULT: "var(--accent-purple)",
+          light: "var(--accent-purple-bg)",
+        },
+        "accent-orange": {
+          DEFAULT: "var(--accent-orange)",
+          light: "var(--accent-orange-bg)",
+        },
+        "accent-cyan": {
+          DEFAULT: "var(--accent-cyan)",
+          light: "var(--accent-cyan-bg)",
+        },
+        "accent-emerald": {
+          DEFAULT: "var(--accent-emerald)",
+          light: "var(--accent-emerald-bg)",
+        },
+        "accent-indigo": {
+          DEFAULT: "var(--accent-indigo)",
+          light: "var(--accent-indigo-bg)",
+        },
+        // Glass tokens
+        brand: {
+          DEFAULT: "var(--brand)",
+          bg: "var(--brand-bg)",
+          foreground: "var(--brand-foreground)",
+        },
+        glass: "var(--glass)",
+        "glass-heavy": "var(--glass-heavy)",
+        "surface-glass": "var(--surface-glass)",
+        "glass-border": "var(--glass-border)",
+        // Overlay (semi-transparent black masks for modals, loading screens, etc.)
+        overlay: {
+          light: "var(--overlay-light)",
+          medium: "var(--overlay-medium)",
+          heavy: "var(--overlay-heavy)",
+        },
+        // Semi-transparent background
+        "bg-50": "var(--bg-50)",
+        "bg-70": "var(--bg-70)",
+        "bg-80": "var(--bg-80)",
+        "bg-90": "var(--bg-90)",
+        "bg-95": "var(--bg-95)",
+      },
+      borderRadius: {
+        lg: "var(--radius)",
+        md: "calc(var(--radius) - 2px)",
+        sm: "calc(var(--radius) - 4px)",
+        xl: "calc(var(--radius) * 1.5)",
+        "2xl": "var(--radius-2xl)",
+      },
+      boxShadow: {
+        sm: "var(--shadow-sm)",
+        md: "var(--shadow-md)",
+        lg: "var(--shadow-lg)",
+        xl: "var(--shadow-xl)",
+        glass: "var(--shadow-glass)",
+        "glass-lg": "var(--shadow-glass-lg)",
+        brand: "var(--shadow-brand)",
+      },
+      keyframes: {
+        "slide-in": {
+          "from": { transform: "translateY(-10px)", opacity: "0" },
+          "to": { transform: "translateY(0)", opacity: "1" },
+        },
+        "slide-in-from-top": {
+          "from": { transform: "translateY(-100%)", opacity: "0" },
+          "to": { transform: "translateY(0)", opacity: "1" },
+        },
+        "slide-in-from-bottom": {
+          "from": { transform: "translateY(100%)", opacity: "0" },
+          "to": { transform: "translateY(0)", opacity: "1" },
+        },
+        "slide-in-from-left": {
+          "from": { transform: "translateX(-100%)", opacity: "0" },
+          "to": { transform: "translateX(0)", opacity: "1" },
+        },
+        "slide-in-from-right": {
+          "from": { transform: "translateX(100%)", opacity: "0" },
+          "to": { transform: "translateX(0)", opacity: "1" },
+        },
+        "fade-in": {
+          "from": { opacity: "0" },
+          "to": { opacity: "1" },
+        },
+        "fade-in-up": {
+          "from": { opacity: "0", transform: "translateY(10px)" },
+          "to": { opacity: "1", transform: "translateY(0)" },
+        },
+        "fade-out": {
+          "from": { opacity: "1" },
+          "to": { opacity: "0" },
+        },
+        "scale-in": {
+          "from": { transform: "scale(0.95)", opacity: "0" },
+          "to": { transform: "scale(1)", opacity: "1" },
+        },
+        "scale-out": {
+          "from": { transform: "scale(1)", opacity: "1" },
+          "to": { transform: "scale(0.95)", opacity: "0" },
+        },
+        "pulse-slow": {
+          "0%, 100%": { opacity: "1" },
+          "50%": { opacity: "0.5" },
+        },
+        "spin-slow": {
+          "from": { transform: "rotate(0deg)" },
+          "to": { transform: "rotate(360deg)" },
+        },
+        "bounce-subtle": {
+          "0%, 100%": { transform: "translateY(0)" },
+          "50%": { transform: "translateY(-5px)" },
+        },
+        "shimmer": {
+          "from": { backgroundPosition: "-1000px 0" },
+          "to": { backgroundPosition: "1000px 0" },
+        },
+        "typewriter": {
+          "from": { width: "0" },
+          "to": { width: "100%" },
+        },
+        "blink": {
+          "0%, 50%": { opacity: "1" },
+          "51%, 100%": { opacity: "0" },
+        },
+      },
+      animation: {
+        "slide-in": "slide-in 0.2s ease-out",
+        "slide-in-from-top": "slide-in-from-top 0.3s ease-out",
+        "slide-in-from-bottom": "slide-in-from-bottom 0.3s ease-out",
+        "slide-in-from-left": "slide-in-from-left 0.3s ease-out",
+        "slide-in-from-right": "slide-in-from-right 0.3s ease-out",
+        "fade-in": "fade-in 0.2s ease-out",
+        "fade-in-up": "fade-in-up 0.3s ease-out",
+        "fade-out": "fade-out 0.2s ease-out",
+        "scale-in": "scale-in 0.2s ease-out",
+        "scale-out": "scale-out 0.2s ease-out",
+        "pulse-slow": "pulse-slow 3s cubic-bezier(0.4, 0, 0.6, 1) infinite",
+        "spin-slow": "spin-slow 3s linear infinite",
+        "bounce-subtle": "bounce-subtle 2s ease-in-out infinite",
+        "shimmer": "shimmer 2s linear infinite",
+        "typewriter": "typewriter 2s steps(40) infinite",
+        "blink": "blink 1s step-end infinite",
+      },
+      // Performance: Animation delay variants for staggered animations
+      animationDelay: {
+        0: "0ms",
+        100: "100ms",
+        150: "150ms",
+        200: "200ms",
+        300: "300ms",
+        400: "400ms",
+        500: "500ms",
+      },
+    },
+  },
+  plugins: [
+    require("@tailwindcss/typography")({
+      theme: {
+        extend: {
+          colors: {},
+        },
+      },
+    }),
+  ],
+}

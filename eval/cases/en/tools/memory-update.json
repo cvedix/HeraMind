@@ -1,0 +1,19 @@
+{
+  "id": "tools-memory-update",
+  "lang": "en",
+  "category": "tools",
+  "workflow": "tools-memory",
+  "scenario_type": "single_turn",
+  "description": "Persist a long-term user preference via the memory tool so later sessions can read it (covers chat memory write path)",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Please remember a long-term preference: sensor-001 is mounted by the north-east window in the living room, and its ambient temperature typically reads 2 degrees below room temperature. Reference this when I mention sensor-001 in the future." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes the `memory` tool (action=update/set, section=user or knowledge) to persist the specified content"
+    ],
+    "overall": "Must actually call the memory tool to persist (not just restate in the reply), and confirm the write"
+  }
+}

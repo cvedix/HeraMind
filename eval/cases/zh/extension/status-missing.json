@@ -1,0 +1,19 @@
+{
+  "id": "extension-status-missing",
+  "lang": "zh",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "single_turn",
+  "description": "查询不存在扩展的运行状态 + 日志（覆盖 `heramind extension status` + `extension logs` 的错误路径，无需 .nep 安装）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "查一下扩展 ghost-extension 的运行状态和最近日志。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind extension status ghost-extension` 和/或 `heramind extension logs ghost-extension`（或对应 API），收到 not-found 错误后明确反馈"
+    ],
+    "overall": "必须实际调用工具，并基于错误结果作答"
+  }
+}

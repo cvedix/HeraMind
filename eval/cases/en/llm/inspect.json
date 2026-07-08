@@ -1,0 +1,21 @@
+{
+  "id": "llm-inspect",
+  "lang": "en",
+  "category": "llm",
+  "workflow": "llm-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: list LLM backends -> inspect one backend's details + model list + connectivity test (covers `heramind llm get` + `llm models` + `llm test`; previously only list was covered).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "What LLM backends are currently configured?" },
+    { "user": "Show me the first backend's details, list its supported models, and run a connectivity test." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind llm list`, parses the first backend's id",
+      "Turn 2: Agent runs `heramind llm get <id>`, `heramind llm models <id>` (or global models), and `heramind llm test <id>`"
+    ],
+    "overall": "Turn 2 must actually execute all three sub-actions (connectivity failure is a valid answer)"
+  }
+}

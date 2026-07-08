@@ -1,0 +1,33 @@
+{
+  "id": "agent-update-and-delete",
+  "lang": "en",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: update agent user_prompt -> delete agent (covers `heramind agent update` + `agent delete`; both previously uncovered).",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "agents": [
+        {
+          "name": "demo-agent",
+          "user_prompt": "old prompt",
+          "schedule": { "schedule_type": "interval", "interval_seconds": 60 },
+          "execution_mode": "free"
+        }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "Update demo-agent's user_prompt to 'monitor temperature and alert'." },
+    { "user": "OK, finally delete this agent." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent resolves demo-agent's id then runs `heramind agent update <id> --prompt 'monitor temperature and alert'` (or PUT /api/agents/<id>)",
+      "Turn 2: Agent runs `heramind agent delete <id>` (or DELETE /api/agents/<id>)"
+    ],
+    "overall": "Both turns must reuse the same id"
+  }
+}

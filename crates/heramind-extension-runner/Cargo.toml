@@ -1,0 +1,39 @@
+[package]
+name = "heramind-extension-runner"
+version.workspace = true
+edition = "2021"
+description = "Standalone extension process runner for process-isolated extensions"
+authors = ["HeraMind Team"]
+license = "MIT"
+
+[[bin]]
+name = "heramind-extension-runner"
+path = "src/main.rs"
+
+[dependencies]
+# Only depends on SDK for ABI stability - no dependency on heramind-core
+heramind-extension-sdk = { path = "../heramind-extension-sdk" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+semver = { workspace = true }
+libloading = "0.8"
+base64 = "0.22"
+# WASM runtime (direct dependency)
+wasmtime = { version = "26", features = ["async", "component-model"] }
+wasmtime-wasi = { version = "26" }
+thiserror = { workspace = true }
+libc = "0.2"
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Foundation"] }
+
+[dev-dependencies]
+tempfile = "3"

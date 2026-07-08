@@ -1,0 +1,691 @@
+/**
+ * OnboardingDialog — Full-screen getting-started wizard
+ *
+ * Two-step guide:
+ *   1. Core setup (configure LLM, connect devices) — with completion status + CLI helpers
+ *   2. Ready (clickable prompt cards that hand off to chat via ?q= URL param)
+ *
+ * Freely browsable; clicking Finish or Skip marks the guide as seen.
+ */
+
+import { useState, useEffect, useMemo } from "react"
+import { createPortal } from "react-dom"
+import { useTranslation } from "react-i18next"
+import { useNavigate } from "react-router-dom"
+import {
+  Rocket, Sparkles, Cpu, Check, X, ChevronLeft, ChevronRight,
+  LayoutDashboard, Zap, Puzzle, MessageSquareText,
+  Terminal, Copy, BookOpen, ExternalLink,
+} from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select"
+import { cn } from "@/lib/utils"
+import { notifySuccess, notifyError } from "@/lib/notify"
+import { useServerUrl } from "@/lib/server-url"
+import type { OnboardingStatus } from "@/hooks/useOnboarding"
+
+interface OnboardingDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  status: OnboardingStatus | null
+  onDismiss: () => void
+}
+
+const STEPS = ["setup", "ready"] as const
+type StepKey = (typeof STEPS)[number]
+
+export function OnboardingDialog({ open, onOpenChange, status, onDismiss }: OnboardingDialogProps) {
+  const { t } = useTranslation("common")
+  const navigate = useNavigate()
+  const [step, setStep] = useState<StepKey>("setup")
+
+  const stepIndex = STEPS.indexOf(step)
+  const isFirst = stepIndex === 0
+  const isLast = stepIndex === STEPS.length - 1
+
+  // Reset to first step each time the dialog opens
+  useEffect(() => {
+    if (open) setStep("setup")
+  }, [open])
+
+  // Lock body scroll + Escape to close
+  useEffect(() => {
+    if (!open) return
+    const prev = document.body.style.overflow
+    document.body.style.overflow = "hidden"
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onOpenChange(false)
+    }
+    window.addEventListener("keydown", onKey)
+    return () => {
+      document.body.style.overflow = prev
+      window.removeEventListener("keydown", onKey)
+    }
+  }, [open, onOpenChange])
+
+  if (!open || !status) return null
+
+  const handleAction = (path: string) => {
+    onOpenChange(false)
+    navigate(path)
+  }
+
+  const handleFinish = () => {
+    onDismiss()
+    onOpenChange(false)
+  }
+
+  const handlePromptNavigate = (prompt: string) => {
+    onDismiss()
+    onOpenChange(false)
+    navigate(`/chat?q=${encodeURIComponent(prompt)}`)
+  }
+
+  const handleStartChat = () => {
+    onDismiss()
+    onOpenChange(false)
+    navigate("/chat")
+  }
+
+  const root = typeof document !== "undefined"
+    ? document.getElementById("dialog-root") || document.body
+    : null
+  if (!root) return null
+
+  return createPortal(
+    <div className="fixed inset-0 z-[100] flex flex-col bg-bg-90 backdrop-blur-xl">
+      {/* Close button */}
+      <button
+        onClick={() => onOpenChange(false)}
+        className="absolute top-4 right-4 z-10 w-9 h-9 rounded-lg flex items-center justify-center text-muted-foreground hover:bg-muted-30 transition-colors"
+        aria-label={t("onboarding.dismiss")}
+      >
+        <X className="w-5 h-5" />
+      </button>
+
+      {/* Progress indicator */}
+      <div className="shrink-0 pt-8 pb-3 px-6">
+        <div className="max-w-5xl mx-auto flex items-center justify-center">
+          {STEPS.map((s, i) => (
+            <button
+              key={s}
+              onClick={() => setStep(s)}
+              className="flex items-center"
+              aria-label={t(`onboarding.stepLabels.${s}`)}
+            >
+              <span className={cn(
+                "flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold transition-colors",
+                i < stepIndex && "bg-success text-primary-foreground",
+                i === stepIndex && "bg-primary text-primary-foreground",
+                i > stepIndex && "bg-muted-30 text-muted-foreground",
+              )}>
+                {i < stepIndex ? <Check className="w-4 h-4" /> : i + 1}
+              </span>
+              <span className={cn(
+                "ml-2 text-xs font-medium hidden sm:inline transition-colors",
+                i === stepIndex ? "text-foreground" : "text-muted-foreground",
+              )}>
+                {t(`onboarding.stepLabels.${s}`)}
+              </span>
+              {i < STEPS.length - 1 && (
+                <span className="w-6 sm:w-10 h-px bg-border mx-3" />
+              )}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Scrollable content */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-5xl mx-auto px-6 sm:px-10 py-6 sm:py-8">
+          {step === "setup" && <SetupStep open={open} status={status} onAction={handleAction} />}
+          {step === "ready" && <ReadyStep status={status} onPromptNavigate={handlePromptNavigate} onStartChat={handleStartChat} />}
+        </div>
+      </div>
+
+      {/* Footer navigation */}
+      <div className="shrink-0 border-t border-border bg-bg-95">
+        <div className="max-w-5xl mx-auto px-6 py-3 flex items-center justify-between">
+          <Button variant="ghost" size="sm" onClick={handleFinish} className="text-muted-foreground">
+            {t("onboarding.dismiss")}
+          </Button>
+          <div className="flex items-center gap-2">
+            {!isFirst && (
+              <Button variant="outline" size="sm" onClick={() => setStep(STEPS[stepIndex - 1])}>
+                <ChevronLeft className="w-4 h-4 mr-1" />
+                {t("onboarding.nav.prev")}
+              </Button>
+            )}
+            {isLast ? (
+              <Button size="sm" onClick={handleFinish}>
+                {t("onboarding.nav.finish")}
+                <Check className="w-4 h-4 ml-1.5" />
+              </Button>
+            ) : (
+              <Button size="sm" onClick={() => setStep(STEPS[stepIndex + 1])}>
+                {t("onboarding.nav.next")}
+                <ChevronRight className="w-4 h-4 ml-1.5" />
+              </Button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>,
+    root,
+  )
+}
+
+// ── LLM CLI quick-setup helper ──
+
+interface LlmProvider {
+  id: string
+  label: string
+  type: string
+  endpoint: string
+  model: string
+  needsKey: boolean
+}
+
+// backend_type passes straight through to the API (cli-ops/src/llm.rs),
+// so each provider's native type works. Endpoints from the user-guide README.
+const LLM_PROVIDERS: LlmProvider[] = [
+  { id: "ollama", label: "Ollama", type: "ollama", endpoint: "http://localhost:11434", model: "qwen3:8b", needsKey: false },
+  { id: "openai", label: "OpenAI", type: "openai", endpoint: "https://api.openai.com/v1", model: "gpt-4o-mini", needsKey: true },
+  { id: "anthropic", label: "Anthropic", type: "anthropic", endpoint: "https://api.anthropic.com", model: "claude-sonnet-4-20250514", needsKey: true },
+  { id: "deepseek", label: "DeepSeek", type: "deepseek", endpoint: "https://api.deepseek.com", model: "deepseek-chat", needsKey: true },
+  { id: "glm", label: "GLM", type: "glm", endpoint: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash", needsKey: true },
+  { id: "qwen", label: "Qwen", type: "qwen", endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus", needsKey: true },
+  { id: "xai", label: "xAI Grok", type: "xai", endpoint: "https://api.x.ai", model: "grok-2", needsKey: true },
+]
+
+function buildLlmCommand(p: LlmProvider): string {
+  const lines: string[] = []
+  if (p.id === "ollama") lines.push(`ollama pull ${p.model}`)
+  const parts = [
+    "heramind llm create",
+    `--name ${p.id}`,
+    `--type ${p.type}`,
+    `--endpoint ${p.endpoint}`,
+    `--model ${p.model}`,
+  ]
+  if (p.needsKey) parts.push("--api-key YOUR_API_KEY")
+  lines.push(parts.join(" \\\n  "))
+  return lines.join("\n")
+}
+
+// Verify + set-default, run after `create` returns a backend ID.
+const FOLLOWUP_COMMANDS = "heramind llm test <ID>\nheramind llm activate <ID>"
+
+function LlmCliHelper() {
+  const { t } = useTranslation("common")
+  const [providerId, setProviderId] = useState("ollama")
+  const provider = LLM_PROVIDERS.find((p) => p.id === providerId) ?? LLM_PROVIDERS[0]
+  const command = useMemo(() => buildLlmCommand(provider), [provider])
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(command)
+      notifySuccess(t("onboarding.cli.copied"))
+    } catch {
+      notifyError(t("onboarding.cli.copyFailed"))
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        <Terminal className="w-4 h-4 text-muted-foreground" />
+        <span className="text-xs text-muted-foreground">{t("onboarding.cli.provider")}</span>
+        <Select value={providerId} onValueChange={setProviderId}>
+          <SelectTrigger className="h-8 w-auto min-w-[140px] text-xs">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent className="z-[200]">
+            {LLM_PROVIDERS.map((p) => (
+              <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {provider.needsKey && (
+          <span className="text-xs text-muted-foreground">{t("onboarding.cli.keyHint")}</span>
+        )}
+      </div>
+      <pre className="text-xs font-mono bg-background border border-border rounded-lg p-3 overflow-x-auto text-foreground whitespace-pre leading-relaxed">
+        {command}
+      </pre>
+      <Button size="sm" variant="outline" onClick={handleCopy} className="gap-1.5">
+        <Copy className="w-3.5 h-3.5" />
+        {t("onboarding.cli.copy")}
+      </Button>
+      <div className="rounded-lg bg-muted-30 p-3">
+        <p className="text-xs text-muted-foreground mb-1.5 leading-relaxed">
+          {t("onboarding.cli.followup")}
+        </p>
+        <pre className="text-xs font-mono text-muted-foreground whitespace-pre-wrap break-all leading-relaxed">
+          {FOLLOWUP_COMMANDS}
+        </pre>
+      </div>
+    </div>
+  )
+}
+
+// ── Device CLI quick-start helper ──
+// POSTing telemetry to the webhook endpoint auto-disovers unregistered devices
+// (webhook.rs:343 emits DeviceDiscovered for unknown device IDs). This gives a
+// pure-curl closed loop: publish → draft created → approve → device registered.
+
+// After the webhook creates a draft, these commands view and approve it.
+const DEVICE_FOLLOWUP_COMMANDS = [
+  "heramind device drafts list",
+  'heramind device drafts approve demo-001 --name "Demo Sensor" --type sensor',
+].join("\n")
+
+function DeviceQuickStart() {
+  const { t } = useTranslation("common")
+  const serverUrl = useServerUrl()
+
+  // Build curl command dynamically using canonical server URL
+  const DEVICE_CURL_COMMAND = useMemo(() => [
+    `curl -X POST ${serverUrl}/api/devices/demo-001/webhook \\`,
+    '  -H "Content-Type: application/json" \\',
+    `  -d '{"data": {"temperature": 25.5, "humidity": 60}}'`,
+  ].join("\n"), [serverUrl])
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(DEVICE_CURL_COMMAND)
+      notifySuccess(t("onboarding.cli.copied"))
+    } catch {
+      notifyError(t("onboarding.cli.copyFailed"))
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground leading-relaxed flex items-center gap-1.5">
+        <Terminal className="w-4 h-4 text-muted-foreground shrink-0" />
+        {t("onboarding.deviceCli.note")}
+      </p>
+      <pre className="text-xs font-mono bg-background border border-border rounded-lg p-3 overflow-x-auto text-foreground whitespace-pre leading-relaxed">
+        {DEVICE_CURL_COMMAND}
+      </pre>
+      <Button size="sm" variant="outline" onClick={handleCopy} className="gap-1.5">
+        <Copy className="w-3.5 h-3.5" />
+        {t("onboarding.cli.copy")}
+      </Button>
+      <div className="rounded-lg bg-muted-30 p-3">
+        <p className="text-xs text-muted-foreground mb-1.5 leading-relaxed">
+          {t("onboarding.deviceCli.followup")}
+        </p>
+        <pre className="text-xs font-mono text-muted-foreground whitespace-pre-wrap break-all leading-relaxed">
+          {DEVICE_FOLLOWUP_COMMANDS}
+        </pre>
+      </div>
+    </div>
+  )
+}
+
+// ── Step 1: Core setup (master-detail layout) ──
+
+type SetupCardId = "llm" | "device"
+
+interface SetupItem {
+  id: SetupCardId
+  icon: React.ReactNode
+  tint: string
+  title: string
+  description: string
+  purpose: string
+  completed: boolean
+  completedLabel: string
+  actionLabel: string
+  onAction: () => void
+  extra: React.ReactNode
+}
+
+function SetupStep({
+  open,
+  status,
+  onAction,
+}: {
+  open: boolean
+  status: OnboardingStatus
+  onAction: (path: string) => void
+}) {
+  const { t } = useTranslation("common")
+  const completedLabel = t("onboarding.completed")
+
+  // First incomplete card wins; fall back to LLM when both done.
+  const defaultSelected: SetupCardId = !status.steps.llm.completed
+    ? "llm"
+    : !status.steps.device.completed
+      ? "device"
+      : "llm"
+
+  const [selected, setSelected] = useState<SetupCardId>(defaultSelected)
+
+  // Re-derive selection when the dialog opens (preserves manual selection while open).
+  useEffect(() => {
+    if (open) setSelected(defaultSelected)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
+
+  const items: SetupItem[] = [
+    {
+      id: "llm",
+      icon: <Sparkles className="w-5 h-5" />,
+      tint: "bg-accent-indigo-light text-accent-indigo",
+      title: t("onboarding.setup.llm.title"),
+      description: t("onboarding.setup.llm.description"),
+      purpose: t("onboarding.setup.llm.purpose"),
+      completed: status.steps.llm.completed,
+      completedLabel,
+      actionLabel: t("onboarding.setup.llm.action"),
+      onAction: () => onAction("/settings?tab=llm"),
+      extra: <LlmCliHelper />,
+    },
+    {
+      id: "device",
+      icon: <Cpu className="w-5 h-5" />,
+      tint: "bg-accent-cyan-light text-accent-cyan",
+      title: t("onboarding.setup.device.title"),
+      description: t("onboarding.setup.device.description"),
+      purpose: t("onboarding.setup.device.purpose"),
+      completed: status.steps.device.completed,
+      completedLabel,
+      actionLabel: t("onboarding.setup.device.action"),
+      onAction: () => onAction("/devices"),
+      extra: <DeviceQuickStart />,
+    },
+  ]
+
+  const active = items.find((i) => i.id === selected) ?? items[0]
+
+  return (
+    <div>
+      <div className="mb-6">
+        <div className="flex items-center gap-3 mb-2">
+          <div className="w-10 h-10 rounded-xl bg-accent-indigo-light flex items-center justify-center shrink-0">
+            <Rocket className="w-5 h-5 text-accent-indigo" />
+          </div>
+          <h2 className="text-lg font-bold text-foreground">{t("onboarding.setup.title")}</h2>
+        </div>
+        <p className="text-sm text-muted-foreground leading-relaxed">{t("onboarding.setup.heroSubtitle")}</p>
+      </div>
+
+      {/* Docs strip — fixed above the variable-height grid so it never shifts */}
+      <div className="mb-4 rounded-lg bg-muted-30 px-4 py-2.5 flex items-center gap-4 flex-wrap">
+        <BookOpen className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+        {[
+          { label: t("onboarding.setup.docs.quickStart"), href: "https://wiki.camthink.ai/docs/heramind/quick-start/five-minute-guide" },
+          { label: t("onboarding.setup.docs.installSetup"), href: "https://wiki.camthink.ai/docs/heramind/user-guide/install-setup" },
+          { label: t("onboarding.setup.docs.developerGuide"), href: "https://wiki.camthink.ai/docs/heramind/developer-guide/overview" },
+        ].map((doc) => (
+          <a
+            key={doc.href}
+            href={doc.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-primary hover:underline inline-flex items-center gap-1"
+          >
+            {doc.label}
+            <ExternalLink className="w-3 h-3" />
+          </a>
+        ))}
+      </div>
+
+      <div className="grid md:grid-cols-[18rem_1fr] gap-4 mb-6">
+        <SetupSelectorList items={items} selectedId={selected} onSelect={setSelected} />
+        <SetupDetailPane item={active} />
+      </div>
+
+      {/* Hint */}
+      <div className="rounded-xl bg-muted-30 p-4 text-center">
+        <p className="text-sm text-muted-foreground">{t("onboarding.setup.hint")}</p>
+      </div>
+    </div>
+  )
+}
+
+// Left pane: vertical selector list on desktop, segmented toggle on mobile.
+function SetupSelectorList({
+  items,
+  selectedId,
+  onSelect,
+}: {
+  items: SetupItem[]
+  selectedId: SetupCardId
+  onSelect: (id: SetupCardId) => void
+}) {
+  return (
+    <>
+      {/* Desktop vertical list */}
+      <div className="hidden md:flex flex-col gap-2">
+        {items.map((item) => {
+          const isActive = item.id === selectedId
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => onSelect(item.id)}
+              className={cn(
+                "flex items-center gap-3 rounded-xl border p-3 text-left transition-colors",
+                isActive
+                  ? "border-primary bg-card"
+                  : "border-border bg-card hover:bg-muted-30",
+              )}
+            >
+              <div className={cn(
+                "w-9 h-9 rounded-lg flex items-center justify-center shrink-0",
+                item.completed ? "bg-success-light text-success" : item.tint,
+              )}>
+                {item.completed ? <Check className="w-4 h-4" /> : item.icon}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className={cn(
+                  "text-sm font-semibold",
+                  item.completed ? "text-muted-foreground line-through" : "text-foreground",
+                )}>
+                  {item.title}
+                </div>
+                <div className="text-xs text-muted-foreground mt-0.5 leading-relaxed line-clamp-1">
+                  {item.completed ? item.completedLabel : item.description}
+                </div>
+              </div>
+            </button>
+          )
+        })}
+      </div>
+
+      {/* Mobile segmented toggle */}
+      <div className="md:hidden grid grid-cols-2 gap-2">
+        {items.map((item) => {
+          const isActive = item.id === selectedId
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => onSelect(item.id)}
+              className={cn(
+                "flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors",
+                isActive
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted-30 text-muted-foreground",
+              )}
+            >
+              {item.completed && <Check className="w-3.5 h-3.5" />}
+              {item.title}
+            </button>
+          )
+        })}
+      </div>
+    </>
+  )
+}
+
+// Right pane: full detail for the selected item.
+function SetupDetailPane({ item }: { item: SetupItem }) {
+  return (
+    <div
+      className={cn(
+        "rounded-2xl border p-5 transition-colors flex flex-col",
+        item.completed
+          ? "border-success bg-success-light"
+          : "border-border bg-card",
+      )}
+    >
+      <div className="flex items-start gap-3 mb-3">
+        <div className={cn(
+          "w-10 h-10 rounded-xl flex items-center justify-center shrink-0",
+          item.completed ? "bg-success-light text-success" : item.tint,
+        )}>
+          {item.completed ? <Check className="w-5 h-5" /> : item.icon}
+        </div>
+        <div className="flex-1 min-w-0">
+          <h3 className={cn("font-semibold text-sm", item.completed && "text-muted-foreground line-through")}>
+            {item.title}
+          </h3>
+          <p className="text-xs text-muted-foreground mt-1 leading-relaxed">{item.description}</p>
+        </div>
+      </div>
+      {item.completed ? (
+        <div className="mt-auto flex items-center gap-1.5 text-xs font-medium text-success">
+          <Check className="w-3.5 h-3.5" />
+          {item.completedLabel}
+        </div>
+      ) : (
+        <>
+          <p className="text-xs text-muted-foreground mb-4 leading-relaxed">{item.purpose}</p>
+          {item.extra}
+          <div className="mt-auto pt-4 flex justify-end">
+            <Button size="sm" onClick={item.onAction} className="gap-1.5">
+              {item.actionLabel}
+              <ChevronRight className="w-3.5 h-3.5" />
+            </Button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+// ── Step 2: Ready — actionable prompt cards that hand off to chat ──
+
+function ReadyStep({
+  status,
+  onPromptNavigate,
+  onStartChat,
+}: {
+  status: OnboardingStatus
+  onPromptNavigate: (prompt: string) => void
+  onStartChat: () => void
+}) {
+  const { t } = useTranslation("common")
+  const allComplete = status.steps.llm.completed && status.steps.device.completed
+
+  const statusItems = [
+    { key: "llm", completed: status.steps.llm.completed },
+    { key: "device", completed: status.steps.device.completed },
+  ] as const
+
+  const cards = [
+    {
+      icon: <LayoutDashboard className="w-5 h-5" />,
+      key: "monitoring",
+      tint: "bg-accent-purple-light text-accent-purple",
+    },
+    {
+      icon: <Zap className="w-5 h-5" />,
+      key: "automation",
+      tint: "bg-accent-orange-light text-accent-orange",
+    },
+    {
+      icon: <Puzzle className="w-5 h-5" />,
+      key: "extensions",
+      tint: "bg-accent-cyan-light text-accent-cyan",
+    },
+  ]
+
+  return (
+    <div>
+      {/* Header — celebration banner when all complete */}
+      <div className={cn(
+        "rounded-2xl p-5 mb-6",
+        allComplete ? "bg-success-light" : "bg-card border border-border",
+      )}>
+        <div className="flex items-center gap-3 mb-2">
+          <div className={cn(
+            "w-10 h-10 rounded-xl flex items-center justify-center shrink-0",
+            allComplete ? "bg-success text-primary-foreground" : "bg-accent-indigo-light text-accent-indigo",
+          )}>
+            {allComplete ? <Check className="w-5 h-5" /> : <Sparkles className="w-5 h-5" />}
+          </div>
+          <h2 className="text-lg font-bold text-foreground">
+            {allComplete ? t("onboarding.ready.allSetTitle") : t("onboarding.ready.partialTitle")}
+          </h2>
+        </div>
+        <p className="text-sm text-muted-foreground leading-relaxed mb-3">
+          {allComplete ? t("onboarding.ready.allSetSubtitle") : t("onboarding.ready.partialSubtitle")}
+        </p>
+        {/* Status summary chips */}
+        <div className="flex items-center gap-2 flex-wrap">
+          {statusItems.map((item) => (
+            <div
+              key={item.key}
+              className={cn(
+                "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium",
+                item.completed
+                  ? allComplete
+                    ? "bg-card text-success"
+                    : "bg-success-light text-success"
+                  : "bg-muted-30 text-muted-foreground",
+              )}
+            >
+              {item.completed ? (
+                <Check className="w-3.5 h-3.5" />
+              ) : (
+                <span className="w-2.5 h-2.5 rounded-full border-2 border-current opacity-40" />
+              )}
+              {t(`onboarding.ready.statusLabels.${item.key}`)}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Prompt cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+        {cards.map((c) => (
+          <button
+            key={c.key}
+            type="button"
+            onClick={() => onPromptNavigate(t(`onboarding.ready.prompts.${c.key}.prompt`))}
+            className="group text-left rounded-2xl border border-border bg-card p-5 flex flex-col h-full hover:border-primary transition-colors"
+          >
+            <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center mb-3 shrink-0", c.tint)}>
+              {c.icon}
+            </div>
+            <h3 className="font-semibold text-sm text-foreground mb-1.5 shrink-0">
+              {t(`onboarding.ready.prompts.${c.key}.title`)}
+            </h3>
+            <p className="text-xs text-muted-foreground leading-relaxed mb-3">
+              {t(`onboarding.ready.prompts.${c.key}.desc`)}
+            </p>
+            <div className="mt-auto flex items-start gap-1.5 rounded-lg bg-muted-30 px-3 py-2 shrink-0 group-hover:bg-muted-50 transition-colors">
+              <MessageSquareText className="w-3.5 h-3.5 text-muted-foreground shrink-0 mt-0.5" />
+              <span className="text-xs text-muted-foreground italic leading-relaxed">
+                {t(`onboarding.ready.prompts.${c.key}.prompt`)}
+              </span>
+            </div>
+          </button>
+        ))}
+      </div>
+
+      <div className="flex justify-center">
+        <Button size="lg" onClick={onStartChat} className="gap-2">
+          <MessageSquareText className="w-4 h-4" />
+          {t("onboarding.ready.chatButton")}
+        </Button>
+      </div>
+    </div>
+  )
+}

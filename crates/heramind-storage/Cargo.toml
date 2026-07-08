@@ -1,0 +1,57 @@
+[package]
+name = "heramind-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+heramind-core = { path = "../heramind-core" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# New database: redb
+redb = { workspace = true }
+
+# LRU cache for hot data
+lru = { workspace = true }
+
+# Concurrent data structures
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+# LRU cache
+moka = { workspace = true }
+
+# Async utilities for parallel operations
+futures = { workspace = true }
+
+# Utils
+bincode = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+
+[features]
+default = ["redb"]
+
+# Storage backends
+redb = []
+
+# Settings migration support
+settings = []
+
+# All features
+all = ["redb", "settings"]
+
+[lints.clippy]
+# Temporarily suppress clippy warnings for heramind-storage
+type_complexity = "allow"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = { workspace = true }

@@ -1,0 +1,999 @@
+//! Automation types for the transform system.
+//!
+//! This module provides types for data transform automations.
+//! Rules are managed separately through the `heramind-rules` crate.
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Automation is now an alias for TransformAutomation.
+/// Rules are managed separately through the `heramind-rules` crate.
+pub type Automation = TransformAutomation;
+
+/// Automation type discriminator (kept for API compatibility)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutomationType {
+    Transform,
+}
+
+impl AutomationType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AutomationType::Transform => "transform",
+        }
+    }
+}
+
+impl std::fmt::Display for AutomationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Helper methods on Automation (TransformAutomation alias)
+impl Automation {
+    /// Get the automation ID
+    pub fn id(&self) -> &str {
+        &self.metadata.id
+    }
+
+    /// Get the automation name
+    pub fn name(&self) -> &str {
+        &self.metadata.name
+    }
+
+    /// Get the automation type
+    pub fn automation_type(&self) -> AutomationType {
+        AutomationType::Transform
+    }
+
+    /// Check if the automation is enabled
+    pub fn is_enabled(&self) -> bool {
+        self.metadata.enabled
+    }
+
+    /// Get the execution count
+    pub fn execution_count(&self) -> u64 {
+        self.metadata.execution_count
+    }
+
+    /// Get the last executed timestamp
+    pub fn last_executed(&self) -> Option<i64> {
+        self.metadata.last_executed
+    }
+}
+
+/// Shared metadata for all automation types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationMetadata {
+    /// Unique identifier
+    pub id: String,
+    /// Human-readable name
+    pub name: String,
+    /// Description of what this automation does
+    #[serde(default)]
+    pub description: String,
+    /// Whether the automation is enabled
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Number of times this automation has been executed
+    #[serde(default)]
+    pub execution_count: u64,
+    /// Last execution timestamp (Unix timestamp)
+    pub last_executed: Option<i64>,
+    /// Creation timestamp (Unix timestamp)
+    pub created_at: i64,
+    /// Last update timestamp (Unix timestamp)
+    pub updated_at: i64,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+impl AutomationMetadata {
+    /// Create new metadata
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        let now = Utc::now().timestamp();
+        Self {
+            id: id.into(),
+            name: name.into(),
+            description: String::new(),
+            enabled: true,
+            execution_count: 0,
+            last_executed: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Set description
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    /// Mark as executed — increments execution_count and stamps last_executed.
+    ///
+    /// Intentionally does NOT bump `updated_at`: that field tracks configuration
+    /// changes (name/scope/code edits), not runtime activity. Bumping it on every
+    /// execution would pollute sort order and erase the "last modified" semantic.
+    pub fn mark_executed(&mut self) {
+        self.execution_count += 1;
+        self.last_executed = Some(Utc::now().timestamp());
+    }
+
+    /// Touch the update timestamp
+    pub fn touch(&mut self) {
+        self.updated_at = Utc::now().timestamp();
+    }
+}
+
+// ==================== Transform Types ====================
+
+/// Transform scope - defines which devices this transform applies to
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransformScope {
+    /// Global scope - applies to all devices
+    Global,
+    /// Device type scope - applies to all devices of a specific type
+    DeviceType(String),
+    /// Device instance scope - applies to a specific device
+    Device(String),
+}
+
+impl TransformScope {
+    pub fn as_str(&self) -> String {
+        match self {
+            TransformScope::Global => "global".to_string(),
+            TransformScope::DeviceType(t) => format!("device_type:{}", t),
+            TransformScope::Device(d) => format!("device:{}", d),
+        }
+    }
+
+    /// Get the scope priority (higher = more specific)
+    pub fn priority(&self) -> u8 {
+        match self {
+            TransformScope::Global => 0,
+            TransformScope::DeviceType(_) => 1,
+            TransformScope::Device(_) => 2,
+        }
+    }
+}
+
+/// Aggregation function for data processing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregationFunc {
+    Mean,
+    Max,
+    Min,
+    Sum,
+    Count,
+    Median,
+    StdDev,
+    First,
+    Last,
+    Trend,
+    Delta,
+    Rate,
+}
+
+impl AggregationFunc {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AggregationFunc::Mean => "mean",
+            AggregationFunc::Max => "max",
+            AggregationFunc::Min => "min",
+            AggregationFunc::Sum => "sum",
+            AggregationFunc::Count => "count",
+            AggregationFunc::Median => "median",
+            AggregationFunc::StdDev => "stddev",
+            AggregationFunc::First => "first",
+            AggregationFunc::Last => "last",
+            AggregationFunc::Trend => "trend",
+            AggregationFunc::Delta => "delta",
+            AggregationFunc::Rate => "rate",
+        }
+    }
+}
+
+/// Time window for time-series aggregation
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeWindow {
+    /// Window size in seconds
+    pub duration_secs: u64,
+    /// Sliding window offset
+    #[serde(default)]
+    pub offset_secs: u64,
+}
+
+impl TimeWindow {
+    pub fn from_minutes(minutes: u64) -> Self {
+        Self {
+            duration_secs: minutes * 60,
+            offset_secs: 0,
+        }
+    }
+
+    pub fn from_hours(hours: u64) -> Self {
+        Self {
+            duration_secs: hours * 3600,
+            offset_secs: 0,
+        }
+    }
+
+    pub fn from_seconds(seconds: u64) -> Self {
+        Self {
+            duration_secs: seconds,
+            offset_secs: 0,
+        }
+    }
+}
+
+// ==================== Transform Expression Language ====================
+
+/// Transform operation - composable expression-based data processing
+///
+/// This uses a pipeline-based approach similar to jq, with composable functions
+/// that AI can understand and generate easily.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op_type", rename_all = "snake_case")]
+pub enum TransformOperation {
+    // ========== Legacy Operations (for backward compatibility) ==========
+    /// Single value extraction using JSONPath
+    Single {
+        /// JSONPath to extract value
+        json_path: String,
+        /// Output metric name
+        output_metric: String,
+    },
+
+    /// Array aggregation - compute aggregate over array elements
+    ArrayAggregation {
+        /// JSONPath to the array
+        json_path: String,
+        /// Aggregation function to apply
+        aggregation: AggregationFunc,
+        /// Optional: path to value within each array element
+        value_path: Option<String>,
+        /// Output metric name
+        output_metric: String,
+    },
+
+    /// Time-series aggregation - aggregate over time window
+    TimeSeriesAggregation {
+        /// Source metric to aggregate
+        source_metric: String,
+        /// Time window
+        window: TimeWindow,
+        /// Aggregation function
+        aggregation: AggregationFunc,
+        /// Output metric name
+        output_metric: String,
+    },
+
+    /// Reference - get data from another device
+    Reference {
+        /// Source device ID
+        source_device: String,
+        /// Source metric name
+        source_metric: String,
+        /// Output metric name
+        output_metric: String,
+    },
+
+    /// Phase 4.2: Extension-based transform
+    /// Calls an extension to perform the transformation
+    Extension {
+        /// Extension ID that provides the transform
+        extension_id: String,
+        /// Command/Function name to call on the extension
+        command: String,
+        /// Input parameters (can reference data from device)
+        #[serde(default)]
+        parameters: HashMap<String, serde_json::Value>,
+        /// Output metric name(s)
+        output_metrics: Vec<String>,
+        /// Output mapping configuration: key=metric name, value={from, normalize, transform, roi, ...}
+        #[serde(default)]
+        output_mapping: Option<HashMap<String, serde_json::Value>>,
+    },
+
+    /// Multi-output transform - generates multiple metrics
+    MultiOutput {
+        /// Operations to run in parallel
+        operations: Vec<TransformOperation>,
+    },
+
+    // ========== New Expression-Based Operations ==========
+    /// Extract data using JSONPath and output as a metric
+    Extract {
+        /// JSONPath expression to locate data
+        from: String,
+        /// Output metric name (supports template variables like `{{field}}`)
+        output: String,
+        /// Optional data type conversion
+        #[serde(default)]
+        as_type: Option<TargetDataType>,
+    },
+
+    /// Map over an array, applying a template to each element
+    Map {
+        /// JSONPath to the array
+        over: String,
+        /// Output template for each element
+        /// Variables: `{{item}}`, `{{index}}`, `{{item.field}}`
+        template: String,
+        /// Output metric name pattern
+        output: String,
+        /// Optional: filter expression (only process matching items)
+        #[serde(default)]
+        filter: Option<String>,
+    },
+
+    /// Reduce an array to a single value
+    Reduce {
+        /// JSONPath to the array
+        over: String,
+        /// Aggregation function
+        using: AggregationFunc,
+        /// Optional: value path within each element
+        #[serde(default)]
+        value: Option<String>,
+        /// Output metric name
+        output: String,
+    },
+
+    /// Format data using a template string
+    Format {
+        /// Template string with `{{variable}}` placeholders
+        /// Supports nested paths: `{{data.sensors[0].temp}}`
+        template: String,
+        /// Output metric name
+        output: String,
+        /// Optional: input data path (default: root `$`)
+        #[serde(default)]
+        from: Option<String>,
+    },
+
+    /// Compute a mathematical expression
+    Compute {
+        /// Expression string like `{{a}} + {{b}} * 2` or `sum($.values)`
+        expression: String,
+        /// Output metric name
+        output: String,
+    },
+
+    /// Pipeline: chain multiple operations together
+    Pipeline {
+        /// Operations to execute in sequence
+        /// Output of one operation becomes input for the next
+        steps: Vec<TransformOperation>,
+        /// Final output metric name
+        output: String,
+    },
+
+    /// Fork: produce multiple outputs from same input
+    Fork {
+        /// Branches to execute in parallel
+        branches: Vec<TransformOperation>,
+    },
+
+    /// Conditional: execute different operations based on condition
+    If {
+        /// Condition expression (e.g., `{{temperature}} > 30`)
+        condition: String,
+        /// Operation to execute if condition is true
+        then: Box<TransformOperation>,
+        /// Optional: operation to execute if condition is false
+        else_: Option<Box<TransformOperation>>,
+        /// Output metric name
+        output: String,
+    },
+
+    // ========== Advanced Data Processing ==========
+    /// GroupBy - group array elements by key and aggregate
+    /// Example: [{box, cls}] → {"fish": 12, "shrimp": 5}
+    GroupBy {
+        /// JSONPath to the array
+        over: String,
+        /// Field to group by (e.g., "cls")
+        key: String,
+        /// Aggregation function (count, sum, avg, etc.)
+        using: AggregationFunc,
+        /// Optional: value field to aggregate within each group
+        #[serde(default)]
+        value: Option<String>,
+        /// Output metric pattern (will be suffixed with group key)
+        output: String,
+    },
+
+    /// Decode - convert encoded data to JSON
+    /// Supports: hex, base64, ascii, csv
+    Decode {
+        /// Input data path
+        from: String,
+        /// Encoding format
+        format: DecodeFormat,
+        /// Output metric name
+        output: String,
+    },
+
+    /// Encode - convert JSON to encoded format
+    Encode {
+        /// Input data path
+        from: String,
+        /// Encoding format
+        format: DecodeFormat,
+        /// Output metric name
+        output: String,
+    },
+}
+
+/// Data decode/encode format
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecodeFormat {
+    /// Hexadecimal string (e.g., "7B2274656D70223A32357D" → {"temp":25})
+    Hex,
+    /// Base64 encoded
+    Base64,
+    /// ASCII/UTF-8 bytes
+    Bytes,
+    /// CSV format
+    Csv,
+    /// URL encoded
+    Url,
+}
+
+/// Data type for value conversion
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetDataType {
+    String,
+    Number,
+    Boolean,
+    Int,
+    Float,
+}
+
+impl TransformOperation {
+    /// Get all output metrics from this operation
+    pub fn output_metrics(&self) -> Vec<String> {
+        match self {
+            // Legacy operations
+            TransformOperation::Single { output_metric, .. } => vec![output_metric.clone()],
+            TransformOperation::ArrayAggregation { output_metric, .. } => {
+                vec![output_metric.clone()]
+            }
+            TransformOperation::TimeSeriesAggregation { output_metric, .. } => {
+                vec![output_metric.clone()]
+            }
+            TransformOperation::Reference { output_metric, .. } => vec![output_metric.clone()],
+            TransformOperation::Extension { output_metrics, .. } => output_metrics.clone(),
+            TransformOperation::MultiOutput { operations } => operations
+                .iter()
+                .flat_map(|op| op.output_metrics())
+                .collect(),
+
+            // New expression-based operations
+            TransformOperation::Extract { output, .. } => vec![output.clone()],
+            TransformOperation::Map { output, .. } => vec![output.clone()],
+            TransformOperation::Reduce { output, .. } => vec![output.clone()],
+            TransformOperation::Format { output, .. } => vec![output.clone()],
+            TransformOperation::Compute { output, .. } => vec![output.clone()],
+            TransformOperation::Pipeline { output, .. } => vec![output.clone()],
+            TransformOperation::Fork { branches } => {
+                branches.iter().flat_map(|op| op.output_metrics()).collect()
+            }
+            TransformOperation::If { output, .. } => vec![output.clone()],
+
+            // Advanced operations
+            TransformOperation::GroupBy { output, .. } => {
+                // GroupBy produces multiple outputs (one per group)
+                // Return the base pattern, actual metrics are determined at runtime
+                vec![output.clone()]
+            }
+            TransformOperation::Decode { output, .. } => vec![output.clone()],
+            TransformOperation::Encode { output, .. } => vec![output.clone()],
+        }
+    }
+
+    /// Get the complexity score for this operation
+    pub fn complexity_score(&self) -> u8 {
+        match self {
+            // Legacy operations
+            TransformOperation::Single { .. } => 1,
+            TransformOperation::ArrayAggregation { .. } => 2,
+            TransformOperation::TimeSeriesAggregation { .. } => 3,
+            TransformOperation::Reference { .. } => 1,
+            TransformOperation::Extension { .. } => 3,
+            TransformOperation::MultiOutput { operations } => operations
+                .iter()
+                .map(|op| op.complexity_score())
+                .sum::<u8>()
+                .min(5),
+
+            // New expression-based operations
+            TransformOperation::Extract { .. } => 1,
+            TransformOperation::Map { .. } => 2,
+            TransformOperation::Reduce { .. } => 2,
+            TransformOperation::Format { .. } => 1,
+            TransformOperation::Compute { .. } => 2,
+            TransformOperation::Pipeline { steps, .. } => {
+                // Pipeline complexity is based on number of steps
+                steps
+                    .iter()
+                    .map(|op| op.complexity_score())
+                    .sum::<u8>()
+                    .min(5)
+            }
+            TransformOperation::Fork { branches } => {
+                // Fork complexity based on branches
+                branches
+                    .iter()
+                    .map(|op| op.complexity_score())
+                    .sum::<u8>()
+                    .min(5)
+            }
+            TransformOperation::If { then, else_, .. } => {
+                // If complexity is 2 + branch complexity
+                let mut score = 2 + then.complexity_score();
+                if let Some(e) = else_ {
+                    score = score.saturating_add(e.complexity_score());
+                }
+                score.min(5)
+            }
+
+            // Advanced operations
+            TransformOperation::GroupBy { .. } => 3,
+            TransformOperation::Decode { .. } => 2,
+            TransformOperation::Encode { .. } => 2,
+        }
+    }
+
+    /// Get a human-readable description of this operation
+    pub fn description(&self) -> String {
+        match self {
+            TransformOperation::Extract { from, output, .. } => {
+                format!("Extract from '{}' to '{}'", from, output)
+            }
+            TransformOperation::Map {
+                over,
+                template,
+                output,
+                ..
+            } => {
+                format!(
+                    "Map over '{}' with template '{}' to '{}'",
+                    over, template, output
+                )
+            }
+            TransformOperation::Reduce {
+                over,
+                using,
+                output,
+                ..
+            } => {
+                format!("Reduce '{}' using {} to '{}'", over, using.as_str(), output)
+            }
+            TransformOperation::Format {
+                template, output, ..
+            } => {
+                format!("Format '{}' to '{}'", template, output)
+            }
+            TransformOperation::Compute { expression, output } => {
+                format!("Compute '{}' to '{}'", expression, output)
+            }
+            TransformOperation::Pipeline { steps, output } => {
+                format!("Pipeline ({} steps) to '{}'", steps.len(), output)
+            }
+            TransformOperation::Fork { branches } => {
+                format!("Fork into {} branches", branches.len())
+            }
+            TransformOperation::If { condition, .. } => {
+                format!("If condition: {}", condition)
+            }
+            TransformOperation::GroupBy {
+                over,
+                key,
+                using,
+                output,
+                ..
+            } => {
+                format!(
+                    "Group '{}' by {} using {} to '{}'",
+                    over,
+                    key,
+                    using.as_str(),
+                    output
+                )
+            }
+            TransformOperation::Decode {
+                from,
+                format,
+                output,
+            } => {
+                format!("Decode {} from '{:?}' to '{}'", from, format, output)
+            }
+            TransformOperation::Encode {
+                from,
+                format,
+                output,
+            } => {
+                format!("Encode {} as '{:?}' to '{}'", from, format, output)
+            }
+            _ => format!("{:?}", self),
+        }
+    }
+}
+
+/// Transform automation - processes raw device data into usable metrics
+///
+/// # New Design (AI-Native)
+///
+/// Instead of complex operation definitions, transforms now use:
+/// - `intent`: User's natural language description
+/// - `js_code`: AI-generated JavaScript code for transformation
+///
+/// This approach is simpler and more flexible:
+/// - User: "统计 detections 数组中每个 cls 的数量"
+/// - AI generates: JavaScript code to count by cls
+/// - Output prefix prevents naming conflicts
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransformAutomation {
+    /// Shared metadata
+    #[serde(flatten)]
+    pub metadata: AutomationMetadata,
+    /// Transform scope - which devices this applies to
+    /// - Global: applies to all devices
+    /// - DeviceType(type): applies to all devices of the specified type
+    /// - Device(id): applies to a specific device instance
+    pub scope: TransformScope,
+
+    // ========== New AI-Native Fields ==========
+    /// User's natural language intent (what they want to transform)
+    /// Example: "统计 detections 数组中每个 cls 的数量"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+
+    /// AI-generated JavaScript code for transformation
+    /// The code receives `input` (raw device data) and should return the transformed result
+    /// Example:
+    /// ```javascript
+    /// const counts = {};
+    /// for (const item of input.detections || []) {
+    ///   counts[item.cls || 'unknown'] = (counts[item.cls] || 0) + 1;
+    /// }
+    /// return counts;
+    /// ```
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub js_code: Option<String>,
+
+    /// Output metric name prefix to avoid conflicts when multiple transforms apply
+    /// Example: "detection_count" → outputs like "detection_count.fish", "detection_count.shrimp"
+    #[serde(default = "default_output_prefix")]
+    pub output_prefix: String,
+
+    /// Complexity score (1-5) for display and execution ordering
+    /// Higher complexity transforms may be executed later
+    #[serde(default = "default_complexity")]
+    pub complexity: u8,
+
+    // ========== Legacy Fields (for backward compatibility) ==========
+    /// Legacy: Transform operations (deprecated, use js_code instead)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<TransformOperation>>,
+}
+
+fn default_output_prefix() -> String {
+    "transform".to_string()
+}
+
+fn default_complexity() -> u8 {
+    2
+}
+
+impl TransformAutomation {
+    /// Create a new transform automation
+    pub fn new(id: impl Into<String>, name: impl Into<String>, scope: TransformScope) -> Self {
+        Self {
+            metadata: AutomationMetadata::new(id, name),
+            scope,
+            intent: None,
+            js_code: None,
+            output_prefix: default_output_prefix(),
+            complexity: default_complexity(),
+            operations: None,
+        }
+    }
+
+    /// Create a new AI-native transform with JavaScript code
+    pub fn with_js_code(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        scope: TransformScope,
+        intent: impl Into<String>,
+        js_code: impl Into<String>,
+    ) -> Self {
+        Self {
+            metadata: AutomationMetadata::new(id, name),
+            scope,
+            intent: Some(intent.into()),
+            js_code: Some(js_code.into()),
+            output_prefix: default_output_prefix(),
+            complexity: default_complexity(),
+            operations: None,
+        }
+    }
+
+    /// Set description
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.metadata.description = description.into();
+        self
+    }
+
+    /// Set device type filter - changes scope to DeviceType
+    /// This is a convenience method that replaces the current scope with DeviceType
+    pub fn with_device_type(mut self, device_type: impl Into<String>) -> Self {
+        self.scope = TransformScope::DeviceType(device_type.into());
+        self
+    }
+
+    /// Set output prefix
+    pub fn with_output_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.output_prefix = prefix.into();
+        self
+    }
+
+    /// Set complexity score
+    pub fn with_complexity(mut self, complexity: u8) -> Self {
+        self.complexity = complexity.min(5);
+        self
+    }
+
+    /// Add a transform operation (legacy, for backward compatibility)
+    pub fn with_operation(mut self, operation: TransformOperation) -> Self {
+        self.operations.get_or_insert_with(Vec::new).push(operation);
+        self
+    }
+
+    /// Get complexity score - returns stored complexity or computes from operations
+    pub fn complexity_score(&self) -> u8 {
+        // If js_code is set, use stored complexity
+        if self.js_code.is_some() {
+            return self.complexity.min(5);
+        }
+
+        // Otherwise compute from operations (legacy)
+        if let Some(ref ops) = self.operations {
+            if ops.is_empty() {
+                return 1;
+            }
+            ops.iter()
+                .map(|op| op.complexity_score())
+                .max()
+                .unwrap_or(1)
+                .min(5)
+        } else {
+            self.complexity.min(5)
+        }
+    }
+
+    /// Get all output metrics from this transform
+    pub fn output_metrics(&self) -> Vec<String> {
+        // For JS-based transforms, return the output prefix as base
+        if self.js_code.is_some() {
+            return vec![self.output_prefix.clone()];
+        }
+
+        // Legacy: compute from operations
+        if let Some(ref ops) = self.operations {
+            ops.iter().flat_map(|op| op.output_metrics()).collect()
+        } else {
+            vec![self.output_prefix.clone()]
+        }
+    }
+
+    /// Check if this is a JS-based (AI-native) transform
+    pub fn is_js_based(&self) -> bool {
+        self.js_code.is_some() && self.js_code.as_ref().is_some_and(|c| !c.is_empty())
+    }
+
+    /// Check if this transform applies to the given device
+    pub fn applies_to_device(&self, device_id: &str, device_type: Option<&str>) -> bool {
+        if !self.metadata.enabled {
+            return false;
+        }
+        match &self.scope {
+            TransformScope::Global => true,
+            TransformScope::DeviceType(dt) => device_type.map(|t| t == dt).unwrap_or(false),
+            TransformScope::Device(d) => d == device_id,
+        }
+    }
+}
+
+/// Intent analysis result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentResult {
+    /// Recommended automation type
+    pub recommended_type: AutomationType,
+    /// Confidence score (0-100)
+    pub confidence: u8,
+    /// Explanation of why this type was recommended
+    pub reasoning: String,
+    /// Suggested automation based on the description
+    pub suggested_automation: Option<SuggestedAutomation>,
+    /// Any warnings about the suggestion
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Suggested automation from intent analysis
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestedAutomation {
+    /// Suggested name
+    pub name: String,
+    /// Suggested description
+    pub description: String,
+    /// Automation type (always Transform)
+    pub automation_type: AutomationType,
+    /// Suggested transform
+    pub transform: Option<TransformAutomation>,
+    /// Estimated complexity
+    pub estimated_complexity: u8,
+}
+
+/// Template parameter
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateParameter {
+    /// Parameter name
+    pub name: String,
+    /// Display label
+    pub label: String,
+    /// Parameter type
+    #[serde(rename = "type")]
+    pub param_type: TemplateParameterType,
+    /// Whether this parameter is required
+    #[serde(default)]
+    pub required: bool,
+    /// Default value
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Options for enum types
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Parameter description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Template parameter types
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateParameterType {
+    String,
+    Number,
+    Boolean,
+    Device,
+    Metric,
+    Enum,
+}
+
+/// Automation template
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationTemplate {
+    /// Template ID
+    pub id: String,
+    /// Template name
+    pub name: String,
+    /// Template description
+    pub description: String,
+    /// Which automation type this template creates
+    pub automation_type: AutomationType,
+    /// Template category
+    pub category: String,
+    /// Parameters for this template
+    pub parameters: Vec<TemplateParameter>,
+    /// Example usage
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub example: Option<String>,
+}
+
+/// Automation execution record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionRecord {
+    /// Unique execution ID
+    pub id: String,
+    /// Automation ID
+    pub automation_id: String,
+    /// Automation type
+    pub automation_type: AutomationType,
+    /// Start time
+    pub started_at: i64,
+    /// End time (null if still running)
+    pub ended_at: Option<i64>,
+    /// Execution status
+    pub status: ExecutionStatus,
+    /// Error message if failed
+    pub error: Option<String>,
+    /// Output from the execution
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
+}
+
+/// Execution status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Filter options for listing automations
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AutomationFilter {
+    /// Filter by automation type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<AutomationType>,
+    /// Filter by enabled status
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Search in name and description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    /// Filter by category
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Pagination offset
+    #[serde(default)]
+    pub offset: usize,
+    /// Pagination limit
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+fn default_limit() -> usize {
+    50
+}
+
+/// Result for listing automations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationList {
+    /// List of automations
+    pub automations: Vec<Automation>,
+    /// Total count (for pagination)
+    pub total_count: usize,
+    /// Count by type
+    pub counts: TypeCounts,
+}
+
+/// Count breakdown by automation type
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TypeCounts {
+    pub total: usize,
+    pub transforms: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_automation_type_display() {
+        assert_eq!(AutomationType::Transform.as_str(), "transform");
+    }
+
+    #[test]
+    fn test_complexity_calculation() {
+        let transform =
+            TransformAutomation::new("test", "Test", TransformScope::Global).with_complexity(2);
+        assert_eq!(transform.complexity_score(), 2);
+    }
+}

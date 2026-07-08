@@ -1,0 +1,19 @@
+{
+  "id": "rule-history",
+  "lang": "en",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "single_turn",
+  "description": "Query a rule's trigger history (covers `heramind rule history` — the read path for rule executions)",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Show me the trigger history of the rule-battery-low rule." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes `heramind rule history rule-battery-low` (or GET /api/rules/rule-battery-low/history)"
+    ],
+    "overall": "Must actually query the history; an empty history is valid but must be stated explicitly"
+  }
+}

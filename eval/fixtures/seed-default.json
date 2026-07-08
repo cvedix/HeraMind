@@ -1,0 +1,49 @@
+{
+  "name": "seed-default",
+  "description": "Default seed: 3 ne101 cameras + 1 enabled low-battery alert rule (rule-battery-low). ne101_camera template exposes values.battery as a real metric, so the rule passes validation.",
+  "devices": [
+    {
+      "device_id": "sensor-001",
+      "name": "Living Room Sensor",
+      "device_type": "ne101_camera",
+      "adapter_type": "mqtt",
+      "connection_config": {}
+    },
+    {
+      "device_id": "sensor-002",
+      "name": "Bedroom Sensor",
+      "device_type": "ne101_camera",
+      "adapter_type": "mqtt",
+      "connection_config": {}
+    },
+    {
+      "device_id": "camera-001",
+      "name": "Front Door Camera",
+      "device_type": "ne101_camera",
+      "adapter_type": "mqtt",
+      "connection_config": {}
+    }
+  ],
+  "metrics": [
+    { "device_id": "sensor-001", "metric": "values.battery", "value": 75 },
+    { "device_id": "sensor-002", "metric": "values.battery", "value": 82 }
+  ],
+  "rules": [
+    {
+      "name": "rule-battery-low",
+      "description": "Low-battery alert — fires when sensor-001 reports values.battery < 20.",
+      "enabled": true,
+      "trigger": { "trigger_type": "data_change" },
+      "condition": {
+        "condition_type": "comparison",
+        "source": "device:sensor-001:values.battery",
+        "operator": "less_than",
+        "threshold": 20.0
+      },
+      "actions": [
+        { "type": "notify", "message": "sensor-001 battery low: {value}%", "severity": "warning" }
+      ],
+      "cooldown": 60000
+    }
+  ]
+}

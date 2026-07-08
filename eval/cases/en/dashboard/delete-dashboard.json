@@ -1,0 +1,29 @@
+{
+  "id": "dashboard-delete-existing",
+  "lang": "en",
+  "category": "dashboard",
+  "workflow": "dashboard-management",
+  "scenario_type": "single_turn",
+  "description": "Delete an existing dashboard (covers the DELETE /api/dashboards/:id path)",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "dashboards": [
+        { "name": "stale-dashboard", "components": [] }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "Please delete the dashboard named 'stale-dashboard'." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes `heramind dashboard delete stale-dashboard` (or DELETE /api/dashboards/stale-dashboard)"
+    ],
+    "overall": "Must confirm deletion; the dashboard must no longer appear in the list"
+  },
+  "state_queries": [
+    { "type": "dashboard_exists", "params": { "id": "stale-dashboard" }, "expected": false }
+  ]
+}

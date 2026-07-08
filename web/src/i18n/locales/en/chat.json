@@ -1,0 +1,225 @@
+{
+  "openPanel": "Open AI Chat",
+  "closePanel": "Close",
+  "panelTitle": "AI Chat",
+  "streamInProgress": "Stream in progress, closing after completion...",
+  "title": "Smart IoT Assistant",
+  "welcome": {
+    "greeting": "Hello! I'm HeraMind",
+    "description": "Smart IoT assistant to help you manage devices and automation",
+    "suggestions": {
+      "checkDevices": "Check device status",
+      "createRule": "Create automation rule",
+      "viewAlerts": "View alerts"
+    }
+  },
+  "input": {
+    "placeholder": "Enter message...",
+    "sendHint": "Press <kbd>/</kbd> for suggestions",
+    "selectModel": "Select model",
+    "selectLLMModel": "Select LLM Model",
+    "attachment": "Attachment",
+    "moreOptions": "More options",
+    "newChat": "New chat",
+    "startNewConversation": "Start typing to chat with AI assistant",
+    "skills": "Skills",
+    "selectSkills": "Select skills",
+    "noSkills": "No skills available",
+    "activeSkills": "Active skills"
+  },
+  "model": {
+    "supportsVision": "Supports vision",
+    "supportsThinking": "Supports thinking",
+    "addImage": "Add image",
+    "notSupportImage": "Current model doesn't support images",
+    "visionError": "The current model doesn't support image input.\n\nPlease select a model that supports vision (like qwen3.5:4b), or remove the image and try again.\n\nModels that support vision show the 👁️ icon.",
+    "supportsTools": "Supports Tools"
+  },
+  "thinking": {
+    "title": "Thinking process",
+    "thinking": "Thinking...",
+    "characters": "characters",
+    "rounds": "Rounds"
+  },
+  "progress": {
+    "thinking": "Thinking",
+    "generating": "Generating",
+    "toolExecution": "Running tool"
+  },
+  "stage": {
+    "thinking": "Thinking",
+    "collecting": "Collecting",
+    "analyzing": "Analyzing",
+    "executing": "Executing",
+    "generating": "Generating",
+    "compacting": "Compacting"
+  },
+  "toolCall": {
+    "title": "Tool calls",
+    "status": {
+      "pending": "Pending",
+      "running": "Running",
+      "completed": "Completed"
+    },
+    "arguments": "Arguments",
+    "result": "Result",
+    "roundTitle": "Round {{round}}",
+    "multiRoundTitle": "Tool Calls",
+    "rounds": "rounds",
+    "toggleDetails": "Toggle details"
+  },
+  "connection": {
+    "connected": "Connected",
+    "reconnecting": "Reconnecting",
+    "error": "Connection error",
+    "disconnected": "Disconnected",
+    "retryAttempt": "Attempt {{count}}",
+    "retryProgress": "Attempt {{retry}}/{{max}}{{seconds, string}}",
+    "retrySeconds": " · {{seconds}}s",
+    "reconnect": "Reconnect"
+  },
+  "quickActions": {
+    "refreshDevices": "Refresh devices",
+    "refreshPrompt": "Refresh status of all devices",
+    "viewDeviceDetails": "View device details",
+    "viewDevicePrompt": "Show device details and configuration",
+    "createAutomation": "Create automation",
+    "createAutomationPrompt": "Help me create a new automation rule",
+    "viewAllAutomations": "View all automations",
+    "viewAllAutomationsPrompt": "List all configured automation rules",
+    "viewAnalytics": "View analytics",
+    "viewAnalyticsPrompt": "Show recent data analysis and trends",
+    "checkAlerts": "Check alerts",
+    "checkAlertsPrompt": "Check for any unhandled alerts",
+    "openSettings": "Open settings",
+    "openSettingsPrompt": "Open system settings page",
+    "continue": "Continue",
+    "continuePrompt": "Continue",
+    "elaborate": "Elaborate",
+    "elaboratePrompt": "Please elaborate"
+  },
+  "taskProgress": {
+    "title": "Task progress",
+    "steps": {
+      "collecting": "Collecting info",
+      "confirming": "Confirming",
+      "executing": "Executing"
+    },
+    "status": {
+      "completed": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "percentComplete": "{{percent}}% complete",
+    "currentStep": "Processing step {{step}}...",
+    "success": "Task completed successfully!",
+    "failed": "Task execution failed, please retry",
+    "createAutomation": "Create automation",
+    "stepLabel": "Step {{step}}",
+    "automationCreated": "Automation created successfully!"
+  },
+  "intent": {
+    "queryData": {
+      "label": "Query data",
+      "description": "Query device status or historical data"
+    },
+    "analyzeData": {
+      "label": "Analyze data",
+      "description": "Analyze trends, anomalies, or statistics"
+    },
+    "controlDevice": {
+      "label": "Control device",
+      "description": "Toggle devices or adjust parameters"
+    },
+    "createAutomation": {
+      "label": "Create automation",
+      "description": "Create rules or workflows"
+    },
+    "sendMessage": {
+      "label": "Send message",
+      "description": "Send notifications or reports"
+    },
+    "summarize": {
+      "label": "Summarize",
+      "description": "Summarize information"
+    },
+    "clarify": {
+      "label": "Needs clarification",
+      "description": "More information needed"
+    },
+    "outOfScope": {
+      "label": "Out of scope",
+      "description": "Beyond system capabilities"
+    },
+    "confidence": "Confidence",
+    "type": "Type",
+    "path": {
+      "fast": "Fast path",
+      "standard": "Standard",
+      "quality": "High quality",
+      "multiTurn": "Multi-turn",
+      "fallback": "Fallback"
+    },
+    "entity": {
+      "device": "Device",
+      "location": "Location",
+      "value": "Value",
+      "time": "Time",
+      "action": "Action",
+      "unknown": "Unknown"
+    }
+  },
+  "loading": "Loading...",
+  "errors": {
+    "sendMessage": "Failed to send message",
+    "connectionLost": "Connection lost",
+    "retry": "Retry",
+    "llmError": "LLM Service Error",
+    "dismiss": "Dismiss"
+  },
+  "memory": {
+    "label": "Memory",
+    "enabled": "Memory on",
+    "disabled": "Memory off"
+  },
+  "notConfigured": {
+    "title": "LLM Not Configured",
+    "description": "Please configure LLM backend to use chat feature",
+    "goToSettings": "Go to Settings"
+  },
+  "build": {
+    "view": "View",
+    "undo": "Undo",
+    "showDetails": "Details",
+    "hideDetails": "Hide details",
+    "types": {
+      "device": "Device",
+      "dashboard": "Dashboard",
+      "rule": "Rule",
+      "extension": "Extension",
+      "widget": "Widget",
+      "transform": "Transform",
+      "agent": "Agent",
+      "message": "Message"
+    },
+    "actions": {
+      "create": "Created",
+      "update": "Updated",
+      "delete": "Deleted",
+      "install": "Installed"
+    }
+  },
+  "newChat": "New Chat",
+  "chat": {
+    "suggestions": {
+      "badge": "Badge"
+    }
+  },
+  "status": {
+    "typing": "Typing",
+    "wait": "Wait"
+  },
+  "footer": {
+    "disclaimer": "Disclaimer"
+  }
+}

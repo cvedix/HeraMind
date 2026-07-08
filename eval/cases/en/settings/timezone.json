@@ -1,0 +1,19 @@
+{
+  "id": "settings-timezone",
+  "lang": "en",
+  "category": "settings",
+  "workflow": "settings-management",
+  "scenario_type": "single_turn",
+  "description": "Query the current global timezone setting (covers `heramind settings timezone` — the settings API surface)",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "What's the current global timezone configured on this instance?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes `heramind settings timezone` (or GET /api/settings/timezone)"
+    ],
+    "overall": "Must surface the actual timezone value (e.g. UTC or Asia/Shanghai)"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "rule-disable-existing",
+  "lang": "zh",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "single_turn",
+  "description": "禁用已有规则",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "把 rule-battery-low 规则禁用" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind rule disable rule-battery-low`（或 status=false 的 update）"
+    ],
+    "overall": "禁用后应确认"
+  },
+  "state_queries": [
+    { "type": "rule_enabled", "params": { "id": "rule-battery-low" }, "expected": false }
+  ]
+}

@@ -1,0 +1,48 @@
+[package]
+name = "heramind-rules"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+heramind-core = { path = "../heramind-core" }
+heramind-devices = { path = "../heramind-devices" }
+heramind-messages = { path = "../heramind-messages" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+# Utils
+uuid = { workspace = true }
+chrono = { workspace = true }
+url = "2.5"
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Storage
+redb = { workspace = true }
+
+# Concurrency
+parking_lot = { workspace = true }
+
+# Regex for string comparison operators
+regex = { workspace = true }
+
+[features]
+default = []
+
+[lints.clippy]
+# Temporarily suppress clippy warnings for heramind-rules
+unnecessary_map_or = "allow"
+collapsible_if = "allow"
+manual_strip = "allow"
+should_implement_trait = "allow"
+type_complexity = "allow"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }

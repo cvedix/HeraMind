@@ -1,0 +1,22 @@
+{
+  "id": "dashboard-create-simple",
+  "lang": "zh",
+  "category": "dashboard",
+  "workflow": "dashboard-management",
+  "scenario_type": "single_turn",
+  "description": "创建一个仪表盘",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "创建一个叫 '温度总览' 的仪表盘" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind dashboard create --name 温度总览`（或等价 API）"
+    ],
+    "overall": "创建后应反馈仪表盘 ID"
+  },
+  "state_queries": [
+    { "type": "dashboard_exists", "params": { "id": "温度总览" }, "expected": true }
+  ]
+}

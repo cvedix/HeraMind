@@ -1,0 +1,19 @@
+{
+  "id": "device-control",
+  "lang": "en",
+  "category": "device",
+  "workflow": "device-onboarding",
+  "scenario_type": "single_turn",
+  "description": "Send a control command to a device (covers `heramind device control` — core IoT control loop, previously 0 coverage). seed-default's ne101_camera template ships with an empty commands list, so an equally valid agent path is to inspect the device, observe no reboot command is defined, and clearly tell the user the command cannot be sent (rather than blindly issuing it). Both paths satisfy the requirement; the bad outcome is silence or hallucinating success.",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Send a reboot command to sensor-001." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent EITHER (a) confirms device existence via `heramind device get sensor-001` (or list) and then runs `heramind device control sensor-001 reboot` (--params optional), OR (b) calls `heramind device get sensor-001`, observes the commands list is empty (no reboot command defined for this template), and clearly informs the user that the reboot command is not available on this device. Both paths satisfy the requirement."
+    ],
+    "overall": "Agent must engage with the control intent. Running `device get`/`device list` first to verify state is acceptable; bailing out with a clear 'no reboot command defined for sensor-001' message after observing the empty commands list is valid. INVALID: silence, claiming success without any tool call, or hallucinating a command result."
+  }
+}

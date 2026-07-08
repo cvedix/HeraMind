@@ -1,0 +1,11 @@
+[package]
+name = "test_event_bus"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "test_event_bus"
+path = "test_event_bus.rs"
+
+[dependencies]
+heramind-core = { path = "../.." }

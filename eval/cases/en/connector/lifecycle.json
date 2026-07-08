@@ -1,0 +1,25 @@
+{
+  "id": "connector-lifecycle",
+  "lang": "en",
+  "category": "connector",
+  "workflow": "connector-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn lifecycle: create -> update topics -> disable -> delete (covers update + disable + delete).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Add an MQTT broker: name edge-broker, host 10.0.0.50, port 1883." },
+    { "user": "Change this connector's topic subscription to 'edge/+/telemetry'." },
+    { "user": "Temporarily disable this connector." },
+    { "user": "OK, finally delete it." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind connector create --name edge-broker --host 10.0.0.50 --port 1883` (--type defaults to mqtt), and parses the ID",
+      "Turn 2: Agent runs `heramind connector update <ID> --topics 'edge/+/telemetry'`",
+      "Turn 3: Agent runs `heramind connector disable <ID>`",
+      "Turn 4: Agent runs `heramind connector delete <ID>`"
+    ],
+    "overall": "Last three turns must reuse the ID parsed from turn 1"
+  }
+}

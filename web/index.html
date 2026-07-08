@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
+
+    <!-- PWA / standalone meta — improves "Add to Home Screen" on iOS & Android.
+         theme-color uses neutral app background (NOT brand orange) so the OS
+         chrome / Android title bar / desktop PWA frame matches the app surface. -->
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f7f7" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000000" />
+      <meta name="application-name" content="HeraMind" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+      <meta name="apple-mobile-web-app-title" content="HeraMind" />
+
+    <!-- iOS PWA splash screens — static PNG replicas of the Tauri StartupLoading
+         visual (dark gradient + dot grid + horizontal logo). iOS doesn't execute
+         JS/React for the launch screen, so we ship static images keyed by device
+         pixel dimensions via media queries. -->
+    <!-- iPhone 14 Pro Max / 13 Pro Max / 12 Pro Max / 11 Pro Max / XS Max -->
+    <link rel="apple-touch-startup-image" href="/splash-1290x2796.png"
+          media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash-1290x2796.png"
+          media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <!-- iPhone 14 Pro / 13 Pro / 12 Pro / 11 Pro / XS / X -->
+    <link rel="apple-touch-startup-image" href="/splash-1179x2556.png"
+          media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash-1179x2556.png"
+          media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <!-- iPhone 14 Plus / 14 / 13 / 12 / 11 / XR -->
+    <link rel="apple-touch-startup-image" href="/splash-1284x2778.png"
+          media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash-1284x2778.png"
+          media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash-1284x2778.png"
+          media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <!-- iPhone 8 / 7 / 6s / 6 / SE -->
+    <link rel="apple-touch-startup-image" href="/splash-750x1334.png"
+          media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <!-- iPad Pro 12.9" -->
+    <link rel="apple-touch-startup-image" href="/splash-2048x2732.png"
+          media="(min-device-width: 1024px) and (min-device-height: 1366px) and (-webkit-min-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <meta name="format-detection" content="telephone=no" />
+
+      <title>HeraMind - Edge AI Agent</title>
+
+      <!-- Preload brand logos for instant display in nav drawer -->
+      <link rel="preload" as="image" href="/logo-square.png" />
+      <link rel="preload" as="image" href="/logo-light.png" />
+
+    <!-- Plus Jakarta Sans + Noto Sans SC — loaded asynchronously to avoid render blocking -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400;1,800&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+    <noscript><link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400;1,800&display=swap" rel="stylesheet"></noscript>
+
+    <!-- Performance: DNS preconnect for API (reduces connection latency by ~200ms) -->
+    <link rel="dns-prefetch" href="//localhost:9375">
+    <link rel="preconnect" href="http://localhost:9375">
+
+    <!-- Performance: Prefetch critical API endpoints -->
+    <link rel="prefetch" href="/api/devices">
+    <link rel="prefetch" href="/api/agents">
+  </head>
+  <body class="h-screen viewport-full overflow-hidden">
+    <div id="root"></div>
+    <div id="dialog-root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

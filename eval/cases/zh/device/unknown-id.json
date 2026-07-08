@@ -1,0 +1,19 @@
+{
+  "id": "device-unknown-id",
+  "lang": "zh",
+  "category": "device",
+  "workflow": "device-onboarding",
+  "scenario_type": "single_turn",
+  "description": "查询不存在的设备 — 测试错误处理",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "查一下 sensor-nonexistent 这个设备的信息" }
+  ],
+  "applies": ["tool_accuracy", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind device get sensor-nonexistent`，工具返回 not found，Agent 应清楚反馈该设备不存在"
+    ],
+    "overall": "不应编造设备信息"
+  }
+}

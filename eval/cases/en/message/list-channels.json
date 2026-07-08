@@ -1,0 +1,19 @@
+{
+  "id": "message-list-channels",
+  "lang": "en",
+  "category": "message",
+  "workflow": "message-management",
+  "scenario_type": "single_turn",
+  "description": "List notification channels",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Which notification channels exist in the system right now?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes `heramind message channel-list` (or `channel list`)"
+    ],
+    "overall": "Must report the result even if the list is empty"
+  }
+}

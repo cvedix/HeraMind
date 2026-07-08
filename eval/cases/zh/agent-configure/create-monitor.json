@@ -1,0 +1,22 @@
+{
+  "id": "agent-create-monitor",
+  "lang": "zh",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "创建一个简单的间隔执行 agent",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "创建一个名为 '温度巡检' 的 agent，每 5 分钟检查一次所有温度传感器，发现超过 35 度的报警" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind agent create --name 温度巡检 --every 5m --prompt ...`"
+    ],
+    "overall": "agent 应该被创建并默认 active"
+  },
+  "state_queries": [
+    { "type": "agent_exists", "params": { "id": "温度巡检" }, "expected": true }
+  ]
+}

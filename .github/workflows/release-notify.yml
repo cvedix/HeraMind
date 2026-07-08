@@ -1,0 +1,113 @@
+name: Release Notify
+
+# Posts a release announcement to the Discord community channel whenever a
+# GitHub Release is published. Requires the `DISCORD_WEBHOOK_URL` repository
+# secret (Discord channel Webhook URL). Optional `DISCORD_ROLE_ID` secret,
+# when set, adds a role ping to the message.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to announce (e.g. v0.8.12)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Post to Discord
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release metadata
+        id: meta
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name || inputs.tag_name }}
+          HTML_URL: ${{ github.event.release.html_url }}
+          BODY: ${{ github.event.release.body }}
+        run: |
+          # Fall back to constructing a URL when triggered via workflow_dispatch
+          # (release body is empty in that case — just announce the tag).
+          tag="${TAG_NAME}"
+          url="${HTML_URL:-https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+
+          # GitHub Actions JSON-in-env vars wrap multi-line strings, so we read
+          # via the environment to keep newlines intact for the JSON payload.
+          export RELEASE_BODY="${BODY}"
+          python3 - <<'PY'
+          import json, os
+          body = os.environ.get("RELEASE_BODY", "") or ""
+          # Discord embed description cap is 4096; truncate the notes summary.
+          summary = body.strip()
+          if len(summary) > 1800:
+              summary = summary[:1797] + "…"
+          # Store as JSON string for safe shell interpolation next step.
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("EMBED_SUMMARY_JSON=" + json.dumps(summary) + "\n")
+          PY
+
+      - name: Post announcement to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          URL: ${{ steps.meta.outputs.url }}
+          SUMMARY_JSON: ${{ env.EMBED_SUMMARY_JSON }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "::warning::DISCORD_WEBHOOK_URL secret is not set; skipping Discord announcement."
+            exit 0
+          fi
+
+          # Build the optional role-ping prefix.
+          ROLE_PREFIX=""
+          if [ -n "$DISCORD_ROLE_ID" ] && [ "$DISCORD_ROLE_ID" != "0" ]; then
+            ROLE_PREFIX="<@&${DISCORD_ROLE_ID}> "
+          fi
+
+          # Assemble the Discord webhook payload via jq for robust JSON escaping.
+          # `content` holds the ping + headline; `embeds[0].description` holds the
+          # release notes summary. Embed colour = HeraMind-ish blue (#2563eb).
+          PAYLOAD=$(jq -n \
+            --arg content "${ROLE_PREFIX}🚀 **HeraMind ${TAG}** is out!" \
+            --arg url "$URL" \
+            --arg tag "$TAG" \
+            --argjson summary "${SUMMARY_JSON:-\"\"}" \
+            '{
+              content: $content,
+              allowed_mentions: { parse: ["roles", "everyone"] },
+              embeds: [{
+                title: ("Release " + $tag),
+                url: $url,
+                description: $summary,
+                color: 2446977,
+                footer: { text: "HeraMind Release Feed" },
+                timestamp: (now | todate)
+              }]
+            }')
+
+          echo "::add-mask::$DISCORD_WEBHOOK_URL"
+          echo "Sending Discord payload for tag ${TAG}…"
+
+          # Fire the webhook. Discord returns 204 No Content on success.
+          # `--fail-with-body` surfaces rate-limit / 4xx errors with the body.
+          code=$(curl -sS -o /tmp/discord_resp.txt -w "%{http_code}" \
+            --fail-with-body \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK_URL" || true)
+
+          echo "Discord responded HTTP ${code}"
+          cat /tmp/discord_resp.txt
+          echo
+
+          if [ "$code" != "204" ] && [ "$code" != "200" ]; then
+            echo "::error::Discord webhook failed (HTTP ${code})"
+            exit 1
+          fi

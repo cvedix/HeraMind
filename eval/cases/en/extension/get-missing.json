@@ -1,0 +1,19 @@
+{
+  "id": "extension-get-missing",
+  "lang": "en",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "single_turn",
+  "description": "Query a non-existent extension ID; verify agent handles not-found gracefully (covers `heramind extension get` error path; previously only list was covered).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Show me the details of the extension called non-existent-ext." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind extension get non-existent-ext` (or GET /api/extensions/non-existent-ext), and after receiving the error response, clearly tells the user the extension does not exist"
+    ],
+    "overall": "Must actually invoke the tool, not answer from imagination; error reply must be grounded in the tool result"
+  }
+}

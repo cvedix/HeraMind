@@ -1,0 +1,26 @@
+{
+  "id": "device-webhook-telemetry",
+  "lang": "zh",
+  "category": "device",
+  "workflow": "device-onboarding",
+  "scenario_type": "multi_turn",
+  "description": "通过 webhook 适配器接入测试设备：先 CLI 创建 webhook 设备 → curl POST 发送遥测 → 查询最新值验证（覆盖 webhook 通道 + curl 工具链 + write 路径）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "帮我用 webhook 适配器创建一个测试设备 test-webhook-01，名字叫 'Webhook Test Probe'。" },
+    { "user": "请用 curl 给这个设备的 webhook URL 发送一次遥测：temperature=24.6。提示：URL 是 http://127.0.0.1:<port>/api/devices/test-webhook-01/webhook，端口是当前服务监听的端口（你可以从 HERAMIND_API_BASE 环境变量推断）。" },
+    { "user": "查询 test-webhook-01 的最新遥测，确认刚才的 temperature 值已经写入。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind device create --id test-webhook-01 --name 'Webhook Test Probe' --device-type ... --adapter-type webhook`",
+      "Turn 2: Agent 在 shell 中执行 curl POST 到 webhook URL，body 包含 temperature 字段",
+      "Turn 3: Agent 调用 `heramind device get test-webhook-01` 或 `device latest`，并引用上一轮发送的值"
+    ],
+    "overall": "第三轮必须真正读取到 temperature=24.6（或 24.6 附近的浮点）"
+  },
+  "state_queries": [
+    { "type": "device_exists", "params": { "id": "test-webhook-01" }, "expected": true }
+  ]
+}

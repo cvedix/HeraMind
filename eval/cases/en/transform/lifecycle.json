@@ -1,0 +1,29 @@
+{
+  "id": "transform-lifecycle",
+  "lang": "en",
+  "category": "transform",
+  "workflow": "transform-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn lifecycle: create -> test-code -> update -> disable -> enable -> delete (covers `heramind transform test-code` + `update` + `enable/disable` + `delete`; previously only create/list had coverage).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Create a global transform: name c2f, code 'return input * 1.8 + 32'." },
+    { "user": "Test it via test-code with input 25 to see the output." },
+    { "user": "Change its code to 'return input * 1.8 + 32 + 0.5'." },
+    { "user": "Temporarily disable it." },
+    { "user": "Re-enable it." },
+    { "user": "Finally delete it." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind transform create --name c2f --scope global --code 'return input * 1.8 + 32'`, parses id",
+      "Turn 2: Agent runs `heramind transform test-code --code 'return input * 1.8 + 32' --input 25` (or tests against the id)",
+      "Turn 3: Agent runs `heramind transform update <id> --code 'return input * 1.8 + 32 + 0.5'`",
+      "Turn 4: Agent runs `heramind transform disable <id>`",
+      "Turn 5: Agent runs `heramind transform enable <id>`",
+      "Turn 6: Agent runs `heramind transform delete <id>`"
+    ],
+    "overall": "Last five turns must reuse the id parsed from turn 1"
+  }
+}

@@ -1,0 +1,54 @@
+[package]
+name = "heramind-devices"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+heramind-core = { path = "../heramind-core" }
+heramind-storage = { path = "../heramind-storage" }
+
+dashmap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Storage
+redb = { workspace = true }
+
+# MQTT
+rumqttc = { version = "0.24", optional = true, features = ["use-rustls"] }
+rmqtt = { version = "0.20", default-features = false, features = ["tls", "plugin"], optional = true }
+rustls = { version = "0.23", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+rustls-native-certs = { version = "0.7", optional = true }
+
+# Utils
+futures = { workspace = true }
+async-trait = { workspace = true }
+async-stream = { workspace = true }
+async-channel = { version = "2", optional = true }
+base64 = { workspace = true }
+semver = { workspace = true }
+bcrypt = { workspace = true, optional = true }
+
+[features]
+default = ["mqtt"]
+mqtt = ["rumqttc", "rustls", "rustls-pki-types", "rustls-pemfile", "rustls-native-certs", "async-channel"]
+embedded-broker = ["rmqtt", "bcrypt"]
+all = ["mqtt", "embedded-broker"]
+
+[dev-dependencies]
+base64 = { workspace = true }
+
+[lints.clippy]
+# Temporarily suppress clippy warnings for heramind-devices
+redundant_locals = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+result_large_err = "allow"

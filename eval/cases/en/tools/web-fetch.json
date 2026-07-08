@@ -1,0 +1,19 @@
+{
+  "id": "tools-web-fetch",
+  "lang": "en",
+  "category": "tools",
+  "workflow": "tools-web",
+  "scenario_type": "single_turn",
+  "description": "Fetch example.com via the web_fetch tool and report title/body summary (covers the non-CLI toolchain)",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Please fetch https://example.com and tell me the page's main heading and what the body says." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes the `web_fetch` tool (url=https://example.com) and reports based on the fetched content"
+    ],
+    "overall": "Response must contain the \"Example Domain\" heading or equivalent; no fabrication"
+  }
+}

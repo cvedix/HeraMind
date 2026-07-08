@@ -1,0 +1,31 @@
+{
+  "id": "agent-list-existing",
+  "lang": "zh",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "列出已存在的 agent（覆盖 `heramind agent list` 基础发现路径）",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "agents": [
+        {
+          "name": "demo-agent",
+          "user_prompt": "demo",
+          "schedule": { "schedule_type": "interval", "interval_seconds": 60 },
+          "execution_mode": "free"
+        }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "系统里现在配置了哪些 agent？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind agent list`，应在结果中出现 demo-agent"
+    ],
+    "overall": "至少应展示 agent 名称与状态"
+  }
+}

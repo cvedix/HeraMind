@@ -1,0 +1,19 @@
+{
+  "id": "tools-memory-update",
+  "lang": "zh",
+  "category": "tools",
+  "workflow": "tools-memory",
+  "scenario_type": "single_turn",
+  "description": "通过 memory 工具持久化一条用户偏好，让后续会话能读到（覆盖 chat memory 写入路径）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "请记住一条长期偏好：sensor-001 安装在客厅东北角的窗户边上，环境温度通常比室温低 2 度。下次我提到 sensor-001 时请参考这条信息。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `memory` 工具（action=update/set，section=user 或 knowledge），写入指定内容"
+    ],
+    "overall": "必须实际调用 memory 工具持久化（而非只在回复里复述），并确认写入"
+  }
+}

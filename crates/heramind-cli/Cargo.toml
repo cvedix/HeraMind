@@ -1,0 +1,39 @@
+[package]
+name = "heramind-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "heramind"
+path = "src/main.rs"
+
+[features]
+default = []
+static = ["heramind-api/static"]
+
+[dependencies]
+heramind-core = { path = "../heramind-core" }
+heramind-agent = { path = "../heramind-agent" }
+heramind-api = { path = "../heramind-api" }
+heramind-cli-ops = { path = "../heramind-cli-ops" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+zip = "2.1"
+
+# CLI
+clap = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = { workspace = true }
+tokio-test = "0.4"

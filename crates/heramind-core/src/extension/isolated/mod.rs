@@ -1,0 +1,88 @@
+//! Process-isolated extension system
+//!
+//! This module provides process-level isolation for extensions that need
+//! additional safety guarantees. Extensions running in isolated mode
+//! cannot crash the main HeraMind process.
+
+mod in_flight;
+mod ipc_local; // Local IPC implementation (uses SDK types)
+mod manager;
+mod process;
+
+pub use in_flight::{InFlightError, InFlightRequests, RequestId};
+// Re-export IPC protocol types from SDK (via system module)
+pub use super::system::{
+    BatchCommand, BatchResult, BatchResultsVec, ErrorKind, IpcFrame, IpcMessage, IpcResponse,
+    PushOutputData, StreamClientInfo, StreamDataChunk,
+};
+pub use manager::{IsolatedExtensionInfo, IsolatedExtensionManager, IsolatedManagerConfig};
+pub use process::{ExtensionLogEntry, IsolatedExtension, IsolatedExtensionConfig};
+
+/// Result type for isolated extension operations
+pub type IsolatedResult<T> = std::result::Result<T, IsolatedExtensionError>;
+
+/// Error type for isolated extension operations
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum IsolatedExtensionError {
+    /// Failed to spawn process
+    #[error("Failed to spawn extension process: {0}")]
+    SpawnFailed(String),
+
+    /// IPC communication error
+    #[error("IPC communication error: {0}")]
+    IpcError(String),
+
+    /// Extension crashed
+    #[error("Extension process crashed: {0}")]
+    Crashed(String),
+
+    /// Timeout
+    #[error("Extension operation timed out after {0}ms")]
+    Timeout(u64),
+
+    /// Invalid response
+    #[error("Invalid response from extension: {0}")]
+    InvalidResponse(String),
+
+    /// Extension not initialized
+    #[error("Extension not initialized")]
+    NotInitialized,
+
+    /// Extension already running
+    #[error("Extension already running")]
+    AlreadyRunning,
+
+    /// Extension not running
+    #[error("Extension not running")]
+    NotRunning,
+
+    /// Too many concurrent requests
+    #[error("Too many concurrent requests: limit is {0}")]
+    TooManyRequests(usize),
+
+    /// Extension load error
+    #[error("Extension load error: {0}")]
+    LoadError(String),
+
+    /// Unexpected response type
+    #[error("Unexpected response type")]
+    UnexpectedResponse,
+
+    /// Channel closed
+    #[error("Response channel closed")]
+    ChannelClosed,
+
+    /// Extension error
+    #[error("Extension error: {0}")]
+    ExtensionError(String),
+
+    /// Command execution failed
+    #[error("Command execution failed: {0}")]
+    ExecutionFailed(String),
+}
+
+impl From<crate::extension::system::ExtensionError> for IsolatedExtensionError {
+    fn from(err: crate::extension::system::ExtensionError) -> Self {
+        IsolatedExtensionError::LoadError(err.to_string())
+    }
+}

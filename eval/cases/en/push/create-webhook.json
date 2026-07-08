@@ -1,0 +1,19 @@
+{
+  "id": "push-create-webhook",
+  "lang": "en",
+  "category": "push",
+  "workflow": "data-push-management",
+  "scenario_type": "single_turn",
+  "description": "Create a webhook push target and verify (covers `heramind push create --type webhook` write path; previously only list was covered).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Create a webhook push target named ops-webhook with URL https://httpbin.org/post, then confirm it appears in the push list." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind push create --name ops-webhook --type webhook --config '{\"url\":\"https://httpbin.org/post\"}'` (any order), then calls `heramind push list` to verify"
+    ],
+    "overall": "Must actually execute create + list, not just restate in reply"
+  }
+}

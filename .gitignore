@@ -1,0 +1,146 @@
+# HeraMind .gitignore
+
+# =============================================================================
+# Build Artifacts
+# =============================================================================
+target/
+# Cargo.lock committed for reproducible builds (binary crates should track lockfile)
+docs/superpowers/.superpowers/
+# Extension binaries (compiled libraries)
+# Extensions are loaded at runtime, not part of source code
+/extensions/
+
+# =============================================================================
+# Runtime Data
+# =============================================================================
+/data/
+/config.toml
+*.redb
+*.db
+*.bak*
+# Crate-level data folders (should use project root data/)
+crates/*/data/
+
+# Embedded static assets (generated during CI build)
+crates/neomind-api/static/
+
+# =============================================================================
+# Web Frontend
+# =============================================================================
+web/node_modules/
+web/dist/
+web/.vite/
+web/build/
+web/package-lock.json
+web/yarn.lock
+web/pnpm-lock.yaml
+web/.pnpm-store
+web/.turbo/
+web/*.log
+
+# Root level node files (accidental npm runs in wrong directory)
+/node_modules/
+/package-lock.json
+/package.json
+
+# =============================================================================
+# Tauri (Desktop App)
+# =============================================================================
+web/src-tauri/target/
+web/src-tauri/WixTools/
+web/src-tauri/icons/HeraMind.iconset/
+web/src-tauri/gen/
+
+# =============================================================================
+# Playwright Testing
+# =============================================================================
+web/test-results/
+web/playwright-report/
+web/playwright/.cache/
+web/test_parens
+web/*.test
+
+# =============================================================================
+# IDE & Editor
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# =============================================================================
+# System Files
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =============================================================================
+# Logs
+# =============================================================================
+*.log
+logs/
+
+# =============================================================================
+# Temporary Files
+# =============================================================================
+*.tmp
+*.temp
+*.bak
+*.bak2
+*.bak3
+*.bak4
+*.bak5
+*.backup
+*.backup2
+:memory:
+-L
+-o
+
+# =============================================================================
+# Environment & Secrets
+# =============================================================================
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.cert
+*.crt
+secrets/
+.tauri/
+
+# =============================================================================
+# Testing & Coverage
+# =============================================================================
+*.profraw
+*.profdata
+coverage/
+tarpaulin-report.html
+
+# =============================================================================
+# Claude Code
+# =============================================================================
+.claude/
+.serena
+.playwright-mcp
+CLAUDE.md*.backup2
+.superpowers
+docs/superpowers
+.worktrees/
+scripts/__pycache__/ble_simulator.cpython-312.pyc
+docs/superpowers/plans/2026-05-31-memory-system-refactor.md
+docs/superpowers/specs/2026-05-31-memory-system-refactor-design.md
+docs/superpowers/
+
+# Eval runner (auto-created outputs only; cases/fixtures/smoke committed)
+eval/runs/
+eval/reports/

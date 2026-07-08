@@ -1,0 +1,22 @@
+{
+  "id": "message-create-channel",
+  "lang": "zh",
+  "category": "message",
+  "workflow": "message-management",
+  "scenario_type": "single_turn",
+  "description": "创建一个 webhook 通知通道",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "创建一个名叫 ops-alerts 的 webhook 通道，URL 是 https://example.com/hook" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind message channel-create`（或 channel create）"
+    ],
+    "overall": "通道应被创建"
+  },
+  "state_queries": [
+    { "type": "channel_exists", "params": { "name": "ops-alerts" }, "expected": true }
+  ]
+}

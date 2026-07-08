@@ -1,0 +1,30 @@
+{
+  "id": "/",
+  "name": "HeraMind",
+  "short_name": "HeraMind",
+  "description": "Edge-deployed LLM agent platform for IoT automation",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "orientation": "any",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "categories": ["productivity", "utilities", "iot"],
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

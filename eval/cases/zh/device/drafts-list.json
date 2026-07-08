@@ -1,0 +1,19 @@
+{
+  "id": "device-drafts-list",
+  "lang": "zh",
+  "category": "device",
+  "workflow": "device-onboarding",
+  "scenario_type": "single_turn",
+  "description": "列出待审核的设备草稿（覆盖 `heramind device drafts list` — 自动发现路径，此前 0 覆盖）",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "我有一些新设备通过 webhook 自动上报了数据但还没正式注册。请列出当前待审核的设备草稿，并告诉我该怎么把它们转正。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind device drafts list`（或 GET /api/devices/drafts），并解释 approve/reject 流程"
+    ],
+    "overall": "必须实际查询 drafts（空列表也合法），并描述 approve 路径"
+  }
+}

@@ -1,0 +1,443 @@
+//! Core tool trait and types for function calling.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::error::{Result, ToolError};
+
+// Re-export from core for unified types
+pub use heramind_core::tools::{ToolCategory, ToolRelationships, UsageScenario};
+
+/// Per-execution handles returned by the memory tool for agent-scoped state.
+pub type MemoryToolHandles = Option<(
+    std::sync::Arc<tokio::sync::RwLock<Option<String>>>,
+    std::sync::Arc<tokio::sync::RwLock<Vec<heramind_storage::KnowledgeFileRef>>>,
+)>;
+
+/// Tool execution result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolOutput {
+    /// Whether the execution was successful
+    pub success: bool,
+    /// The result data
+    pub data: Value,
+    /// Optional error message if success is false
+    pub error: Option<String>,
+    /// Optional metadata
+    pub metadata: Option<Value>,
+}
+
+impl ToolOutput {
+    /// Create a successful output.
+    pub fn success(data: impl Into<Value>) -> Self {
+        Self {
+            success: true,
+            data: data.into(),
+            error: None,
+            metadata: None,
+        }
+    }
+
+    /// Create a successful output with metadata.
+    pub fn success_with_metadata(data: impl Into<Value>, metadata: Value) -> Self {
+        Self {
+            success: true,
+            data: data.into(),
+            error: None,
+            metadata: Some(metadata),
+        }
+    }
+
+    /// Create a failed output.
+    pub fn error(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            data: Value::Null,
+            error: Some(error.into()),
+            metadata: None,
+        }
+    }
+
+    /// Create a failed output with metadata.
+    pub fn error_with_metadata(error: impl Into<String>, metadata: Value) -> Self {
+        Self {
+            success: false,
+            data: metadata.clone(),
+            error: Some(error.into()),
+            metadata: Some(metadata),
+        }
+    }
+
+    /// Create a warning output with metadata.
+    /// A warning is considered successful but should be noted by the user.
+    pub fn warning_with_metadata(warning: impl Into<String>, metadata: Value) -> Self {
+        Self {
+            success: true,
+            data: metadata.clone(),
+            error: Some(warning.into()),
+            metadata: Some(metadata),
+        }
+    }
+}
+
+/// Tool parameter definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Parameter {
+    /// Parameter name
+    pub name: String,
+    /// Parameter type
+    #[serde(rename = "type")]
+    pub param_type: String,
+    /// Parameter description
+    pub description: String,
+    /// Whether the parameter is required
+    pub required: bool,
+    /// Default value (optional)
+    pub default: Option<Value>,
+    /// Enum values (for enum types)
+    #[serde(rename = "enum")]
+    pub enum_values: Option<Vec<Value>>,
+}
+
+impl Parameter {
+    /// Create a new parameter.
+    pub fn new(
+        name: impl Into<String>,
+        param_type: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            param_type: param_type.into(),
+            description: description.into(),
+            required: false,
+            default: None,
+            enum_values: None,
+        }
+    }
+
+    /// Mark as required.
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Set default value.
+    pub fn with_default(mut self, default: Value) -> Self {
+        self.default = Some(default);
+        self
+    }
+
+    /// Set enum values.
+    pub fn with_enum(mut self, values: Vec<Value>) -> Self {
+        self.enum_values = Some(values);
+        self
+    }
+}
+
+/// Example usage of a tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolExample {
+    /// Example arguments
+    pub arguments: Value,
+    /// Example result
+    pub result: Value,
+    /// Description of what this example does
+    pub description: String,
+}
+
+/// Response format controls tool output verbosity.
+/// Based on Anthropic research: concise format reduces tokens by ~40%.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseFormat {
+    /// Concise: minimal output, just the essential data
+    #[default]
+    Concise,
+    /// Detailed: full output with explanations and context
+    Detailed,
+}
+
+/// Tool definition for LLM function calling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    /// Tool name
+    pub name: String,
+    /// Tool description
+    pub description: String,
+    /// Parameters as JSON Schema
+    pub parameters: Value,
+    /// Example usage
+    pub example: Option<ToolExample>,
+    /// Tool category
+    pub category: ToolCategory,
+    /// Usage scenarios
+    pub scenarios: Vec<UsageScenario>,
+    /// Tool relationships
+    pub relationships: ToolRelationships,
+    /// Whether the tool is deprecated
+    pub deprecated: bool,
+    /// What tool replaces this deprecated tool
+    pub replaced_by: Option<String>,
+    /// Tool version
+    pub version: String,
+    /// Multiple examples
+    pub examples: Vec<ToolExample>,
+    /// Response format preference (string like "concise" or "detailed")
+    pub response_format: Option<String>,
+    /// Namespace for the tool
+    pub namespace: Option<String>,
+}
+
+/// Tool trait for function calling.
+///
+/// Tools are callable functions that LLM agents can invoke.
+#[async_trait]
+pub trait Tool: Send + Sync {
+    /// Get the tool name.
+    fn name(&self) -> &str;
+
+    /// Get the tool description.
+    fn description(&self) -> &str;
+
+    /// Get the parameters as JSON Schema.
+    fn parameters(&self) -> Value;
+
+    /// Execute the tool with the given arguments.
+    async fn execute(&self, args: Value) -> Result<ToolOutput>;
+
+    /// Get the tool category.
+    fn category(&self) -> ToolCategory {
+        ToolCategory::System
+    }
+
+    /// Get usage scenarios for this tool.
+    fn scenarios(&self) -> Vec<UsageScenario> {
+        vec![]
+    }
+
+    /// Downcast support for tool-specific operations.
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Default: no downcast support. Override in tools that need it.
+        unimplemented!("as_any not implemented for {}", self.name())
+    }
+
+    /// Swap agent context for per-execution isolation (MemoryTool only).
+    /// Returns per-execution handles if the tool supports it, else None.
+    fn swap_agent_context(
+        &self,
+        _agent_id: String,
+        _knowledge_files: Vec<heramind_storage::KnowledgeFileRef>,
+    ) -> MemoryToolHandles {
+        None
+    }
+
+    /// Get tool relationships.
+    fn relationships(&self) -> ToolRelationships {
+        ToolRelationships::default()
+    }
+
+    /// Get tool version.
+    fn version(&self) -> &str {
+        "1.0.0"
+    }
+
+    /// Check if this tool is deprecated.
+    fn is_deprecated(&self) -> bool {
+        false
+    }
+
+    /// Get the tool's namespace (optional, for grouping related tools).
+    fn namespace(&self) -> Option<&str> {
+        None
+    }
+
+    /// Get the tool's response format preference.
+    fn response_format(&self) -> ResponseFormat {
+        ResponseFormat::default()
+    }
+
+    /// Get the full tool definition.
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: self.parameters(),
+            example: None,
+            category: self.category(),
+            scenarios: self.scenarios(),
+            relationships: self.relationships(),
+            deprecated: self.is_deprecated(),
+            replaced_by: None,
+            version: self.version().to_string(),
+            examples: vec![],
+            response_format: None,
+            namespace: self.namespace().map(|s| s.to_string()),
+        }
+    }
+
+    /// Validate arguments before execution.
+    fn validate_args(&self, args: &Value) -> Result<()> {
+        let params = self.parameters();
+        if let Some(obj) = params.as_object() {
+            if let Some(required) = obj.get("required").and_then(|r| r.as_array()) {
+                let args_obj = args
+                    .as_object()
+                    .ok_or_else(|| ToolError::InvalidArguments("Expected object".to_string()))?;
+
+                for req in required {
+                    if let Some(req_str) = req.as_str() {
+                        if !args_obj.contains_key(req_str) {
+                            return Err(ToolError::InvalidArguments(format!(
+                                "Missing required parameter: {}",
+                                req_str
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Dynamic tool wrapper for trait objects.
+pub type DynTool = Arc<dyn Tool>;
+
+/// Helper function to create a JSON object schema for parameters.
+/// Includes strict mode (additionalProperties: false) to prevent invalid parameters.
+pub fn object_schema(properties: Value, required: Vec<String>) -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+/// Helper function to create a simple property definition.
+pub fn property(prop_type: &str, description: &str) -> Value {
+    serde_json::json!({
+        "type": prop_type,
+        "description": description
+    })
+}
+
+/// Helper function to create a string property.
+pub fn string_property(description: &str) -> Value {
+    property("string", description)
+}
+
+/// Helper function to create a number property.
+pub fn number_property(description: &str) -> Value {
+    property("number", description)
+}
+
+/// Helper function to create a boolean property.
+pub fn boolean_property(description: &str) -> Value {
+    property("boolean", description)
+}
+
+/// Helper function to create an array property.
+pub fn array_property(item_type: &str, description: &str) -> Value {
+    serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": item_type
+        },
+        "description": description
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyTool;
+
+    #[async_trait::async_trait]
+    impl Tool for DummyTool {
+        fn name(&self) -> &str {
+            "dummy_tool"
+        }
+
+        fn description(&self) -> &str {
+            "A dummy tool for testing"
+        }
+
+        fn parameters(&self) -> Value {
+            object_schema(
+                serde_json::json!({
+                    "message": string_property("A message to process")
+                }),
+                vec!["message".to_string()],
+            )
+        }
+
+        async fn execute(&self, args: Value) -> Result<ToolOutput> {
+            self.validate_args(&args)?;
+            let msg = args["message"].as_str().unwrap_or("");
+            Ok(ToolOutput::success(format!("Processed: {}", msg)))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_execution() {
+        let tool = DummyTool;
+        let args = serde_json::json!({"message": "Hello"});
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.data, "Processed: Hello");
+    }
+
+    #[tokio::test]
+    async fn test_tool_validation_missing_required() {
+        let tool = DummyTool;
+        let args = serde_json::json!({}); // Missing required "message"
+
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tool_output() {
+        let output = ToolOutput::success("test data");
+        assert!(output.success);
+        assert_eq!(output.data, "test data");
+        assert!(output.error.is_none());
+
+        let err_output = ToolOutput::error("Something went wrong");
+        assert!(!err_output.success);
+        assert_eq!(err_output.error, Some("Something went wrong".to_string()));
+    }
+
+    #[test]
+    fn test_parameter_builder() {
+        let param = Parameter::new("test_param", "string", "A test parameter")
+            .required()
+            .with_default(serde_json::json!("default_value"));
+
+        assert_eq!(param.name, "test_param");
+        assert_eq!(param.param_type, "string");
+        assert!(param.required);
+        assert_eq!(param.default, Some(serde_json::json!("default_value")));
+    }
+
+    #[test]
+    fn test_schema_helpers() {
+        let schema = object_schema(
+            serde_json::json!({
+                "name": string_property("The name"),
+                "age": number_property("The age")
+            }),
+            vec!["name".to_string()],
+        );
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["name"]["type"] == "string");
+    }
+}

@@ -1,0 +1,107 @@
+{
+  "device_type": "ne101_camera",
+  "name": "CamThink Sensing Camera",
+  "description": "CamThink NE101 sensing camera with low-power battery support and button-triggered capture. Ideal for remote monitoring and photo capture scenarios.",
+  "categories": ["Camera", "Sensing"],
+  "mode": "full",
+  "metrics": [
+    {
+      "name": "ts",
+      "display_name": "Timestamp",
+      "data_type": "Integer",
+      "required": false
+    },
+    {
+      "name": "values.devName",
+      "display_name": "Device Name",
+      "data_type": "String",
+      "required": false
+    },
+    {
+      "name": "values.devMac",
+      "display_name": "MAC Address",
+      "data_type": "String",
+      "required": false
+    },
+    {
+      "name": "values.devSn",
+      "display_name": "Serial Number",
+      "data_type": "String",
+      "required": false
+    },
+    {
+      "name": "values.hwVersion",
+      "display_name": "Hardware Version",
+      "data_type": "String",
+      "required": false
+    },
+    {
+      "name": "values.fwVersion",
+      "display_name": "Firmware Version",
+      "data_type": "String",
+      "required": false
+    },
+    {
+      "name": "values.battery",
+      "display_name": "Battery Level",
+      "data_type": "Integer",
+      "unit": "%",
+      "min": 0,
+      "max": 100,
+      "required": false
+    },
+    {
+      "name": "values.batteryVoltage",
+      "display_name": "Battery Voltage",
+      "data_type": "Integer",
+      "unit": "mV",
+      "min": 0,
+      "required": false
+    },
+    {
+      "name": "values.snapType",
+      "display_name": "Trigger Type",
+      "data_type": "String",
+      "required": false
+    },
+    {
+      "name": "values.localtime",
+      "display_name": "Local Time",
+      "data_type": "String",
+      "required": false
+    },
+    {
+      "name": "values.imageSize",
+      "display_name": "Image Size",
+      "data_type": "Integer",
+      "unit": "bytes",
+      "min": 0,
+      "required": false
+    },
+    {
+      "name": "values.image",
+      "display_name": "Image Data",
+      "data_type": "String",
+      "required": false
+    }
+  ],
+  "uplink_samples": [
+    {
+      "ts": 1740640441620,
+      "values": {
+        "devName": "NE101 Sensing Camera",
+        "devMac": "D8:3B:DA:71:19:C0",
+        "devSn": "458658825555",
+        "hwVersion": "V1.0",
+        "fwVersion": "NE_101.1.0.3",
+        "battery": 84,
+        "batteryVoltage": 4200,
+        "snapType": "Button",
+        "localtime": "2025-10-10 12:13:04",
+        "imageSize": 68255,
+        "image": "data:image/jpeg;base64,..."
+      }
+    }
+  ],
+  "commands": []
+}

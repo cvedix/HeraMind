@@ -1,0 +1,56 @@
+{
+  "id": "rule-enable-existing",
+  "lang": "zh",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "single_turn",
+  "description": "启用一个被禁用的规则（与 rule-disable-existing 对称，覆盖 enable 路径）",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "rules": [
+        {
+          "name": "rule-battery-low",
+          "description": "Pre-seeded disabled rule — agent should enable it.",
+          "enabled": false,
+          "trigger": { "trigger_type": "data_change" },
+          "condition": {
+            "condition_type": "comparison",
+            "source": "device:sensor-001:values.battery",
+            "operator": "less_than",
+            "threshold": 20.0
+          },
+          "actions": [
+            { "type": "notify", "message": "sensor-001 battery low: {value}%", "severity": "warning" }
+          ],
+          "cooldown": 60000
+        }
+      ],
+      "devices": [
+        {
+          "device_id": "sensor-001",
+          "name": "Living Room Sensor",
+          "device_type": "ne101_camera",
+          "adapter_type": "mqtt",
+          "connection_config": {}
+        }
+      ],
+      "metrics": [
+        { "device_id": "sensor-001", "metric": "values.battery", "value": 75.0 }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "把 rule-battery-low 规则启用" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind rule enable rule-battery-low`（或 status=true 的 update）"
+    ],
+    "overall": "启用后应确认"
+  },
+  "state_queries": [
+    { "type": "rule_enabled", "params": { "id": "rule-battery-low" }, "expected": true }
+  ]
+}

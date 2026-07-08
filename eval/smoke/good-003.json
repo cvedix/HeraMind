@@ -1,0 +1,21 @@
+{
+  "id": "smoke-good-003",
+  "lang": "en",
+  "category": "smoke",
+  "workflow": "smoke",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: list devices, then ask about one specific device",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "List all devices in the system." },
+    { "user": "Tell me about sensor-001 specifically — what metrics does it report?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent should call device list and enumerate all 3 devices",
+      "Turn 2: Agent should call device get/details for sensor-001 and report the device's actual metrics (e.g. values.battery, values.batteryVoltage for ne101_camera), referencing the prior turn's context"
+    ],
+    "overall": "Both turns should use English and reference sensor-001's real metrics"
+  }
+}

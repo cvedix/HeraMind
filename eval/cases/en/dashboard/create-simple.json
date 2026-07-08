@@ -1,0 +1,22 @@
+{
+  "id": "dashboard-create-simple",
+  "lang": "en",
+  "category": "dashboard",
+  "workflow": "dashboard-management",
+  "scenario_type": "single_turn",
+  "description": "Create a dashboard",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Create a dashboard called 'Temperature Overview'." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent calls `heramind dashboard create --name Temperature Overview`"
+    ],
+    "overall": "Should report dashboard ID after creation"
+  },
+  "state_queries": [
+    { "type": "dashboard_exists", "params": { "id": "Temperature Overview" }, "expected": true }
+  ]
+}

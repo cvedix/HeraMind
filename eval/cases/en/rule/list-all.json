@@ -1,0 +1,19 @@
+{
+  "id": "rule-list-all",
+  "lang": "en",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "single_turn",
+  "description": "List all configured rules",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Which rules are currently defined in the system?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes `heramind rule list` and should surface rule-battery-low"
+    ],
+    "overall": "Must surface at least the rule name"
+  }
+}

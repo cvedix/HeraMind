@@ -1,0 +1,8 @@
+# Cross compilation configuration
+# Install clang to avoid GCC memcmp bug with aws-lc-sys
+
+[build]
+pre-build = ["apt-get update && for i in 1 2 3; do apt-get install -y --fix-missing clang && break || sleep 10; done"]
+
+[build.env]
+passthrough = ["CC", "CXX"]

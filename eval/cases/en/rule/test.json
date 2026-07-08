@@ -1,0 +1,19 @@
+{
+  "id": "rule-test",
+  "lang": "en",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "single_turn",
+  "description": "Dry-run evaluation of an existing rule (covers `heramind rule test` — essential pre-prod, previously 0 coverage).",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Test rule-battery-low with input {\"value\": 15} to see if it would fire." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent resolves rule id (actual id of rule-battery-low) then runs `heramind rule test <id> --input '{\"value\":15}'` (or POST /api/rules/<id>/test)"
+    ],
+    "overall": "Must actually execute test, and report trigger/no-trigger based on result (15 < 20 should trigger)"
+  }
+}

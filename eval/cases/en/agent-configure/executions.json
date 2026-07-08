@@ -1,0 +1,33 @@
+{
+  "id": "agent-executions",
+  "lang": "en",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: list execution history -> inspect latest execution (covers `heramind agent executions` + `agent latest-execution`; observability core, previously 0 coverage).",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "agents": [
+        {
+          "name": "demo-agent",
+          "user_prompt": "demo",
+          "schedule": { "schedule_type": "interval", "interval_seconds": 60 },
+          "execution_mode": "free"
+        }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "How many times has demo-agent executed recently, and what were the statuses?" },
+    { "user": "Show me the details of its most recent execution." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent resolves demo-agent's id then runs `heramind agent executions <id>` (or GET /api/agents/<id>/executions)",
+      "Turn 2: Agent runs `heramind agent latest-execution <id>` (or executions --limit 1)"
+    ],
+    "overall": "Empty history is a valid answer, but must be grounded in tool results"
+  }
+}

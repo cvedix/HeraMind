@@ -1,0 +1,24 @@
+[package]
+name = "heramind-data-push"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+heramind-core = { path = "../heramind-core" }
+heramind-storage = { path = "../heramind-storage" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+redb = { workspace = true }
+reqwest = { workspace = true }
+handlebars = "5"
+rumqttc = "0.24"
+async-trait = { workspace = true }

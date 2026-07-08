@@ -1,0 +1,25 @@
+{
+  "id": "push-lifecycle",
+  "lang": "en",
+  "category": "push",
+  "workflow": "data-push-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn lifecycle: create -> disable -> enable -> delete (covers enable/disable state toggling + delete).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Create a new push target: name relay-target, type webhook, URL https://example.com/relay." },
+    { "user": "Temporarily stop this push." },
+    { "user": "Now re-enable it." },
+    { "user": "OK, finally delete it." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind push create --name relay-target --type webhook --config '{\"url\":\"https://example.com/relay\"}'` and parses ID for subsequent turns",
+      "Turn 2: Agent runs `heramind push disable <ID>` (or `push stop <ID>`)",
+      "Turn 3: Agent runs `heramind push enable <ID>` (or `push start <ID>`)",
+      "Turn 4: Agent runs `heramind push delete <ID>`"
+    ],
+    "overall": "Last three turns must reuse the ID parsed from turn 1, not re-create"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "rule-create-low-battery",
+  "lang": "en",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "single_turn",
+  "description": "Create a low-battery alert rule (ne101_camera template exposes values.battery — also verifies the rule-validator fix that reads template metrics)",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Create a rule: notify me when sensor-001 values.battery drops below 20. Name it low-battery-warning" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent should call `heramind rule create` with condition device:sensor-001:values.battery < 20, action notify"
+    ],
+    "overall": "Rule should be enabled"
+  },
+  "state_queries": [
+    { "type": "rule_exists", "params": { "id": "low-battery-warning" }, "expected": true }
+  ]
+}

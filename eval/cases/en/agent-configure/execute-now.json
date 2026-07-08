@@ -1,0 +1,50 @@
+{
+  "id": "agent-execute-now",
+  "lang": "en",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "Manually trigger a scheduled agent to run once immediately (covers execute_agent_now path)",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "devices": [
+        {
+          "device_id": "sensor-001",
+          "name": "Living Room Sensor",
+          "device_type": "ne101_camera",
+          "adapter_type": "mqtt",
+          "connection_config": {}
+        }
+      ],
+      "metrics": [
+        { "device_id": "sensor-001", "metric": "temperature", "value": 22.5 }
+      ],
+      "agents": [
+        {
+          "name": "daily-report",
+          "user_prompt": "Check sensor-001 current temperature, report briefly.",
+          "schedule": { "schedule_type": "interval", "interval_seconds": 3600 },
+          "execution_mode": "free",
+          "resources": [
+            { "resource_id": "sensor-001", "resource_type": "device", "name": "Living Room Sensor" }
+          ]
+        }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "Please trigger the daily-report agent to run once right now" }
+  ],
+  "post_run_delay_ms": 12000,
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent calls `heramind agent invoke daily-report` (or POST /api/agents/daily-report/execute)"
+    ],
+    "overall": "Should trigger execution and report the result; agent should not just say 'cannot do this'"
+  },
+  "state_queries": [
+    { "type": "agent_execution_count", "params": { "id": "daily-report" }, "expected_min": 1 }
+  ]
+}

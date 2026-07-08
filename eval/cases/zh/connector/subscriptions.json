@@ -1,0 +1,25 @@
+{
+  "id": "connector-subscriptions",
+  "lang": "zh",
+  "category": "connector",
+  "workflow": "connector-management",
+  "scenario_type": "multi_turn",
+  "description": "多轮：创建连接器 → 订阅主题 → 列出订阅 → 取消订阅（覆盖 `heramind connector subscribe` + `subscriptions` + `unsubscribe`，此前 0 覆盖）。注意：subscribe/unsubscribe/subscriptions 作用于内置 broker 全局——只接受 --topic，不接受 connector id。",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "接入一个 MQTT broker：name sub-broker，host 10.0.0.50。" },
+    { "user": "在内置 broker 上订阅主题 'env/temp/#'。" },
+    { "user": "看一下当前订阅列表。" },
+    { "user": "把 'env/temp/#' 取消订阅。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind connector create --name sub-broker --host 10.0.0.50`，解析 id",
+      "Turn 2: Agent 调用 `heramind connector subscribe --topic 'env/temp/#'`（subscribe 只接受 --topic，无 connector id）",
+      "Turn 3: Agent 调用 `heramind connector subscriptions`（无 id 参数）",
+      "Turn 4: Agent 调用 `heramind connector unsubscribe --topic 'env/temp/#'`"
+    ],
+    "overall": "Turns 2-4 必须使用正确的无 id 语法；subscribe/unsubscribe 作用于内置 broker 全局，而非按连接器"
+  }
+}

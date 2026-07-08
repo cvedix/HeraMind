@@ -1,0 +1,1396 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================================
+ * FORM INPUT NORMALIZATION
+ * ============================================================================ */
+
+/* Hide number input spinners */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+}
+
+/* Stabilize password masking glyph: the project font stack ("Plus Jakarta Sans"
+ * → "Noto Sans SC" → ...) does not include U+25CF (●), so the browser falls
+ * back to CJK / emoji fonts that render the dot taller, wider, or colored.
+ * Pin a glyph-stable system font + explicit -webkit-text-security so the mask
+ * character stays consistent across IME activation and macOS emoji fallback. */
+input[type="password"] {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-text-security: disc;
+  font-variant-emoji: text;
+}
+
+/* Radix SelectTrigger now renders as <div> via asChild — no appearance reset needed */
+
+/* ============================================================================
+ * MOBILE-FIRST OPTIMIZATIONS
+ * ============================================================================ */
+
+/* Height chain for flex layout - body/root fill viewport */
+html {
+  height: 100%;
+  /* iOS PWA standalone silently scrolls the root scroller (documentElement)
+     by ~status-bar height after certain interactions (focusing an input
+     inside a position:fixed container, navigating away from chat, etc.),
+     which pushes `position: absolute/fixed top:0` headers under the
+     notch / status bar ("顶部溢出"). body is already overflow:hidden +
+     full-viewport, so html never NEEDS to scroll — lock it explicitly so
+     iOS PWA cannot introduce the offset. Safe in Safari (no-op) and
+     Android (no-op). */
+  overflow: hidden;
+}
+
+body,
+#root {
+  height: 100vh;
+  height: 100dvh;
+}
+
+/* iOS safe area support for iPhone X+ notches (2025 spec with fallbacks) */
+/* Layout-critical CSS variables MUST live on :root, not bare inside @supports
+   blocks — bare custom-property declarations have no selector and silently
+   never apply, which causes downstream var() fallbacks to kick in. This was
+   the root cause of PWA content overflowing the top safe area on iOS. */
+:root {
+  /* TopNav height including safe area (4rem chrome + safe-area-inset-top) */
+  --topnav-height: calc(4rem + env(safe-area-inset-top, 0px));
+  /* Chat page top padding: TopNav + Mobile Header + safe area */
+  --chat-content-padding-top: calc(6.5rem + env(safe-area-inset-top, 0px));
+}
+@supports (padding: env(safe-area-inset-top)) {
+  .safe-top {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  /* Mobile nav drawer: hide the built-in SheetContent close (X) button —
+     we render our own inside the header for proper safe-area handling
+     and visual consistency with SessionSidebar. */
+  .mobile-nav-sheet > button[data-radix-collection-item],
+  .mobile-nav-sheet > button[type="button"] {
+    display: none !important;
+  }
+  /* Safe top with minimal fallback for chat components */
+  .pt-safe {
+    padding-top: env(safe-area-inset-top, 12px);
+  }
+}
+.safe-bottom {
+  padding-bottom: 0px;
+}
+@supports (padding: env(safe-area-inset-bottom)) {
+  .safe-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  /* Safe bottom with minimal fallback for chat input */
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom, 12px);
+  }
+  /* Safe bottom + bottom nav bar offset (for PageTabsBottomNav) */
+  .safe-bottom-nav {
+    padding-bottom: 8rem;
+  }
+  @supports (padding: env(safe-area-inset-bottom)) {
+    .safe-bottom-nav {
+      padding-bottom: calc(8rem + env(safe-area-inset-bottom, 0px));
+    }
+  }
+}
+@supports (padding: env(safe-area-inset-left)) {
+  .safe-left {
+    padding-left: env(safe-area-inset-left, 0px);
+  }
+}
+@supports (padding: env(safe-area-inset-right)) {
+  .safe-right {
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+}
+@supports (padding: env(safe-area-inset-top)) or (padding: env(safe-area-inset-bottom)) or
+           (padding: env(safe-area-inset-left)) or (padding: env(safe-area-inset-right)) {
+  .safe-all {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+}
+
+/* ============================================================================
+ * FOCUS MANAGEMENT
+ * Suppress focus ring on mouse/touch clicks while preserving keyboard navigation.
+ * Some browsers (Tauri, Chromium) trigger :focus-visible on click — this fixes it.
+ * ============================================================================ */
+:focus {
+  outline: none;
+}
+
+/* Remove ring on mouse/touch focus, keep for keyboard tab focus */
+*:focus:not(:focus-visible) {
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+/* ============================================================================
+ * VISUAL VIEWPORT - Mobile keyboard handling (2025)
+ * ============================================================================ */
+
+/* CSS variables for keyboard tracking */
+:root {
+  --keyboard-height: 0px;
+  --initial-viewport-height: 100dvh;
+  --mobile-header-height: calc(2.5rem + env(safe-area-inset-top, 0px));
+  --chat-page-height: 100dvh;
+}
+
+/* Dynamic viewport height — keyboard-aware on every platform.
+   `--app-height` is driven from `window.visualViewport.height` by
+   useVisualViewport.ts. The visual viewport ALWAYS shrinks when the soft
+   keyboard opens, even in iOS PWA standalone where `interactive-widget=
+   resizes-content` is not honored and `100dvh` / `100vh` stay full-screen.
+   Falling back through dvh → vh keeps the rule safe on older browsers. */
+.viewport-full {
+  height: 100vh;
+  height: 100dvh;
+  height: var(--app-height, 100dvh);
+}
+
+/* Override Tailwind's h-screen / min-h-screen to include dvh fallback.
+   Tailwind 3.4 ships only 100vh; on iOS Safari that includes the URL bar
+   area, cutting off bottom content. The second declaration wins in modern
+   browsers, falls back to the first elsewhere. */
+@layer utilities {
+  .h-screen { height: 100vh; height: 100dvh; }
+  .min-h-screen { min-height: 100vh; min-height: 100dvh; }
+  .max-h-screen { max-height: 100vh; max-height: 100dvh; }
+}
+
+/* Minimum height that adapts */
+.min-viewport-full {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+/* Elements that adjust when keyboard is open */
+.keyboard-aware {
+  padding-bottom: var(--keyboard-height, 0px);
+}
+
+/* Force viewport reset after keyboard dismiss */
+@supports (height: 100dvh) {
+  body {
+    min-height: 100dvh;
+  }
+
+  /* Note: With `interactive-widget=resizes-content` in the viewport meta,
+     the layout viewport itself shrinks when the soft keyboard opens on
+     iOS 16.4+ (Safari + PWA standalone) and Android Chrome. `100dvh`,
+     `position: fixed; bottom: 0`, and `window.innerHeight` all reflect
+     the visible area automatically. No platform-specific keyboard CSS
+     hacks are needed. The previous `body.keyboard-open` overrides were
+     removed to avoid double-subtracting the keyboard height. */
+}
+
+/* Touch devices: `group-hover:` never fires (no hover state), so any element
+   using `opacity-0 group-hover:opacity-100` for action buttons (delete, close,
+   edit) stays invisible forever. There are ~20 such sites across the codebase
+   (image attachment remove, session delete, rule condition delete, component
+   delete, etc.). Rather than touching each one, force these visible on coarse-
+   pointer devices. The class selector escapes the colon to match the literal
+   Tailwind utility class name. */
+@media (hover: none) and (pointer: coarse) {
+  .group-hover\:opacity-100 {
+    opacity: 1 !important;
+  }
+  .group-hover\:opacity-50 {
+    opacity: 0.55 !important;
+  }
+}
+
+/* iOS touch scrolling for overflow-y-auto containers */
+.touch-scroll {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Prevent tap highlight on mobile - applied to all elements */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Fix icon alignment - ensure SVG icons are vertically centered */
+svg {
+  vertical-align: middle;
+}
+
+/* Disable callout on interactive elements */
+button,
+a,
+.clickable,
+[role="button"] {
+  -webkit-touch-callout: none;
+}
+
+/* Allow callout on selectable elements */
+input,
+textarea,
+[contenteditable] {
+  -webkit-touch-callout: default;
+}
+
+/* Prevent iOS auto-zoom on focus: input font-size must be >= 16px on touch
+   devices. Scoped to coarse-pointer (mobile) ONLY — desktop keeps the
+   component's text-sm (14px) so inputs match surrounding body text instead
+   of rendering larger than the page. */
+@media (hover: none) and (pointer: coarse) {
+  input,
+  textarea,
+  [contenteditable] {
+    font-size: 16px !important;
+  }
+}
+
+/* Placeholder hierarchy: make placeholder text noticeably lighter than the
+   actual input value so users see a clear "filled vs empty" contrast.
+   Defaults to muted-foreground (same as labels); this drops it a step. */
+input::placeholder,
+textarea::placeholder {
+  opacity: 0.6;
+}
+
+/* Optimize touch interactions for buttons - prevent accidental zoom on double tap */
+button,
+[role="button"] {
+  touch-action: manipulation;
+}
+
+/* Preserve default touch actions for links and scrollable areas */
+a {
+  touch-action: auto;
+}
+
+/* Ensure scrolling areas work properly on iOS */
+.scrollable,
+.overflow-y-auto,
+.overflow-x-auto {
+  -webkit-overflow-scrolling: touch;
+  touch-action: auto;
+}
+
+/* Theme transition - smooth color changes when switching light/dark */
+html {
+  transition: background-color 300ms ease, color 300ms ease;
+}
+
+@layer base {
+  :root {
+    /* Near-white canvas (~#FAFAFA). Pure neutral, Vercel/Linear-style:
+       bg sits just below card white so cards float via a 0.015 lightness
+       gap rather than heavy shadows. Airier than typical gray canvas. */
+    --background: oklch(0.985 0 0);
+    /* Solid white for stable chrome layers (TopNav, tab strips, toolbars,
+       page headers). These anchor the layout — they should NOT float with
+       the aurora the way the scrollable content area does. In dark mode
+       this token falls back to --card so the same class works in both. */
+    --chrome: oklch(1 0 0);
+    --foreground: oklch(0.21 0.01 264);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.21 0.01 264);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.21 0.01 264);
+    /* Primary keeps a deep, grounded tone but nudged slightly warmer so it
+       harmonizes with the brand orange instead of feeling disconnected. */
+    --primary: oklch(0.22 0.03 265);
+    --primary-foreground: oklch(1 0 0);
+    --secondary: oklch(0.97 0 0);
+    --secondary-foreground: oklch(0.21 0.01 264);
+    --muted: oklch(0.97 0 0);
+    --muted-foreground: oklch(0.48 0.012 264);
+    --accent: oklch(0.97 0 0);
+    --accent-foreground: oklch(0.21 0.01 264);
+    --destructive: oklch(0.577 0.245 27);
+    --destructive-foreground: oklch(1 0 0);
+    /* Alias: some components use text-error-foreground; map it to the same
+       white so red buttons/toasts render correctly (was missing → black text) */
+    --error-foreground: oklch(1 0 0);
+    --border: oklch(0.21 0.01 264 / 9%);
+    --input: oklch(0.21 0.01 264 / 10%);
+    /* Focus ring — neutral foreground tint, NOT brand orange. The previous
+     * `--ring: var(--brand)` made every focused input/tab/button flash a
+     * bright orange halo, which users read as "random orange edges". A
+     * subtle foreground-tinted ring still satisfies WCAG focus-indicator
+     * contrast for keyboard a11y without screaming brand color everywhere. */
+    --ring: color-mix(in oklch, var(--foreground) 35%, transparent);
+    /* Base radius — slightly larger (12px) for a softer, more modern feel.
+       Tailwind's rounded-lg/md/sm all derive from this via calc(). */
+    --radius: 0.75rem;
+    --space-1: 0.25rem;
+    --space-2: 0.5rem;
+    --space-3: 0.75rem;
+    --space-4: 1rem;
+    --space-6: 1.5rem;
+    --space-8: 2rem;
+
+    /* Border radius scale — consistent 2px steps */
+    --radius-sm: 0.5rem;
+    --radius-md: 0.625rem;
+    --radius-lg: 0.75rem;
+    --radius-xl: 1rem;
+    --radius-2xl: 1.25rem;
+    --radius-full: 9999px;
+
+    /* Chart colors */
+    --chart-1: oklch(0.65 0.18 300);
+    --chart-2: oklch(0.65 0.17 155);
+    --chart-3: oklch(0.72 0.16 85);
+    --chart-4: oklch(0.637 0.237 41);
+    --chart-5: oklch(0.65 0.17 20);
+    --chart-6: oklch(0.65 0.12 210);
+
+    /* Animation durations */
+    --duration-fast: 150ms;
+    --duration-normal: 200ms;
+    --duration-slow: 300ms;
+
+    /* Easing functions */
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+    /* Semantic colors */
+    --color-success: oklch(0.55 0.17 155);
+    --color-success-bg: oklch(0.55 0.17 155 / 8%);
+    --color-warning: oklch(0.68 0.17 65);
+    --color-warning-bg: oklch(0.68 0.17 65 / 8%);
+    --color-error: oklch(0.55 0.22 25);
+    --color-error-bg: oklch(0.55 0.22 25 / 8%);
+    --color-info: oklch(0.52 0.15 250);
+    --color-info-bg: oklch(0.52 0.15 250 / 8%);
+
+    /* Tint backgrounds for primary & destructive (mirror semantic *-bg pattern) */
+    --primary-bg: oklch(0.18 0.02 270 / 8%);
+    --primary-bg-hover: oklch(0.18 0.02 270 / 16%);
+    --destructive-bg: oklch(0.577 0.245 27 / 8%);
+
+    /* Overlay (semi-transparent black masks) */
+    --overlay-light: oklch(0 0 0 / 30%);
+    --overlay-medium: oklch(0 0 0 / 50%);
+    --overlay-heavy: oklch(0 0 0 / 80%);
+
+    /* Accent category colors (light) - harmonious OKLCH palette */
+    --accent-purple: oklch(0.52 0.18 300);
+    --accent-purple-bg: oklch(0.52 0.18 300 / 8%);
+    --accent-orange: oklch(0.55 0.22 25);
+    --accent-orange-bg: oklch(0.55 0.22 25 / 8%);
+    --accent-cyan: oklch(0.58 0.12 200);
+    --accent-cyan-bg: oklch(0.58 0.12 200 / 8%);
+    --accent-emerald: oklch(0.55 0.14 165);
+    --accent-emerald-bg: oklch(0.55 0.14 165 / 8%);
+    --accent-indigo: oklch(0.48 0.18 280);
+    --accent-indigo-bg: oklch(0.48 0.18 280 / 8%);
+
+    /* Shadow system */
+    --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 5%);
+    --shadow-md: 0 2px 4px -1px oklch(0 0 0 / 8%);
+    --shadow-lg: 0 4px 12px -2px oklch(0 0 0 / 8%);
+    --shadow-xl: 0 8px 20px -4px oklch(0 0 0 / 10%);
+
+    /* Glass-specific tokens (light) */
+    --glass: oklch(1 0 0 / 55%);
+    --glass-heavy: oklch(1 0 0 / 82%);
+    --surface-glass: oklch(1 0 0 / 55%);
+    --glass-border: oklch(0 0 0 / 6%);
+    --glass-border-hover: oklch(0 0 0 / 14%);
+    --shadow-glass: 0 1px 3px 0 oklch(0 0 0 / 5%);
+    --shadow-glass-lg: 0 2px 8px 0 oklch(0 0 0 / 8%);
+    --shadow-brand: 0 2px 12px 0 oklch(0.647 0.289 71 / 15%);
+
+    /* Brand color - HeraMind orange (#E05727) */
+    --brand: oklch(0.63 0.21 37);
+    --brand-bg: oklch(0.63 0.21 37 / 10%);
+    --brand-foreground: oklch(1 0 0);
+    /* Drop-shadow color for the 3D brand wordmark (fixed hex — drop-shadow
+       does not resolve CSS vars reliably across renderers) */
+    --brand-shadow: #eb4c27;
+
+    /* Semi-transparent background tokens (Tailwind v3 workaround) */
+    --bg-50: oklch(1 0 0 / 50%);
+    --bg-70: oklch(1 0 0 / 70%);
+    --bg-80: oklch(1 0 0 / 80%);
+    --bg-90: oklch(1 0 0 / 90%);
+    --bg-95: oklch(1 0 0 / 95%);
+    --muted-20: oklch(0.96 0.003 270 / 20%);
+    --muted-30: oklch(0.96 0.003 270 / 30%);
+    --muted-50: oklch(0.96 0.003 270 / 50%);
+    --primary-hover: oklch(0.18 0.02 270 / 90%);
+    --secondary-hover: oklch(0.96 0.003 270 / 80%);
+    --destructive-hover: oklch(0.577 0.245 27 / 90%);
+
+    /* Chat-specific colors - light mode */
+    --msg-user-bg: oklch(0.15 0.02 270);
+    --msg-user-text: oklch(1 0 0);
+    --msg-ai-bg: oklch(0.97 0.003 270);
+    --msg-ai-text: oklch(0.18 0.02 270);
+    --msg-system-bg: oklch(0.95 0.003 270);
+    --msg-system-text: oklch(0.45 0.01 270);
+
+    --tool-bg: oklch(0.97 0.003 270);
+    --tool-border: oklch(0.45 0.15 260);
+    --tool-header-bg: oklch(0.94 0.005 270);
+
+    --thinking-bg: oklch(0.97 0.01 80);
+    --thinking-border: oklch(0.68 0.17 65);
+    --thinking-text: oklch(0.40 0.01 270);
+
+    --card-hover-bg: oklch(0.995 0 0);
+    --input-focus-bg: oklch(1 0 0);
+
+    --session-drawer-bg: oklch(0.99 0.002 270);
+    --session-drawer-border: oklch(0 0 0 / 8%);
+    --session-item-hover: oklch(0.95 0.003 270);
+    --session-item-active: oklch(0.93 0.003 270);
+
+    /* ============================================================================
+     * CODE EDITOR (CodeMirror) SYNTAX TOKENS
+     * Used by web/src/components/ui/code-editor.tsx. Theme-agnostic — the editor
+     * reads these CSS vars directly, so light/dark switching is instant with no
+     * JS re-render. Hue conventions:
+     *   25  = keyword/operator/null (red — control flow)
+     *   250 = cursor/number/property/bool (blue — literal/identifier accent)
+     *   220 = string (cyan-leaning blue)
+     *   300 = def (purple — user definitions)
+     *   264 = base text/gutter/comment (neutral with foreground hue)
+     * ========================================================================== */
+    --syntax-text: oklch(0.25 0.01 264);
+    --syntax-gutter: oklch(0.55 0.008 264);
+    --syntax-active-line: oklch(0.55 0.15 250 / 8%);
+    --syntax-selection: oklch(0.55 0.15 250 / 20%);
+    --syntax-cursor: oklch(0.50 0.18 250);
+    --syntax-bracket: oklch(0.50 0.18 250);
+    --syntax-keyword: oklch(0.55 0.22 25);
+    --syntax-string: oklch(0.40 0.18 260);
+    --syntax-number: oklch(0.50 0.20 250);
+    --syntax-comment: oklch(0.55 0.008 264);
+    --syntax-def: oklch(0.50 0.18 300);
+    --syntax-property: oklch(0.50 0.20 250);
+    --syntax-scrollbar: oklch(0.82 0.005 264);
+    --syntax-scrollbar-hover: oklch(0.68 0.008 264);
+  }
+
+  .dark {
+    /* Subtle warm charcoal — avoids the cold dead-black by mixing a touch of
+       brand warmth (hue 280→270 with slight chroma) for a richer dark mode. */
+    --background: oklch(0.135 0.01 270 / 97%);
+    --foreground: oklch(0.95 0.006 270);
+    --card: oklch(0.165 0.01 270 / 82%);
+    /* Dark-mode chrome: slightly lighter than background so nav/toolbars
+       read as a distinct elevated layer, mirroring how light-mode --chrome
+       (pure white) sits above --background. */
+    --chrome: oklch(0.20 0.008 270);
+    --card-foreground: oklch(0.95 0.006 270);
+    --popover: oklch(0.165 0.01 270);
+    --popover-foreground: oklch(0.95 0.006 270);
+    --primary: oklch(0.95 0.006 270);
+    --primary-foreground: oklch(0.135 0.01 270);
+    --secondary: oklch(0.205 0.01 270);
+    --secondary-foreground: oklch(0.95 0.006 270);
+    --muted: oklch(0.205 0.01 270);
+    --muted-foreground: oklch(0.64 0.014 270);
+    --accent: oklch(0.205 0.01 270);
+    --accent-foreground: oklch(0.95 0.006 270);
+    --destructive: oklch(0.577 0.245 27);
+    --destructive-foreground: oklch(0.95 0.006 270);
+    --error-foreground: oklch(0.95 0.006 270);
+    --border: oklch(1 0 0 / 9%);
+    --input: oklch(1 0 0 / 11%);
+    /* Neutral focus ring (see light-mode --ring rationale). */
+    --ring: color-mix(in oklch, var(--foreground) 35%, transparent);
+
+    --color-success: oklch(0.72 0.19 155);
+    --color-success-bg: oklch(0.72 0.19 155 / 10%);
+    --color-warning: oklch(0.72 0.16 85);
+    --color-warning-bg: oklch(0.72 0.16 85 / 10%);
+    --color-error: oklch(0.577 0.245 27);
+    --color-error-bg: oklch(0.577 0.245 27 / 10%);
+    --color-info: oklch(0.65 0.15 250);
+    --color-info-bg: oklch(0.65 0.15 250 / 10%);
+
+    /* Tint backgrounds (dark: white-based for visibility on dark bg) */
+    --primary-bg: oklch(0.96 0.003 270 / 12%);
+    --primary-bg-hover: oklch(0.96 0.003 270 / 20%);
+    --destructive-bg: oklch(0.577 0.245 27 / 12%);
+
+    /* Overlay (dark theme: slightly heavier masks) */
+    --overlay-light: oklch(0 0 0 / 40%);
+    --overlay-medium: oklch(0 0 0 / 60%);
+    --overlay-heavy: oklch(0 0 0 / 85%);
+
+    /* Accent category colors (dark) - brighter for dark bg */
+    --accent-purple: oklch(0.72 0.16 300);
+    --accent-purple-bg: oklch(0.72 0.16 300 / 12%);
+    --accent-orange: oklch(0.68 0.20 25);
+    --accent-orange-bg: oklch(0.68 0.20 25 / 12%);
+    --accent-cyan: oklch(0.70 0.12 200);
+    --accent-cyan-bg: oklch(0.70 0.12 200 / 12%);
+    --accent-emerald: oklch(0.72 0.16 165);
+    --accent-emerald-bg: oklch(0.72 0.16 165 / 12%);
+    --accent-indigo: oklch(0.68 0.16 280);
+    --accent-indigo-bg: oklch(0.68 0.16 280 / 12%);
+
+    --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 20%);
+    --shadow-md: 0 2px 6px -1px oklch(0 0 0 / 25%);
+    --shadow-lg: 0 4px 16px -3px oklch(0 0 0 / 25%);
+    --shadow-xl: 0 8px 24px -5px oklch(0 0 0 / 30%);
+
+    --glass: oklch(0.20 0.008 270 / 50%);
+    --glass-heavy: oklch(0.18 0.008 270 / 80%);
+    --surface-glass: oklch(0.14 0.008 270 / 50%);
+    --glass-border: oklch(1 0 0 / 8%);
+    --glass-border-hover: oklch(1 0 0 / 18%);
+    --shadow-glass: 0 2px 8px 0 oklch(0 0 0 / 20%);
+    --shadow-glass-lg: 0 4px 16px 0 oklch(0 0 0 / 25%);
+    --shadow-brand: 0 2px 12px 0 oklch(0.647 0.289 71 / 15%);
+
+    /* Brand color - HeraMind orange (brighter for dark bg) */
+    --brand: oklch(0.70 0.19 40);
+    --brand-bg: oklch(0.70 0.19 40 / 14%);
+    --brand-foreground: oklch(0.13 0.008 270);
+    --brand-shadow: #eb4c27;
+
+    /* Semi-transparent background tokens (dark) */
+    --bg-50: oklch(0.13 0.008 270 / 50%);
+    --bg-70: oklch(0.13 0.008 270 / 70%);
+    --bg-80: oklch(0.13 0.008 270 / 80%);
+    --bg-90: oklch(0.13 0.008 270 / 90%);
+    --bg-95: oklch(0.13 0.008 270 / 95%);
+    --muted-20: oklch(0.20 0.008 270 / 20%);
+    --muted-30: oklch(0.20 0.008 270 / 30%);
+    --muted-50: oklch(0.20 0.008 270 / 50%);
+    --primary-hover: oklch(0.95 0.005 270 / 90%);
+    --secondary-hover: oklch(0.20 0.008 270 / 80%);
+    --destructive-hover: oklch(0.577 0.245 27 / 90%);
+
+    --chart-1: oklch(0.65 0.18 300);
+    --chart-2: oklch(0.65 0.17 155);
+    --chart-3: oklch(0.72 0.16 85);
+    --chart-4: oklch(0.637 0.237 41);
+    --chart-5: oklch(0.65 0.17 20);
+    --chart-6: oklch(0.65 0.12 210);
+
+    --msg-user-bg: oklch(0.97 0.003 270);
+    --msg-user-text: oklch(0.15 0.02 270);
+    --msg-ai-bg: oklch(0.18 0.008 270);
+    --msg-ai-text: oklch(0.90 0.005 270);
+    --msg-system-bg: oklch(0.20 0.008 270);
+    --msg-system-text: oklch(0.58 0.012 270);
+
+    --tool-bg: oklch(0.20 0.008 270);
+    --tool-border: oklch(1 0 0 / 15%);
+    --tool-header-bg: oklch(0.22 0.008 270);
+
+    --thinking-bg: oklch(0.20 0.008 270);
+    --thinking-border: oklch(1 0 0 / 12%);
+    --thinking-text: oklch(0.62 0.01 270);
+
+    --card-hover-bg: oklch(0.18 0.008 270);
+    --input-focus-bg: oklch(0.16 0.008 270);
+
+    --session-drawer-bg: oklch(0.12 0.008 270);
+    --session-drawer-border: oklch(1 0 0 / 8%);
+    --session-item-hover: oklch(0.18 0.008 270);
+    --session-item-active: oklch(0.22 0.008 270);
+
+    /* CodeMirror syntax tokens — dark variants. See light-mode block above for
+     * hue conventions. Brighter lightness + slightly higher chroma so each
+     * token class stays legible against the dark editor surface. */
+    --syntax-text: oklch(0.87 0.005 264);
+    --syntax-gutter: oklch(0.52 0.012 264);
+    --syntax-active-line: oklch(0.70 0.15 250 / 12%);
+    --syntax-selection: oklch(0.70 0.15 250 / 28%);
+    --syntax-cursor: oklch(0.72 0.15 250);
+    --syntax-bracket: oklch(0.72 0.15 250);
+    --syntax-keyword: oklch(0.72 0.20 25);
+    --syntax-string: oklch(0.80 0.10 220);
+    --syntax-number: oklch(0.76 0.13 250);
+    --syntax-comment: oklch(0.60 0.012 264);
+    --syntax-def: oklch(0.76 0.16 300);
+    --syntax-property: oklch(0.76 0.13 250);
+    --syntax-scrollbar: oklch(0.34 0.005 264);
+    --syntax-scrollbar-hover: oklch(0.42 0.008 264);
+  }
+
+  /* Aurora background - animated flowing gradient layer.
+     Very low opacity (≤10% light / ≤14% dark) so it never competes with
+     content readability; content areas use opaque bg-background/bg-card that
+     fully cover it, so aurora only shows through the translucent nav chrome.
+     Animation is gentle (30s) to minimize repaint cost. */
+  .aurora-bg {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(ellipse 800px 500px at 10% 5%, oklch(0.55 0.15 280 / 10%) 0%, transparent 70%),
+      radial-gradient(ellipse 600px 600px at 85% 90%, oklch(0.55 0.18 300 / 7%) 0%, transparent 70%),
+      radial-gradient(ellipse 1000px 400px at 50% 40%, oklch(0.60 0.08 250 / 5%) 0%, transparent 70%);
+    background-size: 150% 150%;
+    animation: aurora-shift 30s ease-in-out infinite alternate;
+  }
+
+  .dark .aurora-bg {
+    background:
+      radial-gradient(ellipse 800px 500px at 15% 10%, oklch(0.55 0.18 280 / 14%) 0%, transparent 70%),
+      radial-gradient(ellipse 600px 600px at 85% 90%, oklch(0.62 0.20 300 / 12%) 0%, transparent 70%),
+      radial-gradient(ellipse 1000px 400px at 50% 50%, oklch(0.55 0.10 250 / 8%) 0%, transparent 70%);
+    background-size: 150% 150%;
+  }
+
+  /* Respect reduced-motion: freeze the gradient (still visible, just static).
+     Also the sensible default for battery/perf-sensitive contexts. */
+  @media (prefers-reduced-motion: reduce) {
+    .aurora-bg {
+      animation: none;
+    }
+  }
+
+  @keyframes aurora-shift {
+    0%   { background-position: 0% 0%; }
+    50%  { background-position: 50% 50%; }
+    100% { background-position: 100% 100%; }
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  /* Exception: Switch component - no border */
+  [role="switch"] {
+    border: none !important;
+  }
+
+  /* Checkbox border is handled by the Checkbox component itself */
+
+  /* Exception: Tabs component - no border */
+  [role="tablist"],
+  [role="tab"],
+  [role="tabpanel"] {
+    border: none !important;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+
+  /* Ensure hidden elements don't take up space */
+  [hidden] {
+    display: none !important;
+  }
+}
+
+/* Custom scrollbar */
+@layer components {
+  /* ============================================================================
+   * MOBILE TOUCH TARGET OPTIMIZATIONS
+   * ============================================================================ */
+
+  /* Ensure minimum touch target size (44x44px per iOS/Android guidelines) */
+  button,
+  .clickable,
+  [role="button"] {
+    min-height: 44px;
+    min-width: 44px;
+    /* Smooth hover/active transitions for all interactive elements that don't
+       define their own. Covers custom <div role="button"> cards/rows that
+       would otherwise snap instantly on hover. Limited property set for perf. */
+    transition-property: color, background-color, border-color, box-shadow, transform, opacity;
+    transition-duration: var(--duration-fast, 150ms);
+    transition-timing-function: var(--ease-out, cubic-bezier(0.16, 1, 0.3, 1));
+  }
+
+  /* Exception: Small icon buttons - add padding instead of forcing size */
+  button:where([class*="h-6"], [class*="h-7"], [class*="h-8"], [class*="h-9"]) {
+    min-height: auto;
+    min-width: auto;
+  }
+
+  /* Exception: Color picker preset buttons - keep original size */
+  button[type="button"]:where([class*="w-6"][class*="h-6"]) {
+    min-height: auto !important;
+    min-width: auto !important;
+  }
+
+  /* Exception: Switch component - keep original size */
+  [role="switch"] {
+    min-height: auto !important;
+    min-width: auto !important;
+  }
+
+  /* Exception: Checkbox component - keep original size */
+  [role="checkbox"] {
+    min-height: auto !important;
+    min-width: auto !important;
+  }
+
+  /* Exception: Tabs component - keep original size */
+  [role="tablist"],
+  [role="tab"],
+  [role="tabpanel"] {
+    min-height: auto !important;
+    min-width: auto !important;
+  }
+
+  /* Pointer cursor for all interactive elements — native buttons, links,
+     and custom clickable divs. Improves perceived affordance ("can I click?"). */
+  button:not(:disabled),
+  a[href],
+  [role="button"],
+  .clickable,
+  summary {
+    cursor: pointer;
+  }
+
+  /* Subtle press feedback for clickable surfaces that don't define their own.
+     Button component already has active:scale-[0.97]; this gives custom
+     role="button" cards/rows the same tactile response, lighter to stay calm. */
+  [role="button"]:active,
+  .clickable:active {
+    transform: scale(0.985);
+  }
+
+  /* Scrollbar styles */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: oklch(0.5 0.01 264 / 30%) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background-color: oklch(0.5 0.01 270 / 30%);
+    border-radius: 4px;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: oklch(0.5 0.01 270 / 50%);
+  }
+}
+
+/* Improved animations */
+@layer utilities {
+  /* Duration utilities */
+  .animate-duration-150 {
+    animation-duration: 150ms;
+  }
+  .animate-duration-200 {
+    animation-duration: 200ms;
+  }
+  .animate-duration-300 {
+    animation-duration: 300ms;
+  }
+  .animate-duration-500 {
+    animation-duration: 500ms;
+  }
+
+  /* Easing utilities */
+  .ease-out-custom {
+    animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .ease-in-out-custom {
+    animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* Ripple effect */
+  .ripple {
+    position: relative;
+    overflow: hidden;
+  }
+
+  /* Hide scrollbar but keep scrolling */
+  .scrollbar-none {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* ============================================================================
+   * CARD SURFACE QUALITY
+   * A 1px top highlight via box-shadow inset, giving opaque cards a subtle
+   * material thickness — the difference between "flat div" and "raised tile".
+   * Applied to dashboard cards (dashboard-card-sheen) and general cards.
+   * Keeps surfaces readable (no blur) while adding quiet depth.
+   * ============================================================================ */
+  .dashboard-card-sheen,
+  .card-sheen {
+    box-shadow:
+      inset 0 1px 0 0 oklch(1 0 0 / 45%),
+      var(--shadow-sm);
+  }
+  .dark .dashboard-card-sheen,
+  .dark .card-sheen {
+    box-shadow:
+      inset 0 1px 0 0 oklch(1 0 0 / 6%),
+      var(--shadow-sm);
+  }
+
+  /* Glass morphism utilities */
+  .glass {
+    background: var(--glass);
+    backdrop-filter: blur(20px) saturate(120%);
+    -webkit-backdrop-filter: blur(20px) saturate(120%);
+    border: 1px solid var(--glass-border);
+    box-shadow: var(--shadow-glass);
+  }
+
+  .glass-heavy {
+    background: var(--glass-heavy);
+    backdrop-filter: blur(24px) saturate(130%);
+    -webkit-backdrop-filter: blur(24px) saturate(130%);
+    border: 1px solid var(--glass-border);
+    box-shadow: var(--shadow-glass-lg);
+  }
+}
+
+/* Loading spinner */
+@keyframes spin-dash {
+  0% {
+    stroke-dasharray: 1, 150;
+    stroke-dashoffset: 0;
+  }
+  50% {
+    stroke-dasharray: 90, 150;
+    stroke-dashoffset: -35;
+  }
+  100% {
+    stroke-dasharray: 90, 150;
+    stroke-dashoffset: -124;
+  }
+}
+
+/* Pulse ring animation */
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.8);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1.3);
+    opacity: 0;
+  }
+}
+
+/* Shimmer loading effect */
+@keyframes shimmer {
+  0% {
+    background-position: -1000px 0;
+  }
+  100% {
+    background-position: 1000px 0;
+  }
+}
+
+/* Typing cursor animation */
+@keyframes blink {
+  0%, 50% {
+    opacity: 1;
+  }
+  51%, 100% {
+    opacity: 0;
+  }
+}
+
+.animate-blink {
+  animation: blink 1s step-end infinite;
+}
+
+/* Scale in animation */
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Slide from right */
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+/* Slide from left */
+@keyframes slide-in-left {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+/* Status badge styles */
+.badge-success {
+  @apply bg-success-light text-success;
+}
+.badge-warning {
+  @apply bg-warning-light text-warning;
+}
+.badge-error {
+  @apply bg-error-light text-error;
+}
+.badge-info {
+  @apply bg-info-light text-info;
+}
+
+/* Online status indicator with pulse */
+.status-dot {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+.status-dot::before {
+  content: '';
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 9999px;
+}
+.status-dot.online::before {
+  @apply bg-success;
+}
+.status-dot.offline::before {
+  @apply bg-muted-foreground;
+}
+.status-dot.online::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 9999px;
+  @apply bg-success;
+  animation: pulse-ring 1.5s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+}
+
+/* ==================== New Design System ==================== */
+
+/* Fade in up animation */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up var(--duration-normal) var(--ease-out);
+}
+
+/* Slide in highlight animation for new events */
+@keyframes slide-in-highlight {
+  0% {
+    opacity: 0;
+    transform: translateX(-20px);
+    background: var(--muted);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+    background: transparent;
+  }
+}
+
+.animate-slide-in-highlight {
+  animation: slide-in-highlight var(--duration-slow) var(--ease-out);
+}
+
+/* Icon button styles */
+.icon-btn {
+  @apply rounded-xl p-2 transition-all;
+  transition-duration: var(--duration-fast);
+  transition-timing-function: var(--ease-out);
+}
+
+.icon-btn:hover {
+  @apply bg-muted;
+  transform: scale(1.05);
+}
+
+.icon-btn:active {
+  transform: scale(0.95);
+}
+
+.icon-btn.active {
+  @apply bg-foreground text-background;
+}
+
+/* List item hover effect */
+.list-item-hover {
+  @apply transition-all;
+  transition-duration: var(--duration-fast);
+  transition-timing-function: var(--ease-out);
+}
+
+.list-item-hover:hover {
+  background-color: color-mix(in oklch, var(--muted) 50%, transparent);
+  transform: translateX(4px);
+}
+
+/* Tab indicator animation */
+.tab-indicator {
+  @apply transition-all;
+  transition-duration: var(--duration-normal);
+  transition-timing-function: var(--ease-spring);
+}
+
+/* Events bar marquee effect */
+@keyframes events-scroll {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.events-scroll {
+  animation: events-scroll 30s linear infinite;
+}
+
+.events-scroll:hover {
+  animation-play-state: paused;
+}
+
+/* Accordion animations */
+@keyframes accordion-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-accordion-content-height);
+  }
+}
+
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+
+/* ============================================================================
+ * Chat message prose text color override
+ * User messages: white text in light theme, dark text in dark theme
+ * AI messages: use theme variables
+ * ============================================================================ */
+
+/* Light theme - User messages: white text on blue background */
+.message-bubble-user .prose,
+.message-bubble-user .prose *,
+.message-bubble-user .prose p,
+.message-bubble-user .prose li,
+.message-bubble-user .prose span,
+.message-bubble-user .prose strong,
+.message-bubble-user .prose em,
+.message-bubble-user .prose b,
+.message-bubble-user .prose i,
+.message-bubble-user .prose h1,
+.message-bubble-user .prose h2,
+.message-bubble-user .prose h3,
+.message-bubble-user .prose h4,
+.message-bubble-user .prose h5,
+.message-bubble-user .prose h6,
+.message-bubble-user .prose td,
+.message-bubble-user .prose th,
+.message-bubble-user .prose blockquote,
+.message-bubble-user .prose code,
+.message-bubble-user .prose pre {
+  color: #fff !important;
+}
+
+/* Dark theme - User messages: dark text on blue background */
+.dark .message-bubble-user .prose,
+.dark .message-bubble-user .prose *,
+.dark .message-bubble-user .prose p,
+.dark .message-bubble-user .prose li,
+.dark .message-bubble-user .prose span,
+.dark .message-bubble-user .prose strong,
+.dark .message-bubble-user .prose em,
+.dark .message-bubble-user .prose b,
+.dark .message-bubble-user .prose i,
+.dark .message-bubble-user .prose h1,
+.dark .message-bubble-user .prose h2,
+.dark .message-bubble-user .prose h3,
+.dark .message-bubble-user .prose h4,
+.dark .message-bubble-user .prose h5,
+.dark .message-bubble-user .prose h6,
+.dark .message-bubble-user .prose td,
+.dark .message-bubble-user .prose th,
+.dark .message-bubble-user .prose blockquote,
+.dark .message-bubble-user .prose code,
+.dark .message-bubble-user .prose pre,
+.dark .message-bubble-user .dark\:prose-invert,
+.dark .message-bubble-user .dark\:prose-invert * {
+  color: #1a1a1a !important;
+}
+
+/* Target using data-variant attribute - light theme */
+.prose[data-variant="user"],
+.prose[data-variant="user"] * {
+  color: #fff !important;
+}
+
+/* Target using data-variant attribute - dark theme */
+.dark .prose[data-variant="user"],
+.dark .prose[data-variant="user"] * {
+  color: #1a1a1a !important;
+}
+
+/* AI messages - use theme variables */
+.message-bubble-assistant .prose,
+.message-bubble-assistant .prose * {
+  color: var(--msg-ai-text) !important;
+}
+
+.dark .message-bubble-assistant .prose,
+.dark .message-bubble-assistant .prose * {
+  color: var(--msg-ai-text) !important;
+}
+
+.prose[data-variant="assistant"],
+.prose[data-variant="assistant"] * {
+  color: var(--msg-ai-text) !important;
+}
+
+.dark .prose[data-variant="assistant"],
+.dark .prose[data-variant="assistant"] * {
+  color: var(--msg-ai-text) !important;
+}
+
+/* Links: inherit the per-bubble text color so they stay readable on every
+ * background. We previously hardcoded `var(--primary)`, but in light theme
+ * `--primary` is near-white (oklch 0.95) which collides with the user
+ * bubble's `--msg-user-bg` (also near-white, oklch 0.97) — making URLs in
+ * user messages invisible. The MarkdownMessage component supplies the
+ * underline affordance via Tailwind classes; color just needs to contrast
+ * with the bubble, which `inherit`/`currentColor` guarantees because the
+ * surrounding prose color is already themed per variant above. */
+.message-bubble-user .prose a,
+.message-bubble-user .prose * a,
+.message-bubble-assistant .prose a,
+.message-bubble-assistant .prose * a,
+.dark .message-bubble-user .dark\:prose-invert a,
+.dark .message-bubble-user .dark\:prose-invert * a,
+.dark .message-bubble-assistant .dark\:prose-invert a,
+.dark .message-bubble-assistant .dark\:prose-invert * a,
+.prose[data-variant="user"] a,
+.prose[data-variant="user"] * a,
+.prose[data-variant="assistant"] a,
+.prose[data-variant="assistant"] * a {
+  color: inherit !important;
+}
+
+/* Code blocks background - keep readable */
+.message-bubble-user .prose pre,
+.message-bubble-assistant .prose pre,
+.message-bubble-user .prose code:not(pre code),
+.message-bubble-assistant .prose code:not(pre code),
+.dark .message-bubble-user .prose pre,
+.dark .message-bubble-assistant .prose pre,
+.dark .message-bubble-user .prose code:not(pre code),
+.dark .message-bubble-assistant .prose code:not(pre code) {
+  background-color: var(--muted) !important;
+  color: inherit !important;
+}
+
+/* Thinking block inside message bubbles */
+.message-bubble-user .thinking-content,
+.message-bubble-user .thinking-content *,
+.message-bubble-assistant .thinking-content,
+.message-bubble-assistant .thinking-content *,
+.dark .message-bubble-user .thinking-content,
+.dark .message-bubble-user .thinking-content *,
+.dark .message-bubble-assistant .thinking-content,
+.dark .message-bubble-assistant .thinking-content * {
+  color: inherit !important;
+}
+
+/* Agent Monitor Widget - Sci-fi animations */
+@keyframes shimmer-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Page transition — opacity-only fade for route changes. No transform
+   (translateY/scale) because some pages use left-drawer layouts where
+   vertical movement looks jarring. */
+@keyframes page-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.animate-page-enter {
+  animation: page-enter 150ms ease-out;
+}
+
+.animate-fade-in {
+  animation: fade-in 200ms var(--ease-out);
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    opacity: 1;
+    filter: drop-shadow(0 0 8px currentColor);
+  }
+  50% {
+    opacity: 0.7;
+    filter: drop-shadow(0 0 4px currentColor);
+  }
+}
+
+/* ============================================================================
+ * Chat Message Animations
+ * ============================================================================ */
+
+/* Simple fade in for messages */
+@keyframes message-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes marquee-scroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+.animate-marquee {
+  animation: marquee-scroll var(--marquee-duration, 40s) linear infinite;
+}
+
+.animate-marquee:hover {
+  animation-play-state: paused;
+}
+
+/* Message list simple fade */
+.message-list-container {
+  animation: message-fade-in 0.2s ease-out;
+}
+
+/* ============================================================================
+ * Dashboard Mobile Touch Optimizations
+ * ============================================================================ */
+
+/* Touch-friendly dashboard grid items */
+@media (hover: none) and (pointer: coarse) {
+  /* Make grid items respond to touch properly */
+  .react-grid-layout .react-grid-item {
+    touch-action: pan-y pan-x pinch-zoom;
+  }
+
+  /* In edit mode, disable default touch to allow drag */
+  .react-grid-layout.edit-mode .react-grid-item {
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* Larger resize handle for touch */
+  .react-resizable-handle {
+    min-width: 44px !important;
+    min-height: 44px !important;
+  }
+
+  /* Dashboard component buttons - larger touch targets */
+  .react-grid-layout.edit-mode .react-grid-item button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* Prevent zoom on double tap for dashboard controls */
+  .dashboard-grid button,
+  .dashboard-grid [role="button"] {
+    touch-action: manipulation;
+  }
+}
+
+/* Mobile edit bar - ensure proper z-index and touch handling */
+.mobile-edit-bar {
+  position: fixed;
+  z-index: 9999;
+  touch-action: manipulation;
+}
+
+/* Mobile edit bar buttons */
+.mobile-edit-bar button {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Selected component indicator on mobile */
+@media (hover: none) and (pointer: coarse) {
+  .react-grid-layout.edit-mode .react-grid-item.selected {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+  }
+}
+

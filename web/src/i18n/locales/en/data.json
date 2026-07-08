@@ -1,0 +1,65 @@
+{
+  "title": "Data Explorer",
+  "subtitle": "Browse all data sources across devices, extensions, and transforms",
+  "tabs": {
+    "all": "Data Sources",
+    "device": "Devices",
+    "extension": "Extensions",
+    "transform": "Transforms",
+    "ai": "AI Metrics",
+    "push": "Data Push"
+  },
+  "columns": {
+    "type": "Type",
+    "source": "Source",
+    "field": "Field",
+    "dataType": "Data Type",
+    "updated": "Updated"
+  },
+  "noResults": "No data sources match your search",
+  "noSources": "No data sources found",
+  "search": "Search data sources...",
+  "filterSource": "Filter source...",
+  "allSources": "All Sources",
+  "noSourcesDesc": "Data sources will appear here once devices are connected or extensions are registered",
+  "currentValue": "Current Value",
+  "unit": "Unit",
+  "lastUpdate": "Last Update",
+  "description": "Description",
+  "history": "History",
+  "range.1h": "1 Hour",
+  "range.6h": "6 Hours",
+  "range.24h": "24 Hours",
+  "range.7d": "7 Days",
+  "timestamp": "Timestamp",
+  "value": "Value",
+  "quality": "Quality",
+  "noHistory": "No historical data available for this period",
+  "export": {
+    "title": "Export Data",
+    "startTime": "Start Time",
+    "endTime": "End Time",
+    "button": "Export",
+    "exporting": "Exporting...",
+    "noData": "No data found for the selected time range",
+    "truncated": "Showing {{count}} of {{total}} data points",
+    "format.excel": "Excel (.xlsx)",
+    "format.zip": "ZIP (.zip)",
+    "format.auto": "Auto-detect",
+    "format.autoDesc": "Excel or ZIP based on content",
+    "binaryWarning": "Binary data export is partially supported — actual file contents may not be available.",
+    "success": "Download complete — saved to your downloads folder",
+    "format": {
+      "auto": "Auto",
+      "autoDesc": "Automatically detect the best format"
+    }
+  },
+  "field": "Field",
+  "dataType": "Data Type",
+  "range": {
+    "1h": "1h",
+    "6h": "6h",
+    "24h": "24h",
+    "7d": "7d"
+  }
+}

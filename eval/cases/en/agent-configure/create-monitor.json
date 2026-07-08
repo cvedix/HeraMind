@@ -1,0 +1,22 @@
+{
+  "id": "agent-create-monitor",
+  "lang": "en",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "Create a simple interval-based monitoring agent (ne101_camera exposes values.battery)",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Create an agent named 'Battery Patrol' that checks all ne101_camera devices every 5 minutes and alerts when values.battery drops below 20." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent calls `heramind agent create --name Battery Patrol --every 5m --prompt ...`"
+    ],
+    "overall": "Agent should be created and active by default"
+  },
+  "state_queries": [
+    { "type": "agent_exists", "params": { "id": "Battery Patrol" }, "expected": true }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "id": "agent-get-detail",
+  "lang": "en",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "Inspect a single agent's detailed config (covers `heramind agent get`; previously only list was covered).",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "agents": [
+        {
+          "name": "demo-agent",
+          "user_prompt": "demo",
+          "schedule": { "schedule_type": "interval", "interval_seconds": 60 },
+          "execution_mode": "free"
+        }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "What are demo-agent's detailed config fields — schedule, resources, LLM backend, etc.?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent resolves demo-agent's id then runs `heramind agent get <id>` (or GET /api/agents/<id>), and summarizes key fields"
+    ],
+    "overall": "Answer must be grounded in tool results"
+  }
+}

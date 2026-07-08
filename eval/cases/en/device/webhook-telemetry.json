@@ -1,0 +1,26 @@
+{
+  "id": "device-webhook-telemetry",
+  "lang": "en",
+  "category": "device",
+  "workflow": "device-onboarding",
+  "scenario_type": "multi_turn",
+  "description": "Onboard a test device via the webhook adapter: CLI-create webhook device → curl POST telemetry → query latest value (covers webhook channel + curl toolchain + write path)",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Create a test device test-webhook-01 via the webhook adapter, name it 'Webhook Test Probe'." },
+    { "user": "Use curl to send one telemetry reading to this device's webhook URL: temperature=24.6. Hint: the URL is http://127.0.0.1:<port>/api/devices/test-webhook-01/webhook, where the port is the server's listen port (you can infer it from the HERAMIND_API_BASE env var)." },
+    { "user": "Query test-webhook-01's latest telemetry and confirm the temperature value landed." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent calls `heramind device create --id test-webhook-01 --name 'Webhook Test Probe' --device-type ... --adapter-type webhook`",
+      "Turn 2: Agent runs curl POST to the webhook URL via the shell tool, body contains the temperature field",
+      "Turn 3: Agent calls `heramind device get test-webhook-01` (or `device latest`) and references the value sent in the previous turn"
+    ],
+    "overall": "Turn 3 must read back temperature=24.6 (or a nearby float)"
+  },
+  "state_queries": [
+    { "type": "device_exists", "params": { "id": "test-webhook-01" }, "expected": true }
+  ]
+}

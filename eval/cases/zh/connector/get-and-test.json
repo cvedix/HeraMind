@@ -1,0 +1,23 @@
+{
+  "id": "connector-get-and-test",
+  "lang": "zh",
+  "category": "connector",
+  "workflow": "connector-management",
+  "scenario_type": "multi_turn",
+  "description": "多轮：创建连接器 → 查看 get 详情 → 测连通性（覆盖 `heramind connector get` + `connector test`，此前未覆盖）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "接入一个 MQTT broker：name probe-broker，host 10.0.0.99，port 1883。" },
+    { "user": "查看 probe-broker 的详细状态。" },
+    { "user": "测一下到这个 broker 的连通性。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind connector create --name probe-broker --host 10.0.0.99 --port 1883`，解析 id",
+      "Turn 2: Agent 调用 `heramind connector get <id>`",
+      "Turn 3: Agent 调用 `heramind connector test <id>`（连通失败也是合法答案，但必须执行工具）"
+    ],
+    "overall": "后两轮必须复用第一轮的 id"
+  }
+}

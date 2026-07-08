@@ -1,0 +1,225 @@
+{
+  "openPanel": "打开 AI 对话",
+  "closePanel": "关闭",
+  "panelTitle": "AI 对话",
+  "streamInProgress": "正在响应中，完成后自动关闭...",
+  "title": "智能物联网助手",
+  "welcome": {
+    "greeting": "你好！我是 HeraMind",
+    "description": "智能物联网助手，帮你管理设备和自动化",
+    "suggestions": {
+      "checkDevices": "查看设备状态",
+      "createRule": "创建自动化规则",
+      "viewAlerts": "查看告警"
+    }
+  },
+  "input": {
+    "placeholder": "输入消息...",
+    "sendHint": "按 <kbd>/</kbd> 显示建议",
+    "selectModel": "选择模型",
+    "selectLLMModel": "选择 LLM 模型",
+    "attachment": "附件",
+    "moreOptions": "更多选项",
+    "newChat": "新对话",
+    "startNewConversation": "开始输入消息，与 AI 助手对话",
+    "skills": "技能",
+    "selectSkills": "选择技能",
+    "noSkills": "暂无可用技能",
+    "activeSkills": "已激活技能"
+  },
+  "model": {
+    "supportsVision": "支持图像",
+    "supportsThinking": "支持思考",
+    "addImage": "添加图片",
+    "notSupportImage": "当前模型不支持图片",
+    "visionError": "当前模型不支持图像输入。\n\n请选择一个支持视觉的模型（如 qwen3.5:4b），或者移除图片后重试。\n\n支持视觉的模型会显示 👁️ 图标。",
+    "supportsTools": "支持工具调用"
+  },
+  "thinking": {
+    "title": "思考过程",
+    "thinking": "思考中...",
+    "characters": "字符",
+    "rounds": "轮次"
+  },
+  "progress": {
+    "thinking": "思考中",
+    "generating": "生成中",
+    "toolExecution": "执行工具"
+  },
+  "stage": {
+    "thinking": "思考中",
+    "collecting": "收集中",
+    "analyzing": "分析中",
+    "executing": "执行中",
+    "generating": "生成中",
+    "compacting": "压缩上下文中"
+  },
+  "toolCall": {
+    "title": "工具调用",
+    "status": {
+      "pending": "等待",
+      "running": "执行中",
+      "completed": "完成"
+    },
+    "arguments": "参数",
+    "result": "结果",
+    "roundTitle": "第 {{round}} 轮",
+    "multiRoundTitle": "工具调用",
+    "rounds": "轮",
+    "toggleDetails": "展开/收起详情"
+  },
+  "connection": {
+    "connected": "已连接",
+    "reconnecting": "重连中",
+    "error": "连接错误",
+    "disconnected": "未连接",
+    "retryAttempt": "第 {{count}} 次尝试",
+    "retryProgress": "尝试 {{retry}}/{{max}}{{seconds, string}}",
+    "retrySeconds": " · {{seconds}}s",
+    "reconnect": "重新连接"
+  },
+  "quickActions": {
+    "refreshDevices": "刷新设备状态",
+    "refreshPrompt": "刷新所有设备的状态",
+    "viewDeviceDetails": "查看设备详情",
+    "viewDevicePrompt": "显示设备的详细信息和配置",
+    "createAutomation": "创建自动化",
+    "createAutomationPrompt": "帮我创建一个新的自动化规则",
+    "viewAllAutomations": "查看所有自动化",
+    "viewAllAutomationsPrompt": "列出所有已配置的自动化规则",
+    "viewAnalytics": "查看数据分析",
+    "viewAnalyticsPrompt": "显示最近的数据分析和趋势",
+    "checkAlerts": "检查告警",
+    "checkAlertsPrompt": "检查当前是否有未处理的告警",
+    "openSettings": "打开设置",
+    "openSettingsPrompt": "打开系统设置页面",
+    "continue": "继续对话",
+    "continuePrompt": "继续",
+    "elaborate": "详细说明",
+    "elaboratePrompt": "请详细说明一下"
+  },
+  "taskProgress": {
+    "title": "任务进度",
+    "steps": {
+      "collecting": "收集信息",
+      "confirming": "确认",
+      "executing": "执行"
+    },
+    "status": {
+      "completed": "已完成",
+      "failed": "失败",
+      "cancelled": "已取消"
+    },
+    "percentComplete": "{{percent}}% 完成",
+    "currentStep": "正在处理第 {{step}} 步...",
+    "success": "任务已成功完成！",
+    "failed": "任务执行失败，请重试",
+    "createAutomation": "创建自动化",
+    "stepLabel": "第 {{step}} 步",
+    "automationCreated": "自动化已成功创建！"
+  },
+  "intent": {
+    "queryData": {
+      "label": "查询数据",
+      "description": "查询设备状态或历史数据"
+    },
+    "analyzeData": {
+      "label": "分析数据",
+      "description": "分析趋势、异常或统计"
+    },
+    "controlDevice": {
+      "label": "控制设备",
+      "description": "控制设备开关或调节参数"
+    },
+    "createAutomation": {
+      "label": "创建自动化",
+      "description": "创建规则或工作流"
+    },
+    "sendMessage": {
+      "label": "发送消息",
+      "description": "发送通知或报告"
+    },
+    "summarize": {
+      "label": "汇总信息",
+      "description": "汇总或总结信息"
+    },
+    "clarify": {
+      "label": "需要澄清",
+      "description": "需要更多信息"
+    },
+    "outOfScope": {
+      "label": "超出范围",
+      "description": "超出系统能力范围"
+    },
+    "confidence": "置信度",
+    "type": "类型",
+    "path": {
+      "fast": "快速路径",
+      "standard": "标准",
+      "quality": "高质量",
+      "multiTurn": "多轮对话",
+      "fallback": "降级"
+    },
+    "entity": {
+      "device": "设备",
+      "location": "位置",
+      "value": "数值",
+      "time": "时间",
+      "action": "动作",
+      "unknown": "未知"
+    }
+  },
+  "loading": "加载中...",
+  "errors": {
+    "sendMessage": "发送消息失败",
+    "connectionLost": "连接已断开",
+    "retry": "重试",
+    "llmError": "LLM 服务错误",
+    "dismiss": "关闭"
+  },
+  "memory": {
+    "label": "记忆",
+    "enabled": "记忆已开启",
+    "disabled": "记忆已关闭"
+  },
+  "notConfigured": {
+    "title": "LLM 未配置",
+    "description": "请先配置 LLM 后端以使用聊天功能",
+    "goToSettings": "前往设置"
+  },
+  "build": {
+    "view": "查看",
+    "undo": "撤销",
+    "showDetails": "详情",
+    "hideDetails": "收起",
+    "types": {
+      "device": "设备",
+      "dashboard": "仪表盘",
+      "rule": "规则",
+      "extension": "扩展",
+      "widget": "组件",
+      "transform": "转换",
+      "agent": "智能体",
+      "message": "消息"
+    },
+    "actions": {
+      "create": "已创建",
+      "update": "已更新",
+      "delete": "已删除",
+      "install": "已安装"
+    }
+  },
+  "newChat": "新对话",
+  "chat": {
+    "suggestions": {
+      "badge": "推荐"
+    }
+  },
+  "status": {
+    "typing": "输入中",
+    "wait": "等待中"
+  },
+  "footer": {
+    "disclaimer": "免责声明"
+  }
+}

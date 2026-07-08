@@ -1,0 +1,19 @@
+{
+  "id": "extension-get-missing",
+  "lang": "zh",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "single_turn",
+  "description": "查询一个不存在的扩展 ID，验证 agent 能优雅处理 not-found（覆盖 `heramind extension get` 错误路径，此前仅覆盖 list）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "帮我查一下扩展 non-existent-ext 的详细信息。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind extension get non-existent-ext`（或 GET /api/extensions/non-existent-ext），收到错误响应后向用户明确反馈该扩展不存在"
+    ],
+    "overall": "必须实际调用工具，不能凭空回答；错误回复必须基于工具结果"
+  }
+}

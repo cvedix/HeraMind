@@ -1,0 +1,29 @@
+{
+  "id": "dashboard-delete-existing",
+  "lang": "zh",
+  "category": "dashboard",
+  "workflow": "dashboard-management",
+  "scenario_type": "single_turn",
+  "description": "删除一个已存在的 dashboard（覆盖 DELETE /api/dashboards/:id 路径）",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "dashboards": [
+        { "name": "stale-dashboard", "components": [] }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "把 stale-dashboard 这个仪表盘删掉" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind dashboard delete stale-dashboard`（或 DELETE /api/dashboards/stale-dashboard）"
+    ],
+    "overall": "删除后应确认；列表中不应再出现"
+  },
+  "state_queries": [
+    { "type": "dashboard_exists", "params": { "id": "stale-dashboard" }, "expected": false }
+  ]
+}

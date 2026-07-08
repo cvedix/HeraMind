@@ -1,0 +1,23 @@
+[package]
+name = "heramind-cli-ops"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+heramind-core = { path = "../heramind-core" }
+reqwest = { workspace = true, features = ["multipart"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+
+# Auto-auth: read API key from local redb database
+redb = { workspace = true }
+bincode = { workspace = true }
+aes-gcm = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+dirs = { workspace = true }

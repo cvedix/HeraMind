@@ -1,0 +1,25 @@
+{
+  "id": "message-channel-lifecycle",
+  "lang": "en",
+  "category": "message",
+  "workflow": "message-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: create channel -> update filter -> test -> delete (covers `heramind message channel-update` + `channel-test` + `channel-delete`). channel-update uses --name flag + --config JSON; channel-delete/channel-test take name as positional arg.",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Create a webhook message channel named ops-critical pointing at https://example.com/hook." },
+    { "user": "Configure it to accept only messages with severity warning or higher." },
+    { "user": "Run a test delivery on this channel." },
+    { "user": "Finally delete it." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind message channel-create --name ops-critical --type webhook --config '{\"url\":\"https://example.com/hook\"}'`",
+      "Turn 2: Agent runs `heramind message channel-update --name ops-critical --config '{\"min_severity\":\"warning\"}'` (filter config goes inside --config JSON)",
+      "Turn 3: Agent runs `heramind message channel-test ops-critical` (positional name)",
+      "Turn 4: Agent runs `heramind message channel-delete ops-critical` (positional name)"
+    ],
+    "overall": "Last three turns must reuse the channel name 'ops-critical'; turn 2 must express severity filter inside the --config JSON blob, not as a separate --min-severity flag"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "widget-list",
+  "lang": "en",
+  "category": "widget",
+  "workflow": "widget-management",
+  "scenario_type": "single_turn",
+  "description": "List available dashboard widgets (covers `heramind widget list` — built-in + custom, previously uncovered)",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "I want to add components to my dashboard — what widget types are available right now?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent calls `heramind widget list` (or GET /api/frontend-components)"
+    ],
+    "overall": "Must report available widget count/types; no fabricated type names"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "transform-create-avg",
+  "lang": "en",
+  "category": "transform",
+  "workflow": "transform-management",
+  "scenario_type": "single_turn",
+  "description": "Create a transform that averages sensor-001's values.battery and exposes the result as avg_battery",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Create a transform that averages sensor-001's values.battery and exposes the result as avg_battery." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes `heramind transform create` (or POST /api/transforms) with the averaging config"
+    ],
+    "overall": "Transform must be persisted; querying the transform list should show the new entry"
+  },
+  "state_queries": [
+    { "type": "transform_count", "params": {}, "expected_min": 1 }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "id": "rule-update-and-delete",
+  "lang": "zh",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "multi_turn",
+  "description": "多轮：更新规则阈值 → 删除规则（覆盖 `heramind rule update` + `rule delete`，此前未覆盖）",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "把 rule-battery-low 的阈值从 20 改成 15。" },
+    { "user": "好的，最后把这个规则删掉。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 解析规则 id 后调用 `heramind rule update <id>`，新 condition 阈值 15（或 PUT /api/rules/<id>）",
+      "Turn 2: Agent 调用 `heramind rule delete <id>`"
+    ],
+    "overall": "两轮必须复用同一 id"
+  }
+}

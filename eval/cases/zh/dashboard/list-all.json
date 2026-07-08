@@ -1,0 +1,19 @@
+{
+  "id": "dashboard-list-all",
+  "lang": "zh",
+  "category": "dashboard",
+  "workflow": "dashboard-management",
+  "scenario_type": "single_turn",
+  "description": "列出所有仪表盘",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "现在有哪些仪表盘？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind dashboard list`"
+    ],
+    "overall": "应清楚反馈（哪怕为空也应说明）"
+  }
+}

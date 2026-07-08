@@ -1,0 +1,19 @@
+{
+  "id": "extension-reload",
+  "lang": "en",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "single_turn",
+  "description": "Trigger a full reload of all extensions (covers `heramind extension reload`; no .nep install needed). With seed-empty fixture, an empty extension list is the realistic outcome — agent may either run reload unconditionally OR detect the empty state and clearly inform the user. Both paths are valid; the bad outcome is silence or hallucinating installed extensions.",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Reload all installed extensions." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent EITHER (a) runs `heramind extension reload` (or POST /api/extensions/reload), OR (b) first lists extensions, observes 0 installed, and clearly tells the user there is nothing to reload. Both paths satisfy the requirement."
+    ],
+    "overall": "Agent must engage with the reload intent. Running `heramind extension list` first to verify state is acceptable; bailing out with a clear '0 extensions installed, nothing to reload' message is valid. INVALID: silence, or claiming reload succeeded without any tool call, or hallucinating extensions."
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "id": "settings-timezone-set",
+  "lang": "en",
+  "category": "settings",
+  "workflow": "settings-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: list available timezones -> set system timezone (covers `heramind settings timezones` + `settings set-timezone`; previously only timezone get was covered).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "What timezones does the system support? Show me the list." },
+    { "user": "Set the system timezone to Asia/Shanghai." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind settings timezones`",
+      "Turn 2: Agent runs `heramind settings set-timezone Asia/Shanghai` (or PUT /api/settings/timezone)"
+    ],
+    "overall": "Turn 2 must actually perform the setting"
+  }
+}

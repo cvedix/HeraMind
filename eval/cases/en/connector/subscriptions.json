@@ -1,0 +1,25 @@
+{
+  "id": "connector-subscriptions",
+  "lang": "en",
+  "category": "connector",
+  "workflow": "connector-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: create connector -> subscribe topic -> list subscriptions -> unsubscribe (covers `heramind connector subscribe` + `subscriptions` + `unsubscribe`; previously 0 coverage). Note: subscribe/unsubscribe/subscriptions operate on the embedded broker globally — they take only --topic, no connector id.",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Add an MQTT broker: name sub-broker, host 10.0.0.50." },
+    { "user": "Subscribe to topic 'env/temp/#' on the embedded broker." },
+    { "user": "Show the current subscription list." },
+    { "user": "Unsubscribe from 'env/temp/#'." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind connector create --name sub-broker --host 10.0.0.50`, parses id",
+      "Turn 2: Agent runs `heramind connector subscribe --topic 'env/temp/#'` (subscribe takes only --topic, no connector id)",
+      "Turn 3: Agent runs `heramind connector subscriptions` (no id arg)",
+      "Turn 4: Agent runs `heramind connector unsubscribe --topic 'env/temp/#'`"
+    ],
+    "overall": "Turns 2-4 must use the correct no-id syntax; subscribe/unsubscribe operate globally on the embedded broker, not per-connector"
+  }
+}

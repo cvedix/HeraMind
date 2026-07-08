@@ -1,0 +1,19 @@
+{
+  "id": "system-info",
+  "lang": "zh",
+  "category": "system",
+  "workflow": "system-info",
+  "scenario_type": "single_turn",
+  "description": "查询系统基础设施信息：MQTT broker 地址、网络、webhook URL（覆盖 `heramind system info`，设备 onboarding 前置询问）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "我想把一个 ESP32 设备通过 MQTT 接入，需要知道 broker 地址、端口和当前网络信息。请给我一份简短报告。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind system info`（或 GET /api/mqtt/status + /api/system/network-info），聚合出 broker URL + 端口"
+    ],
+    "overall": "响应中必须出现可识别的 MQTT broker URL（mqtt://...:1883）和服务器 IP；不能凭空编造"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "id": "llm-inspect",
+  "lang": "zh",
+  "category": "llm",
+  "workflow": "llm-management",
+  "scenario_type": "multi_turn",
+  "description": "多轮：列出 LLM 后端 → 查看某个后端详情 + 模型列表 + 连通性测试（覆盖 `heramind llm get` + `llm models` + `llm test`，此前仅 list 有覆盖）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "现在系统里有哪些 LLM 后端？" },
+    { "user": "把第一个后端的详情给我，并列出它支持的模型，再做一次连通性测试。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind llm list`，解析第一个后端的 id",
+      "Turn 2: Agent 依次调用 `heramind llm get <id>`、`heramind llm models <id>`（或全局 models）、`heramind llm test <id>`"
+    ],
+    "overall": "Turn 2 必须实际执行三个子动作（连通失败也是合法答案）"
+  }
+}

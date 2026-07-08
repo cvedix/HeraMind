@@ -1,0 +1,16 @@
+[package]
+name = "heramind-smoke-extension"
+version.workspace = true
+edition.workspace = true
+description = "Smoke test extension for verifying extension system functionality"
+
+[lib]
+name = "heramind_smoke_extension"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+heramind-extension-sdk = { path = "../../../../heramind-extension-sdk" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+semver = { workspace = true }
+tokio = { workspace = true }

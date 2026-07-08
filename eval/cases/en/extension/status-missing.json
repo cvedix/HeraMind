@@ -1,0 +1,19 @@
+{
+  "id": "extension-status-missing",
+  "lang": "en",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "single_turn",
+  "description": "Query status + logs of a non-existent extension (covers error paths of `heramind extension status` + `extension logs`; no .nep install needed).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Show me the runtime status and recent logs for extension ghost-extension." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind extension status ghost-extension` and/or `heramind extension logs ghost-extension` (or equivalent API), and after receiving the not-found error, clearly reports it"
+    ],
+    "overall": "Must actually invoke the tool, and answer based on the error result"
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "title": "数据浏览器",
+  "subtitle": "浏览设备、扩展和转换中的所有数据源",
+  "tabs": {
+    "all": "数据源",
+    "device": "设备",
+    "extension": "扩展",
+    "transform": "转换",
+    "ai": "AI 指标",
+    "push": "数据推送"
+  },
+  "columns": {
+    "type": "类型",
+    "source": "来源",
+    "field": "字段",
+    "dataType": "数据类型",
+    "updated": "更新时间"
+  },
+  "noResults": "没有匹配的数据源",
+  "noSources": "未找到数据源",
+  "search": "搜索数据源...",
+  "filterSource": "筛选来源...",
+  "allSources": "全部来源",
+  "noSourcesDesc": "设备连接或扩展注册后，数据源将出现在此处",
+  "currentValue": "当前值",
+  "unit": "单位",
+  "lastUpdate": "最后更新",
+  "description": "描述",
+  "history": "历史记录",
+  "range.1h": "1 小时",
+  "range.6h": "6 小时",
+  "range.24h": "24 小时",
+  "range.7d": "7 天",
+  "timestamp": "时间戳",
+  "value": "值",
+  "quality": "质量",
+  "noHistory": "该时间段内没有历史数据",
+  "export": {
+    "title": "导出数据",
+    "startTime": "开始时间",
+    "endTime": "结束时间",
+    "button": "导出",
+    "exporting": "导出中...",
+    "noData": "所选时间范围内没有数据",
+    "truncated": "显示 {{count}} / {{total}} 条数据",
+    "format.excel": "Excel (.xlsx)",
+    "format.zip": "ZIP (.zip)",
+    "format.auto": "自动检测",
+    "format.autoDesc": "根据内容自动选择格式",
+    "binaryWarning": "二进制数据导出仅部分支持 — 实际文件内容可能不可用。",
+    "success": "下载完成 — 已保存到下载文件夹",
+    "format": {
+      "auto": "自动",
+      "autoDesc": "自动检测最佳格式"
+    }
+  },
+  "field": "字段",
+  "dataType": "数据类型",
+  "range": {
+    "1h": "1小时",
+    "6h": "6小时",
+    "24h": "24小时",
+    "7d": "7天"
+  }
+}

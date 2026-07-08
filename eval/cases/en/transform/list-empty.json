@@ -1,0 +1,19 @@
+{
+  "id": "transform-list-empty",
+  "lang": "en",
+  "category": "transform",
+  "workflow": "transform-management",
+  "scenario_type": "single_turn",
+  "description": "List transforms when none exist (covers `heramind transform list` — must handle the empty case gracefully)",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Which transforms are currently defined?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes `heramind transform list` (or GET /api/automations)"
+    ],
+    "overall": "Must clearly state the list is empty (not an error)"
+  }
+}

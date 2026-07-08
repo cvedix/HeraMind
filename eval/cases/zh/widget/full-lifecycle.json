@@ -1,0 +1,27 @@
+{
+  "id": "widget-full-lifecycle",
+  "lang": "zh",
+  "category": "widget",
+  "workflow": "widget-management",
+  "scenario_type": "multi_turn",
+  "description": "多轮完整生命周期：scaffold → tar/gzip 打包 → install → uninstall（widget CLI 无 build 子命令，故用 shell tar 打包；自举生成 fixture，无需预先 .tgz）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "用 `heramind widget create 'Eval Widget' --widget-type custom -o /tmp/eval-widget-src` 脚手架生成一个最小 widget 项目。" },
+    { "user": "用 shell tar -czf 把 /tmp/eval-widget-src 打成 /tmp/eval-widget.tgz（注意：要打包目录内容而不是目录本身，让 manifest.json 在 .tgz 根目录）。" },
+    { "user": "用 `heramind widget install /tmp/eval-widget.tgz` 安装。" },
+    { "user": "用 `heramind widget list` 确认它出现在列表中。" },
+    { "user": "最后用 `heramind widget uninstall eval-widget` 卸载。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind widget create 'Eval Widget' --widget-type custom -o /tmp/eval-widget-src`，确认 manifest.json + bundle.js 生成",
+      "Turn 2: Agent 调用 shell 执行 tar -czf，且 cwd 或 -C 参数正确，让 manifest.json 在包内根目录",
+      "Turn 3: Agent 调用 `heramind widget install /tmp/eval-widget.tgz`，解析 widget id",
+      "Turn 4: Agent 调用 `heramind widget list` 并在结果中找到刚装的 widget",
+      "Turn 5: Agent 调用 `heramind widget uninstall <id>`"
+    ],
+    "overall": "若 widget 校验失败（如 manifest schema 不匹配），agent 应基于错误信息反馈；turn 1 的 scaffold 和 turn 5 的 uninstall 必须实际执行"
+  }
+}

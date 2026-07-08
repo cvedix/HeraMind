@@ -1,0 +1,22 @@
+{
+  "id": "rule-create-low-battery",
+  "lang": "zh",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "single_turn",
+  "description": "创建低电量告警规则（ne101_camera 真实模板暴露 values.battery 指标 — 同时验证 rule validator 读取 template metrics 的修复）",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "帮我创建一条规则：当 sensor-001 的 values.battery 低于 20 时发通知。规则名叫 low-battery-warning" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 应该调用 `heramind rule create`，参数包含 condition: device:sensor-001:values.battery < 20, actions: notify"
+    ],
+    "overall": "规则应该启用（enabled=true）"
+  },
+  "state_queries": [
+    { "type": "rule_exists", "params": { "id": "low-battery-warning" }, "expected": true }
+  ]
+}

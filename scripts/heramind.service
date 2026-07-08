@@ -1,0 +1,44 @@
+[Unit]
+Description=HeraMind Server
+Documentation=https://github.com/camthink-ai/HeraMind
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=heramind
+Group=heramind
+
+# Working directory
+WorkingDirectory=/var/lib/heramind
+
+# Executables
+ExecStart=/usr/local/bin/heramind
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Auto-restart
+Restart=always
+RestartSec=5
+StartLimitBurst=10
+StartLimitInterval=60
+
+# Environment
+Environment="RUST_LOG=info"
+Environment="HERAMIND_DATA_DIR=/var/lib/heramind"
+Environment="HERAMIND_BIND_ADDR=0.0.0.0:9375"
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/heramind
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

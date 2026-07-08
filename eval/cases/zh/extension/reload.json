@@ -1,0 +1,19 @@
+{
+  "id": "extension-reload",
+  "lang": "zh",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "single_turn",
+  "description": "触发所有已安装扩展的全量 reload（覆盖 `heramind extension reload`；无需 .nep 安装）。seed-empty fixture 下扩展列表为空是合理结果 —— agent 既可以直接执行 reload，也可以先识别空状态并明确告知用户无可重新加载的扩展。两条路径均有效；错误做法是沉默或幻觉出已安装的扩展。",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "把所有已安装扩展重新加载一遍。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 或者 (a) 调用 `heramind extension reload`（或 POST /api/extensions/reload），或者 (b) 先列出扩展、观察到 0 个已安装，并明确告知用户没有需要 reload 的内容。两条路径都满足要求。"
+    ],
+    "overall": "Agent 必须回应 reload 的意图。先运行 `heramind extension list` 核实状态是可以接受的；以清晰的『0 个扩展、无需 reload』信息退出也是有效的。无效：沉默；或未做任何工具调用就声称 reload 成功；或幻觉出扩展。"
+  }
+}

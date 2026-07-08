@@ -1,0 +1,25 @@
+{
+  "id": "connector-lifecycle",
+  "lang": "zh",
+  "category": "connector",
+  "workflow": "connector-management",
+  "scenario_type": "multi_turn",
+  "description": "多轮生命周期：创建 → 更新主题 → 禁用 → 删除（覆盖 update + disable + delete，此前未覆盖）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "接入一个 MQTT broker：名字 edge-broker，地址 10.0.0.50，端口 1883。" },
+    { "user": "把这个连接器的订阅主题改成 'edge/+/telemetry'。" },
+    { "user": "暂时禁用这个连接器。" },
+    { "user": "好的，最后把它删除。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind connector create --name edge-broker --host 10.0.0.50 --port 1883`（--type 默认 mqtt），并解析出 ID",
+      "Turn 2: Agent 调用 `heramind connector update <ID> --topics 'edge/+/telemetry'`",
+      "Turn 3: Agent 调用 `heramind connector disable <ID>`",
+      "Turn 4: Agent 调用 `heramind connector delete <ID>`"
+    ],
+    "overall": "后三轮必须复用第一轮解析出的 ID"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "connector-list",
+  "lang": "zh",
+  "category": "connector",
+  "workflow": "connector-management",
+  "scenario_type": "single_turn",
+  "description": "列出已配置的数据连接器（覆盖 `heramind connector list` — connector-management skill，此前 0 覆盖）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "系统里现在注册了哪些外部数据连接器（MQTT broker 之类的）？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind connector list`（或 GET /api/connectors）"
+    ],
+    "overall": "即使没有连接器也要明确反馈"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "HeraMind Build",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-noble",
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {},
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["tauri-apps.tauri-vscode", "rust-lang.rust-analyzer"]
+    }
+  },
+  "postCreateCommand": "cd web && npm install"
+}

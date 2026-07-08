@@ -1,0 +1,102 @@
+[package]
+name = "heramind-api"
+version.workspace = true
+edition.workspace = true
+
+[dev-dependencies]
+# Enable testing feature when running tests
+heramind-api = { path = ".", features = ["testing"] }
+
+[features]
+default = ["embedded-broker", "webhook", "email", "telegram", "wecom", "dingtalk", "slack", "feishu"]
+embedded-broker = []
+webhook = []
+email = []
+telegram = []
+wecom = []
+dingtalk = []
+slack = []
+feishu = []
+static = ["rust-embed", "mime_guess"]
+testing = []  # Enable test-only APIs for parallel test execution
+
+[dependencies]
+heramind-core = { path = "../heramind-core" }
+heramind-extension-sdk = { path = "../heramind-extension-sdk" }
+heramind-agent = { path = "../heramind-agent", features = ["cloud", "llamacpp"] }
+heramind-devices = { path = "../heramind-devices", features = ["embedded-broker"] }
+heramind-rules = { path = "../heramind-rules" }
+heramind-messages = { path = "../heramind-messages", features = ["webhook", "email", "telegram", "wecom", "dingtalk", "slack", "feishu"] }
+heramind-storage = { path = "../heramind-storage" }
+heramind-data-push = { path = "../heramind-data-push" }
+
+# JavaScript execution (merged from heramind-automation)
+boa_engine = "0.17"
+
+# Encoding (merged from heramind-automation)
+hex = { workspace = true }
+urlencoding = "2.1"
+
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+
+# Web framework
+axum = { workspace = true, features = ["ws", "multipart", "macros"] }
+tower-http = { workspace = true }
+
+# Utils
+uuid = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+async-trait = { workspace = true }
+get_if_addrs = "0.5"
+base64 = { workspace = true }
+async-stream = { workspace = true }
+atty = "0.2"
+sysinfo = "0.32"
+tempfile = { workspace = true }
+
+# Concurrent data structures
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+# TLS certificate generation
+rcgen = { workspace = true }
+hostname = { workspace = true }
+time = { workspace = true }
+
+# Encryption
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
+pbkdf2 = { workspace = true }
+hmac = { workspace = true }
+bcrypt = { workspace = true }
+
+# Persistence
+redb = { workspace = true }
+bincode = { workspace = true }
+
+# Version comparison
+semver = { workspace = true }
+
+# Cron expression validation
+cron = "0.12"
+
+# ZIP archive support
+zip = "2"
+
+# Image processing (decode headers for dimensions)
+image = { workspace = true }
+
+# Static file embedding (optional, requires 'static' feature)
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }

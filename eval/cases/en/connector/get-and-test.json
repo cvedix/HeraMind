@@ -1,0 +1,23 @@
+{
+  "id": "connector-get-and-test",
+  "lang": "en",
+  "category": "connector",
+  "workflow": "connector-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: create connector -> inspect via get -> test connectivity (covers `heramind connector get` + `connector test`).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Add an MQTT broker: name probe-broker, host 10.0.0.99, port 1883." },
+    { "user": "Show the detailed status of probe-broker." },
+    { "user": "Test connectivity to this broker." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind connector create --name probe-broker --host 10.0.0.99 --port 1883`, parses id",
+      "Turn 2: Agent runs `heramind connector get <id>`",
+      "Turn 3: Agent runs `heramind connector test <id>` (connectivity failure is a valid answer, but tool must run)"
+    ],
+    "overall": "Last two turns must reuse the id from turn 1"
+  }
+}

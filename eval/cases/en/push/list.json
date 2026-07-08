@@ -1,0 +1,19 @@
+{
+  "id": "push-list",
+  "lang": "en",
+  "category": "push",
+  "workflow": "data-push-management",
+  "scenario_type": "single_turn",
+  "description": "List configured data-push targets (covers `heramind push list` — the data-push-management skill, previously 0 coverage)",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Which data-push targets are currently configured?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes `heramind push list` (or GET /api/data-push)"
+    ],
+    "overall": "Must report the result even when no push targets are configured"
+  }
+}

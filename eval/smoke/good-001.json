@@ -1,0 +1,19 @@
+{
+  "id": "smoke-good-001",
+  "lang": "zh",
+  "category": "smoke",
+  "workflow": "smoke",
+  "scenario_type": "single_turn",
+  "description": "基础问候 — 验证 agent 端到端能响应，无工具调用需求",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "你好，请简单介绍一下你能做什么？" }
+  ],
+  "applies": ["response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 应该用中文回复，提到设备/规则/代理/仪表盘等能力"
+    ],
+    "overall": "不需要调用工具；回复应该清晰简短"
+  }
+}

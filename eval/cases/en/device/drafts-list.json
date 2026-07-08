@@ -1,0 +1,19 @@
+{
+  "id": "device-drafts-list",
+  "lang": "en",
+  "category": "device",
+  "workflow": "device-onboarding",
+  "scenario_type": "single_turn",
+  "description": "List pending device drafts (covers `heramind device drafts list` — the auto-discovery path, previously uncovered)",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Some new devices have reported data via webhook but aren't registered yet. List the current pending device drafts and tell me how to promote them." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent calls `heramind device drafts list` (or GET /api/devices/drafts) and explains the approve/reject flow"
+    ],
+    "overall": "Must actually query drafts (empty list is valid) and describe the approve path"
+  }
+}

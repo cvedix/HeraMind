@@ -1,0 +1,19 @@
+{
+  "id": "system-info",
+  "lang": "en",
+  "category": "system",
+  "workflow": "system-info",
+  "scenario_type": "single_turn",
+  "description": "Query system infrastructure info: MQTT broker address, network, webhook URL (covers `heramind system info`, the pre-onboarding question)",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "I want to connect an ESP32 over MQTT — what's the broker URL, port, and current network info? Give me a short report." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent calls `heramind system info` (or GET /api/mqtt/status + /api/system/network-info) and aggregates a broker URL + port"
+    ],
+    "overall": "Response must contain a recognizable MQTT broker URL (mqtt://...:1883) and server IP; no fabrication"
+  }
+}

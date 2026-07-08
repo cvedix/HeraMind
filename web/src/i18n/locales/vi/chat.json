@@ -1,0 +1,225 @@
+{
+  "openPanel": "Mở AI Chat",
+  "closePanel": "Đóng",
+  "panelTitle": "AI Chat",
+  "streamInProgress": "Đang stream, sẽ đóng sau khi hoàn tất...",
+  "title": "Trợ lý IoT thông minh",
+  "welcome": {
+    "greeting": "Xin chào! Tôi là HeraMind",
+    "description": "Trợ lý IoT thông minh giúp bạn quản lý thiết bị và tự động hóa",
+    "suggestions": {
+      "checkDevices": "Kiểm tra trạng thái thiết bị",
+      "createRule": "Tạo quy tắc tự động hóa",
+      "viewAlerts": "Xem cảnh báo"
+    }
+  },
+  "input": {
+    "placeholder": "Nhập tin nhắn...",
+    "sendHint": "Nhấn <kbd>/</kbd> để xem gợi ý",
+    "selectModel": "Chọn mô hình",
+    "selectLLMModel": "Chọn mô hình LLM",
+    "attachment": "Tệp đính kèm",
+    "moreOptions": "Tùy chọn khác",
+    "newChat": "Cuộc trò chuyện mới",
+    "startNewConversation": "Bắt đầu nhập để trò chuyện với AI",
+    "skills": "Kỹ năng",
+    "selectSkills": "Chọn kỹ năng",
+    "noSkills": "Không có kỹ năng khả dụng",
+    "activeSkills": "Kỹ năng đang bật"
+  },
+  "model": {
+    "supportsVision": "Hỗ trợ thị giác",
+    "supportsThinking": "Hỗ trợ suy luận",
+    "addImage": "Thêm ảnh",
+    "notSupportImage": "Mô hình hiện tại không hỗ trợ ảnh",
+    "visionError": "Mô hình hiện tại không hỗ trợ đầu vào hình ảnh.\n\nVui lòng chọn mô hình có hỗ trợ thị giác (ví dụ qwen3.5:4b), hoặc xóa ảnh và thử lại.\n\nCác mô hình hỗ trợ thị giác có biểu tượng 👁️.",
+    "supportsTools": "Hỗ trợ công cụ"
+  },
+  "thinking": {
+    "title": "Quá trình suy luận",
+    "thinking": "Đang suy luận...",
+    "characters": "characters",
+    "rounds": "Vòng"
+  },
+  "progress": {
+    "thinking": "Suy luận",
+    "generating": "Đang tạo",
+    "toolExecution": "Đang chạy công cụ"
+  },
+  "stage": {
+    "thinking": "Thinking",
+    "collecting": "Đang thu thập",
+    "analyzing": "Đang phân tích",
+    "executing": "Đang thực thi",
+    "generating": "Đang tạo",
+    "compacting": "Đang nén"
+  },
+  "toolCall": {
+    "title": "Lần gọi công cụ",
+    "status": {
+      "pending": "Chờ xử lý",
+      "running": "Đang chạy",
+      "completed": "Hoàn tất"
+    },
+    "arguments": "Tham số",
+    "result": "Kết quả",
+    "roundTitle": "Vòng {{round}}",
+    "multiRoundTitle": "Lần gọi công cụ",
+    "rounds": "vòng",
+    "toggleDetails": "Bật/tắt chi tiết"
+  },
+  "connection": {
+    "connected": "Đã kết nối",
+    "reconnecting": "Đang kết nối lại",
+    "error": "Lỗi kết nối",
+    "disconnected": "Đã ngắt kết nối",
+    "retryAttempt": "Lần thử {{count}}",
+    "retryProgress": "Lần thử {{retry}}/{{max}}{{seconds, string}}",
+    "retrySeconds": " · {{seconds}}s",
+    "reconnect": "Kết nối lại"
+  },
+  "quickActions": {
+    "refreshDevices": "Làm mới thiết bị",
+    "refreshPrompt": "Làm mới trạng thái tất cả thiết bị",
+    "viewDeviceDetails": "Xem chi tiết thiết bị",
+    "viewDevicePrompt": "Show device details and configuration",
+    "createAutomation": "Tạo tự động hóa",
+    "createAutomationPrompt": "Help me create a new automation rule",
+    "viewAllAutomations": "Xem tất cả tự động hóa",
+    "viewAllAutomationsPrompt": "List all configured automation rules",
+    "viewAnalytics": "Xem phân tích",
+    "viewAnalyticsPrompt": "Show recent data analysis and trends",
+    "checkAlerts": "Kiểm tra cảnh báo",
+    "checkAlertsPrompt": "Check for any unhandled alerts",
+    "openSettings": "Mở cài đặt",
+    "openSettingsPrompt": "Open system settings page",
+    "continue": "Tiếp tục",
+    "continuePrompt": "Continue",
+    "elaborate": "Giải thích thêm",
+    "elaboratePrompt": "Vui lòng nói rõ hơn"
+  },
+  "taskProgress": {
+    "title": "Tiến độ tác vụ",
+    "steps": {
+      "collecting": "Đang thu thập thông tin",
+      "confirming": "Đang xác nhận",
+      "executing": "Đang thực thi"
+    },
+    "status": {
+      "completed": "Hoàn tất",
+      "failed": "Thất bại",
+      "cancelled": "Đã hủy"
+    },
+    "percentComplete": "Hoàn thành {{percent}}%",
+    "currentStep": "Đang xử lý bước {{step}}...",
+    "success": "Tác vụ đã hoàn tất thành công!",
+    "failed": "Thực thi tác vụ thất bại, vui lòng thử lại",
+    "createAutomation": "Tạo tự động hóa",
+    "stepLabel": "Bước {{step}}",
+    "automationCreated": "Đã tạo tự động hóa thành công!"
+  },
+  "intent": {
+    "queryData": {
+      "label": "Query data",
+      "description": "Query device status or historical data"
+    },
+    "analyzeData": {
+      "label": "Analyze data",
+      "description": "Analyze trends, anomalies, or statistics"
+    },
+    "controlDevice": {
+      "label": "Control device",
+      "description": "Toggle devices or adjust parameters"
+    },
+    "createAutomation": {
+      "label": "Create automation",
+      "description": "Create rules or workflows"
+    },
+    "sendMessage": {
+      "label": "Send message",
+      "description": "Send notifications or reports"
+    },
+    "summarize": {
+      "label": "Summarize",
+      "description": "Summarize information"
+    },
+    "clarify": {
+      "label": "Needs clarification",
+      "description": "More information needed"
+    },
+    "outOfScope": {
+      "label": "Out of scope",
+      "description": "Beyond system capabilities"
+    },
+    "confidence": "Confidence",
+    "type": "Type",
+    "path": {
+      "fast": "Fast path",
+      "standard": "Standard",
+      "quality": "High quality",
+      "multiTurn": "Multi-turn",
+      "fallback": "Fallback"
+    },
+    "entity": {
+      "device": "Device",
+      "location": "Location",
+      "value": "Value",
+      "time": "Time",
+      "action": "Action",
+      "unknown": "Unknown"
+    }
+  },
+  "loading": "Đang tải...",
+  "errors": {
+    "sendMessage": "Gửi tin nhắn thất bại",
+    "connectionLost": "Mất kết nối",
+    "retry": "Thử lại",
+    "llmError": "Lỗi dịch vụ LLM",
+    "dismiss": "Đóng"
+  },
+  "memory": {
+    "label": "Bộ nhớ",
+    "enabled": "Bật bộ nhớ",
+    "disabled": "Tắt bộ nhớ"
+  },
+  "notConfigured": {
+    "title": "Chưa cấu hình LLM",
+    "description": "Vui lòng cấu hình LLM backend để dùng tính năng chat",
+    "goToSettings": "Đi tới Cài đặt"
+  },
+  "build": {
+    "view": "Xem",
+    "undo": "Hoàn tác",
+    "showDetails": "Chi tiết",
+    "hideDetails": "Ẩn chi tiết",
+    "types": {
+      "device": "Device",
+      "dashboard": "Dashboard",
+      "rule": "Rule",
+      "extension": "Extension",
+      "widget": "Widget",
+      "transform": "Transform",
+      "agent": "Agent",
+      "message": "Message"
+    },
+    "actions": {
+      "create": "Đã tạo",
+      "update": "Đã cập nhật",
+      "delete": "Đã xóa",
+      "install": "Đã cài đặt"
+    }
+  },
+  "newChat": "Cuộc trò chuyện mới",
+  "chat": {
+    "suggestions": {
+      "badge": "Nhãn"
+    }
+  },
+  "status": {
+    "typing": "Đang nhập",
+    "wait": "Vui lòng chờ"
+  },
+  "footer": {
+    "disclaimer": "Miễn trừ trách nhiệm"
+  }
+}

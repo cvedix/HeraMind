@@ -1,0 +1,19 @@
+{
+  "id": "dashboard-list-all",
+  "lang": "en",
+  "category": "dashboard",
+  "workflow": "dashboard-management",
+  "scenario_type": "single_turn",
+  "description": "List all dashboards",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "Which dashboards currently exist?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes `heramind dashboard list`"
+    ],
+    "overall": "Must clearly report the result (an empty list should be stated explicitly)"
+  }
+}

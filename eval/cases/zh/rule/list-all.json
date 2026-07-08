@@ -1,0 +1,19 @@
+{
+  "id": "rule-list-all",
+  "lang": "zh",
+  "category": "rule",
+  "workflow": "rule-management",
+  "scenario_type": "single_turn",
+  "description": "列出所有规则",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "现在系统里有哪些规则？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind rule list`，应返回 rule-battery-low"
+    ],
+    "overall": "应至少展示规则名称"
+  }
+}

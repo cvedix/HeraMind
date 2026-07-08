@@ -1,0 +1,144 @@
+# HeraMind Nginx Deployment Configuration
+#
+# Architecture: Frontend-backend separation
+# - Frontend: Static files served by nginx
+# - Backend: API server running on localhost:9375
+# - Extension loading: Via reverse proxy to backend API
+#
+# Usage:
+# 1. Copy this file to /etc/nginx/sites-available/heramind
+# 2. Modify server_name and root path
+# 3. Create symlink: ln -s /etc/nginx/sites-available/heramind /etc/nginx/sites-enabled/
+# 4. Test config: nginx -t
+# 5. Reload: nginx -s reload
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name your-domain.com;
+
+    # Frontend static files directory
+    # Extract heramind-web-{version}.tar.gz here
+    root /var/www/heramind;
+    index index.html;
+
+    # Gzip compression
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_proxied any;
+    gzip_types text/plain text/css text/xml text/javascript application/javascript application/json application/xml image/svg+xml;
+
+    # Brotli compression (requires ngx_http_brotli module)
+    # Install: apt install libnginx-mod-http-brotli (Debian/Ubuntu)
+    # brotli on;
+    # brotli_comp_level 4;
+    # brotli_types text/plain text/css text/javascript application/javascript application/json image/svg+xml;
+
+    # Default security headers for all responses
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    # index.html — never cache (ensures users get latest version after upgrades)
+    location = /index.html {
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+    }
+
+    # Hashed static assets — cache forever (Vite outputs [name]-[hash].[ext])
+    # When frontend is rebuilt, filenames change and browsers fetch fresh copies.
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        try_files $uri =404;
+    }
+
+    # SPA routing — serve index.html for non-file requests
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # API reverse proxy
+    location /api {
+        proxy_pass http://127.0.0.1:9375;
+        proxy_http_version 1.1;
+
+        # WebSocket support (for real-time communication)
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Proxy headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Timeout config (WebSocket and long connections)
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+
+        # File upload size limit
+        client_max_body_size 100M;
+    }
+
+    # Health check endpoint (optional, for load balancers)
+    location /api/health {
+        proxy_pass http://127.0.0.1:9375;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        access_log off;
+    }
+}
+
+# ============================================
+# Optional: HTTPS Configuration (recommended for production)
+# ============================================
+#
+# Using Certbot for automatic SSL:
+# sudo certbot --nginx -d your-domain.com
+#
+# Or manual configuration:
+#
+# server {
+#     listen 443 ssl http2;
+#     listen [::]:443 ssl http2;
+#     server_name your-domain.com;
+#
+#     ssl_certificate /etc/letsencrypt/live/your-domain.com/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+#
+#     # ... other config same as above ...
+# }
+#
+# server {
+#     listen 80;
+#     server_name your-domain.com;
+#     return 301 https://$server_name$request_uri;
+# }
+
+# ============================================
+# Optional: Cross-origin Deployment (different domains)
+# ============================================
+#
+# If frontend on app.example.com, backend on api.example.com:
+#
+# 1. Backend CORS is configured with allow_origin(Any)
+# 2. Build frontend with: VITE_API_BASE_URL=https://api.example.com/api
+#
+# Backend nginx config:
+# server {
+#     listen 443 ssl http2;
+#     server_name api.example.com;
+#
+#     location / {
+#         proxy_pass http://127.0.0.1:9375;
+#         proxy_http_version 1.1;
+#         proxy_set_header Upgrade $http_upgrade;
+#         proxy_set_header Connection "upgrade";
+#         proxy_set_header Host $host;
+#         proxy_set_header X-Real-IP $remote_addr;
+#         proxy_read_timeout 86400;
+#     }
+# }

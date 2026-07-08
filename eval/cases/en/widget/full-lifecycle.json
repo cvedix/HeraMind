@@ -1,0 +1,27 @@
+{
+  "id": "widget-full-lifecycle",
+  "lang": "en",
+  "category": "widget",
+  "workflow": "widget-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn full lifecycle: scaffold -> tar/gzip package -> install -> uninstall (widget CLI has no build subcommand, so we use shell tar; self-bootstraps fixture, no pre-built .tgz needed).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Scaffold a minimal widget project via `heramind widget create 'Eval Widget' --widget-type custom -o /tmp/eval-widget-src`." },
+    { "user": "Use shell tar -czf to package /tmp/eval-widget-src into /tmp/eval-widget.tgz (note: package the directory CONTENTS, not the directory itself, so manifest.json sits at the .tgz root)." },
+    { "user": "Install it via `heramind widget install /tmp/eval-widget.tgz`." },
+    { "user": "Confirm it appears in `heramind widget list`." },
+    { "user": "Finally uninstall it via `heramind widget uninstall eval-widget`." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind widget create 'Eval Widget' --widget-type custom -o /tmp/eval-widget-src` and confirms manifest.json + bundle.js were generated",
+      "Turn 2: Agent runs shell tar -czf with correct cwd or -C flag so manifest.json lands at package root",
+      "Turn 3: Agent runs `heramind widget install /tmp/eval-widget.tgz` and parses the widget id",
+      "Turn 4: Agent runs `heramind widget list` and locates the newly installed widget in results",
+      "Turn 5: Agent runs `heramind widget uninstall <id>`"
+    ],
+    "overall": "If widget validation fails (e.g. manifest schema mismatch), agent must surface the error message; turn 1 scaffold and turn 5 uninstall must still execute"
+  }
+}

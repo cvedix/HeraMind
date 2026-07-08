@@ -1,0 +1,48 @@
+# =============================================================================
+# HeraMind Docker Compose
+# =============================================================================
+# Quick start:
+#   docker compose up -d
+#
+# With custom config:
+#   cp .env.example .env   # edit as needed
+#   docker compose up -d
+#
+# View logs:
+#   docker compose logs -f heramind
+#
+# Stop:
+#   docker compose down
+# =============================================================================
+
+services:
+  heramind:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: heramind:latest
+    container_name: heramind
+    restart: unless-stopped
+    ports:
+      - "${HERAMIND_HTTP_PORT:-9375}:9375"   # HTTP API + Web UI + WebSocket
+      - "${HERAMIND_MQTT_PORT:-1883}:1883"   # MQTT broker (device connections)
+    volumes:
+      - heramind-data:/app/data
+    environment:
+      - HERAMIND_WEB_DIR=/var/www/heramind
+      - RUST_LOG=${RUST_LOG:-heramind=info}
+      - TZ=${TZ:-Asia/Shanghai}
+      # Optional: set JWT secret for persistent auth across restarts
+      # - HERAMIND_JWT_SECRET=your-secret-key-here
+      # Optional: set encryption key for persistent data encryption
+      # - HERAMIND_ENCRYPTION_KEY=your-encryption-key-here
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9375/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  heramind-data:
+    driver: local

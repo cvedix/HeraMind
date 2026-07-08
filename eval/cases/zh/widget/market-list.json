@@ -1,0 +1,19 @@
+{
+  "id": "widget-market-list",
+  "lang": "zh",
+  "category": "widget",
+  "workflow": "widget-management",
+  "scenario_type": "single_turn",
+  "description": "列出社区 widget 市场可装的 widget（覆盖 `heramind widget market-list`，无需 .tgz 安装）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "社区 widget 市场里现在有哪些 widget 可以装？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind widget market-list`（或 GET /api/frontend-components/marketplace）"
+    ],
+    "overall": "市场未配置或网络失败也是合法答案"
+  }
+}

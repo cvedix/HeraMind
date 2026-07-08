@@ -1,0 +1,1 @@
+export { UnifiedAlertChannelsTab } from './UnifiedAlertChannelsTab'

@@ -1,0 +1,16 @@
+{
+  "format": "heramind-extension-package",
+  "abi_version": 3,
+  "type": "native",
+  "id": "test-extension",
+  "name": "TestExtension",
+  "version": "0.1.0",
+  "capabilities": {
+    "commands": [
+      "hello"
+    ],
+    "metrics": [
+      "invocations"
+    ]
+  }
+}

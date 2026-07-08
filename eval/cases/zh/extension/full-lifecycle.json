@@ -1,0 +1,27 @@
+{
+  "id": "extension-full-lifecycle",
+  "lang": "zh",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "multi_turn",
+  "description": "多轮完整生命周期：scaffold → build → install → status/logs → uninstall（自举生成 fixture，无需预先 .nep；同时覆盖 create/build/install/status/logs/uninstall 六个动作）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "用 `heramind extension create eval-ext-test --extension-type tool -o /tmp/eval-ext-src` 脚手架生成一个最小扩展项目。" },
+    { "user": "用 `heramind extension build /tmp/eval-ext-src/eval-ext-test` 把它编译成 .nep 包。" },
+    { "user": "把刚生成的 .nep 安装到系统里。" },
+    { "user": "查看 eval-ext-test 的运行状态和最近日志。" },
+    { "user": "最后卸载 eval-ext-test。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind extension create eval-ext-test --extension-type tool -o /tmp/eval-ext-src`，确认生成 Cargo.toml/lib.rs/manifest.json",
+      "Turn 2: Agent 调用 `heramind extension build /tmp/eval-ext-src/eval-ext-test`，从输出解析 .nep 文件路径",
+      "Turn 3: Agent 调用 `heramind extension install <解析到的 .nep 路径>`，解析安装后的扩展 id",
+      "Turn 4: Agent 调用 `heramind extension status eval-ext-test` 和 `heramind extension logs eval-ext-test`",
+      "Turn 5: Agent 调用 `heramind extension uninstall eval-ext-test`"
+    ],
+    "overall": "若 build 因缺少 Rust 工具链失败，应明确把环境原因反馈给用户（不扣分）；但 turn 1 的 scaffold 和 turn 5 的 uninstall 必须实际执行"
+  }
+}

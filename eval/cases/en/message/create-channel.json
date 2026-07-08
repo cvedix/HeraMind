@@ -1,0 +1,22 @@
+{
+  "id": "message-create-channel",
+  "lang": "en",
+  "category": "message",
+  "workflow": "message-management",
+  "scenario_type": "single_turn",
+  "description": "Create a webhook notification channel",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Create a webhook channel named ops-alerts pointing to https://example.com/hook" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent calls `heramind message channel-create` with webhook config"
+    ],
+    "overall": "Channel should be created"
+  },
+  "state_queries": [
+    { "type": "channel_exists", "params": { "name": "ops-alerts" }, "expected": true }
+  ]
+}

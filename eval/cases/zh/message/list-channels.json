@@ -1,0 +1,19 @@
+{
+  "id": "message-list-channels",
+  "lang": "zh",
+  "category": "message",
+  "workflow": "message-management",
+  "scenario_type": "single_turn",
+  "description": "列出消息通道",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "系统里现在有哪些消息通道？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind message channel-list`（或 channel list）"
+    ],
+    "overall": "即使为空也应说明"
+  }
+}

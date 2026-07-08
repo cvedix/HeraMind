@@ -1,0 +1,62 @@
+import { ReactNode } from "react"
+import { cn } from "@/lib/utils"
+import { Cpu, Plug, Sliders, Info } from "lucide-react"
+import { useTranslation } from "react-i18next"
+
+export type SettingsSection = "llm" | "connections" | "preferences" | "about"
+
+export interface SettingsSectionConfig {
+  value: SettingsSection
+  label: string
+  icon: ReactNode
+}
+
+export function getSettingsSections(t: ReturnType<typeof useTranslation>["t"]): SettingsSectionConfig[] {
+  return [
+    { value: "llm", label: t("settings:llmBackends"), icon: <Cpu className="h-4 w-4" /> },
+    { value: "connections", label: t("settings:deviceConnections"), icon: <Plug className="h-4 w-4" /> },
+    { value: "preferences", label: t("settings:preferences"), icon: <Sliders className="h-4 w-4" /> },
+    { value: "about", label: t("settings:about"), icon: <Info className="h-4 w-4" /> },
+  ]
+}
+
+interface SettingsNavProps {
+  sections: SettingsSectionConfig[]
+  activeSection: SettingsSection
+  onSectionChange: (section: SettingsSection) => void
+}
+
+export function SettingsNav({ sections, activeSection, onSectionChange }: SettingsNavProps) {
+  return (
+    <nav
+      className="w-52 shrink-0 hidden md:block"
+      role="tablist"
+      aria-label="Settings sections"
+    >
+      <div className="space-y-1">
+        {sections.map((section) => {
+          const isActive = activeSection === section.value
+          return (
+            <button
+              key={section.value}
+              role="tab"
+              aria-selected={isActive}
+              onClick={() => onSectionChange(section.value)}
+              className={cn(
+                "flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
+                "border-l-2",
+                "focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-2",
+                isActive
+                  ? "bg-muted border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:bg-muted-50 hover:text-foreground"
+              )}
+            >
+              <span className="shrink-0">{section.icon}</span>
+              <span>{section.label}</span>
+            </button>
+          )
+        })}
+      </div>
+    </nav>
+  )
+}

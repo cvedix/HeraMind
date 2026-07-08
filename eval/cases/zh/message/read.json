@@ -1,0 +1,23 @@
+{
+  "id": "message-read",
+  "lang": "zh",
+  "category": "message",
+  "workflow": "message-management",
+  "scenario_type": "multi_turn",
+  "description": "多轮：发送消息 → 列出 → 标记已读（覆盖 `heramind message read` ack 路径，此前未覆盖）",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "请发一条 severity=info 的消息：'每日巡检完成'。" },
+    { "user": "列出最近的消息。" },
+    { "user": "把刚才那条消息标记为已读。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind message send --severity info --message '每日巡检完成'`（或 POST /api/messages），解析消息 id",
+      "Turn 2: Agent 调用 `heramind message list`",
+      "Turn 3: Agent 调用 `heramind message read <id>`（或 POST /api/messages/<id>/read）"
+    ],
+    "overall": "Turn 3 必须复用 Turn 1/2 解析出的消息 id"
+  }
+}

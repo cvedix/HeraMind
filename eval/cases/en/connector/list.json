@@ -1,0 +1,19 @@
+{
+  "id": "connector-list",
+  "lang": "en",
+  "category": "connector",
+  "workflow": "connector-management",
+  "scenario_type": "single_turn",
+  "description": "List configured data connectors (covers `heramind connector list` — the connector-management skill, previously 0 coverage)",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Which external data connectors (MQTT brokers, etc.) are currently registered?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent invokes `heramind connector list` (or GET /api/connectors)"
+    ],
+    "overall": "Must report the result even when no connectors are configured"
+  }
+}

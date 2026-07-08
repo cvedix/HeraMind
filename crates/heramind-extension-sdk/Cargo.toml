@@ -1,0 +1,59 @@
+[package]
+name = "heramind-extension-sdk"
+version = "0.6.4"
+edition = "2021"
+authors = ["HeraMind Team"]
+license = "MIT OR Apache-2.0"
+description = "Unified SDK for developing HeraMind Edge AI Platform extensions with ABI Version 3"
+readme = "README.md"
+repository = "https://github.com/heramind-ai/heramind"
+homepage = "https://github.com/heramind-ai/heramind"
+documentation = "https://docs.rs/heramind-extension-sdk"
+keywords = ["extension", "sdk", "edge-ai", "iot", "heramind"]
+categories = ["api-bindings", "development-tools::ffi", "embedded", "wasm"]
+rust-version = "1.75"
+
+[lib]
+name = "heramind_extension_sdk"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Base64 encoding for PushOutputMessage.data
+base64 = "0.22"
+
+# Error handling
+thiserror = "2.0"
+
+# Version parsing
+semver = { version = "1.0", features = ["serde"] }
+
+# Async support
+async-trait = "0.1"
+
+# Native-only dependencies
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "net", "io-util"] }
+tracing = "0.1"
+num_cpus = { version = "1", optional = true }
+
+# WASM-only dependencies
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Use pollster for WASM-compatible block_on - it's lightweight and works on wasm32-unknown-unknown
+pollster = "0.4"
+
+[features]
+default = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-test = "0.4"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]

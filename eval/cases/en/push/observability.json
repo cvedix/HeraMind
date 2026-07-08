@@ -1,0 +1,23 @@
+{
+  "id": "push-observability",
+  "lang": "en",
+  "category": "push",
+  "workflow": "data-push-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: create push target -> trigger self-test -> view delivery logs + global stats (covers `heramind push test` + `push logs` + `push stats`; observability path).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Create a webhook push: name obs-target, URL https://example.com/obs." },
+    { "user": "Run a self-test on this push." },
+    { "user": "Show its delivery logs and the global push stats." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind push create --name obs-target --type webhook --config '{\"url\":\"https://example.com/obs\"}'`, parses id",
+      "Turn 2: Agent runs `heramind push test <id>`",
+      "Turn 3: Agent runs `heramind push logs <id>` and `heramind push stats`"
+    ],
+    "overall": "Last two turns must reuse the id from turn 1; empty logs/zero stats are valid answers"
+  }
+}

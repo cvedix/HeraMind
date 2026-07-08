@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Camera access description (if needed in future) -->
+  <key>NSCameraUsageDescription</key>
+  <string>This app may need camera access for future video features.</string>
+
+  <!-- Microphone access description (if needed in future) -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>This app may need microphone access for future voice features.</string>
+
+  <!-- Bluetooth access description -->
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>HeraMind uses Bluetooth to discover, provision, and communicate with IoT devices.</string>
+
+  <!-- Local network access description -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>HeraMind needs access to local network to connect to IoT devices and backend services.</string>
+
+  <!-- File access documentation -->
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © 2025 HeraMind. All rights reserved.</string>
+
+  <!-- Prevent app from being migrated off Apple Silicon -->
+  <key>LSRequiresNativeArchitecture</key>
+  <true/>
+
+  <!-- High DPI capable -->
+  <key>NSHighResolutionCapable</key>
+  <true/>
+
+  <!-- Disable iCloud features (not used) -->
+  <key>NSCloudKitUsageDescription</key>
+  <string>HeraMind does not use iCloud sync.</string>
+
+  <!-- Sets the app as a foreground application (activatable) -->
+  <key>LSUIElement</key>
+  <false/>
+
+  <!-- Allow HTTP connections for IoT device images and external resources -->
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoads</key>
+    <true/>
+  </dict>
+</dict>
+</plist>

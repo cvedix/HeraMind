@@ -1,0 +1,21 @@
+{
+  "id": "dashboard-share",
+  "lang": "en",
+  "category": "dashboard",
+  "workflow": "dashboard-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: create a simple dashboard -> enable public sharing (covers `heramind dashboard share`, new feature, previously 0 coverage).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Create a dashboard called Share Board; empty is fine." },
+    { "user": "Share this dashboard and give me a public access link." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind dashboard create --name Share Board` (or POST /api/dashboards), parses id",
+      "Turn 2: Agent runs `heramind dashboard share <id> --enable` (or POST /api/dashboards/<id>/share) and returns the share link/id"
+    ],
+    "overall": "Turn 2 must actually invoke the share action, not just restate"
+  }
+}

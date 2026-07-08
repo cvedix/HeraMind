@@ -1,0 +1,19 @@
+{
+  "id": "extension-list",
+  "lang": "en",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "single_turn",
+  "description": "List installed extensions and identify their command/metric capabilities (covers `heramind extension list` — previously uncovered)",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "Which extensions are installed in this system? What commands and metrics do they expose?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent calls `heramind extension list` (or GET /api/extensions) and reports a command/metric summary"
+    ],
+    "overall": "Must report the extension count (empty is a valid answer, but must come from a tool call, not a guess)"
+  }
+}

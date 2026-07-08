@@ -1,0 +1,19 @@
+{
+  "id": "extension-list",
+  "lang": "zh",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "single_turn",
+  "description": "列出当前已安装的扩展，识别命令/指标能力（覆盖 `heramind extension list` — 此前 0 覆盖）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "目前系统里装了哪些扩展？它们提供什么命令和指标？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind extension list`（或 GET /api/extensions），并尝试报告命令/指标摘要"
+    ],
+    "overall": "应报告扩展数量（空也是合法答案，但必须基于工具调用结果而非猜测）"
+  }
+}

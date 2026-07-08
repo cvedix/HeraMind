@@ -1,0 +1,4 @@
+{
+  "name": "seed-empty",
+  "description": "Empty fixture — for cases that create resources from scratch"
+}

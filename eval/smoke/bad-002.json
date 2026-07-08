@@ -1,0 +1,22 @@
+{
+  "id": "smoke-bad-002",
+  "lang": "zh",
+  "category": "smoke",
+  "workflow": "smoke",
+  "scenario_type": "single_turn",
+  "description": "Negative test: agent is asked to do something that requires a tool call (create rule). Tests fallback detection — if agent just outputs prose, suspected_fallback should fire.",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "创建一个规则：当 sensor-001 的 values.battery < 20 时通知我。规则名叫 low-battery-warning" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 必须调用 shell 工具执行 `heramind rule create` 创建规则"
+    ],
+    "overall": "如果 agent 只回复文字、不调用 rule create 工具，则 suspected_fallback = true"
+  },
+  "state_queries": [
+    { "type": "rule_exists", "params": { "id": "low-battery-warning" }, "expected": true }
+  ]
+}

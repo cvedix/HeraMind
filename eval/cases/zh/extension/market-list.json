@@ -1,0 +1,19 @@
+{
+  "id": "extension-market-list",
+  "lang": "zh",
+  "category": "extension",
+  "workflow": "extension-management",
+  "scenario_type": "single_turn",
+  "description": "列出官方扩展市场可装的扩展（覆盖 `heramind extension market-list`，无需 .nep 文件）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "官方扩展市场里现在有哪些扩展可以装？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind extension market-list`（或 GET /api/extensions/marketplace）"
+    ],
+    "overall": "市场未配置或网络失败也是合法答案，但必须实际调用工具"
+  }
+}

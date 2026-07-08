@@ -1,0 +1,75 @@
+[package]
+name = "heramind-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["ollama", "cloud"]
+ollama = []
+cloud = []
+llamacpp = []
+openai = ["cloud"]
+anthropic = ["cloud"]
+google = ["cloud"]
+xai = ["cloud"]
+all = ["ollama", "cloud", "llamacpp", "openai", "anthropic", "google", "xai"]
+
+[dependencies]
+heramind-core = { path = "../heramind-core" }
+heramind-cli-ops = { path = "../heramind-cli-ops" }
+heramind-devices = { path = "../heramind-devices" }
+heramind-storage = { path = "../heramind-storage" }
+heramind-rules = { path = "../heramind-rules" }
+heramind-messages = { path = "../heramind-messages" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+glob = "0.3"
+regex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+# Cron scheduling libraries
+cron = "0.12"
+
+# Image processing (resize before VLM dispatch — saves bandwidth on cloud backends)
+image = { workspace = true }
+# Image drawing/editing operations for the `image_edit` tool.
+# imageproc 0.27 depends on image 0.25 + ab_glyph (verified P1).
+imageproc = "0.27"
+ab_glyph = "0.2"
+
+# Memory system dependencies (merged from heramind-memory)
+reqwest = { workspace = true }
+lru = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+
+# Platform-specific dependencies for shell tool
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+anyhow = "1.0"
+criterion = { version = "0.5", features = ["async_tokio"] }

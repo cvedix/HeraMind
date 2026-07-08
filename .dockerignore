@@ -1,0 +1,37 @@
+# Build artifacts
+target/
+web/node_modules/
+web/dist/
+
+# Runtime data
+data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Claude / plugins
+.claude/
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Docs (not needed in image)
+docs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.md
+!crates/**/README.md
+LICENSE

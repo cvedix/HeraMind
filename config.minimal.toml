@@ -1,0 +1,25 @@
+# ============================================================
+# HeraMind Quick Start Configuration
+# ============================================================
+#
+# Minimal configuration for first-time users
+#
+# Setup steps:
+#   1. Install Ollama: curl -fsSL https://ollama.com/install.sh | sh
+#   2. Pull model: ollama pull qwen3.5:4b
+#   3. Copy this file: cp config.minimal.toml config.toml
+#   4. Start server: cargo run -p heramind-cli -- serve
+#   5. Open: http://localhost:9375
+#
+# For full configuration options, see config.toml or CLAUDE.md
+
+[llm]
+backend = "ollama"
+model = "qwen3.5:4b"
+
+[mqtt]
+listen = "0.0.0.0"
+port = 1883
+
+# Memory settings are configured via the Web UI (Settings > Memory)
+# No [memory] section needed here

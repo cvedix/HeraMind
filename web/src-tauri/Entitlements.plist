@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- App Sandbox: Required for macOS App Store distribution -->
+  <key>com.apple.security.app-sandbox</key>
+  <true/>
+
+  <!-- Network outgoing: Allow backend server and API calls -->
+  <key>com.apple.security.network.outgoing</key>
+  <true/>
+
+  <!-- Network server: Allow backend server on localhost -->
+  <key>com.apple.security.network.server</key>
+  <true/>
+
+  <!-- Allow arbitrary loads for localhost development -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+
+  <!-- JIT compilation (for V8/JavaScript engines if needed) -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!-- Allow loading unsigned code (for development plugins) -->
+  <!-- Remove this for App Store distribution -->
+  <!--
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  -->
+</dict>
+</plist>

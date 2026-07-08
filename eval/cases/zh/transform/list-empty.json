@@ -1,0 +1,19 @@
+{
+  "id": "transform-list-empty",
+  "lang": "zh",
+  "category": "transform",
+  "workflow": "transform-management",
+  "scenario_type": "single_turn",
+  "description": "在没有 transform 时列出 transform（覆盖 `heramind transform list` — 需正确处理空列表）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "现在系统里有哪些 transform？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind transform list`（或 GET /api/automations）"
+    ],
+    "overall": "必须明确说明列表为空（而非报错）"
+  }
+}

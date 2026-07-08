@@ -1,0 +1,25 @@
+{
+  "id": "push-lifecycle",
+  "lang": "zh",
+  "category": "push",
+  "workflow": "data-push-management",
+  "scenario_type": "multi_turn",
+  "description": "多轮生命周期：创建 → 禁用 → 启用 → 删除（覆盖 enable/disable 状态切换 + delete，此前未覆盖）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "新建一个推送目标：名字 relay-target，类型 webhook，URL https://example.com/relay。" },
+    { "user": "临时把这个推送停掉。" },
+    { "user": "现在再把它重新启用。" },
+    { "user": "好的，最后把它删掉。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind push create --name relay-target --type webhook --config '{\"url\":\"https://example.com/relay\"}'`，并解析出 ID 用于后续轮次",
+      "Turn 2: Agent 调用 `heramind push disable <ID>`（或 `push stop <ID>`）",
+      "Turn 3: Agent 调用 `heramind push enable <ID>`（或 `push start <ID>`）",
+      "Turn 4: Agent 调用 `heramind push delete <ID>`"
+    ],
+    "overall": "后三轮必须复用前一轮解析出的 ID，不能每次重新创建"
+  }
+}

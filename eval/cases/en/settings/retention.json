@@ -1,0 +1,23 @@
+{
+  "id": "settings-retention",
+  "lang": "en",
+  "category": "settings",
+  "workflow": "settings-management",
+  "scenario_type": "multi_turn",
+  "description": "Multi-turn: view retention config -> update -> trigger manual cleanup (covers `heramind settings retention` + `set-retention` + `cleanup`; previously 0 coverage).",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "What is the current telemetry retention policy?" },
+    { "user": "Enable retention cleanup, run every 1 hour, default retention 168 hours." },
+    { "user": "Trigger a manual cleanup right now." }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent runs `heramind settings retention` (or GET /api/settings/retention)",
+      "Turn 2: Agent runs `heramind settings set-retention --enabled --interval-hours 1 --default-retention 168` (or PUT equivalent)",
+      "Turn 3: Agent runs `heramind settings cleanup`"
+    ],
+    "overall": "Turn 2/3 must actually execute the write action"
+  }
+}

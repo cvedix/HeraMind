@@ -1,0 +1,50 @@
+{
+  "id": "agent-execute-now",
+  "lang": "zh",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "手动触发一个定时 agent 立即执行一次（覆盖 execute_agent_now 路径）",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "devices": [
+        {
+          "device_id": "sensor-001",
+          "name": "Living Room Sensor",
+          "device_type": "ne101_camera",
+          "adapter_type": "mqtt",
+          "connection_config": {}
+        }
+      ],
+      "metrics": [
+        { "device_id": "sensor-001", "metric": "temperature", "value": 22.5 }
+      ],
+      "agents": [
+        {
+          "name": "daily-report",
+          "user_prompt": "查看 sensor-001 当前温度，简短报告。",
+          "schedule": { "schedule_type": "interval", "interval_seconds": 3600 },
+          "execution_mode": "free",
+          "resources": [
+            { "resource_id": "sensor-001", "resource_type": "device", "name": "Living Room Sensor" }
+          ]
+        }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "请立即手动执行一次 daily-report agent" }
+  ],
+  "post_run_delay_ms": 12000,
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind agent invoke daily-report`（或 POST /api/agents/daily-report/execute）"
+    ],
+    "overall": "应触发执行并返回结果；agent 不应只是回复 'cannot do this'"
+  },
+  "state_queries": [
+    { "type": "agent_execution_count", "params": { "id": "daily-report" }, "expected_min": 1 }
+  ]
+}

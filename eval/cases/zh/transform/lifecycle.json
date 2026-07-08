@@ -1,0 +1,29 @@
+{
+  "id": "transform-lifecycle",
+  "lang": "zh",
+  "category": "transform",
+  "workflow": "transform-management",
+  "scenario_type": "multi_turn",
+  "description": "多轮生命周期：创建 → 测试代码 → 更新 → 禁用 → 启用 → 删除（覆盖 `heramind transform test-code` + `update` + `enable/disable` + `delete`，此前仅 create/list 有覆盖）",
+  "setup": { "fixture": "seed-empty" },
+  "turns": [
+    { "user": "创建一个全局 transform：name c2f，code 'return input * 1.8 + 32'。" },
+    { "user": "用 test-code 测试输入 25 看输出。" },
+    { "user": "把它的 code 改成 'return input * 1.8 + 32 + 0.5'。" },
+    { "user": "暂时禁用它。" },
+    { "user": "再启用。" },
+    { "user": "最后删除。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "error_recovery", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 调用 `heramind transform create --name c2f --scope global --code 'return input * 1.8 + 32'`，解析 id",
+      "Turn 2: Agent 调用 `heramind transform test-code --code 'return input * 1.8 + 32' --input 25`（或对 id 测试）",
+      "Turn 3: Agent 调用 `heramind transform update <id> --code 'return input * 1.8 + 32 + 0.5'`",
+      "Turn 4: Agent 调用 `heramind transform disable <id>`",
+      "Turn 5: Agent 调用 `heramind transform enable <id>`",
+      "Turn 6: Agent 调用 `heramind transform delete <id>`"
+    ],
+    "overall": "后五轮必须复用第一轮解析的 id"
+  }
+}

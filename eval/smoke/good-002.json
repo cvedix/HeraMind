@@ -1,0 +1,22 @@
+{
+  "id": "smoke-good-002",
+  "lang": "zh",
+  "category": "smoke",
+  "workflow": "smoke",
+  "scenario_type": "single_turn",
+  "description": "列出当前设备 — 验证 agent 会调用 device list 工具",
+  "setup": { "fixture": "seed-default" },
+  "turns": [
+    { "user": "现在系统里有哪些设备？" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "response_quality", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 应该调用 shell 工具执行 `heramind device list`，返回 3 个设备"
+    ],
+    "overall": "应该列出 sensor-001, sensor-002, camera-001"
+  },
+  "state_queries": [
+    { "type": "device_count", "params": {}, "expected": 3 }
+  ]
+}

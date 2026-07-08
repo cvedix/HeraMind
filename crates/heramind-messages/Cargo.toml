@@ -1,0 +1,37 @@
+[package]
+name = "heramind-messages"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+heramind-core = { path = "../heramind-core" }
+heramind-storage = { path = "../heramind-storage" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+redb = { workspace = true }
+reqwest = { workspace = true, optional = true }
+lettre = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+base64 = { workspace = true }
+urlencoding = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = ["webhook", "email", "telegram", "wecom", "dingtalk", "slack", "feishu"]
+webhook = ["reqwest"]
+email = ["lettre"]
+telegram = ["reqwest"]
+wecom = ["reqwest"]
+dingtalk = ["reqwest", "hmac", "sha2", "urlencoding"]
+slack = ["reqwest"]
+feishu = ["reqwest", "hmac", "sha2"]

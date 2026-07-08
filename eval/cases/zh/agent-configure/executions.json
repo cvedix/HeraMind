@@ -1,0 +1,33 @@
+{
+  "id": "agent-executions",
+  "lang": "zh",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "multi_turn",
+  "description": "多轮：列出执行历史 → 查看最近一次执行（覆盖 `heramind agent executions` + `agent latest-execution`，可观测性核心，此前 0 覆盖）",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "agents": [
+        {
+          "name": "demo-agent",
+          "user_prompt": "demo",
+          "schedule": { "schedule_type": "interval", "interval_seconds": 60 },
+          "execution_mode": "free"
+        }
+      ]
+    }
+  },
+  "turns": [
+    { "user": "demo-agent 最近执行过几次？状态分别是什么？" },
+    { "user": "它最近一次执行的结果详细看一下。" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "context_retention", "language_adherence"],
+  "expectations": {
+    "per_turn": [
+      "Turn 1: Agent 解析 demo-agent 的 id 后调用 `heramind agent executions <id>`（或 GET /api/agents/<id>/executions）",
+      "Turn 2: Agent 调用 `heramind agent latest-execution <id>`（或 executions --limit 1）"
+    ],
+    "overall": "空历史也是合法答案，但必须基于工具结果"
+  }
+}

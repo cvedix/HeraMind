@@ -1,0 +1,74 @@
+name: CI Checks
+
+# Continuous-integration checks that don't gate the release pipeline.
+# Runs on every PR and every push to main; cheap enough that we don't
+# cache aggressively here (the release pipeline in build.yml owns caching).
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  skill-cli-drift:
+    name: Skill ↔ CLI drift check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: drift-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            drift-${{ runner.os }}-
+
+      - name: Generate skill manifest
+        run: |
+          python3 scripts/check_skill_cli_drift.py --out /tmp/skill_manifest.json
+          echo "--- manifest summary ---"
+          python3 -c "import json; m=json.load(open('/tmp/skill_manifest.json')); print(f'{sum(len(v) for v in m.values())} commands across {len(m)} skills')"
+
+      - name: Run drift test
+        env:
+          NEOMIND_SKILL_MANIFEST: /tmp/skill_manifest.json
+        run: |
+          cargo test -p neomind-cli-ops --test skill_cli_drift -- --nocapture --test-threads=1
+
+  skill-parser-tests:
+    name: Skill parser / matcher tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: skills-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            skills-${{ runner.os }}-
+
+      - name: Run skill tests
+        run: "cargo test -p neomind-agent --lib skills::"
