@@ -602,8 +602,9 @@
     "resume": "恢复"
   },
   "language": {
-    "switchToEnglish": "Switch to English",
-    "switchToChinese": "切换到中文"
+    "switchToEnglish": "切换到英文",
+    "switchToChinese": "切换到中文",
+    "switchToVietnamese": "切换到越南语"
   },
   "dataPush": {
     "title": "数据推送目标",

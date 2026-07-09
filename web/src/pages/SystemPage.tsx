@@ -144,6 +144,13 @@ export default function SystemPage() {
     i18n.changeLanguage(next)
   }
 
+  const currentLanguageLabel = () => {
+    const lang = (i18n.language || 'vi').split('-')[0]
+    if (lang === "zh") return "中文"
+    if (lang === "en") return "English"
+    return "Tiếng Việt"
+  }
+
   const businessCards: CardDef[] = [
     {
       id: "automation",
@@ -202,7 +209,7 @@ export default function SystemPage() {
       descKey: "system.cards.language",
       trailing: (
         <span className="text-xs text-muted-foreground">
-          {i18n.language === "zh" ? "中文" : "English"}
+          {currentLanguageLabel()}
         </span>
       ),
       onClick: toggleLanguage,

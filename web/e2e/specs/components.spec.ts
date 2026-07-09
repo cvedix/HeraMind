@@ -48,7 +48,7 @@ test.describe('UI Components', () => {
   test('dropdown menu should open and close', async ({ page }) => {
     await page.goto('/login');
 
-    const langButton = page.locator('button:has-text("Language"), button:has-text("语言")');
+    const langButton = page.locator('button:has-text("Language"), button:has-text("语言"), button:has-text("Tiếng Việt")');
 
     if (await langButton.count() > 0) {
       await langButton.click();

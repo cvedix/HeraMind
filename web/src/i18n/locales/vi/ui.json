@@ -1,45 +1,45 @@
 {
   "iconPicker": {
-    "allCategories": "All",
-    "common": "Common",
-    "status": "Status",
-    "arrows": "Arrows",
-    "media": "Media",
-    "files": "Files",
-    "devices": "Devices",
-    "charts": "Charts",
-    "misc": "Misc",
-    "selectIcon": "Select icon",
-    "searchPlaceholder": "Search icons...",
-    "noIconsFound": "No matching icons found",
-    "noIcon": "No icon",
-    "searchIcon": "Search icon...",
-    "notFound": "No matching icon",
-    "clear": "Clear"
+    "allCategories": "Tất cả",
+    "common": "chung",
+    "status": "Trạng thái",
+    "arrows": "Mũi tên",
+    "media": "Phương tiện truyền thông",
+    "files": "Tập tin",
+    "devices": "Thiết bị",
+    "charts": "Biểu đồ",
+    "misc": "linh tinh",
+    "selectIcon": "Chọn biểu tượng",
+    "searchPlaceholder": "Biểu tượng tìm kiếm...",
+    "noIconsFound": "Không tìm thấy biểu tượng phù hợp",
+    "noIcon": "Không có biểu tượng",
+    "searchIcon": "Biểu tượng tìm kiếm...",
+    "notFound": "Không có biểu tượng phù hợp",
+    "clear": "Xóa"
   },
   "entityIconPicker": {
-    "noIcon": "No icon",
-    "searchIcon": "Search icon...",
-    "notFound": "No matching icon",
-    "clear": "Clear"
+    "noIcon": "Không có biểu tượng",
+    "searchIcon": "Biểu tượng tìm kiếm...",
+    "notFound": "Không có biểu tượng phù hợp",
+    "clear": "Xóa"
   },
   "colorPicker": {
-    "themeForegroundColor": "Theme foreground color",
-    "hexValue": "Hex value",
-    "selectColor": "Select color"
+    "themeForegroundColor": "Màu nền trước của chủ đề",
+    "hexValue": "Giá trị thập lục phân",
+    "selectColor": "Chọn màu"
   },
   "codeEditor": {
-    "jsonFormatError": "Invalid JSON format",
-    "yamlFormatError": "Invalid YAML format (incorrect indentation)"
+    "jsonFormatError": "Định dạng JSON không hợp lệ",
+    "yamlFormatError": "Định dạng YAML không hợp lệ (thụt lề không chính xác)"
   },
   "toggleSwitch": {
-    "minValue": "Min:",
-    "maxValue": "Max:"
+    "minValue": "tối thiểu:",
+    "maxValue": "Tối đa:"
   },
   "searchBar": {
-    "placeholder": "Search devices, rules..."
+    "placeholder": "Tìm kiếm thiết bị, quy tắc..."
   },
   "common": {
-    "clear": "Clear"
+    "clear": "Xóa"
   }
 }

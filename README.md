@@ -10,16 +10,16 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="License">
-  <a href="https://github.com/camthink-ai/HeraMind/releases/latest">
-    <img src="https://img.shields.io/github/v/release/camthink-ai/HeraMind?color=informational&label=release" alt="Release">
+  <a href="https://github.com/CVEDIX/HeraMind/releases/latest">
+    <img src="https://img.shields.io/github/v/release/CVEDIX/HeraMind?color=informational&label=release" alt="Release">
   </a>
-  <a href="https://github.com/camthink-ai/HeraMind/stargazers">
-    <img src="https://img.shields.io/github/stars/camthink-ai/HeraMind?style=social" alt="Stars">
+  <a href="https://github.com/CVEDIX/HeraMind/stargazers">
+    <img src="https://img.shields.io/github/stars/CVEDIX/HeraMind?style=social" alt="Stars">
   </a>
   <a href="https://discord.gg/gkM7cc8gKb">
     <img src="https://img.shields.io/discord/0.svg?logo=discord&logoColor=ffffff&label=Discord&color=5865F2&link=https://discord.gg/gkM7cc8gKb" alt="Discord Community">
   </a>
-  <img src="https://img.shields.io/github/last-commit/camthink-ai/HeraMind?label=last%20commit&color=success" alt="Last Commit">
+  <img src="https://img.shields.io/github/last-commit/CVEDIX/HeraMind?label=last%20commit&color=success" alt="Last Commit">
   <img src="https://img.shields.io/badge/Rust-1.85+-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Server-informational.svg" alt="Platform">
 </p>
@@ -27,8 +27,8 @@
 <br/>
 
 <div align="center">
-  <img src="https://resources.camthink.ai/HeraMind/dashboardDemo.png" alt="Dashboard" width="800" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);" />
-  <br/><sub><b>Dashboard</b></sub>
+  <img src="docs/img/llm_backend.png" alt="LLM" width="800" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);" />
+  <br/><sub><b>LLM</b></sub>
 </div>
 
 <br/>
@@ -60,12 +60,12 @@ HeraMind is an **edge-deployed AI platform** that brings intelligence to IoT. It
 
 **Key idea**: Talk to your devices in natural language. The AI understands your intent, queries device states, creates automation rules, and takes action autonomously.
 
-> 📚 **Full documentation is on the [HeraMind Wiki](https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind).** This README is a quick overview — visit the wiki for complete guides:
+> 📚 **Full documentation is on the [HeraMind Docs](https://docs.cvedix.com/heramind).** This README is a quick overview — visit the docs for complete guides:
 >
-> - [What is HeraMind?](https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind) — product overview and concepts
-> - [Five-Minute Quick Start](https://wiki.camthink.ai/docs/heramind/quick-start/five-minute-guide) — get running fast
-> - [Install & Setup](https://wiki.camthink.ai/docs/heramind/user-guide/install-setup) — deployment, desktop app, server, Docker
-> - [Developer Guide](https://wiki.camthink.ai/docs/heramind/developer-guide/overview) — API, extensions, integrations
+> - [What is HeraMind?](https://docs.cvedix.com/heramind) — product overview and concepts
+> - [Five-Minute Quick Start](https://docs.cvedix.com/heramind) — get running fast
+> - [Install & Setup](https://docs.cvedix.com/heramind) — deployment, desktop app, server, Docker
+> - [Developer Guide](https://docs.cvedix.com/heramind) — API, extensions, integrations
 
 ### Why HeraMind?
 
@@ -116,21 +116,21 @@ HeraMind is an **edge-deployed AI platform** that brings intelligence to IoT. It
 - **Extension System** — Native & WASM extensions with process isolation and capability-based permissions
 - **Cross-Platform Desktop** — macOS, Windows, Linux native apps via Tauri
 - **Mobile-Friendly Web** — Responsive web UI optimized for phone and tablet
-- **i18n** — English and Chinese language support
+- **i18n** — Vietnamese, English, and Chinese language support
 - **Dark Mode** — System-aware dark/light theme
 - **API Key Auth** — Alternative to JWT for programmatic access
 - **CLI Tools** — Full-featured command-line interface for all operations
 
 ## Ecosystem
 
-HeraMind is a modular ecosystem with specialized repositories for each concern:
+HeraMind is a modular ecosystem with specialized resources for each concern:
 
-| Repository | Purpose |
+| Resource | Purpose |
 |------------|---------|
-| **[HeraMind](https://github.com/camthink-ai/HeraMind)** | Core platform (this repo) — backend, frontend, desktop app |
-| **[HeraMind-Extensions](https://github.com/camthink-ai/HeraMind-Extensions)** | Official extension marketplace — weather, YOLO detection, OCR, face recognition, streaming |
-| **[HeraMind-DeviceTypes](https://github.com/camthink-ai/HeraMind-DeviceTypes)** | Device type definitions — standardized metrics and commands for IoT hardware |
-| **[HeraMind-Dashboard-Components](https://github.com/camthink-ai/HeraMind-Dashboard-Components)** | Dashboard widget marketplace — community-contributed React components |
+| **[HeraMind](https://github.com/CVEDIX/HeraMind)** | Core platform (this repo) — backend, frontend, desktop app |
+| **[Extension docs](https://docs.cvedix.com/heramind)** | Official extension marketplace — weather, YOLO detection, OCR, face recognition, streaming |
+| **[Device type docs](https://docs.cvedix.com/heramind)** | Device type definitions — standardized metrics and commands for IoT hardware |
+| **[Dashboard component docs](https://docs.cvedix.com/heramind)** | Dashboard widget marketplace — community-contributed React components |
 
 ### Available Extensions
 
@@ -150,23 +150,23 @@ HeraMind is a modular ecosystem with specialized repositories for each concern:
 
 ### Supported Devices
 
-NE301 (Edge AI Camera) and NE101 (Sensing Camera). See [HeraMind-DeviceTypes](https://github.com/camthink-ai/HeraMind-DeviceTypes) for full device type definitions.
+NE301 (Edge AI Camera) and NE101 (Sensing Camera). See the [device type docs](https://docs.cvedix.com/heramind) for full device type definitions.
 
 ### Contribute to the Ecosystem
 
 We welcome community contributions to grow the HeraMind ecosystem:
 
-- **[Build an Extension](https://github.com/camthink-ai/HeraMind-Extensions)** — Create extensions for new data sources, AI models, or integrations. Follow the [Extension Development Guide](https://wiki.camthink.ai/docs/heramind/developer-guide/overview) to get started, then submit a PR to the marketplace.
-- **[Add a Device Type](https://github.com/camthink-ai/HeraMind-DeviceTypes)** — Define metrics and commands for your IoT hardware so others can use it out of the box. Just add a JSON file.
-- **[Create a Dashboard Widget](https://github.com/camthink-ai/HeraMind-Dashboard-Components)** — Build reusable React dashboard components (charts, gauges, maps, etc.) and share them with the community.
+- **[Build an Extension](https://docs.cvedix.com/heramind)** — Create extensions for new data sources, AI models, or integrations. Follow the [Extension Development Guide](https://docs.cvedix.com/heramind) to get started, then submit a PR to the marketplace.
+- **[Add a Device Type](https://docs.cvedix.com/heramind)** — Define metrics and commands for your IoT hardware so others can use it out of the box. Just add a JSON file.
+- **[Create a Dashboard Widget](https://docs.cvedix.com/heramind)** — Build reusable React dashboard components (charts, gauges, maps, etc.) and share them with the community.
 
 ## Quick Start
 
-> For the full walkthrough see the [Five-Minute Guide](https://wiki.camthink.ai/docs/heramind/quick-start/five-minute-guide) and [Install & Setup](https://wiki.camthink.ai/docs/heramind/user-guide/install-setup) on the wiki.
+> For the full walkthrough see the [Five-Minute Guide](https://docs.cvedix.com/heramind) and [Install & Setup](https://docs.cvedix.com/heramind) in the docs.
 
 ### Desktop App (Recommended)
 
-Download the latest release from [GitHub Releases](https://github.com/camthink-ai/HeraMind/releases/latest).
+Download the latest release from [GitHub Releases](https://github.com/CVEDIX/HeraMind/releases/latest).
 
 | Platform | Format |
 |----------|--------|
@@ -181,7 +181,7 @@ On first launch, a setup wizard guides you through creating an admin account, co
 One-line install (Linux & macOS):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/camthink-ai/HeraMind/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | sh
 ```
 
 Access the web UI at `http://your-server:9375`.
@@ -192,14 +192,14 @@ Access the web UI at `http://your-server:9375`.
 **Docker:**
 
 ```bash
-git clone https://github.com/camthink-ai/HeraMind.git
+git clone https://github.com/CVEDIX/HeraMind.git
 cd HeraMind
 docker compose up -d
 ```
 
 **Specific version:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/camthink-ai/HeraMind/main/scripts/install.sh | VERSION=0.9.1 sh
+curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | VERSION=0.9.1 sh
 ```
 
 **Custom directories:**
@@ -220,8 +220,8 @@ curl -fsSL ... | USE_NGINX=true sh
 **Manual installation:**
 ```bash
 VERSION=0.9.1
-wget https://github.com/camthink-ai/HeraMind/releases/download/v${VERSION}/heramind-server-linux-amd64.tar.gz
-wget https://github.com/camthink-ai/HeraMind/releases/download/v${VERSION}/heramind-web-${VERSION}.tar.gz
+wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-server-linux-amd64.tar.gz
+wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-web-${VERSION}.tar.gz
 tar xzf heramind-server-linux-amd64.tar.gz
 sudo install -m 755 heramind /usr/local/bin/
 sudo install -m 755 heramind-extension-runner /usr/local/bin/
@@ -254,7 +254,7 @@ server {
 
 ```bash
 # Clone
-git clone https://github.com/camthink-ai/HeraMind.git
+git clone https://github.com/CVEDIX/HeraMind.git
 cd HeraMind
 
 # Start backend (port 9375)
@@ -424,7 +424,7 @@ heramind api-key create                # Create API key
 
 ## Extension Development
 
-Build extensions using the Rust SDK with process isolation. See the [Developer Guide](https://wiki.camthink.ai/docs/heramind/developer-guide/overview) and [HeraMind-Extensions](https://github.com/camthink-ai/HeraMind-Extensions) for full examples.
+Build extensions using the Rust SDK with process isolation. See the [Developer Guide](https://docs.cvedix.com/heramind) and [HeraMind docs](https://docs.cvedix.com/heramind) for full examples.
 
 <details>
 <summary>Quick example</summary>
@@ -464,14 +464,14 @@ heramind_export!(MyExtension);
 
 ## Documentation
 
-All user, install, and developer documentation lives on the **[HeraMind Wiki](https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind)**:
+All user, install, and developer documentation lives on the **[HeraMind Docs](https://docs.cvedix.com/heramind)**:
 
-| Wiki Section | Covers |
+| Docs Section | Covers |
 |--------------|--------|
-| [Product Overview](https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind) | What HeraMind is, core concepts, architecture |
-| [Quick Start](https://wiki.camthink.ai/docs/heramind/quick-start/five-minute-guide) | Five-minute guide to your first running instance |
-| [Install & Setup](https://wiki.camthink.ai/docs/heramind/user-guide/install-setup) | Desktop app, server, Docker, configuration |
-| [Developer Guide](https://wiki.camthink.ai/docs/heramind/developer-guide/overview) | REST/WebSocket API, extensions, integrations |
+| [Product Overview](https://docs.cvedix.com/heramind) | What HeraMind is, core concepts, architecture |
+| [Quick Start](https://docs.cvedix.com/heramind) | Five-minute guide to your first running instance |
+| [Install & Setup](https://docs.cvedix.com/heramind) | Desktop app, server, Docker, configuration |
+| [Developer Guide](https://docs.cvedix.com/heramind) | REST/WebSocket API, extensions, integrations |
 
 Repo-local references (kept here for contributors):
 
@@ -497,11 +497,11 @@ Repo-local references (kept here for contributors):
 Join our community to get help, share ideas, and stay up to date:
 
 - **[Discord](https://discord.gg/gkM7cc8gKb)** — Real-time chat, support, and announcements (recommended)
-- **[GitHub Issues](https://github.com/camthink-ai/HeraMind/issues)** — Bug reports and feature requests
-- **[GitHub Discussions](https://github.com/camthink-ai/HeraMind/discussions)** — Long-form Q&A and design talks
-- **[HeraMind Wiki](https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind)** — Full documentation
+- **[GitHub Issues](https://github.com/CVEDIX/HeraMind/issues)** — Bug reports and feature requests
+- **[GitHub Discussions](https://github.com/CVEDIX/HeraMind/discussions)** — Long-form Q&A and design talks
+- **[HeraMind Docs](https://docs.cvedix.com/heramind)** — Full documentation
 
-Release announcements are published to the Discord `#announcements` channel and on [GitHub Releases](https://github.com/camthink-ai/HeraMind/releases).
+Release announcements are published to the Discord `#announcements` channel and on [GitHub Releases](https://github.com/CVEDIX/HeraMind/releases).
 
 ## Contributing
 

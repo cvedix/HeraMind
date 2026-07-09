@@ -1,7 +1,7 @@
 {
   "openPanel": "Mở AI Chat",
   "closePanel": "Đóng",
-  "panelTitle": "AI Chat",
+  "panelTitle": "Trò chuyện AI",
   "streamInProgress": "Đang stream, sẽ đóng sau khi hoàn tất...",
   "title": "Trợ lý IoT thông minh",
   "welcome": {
@@ -38,7 +38,7 @@
   "thinking": {
     "title": "Quá trình suy luận",
     "thinking": "Đang suy luận...",
-    "characters": "characters",
+    "characters": "nhân vật",
     "rounds": "Vòng"
   },
   "progress": {
@@ -47,7 +47,7 @@
     "toolExecution": "Đang chạy công cụ"
   },
   "stage": {
-    "thinking": "Thinking",
+    "thinking": "suy nghĩ",
     "collecting": "Đang thu thập",
     "analyzing": "Đang phân tích",
     "executing": "Đang thực thi",
@@ -75,26 +75,26 @@
     "disconnected": "Đã ngắt kết nối",
     "retryAttempt": "Lần thử {{count}}",
     "retryProgress": "Lần thử {{retry}}/{{max}}{{seconds, string}}",
-    "retrySeconds": " · {{seconds}}s",
+    "retrySeconds": "· {{seconds}}",
     "reconnect": "Kết nối lại"
   },
   "quickActions": {
     "refreshDevices": "Làm mới thiết bị",
     "refreshPrompt": "Làm mới trạng thái tất cả thiết bị",
     "viewDeviceDetails": "Xem chi tiết thiết bị",
-    "viewDevicePrompt": "Show device details and configuration",
+    "viewDevicePrompt": "Hiển thị chi tiết và cấu hình thiết bị",
     "createAutomation": "Tạo tự động hóa",
-    "createAutomationPrompt": "Help me create a new automation rule",
+    "createAutomationPrompt": "Giúp tôi tạo quy tắc tự động hóa mới",
     "viewAllAutomations": "Xem tất cả tự động hóa",
-    "viewAllAutomationsPrompt": "List all configured automation rules",
+    "viewAllAutomationsPrompt": "Liệt kê tất cả các quy tắc tự động hóa được cấu hình",
     "viewAnalytics": "Xem phân tích",
-    "viewAnalyticsPrompt": "Show recent data analysis and trends",
+    "viewAnalyticsPrompt": "Hiển thị phân tích và xu hướng dữ liệu gần đây",
     "checkAlerts": "Kiểm tra cảnh báo",
-    "checkAlertsPrompt": "Check for any unhandled alerts",
+    "checkAlertsPrompt": "Kiểm tra mọi cảnh báo chưa được xử lý",
     "openSettings": "Mở cài đặt",
-    "openSettingsPrompt": "Open system settings page",
+    "openSettingsPrompt": "Mở trang cài đặt hệ thống",
     "continue": "Tiếp tục",
-    "continuePrompt": "Continue",
+    "continuePrompt": "Tiếp tục",
     "elaborate": "Giải thích thêm",
     "elaboratePrompt": "Vui lòng nói rõ hơn"
   },
@@ -120,53 +120,53 @@
   },
   "intent": {
     "queryData": {
-      "label": "Query data",
-      "description": "Query device status or historical data"
+      "label": "Truy vấn dữ liệu",
+      "description": "Truy vấn trạng thái thiết bị hoặc dữ liệu lịch sử"
     },
     "analyzeData": {
-      "label": "Analyze data",
-      "description": "Analyze trends, anomalies, or statistics"
+      "label": "Phân tích dữ liệu",
+      "description": "Phân tích xu hướng, sự bất thường hoặc chỉ số thống kê"
     },
     "controlDevice": {
-      "label": "Control device",
-      "description": "Toggle devices or adjust parameters"
+      "label": "Thiết bị điều khiển",
+      "description": "Chuyển đổi thiết bị hoặc điều chỉnh tham số"
     },
     "createAutomation": {
-      "label": "Create automation",
-      "description": "Create rules or workflows"
+      "label": "Tạo tự động hóa",
+      "description": "Tạo quy tắc hoặc quy trình làm việc"
     },
     "sendMessage": {
-      "label": "Send message",
-      "description": "Send notifications or reports"
+      "label": "Gửi tin nhắn",
+      "description": "Gửi thông báo hoặc báo cáo"
     },
     "summarize": {
-      "label": "Summarize",
-      "description": "Summarize information"
+      "label": "Tóm tắt",
+      "description": "Tóm tắt thông tin"
     },
     "clarify": {
-      "label": "Needs clarification",
-      "description": "More information needed"
+      "label": "Cần làm rõ",
+      "description": "Cần thêm thông tin"
     },
     "outOfScope": {
-      "label": "Out of scope",
-      "description": "Beyond system capabilities"
+      "label": "Ngoài phạm vi",
+      "description": "Ngoài khả năng của hệ thống"
     },
-    "confidence": "Confidence",
-    "type": "Type",
+    "confidence": "độ tin cậy",
+    "type": "Loại",
     "path": {
-      "fast": "Fast path",
-      "standard": "Standard",
-      "quality": "High quality",
-      "multiTurn": "Multi-turn",
-      "fallback": "Fallback"
+      "fast": "Đường dẫn nhanh",
+      "standard": "Tiêu chuẩn",
+      "quality": "chất lượng cao",
+      "multiTurn": "Nhiều lượt",
+      "fallback": "Dự phòng"
     },
     "entity": {
-      "device": "Device",
-      "location": "Location",
-      "value": "Value",
-      "time": "Time",
-      "action": "Action",
-      "unknown": "Unknown"
+      "device": "Thiết bị",
+      "location": "Vị trí",
+      "value": "Giá trị",
+      "time": "thời gian",
+      "action": "Hành động",
+      "unknown": "Không xác định"
     }
   },
   "loading": "Đang tải...",
@@ -193,14 +193,14 @@
     "showDetails": "Chi tiết",
     "hideDetails": "Ẩn chi tiết",
     "types": {
-      "device": "Device",
-      "dashboard": "Dashboard",
-      "rule": "Rule",
+      "device": "Thiết bị",
+      "dashboard": "Trang tổng quan",
+      "rule": "quy tắc",
       "extension": "Extension",
-      "widget": "Widget",
-      "transform": "Transform",
-      "agent": "Agent",
-      "message": "Message"
+      "widget": "Tiện ích",
+      "transform": "chuyển đổi",
+      "agent": "tác nhân",
+      "message": "Tin nhắn"
     },
     "actions": {
       "create": "Đã tạo",

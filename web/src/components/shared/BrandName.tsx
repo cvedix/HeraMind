@@ -81,8 +81,8 @@ export function BrandLogoHorizontal({ className }: { className?: string }) {
 
 /**
  * Styled brand name with logo-inspired design
- * - Light mode: white text with orange shadow/stroke
- * - Dark mode: black text with orange shadow/stroke
+ * - Light mode: foreground text with blue shadow/stroke
+ * - Dark mode: foreground text with blue shadow/stroke
  *
  * @example
  * ```tsx
@@ -111,7 +111,7 @@ export function StyledBrandName({
         'inline-block font-black italic tracking-tight',
         // Use foreground color that adapts to light/dark mode
         'text-foreground',
-        // Orange shadow effect (3D) - top-right direction with #EB4C27
+        // Blue shadow effect (3D) - top-right direction via --brand-shadow
         'drop-shadow-[1.5px_-1.5px_0_var(--brand-shadow)]',
         // Transition
         'transition-all duration-200',

@@ -31,7 +31,7 @@ test.describe('Theme & Language', () => {
   test('should have language selector', async ({ page }) => {
     await page.goto('/login');
 
-    const langSelector = page.locator('button:has-text("Language"), button:has-text("语言"), [data-testid="language-selector"]');
+    const langSelector = page.locator('button:has-text("Language"), button:has-text("语言"), button:has-text("Tiếng Việt"), [data-testid="language-selector"]');
 
     if (await langSelector.count() > 0) {
       await langSelector.click();

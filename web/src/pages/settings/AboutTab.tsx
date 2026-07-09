@@ -519,17 +519,17 @@ export function AboutTab() {
             </InfoRow>
             <InfoRow label={t("settings:repository")}>
               <ExternalLinkValue
-                href="https://github.com/camthink-ai/HeraMind"
-                text="github.com/camthink-ai/HeraMind"
+                href="https://github.com/CVEDIX/HeraMind"
+                text="github.com/CVEDIX/HeraMind"
               />
             </InfoRow>
             <InfoRow label={t("settings:website")}>
-              <ExternalLinkValue href="https://www.camthink.ai" text="www.camthink.ai" />
+              <ExternalLinkValue href="https://cvedix.com" text="cvedix.com" />
             </InfoRow>
             <InfoRow label={t("settings:documentation")} last>
               <ExternalLinkValue
-                href="https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind"
-                text="wiki.camthink.ai"
+                href="https://docs.cvedix.com/heramind"
+                text="docs.cvedix.com/heramind"
               />
             </InfoRow>
           </div>
