@@ -16,8 +16,8 @@
   <a href="https://github.com/CVEDIX/HeraMind/stargazers">
     <img src="https://img.shields.io/github/stars/CVEDIX/HeraMind?style=social" alt="Stars">
   </a>
-  <a href="https://discord.gg/gkM7cc8gKb">
-    <img src="https://img.shields.io/discord/0.svg?logo=discord&logoColor=ffffff&label=Discord&color=5865F2&link=https://discord.gg/gkM7cc8gKb" alt="Cộng đồng Discord">
+  <a href="https://discord.gg/cvedixai">
+    <img src="https://img.shields.io/discord/0.svg?logo=discord&logoColor=ffffff&label=Discord&color=5865F2&link=https://discord.gg/cvedixai" alt="Cộng đồng Discord">
   </a>
   <img src="https://img.shields.io/github/last-commit/CVEDIX/HeraMind?label=last%20commit&color=success" alt="Commit gần nhất">
   <img src="https://img.shields.io/badge/Rust-1.85+-orange.svg" alt="Rust">
@@ -496,7 +496,7 @@ Tài liệu tham khảo cục bộ trong repo (dành cho người đóng góp):
 
 Tham gia cộng đồng để được hỗ trợ, chia sẻ ý tưởng, và cập nhật tin mới:
 
-- **[Discord](https://discord.gg/gkM7cc8gKb)** — Chat thời gian thực, hỗ trợ, và thông báo (khuyến nghị)
+- **[Discord](https://discord.gg/cvedixai)** — Chat thời gian thực, hỗ trợ, và thông báo (khuyến nghị)
 - **[GitHub Issues](https://github.com/CVEDIX/HeraMind/issues)** — Báo lỗi và yêu cầu tính năng
 - **[GitHub Discussions](https://github.com/CVEDIX/HeraMind/discussions)** — Hỏi đáp dài hơn và thảo luận thiết kế
 - **[Tài liệu HeraMind](https://docs.cvedix.com/heramind)** — Tài liệu đầy đủ

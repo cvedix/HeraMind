@@ -16,8 +16,8 @@
   <a href="https://github.com/CVEDIX/HeraMind/stargazers">
     <img src="https://img.shields.io/github/stars/CVEDIX/HeraMind?style=social" alt="Stars">
   </a>
-  <a href="https://discord.gg/gkM7cc8gKb">
-    <img src="https://img.shields.io/discord/0.svg?logo=discord&logoColor=ffffff&label=Discord&color=5865F2&link=https://discord.gg/gkM7cc8gKb" alt="Discord Community">
+  <a href="https://discord.gg/cvedixai">
+    <img src="https://img.shields.io/discord/0.svg?logo=discord&logoColor=ffffff&label=Discord&color=5865F2&link=https://discord.gg/cvedixai" alt="Discord Community">
   </a>
   <img src="https://img.shields.io/github/last-commit/CVEDIX/HeraMind?label=last%20commit&color=success" alt="Last Commit">
   <img src="https://img.shields.io/badge/Rust-1.85+-orange.svg" alt="Rust">
@@ -496,7 +496,7 @@ Repo-local references (kept here for contributors):
 
 Join our community to get help, share ideas, and stay up to date:
 
-- **[Discord](https://discord.gg/gkM7cc8gKb)** — Real-time chat, support, and announcements (recommended)
+- **[Discord](https://discord.gg/cvedixai)** — Real-time chat, support, and announcements (recommended)
 - **[GitHub Issues](https://github.com/CVEDIX/HeraMind/issues)** — Bug reports and feature requests
 - **[GitHub Discussions](https://github.com/CVEDIX/HeraMind/discussions)** — Long-form Q&A and design talks
 - **[HeraMind Docs](https://docs.cvedix.com/heramind)** — Full documentation
