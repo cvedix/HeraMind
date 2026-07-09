@@ -1,7 +1,7 @@
 {
   "device_type": "ne101_camera",
-  "name": "CamThink Sensing Camera",
-  "description": "CamThink NE101 sensing camera with low-power battery support and button-triggered capture. Ideal for remote monitoring and photo capture scenarios.",
+  "name": "Sensing Camera",
+  "description": "CamAI CV01 sensing camera with low-power battery support and button-triggered capture. Ideal for remote monitoring and photo capture scenarios.",
   "categories": ["Camera", "Sensing"],
   "mode": "full",
   "metrics": [
@@ -89,7 +89,7 @@
     {
       "ts": 1740640441620,
       "values": {
-        "devName": "NE101 Sensing Camera",
+        "devName": "CV101 Sensing Camera",
         "devMac": "D8:3B:DA:71:19:C0",
         "devSn": "458658825555",
         "hwVersion": "V1.0",

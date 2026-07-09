@@ -644,9 +644,9 @@ pub async fn generate_device_type_from_samples_handler(
 // ============================================================================
 
 /// Configuration for cloud device type repository
-const CLOUD_REPO: &str = "camthink-ai/HeraMind-DeviceTypes";
+const CLOUD_REPO: &str = "CVEDIX/HeraMind-DeviceTypes";
 const CLOUD_BRANCH: &str = "main";
-const CLOUD_BASE_URL: &str = "https://raw.githubusercontent.com/camthink-ai/HeraMind-DeviceTypes";
+const CLOUD_BASE_URL: &str = "https://raw.githubusercontent.com/CVEDIX/HeraMind-DeviceTypes";
 
 /// Cloud device type metadata (in index.json)
 #[derive(Debug, Serialize, Deserialize, Clone)]

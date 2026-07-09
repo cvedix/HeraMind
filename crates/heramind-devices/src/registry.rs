@@ -1347,13 +1347,13 @@ mod tests {
     }
 
     /// Test that GitHub device type JSON files can be deserialized correctly
-    /// This validates compatibility with the camthink-ai/HeraMind-DeviceTypes repository
+    /// This validates compatibility with the CVEDIX/HeraMind-DeviceTypes repository
     #[test]
     fn test_github_device_types_deserialization() {
         // ne101_camera.json - uses TitleCase types (String, Integer)
         let ne101_json = r#"{
             "device_type": "ne101_camera",
-            "name": "CamThink Sensing Camera",
+            "name": "CVEDIX Sensing Camera",
             "description": "Test camera",
             "categories": ["Camera", "Sensing"],
             "mode": "simple",
@@ -1378,7 +1378,7 @@ mod tests {
         // ne301_camera.json - uses TitleCase "Array" which was problematic
         let ne301_json = r#"{
             "device_type": "ne301_camera",
-            "name": "CamThink Edge AI Camera",
+            "name": "CVEDIX Edge AI Camera",
             "description": "Test AI camera",
             "categories": ["Camera", "AI"],
             "mode": "simple",

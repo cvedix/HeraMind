@@ -1,7 +1,7 @@
 {
   "device_type": "ne301_camera",
-  "name": "CamThink Edge AI Camera",
-  "description": "CamThink NE301 Edge AI Camera with built-in YOLOv8 Nano object detection model supporting 80-class recognition. Features WiFi connectivity and battery power.",
+  "name": "Edge AI Camera",
+  "description": "CamAI CV301 Edge AI Camera with built-in YOLOv8 Nano object detection model supporting 80-class recognition. Features WiFi connectivity and battery power.",
   "categories": ["Camera", "AI", "Edge Computing"],
   "mode": "full",
   "metrics": [
@@ -199,7 +199,7 @@
         "quality": 60
       },
       "device_info": {
-        "device_name": "NE301-2A207D",
+        "device_name": "CV301-2A207D",
         "mac_address": "44:9f:da:2a:20:7d",
         "serial_number": "SN202500001",
         "hardware_version": "V1.1",

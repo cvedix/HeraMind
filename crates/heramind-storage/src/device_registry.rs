@@ -891,8 +891,8 @@ impl DeviceRegistryStore {
                 Error::Serialization(format!("Invalid builtin template {}: {}", device_type, e))
             })?;
             // Builtin template version. Bump when pulling updated templates from
-            // camthink-ai/HeraMind-DeviceTypes to propagate updates to existing installs.
-            bundled.builtin_version = Some("1.0.0".to_string());
+            // CVEDIX/HeraMind-DeviceTypes to propagate updates to existing installs.
+            bundled.builtin_version = Some("1.0.1".to_string());
 
             match self.load_template(device_type)? {
                 // Doesn't exist → insert
@@ -1222,7 +1222,7 @@ mod tests {
         assert!(ne101.name.contains("NE101") || ne101.name.contains("Sensing"));
         assert!(!ne101.metrics.is_empty());
         // Builtin templates should have version set
-        assert_eq!(ne101.builtin_version.as_deref(), Some("1.0.0"));
+        assert_eq!(ne101.builtin_version.as_deref(), Some("1.0.1"));
 
         // Verify NE301 content
         let ne301 = store.load_template("ne301_camera").unwrap().unwrap();
@@ -1230,7 +1230,7 @@ mod tests {
         assert!(ne301.name.contains("NE301") || ne301.name.contains("Edge AI"));
         assert!(!ne301.metrics.is_empty());
         assert!(!ne301.commands.is_empty()); // NE301 has capture/sleep commands
-        assert_eq!(ne301.builtin_version.as_deref(), Some("1.0.0"));
+        assert_eq!(ne301.builtin_version.as_deref(), Some("1.0.1"));
 
         // Second seed should not overwrite (same version = idempotent)
         let seeded_again = store.seed_builtin_templates().unwrap();
