@@ -72,6 +72,10 @@ export default {
           light: "var(--color-info-bg)",
         },
         // Accent category colors (OKLCH-harmonized)
+        "accent-blue": {
+          DEFAULT: "var(--accent-blue)",
+          light: "var(--accent-blue-bg)",
+        },
         "accent-purple": {
           DEFAULT: "var(--accent-purple)",
           light: "var(--accent-purple-bg)",

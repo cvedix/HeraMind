@@ -607,7 +607,8 @@
   },
   "language": {
     "switchToEnglish": "Switch to English",
-    "switchToChinese": "切换到中文"
+    "switchToChinese": "Switch to Chinese",
+    "switchToVietnamese": "Switch to Vietnamese"
   },
   "dataPush": {
     "title": "Data Push Targets",

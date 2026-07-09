@@ -288,7 +288,7 @@ lto = "thin"
 
 ## 示例
 
-参考 [HeraMind-Extensions](https://github.com/camthink-ai/HeraMind-Extensions) 仓库：
+参考 [HeraMind 文档](https://docs.cvedix.com/heramind)：
 
 | 扩展 | 类型 | 说明 |
 |------|------|------|

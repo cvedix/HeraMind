@@ -50,7 +50,7 @@ The fastest way to deploy HeraMind on a server. Single container includes fronte
 
 ```bash
 # Clone the repository
-git clone https://github.com/camthink-ai/HeraMind.git
+git clone https://github.com/CVEDIX/HeraMind.git
 cd HeraMind
 
 # Start HeraMind

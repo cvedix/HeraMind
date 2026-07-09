@@ -288,43 +288,38 @@ html {
 
 @layer base {
   :root {
-    /* Near-white canvas (~#FAFAFA). Pure neutral, Vercel/Linear-style:
-       bg sits just below card white so cards float via a 0.015 lightness
-       gap rather than heavy shadows. Airier than typical gray canvas. */
-    --background: oklch(0.985 0 0);
+    /* Blue / white / black product palette.
+       Light mode keeps the workspace white with a faint blue temperature,
+       while interaction and brand surfaces use saturated HeraMind blue. */
+    --background: oklch(0.99 0.004 255);
     /* Solid white for stable chrome layers (TopNav, tab strips, toolbars,
        page headers). These anchor the layout — they should NOT float with
        the aurora the way the scrollable content area does. In dark mode
        this token falls back to --card so the same class works in both. */
     --chrome: oklch(1 0 0);
-    --foreground: oklch(0.21 0.01 264);
+    --foreground: oklch(0.13 0.02 255);
     --card: oklch(1 0 0);
-    --card-foreground: oklch(0.21 0.01 264);
+    --card-foreground: oklch(0.13 0.02 255);
     --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0.21 0.01 264);
-    /* Primary keeps a deep, grounded tone but nudged slightly warmer so it
-       harmonizes with the brand orange instead of feeling disconnected. */
-    --primary: oklch(0.22 0.03 265);
+    --popover-foreground: oklch(0.13 0.02 255);
+    --primary: oklch(0.52 0.23 255);
     --primary-foreground: oklch(1 0 0);
-    --secondary: oklch(0.97 0 0);
-    --secondary-foreground: oklch(0.21 0.01 264);
-    --muted: oklch(0.97 0 0);
-    --muted-foreground: oklch(0.48 0.012 264);
-    --accent: oklch(0.97 0 0);
-    --accent-foreground: oklch(0.21 0.01 264);
-    --destructive: oklch(0.577 0.245 27);
+    --secondary: oklch(0.965 0.012 255);
+    --secondary-foreground: oklch(0.13 0.02 255);
+    --muted: oklch(0.965 0.012 255);
+    --muted-foreground: oklch(0.44 0.025 255);
+    --accent: oklch(0.94 0.035 255);
+    --accent-foreground: oklch(0.13 0.02 255);
+    --destructive: oklch(0.42 0.14 255);
     --destructive-foreground: oklch(1 0 0);
     /* Alias: some components use text-error-foreground; map it to the same
-       white so red buttons/toasts render correctly (was missing → black text) */
+       white so action buttons/toasts render correctly (was missing -> black text) */
     --error-foreground: oklch(1 0 0);
-    --border: oklch(0.21 0.01 264 / 9%);
-    --input: oklch(0.21 0.01 264 / 10%);
-    /* Focus ring — neutral foreground tint, NOT brand orange. The previous
-     * `--ring: var(--brand)` made every focused input/tab/button flash a
-     * bright orange halo, which users read as "random orange edges". A
-     * subtle foreground-tinted ring still satisfies WCAG focus-indicator
-     * contrast for keyboard a11y without screaming brand color everywhere. */
-    --ring: color-mix(in oklch, var(--foreground) 35%, transparent);
+    --border: oklch(0.13 0.02 255 / 10%);
+    --input: oklch(0.13 0.02 255 / 11%);
+    /* Focus ring uses the product blue, with opacity kept low enough to avoid
+     * a heavy halo on repeated controls. */
+    --ring: color-mix(in oklch, var(--primary) 42%, transparent);
     /* Base radius — slightly larger (12px) for a softer, more modern feel.
        Tailwind's rounded-lg/md/sm all derive from this via calc(). */
     --radius: 0.75rem;
@@ -344,12 +339,12 @@ html {
     --radius-full: 9999px;
 
     /* Chart colors */
-    --chart-1: oklch(0.65 0.18 300);
-    --chart-2: oklch(0.65 0.17 155);
-    --chart-3: oklch(0.72 0.16 85);
-    --chart-4: oklch(0.637 0.237 41);
-    --chart-5: oklch(0.65 0.17 20);
-    --chart-6: oklch(0.65 0.12 210);
+    --chart-1: oklch(0.52 0.23 255);
+    --chart-2: oklch(0.61 0.20 245);
+    --chart-3: oklch(0.70 0.14 235);
+    --chart-4: oklch(0.38 0.08 255);
+    --chart-5: oklch(0.56 0.06 255);
+    --chart-6: oklch(0.76 0.09 225);
 
     /* Animation durations */
     --duration-fast: 150ms;
@@ -362,36 +357,38 @@ html {
     --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 
     /* Semantic colors */
-    --color-success: oklch(0.55 0.17 155);
-    --color-success-bg: oklch(0.55 0.17 155 / 8%);
-    --color-warning: oklch(0.68 0.17 65);
-    --color-warning-bg: oklch(0.68 0.17 65 / 8%);
-    --color-error: oklch(0.55 0.22 25);
-    --color-error-bg: oklch(0.55 0.22 25 / 8%);
-    --color-info: oklch(0.52 0.15 250);
-    --color-info-bg: oklch(0.52 0.15 250 / 8%);
+    --color-success: oklch(0.55 0.21 250);
+    --color-success-bg: oklch(0.55 0.21 250 / 9%);
+    --color-warning: oklch(0.36 0.06 255);
+    --color-warning-bg: oklch(0.36 0.06 255 / 8%);
+    --color-error: oklch(0.48 0.18 265);
+    --color-error-bg: oklch(0.48 0.18 265 / 9%);
+    --color-info: oklch(0.52 0.23 255);
+    --color-info-bg: oklch(0.52 0.23 255 / 9%);
 
     /* Tint backgrounds for primary & destructive (mirror semantic *-bg pattern) */
-    --primary-bg: oklch(0.18 0.02 270 / 8%);
-    --primary-bg-hover: oklch(0.18 0.02 270 / 16%);
-    --destructive-bg: oklch(0.577 0.245 27 / 8%);
+    --primary-bg: oklch(0.52 0.23 255 / 10%);
+    --primary-bg-hover: oklch(0.52 0.23 255 / 18%);
+    --destructive-bg: oklch(0.42 0.14 255 / 10%);
 
     /* Overlay (semi-transparent black masks) */
     --overlay-light: oklch(0 0 0 / 30%);
     --overlay-medium: oklch(0 0 0 / 50%);
     --overlay-heavy: oklch(0 0 0 / 80%);
 
-    /* Accent category colors (light) - harmonious OKLCH palette */
-    --accent-purple: oklch(0.52 0.18 300);
-    --accent-purple-bg: oklch(0.52 0.18 300 / 8%);
-    --accent-orange: oklch(0.55 0.22 25);
-    --accent-orange-bg: oklch(0.55 0.22 25 / 8%);
-    --accent-cyan: oklch(0.58 0.12 200);
-    --accent-cyan-bg: oklch(0.58 0.12 200 / 8%);
-    --accent-emerald: oklch(0.55 0.14 165);
-    --accent-emerald-bg: oklch(0.55 0.14 165 / 8%);
-    --accent-indigo: oklch(0.48 0.18 280);
-    --accent-indigo-bg: oklch(0.48 0.18 280 / 8%);
+    /* Accent category colors (light) - blue family aliases for existing UI classes */
+    --accent-blue: oklch(0.52 0.23 255);
+    --accent-blue-bg: oklch(0.52 0.23 255 / 10%);
+    --accent-purple: oklch(0.50 0.20 265);
+    --accent-purple-bg: oklch(0.50 0.20 265 / 9%);
+    --accent-orange: oklch(0.55 0.21 250);
+    --accent-orange-bg: oklch(0.55 0.21 250 / 9%);
+    --accent-cyan: oklch(0.63 0.14 225);
+    --accent-cyan-bg: oklch(0.63 0.14 225 / 10%);
+    --accent-emerald: oklch(0.58 0.16 235);
+    --accent-emerald-bg: oklch(0.58 0.16 235 / 9%);
+    --accent-indigo: oklch(0.44 0.15 260);
+    --accent-indigo-bg: oklch(0.44 0.15 260 / 10%);
 
     /* Shadow system */
     --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 5%);
@@ -407,15 +404,15 @@ html {
     --glass-border-hover: oklch(0 0 0 / 14%);
     --shadow-glass: 0 1px 3px 0 oklch(0 0 0 / 5%);
     --shadow-glass-lg: 0 2px 8px 0 oklch(0 0 0 / 8%);
-    --shadow-brand: 0 2px 12px 0 oklch(0.647 0.289 71 / 15%);
+    --shadow-brand: 0 2px 12px 0 oklch(0.52 0.23 255 / 18%);
 
-    /* Brand color - HeraMind orange (#E05727) */
-    --brand: oklch(0.63 0.21 37);
-    --brand-bg: oklch(0.63 0.21 37 / 10%);
+    /* Brand color - HeraMind blue */
+    --brand: oklch(0.52 0.23 255);
+    --brand-bg: oklch(0.52 0.23 255 / 11%);
     --brand-foreground: oklch(1 0 0);
     /* Drop-shadow color for the 3D brand wordmark (fixed hex — drop-shadow
        does not resolve CSS vars reliably across renderers) */
-    --brand-shadow: #eb4c27;
+    --brand-shadow: #006dff;
 
     /* Semi-transparent background tokens (Tailwind v3 workaround) */
     --bg-50: oklch(1 0 0 / 50%);
@@ -423,202 +420,202 @@ html {
     --bg-80: oklch(1 0 0 / 80%);
     --bg-90: oklch(1 0 0 / 90%);
     --bg-95: oklch(1 0 0 / 95%);
-    --muted-20: oklch(0.96 0.003 270 / 20%);
-    --muted-30: oklch(0.96 0.003 270 / 30%);
-    --muted-50: oklch(0.96 0.003 270 / 50%);
-    --primary-hover: oklch(0.18 0.02 270 / 90%);
-    --secondary-hover: oklch(0.96 0.003 270 / 80%);
-    --destructive-hover: oklch(0.577 0.245 27 / 90%);
+    --muted-20: oklch(0.96 0.012 255 / 20%);
+    --muted-30: oklch(0.96 0.012 255 / 30%);
+    --muted-50: oklch(0.96 0.012 255 / 50%);
+    --primary-hover: oklch(0.46 0.24 255 / 95%);
+    --secondary-hover: oklch(0.94 0.018 255 / 86%);
+    --destructive-hover: oklch(0.36 0.16 255 / 95%);
 
     /* Chat-specific colors - light mode */
-    --msg-user-bg: oklch(0.15 0.02 270);
+    --msg-user-bg: oklch(0.52 0.23 255);
     --msg-user-text: oklch(1 0 0);
-    --msg-ai-bg: oklch(0.97 0.003 270);
-    --msg-ai-text: oklch(0.18 0.02 270);
-    --msg-system-bg: oklch(0.95 0.003 270);
-    --msg-system-text: oklch(0.45 0.01 270);
+    --msg-ai-bg: oklch(0.97 0.012 255);
+    --msg-ai-text: oklch(0.13 0.02 255);
+    --msg-system-bg: oklch(0.95 0.018 255);
+    --msg-system-text: oklch(0.38 0.04 255);
 
-    --tool-bg: oklch(0.97 0.003 270);
-    --tool-border: oklch(0.45 0.15 260);
-    --tool-header-bg: oklch(0.94 0.005 270);
+    --tool-bg: oklch(0.97 0.012 255);
+    --tool-border: oklch(0.52 0.23 255);
+    --tool-header-bg: oklch(0.94 0.025 255);
 
-    --thinking-bg: oklch(0.97 0.01 80);
-    --thinking-border: oklch(0.68 0.17 65);
-    --thinking-text: oklch(0.40 0.01 270);
+    --thinking-bg: oklch(0.96 0.018 255);
+    --thinking-border: oklch(0.52 0.18 255);
+    --thinking-text: oklch(0.34 0.045 255);
 
     --card-hover-bg: oklch(0.995 0 0);
     --input-focus-bg: oklch(1 0 0);
 
-    --session-drawer-bg: oklch(0.99 0.002 270);
+    --session-drawer-bg: oklch(0.99 0.004 255);
     --session-drawer-border: oklch(0 0 0 / 8%);
-    --session-item-hover: oklch(0.95 0.003 270);
-    --session-item-active: oklch(0.93 0.003 270);
+    --session-item-hover: oklch(0.95 0.018 255);
+    --session-item-active: oklch(0.92 0.03 255);
 
     /* ============================================================================
      * CODE EDITOR (CodeMirror) SYNTAX TOKENS
      * Used by web/src/components/ui/code-editor.tsx. Theme-agnostic — the editor
      * reads these CSS vars directly, so light/dark switching is instant with no
      * JS re-render. Hue conventions:
-     *   25  = keyword/operator/null (red — control flow)
-     *   250 = cursor/number/property/bool (blue — literal/identifier accent)
-     *   220 = string (cyan-leaning blue)
-     *   300 = def (purple — user definitions)
-     *   264 = base text/gutter/comment (neutral with foreground hue)
+     *   255 = keyword/cursor/number/property/bool (blue)
+     *   225 = string (sky blue)
+     *   260 = def (deep blue)
+     *   264 = base text/gutter/comment (neutral)
      * ========================================================================== */
-    --syntax-text: oklch(0.25 0.01 264);
-    --syntax-gutter: oklch(0.55 0.008 264);
-    --syntax-active-line: oklch(0.55 0.15 250 / 8%);
-    --syntax-selection: oklch(0.55 0.15 250 / 20%);
-    --syntax-cursor: oklch(0.50 0.18 250);
-    --syntax-bracket: oklch(0.50 0.18 250);
-    --syntax-keyword: oklch(0.55 0.22 25);
-    --syntax-string: oklch(0.40 0.18 260);
-    --syntax-number: oklch(0.50 0.20 250);
+    --syntax-text: oklch(0.22 0.015 255);
+    --syntax-gutter: oklch(0.55 0.008 255);
+    --syntax-active-line: oklch(0.52 0.20 255 / 8%);
+    --syntax-selection: oklch(0.52 0.20 255 / 20%);
+    --syntax-cursor: oklch(0.50 0.22 255);
+    --syntax-bracket: oklch(0.50 0.22 255);
+    --syntax-keyword: oklch(0.44 0.18 260);
+    --syntax-string: oklch(0.42 0.13 225);
+    --syntax-number: oklch(0.50 0.20 255);
     --syntax-comment: oklch(0.55 0.008 264);
-    --syntax-def: oklch(0.50 0.18 300);
-    --syntax-property: oklch(0.50 0.20 250);
+    --syntax-def: oklch(0.45 0.16 260);
+    --syntax-property: oklch(0.50 0.20 255);
     --syntax-scrollbar: oklch(0.82 0.005 264);
     --syntax-scrollbar-hover: oklch(0.68 0.008 264);
   }
 
   .dark {
-    /* Subtle warm charcoal — avoids the cold dead-black by mixing a touch of
-       brand warmth (hue 280→270 with slight chroma) for a richer dark mode. */
-    --background: oklch(0.135 0.01 270 / 97%);
-    --foreground: oklch(0.95 0.006 270);
-    --card: oklch(0.165 0.01 270 / 82%);
+    /* Black-first dark mode with a blue undertone for brand continuity. */
+    --background: oklch(0.10 0.018 255 / 98%);
+    --foreground: oklch(0.97 0.004 255);
+    --card: oklch(0.145 0.018 255 / 86%);
     /* Dark-mode chrome: slightly lighter than background so nav/toolbars
        read as a distinct elevated layer, mirroring how light-mode --chrome
        (pure white) sits above --background. */
-    --chrome: oklch(0.20 0.008 270);
-    --card-foreground: oklch(0.95 0.006 270);
-    --popover: oklch(0.165 0.01 270);
-    --popover-foreground: oklch(0.95 0.006 270);
-    --primary: oklch(0.95 0.006 270);
-    --primary-foreground: oklch(0.135 0.01 270);
-    --secondary: oklch(0.205 0.01 270);
-    --secondary-foreground: oklch(0.95 0.006 270);
-    --muted: oklch(0.205 0.01 270);
-    --muted-foreground: oklch(0.64 0.014 270);
-    --accent: oklch(0.205 0.01 270);
-    --accent-foreground: oklch(0.95 0.006 270);
-    --destructive: oklch(0.577 0.245 27);
-    --destructive-foreground: oklch(0.95 0.006 270);
-    --error-foreground: oklch(0.95 0.006 270);
+    --chrome: oklch(0.13 0.018 255);
+    --card-foreground: oklch(0.97 0.004 255);
+    --popover: oklch(0.145 0.018 255);
+    --popover-foreground: oklch(0.97 0.004 255);
+    --primary: oklch(0.62 0.22 255);
+    --primary-foreground: oklch(1 0 0);
+    --secondary: oklch(0.19 0.02 255);
+    --secondary-foreground: oklch(0.97 0.004 255);
+    --muted: oklch(0.19 0.02 255);
+    --muted-foreground: oklch(0.68 0.018 255);
+    --accent: oklch(0.22 0.035 255);
+    --accent-foreground: oklch(0.97 0.004 255);
+    --destructive: oklch(0.62 0.18 255);
+    --destructive-foreground: oklch(1 0 0);
+    --error-foreground: oklch(1 0 0);
     --border: oklch(1 0 0 / 9%);
     --input: oklch(1 0 0 / 11%);
-    /* Neutral focus ring (see light-mode --ring rationale). */
-    --ring: color-mix(in oklch, var(--foreground) 35%, transparent);
+    /* Blue focus ring (see light-mode --ring rationale). */
+    --ring: color-mix(in oklch, var(--primary) 48%, transparent);
 
-    --color-success: oklch(0.72 0.19 155);
-    --color-success-bg: oklch(0.72 0.19 155 / 10%);
-    --color-warning: oklch(0.72 0.16 85);
-    --color-warning-bg: oklch(0.72 0.16 85 / 10%);
-    --color-error: oklch(0.577 0.245 27);
-    --color-error-bg: oklch(0.577 0.245 27 / 10%);
-    --color-info: oklch(0.65 0.15 250);
-    --color-info-bg: oklch(0.65 0.15 250 / 10%);
+    --color-success: oklch(0.70 0.15 235);
+    --color-success-bg: oklch(0.70 0.15 235 / 12%);
+    --color-warning: oklch(0.72 0.08 235);
+    --color-warning-bg: oklch(0.72 0.08 235 / 12%);
+    --color-error: oklch(0.66 0.18 265);
+    --color-error-bg: oklch(0.66 0.18 265 / 12%);
+    --color-info: oklch(0.68 0.19 255);
+    --color-info-bg: oklch(0.68 0.19 255 / 12%);
 
     /* Tint backgrounds (dark: white-based for visibility on dark bg) */
-    --primary-bg: oklch(0.96 0.003 270 / 12%);
-    --primary-bg-hover: oklch(0.96 0.003 270 / 20%);
-    --destructive-bg: oklch(0.577 0.245 27 / 12%);
+    --primary-bg: oklch(0.68 0.19 255 / 16%);
+    --primary-bg-hover: oklch(0.68 0.19 255 / 24%);
+    --destructive-bg: oklch(0.62 0.18 255 / 16%);
 
     /* Overlay (dark theme: slightly heavier masks) */
     --overlay-light: oklch(0 0 0 / 40%);
     --overlay-medium: oklch(0 0 0 / 60%);
     --overlay-heavy: oklch(0 0 0 / 85%);
 
-    /* Accent category colors (dark) - brighter for dark bg */
-    --accent-purple: oklch(0.72 0.16 300);
-    --accent-purple-bg: oklch(0.72 0.16 300 / 12%);
-    --accent-orange: oklch(0.68 0.20 25);
-    --accent-orange-bg: oklch(0.68 0.20 25 / 12%);
-    --accent-cyan: oklch(0.70 0.12 200);
-    --accent-cyan-bg: oklch(0.70 0.12 200 / 12%);
-    --accent-emerald: oklch(0.72 0.16 165);
-    --accent-emerald-bg: oklch(0.72 0.16 165 / 12%);
-    --accent-indigo: oklch(0.68 0.16 280);
-    --accent-indigo-bg: oklch(0.68 0.16 280 / 12%);
+    /* Accent category colors (dark) - blue family aliases for existing UI classes */
+    --accent-blue: oklch(0.68 0.19 255);
+    --accent-blue-bg: oklch(0.68 0.19 255 / 16%);
+    --accent-purple: oklch(0.66 0.18 265);
+    --accent-purple-bg: oklch(0.66 0.18 265 / 15%);
+    --accent-orange: oklch(0.68 0.19 250);
+    --accent-orange-bg: oklch(0.68 0.19 250 / 15%);
+    --accent-cyan: oklch(0.75 0.13 225);
+    --accent-cyan-bg: oklch(0.75 0.13 225 / 16%);
+    --accent-emerald: oklch(0.70 0.15 235);
+    --accent-emerald-bg: oklch(0.70 0.15 235 / 15%);
+    --accent-indigo: oklch(0.64 0.16 260);
+    --accent-indigo-bg: oklch(0.64 0.16 260 / 15%);
 
     --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 20%);
     --shadow-md: 0 2px 6px -1px oklch(0 0 0 / 25%);
     --shadow-lg: 0 4px 16px -3px oklch(0 0 0 / 25%);
     --shadow-xl: 0 8px 24px -5px oklch(0 0 0 / 30%);
 
-    --glass: oklch(0.20 0.008 270 / 50%);
-    --glass-heavy: oklch(0.18 0.008 270 / 80%);
-    --surface-glass: oklch(0.14 0.008 270 / 50%);
+    --glass: oklch(0.16 0.018 255 / 56%);
+    --glass-heavy: oklch(0.13 0.018 255 / 84%);
+    --surface-glass: oklch(0.11 0.018 255 / 58%);
     --glass-border: oklch(1 0 0 / 8%);
     --glass-border-hover: oklch(1 0 0 / 18%);
     --shadow-glass: 0 2px 8px 0 oklch(0 0 0 / 20%);
     --shadow-glass-lg: 0 4px 16px 0 oklch(0 0 0 / 25%);
-    --shadow-brand: 0 2px 12px 0 oklch(0.647 0.289 71 / 15%);
+    --shadow-brand: 0 2px 12px 0 oklch(0.68 0.19 255 / 22%);
 
-    /* Brand color - HeraMind orange (brighter for dark bg) */
-    --brand: oklch(0.70 0.19 40);
-    --brand-bg: oklch(0.70 0.19 40 / 14%);
-    --brand-foreground: oklch(0.13 0.008 270);
-    --brand-shadow: #eb4c27;
+    /* Brand color - HeraMind blue (brighter for dark bg) */
+    --brand: oklch(0.68 0.19 255);
+    --brand-bg: oklch(0.68 0.19 255 / 16%);
+    --brand-foreground: oklch(1 0 0);
+    --brand-shadow: #2f83ff;
 
     /* Semi-transparent background tokens (dark) */
-    --bg-50: oklch(0.13 0.008 270 / 50%);
-    --bg-70: oklch(0.13 0.008 270 / 70%);
-    --bg-80: oklch(0.13 0.008 270 / 80%);
-    --bg-90: oklch(0.13 0.008 270 / 90%);
-    --bg-95: oklch(0.13 0.008 270 / 95%);
-    --muted-20: oklch(0.20 0.008 270 / 20%);
-    --muted-30: oklch(0.20 0.008 270 / 30%);
-    --muted-50: oklch(0.20 0.008 270 / 50%);
-    --primary-hover: oklch(0.95 0.005 270 / 90%);
-    --secondary-hover: oklch(0.20 0.008 270 / 80%);
-    --destructive-hover: oklch(0.577 0.245 27 / 90%);
+    --bg-50: oklch(0.10 0.018 255 / 50%);
+    --bg-70: oklch(0.10 0.018 255 / 70%);
+    --bg-80: oklch(0.10 0.018 255 / 80%);
+    --bg-90: oklch(0.10 0.018 255 / 90%);
+    --bg-95: oklch(0.10 0.018 255 / 95%);
+    --muted-20: oklch(0.19 0.02 255 / 20%);
+    --muted-30: oklch(0.19 0.02 255 / 30%);
+    --muted-50: oklch(0.19 0.02 255 / 50%);
+    --primary-hover: oklch(0.68 0.19 255 / 92%);
+    --secondary-hover: oklch(0.22 0.035 255 / 82%);
+    --destructive-hover: oklch(0.62 0.18 255 / 92%);
 
-    --chart-1: oklch(0.65 0.18 300);
-    --chart-2: oklch(0.65 0.17 155);
-    --chart-3: oklch(0.72 0.16 85);
-    --chart-4: oklch(0.637 0.237 41);
-    --chart-5: oklch(0.65 0.17 20);
-    --chart-6: oklch(0.65 0.12 210);
+    --chart-1: oklch(0.68 0.19 255);
+    --chart-2: oklch(0.74 0.16 240);
+    --chart-3: oklch(0.80 0.11 225);
+    --chart-4: oklch(0.52 0.11 255);
+    --chart-5: oklch(0.66 0.04 255);
+    --chart-6: oklch(0.88 0.04 225);
 
-    --msg-user-bg: oklch(0.97 0.003 270);
-    --msg-user-text: oklch(0.15 0.02 270);
-    --msg-ai-bg: oklch(0.18 0.008 270);
-    --msg-ai-text: oklch(0.90 0.005 270);
-    --msg-system-bg: oklch(0.20 0.008 270);
-    --msg-system-text: oklch(0.58 0.012 270);
+    --msg-user-bg: oklch(0.68 0.19 255);
+    --msg-user-text: oklch(1 0 0);
+    --msg-ai-bg: oklch(0.16 0.018 255);
+    --msg-ai-text: oklch(0.92 0.006 255);
+    --msg-system-bg: oklch(0.19 0.02 255);
+    --msg-system-text: oklch(0.68 0.018 255);
 
-    --tool-bg: oklch(0.20 0.008 270);
+    --tool-bg: oklch(0.18 0.02 255);
     --tool-border: oklch(1 0 0 / 15%);
-    --tool-header-bg: oklch(0.22 0.008 270);
+    --tool-header-bg: oklch(0.21 0.03 255);
 
-    --thinking-bg: oklch(0.20 0.008 270);
-    --thinking-border: oklch(1 0 0 / 12%);
-    --thinking-text: oklch(0.62 0.01 270);
+    --thinking-bg: oklch(0.18 0.02 255);
+    --thinking-border: oklch(0.68 0.19 255 / 30%);
+    --thinking-text: oklch(0.70 0.02 255);
 
-    --card-hover-bg: oklch(0.18 0.008 270);
-    --input-focus-bg: oklch(0.16 0.008 270);
+    --card-hover-bg: oklch(0.18 0.02 255);
+    --input-focus-bg: oklch(0.14 0.018 255);
 
-    --session-drawer-bg: oklch(0.12 0.008 270);
+    --session-drawer-bg: oklch(0.09 0.018 255);
     --session-drawer-border: oklch(1 0 0 / 8%);
-    --session-item-hover: oklch(0.18 0.008 270);
-    --session-item-active: oklch(0.22 0.008 270);
+    --session-item-hover: oklch(0.17 0.02 255);
+    --session-item-active: oklch(0.22 0.04 255);
 
     /* CodeMirror syntax tokens — dark variants. See light-mode block above for
      * hue conventions. Brighter lightness + slightly higher chroma so each
      * token class stays legible against the dark editor surface. */
     --syntax-text: oklch(0.87 0.005 264);
     --syntax-gutter: oklch(0.52 0.012 264);
-    --syntax-active-line: oklch(0.70 0.15 250 / 12%);
-    --syntax-selection: oklch(0.70 0.15 250 / 28%);
-    --syntax-cursor: oklch(0.72 0.15 250);
-    --syntax-bracket: oklch(0.72 0.15 250);
-    --syntax-keyword: oklch(0.72 0.20 25);
-    --syntax-string: oklch(0.80 0.10 220);
-    --syntax-number: oklch(0.76 0.13 250);
+    --syntax-active-line: oklch(0.70 0.15 255 / 12%);
+    --syntax-selection: oklch(0.70 0.15 255 / 28%);
+    --syntax-cursor: oklch(0.72 0.15 255);
+    --syntax-bracket: oklch(0.72 0.15 255);
+    --syntax-keyword: oklch(0.74 0.16 260);
+    --syntax-string: oklch(0.82 0.10 225);
+    --syntax-number: oklch(0.76 0.13 255);
     --syntax-comment: oklch(0.60 0.012 264);
-    --syntax-def: oklch(0.76 0.16 300);
-    --syntax-property: oklch(0.76 0.13 250);
+    --syntax-def: oklch(0.76 0.14 260);
+    --syntax-property: oklch(0.76 0.13 255);
     --syntax-scrollbar: oklch(0.34 0.005 264);
     --syntax-scrollbar-hover: oklch(0.42 0.008 264);
   }
@@ -634,18 +631,18 @@ html {
     z-index: 0;
     pointer-events: none;
     background:
-      radial-gradient(ellipse 800px 500px at 10% 5%, oklch(0.55 0.15 280 / 10%) 0%, transparent 70%),
-      radial-gradient(ellipse 600px 600px at 85% 90%, oklch(0.55 0.18 300 / 7%) 0%, transparent 70%),
-      radial-gradient(ellipse 1000px 400px at 50% 40%, oklch(0.60 0.08 250 / 5%) 0%, transparent 70%);
+      radial-gradient(ellipse 800px 500px at 10% 5%, oklch(0.56 0.20 255 / 10%) 0%, transparent 70%),
+      radial-gradient(ellipse 600px 600px at 85% 90%, oklch(0.70 0.12 225 / 7%) 0%, transparent 70%),
+      radial-gradient(ellipse 1000px 400px at 50% 40%, oklch(0.45 0.10 260 / 5%) 0%, transparent 70%);
     background-size: 150% 150%;
     animation: aurora-shift 30s ease-in-out infinite alternate;
   }
 
   .dark .aurora-bg {
     background:
-      radial-gradient(ellipse 800px 500px at 15% 10%, oklch(0.55 0.18 280 / 14%) 0%, transparent 70%),
-      radial-gradient(ellipse 600px 600px at 85% 90%, oklch(0.62 0.20 300 / 12%) 0%, transparent 70%),
-      radial-gradient(ellipse 1000px 400px at 50% 50%, oklch(0.55 0.10 250 / 8%) 0%, transparent 70%);
+      radial-gradient(ellipse 800px 500px at 15% 10%, oklch(0.60 0.21 255 / 16%) 0%, transparent 70%),
+      radial-gradient(ellipse 600px 600px at 85% 90%, oklch(0.74 0.15 225 / 12%) 0%, transparent 70%),
+      radial-gradient(ellipse 1000px 400px at 50% 50%, oklch(0.50 0.10 260 / 9%) 0%, transparent 70%);
     background-size: 150% 150%;
   }
 
@@ -1195,13 +1192,12 @@ html {
 }
 
 /* Links: inherit the per-bubble text color so they stay readable on every
- * background. We previously hardcoded `var(--primary)`, but in light theme
- * `--primary` is near-white (oklch 0.95) which collides with the user
- * bubble's `--msg-user-bg` (also near-white, oklch 0.97) — making URLs in
- * user messages invisible. The MarkdownMessage component supplies the
- * underline affordance via Tailwind classes; color just needs to contrast
- * with the bubble, which `inherit`/`currentColor` guarantees because the
- * surrounding prose color is already themed per variant above. */
+ * background. We previously hardcoded `var(--primary)`, but chat bubbles can
+ * now use the same saturated brand blue as primary actions, so links inside
+ * user messages need to inherit the bubble text color. The MarkdownMessage
+ * component supplies the underline affordance via Tailwind classes; color just
+ * needs to contrast with the bubble, which `inherit`/`currentColor` guarantees
+ * because the surrounding prose color is already themed per variant above. */
 .message-bubble-user .prose a,
 .message-bubble-user .prose * a,
 .message-bubble-assistant .prose a,
@@ -1393,4 +1389,3 @@ html {
     outline-offset: 2px;
   }
 }
-

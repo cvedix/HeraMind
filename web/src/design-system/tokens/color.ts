@@ -5,48 +5,48 @@
  * Uses OKLCH for perceptual uniformity.
  */
 
-// Chart colors — vibrant, high-contrast palette for data visualization
-// Each color has distinct lightness/chroma for visual hierarchy and accessibility
+// Chart colors — blue/white/black product palette with distinct lightness
+// and chroma steps for visual hierarchy and accessibility.
 export const chartColors = {
-  1: 'oklch(0.62 0.22 270)',   // Indigo-Blue — primary series
-  2: 'oklch(0.65 0.20 155)',   // Emerald — growth/positive
-  3: 'oklch(0.72 0.17 65)',    // Amber — warm accent
-  4: 'oklch(0.67 0.20 25)',    // Orange — energy/alert
-  5: 'oklch(0.65 0.18 340)',   // Rose — highlight/attention
-  6: 'oklch(0.68 0.12 210)',   // Sky Blue — cool complement
+  1: 'oklch(0.52 0.23 255)',   // HeraMind blue — primary series
+  2: 'oklch(0.61 0.20 245)',   // Royal blue
+  3: 'oklch(0.70 0.14 235)',   // Sky blue
+  4: 'oklch(0.38 0.08 255)',   // Navy
+  5: 'oklch(0.56 0.06 255)',   // Slate blue
+  6: 'oklch(0.76 0.09 225)',   // Ice blue
 } as const
 
 export type ChartColor = keyof typeof chartColors
 
 // Hex equivalents for SVG rendering (Recharts needs hex, not OKLCH)
-// These are accurate sRGB conversions of the OKLCH values above
+// Hex approximations for SVG rendering (Recharts needs hex, not OKLCH)
 export const chartColorsHex = [
-  '#6360ef', // Indigo-Blue  (chartColors[1])
-  '#36b37e', // Emerald      (chartColors[2])
-  '#e8a735', // Amber        (chartColors[3])
-  '#e07838', // Orange       (chartColors[4])
-  '#d86098', // Rose         (chartColors[5])
-  '#4ca8c8', // Sky Blue     (chartColors[6])
+  '#005bea', // HeraMind blue (chartColors[1])
+  '#2563eb', // Royal blue    (chartColors[2])
+  '#38bdf8', // Sky blue      (chartColors[3])
+  '#0f172a', // Navy          (chartColors[4])
+  '#64748b', // Slate blue    (chartColors[5])
+  '#93c5fd', // Ice blue      (chartColors[6])
 ] as const
 
-// Status colors — tuned for semantic meaning with good contrast
+// Status colors — kept inside the product palette while preserving contrast
 export const statusColors = {
-  success: 'oklch(0.65 0.20 155)',      // Emerald green
-  warning: 'oklch(0.72 0.17 65)',       // Amber
-  error: 'oklch(0.58 0.22 25)',         // Deep red-orange
-  info: 'oklch(0.62 0.22 270)',         // Indigo-blue
-  neutral: 'oklch(0.55 0.02 260)',      // Cool gray
+  success: 'oklch(0.55 0.21 250)',      // Blue success
+  warning: 'oklch(0.36 0.06 255)',      // Navy warning
+  error: 'oklch(0.48 0.18 265)',        // Deep blue error
+  info: 'oklch(0.52 0.23 255)',         // HeraMind blue
+  neutral: 'oklch(0.55 0.02 255)',      // Cool gray
 } as const
 
 export type StatusColor = keyof typeof statusColors
 
 // Status colors with opacity for backgrounds
 export const statusBgColors = {
-  success: 'oklch(0.65 0.20 155 / 0.15)',
-  warning: 'oklch(0.72 0.17 65 / 0.15)',
-  error: 'oklch(0.58 0.22 25 / 0.15)',
-  info: 'oklch(0.62 0.22 270 / 0.15)',
-  neutral: 'oklch(0.55 0.02 260 / 0.1)',
+  success: 'oklch(0.55 0.21 250 / 0.15)',
+  warning: 'oklch(0.36 0.06 255 / 0.12)',
+  error: 'oklch(0.48 0.18 265 / 0.14)',
+  info: 'oklch(0.52 0.23 255 / 0.15)',
+  neutral: 'oklch(0.55 0.02 255 / 0.1)',
 } as const
 
 // Semantic color mappings
@@ -65,8 +65,8 @@ export const semanticColors = {
   failed: statusColors.error,
 
   // Trend directions
-  up: 'oklch(0.65 0.20 155)',       // Emerald
-  down: 'oklch(0.58 0.22 25)',      // Deep red-orange
+  up: 'oklch(0.55 0.21 250)',       // Blue positive
+  down: 'oklch(0.38 0.08 255)',     // Navy negative
   neutral: statusColors.neutral,
 } as const
 

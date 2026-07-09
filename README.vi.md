@@ -10,16 +10,16 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="Giấy phép">
-  <a href="https://github.com/camthink-ai/HeraMind/releases/latest">
-    <img src="https://img.shields.io/github/v/release/camthink-ai/HeraMind?color=informational&label=release" alt="Bản phát hành">
+  <a href="https://github.com/CVEDIX/HeraMind/releases/latest">
+    <img src="https://img.shields.io/github/v/release/CVEDIX/HeraMind?color=informational&label=release" alt="Bản phát hành">
   </a>
-  <a href="https://github.com/camthink-ai/HeraMind/stargazers">
-    <img src="https://img.shields.io/github/stars/camthink-ai/HeraMind?style=social" alt="Stars">
+  <a href="https://github.com/CVEDIX/HeraMind/stargazers">
+    <img src="https://img.shields.io/github/stars/CVEDIX/HeraMind?style=social" alt="Stars">
   </a>
   <a href="https://discord.gg/gkM7cc8gKb">
     <img src="https://img.shields.io/discord/0.svg?logo=discord&logoColor=ffffff&label=Discord&color=5865F2&link=https://discord.gg/gkM7cc8gKb" alt="Cộng đồng Discord">
   </a>
-  <img src="https://img.shields.io/github/last-commit/camthink-ai/HeraMind?label=last%20commit&color=success" alt="Commit gần nhất">
+  <img src="https://img.shields.io/github/last-commit/CVEDIX/HeraMind?label=last%20commit&color=success" alt="Commit gần nhất">
   <img src="https://img.shields.io/badge/Rust-1.85+-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Server-informational.svg" alt="Nền tảng">
 </p>
@@ -27,7 +27,7 @@
 <br/>
 
 <div align="center">
-  <img src="https://resources.camthink.ai/HeraMind/dashboardDemo.png" alt="Bảng điều khiển" width="800" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);" />
+  <img src="docs/img/dashboard-main.png" alt="Bảng điều khiển" width="800" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);" />
   <br/><sub><b>Bảng điều khiển</b></sub>
 </div>
 
@@ -60,12 +60,12 @@ HeraMind là một **nền tảng AI triển khai ở biên** đưa trí tuệ v
 
 **Ý tưởng cốt lõi**: Trò chuyện với thiết bị bằng ngôn ngữ tự nhiên. AI hiểu ý định của bạn, truy vấn trạng thái thiết bị, tạo quy tắc tự động hóa, và tự chủ thực hiện hành động.
 
-> **Tài liệu đầy đủ có trên [HeraMind Wiki](https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind).** README này là phần tổng quan nhanh — hãy xem wiki để đọc hướng dẫn đầy đủ:
+> **Tài liệu đầy đủ có trên [tài liệu HeraMind](https://docs.cvedix.com/heramind).** README này là phần tổng quan nhanh — hãy xem tài liệu để đọc hướng dẫn đầy đủ:
 >
-> - [HeraMind là gì?](https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind) — tổng quan sản phẩm và khái niệm
-> - [Khởi động nhanh trong năm phút](https://wiki.camthink.ai/docs/heramind/quick-start/five-minute-guide) — chạy hệ thống thật nhanh
-> - [Cài đặt & thiết lập](https://wiki.camthink.ai/docs/heramind/user-guide/install-setup) — triển khai, ứng dụng desktop, server, Docker
-> - [Hướng dẫn lập trình viên](https://wiki.camthink.ai/docs/heramind/developer-guide/overview) — API, extension, tích hợp
+> - [HeraMind là gì?](https://docs.cvedix.com/heramind) — tổng quan sản phẩm và khái niệm
+> - [Khởi động nhanh trong năm phút](https://docs.cvedix.com/heramind) — chạy hệ thống thật nhanh
+> - [Cài đặt & thiết lập](https://docs.cvedix.com/heramind) — triển khai, ứng dụng desktop, server, Docker
+> - [Hướng dẫn lập trình viên](https://docs.cvedix.com/heramind) — API, extension, tích hợp
 
 ### Vì sao chọn HeraMind?
 
@@ -116,21 +116,21 @@ HeraMind là một **nền tảng AI triển khai ở biên** đưa trí tuệ v
 - **Hệ thống extension** — Extension Native & WASM với cô lập tiến trình và quyền dựa trên capability
 - **Desktop đa nền tảng** — Ứng dụng native cho macOS, Windows, Linux qua Tauri
 - **Web thân thiện với di động** — UI web responsive tối ưu cho điện thoại và máy tính bảng
-- **i18n** — Hỗ trợ tiếng Anh và tiếng Trung
+- **i18n** — Hỗ trợ tiếng Việt, tiếng Anh và tiếng Trung
 - **Dark mode** — Giao diện sáng/tối tự động theo hệ thống
 - **Xác thực API key** — Phương án thay thế JWT cho truy cập bằng chương trình
 - **Công cụ CLI** — Giao diện dòng lệnh đầy đủ cho mọi thao tác
 
 ## Hệ sinh thái
 
-HeraMind là một hệ sinh thái mô-đun với các repository chuyên biệt cho từng mảng:
+HeraMind là một hệ sinh thái mô-đun với các tài nguyên chuyên biệt cho từng mảng:
 
-| Repository | Mục đích |
+| Tài nguyên | Mục đích |
 |------------|----------|
-| **[HeraMind](https://github.com/camthink-ai/HeraMind)** | Nền tảng lõi (repo này) — backend, frontend, ứng dụng desktop |
-| **[HeraMind-Extensions](https://github.com/camthink-ai/HeraMind-Extensions)** | Marketplace extension chính thức — thời tiết, YOLO detection, OCR, nhận diện khuôn mặt, streaming |
-| **[HeraMind-DeviceTypes](https://github.com/camthink-ai/HeraMind-DeviceTypes)** | Định nghĩa loại thiết bị — metric và lệnh chuẩn hóa cho phần cứng IoT |
-| **[HeraMind-Dashboard-Components](https://github.com/camthink-ai/HeraMind-Dashboard-Components)** | Marketplace widget dashboard — component React do cộng đồng đóng góp |
+| **[HeraMind](https://github.com/CVEDIX/HeraMind)** | Nền tảng lõi (repo này) — backend, frontend, ứng dụng desktop |
+| **[Tài liệu extension](https://docs.cvedix.com/heramind)** | Marketplace extension chính thức — thời tiết, YOLO detection, OCR, nhận diện khuôn mặt, streaming |
+| **[Tài liệu loại thiết bị](https://docs.cvedix.com/heramind)** | Định nghĩa loại thiết bị — metric và lệnh chuẩn hóa cho phần cứng IoT |
+| **[Tài liệu widget dashboard](https://docs.cvedix.com/heramind)** | Marketplace widget dashboard — component React do cộng đồng đóng góp |
 
 ### Extension có sẵn
 
@@ -150,23 +150,23 @@ HeraMind là một hệ sinh thái mô-đun với các repository chuyên biệt
 
 ### Thiết bị được hỗ trợ
 
-NE301 (Edge AI Camera) và NE101 (Sensing Camera). Xem [HeraMind-DeviceTypes](https://github.com/camthink-ai/HeraMind-DeviceTypes) để biết đầy đủ định nghĩa loại thiết bị.
+NE301 (Edge AI Camera) và NE101 (Sensing Camera). Xem [tài liệu loại thiết bị](https://docs.cvedix.com/heramind) để biết đầy đủ định nghĩa loại thiết bị.
 
 ### Đóng góp cho hệ sinh thái
 
 Chúng tôi chào đón đóng góp từ cộng đồng để phát triển hệ sinh thái HeraMind:
 
-- **[Xây dựng extension](https://github.com/camthink-ai/HeraMind-Extensions)** — Tạo extension cho nguồn dữ liệu, mô hình AI hoặc tích hợp mới. Làm theo [Hướng dẫn phát triển extension](https://wiki.camthink.ai/docs/heramind/developer-guide/overview) để bắt đầu, rồi gửi PR lên marketplace.
-- **[Thêm loại thiết bị](https://github.com/camthink-ai/HeraMind-DeviceTypes)** — Định nghĩa metric và lệnh cho phần cứng IoT của bạn để người khác dùng được ngay. Chỉ cần thêm một file JSON.
-- **[Tạo widget dashboard](https://github.com/camthink-ai/HeraMind-Dashboard-Components)** — Xây dựng component dashboard React tái sử dụng (biểu đồ, đồng hồ đo, bản đồ, v.v.) và chia sẻ với cộng đồng.
+- **[Xây dựng extension](https://docs.cvedix.com/heramind)** — Tạo extension cho nguồn dữ liệu, mô hình AI hoặc tích hợp mới. Làm theo [Hướng dẫn phát triển extension](https://docs.cvedix.com/heramind) để bắt đầu, rồi gửi PR lên marketplace.
+- **[Thêm loại thiết bị](https://docs.cvedix.com/heramind)** — Định nghĩa metric và lệnh cho phần cứng IoT của bạn để người khác dùng được ngay. Chỉ cần thêm một file JSON.
+- **[Tạo widget dashboard](https://docs.cvedix.com/heramind)** — Xây dựng component dashboard React tái sử dụng (biểu đồ, đồng hồ đo, bản đồ, v.v.) và chia sẻ với cộng đồng.
 
 ## Khởi động nhanh
 
-> Xem hướng dẫn đầy đủ tại [Hướng dẫn năm phút](https://wiki.camthink.ai/docs/heramind/quick-start/five-minute-guide) và [Cài đặt & thiết lập](https://wiki.camthink.ai/docs/heramind/user-guide/install-setup) trên wiki.
+> Xem hướng dẫn đầy đủ tại [Hướng dẫn năm phút](https://docs.cvedix.com/heramind) và [Cài đặt & thiết lập](https://docs.cvedix.com/heramind) trong tài liệu.
 
 ### Ứng dụng desktop (khuyến nghị)
 
-Tải bản phát hành mới nhất từ [GitHub Releases](https://github.com/camthink-ai/HeraMind/releases/latest).
+Tải bản phát hành mới nhất từ [GitHub Releases](https://github.com/CVEDIX/HeraMind/releases/latest).
 
 | Nền tảng | Định dạng |
 |----------|-----------|
@@ -181,7 +181,7 @@ Khi khởi chạy lần đầu, trình hướng dẫn thiết lập sẽ giúp b
 Cài đặt một dòng lệnh (Linux & macOS):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/camthink-ai/HeraMind/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | sh
 ```
 
 Truy cập web UI tại `http://your-server:9375`.
@@ -192,14 +192,14 @@ Truy cập web UI tại `http://your-server:9375`.
 **Docker:**
 
 ```bash
-git clone https://github.com/camthink-ai/HeraMind.git
+git clone https://github.com/CVEDIX/HeraMind.git
 cd HeraMind
 docker compose up -d
 ```
 
 **Phiên bản cụ thể:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/camthink-ai/HeraMind/main/scripts/install.sh | VERSION=0.9.1 sh
+curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | VERSION=0.9.1 sh
 ```
 
 **Thư mục tùy chỉnh:**
@@ -220,8 +220,8 @@ curl -fsSL ... | USE_NGINX=true sh
 **Cài đặt thủ công:**
 ```bash
 VERSION=0.9.1
-wget https://github.com/camthink-ai/HeraMind/releases/download/v${VERSION}/heramind-server-linux-amd64.tar.gz
-wget https://github.com/camthink-ai/HeraMind/releases/download/v${VERSION}/heramind-web-${VERSION}.tar.gz
+wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-server-linux-amd64.tar.gz
+wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-web-${VERSION}.tar.gz
 tar xzf heramind-server-linux-amd64.tar.gz
 sudo install -m 755 heramind /usr/local/bin/
 sudo install -m 755 heramind-extension-runner /usr/local/bin/
@@ -254,7 +254,7 @@ server {
 
 ```bash
 # Clone
-git clone https://github.com/camthink-ai/HeraMind.git
+git clone https://github.com/CVEDIX/HeraMind.git
 cd HeraMind
 
 # Chạy backend (cổng 9375)
@@ -424,7 +424,7 @@ heramind api-key create                # Tạo API key
 
 ## Phát triển extension
 
-Xây dựng extension bằng Rust SDK với cô lập tiến trình. Xem [Hướng dẫn lập trình viên](https://wiki.camthink.ai/docs/heramind/developer-guide/overview) và [HeraMind-Extensions](https://github.com/camthink-ai/HeraMind-Extensions) để có ví dụ đầy đủ.
+Xây dựng extension bằng Rust SDK với cô lập tiến trình. Xem [Hướng dẫn lập trình viên](https://docs.cvedix.com/heramind) và [tài liệu HeraMind](https://docs.cvedix.com/heramind) để có ví dụ đầy đủ.
 
 <details>
 <summary>Ví dụ nhanh</summary>
@@ -464,14 +464,14 @@ heramind_export!(MyExtension);
 
 ## Tài liệu
 
-Toàn bộ tài liệu người dùng, cài đặt, và lập trình viên nằm trên **[HeraMind Wiki](https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind)**:
+Toàn bộ tài liệu người dùng, cài đặt, và lập trình viên nằm trên **[tài liệu HeraMind](https://docs.cvedix.com/heramind)**:
 
-| Mục wiki | Nội dung |
+| Mục tài liệu | Nội dung |
 |----------|----------|
-| [Tổng quan sản phẩm](https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind) | HeraMind là gì, khái niệm lõi, kiến trúc |
-| [Khởi động nhanh](https://wiki.camthink.ai/docs/heramind/quick-start/five-minute-guide) | Hướng dẫn năm phút để chạy instance đầu tiên |
-| [Cài đặt & thiết lập](https://wiki.camthink.ai/docs/heramind/user-guide/install-setup) | Ứng dụng desktop, server, Docker, cấu hình |
-| [Hướng dẫn lập trình viên](https://wiki.camthink.ai/docs/heramind/developer-guide/overview) | REST/WebSocket API, extension, tích hợp |
+| [Tổng quan sản phẩm](https://docs.cvedix.com/heramind) | HeraMind là gì, khái niệm lõi, kiến trúc |
+| [Khởi động nhanh](https://docs.cvedix.com/heramind) | Hướng dẫn năm phút để chạy instance đầu tiên |
+| [Cài đặt & thiết lập](https://docs.cvedix.com/heramind) | Ứng dụng desktop, server, Docker, cấu hình |
+| [Hướng dẫn lập trình viên](https://docs.cvedix.com/heramind) | REST/WebSocket API, extension, tích hợp |
 
 Tài liệu tham khảo cục bộ trong repo (dành cho người đóng góp):
 
@@ -497,11 +497,11 @@ Tài liệu tham khảo cục bộ trong repo (dành cho người đóng góp):
 Tham gia cộng đồng để được hỗ trợ, chia sẻ ý tưởng, và cập nhật tin mới:
 
 - **[Discord](https://discord.gg/gkM7cc8gKb)** — Chat thời gian thực, hỗ trợ, và thông báo (khuyến nghị)
-- **[GitHub Issues](https://github.com/camthink-ai/HeraMind/issues)** — Báo lỗi và yêu cầu tính năng
-- **[GitHub Discussions](https://github.com/camthink-ai/HeraMind/discussions)** — Hỏi đáp dài hơn và thảo luận thiết kế
-- **[HeraMind Wiki](https://wiki.camthink.ai/docs/heramind/product-overview/what-is-heramind)** — Tài liệu đầy đủ
+- **[GitHub Issues](https://github.com/CVEDIX/HeraMind/issues)** — Báo lỗi và yêu cầu tính năng
+- **[GitHub Discussions](https://github.com/CVEDIX/HeraMind/discussions)** — Hỏi đáp dài hơn và thảo luận thiết kế
+- **[Tài liệu HeraMind](https://docs.cvedix.com/heramind)** — Tài liệu đầy đủ
 
-Thông báo phát hành được đăng trong kênh Discord `#announcements` và trên [GitHub Releases](https://github.com/camthink-ai/HeraMind/releases).
+Thông báo phát hành được đăng trong kênh Discord `#announcements` và trên [GitHub Releases](https://github.com/CVEDIX/HeraMind/releases).
 
 ## Đóng góp
 
