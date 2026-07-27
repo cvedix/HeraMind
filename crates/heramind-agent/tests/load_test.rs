@@ -11,7 +11,7 @@
 
 use heramind_agent::ai_agent::{AgentExecutor, AgentExecutorConfig};
 use heramind_agent::llm_backends::{OllamaConfig, OllamaRuntime};
-use heramind_core::{EventBus, MetricValue, HeraMindEvent};
+use heramind_core::{EventBus, HeraMindEvent, MetricValue};
 use heramind_storage::{
     AgentMemory, AgentSchedule, AgentStats, AgentStatus, AgentStore, AiAgent, ExecutionJournal,
     ExecutionMode, ScheduleType,

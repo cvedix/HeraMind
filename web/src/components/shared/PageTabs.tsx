@@ -130,7 +130,7 @@ export function PageTabsBar({
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div
             className={cn(
-              'inline-flex w-auto flex-wrap overflow-visible rounded-lg border border-border bg-muted p-1',
+              'inline-flex w-auto flex-wrap overflow-visible rounded-lg border border-border bg-card p-1',
               tabsClassName
             )}
           >
@@ -144,7 +144,7 @@ export function PageTabsBar({
                   className={cn(
                     'inline-flex items-center justify-center gap-2 rounded-sm px-4 py-1.5 h-9 text-sm font-medium whitespace-nowrap transition-all',
                     isActive
-                      ? 'bg-card text-foreground shadow-sm'
+                      ? 'bg-foreground text-background shadow-sm'
                       : 'text-muted-foreground hover:text-foreground'
                   )}
                 >
@@ -265,7 +265,7 @@ export function PageTabs({
             <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
               <div
                 className={cn(
-                  'inline-flex w-auto flex-wrap overflow-visible rounded-lg border border-border bg-muted p-1',
+                  'inline-flex w-auto flex-wrap overflow-visible rounded-lg border border-border bg-card p-1',
                   tabsClassName
                 )}
               >
@@ -279,7 +279,7 @@ export function PageTabs({
                       className={cn(
                         'inline-flex items-center justify-center gap-2 rounded-sm px-4 py-1.5 h-9 text-sm font-medium whitespace-nowrap transition-all',
                         isActive
-                          ? 'bg-card text-foreground shadow-sm'
+                          ? 'bg-foreground text-background shadow-sm'
                           : 'text-muted-foreground hover:text-foreground'
                       )}
                     >
@@ -366,7 +366,7 @@ export function PageTabs({
               'flex w-full flex-nowrap overflow-x-auto rounded-lg border border-border bg-muted-30 p-1',
               '[-webkit-overflow-scrolling:touch]',
               /* desktop: inline tabs with full text */
-              'md:inline-flex md:w-auto md:flex-wrap md:overflow-visible md:rounded-md md:border-0 md:bg-muted md:p-0.5',
+              'md:inline-flex md:w-auto md:flex-wrap md:overflow-visible md:rounded-md md:border-0 md:bg-card md:p-0.5',
               tabsClassName
             )}
           >
@@ -386,7 +386,7 @@ export function PageTabs({
                     /* desktop: full text display, centered, fixed height */
                     'md:inline-flex md:h-9 md:min-w-max md:shrink-0 md:rounded-sm md:px-4 md:py-1.5 md:whitespace-nowrap',
                     !isActive && 'md:hover:text-foreground',
-                    isActive && 'md:bg-background md:text-foreground md:shadow-sm'
+                    isActive && 'md:bg-foreground md:text-background md:shadow-sm'
                   )}
                 >
                   {tab.icon && <span className="shrink-0 h-4 w-4">{tab.icon}</span>}
@@ -484,7 +484,7 @@ export function PageTabsGrid({
               'grid w-full shrink-0 grid-cols-2 overflow-x-auto rounded-lg border border-border bg-muted-30 p-1',
               '[-webkit-overflow-scrolling:touch]',
               /* desktop: compact inline grid */
-              'md:w-auto md:overflow-visible md:rounded-md md:border-0 md:bg-muted',
+              'md:w-auto md:overflow-visible md:rounded-md md:border-0 md:bg-card',
               gridColsClass[gridCols],
               maxWidthClass
             )}
@@ -504,7 +504,7 @@ export function PageTabsGrid({
                       : 'text-muted-foreground',
                     /* desktop: compact, Radix-style active */
                     'md:min-h-0 md:rounded-sm md:px-3 md:py-1.5',
-                    isActive && 'md:bg-background md:text-foreground md:shadow-sm'
+                    isActive && 'md:bg-foreground md:text-background md:shadow-sm'
                   )}
                 >
                   {tab.icon && <span className="shrink-0">{tab.icon}</span>}

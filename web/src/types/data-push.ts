@@ -24,6 +24,7 @@ export interface RetryConfig {
 export interface BatchConfig {
   batch_size: number
   batch_interval_ms: number
+  format?: 'flat' | 'nested'
 }
 
 export interface PushTarget {

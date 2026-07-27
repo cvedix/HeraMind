@@ -12,11 +12,13 @@ import {
   Plus,
   Trash2,
   Pencil,
+  Copy,
   Check,
   X,
   PanelTop,
   ChevronUp,
   ChevronDown,
+  MoreVertical,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
@@ -28,6 +30,13 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import { textNano } from '@/design-system/tokens/typography'
 import type { Dashboard } from '@/types/dashboard'
@@ -39,6 +48,7 @@ export interface DashboardListSidebarProps {
   onSwitch: (id: string) => void
   onCreate: (name: string) => void
   onRename: (id: string, name: string) => void
+  onDuplicate: (id: string) => void
   onDelete: (id: string) => void
   /** Persist a new manual order (array of dashboard IDs, index 0 = top). */
   onReorder?: (newOrder: string[]) => void
@@ -60,6 +70,7 @@ function DashboardSidebarContent({
   onSwitch,
   onCreate,
   onRename,
+  onDuplicate,
   onDelete,
   onReorder,
   onOpenChange,
@@ -305,44 +316,61 @@ function DashboardSidebarContent({
                         </div>
                       </div>
 
-                      {/* Action buttons */}
-                      <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                        {canReorder && (
-                          <>
+                      {/* Action menu */}
+                      <div className="absolute right-1.5 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
                             <button
-                              className="h-6 w-6 flex items-center justify-center rounded hover:bg-muted transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                              disabled={index === 0}
-                              onClick={(e) => { e.stopPropagation(); moveByOne(dashboard.id, -1) }}
-                              title={t('sidebar.moveUp')}
-                              aria-label={t('sidebar.moveUp')}
+                              type="button"
+                              className="h-6 w-6 flex items-center justify-center rounded hover:bg-muted transition-colors"
+                              onClick={(e) => e.stopPropagation()}
+                              aria-label={t('sidebar.moreActions')}
+                              title={t('sidebar.moreActions')}
                             >
-                              <ChevronUp className="h-3 w-3" />
+                              <MoreVertical className="h-3 w-3" />
                             </button>
-                            <button
-                              className="h-6 w-6 flex items-center justify-center rounded hover:bg-muted transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                              disabled={index === dashboards.length - 1}
-                              onClick={(e) => { e.stopPropagation(); moveByOne(dashboard.id, 1) }}
-                              title={t('sidebar.moveDown')}
-                              aria-label={t('sidebar.moveDown')}
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="z-[200]">
+                            {canReorder && (
+                              <>
+                                <DropdownMenuItem
+                                  onClick={(e) => { e.stopPropagation(); moveByOne(dashboard.id, -1) }}
+                                  disabled={index === 0}
+                                >
+                                  <ChevronUp className="h-4 w-4" />
+                                  {t('sidebar.moveUp')}
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  onClick={(e) => { e.stopPropagation(); moveByOne(dashboard.id, 1) }}
+                                  disabled={index === dashboards.length - 1}
+                                >
+                                  <ChevronDown className="h-4 w-4" />
+                                  {t('sidebar.moveDown')}
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
+                              </>
+                            )}
+                            <DropdownMenuItem
+                              onClick={(e) => { e.stopPropagation(); setEditingId(dashboard.id); setEditingName(dashboard.name) }}
                             >
-                              <ChevronDown className="h-3 w-3" />
-                            </button>
-                          </>
-                        )}
-                        <button
-                          className="h-6 w-6 flex items-center justify-center rounded hover:bg-muted transition-colors"
-                          onClick={(e) => { e.stopPropagation(); setEditingId(dashboard.id); setEditingName(dashboard.name) }}
-                          title={t('sidebar.rename')}
-                        >
-                          <Pencil className="h-3 w-3" />
-                        </button>
-                        <button
-                          className="h-6 w-6 flex items-center justify-center rounded hover:bg-error-light text-muted-foreground hover:text-error transition-colors"
-                          onClick={(e) => { e.stopPropagation(); handleDelete(dashboard.id) }}
-                          title={t('sidebar.delete')}
-                        >
-                          <Trash2 className="h-3 w-3" />
-                        </button>
+                              <Pencil className="h-4 w-4" />
+                              {t('sidebar.rename')}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={(e) => { e.stopPropagation(); onDuplicate(dashboard.id) }}
+                            >
+                              <Copy className="h-4 w-4" />
+                              {t('sidebar.duplicateDashboard')}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={(e) => { e.stopPropagation(); handleDelete(dashboard.id) }}
+                              className="text-error focus:text-error"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                              {t('sidebar.delete')}
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
                       </div>
                     </>
                   )}
@@ -369,6 +397,7 @@ export function DashboardListSidebar({
   onSwitch,
   onCreate,
   onRename,
+  onDuplicate,
   onDelete,
   onReorder,
   open = true,
@@ -396,6 +425,7 @@ export function DashboardListSidebar({
           onSwitch={onSwitch}
           onCreate={onCreate}
           onRename={onRename}
+          onDuplicate={onDuplicate}
           onDelete={onDelete}
           onReorder={onReorder}
           onOpenChange={onOpenChange}
@@ -438,6 +468,7 @@ export function DashboardListSidebar({
           onSwitch={onSwitch}
           onCreate={onCreate}
           onRename={onRename}
+          onDuplicate={onDuplicate}
           onDelete={onDelete}
           onReorder={onReorder}
           onOpenChange={onOpenChange}

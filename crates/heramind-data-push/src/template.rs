@@ -32,7 +32,6 @@ impl TemplateRenderer {
                     "source_id": context.source_id,
                     "value": context.value,
                     "timestamp": context.timestamp,
-                    "metadata": context.metadata,
                 });
                 let registry = self.registry.lock().unwrap();
                 let rendered = registry.render_template(tmpl, &data)?;
@@ -44,7 +43,6 @@ impl TemplateRenderer {
                     "source_id": context.source_id,
                     "value": context.value,
                     "timestamp": context.timestamp,
-                    "metadata": context.metadata,
                 }))?)
             }
         }
@@ -103,7 +101,6 @@ mod tests {
             source_id: "device:s1:temp".to_string(),
             value: json!(25.5),
             timestamp: 1700000000,
-            metadata: None,
         };
         let result = renderer.render(&None, &ctx).unwrap();
         assert!(result.contains("device:s1:temp"));
@@ -117,7 +114,6 @@ mod tests {
             source_id: "device:s1:temp".to_string(),
             value: json!(25.5),
             timestamp: 1700000000,
-            metadata: None,
         };
         let template = Some("Temperature: {{value}} from {{source_id}}".to_string());
         let result = renderer.render(&template, &ctx).unwrap();

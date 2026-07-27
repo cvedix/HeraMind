@@ -219,6 +219,9 @@ fn convert_metric_value(value: MetricValue) -> heramind_core::MetricValue {
                 .collect();
             heramind_core::MetricValue::Json(json!(json_arr))
         }
+        // Fallback: Binary values should normally be converted to URLs by the ingestion fork
+        // (MqttAdapter/WebhookAdapter::convert_binary_to_url) before reaching this point.
+        // This handles edge cases where conversion failed or no data_dir is configured.
         MetricValue::Binary(v) => heramind_core::MetricValue::String(STANDARD.encode(v)),
         MetricValue::Null => heramind_core::MetricValue::String("null".to_string()),
     }

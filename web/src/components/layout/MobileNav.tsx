@@ -154,16 +154,16 @@ export function MobileNav() {
         // a few pixels, especially near the rounded-lg corners.
         className={cn(
           "group relative flex w-full items-center gap-3 rounded-lg p-3 text-left transition-colors",
-          active ? "bg-muted" : "hover:bg-muted-50 active:bg-muted",
+          active ? "" : "hover:bg-muted-50 active:bg-muted",
         )}
       >
         <Icon
-          className={cn("h-5 w-5 shrink-0", active ? "text-foreground" : "text-muted-foreground")}
+          className={cn("h-5 w-5 shrink-0", active ? "text-brand brand-icon-stroke" : "text-muted-foreground")}
         />
         <span
           className={cn(
             "flex-1 truncate text-sm",
-            active ? "font-medium text-foreground" : "text-muted-foreground",
+            active ? "font-medium text-brand" : "text-muted-foreground",
           )}
         >
           {t(entry.labelKey)}

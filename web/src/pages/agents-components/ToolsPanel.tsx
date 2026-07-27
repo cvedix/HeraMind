@@ -444,7 +444,7 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
               <section>
                 <h3 className="text-xs uppercase tracking-wide text-muted-foreground mb-1.5">
                   {t("agents:detail.toolsParameters")}
-                  <span className="ml-1 text-muted-foreground/70">({dialogParamCount})</span>
+                  <span className="ml-1 text-muted-foreground">({dialogParamCount})</span>
                 </h3>
                 {dialogParamCount === 0 ? (
                   <p className="text-xs text-muted-foreground italic">
@@ -482,7 +482,7 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
 function MetaItem({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="flex flex-col gap-0.5">
-      <span className="text-[10px] uppercase tracking-wide text-muted-foreground/80">
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
         {label}
       </span>
       <div className="text-sm">{children}</div>

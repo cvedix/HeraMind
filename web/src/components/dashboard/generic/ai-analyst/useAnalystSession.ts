@@ -604,6 +604,24 @@ export function useAnalystSession({
           break
         }
 
+        case 'AgentProgress': {
+          const progressData = data as { stage: string; stage_label: string; details?: string }
+          // Show stage progress in the streaming bubble (e.g. "Collecting data...",
+          // "Analyzing 5 data points...", "Executing decisions...")
+          const text = progressData.details || progressData.stage_label
+          if (text) setStreamingContent(text)
+          break
+        }
+
+        case 'AgentThinking': {
+          const thinkingData = data as { description: string }
+          // Thinking events give finer-grained step descriptions than progress
+          // stages (e.g. "Collected device-temp: 5 data points", "Tool-calling
+          // round 2"). Prefer the latest thinking description.
+          if (thinkingData.description) setStreamingContent(thinkingData.description)
+          break
+        }
+
         case 'AgentExecutionCompleted': {
           // Stop the polling — event arrived successfully
           if (streamingPollRef.current) {
@@ -611,12 +629,13 @@ export function useAnalystSession({
             streamingPollRef.current = null
           }
 
+          // Stop the "Analyzing" badge immediately, but DON'T clear streamingContent/
+          // streamingMsgId yet — the bubble still shows the last progress text while
+          // we fetch the result. Clearing too early causes a blank-bubble gap between
+          // Completed event and getExecution API response.
           setIsStreaming(false)
           isStreamingRef.current = false
-          setStreamingContent('')
           const placeholderId = streamingMsgIdRef.current
-          setStreamingMsgId(null)
-          streamingMsgIdRef.current = null
 
           const completedData = data as { agent_id: string; execution_id: string; success: boolean; duration_ms: number }
           // Cross-path dedup: skip if this execution was already added (history or recovery)
@@ -625,6 +644,9 @@ export function useAnalystSession({
             if (placeholderId) {
               setMessages((prev) => prev.filter((m) => m.id !== placeholderId))
             }
+            setStreamingContent('')
+            setStreamingMsgId(null)
+            streamingMsgIdRef.current = null
             break
           }
           addSeenExecId(completedData.execution_id)
@@ -648,6 +670,10 @@ export function useAnalystSession({
                   : prev
                 return trimMessages([...withoutStreaming, aiMsg])
               })
+              // NOW safe to clear streaming state — result is in the timeline
+              setStreamingContent('')
+              setStreamingMsgId(null)
+              streamingMsgIdRef.current = null
             })
             .catch((err) => {
               const errMsg: AnalystMessage = {
@@ -662,6 +688,9 @@ export function useAnalystSession({
                   : prev
                 return trimMessages([...withoutStreaming, errMsg])
               })
+              setStreamingContent('')
+              setStreamingMsgId(null)
+              streamingMsgIdRef.current = null
             })
           break
         }
@@ -769,10 +798,11 @@ export function useAnalystSession({
     return () => { cancelled = true }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Sync llm_backend_id and user_prompt when config changes after agent creation.
+  // Sync llm_backend_id, user_prompt, and context_window_size when config changes after agent creation.
   // Also fires on initial connection (isConnected transition) to sync saved config.
   const prevModelIdRef = useRef<string | undefined>(undefined)
   const prevPromptRef = useRef<string | undefined>(undefined)
+  const prevContextSizeRef = useRef<number | undefined>(undefined)
   useEffect(() => {
     const agentId = agentIdRef.current
     if (!agentId || !isConnected) return
@@ -785,6 +815,10 @@ export function useAnalystSession({
     if (config.systemPrompt && config.systemPrompt !== prevPromptRef.current) {
       updates.user_prompt = config.systemPrompt
       prevPromptRef.current = config.systemPrompt
+    }
+    if (config.contextWindowSize && config.contextWindowSize !== prevContextSizeRef.current) {
+      updates.context_window_size = config.contextWindowSize
+      prevContextSizeRef.current = config.contextWindowSize
     }
 
     if (Object.keys(updates).length === 0) return
@@ -801,7 +835,7 @@ export function useAnalystSession({
     api.updateAgent(agentId, updates).catch(() => {
       // Non-critical: agent will use whatever configuration it has
     })
-  }, [config.modelId, config.systemPrompt, isConnected])
+  }, [config.modelId, config.systemPrompt, config.contextWindowSize, isConnected])
 
   // Sync agent name when title changes after agent creation
   const prevTitleRef = useRef(title)

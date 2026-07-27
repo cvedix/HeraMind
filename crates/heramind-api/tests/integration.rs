@@ -22,7 +22,7 @@ use tokio::time::sleep;
 /// 3. Action is published to event bus
 #[tokio::test]
 async fn test_device_to_rule_action_flow() {
-    use heramind_core::event::{MetricValue, HeraMindEvent};
+    use heramind_core::event::{HeraMindEvent, MetricValue};
     use heramind_core::eventbus::EventBus;
 
     // Create event bus
@@ -149,7 +149,7 @@ async fn test_llm_periodic_review_flow() {
 /// Verify that events are published with minimal latency
 #[tokio::test]
 async fn test_event_streaming_performance() {
-    use heramind_core::event::{MetricValue, HeraMindEvent};
+    use heramind_core::event::{HeraMindEvent, MetricValue};
     use heramind_core::eventbus::EventBus;
     use std::time::Instant;
 
@@ -187,7 +187,7 @@ async fn test_event_streaming_performance() {
 /// Verify broadcast functionality
 #[tokio::test]
 async fn test_broadcast_to_multiple_subscribers() {
-    use heramind_core::event::{MetricValue, HeraMindEvent};
+    use heramind_core::event::{HeraMindEvent, MetricValue};
     use heramind_core::eventbus::EventBus;
 
     let bus = EventBus::new();
@@ -225,7 +225,7 @@ async fn test_broadcast_to_multiple_subscribers() {
 /// Verify that filtered subscribers only receive matching events
 #[tokio::test]
 async fn test_filtered_subscriptions() {
-    use heramind_core::event::{MetricValue, HeraMindEvent};
+    use heramind_core::event::{HeraMindEvent, MetricValue};
     use heramind_core::eventbus::EventBus;
 
     let bus = EventBus::new();
@@ -270,7 +270,7 @@ async fn test_filtered_subscriptions() {
 /// Verify that event metadata (source, timestamp, etc.) is correctly attached
 #[tokio::test]
 async fn test_event_metadata_preserved() {
-    use heramind_core::event::{MetricValue, HeraMindEvent};
+    use heramind_core::event::{HeraMindEvent, MetricValue};
     use heramind_core::eventbus::EventBus;
 
     let bus = EventBus::new();

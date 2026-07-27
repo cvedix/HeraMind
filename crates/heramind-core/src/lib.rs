@@ -23,7 +23,7 @@ pub use llm::backend::{BackendCapabilities, GenerationParams, LlmRuntime};
 pub use message::{Content, ContentPart, Message, MessageRole};
 
 // Event exports
-pub use event::{MetricValue, HeraMindEvent};
+pub use event::{HeraMindEvent, MetricValue};
 
 // Event bus exports
 pub use eventbus::EventBus;

@@ -27,7 +27,12 @@ export function SetupPage() {
 
   const [step, setStep] = useState<SetupStep>('account')
   const [checking, setChecking] = useState(true)
-  const [accountInfo, setAccountInfo] = useState<{ username: string; password: string } | null>(null)
+  const [accountInfo, setAccountInfo] = useState<{
+    username: string
+    password: string
+    token: string
+    timezone: string
+  } | null>(null)
 
   const getApiUrl = (path: string) => `${getApiBase()}${path}`
 
@@ -68,8 +73,8 @@ export function SetupPage() {
     }
   }
 
-  const handleAccountCreated = async (username: string, password: string, token: string) => {
-    setAccountInfo({ username, password })
+  const handleAccountCreated = async (username: string, password: string, token: string, timezone: string) => {
+    setAccountInfo({ username, password, token, timezone })
     // Complete setup (mark as done on server)
     try {
       await fetch(getApiUrl('/setup/complete'), {
@@ -116,6 +121,9 @@ export function SetupPage() {
     return (
       <CompleteStep
         username={accountInfo?.username || ''}
+        initialTimezone={accountInfo?.timezone || 'Asia/Shanghai'}
+        token={accountInfo?.token || ''}
+        getApiUrl={getApiUrl}
         onComplete={handleComplete}
       />
     )

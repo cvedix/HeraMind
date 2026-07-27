@@ -5,6 +5,8 @@
  * Contains base64 detection, image format identification, and URL normalization.
  */
 
+import { getServerOrigin } from '@/lib/api'
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -117,6 +119,18 @@ const MIME_TO_FORMAT: Record<string, ImageFormatType> = {
 
 /** Inner computation — separated for caching. */
 function computeNormalizedImage(trimmed: string, valueStr: string): NormalizedImage | null {
+  // 0. API image URL (/api/images/...) — stored as file, serve via authenticated route.
+  //    Must prepend server origin (frontend ≠ API origin in Tauri/Vite dev).
+  if (trimmed.startsWith('/api/images/')) {
+    return {
+      src: getServerOrigin() + trimmed,
+      format: 'unknown',
+      isBase64: false,
+      isDataUrl: false,
+      originalValue: valueStr,
+    }
+  }
+
   // 1. Proper data:image/ URL
   if (trimmed.startsWith('data:image/')) {
     // Fast path: already a well-formed base64 data URL — skip expensive

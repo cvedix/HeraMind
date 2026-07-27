@@ -345,10 +345,23 @@ impl ShellTool {
                 // an already-exited process group (would be a benign ESRCH
                 // but disarming makes the intent obvious).
                 guard.child = None;
+                let raw_stdout = String::from_utf8_lossy(&out).into_owned();
+                let raw_stderr = String::from_utf8_lossy(&err).into_owned();
+                // Truncate SUBPROCESS output here (not in execute()) so that
+                // in-process `heramind` output — returned unchanged by
+                // try_in_process_dispatch above — reaches the streaming slim
+                // layer intact. Subprocess stdout is arbitrary host output
+                // (logs, file dumps) with no downstream size guard, so the
+                // configured char cap still applies; in-process output's
+                // large payloads are images/base64 the slim layer caches as
+                // `$cached` refs, and the old 10k-char cap destroyed those
+                // bytes before slim could cache them.
+                let (stdout, stderr) =
+                    truncate_output(&raw_stdout, &raw_stderr, self.config.max_output_chars);
                 Ok(CommandOutput {
                     exit_code: status.code(),
-                    stdout: String::from_utf8_lossy(&out).into_owned(),
-                    stderr: String::from_utf8_lossy(&err).into_owned(),
+                    stdout,
+                    stderr,
                     timed_out: false,
                 })
             }
@@ -950,8 +963,13 @@ Commands like `open` (macOS), `xdg-open` (Linux), `start`/`explorer` (Windows), 
 
         let output = self.execute_command(command, working_dir, timeout).await?;
 
-        let (stdout, stderr) =
-            truncate_output(&output.stdout, &output.stderr, self.config.max_output_chars);
+        // execute_command already truncated subprocess output; in-process
+        // `heramind` output is left intact so the streaming slim layer can
+        // cache image/base64 payloads as `$cached` refs before any size cap
+        // destroys them. (stdout/stderr are moved out; exit_code/timed_out
+        // are still read below.)
+        let stdout = output.stdout;
+        let stderr = output.stderr;
 
         tracing::info!(
             command = %command,

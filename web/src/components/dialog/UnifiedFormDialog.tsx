@@ -343,6 +343,7 @@ export function UnifiedFormDialog({
             'duration-200',
             'animate-in fade-in zoom-in-95 slide-in-from-left-1/2 slide-in-from-top-[48%]',
             'rounded-lg sm:rounded-xl',
+            'overflow-hidden',
             'max-h-[calc(100dvh-2rem)] sm:max-h-[85dvh]',
             'flex flex-col',
             widthClasses[width],
@@ -391,9 +392,12 @@ export function UnifiedFormDialog({
             </div>
           )}
 
-          {/* Footer */}
+          {/* Footer — no bg: inherits bg-popover so it matches the header and
+              content. A bg-muted-30 wash here read as #FBFBFC, visibly
+              different from the white body. border-t alone separates
+              content from actions (same approach as the mobile footer). */}
           {footerContent && (
-            <div className="flex items-center justify-end gap-2 px-6 py-4 border-t shrink-0 bg-muted-30">
+            <div className="flex items-center justify-end gap-2 px-6 py-4 border-t shrink-0">
               {footerContent}
             </div>
           )}

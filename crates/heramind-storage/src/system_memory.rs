@@ -1048,9 +1048,10 @@ impl MarkdownMemoryStore {
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.md", name));
         // Serialize against concurrent writers to the same custom file.
-        let _lock = self.custom_write_lock.lock().map_err(|e| {
-            Error::Storage(format!("Custom write lock poisoned: {}", e))
-        })?;
+        let _lock = self
+            .custom_write_lock
+            .lock()
+            .map_err(|e| Error::Storage(format!("Custom write lock poisoned: {}", e)))?;
         atomic_write::write(&path, content)
             .map_err(|e| Error::Storage(format!("Failed to write custom file {}: {}", name, e)))?;
         info!(name = %name, chars = char_count, "Wrote custom memory file");
@@ -1135,9 +1136,10 @@ impl MarkdownMemoryStore {
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.md", name));
         // Serialize against concurrent writers to the same agent custom file.
-        let _lock = self.custom_write_lock.lock().map_err(|e| {
-            Error::Storage(format!("Custom write lock poisoned: {}", e))
-        })?;
+        let _lock = self
+            .custom_write_lock
+            .lock()
+            .map_err(|e| Error::Storage(format!("Custom write lock poisoned: {}", e)))?;
         atomic_write::write(&path, content).map_err(|e| {
             Error::Storage(format!(
                 "Failed to write agent custom file {}/{}: {}",

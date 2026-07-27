@@ -11,6 +11,7 @@
 //! - Memory and resource limits are enforced
 //! - Clean separation of concerns
 
+pub mod accel;
 pub mod capability_services;
 pub mod context;
 pub mod event_dispatcher;

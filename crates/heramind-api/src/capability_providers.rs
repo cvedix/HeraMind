@@ -299,6 +299,7 @@ impl DeviceCapabilityProvider {
             uplink_samples: vec![],
             commands,
             default_offline_timeout_secs: None,
+            store_raw: None,
         };
 
         device_service
@@ -2019,7 +2020,10 @@ pub async fn register_builtin_providers_with_dispatcher(
         event_bus_for_chat.clone(),
     ));
     context
-        .register_provider("heramind-api::chat_stream".to_string(), chat_stream_provider)
+        .register_provider(
+            "heramind-api::chat_stream".to_string(),
+            chat_stream_provider,
+        )
         .await;
 
     let chat_session_provider = Arc::new(ChatSessionCapabilityProvider::new(
@@ -2132,9 +2136,10 @@ impl CompositeCapabilityProvider {
             session_manager_holder.clone(),
             event_bus_for_chat.clone(),
         ));
-        composite
-            .providers
-            .insert("heramind-api::chat_stream".to_string(), chat_stream_provider);
+        composite.providers.insert(
+            "heramind-api::chat_stream".to_string(),
+            chat_stream_provider,
+        );
 
         // ChatSession provider (Phase 2: persistent session-stream + direct
         // routing). Shares the same session_manager holder + event_bus as

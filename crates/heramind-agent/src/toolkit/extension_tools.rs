@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use super::error::Result as ToolResult;
@@ -217,33 +218,55 @@ impl ExtensionTool {
         })
     }
 
-    /// Normalize image-related arguments by stripping data URI prefixes.
+    /// Normalize image-related arguments for extensions.
     ///
-    /// Device tools return image metrics as `data:image/jpeg;base64,<base64data>` data URIs.
-    /// Extensions expect raw base64 data. This function strips the prefix from all string
-    /// parameters that contain data URIs, ensuring compatibility.
+    /// Extensions run in a separate process and cannot resolve a hostless
+    /// internal path, so two image forms must be reduced to raw base64 before
+    /// crossing the process boundary:
     ///
-    /// Handles both direct string values and strings nested in objects/arrays.
-    fn normalize_image_args(args: &Value) -> Value {
+    /// - `/api/images/...` internal file URLs (the v0.9.6 image-storage form):
+    ///   resolved to bytes via
+    ///   `resolve_internal_image_to_data_url`, which applies the same
+    ///   symlink/size/magic-byte guards as the public `GET /api/images/` route.
+    /// - `data:image/...;base64,<data>` data URIs: the prefix is stripped.
+    ///
+    /// Both become a `data:` URL, then the `;base64,` strip below reduces them
+    /// to the raw base64 payload extensions expect. Handles direct strings and
+    /// strings nested in objects/arrays.
+    fn normalize_image_args(args: &Value, data_dir: &Path) -> Value {
         match args {
             Value::String(s) => {
+                // Resolve internal /api/images/ URLs → data URL. If resolution
+                // fails (missing file, too large, non-image, traversal) fall
+                // back to the original string so the extension surfaces its own
+                // error instead of the arg being silently dropped.
+                let resolved: String = if s.starts_with("/api/images/") {
+                    heramind_devices::image_storage::resolve_internal_image_to_data_url(s, data_dir)
+                        .unwrap_or_else(|| s.clone())
+                } else {
+                    s.clone()
+                };
                 // Strip data URI prefix: "data:image/jpeg;base64,<data>" → "<data>"
-                if let Some(comma_pos) = s.find(";base64,") {
-                    let base64_data = &s[comma_pos + 8..]; // skip ";base64,"
+                if let Some(comma_pos) = resolved.find(";base64,") {
+                    let base64_data = &resolved[comma_pos + 8..]; // skip ";base64,"
                     if !base64_data.is_empty() {
                         return Value::String(base64_data.to_string());
                     }
                 }
-                args.clone()
+                Value::String(resolved)
             }
             Value::Object(map) => {
                 let normalized: serde_json::Map<String, Value> = map
                     .iter()
-                    .map(|(k, v)| (k.clone(), Self::normalize_image_args(v)))
+                    .map(|(k, v)| (k.clone(), Self::normalize_image_args(v, data_dir)))
                     .collect();
                 Value::Object(normalized)
             }
-            Value::Array(arr) => Value::Array(arr.iter().map(Self::normalize_image_args).collect()),
+            Value::Array(arr) => Value::Array(
+                arr.iter()
+                    .map(|v| Self::normalize_image_args(v, data_dir))
+                    .collect(),
+            ),
             _ => args.clone(),
         }
     }
@@ -270,11 +293,13 @@ impl Tool for ExtensionTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<ToolOutput> {
-        // Normalize image data in parameters: strip data URI prefix so extensions
-        // receive raw base64 data instead of "data:image/jpeg;base64,..." strings.
-        // Extensions (image analyzers, YOLO, etc.) expect raw base64 and fail with
-        // "Invalid base64: Invalid symbol 58" when they receive the data URI prefix.
-        let normalized_args = Self::normalize_image_args(&args);
+        // Normalize image data in parameters so extensions receive raw base64:
+        // - resolve /api/images/ internal URLs to bytes (extensions are a
+        //   separate process and can't read hostless internal paths);
+        // - strip the data:image/...;base64, prefix (extensions fail with
+        //   "Invalid base64: Invalid symbol 58" when they get the data URI).
+        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+        let normalized_args = Self::normalize_image_args(&args, std::path::Path::new(&data_dir));
 
         // Execute with the centralized SLOW tier timeout (300s) for extensions that
         // need longer inference. Routed through `timeouts` so the ceiling is tunable
@@ -519,7 +544,7 @@ mod tests {
             "image": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ==",
             "prompt": "Analyze this image"
         });
-        let normalized = ExtensionTool::normalize_image_args(&args);
+        let normalized = ExtensionTool::normalize_image_args(&args, std::path::Path::new("data"));
         assert_eq!(normalized["image"], "/9j/4AAQSkZJRgABAQ==");
         assert_eq!(normalized["prompt"], "Analyze this image"); // unchanged
     }
@@ -531,7 +556,7 @@ mod tests {
             "image": "/9j/4AAQSkZJRgABAQ==",
             "prompt": "Analyze"
         });
-        let normalized = ExtensionTool::normalize_image_args(&args);
+        let normalized = ExtensionTool::normalize_image_args(&args, std::path::Path::new("data"));
         assert_eq!(normalized["image"], "/9j/4AAQSkZJRgABAQ==");
     }
 
@@ -544,7 +569,7 @@ mod tests {
                 "model": "yolov8"
             }
         });
-        let normalized = ExtensionTool::normalize_image_args(&args);
+        let normalized = ExtensionTool::normalize_image_args(&args, std::path::Path::new("data"));
         assert_eq!(normalized["params"]["image"], "iVBORw0KGgo=");
         assert_eq!(normalized["params"]["model"], "yolov8");
     }
@@ -558,7 +583,7 @@ mod tests {
                 "data:image/png;base64,iVBORw0K=="
             ]
         });
-        let normalized = ExtensionTool::normalize_image_args(&args);
+        let normalized = ExtensionTool::normalize_image_args(&args, std::path::Path::new("data"));
         assert_eq!(normalized["images"][0], "/9j/AAA==");
         assert_eq!(normalized["images"][1], "iVBORw0K==");
     }
@@ -571,9 +596,61 @@ mod tests {
             "count": 42,
             "enabled": true
         });
-        let normalized = ExtensionTool::normalize_image_args(&args);
+        let normalized = ExtensionTool::normalize_image_args(&args, std::path::Path::new("data"));
         assert_eq!(normalized["city"], "Beijing");
         assert_eq!(normalized["count"], 42);
         assert_eq!(normalized["enabled"], true);
+    }
+
+    #[test]
+    fn test_normalize_image_args_resolves_api_images_url() {
+        // /api/images/ internal URLs must be resolved to raw base64 so the
+        // extension (a separate process) can read them. This is the same
+        // url→base64 transform data-push / transform / agent collector apply
+        // at their boundaries.
+        let temp =
+            std::env::temp_dir().join(format!("heramind_test_ext_tool_{}", uuid::Uuid::new_v4()));
+        let images_dir = temp.join("images").join("dev").join("image");
+        std::fs::create_dir_all(&images_dir).unwrap();
+        // PNG signature + IHDR chunk header: enough for detect_extension to
+        // classify as png and clear the magic-byte guard in read_internal_image_url.
+        let png = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52,
+        ];
+        std::fs::write(images_dir.join("1234567890.png"), png).unwrap();
+
+        let args = json!({ "image": "/api/images/dev/image/1234567890.png" });
+        let normalized = ExtensionTool::normalize_image_args(&args, &temp);
+        let got = normalized["image"]
+            .as_str()
+            .expect("image should be a string");
+        // Raw base64: no data: prefix, no internal path leaked.
+        assert!(!got.starts_with("data:"), "got: {got}");
+        assert!(!got.starts_with("/api/images/"), "got: {got}");
+        // And it must decode back to the original bytes.
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(got)
+            .expect("should be valid base64");
+        assert_eq!(decoded, png);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_normalize_image_args_api_images_missing_falls_back() {
+        // A /api/images/ URL whose file is missing must fall back to the
+        // original string (so the extension surfaces its own error) rather than
+        // panic or silently drop the arg.
+        let temp = std::env::temp_dir().join(format!(
+            "heramind_test_ext_tool_empty_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let args = json!({ "image": "/api/images/nope/image/0.png" });
+        let normalized = ExtensionTool::normalize_image_args(&args, &temp);
+        assert_eq!(normalized["image"], "/api/images/nope/image/0.png");
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

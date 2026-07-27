@@ -148,6 +148,6 @@ rm -f "$CERT_FILE"
 log_info "Temporary P12 file removed"
 
 log_step "Next steps:"
-log_info "1. Go to: https://github.com/camthink-ai/HeraMind/settings/secrets/actions"
+log_info "1. Go to: https://github.com/cvedix/HeraMind/settings/secrets/actions"
 log_info "2. Add each secret from above"
 log_info "3. Push a new tag to trigger build: git tag v0.3.0 && git push origin v0.3.0"

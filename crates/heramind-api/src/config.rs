@@ -21,7 +21,8 @@ pub use heramind_devices::EmbeddedBrokerConfig;
 const SETTINGS_DB_PATH: &str = "data/settings.redb";
 
 /// Get or create the global settings store (cached).
-fn get_settings_store() -> Result<Arc<heramind_storage::SettingsStore>, Box<dyn std::error::Error>> {
+fn get_settings_store() -> Result<Arc<heramind_storage::SettingsStore>, Box<dyn std::error::Error>>
+{
     // SettingsStore::open already has internal caching via SETTINGS_STORE_SINGLETON
     Ok(heramind_storage::SettingsStore::open(SETTINGS_DB_PATH)?)
 }

@@ -84,7 +84,9 @@ pub fn config_to_device_instance(
             MdlConnectionStatus::Connecting => {
                 heramind_devices::mdl_format::ConnectionStatus::Connecting
             }
-            MdlConnectionStatus::Connected => heramind_devices::mdl_format::ConnectionStatus::Online,
+            MdlConnectionStatus::Connected => {
+                heramind_devices::mdl_format::ConnectionStatus::Online
+            }
             MdlConnectionStatus::Reconnecting => {
                 heramind_devices::mdl_format::ConnectionStatus::Connecting
             }
@@ -111,6 +113,7 @@ pub fn device_type_to_template(def: &DeviceTypeDefinition) -> DeviceTypeTemplate
         // Extract commands from downlink
         commands: def.downlink.commands.clone(),
         default_offline_timeout_secs: None,
+        store_raw: None,
     }
 }
 

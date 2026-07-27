@@ -455,7 +455,10 @@ async fn test_complete_weather_extension_workflow() {
     assert!(registry.contains("heramind.weather.forecast").await);
 
     // Get extension info
-    let info = registry.get_info("heramind.weather.forecast").await.unwrap();
+    let info = registry
+        .get_info("heramind.weather.forecast")
+        .await
+        .unwrap();
     assert_eq!(info.state, ExtensionState::Running);
     assert_eq!(info.commands.len(), 2);
 

@@ -62,7 +62,7 @@ function StepDot({
       )}
     >
       {status === 'completed' ? (
-        <Check className={size === 'large' ? 'h-4.5 w-4.5' : 'h-4 w-4'} />
+        <Check className={size === 'large' ? 'h-4 w-4' : 'h-4 w-4'} />
       ) : icon ? (
         icon
       ) : null}

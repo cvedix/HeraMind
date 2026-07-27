@@ -306,6 +306,13 @@ fn value_looks_like_image(value: &serde_json::Value) -> bool {
     if s.starts_with("data:image/") {
         return true;
     }
+    // Fast path: /api/images/ URL prefix (image stored as file URL, not base64).
+    // Without this, apply_retention won't recognize image URL records as images,
+    // so they'd use default_retention (7d) instead of image_retention (3d) —
+    // causing files to be deleted before telemetry records (URL 404 window).
+    if s.starts_with("/api/images/") {
+        return true;
+    }
     // Need at least 32 chars to fill a 24-byte magic-byte window.
     // Shorter strings can't carry a meaningful image payload.
     if s.len() < 32 {
@@ -503,6 +510,25 @@ impl WriteBuffer {
         std::mem::take(&mut *pending)
     }
 
+    /// Re-queue writes whose batch failed to flush, so the next flush retries
+    /// them instead of silently dropping them. Bounded by a hard cap
+    /// (`max_size * 10`) so a persistent write failure (e.g. disk full) can't
+    /// grow memory without bound — once at the cap, further failed writes are
+    /// dropped and the caller logs them. Returns the number dropped.
+    fn requeue(&self, writes: Vec<BufferedWrite>) -> usize {
+        let mut pending = self.pending.lock();
+        let hard_cap = self.max_size.saturating_mul(10);
+        let mut dropped = 0;
+        for w in writes {
+            if pending.len() >= hard_cap {
+                dropped += 1;
+            } else {
+                pending.push(w);
+            }
+        }
+        dropped
+    }
+
     /// Start the background periodic flush task.
     fn start_flush_task(&self, store: Arc<TimeSeriesStore>, interval: Duration) {
         let shutdown = self.shutdown.clone();
@@ -516,11 +542,15 @@ impl WriteBuffer {
                 }
                 // Offload synchronous redb writes to a blocking thread
                 let s = store.clone();
-                let _ = tokio::task::spawn_blocking(move || s.flush_buffer()).await;
+                if let Err(e) = tokio::task::spawn_blocking(move || s.flush_buffer()).await {
+                    tracing::error!("Periodic flush task join error: {}", e);
+                }
             }
             // Final flush on shutdown
             let s = store.clone();
-            let _ = tokio::task::spawn_blocking(move || s.flush_buffer()).await;
+            if let Err(e) = tokio::task::spawn_blocking(move || s.flush_buffer()).await {
+                tracing::error!("Shutdown flush task join error: {}", e);
+            }
         });
         *self.flush_task.lock() = Some(handle);
     }
@@ -566,6 +596,32 @@ pub struct TimeSeriesStore {
 /// Global time series store singleton (thread-safe).
 static TIMESERIES_STORE_SINGLETON: Mutex<Option<Arc<TimeSeriesStore>>> = Mutex::new(None);
 
+/// Default telemetry redb cache size in MiB when no env override is set.
+///
+/// redb 2.6.3 defaults to a 1 GiB per-DB page cache (90% read). The
+/// telemetry store is the only DB large enough for that cache to fill
+/// (~920 MB anonymous heap on prod), so cap it here. The OS page cache
+/// backs reads regardless, so shrinking the in-process cache reclaims
+/// ~650 MB RSS at little read-perf cost.
+const DEFAULT_TELEMETRY_CACHE_MB: usize = 256;
+
+/// Resolve the telemetry redb cache size (MiB) from an env-var value.
+/// `None` / unparseable / `0` / negative → `DEFAULT_TELEMETRY_CACHE_MB`.
+fn parse_telemetry_cache_mb(env_val: Option<&str>) -> usize {
+    env_val
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(DEFAULT_TELEMETRY_CACHE_MB)
+}
+
+/// Telemetry redb cache size in bytes, from `HERAMIND_TELEMETRY_CACHE_MB`
+/// (falls back to `DEFAULT_TELEMETRY_CACHE_MB`). `set_cache_size` takes bytes.
+fn telemetry_cache_size_bytes() -> usize {
+    parse_telemetry_cache_mb(std::env::var("HERAMIND_TELEMETRY_CACHE_MB").ok().as_deref())
+        * 1024
+        * 1024
+}
+
 impl TimeSeriesStore {
     /// Open or create a time series store at the given path.
     /// Uses a singleton pattern to prevent multiple opens of the same database.
@@ -592,10 +648,16 @@ impl TimeSeriesStore {
 
         // Create new store and save to singleton
         let path_ref = path.as_ref();
+        // redb defaults to a 1 GiB per-DB cache; telemetry.redb is the only
+        // store large enough to fill it (~920 MB anonymous heap on prod).
+        // Cap via HERAMIND_TELEMETRY_CACHE_MB (default 256 MiB). The OS page
+        // cache still backs reads, so read perf is largely preserved.
+        let mut builder = Database::builder();
+        builder.set_cache_size(telemetry_cache_size_bytes());
         let db = if path_ref.exists() {
-            Database::open(path_ref)?
+            builder.open(path_ref)?
         } else {
-            Database::create(path_ref)?
+            builder.create(path_ref)?
         };
 
         let store = Arc::new(TimeSeriesStore {
@@ -799,18 +861,86 @@ impl TimeSeriesStore {
 
         let total_count: usize = groups.values().map(|v| v.len()).sum();
 
-        // Write each group in a single transaction
-        for ((source_id, metric), points) in &groups {
-            if let Err(e) = self.write_batch_sync(source_id, metric, points) {
-                tracing::error!("Failed to flush batch for {}/{}: {}", source_id, metric, e);
+        // Write each group in a single transaction. On failure, isolate the
+        // offending point by retrying per-point in its own transaction —
+        // otherwise a single poison payload (e.g. a value exceeding redb's
+        // max_value_size) aborts the whole (source, metric) batch every flush
+        // and blocks fresh writes for that metric forever. Only the genuinely
+        // unwritable points are re-queued.
+        let mut requeue: Vec<BufferedWrite> = Vec::new();
+        for ((source_id, metric), points) in groups {
+            if let Err(e) = self.write_batch_sync(&source_id, &metric, &points) {
+                tracing::error!(
+                    "Failed to flush batch for {}/{}: {} — isolating per-point",
+                    source_id,
+                    metric,
+                    e
+                );
+                let failed = self.write_points_isolated(&source_id, &metric, points);
+                if !failed.is_empty() {
+                    tracing::error!(
+                        "Per-point isolation {}/{}: {} poison point(s) failed and were re-queued",
+                        source_id,
+                        metric,
+                        failed.len()
+                    );
+                    for point in failed {
+                        requeue.push(BufferedWrite {
+                            source_id: source_id.clone(),
+                            metric: metric.clone(),
+                            point,
+                        });
+                    }
+                }
             }
         }
 
-        // Record stats
+        // Re-queue failed points (bounded — drops once at the hard cap).
+        let mut requeued_count: usize = 0;
+        if !requeue.is_empty() {
+            requeued_count = requeue.len();
+            let dropped = self.write_buffer.requeue(requeue);
+            if dropped > 0 {
+                tracing::error!(
+                    "Write buffer at hard cap under persistent flush failure — {} points re-queued, {} dropped",
+                    requeued_count - dropped,
+                    dropped
+                );
+            }
+        }
+
+        // Record stats — count only points that actually landed. Counting the
+        // full drained set would double-count re-queued points on every retry.
         if let Ok(mut stats) = self.stats.try_write() {
-            stats.write_count += total_count as u64;
+            stats.write_count += (total_count - requeued_count) as u64;
             stats.total_write_ns += start.elapsed().as_nanos() as u64;
         }
+    }
+
+    /// Write each point in its OWN transaction, returning only the points that
+    /// failed. Used after a batch write fails to isolate a poison point: the
+    /// good points in the group land, only the genuinely unwritable ones come
+    /// back for (bounded) re-queue.
+    fn write_points_isolated(
+        &self,
+        source_id: &str,
+        metric: &str,
+        points: Vec<DataPoint>,
+    ) -> Vec<DataPoint> {
+        let mut failed = Vec::new();
+        for point in points {
+            if let Err(e) = self.write_batch_sync(source_id, metric, std::slice::from_ref(&point)) {
+                tracing::error!(
+                    "Per-point write failed for {}/{} @{} (poison): {}",
+                    source_id,
+                    metric,
+                    point.timestamp,
+                    e
+                );
+                failed.push(point);
+            }
+        }
+        failed
     }
 
     /// Synchronous batch write (used by flush_buffer).
@@ -1955,9 +2085,12 @@ impl TimeSeriesStore {
             // data point's value), NOT name-based, so it works for any
             // metric name as long as the payload really is image data.
             let explicit_hours = policy.get_retention_hours(device_type, metric);
-            let effective_hours = if explicit_hours == policy.default_hours
-                && explicit_hours.is_some()
-            {
+            // Do NOT also require explicit_hours.is_some(): when
+            // default_retention=null but image_retention is set, explicit_hours
+            // is None — gating on .is_some() would skip this branch so image
+            // rows never purge here while image_cleanup deletes their files
+            // → dangling 404 URLs forever.
+            let effective_hours = if explicit_hours == policy.default_hours {
                 // No explicit override — fell through to default. Check
                 // whether this metric actually carries image data, and if
                 // so, apply image_retention instead.
@@ -2366,6 +2499,63 @@ fn fmt_ts_range(start_ts: i64, end_ts: i64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_write_buffer_requeue_respects_hard_cap() {
+        // requeue bounds memory under persistent write failure: hard cap =
+        // max_size * 10. Below the cap, failed writes are re-queued for the
+        // next flush; at the cap, excess is dropped and reported.
+        let buf = WriteBuffer::new(10); // hard cap = 100
+
+        let mk = |i: i64| BufferedWrite {
+            source_id: "s".into(),
+            metric: "m".into(),
+            point: DataPoint {
+                timestamp: i,
+                value: serde_json::Value::Null,
+                quality: None,
+                metadata: None,
+            },
+        };
+
+        // 95 fit under the 100 cap — none dropped.
+        let fill: Vec<_> = (0..95).map(mk).collect();
+        assert_eq!(buf.requeue(fill), 0);
+        assert_eq!(buf.pending.lock().len(), 95);
+
+        // Re-queue 20 more: only 5 fit (95 -> 100), 15 dropped.
+        let more: Vec<_> = (100..120).map(mk).collect();
+        assert_eq!(buf.requeue(more), 15);
+        assert_eq!(buf.pending.lock().len(), 100);
+    }
+
+    #[test]
+    fn test_parse_telemetry_cache_mb() {
+        // Absent → default
+        assert_eq!(parse_telemetry_cache_mb(None), DEFAULT_TELEMETRY_CACHE_MB);
+        assert_eq!(DEFAULT_TELEMETRY_CACHE_MB, 256);
+        // Explicit override
+        assert_eq!(parse_telemetry_cache_mb(Some("512")), 512);
+        assert_eq!(parse_telemetry_cache_mb(Some("128")), 128);
+        // Unparseable / empty → default
+        assert_eq!(
+            parse_telemetry_cache_mb(Some("abc")),
+            DEFAULT_TELEMETRY_CACHE_MB
+        );
+        assert_eq!(
+            parse_telemetry_cache_mb(Some("")),
+            DEFAULT_TELEMETRY_CACHE_MB
+        );
+        // Zero / negative → default
+        assert_eq!(
+            parse_telemetry_cache_mb(Some("0")),
+            DEFAULT_TELEMETRY_CACHE_MB
+        );
+        assert_eq!(
+            parse_telemetry_cache_mb(Some("-1")),
+            DEFAULT_TELEMETRY_CACHE_MB
+        );
+    }
+
     #[tokio::test]
     async fn test_timeseries_write_read() {
         let store = TimeSeriesStore::memory().unwrap();
@@ -2538,6 +2728,60 @@ mod tests {
                 .retention_in_progress
                 .load(std::sync::atomic::Ordering::SeqCst),
             "flag must be cleared after a real run completes"
+        );
+    }
+
+    /// v0.9.6 regression guard: with default_retention=None but
+    /// image_retention=Some(short), image rows must STILL be purged.
+    #[tokio::test]
+    async fn test_apply_retention_image_when_default_none() {
+        let store = TimeSeriesStore::memory().unwrap();
+        let old = chrono::Utc::now().timestamp() - 100 * 3600;
+
+        store
+            .write(
+                "cam",
+                "values.image",
+                DataPoint::new_string(
+                    old,
+                    "/api/images/cam/values.image/1700000000.jpg".to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .write("cam", "temperature", DataPoint::new(old, 23.5))
+            .await
+            .unwrap();
+        store.flush().unwrap();
+
+        let mut policy = RetentionPolicy::new(None);
+        policy.set_image_retention(Some(1));
+        store.set_retention_policy(policy).await;
+
+        let result = store.apply_retention().await.unwrap();
+        assert!(
+            result.points_removed >= 1,
+            "image row must be purged by image_retention even when default_retention is None"
+        );
+
+        let img_left = store
+            .query_range("cam", "values.image", i64::MIN, i64::MAX, None)
+            .await
+            .unwrap();
+        assert!(
+            img_left.points.is_empty(),
+            "image metric must be empty after retention"
+        );
+
+        let num_left = store
+            .query_range("cam", "temperature", i64::MIN, i64::MAX, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            num_left.points.len(),
+            1,
+            "numeric metric must be kept when default_retention is None"
         );
     }
 
@@ -2977,15 +3221,15 @@ mod tests {
         assert!(value_looks_like_image(&raw_png));
 
         // GIF: R0lGOD → 47 49 46 38
-        let raw_gif = serde_json::json!(
-            "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
-        );
+        let raw_gif = serde_json::json!("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7");
         assert!(value_looks_like_image(&raw_gif));
 
         // Non-image values
         assert!(!value_looks_like_image(&serde_json::json!(42.5)));
         assert!(!value_looks_like_image(&serde_json::json!("hello world")));
-        assert!(!value_looks_like_image(&serde_json::json!("temperature: 23.5")));
+        assert!(!value_looks_like_image(&serde_json::json!(
+            "temperature: 23.5"
+        )));
         // Short strings even if base64-decodable: not an image
         assert!(!value_looks_like_image(&serde_json::json!("dGVzdA==")));
         // Numeric metric value stored as string

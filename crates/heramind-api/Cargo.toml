@@ -31,7 +31,11 @@ heramind-storage = { path = "../heramind-storage" }
 heramind-data-push = { path = "../heramind-data-push" }
 
 # JavaScript execution (merged from heramind-automation)
-boa_engine = "0.17"
+# NOTE: 0.17→0.19 deferred to 0.9.11 — it's the Realm refactor (FunctionObjectBuilder
+# takes &Realm, Context lifetime removed) and this is the user-facing transform engine;
+# needs integration testing with real transforms, not a mid-0.9.10 change. The advisory
+# (RUSTSEC-2024-0444, AsyncGenerator) is also likely unexploitable on our simple sync JS.
+boa_engine = "0.21"
 
 # Encoding (merged from heramind-automation)
 hex = { workspace = true }
@@ -47,6 +51,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
+# rustls 0.23 (pulled via reqwest's rustls-tls-...-no-provider build) does not
+# auto-select a CryptoProvider — enable ring here so we can install it at startup
+# (server/mod.rs start_server). ring is portable (alpine/musl + cross-compile).
+rustls = { version = "0.23", features = ["ring"] }
 
 # Web framework
 axum = { workspace = true, features = ["ws", "multipart", "macros"] }

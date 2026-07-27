@@ -21,6 +21,7 @@
 //! Devices are configured using `DeviceConfig` and accessed through `DeviceService`.
 //! Protocol adapters are registered as plugins for unified management.
 
+pub mod image_storage;
 pub mod mdl;
 pub mod mdl_format;
 pub mod mqtt;
@@ -47,14 +48,14 @@ pub mod unified_extractor;
 pub mod embedded_broker;
 
 // Re-exports (only types used externally via crate-root shortcut path)
+pub use adapter::{AdapterResult, ConnectionStatus, DeviceAdapter, DeviceEvent};
 pub use mdl::{DeviceError, MetricDataType, MetricValue};
 pub use mdl_format::{CommandDefinition, MetricDefinition as MdlMetricDefinition};
-pub use telemetry::{DataPoint, TimeSeriesStorage};
-pub use service::{CommandStatus, DeviceService, ExtensionCommandRouterFn};
 pub use registry::{
     ConnectionConfig, DeviceConfig, DeviceRegistry, DeviceTypeMode, DeviceTypeTemplate,
 };
-pub use adapter::{AdapterResult, ConnectionStatus, DeviceAdapter, DeviceEvent};
+pub use service::{CommandStatus, DeviceService, ExtensionCommandRouterFn};
+pub use telemetry::{DataPoint, TimeSeriesStorage};
 
 #[cfg(feature = "embedded-broker")]
 pub use embedded_broker::{EmbeddedBroker, EmbeddedBrokerConfig, TopicResolverFn};

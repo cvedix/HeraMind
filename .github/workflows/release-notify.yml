@@ -25,14 +25,27 @@ jobs:
       - name: Resolve release metadata
         id: meta
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.event.release.tag_name || inputs.tag_name }}
           HTML_URL: ${{ github.event.release.html_url }}
           BODY: ${{ github.event.release.body }}
         run: |
-          # Fall back to constructing a URL when triggered via workflow_dispatch
-          # (release body is empty in that case — just announce the tag).
           tag="${TAG_NAME}"
           url="${HTML_URL:-https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}}"
+
+          # When triggered via workflow_dispatch (the build workflow's release
+          # job dispatches us, because a release published with the default
+          # GITHUB_TOKEN does not emit a `release: published` event that
+          # triggers other workflows), github.event.release.* is empty. Fetch
+          # the published release's body + URL ourselves so the Discord embed
+          # keeps the full release notes instead of just the headline.
+          if [ -z "${BODY}" ]; then
+            fetched=$(gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json body,htmlUrl 2>/dev/null || echo '{}')
+            BODY=$(printf '%s' "${fetched}" | jq -r '.body // ""')
+            fetched_url=$(printf '%s' "${fetched}" | jq -r '.htmlUrl // ""')
+            [ -n "${fetched_url}" ] && url="${fetched_url}"
+          fi
+
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "url=${url}" >> "$GITHUB_OUTPUT"
 

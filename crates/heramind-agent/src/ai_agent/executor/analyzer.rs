@@ -185,10 +185,20 @@ impl AgentExecutor {
             "[DIAG] legacy analyzer vision decision"
         );
         if !image_parts.is_empty() && !llm_supports_vision {
-            tracing::warn!(
+            // Event-agent running blind: images are present but the configured
+            // LLM can't see them. Elevated to error so monitoring catches a
+            // misconfigured camera-event agent — the chat path rejects this
+            // outright (session.rs: "select a vision-capable model"), but the
+            // event-agent path degrades. The analysis still runs text-only to
+            // avoid breaking existing flows; the prompt below surfaces the
+            // limitation into the output.
+            tracing::error!(
                 agent_id = %agent.id,
+                model_name = %llm.model_name(),
                 image_count = image_parts.len(),
-                "Images available but LLM doesn't support vision — images ignored"
+                "Vision misconfiguration: camera event agent received images but the active \
+                 LLM does not support vision — analyzing text-only. Configure a vision-capable \
+                 backend (or set a multimodal override) for this agent to actually see images."
             );
         }
 
@@ -218,13 +228,30 @@ impl AgentExecutor {
             String::new()
         };
 
-        // User message instructing plain-text output
-        let user_msg_text = format!(
-            "{}{}\n\nAnalyze the data above and provide your findings as plain text. \
-             Include your conclusion at the end.",
-            data_lines.join("\n"),
-            image_info,
-        );
+        // User message instructing plain-text output. When running blind
+        // (images present but the model can't see them), ask the LLM to
+        // surface that limitation in its findings so a reader of the output
+        // knows the images weren't analyzed — instead of a confident
+        // text-only conclusion. No forced prepend, so downstream consumers
+        // parsing the findings aren't broken.
+        let blind = !image_info.is_empty();
+        let user_msg_text = if blind {
+            format!(
+                "{}{}\n\nAnalyze the data above and provide your findings as plain text. \
+                 Note: the image capture(s) could not be analyzed because the configured \
+                 model lacks vision — mention this limitation in your findings, then proceed \
+                 with text-only analysis. Include your conclusion at the end.",
+                data_lines.join("\n"),
+                image_info,
+            )
+        } else {
+            format!(
+                "{}{}\n\nAnalyze the data above and provide your findings as plain text. \
+                 Include your conclusion at the end.",
+                data_lines.join("\n"),
+                image_info,
+            )
+        };
 
         // Build multimodal messages if images present
         let messages = if has_valid_images {

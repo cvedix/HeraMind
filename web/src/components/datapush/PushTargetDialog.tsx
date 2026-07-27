@@ -152,6 +152,7 @@ export function PushTargetDialog() {
   const [batchEnabled, setBatchEnabled] = useState(false)
   const [batchSize, setBatchSize] = useState(50)
   const [batchIntervalMs, setBatchIntervalMs] = useState(2000)
+  const [batchFormat, setBatchFormat] = useState<'flat' | 'nested'>('flat')
   // Pending patterns from editing target — expanded into selectedSources once sources load
   const [pendingPatterns, setPendingPatterns] = useState<string[] | null>(null)
 
@@ -210,6 +211,7 @@ export function PushTargetDialog() {
           setBatchEnabled(true)
           setBatchSize(bc.batch_size)
           setBatchIntervalMs(bc.batch_interval_ms || 1000)
+          setBatchFormat(bc.format === 'nested' ? 'nested' : 'flat')
         }
       } else {
         resetForm()
@@ -282,6 +284,7 @@ export function PushTargetDialog() {
     setBatchEnabled(false)
     setBatchSize(10)
     setBatchIntervalMs(1000)
+    setBatchFormat('flat')
     setPendingPatterns(null)
   }
 
@@ -404,6 +407,7 @@ export function PushTargetDialog() {
     const batchConfig = batchEnabled ? {
       batch_size: batchSize,
       batch_interval_ms: batchIntervalMs,
+      format: batchFormat,
     } : undefined
 
     await wrapSubmit(async () => {
@@ -431,7 +435,7 @@ export function PushTargetDialog() {
         if (!ok) throw new Error('Create failed')
       }
     })()
-  }, [wrapSubmit, isEditing, editingPushTarget, name, targetType, webhookUrl, webhookAuthType, webhookAuthToken, webhookAuthUser, webhookAuthPass, mqttBroker, mqttTopic, mqttPort, mqttUsername, mqttPassword, mqttQos, mqttMode, selectedBrokerId, brokers, scheduleType, intervalSecs, showAdvanced, manualPatterns, selectedSources, sources, batchEnabled, batchSize, batchIntervalMs, createPushTarget, updatePushTarget, t])
+  }, [wrapSubmit, isEditing, editingPushTarget, name, targetType, webhookUrl, webhookAuthType, webhookAuthToken, webhookAuthUser, webhookAuthPass, mqttBroker, mqttTopic, mqttPort, mqttUsername, mqttPassword, mqttQos, mqttMode, selectedBrokerId, brokers, scheduleType, intervalSecs, showAdvanced, manualPatterns, selectedSources, sources, batchEnabled, batchSize, batchIntervalMs, batchFormat, createPushTarget, updatePushTarget, t])
 
   return (
     <FullScreenDialog open={pushTargetDialogOpen} onOpenChange={setPushTargetDialogOpen}>
@@ -712,6 +716,9 @@ export function PushTargetDialog() {
                 <Label className={cn("font-medium", isMobile ? "text-base" : "text-sm")}>
                   {t('common:dataPush.batchConfig', 'Batch Aggregation')}
                 </Label>
+                <p className={cn(textMini, "text-muted-foreground")}>
+                  {t('common:dataPush.batchConfigDesc', 'Aggregate multiple events into a single payload to reduce requests')}
+                </p>
                 <Select value={batchEnabled ? 'batched' : 'immediate'} onValueChange={(v) => setBatchEnabled(v === 'batched')}>
                   <SelectTrigger className={isMobile ? "h-12 text-base" : "h-10"}>
                     <SelectValue />
@@ -722,25 +729,54 @@ export function PushTargetDialog() {
                   </SelectContent>
                 </Select>
                 {batchEnabled && (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-2">
-                    <Input
-                      type="number"
-                      value={batchSize}
-                      onChange={(e) => setBatchSize(Number(e.target.value))}
-                      min={2}
-                      max={1000}
-                      placeholder={t('common:dataPush.batchSize', 'Batch Size')}
-                      className={isMobile ? "h-12 text-base" : "h-10"}
-                    />
-                    <Input
-                      type="number"
-                      value={batchIntervalMs}
-                      onChange={(e) => setBatchIntervalMs(Number(e.target.value))}
-                      min={100}
-                      max={60000}
-                      placeholder={t('common:dataPush.batchInterval', 'Max Interval (ms)')}
-                      className={isMobile ? "h-12 text-base" : "h-10"}
-                    />
+                  <div className="space-y-2 mt-2">
+                    <div className="space-y-1.5">
+                      <Label className={cn(textMini, "font-medium text-muted-foreground")}>
+                        {t('common:dataPush.batchFormat', 'Payload Format')}
+                      </Label>
+                      <Select value={batchFormat} onValueChange={(v) => setBatchFormat(v as 'flat' | 'nested')}>
+                        <SelectTrigger className={isMobile ? "h-12 text-base" : "h-10"}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="flat">{t('common:dataPush.batchFormatFlat', 'Flat (item list)')}</SelectItem>
+                          <SelectItem value="nested">{t('common:dataPush.batchFormatNested', 'Nested (by device/source)')}</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="space-y-1.5">
+                        <Label className={cn(textMini, "font-medium text-muted-foreground")}>
+                          {t('common:dataPush.batchSize', 'Batch Size')}
+                        </Label>
+                        <Input
+                          type="number"
+                          value={batchSize}
+                          onChange={(e) => setBatchSize(Number(e.target.value))}
+                          min={2}
+                          max={1000}
+                          placeholder="50"
+                          className={isMobile ? "h-12 text-base" : "h-10"}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label className={cn(textMini, "font-medium text-muted-foreground")}>
+                          {t('common:dataPush.batchInterval', 'Max Interval (ms)')}
+                        </Label>
+                        <Input
+                          type="number"
+                          value={batchIntervalMs}
+                          onChange={(e) => setBatchIntervalMs(Number(e.target.value))}
+                          min={100}
+                          max={60000}
+                          placeholder="2000"
+                          className={isMobile ? "h-12 text-base" : "h-10"}
+                        />
+                      </div>
+                    </div>
+                    <p className={cn(textMini, "text-muted-foreground")}>
+                      {t('common:dataPush.batchFieldsHint', 'Flushes when batch size or max interval is reached, whichever comes first')}
+                    </p>
                   </div>
                 )}
               </div>

@@ -18,6 +18,7 @@ import { useTranslation } from 'react-i18next'
 import { Link2, Unlink, Upload, Trash2, Database, Server, Zap, Activity, Puzzle, Workflow, Brain, MapPin } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
+import { normalizeImageUrl } from '@/lib/imageUtils'
 import { Label } from '@/components/ui/label'
 import {
   Dialog,
@@ -146,7 +147,7 @@ export function DualModeSourceField({
   }, [])
 
   const TypeIcon = isBound ? getTypeIcon(normalizedSources[0]?.type) : Database
-  const isBase64Image = value?.startsWith('data:image')
+  const isBase64Image = value?.startsWith('data:image') || value?.startsWith('/api/images/')
 
   // Does the staged selection differ from the current binding?
   const stagedSources = stagedDataSource ? normalizeDataSource(stagedDataSource) : []
@@ -216,7 +217,7 @@ export function DualModeSourceField({
               onChange={(e) => onValueChange(e.target.value)}
               placeholder={placeholder}
               rows={rows}
-              className="w-full px-3 py-2 rounded-md border border-input bg-background text-sm resize-y"
+              className="w-full px-3 py-2 rounded-md border border-input bg-card text-sm resize-y"
             />
           ) : (
             <div className="flex gap-2">
@@ -263,7 +264,7 @@ export function DualModeSourceField({
               {isBase64Image ? (
                 <div className="flex items-center gap-2">
                   <div className="w-10 h-10 rounded border overflow-hidden bg-muted-30">
-                    <img src={value} alt="Preview" className="w-full h-full object-contain" />
+                    <img src={value?.startsWith('/api/images/') ? normalizeImageUrl(value)?.src ?? value : value} alt="Preview" className="w-full h-full object-contain" />
                   </div>
                   <Button
                     variant="ghost"
@@ -314,7 +315,7 @@ export function DualModeSourceField({
           </div>
 
           {/* Footer: Cancel / Confirm */}
-          <DialogFooter className="px-5 py-3 border-t shrink-0 bg-background">
+          <DialogFooter className="px-5 py-3 border-t shrink-0">
             <Button variant="outline" onClick={handleCancel}>
               {t('common.cancel')}
             </Button>

@@ -28,7 +28,8 @@ use crate::store::RuleStore;
 // Type aliases for optional dependencies
 // ---------------------------------------------------------------------------
 
-type OptionMessageManager = Arc<tokio::sync::RwLock<Option<Arc<heramind_messages::MessageManager>>>>;
+type OptionMessageManager =
+    Arc<tokio::sync::RwLock<Option<Arc<heramind_messages::MessageManager>>>>;
 type OptionDeviceActionExecutor = Arc<tokio::sync::RwLock<Option<Arc<DeviceActionExecutor>>>>;
 type OptionExtensionActionExecutor = Arc<tokio::sync::RwLock<Option<Arc<ExtensionActionExecutor>>>>;
 

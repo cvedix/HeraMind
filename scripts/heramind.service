@@ -1,6 +1,6 @@
 [Unit]
 Description=HeraMind Server
-Documentation=https://github.com/camthink-ai/HeraMind
+Documentation=https://github.com/cvedix/HeraMind
 After=network-online.target
 Wants=network-online.target
 

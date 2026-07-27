@@ -1,15 +1,23 @@
 /**
- * Shared background effect for setup pages
+ * Shared background for setup pages — matches the login page so the whole
+ * auth flow (login → setup) reads as one surface: base gradient + HeraMind-blue
+ * honeycomb breathe + a single soft brand glow.
  */
+import { HoneycombBackground } from "@/components/shared/HoneycombBackground"
+
 export function SetupBackground() {
   return (
     <div className="fixed inset-0">
+      {/* Base gradient */}
       <div className="absolute inset-0 bg-gradient-to-br from-background via-background to-muted" />
-      <div className="absolute inset-0" style={{
-        backgroundImage: 'radial-gradient(circle, color-mix(in oklch, var(--foreground) 8%, transparent) 1px, transparent 1px)',
-        backgroundSize: '32px 32px'
-      }} />
-      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-muted rounded-full blur-3xl animate-pulse" style={{ animationDuration: '8s' }} />
+      {/* Honeycomb mesh — shared with login */}
+      <HoneycombBackground />
+      {/* One soft brand glow — restrained, just enough warmth to avoid
+          feeling flat. Brand blue ties to the logo. */}
+      <div
+        className="absolute top-[28%] left-1/2 -translate-x-1/2 w-[42rem] h-[42rem] rounded-full blur-3xl"
+        style={{ background: 'color-mix(in oklch, var(--accent-blue) 8%, transparent)' }}
+      />
     </div>
   )
 }

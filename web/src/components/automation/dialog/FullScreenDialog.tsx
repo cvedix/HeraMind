@@ -215,12 +215,11 @@ export function FullScreenDialogFooter({
         "shrink-0 flex items-center justify-end gap-2 md:gap-3",
         "px-3 md:px-5 lg:px-6 py-3 md:py-4",
         "border-t border-border",
-        // Tint only on desktop where the container has the glassmorphism
-        // bg-bg-95 treatment. On mobile the container is opaque --chrome,
-        // and any alpha tint over it produces a visible color mismatch vs
-        // the body of the dialog. Mobile relies on border-t alone for
-        // content/footer separation (iOS sheet pattern).
-        "md:bg-black/[0.02] md:dark:bg-white/[0.02]",
+        // No bg: footer inherits the container's bg-popover (white) so it
+        // matches the body. A bg-black/[0.02] tint here read as #FBFBFC,
+        // a visible mismatch vs the white content (the old "glassmorphism
+        // bg-bg-95 container" rationale is stale — the container is now
+        // opaque bg-popover). border-t alone separates content from actions.
         className
       )}
     >

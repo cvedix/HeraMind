@@ -355,7 +355,7 @@ export const FloatingEditButton = memo(function FloatingEditButton({
         'flex items-center gap-2',
         'min-h-[56px] px-6',
         'bg-primary text-primary-foreground',
-        'rounded-full shadow-lg shadow-primary/25',
+        'rounded-full shadow-lg',
         'transition-all duration-300 ease-out',
         'active:scale-95',
         // Position

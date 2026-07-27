@@ -20,6 +20,8 @@ import {
   Globe,
   Database,
   SwitchCamera,
+  ScrollText,
+  Download,
 } from "lucide-react"
 import { Switch } from "@/components/ui/switch"
 import { useToast } from "@/hooks/use-toast"
@@ -287,6 +289,9 @@ export function PreferencesTab() {
       {/* Data Management */}
       <DataManagementCard />
 
+      {/* Diagnostic Data — log archive download */}
+      <DiagnosticDataCard />
+
       {/* Info */}
       <div className="text-sm text-muted-foreground text-center py-4">
         <p>{t("settings:preferencesInfo")}</p>
@@ -479,6 +484,79 @@ function DataManagementCard() {
               <Database className="h-4 w-4 mr-2" />
             )}
             {cleaning ? t("settings:cleanupRunning") : t("settings:cleanupNow")}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function DiagnosticDataCard() {
+  const { t } = useTranslation(["common", "settings"])
+  const { handleError, showSuccess } = useErrorHandler()
+  const [downloading, setDownloading] = useState(false)
+  /**
+   * Time-range filter for log download. Default "7" matches the Tauri
+   * shell's 7-day log retention (`cleanup_old_logs` in main.rs) — i.e. all
+   * logs the app actually keeps on disk.
+   */
+  const [logDays, setLogDays] = useState<string>("7")
+
+  const handleDownload = async () => {
+    setDownloading(true)
+    try {
+      const days = Number.parseInt(logDays, 10) || 0
+      const { filename } = await api.downloadLogs(days > 0 ? days : undefined)
+      showSuccess(t("settings:downloadLogsSuccess", { filename }))
+    } catch (error) {
+      handleError(error, { operation: "Download diagnostic logs" })
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <ScrollText className="h-5 w-5 text-info" />
+          {t("settings:diagnosticData")}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <div>
+            <Label className="text-sm font-medium">
+              {t("settings:logTimeRange")}
+            </Label>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              {t("settings:diagnosticDataDesc")}
+            </p>
+          </div>
+          <Select value={logDays} onValueChange={setLogDays}>
+            <SelectTrigger className="w-full sm:w-[180px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="1">{t("settings:logRangeToday")}</SelectItem>
+              <SelectItem value="3">{t("settings:logRangeLast3Days")}</SelectItem>
+              <SelectItem value="7">{t("settings:logRangeLast7Days")}</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="pt-4 border-t">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleDownload}
+            disabled={downloading}
+          >
+            {downloading ? (
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+            ) : (
+              <Download className="h-4 w-4 mr-2" />
+            )}
+            {downloading ? t("settings:downloadingLogs") : t("settings:downloadLogs")}
           </Button>
         </div>
       </CardContent>

@@ -98,17 +98,17 @@ jobs:
           # Extract version from tag (e.g., v0.6.2 -> 0.6.2)
           VERSION="${GITHUB_REF#refs/tags/v}"
           cd web/dist
-          tar czvf ../../neomind-web-${VERSION}.tar.gz .
+          tar czvf ../../heramind-web-${VERSION}.tar.gz .
           cd ../..
-          echo "✅ Frontend package created: neomind-web-${VERSION}.tar.gz"
-          ls -lh neomind-web-${VERSION}.tar.gz
+          echo "✅ Frontend package created: heramind-web-${VERSION}.tar.gz"
+          ls -lh heramind-web-${VERSION}.tar.gz
 
       - name: Upload frontend release artifact
         if: contains(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
-          name: neomind-web
-          path: neomind-web-*.tar.gz
+          name: heramind-web
+          path: heramind-web-*.tar.gz
           retention-days: 30
 
   # ========== 桌面应用构建（使用并行策略）==========
@@ -155,6 +155,11 @@ jobs:
         run: test -f web/dist/index.html && echo "✅ Frontend ready"
 
       # 更激进的 Rust 缓存策略
+      # Key includes matrix.os (the exact runner image, e.g. ubuntu-22.04 vs
+      # ubuntu-latest/24.04) so caches don't cross-contaminate across GLIBC
+      # versions — build-script binaries compiled on 24.04 require GLIBC_2.39
+      # and crash on 22.04 ("version GLIBC_2.39 not found"). restore-keys is
+      # likewise scoped to the image to prevent pulling stale 24.04 artifacts.
       - name: Setup Rust cache
         uses: actions/cache@v4
         with:
@@ -163,10 +168,9 @@ jobs:
             ~/.cargo/git/
             target/
             web/src-tauri/target/
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ matrix.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.target }}-
-            ${{ runner.os }}-cargo-
+            cargo-${{ matrix.os }}-${{ matrix.target }}-
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -213,18 +217,18 @@ jobs:
           export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256
 
           # Build extension runner (CLI is dispatched in-process, no sidecar needed)
-          cargo build --release -p neomind-extension-runner --target ${{ matrix.target }}
+          cargo build --release -p heramind-extension-runner --target ${{ matrix.target }}
 
           # Prepare binary for Tauri
           mkdir -p web/src-tauri/binaries
 
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cp target/${{ matrix.target }}/release/neomind-extension-runner.exe \
-               web/src-tauri/binaries/neomind-extension-runner-${{ matrix.target }}.exe
+            cp target/${{ matrix.target }}/release/heramind-extension-runner.exe \
+               web/src-tauri/binaries/heramind-extension-runner-${{ matrix.target }}.exe
           else
-            cp target/${{ matrix.target }}/release/neomind-extension-runner \
-               web/src-tauri/binaries/neomind-extension-runner-${{ matrix.target }}
-            chmod +x web/src-tauri/binaries/neomind-extension-runner-${{ matrix.target }}
+            cp target/${{ matrix.target }}/release/heramind-extension-runner \
+               web/src-tauri/binaries/heramind-extension-runner-${{ matrix.target }}
+            chmod +x web/src-tauri/binaries/heramind-extension-runner-${{ matrix.target }}
           fi
 
           echo "✅ External binary built for ${{ matrix.target }}"
@@ -285,7 +289,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: neomind-desktop-${{ matrix.platform }}
+          name: heramind-desktop-${{ matrix.platform }}
           path: |
             web/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
             web/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app
@@ -300,7 +304,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
-          name: neomind-updater-${{ matrix.platform }}
+          name: heramind-updater-${{ matrix.platform }}
           path: updater-out/*
           retention-days: 90
           if-no-files-found: ignore
@@ -323,7 +327,7 @@ jobs:
           - os: linux
             target: aarch64-unknown-linux-gnu
             arch: arm64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04-arm  # pin to oldest supported LTS for glibc 2.35 baseline (matches amd64)
           - os: darwin
             target: aarch64-apple-darwin
             arch: arm64
@@ -360,38 +364,21 @@ jobs:
           restore-keys: |
             server-v2-${{ matrix.runner }}-${{ matrix.target }}-
 
-      - name: Cache cross-compilation tool
-        if: matrix.os == 'linux' && matrix.arch != 'amd64'
-        uses: actions/cache@v4
-        id: cache-cross
-        with:
-          path: ~/.cargo/bin/cross
-          key: cross-${{ matrix.target }}-${{ runner.os }}-v2
-
-      - name: Install cross-compilation tool
-        if: matrix.os == 'linux' && matrix.arch != 'amd64' && steps.cache-cross.outputs.cache-hit != 'true'
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
       # ========== 构建纯 API 服务器（无前端嵌入）==========
+      # Both linux arches now run on native runners (amd64 on ubuntu-22.04 x86_64,
+      # arm64 on ubuntu-22.04-arm ARM64), so both use plain `cargo build`. The old
+      # `cross` cross-compile path was removed — its cached x86_64 binary failed
+      # with "Exec format error" on the ARM runner, and native builds are faster.
       - name: Build server and extension runner (Linux)
         if: matrix.os == 'linux'
         shell: bash
         run: |
           set -e
-
-          # Native x86_64 build uses plain cargo (target == host) to avoid the
-          # `cross` binary's own glibc dependency leaking into the toolchain.
-          # aarch64 is cross-compiled from x86_64 host via `cross`.
-          if [[ "${{ matrix.arch }}" == "amd64" ]]; then
-            cargo build --release -p neomind-cli --target ${{ matrix.target }}
-            cargo build --release -p neomind-extension-runner --target ${{ matrix.target }}
-          else
-            cross build --release -p neomind-cli --target ${{ matrix.target }}
-            cross build --release -p neomind-extension-runner --target ${{ matrix.target }}
-          fi
+          cargo build --release -p heramind-cli --target ${{ matrix.target }}
+          cargo build --release -p heramind-extension-runner --target ${{ matrix.target }}
 
           # Verify binaries exist
-          ls -la target/${{ matrix.target }}/release/neomind target/${{ matrix.target }}/release/neomind-extension-runner
+          ls -la target/${{ matrix.target }}/release/heramind target/${{ matrix.target }}/release/heramind-extension-runner
         env:
           CC: clang
           CXX: clang++
@@ -400,8 +387,8 @@ jobs:
         if: matrix.os == 'linux' && matrix.arch == 'amd64'
         shell: bash
         run: |
-          cargo test -p neomind-core --test capability_e2e_test test_native_isolated_capability_ipc -- --ignored
-          cargo test -p neomind-core --test capability_e2e_test test_native_isolated_event_capability_ipc -- --ignored
+          cargo test -p heramind-core --test capability_e2e_test test_native_isolated_capability_ipc -- --ignored
+          cargo test -p heramind-core --test capability_e2e_test test_native_isolated_event_capability_ipc -- --ignored
 
       - name: Build server and extension runner (macOS)
         if: matrix.os == 'darwin'
@@ -410,24 +397,24 @@ jobs:
           set -e
 
           # Build server binary (no static feature - pure API server)
-          cargo build --release -p neomind-cli --target ${{ matrix.target }}
+          cargo build --release -p heramind-cli --target ${{ matrix.target }}
 
           # Build extension runner
-          cargo build --release -p neomind-extension-runner --target ${{ matrix.target }}
+          cargo build --release -p heramind-extension-runner --target ${{ matrix.target }}
 
           # Verify binaries exist
-          ls -la target/${{ matrix.target }}/release/neomind target/${{ matrix.target }}/release/neomind-extension-runner
+          ls -la target/${{ matrix.target }}/release/heramind target/${{ matrix.target }}/release/heramind-extension-runner
 
       - name: Create release archive
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../neomind-server-${{ matrix.os }}-${{ matrix.arch }}.tar.gz neomind neomind-extension-runner
+          tar czf ../../../heramind-server-${{ matrix.os }}-${{ matrix.arch }}.tar.gz heramind heramind-extension-runner
 
       - name: Upload server artifact
         uses: actions/upload-artifact@v4
         with:
-          name: neomind-server-${{ matrix.os }}-${{ matrix.arch }}
-          path: neomind-server-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+          name: heramind-server-${{ matrix.os }}-${{ matrix.arch }}
+          path: heramind-server-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
           retention-days: 30
 
   # ========== Release job ==========
@@ -435,6 +422,9 @@ jobs:
     needs: [build-frontend, build-desktop, build-server]
     runs-on: ubuntu-latest
     if: contains(github.ref, 'refs/tags/')
+    permissions:
+      contents: write   # create the release + upload assets
+      actions: write    # dispatch the release-notify workflow (see step below)
 
     steps:
       - name: Checkout repository
@@ -453,7 +443,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
           TAG="${GITHUB_REF_NAME}"
-          BASE_URL="https://github.com/camthink-ai/HeraMind/releases/download/${TAG}"
+          BASE_URL="https://github.com/cvedix/HeraMind/releases/download/${TAG}"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           echo "📦 Generating update manifest for version ${VERSION}"
@@ -489,23 +479,23 @@ jobs:
 
           # macOS aarch64: sig is .app.tar.gz.sig, URL file is .app.tar.gz
           add_platform "darwin-aarch64" \
-            "$(find artifacts/neomind-updater-macos-aarch64 -name "*.app.tar.gz.sig" 2>/dev/null | head -1)" \
-            "$(find artifacts/neomind-updater-macos-aarch64 -name "*.app.tar.gz" ! -name "*.sig" 2>/dev/null | head -1)"
+            "$(find artifacts/heramind-updater-macos-aarch64 -name "*.app.tar.gz.sig" 2>/dev/null | head -1)" \
+            "$(find artifacts/heramind-updater-macos-aarch64 -name "*.app.tar.gz" ! -name "*.sig" 2>/dev/null | head -1)"
 
           # Windows x86_64: sig is nsis *.exe.sig, URL file is the nsis .exe from desktop artifacts
           add_platform "windows-x86_64" \
-            "$(find artifacts/neomind-updater-windows-x86_64 -name "*x64-setup.exe.sig" 2>/dev/null | grep "${VERSION}" | head -1)" \
-            "$(find artifacts/neomind-desktop-windows-x86_64 -name "*x64-setup.exe" 2>/dev/null | grep "${VERSION}" | head -1)"
+            "$(find artifacts/heramind-updater-windows-x86_64 -name "*x64-setup.exe.sig" 2>/dev/null | grep "${VERSION}" | head -1)" \
+            "$(find artifacts/heramind-desktop-windows-x86_64 -name "*x64-setup.exe" 2>/dev/null | grep "${VERSION}" | head -1)"
 
           # Linux x86_64: sig is AppImage.sig, URL file is the AppImage from desktop artifacts
           add_platform "linux-x86_64" \
-            "$(find artifacts/neomind-updater-linux-x86_64 -name "*amd64.AppImage.sig" 2>/dev/null | grep "${VERSION}" | head -1)" \
-            "$(find artifacts/neomind-desktop-linux-x86_64 -name "*amd64.AppImage" 2>/dev/null | grep "${VERSION}" | head -1)"
+            "$(find artifacts/heramind-updater-linux-x86_64 -name "*amd64.AppImage.sig" 2>/dev/null | grep "${VERSION}" | head -1)" \
+            "$(find artifacts/heramind-desktop-linux-x86_64 -name "*amd64.AppImage" 2>/dev/null | grep "${VERSION}" | head -1)"
 
           # Linux aarch64: sig is AppImage.sig, URL file is the AppImage from desktop artifacts
           add_platform "linux-aarch64" \
-            "$(find artifacts/neomind-updater-linux-aarch64 -name "*aarch64.AppImage.sig" 2>/dev/null | grep "${VERSION}" | head -1)" \
-            "$(find artifacts/neomind-desktop-linux-aarch64 -name "*aarch64.AppImage" 2>/dev/null | grep "${VERSION}" | head -1)"
+            "$(find artifacts/heramind-updater-linux-aarch64 -name "*aarch64.AppImage.sig" 2>/dev/null | grep "${VERSION}" | head -1)" \
+            "$(find artifacts/heramind-desktop-linux-aarch64 -name "*aarch64.AppImage" 2>/dev/null | grep "${VERSION}" | head -1)"
 
           if [ "$FOUND" -eq 0 ]; then
             echo "⚠️ No updater artifacts found - skipping latest-update.json"
@@ -544,14 +534,14 @@ jobs:
           - **Linux**: Download `.AppImage` (universal) or `.deb` (Debian/Ubuntu)
 
           ### Server Deployment
-          1. **Backend Server**: Download `neomind-server-{os}-{arch}.tar.gz`
-             - Extract and run: `./neomind serve`
+          1. **Backend Server**: Download `heramind-server-{os}-{arch}.tar.gz`
+             - Extract and run: `./heramind serve`
              - Default port: 9375
 
-          2. **Frontend Static Files**: Download `neomind-web-{version}.tar.gz`
+          2. **Frontend Static Files**: Download `heramind-web-{version}.tar.gz`
 
           **All-in-One** (default, no nginx needed):
-          - Extract frontend to `/var/www/neomind` (or configure `NEOMIND_WEB_DIR`)
+          - Extract frontend to `/var/www/heramind` (or configure `HERAMIND_WEB_DIR`)
           - The server serves both API and Web UI on the same port
 
           **Frontend-Backend Separation** (optional, with nginx):
@@ -562,13 +552,13 @@ jobs:
 
           ```bash
           # All-in-one (default)
-          curl -fsSL https://raw.githubusercontent.com/camthink-ai/HeraMind/main/scripts/install.sh | sh
+          curl -fsSL https://raw.githubusercontent.com/cvedix/HeraMind/main/scripts/install.sh | sh
 
           # Backend only (users connect via local desktop app)
-          curl -fsSL https://raw.githubusercontent.com/camthink-ai/HeraMind/main/scripts/install.sh | NO_WEB=true sh
+          curl -fsSL https://raw.githubusercontent.com/cvedix/HeraMind/main/scripts/install.sh | NO_WEB=true sh
 
           # With nginx for frontend-backend separation
-          curl -fsSL https://raw.githubusercontent.com/camthink-ai/HeraMind/main/scripts/install.sh | USE_NGINX=true sh
+          curl -fsSL https://raw.githubusercontent.com/cvedix/HeraMind/main/scripts/install.sh | USE_NGINX=true sh
           ```
 
           ---
@@ -588,16 +578,34 @@ jobs:
             artifacts/**/*.exe
             artifacts/**/*.AppImage
             artifacts/**/*.deb
-            artifacts/neomind-updater-**/*.app.tar.gz
-            artifacts/neomind-server-linux-amd64/**/*.tar.gz
-            artifacts/neomind-server-linux-arm64/**/*.tar.gz
-            artifacts/neomind-server-darwin-arm64/**/*.tar.gz
-            artifacts/neomind-web/**/*.tar.gz
+            artifacts/heramind-updater-**/*.app.tar.gz
+            artifacts/heramind-server-linux-amd64/**/*.tar.gz
+            artifacts/heramind-server-linux-arm64/**/*.tar.gz
+            artifacts/heramind-server-darwin-arm64/**/*.tar.gz
+            artifacts/heramind-web/**/*.tar.gz
           draft: false
           prerelease: false
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Announce release on Discord
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # The default GITHUB_TOKEN that published this release does NOT emit a
+          # `release: published` event that triggers other workflows (GitHub
+          # blocks token-generated events to prevent loops). So dispatch the
+          # release-notify workflow explicitly — workflow_dispatch is one of the
+          # two events exempted from that rule. release-notify.yml then
+          # self-fetches the release notes via `gh release view`.
+          echo "Dispatching release-notify for ${GITHUB_REF_NAME}…"
+          if gh workflow run release-notify.yml --repo "${REPO}" -f tag_name="${GITHUB_REF_NAME}"; then
+            echo "✅ dispatched release-notify"
+          else
+            echo "⚠️ failed to dispatch release-notify (non-fatal — release itself succeeded)"
+          fi
 
   # ========== Auto-cleanup old releases (keep latest 3) ==========
   cleanup-releases:
@@ -607,21 +615,36 @@ jobs:
       contents: write
 
     steps:
-      - name: Delete old releases (keep latest 3)
+      - name: Delete drafts + old releases (keep latest 3)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           KEEP=3
-          echo "🧹 Cleaning up releases, keeping latest $KEEP..."
+          echo "🧹 Cleaning up releases..."
 
-          # List all non-draft releases sorted newest-first, skip top $KEEP
+          # 1. Delete ALL draft releases first.
+          # Drafts are incomplete releases that were never published. They linger on
+          # the /releases page (sorted to the top for collaborators) and obscure the
+          # real "latest" release. The previous filter (select(.isDraft == false))
+          # never touched them, so stale drafts from abandoned release attempts
+          # (e.g. the old v0.8.x drafts) piled up indefinitely. Tags are kept.
+          gh release list --repo "$REPO" --limit 100 --json tagName,isDraft \
+            --jq '[.[] | select(.isDraft == true)] | .[].tagName' \
+            | while read -r tag; do
+                echo "  deleting draft release: $tag"
+                gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag=false 2>/dev/null \
+                  && echo "    ✅ deleted draft" || echo "    ⚠️ skip"
+              done
+
+          # 2. Keep the latest $KEEP published releases, delete the rest.
           gh release list --repo "$REPO" --limit 100 --json tagName,isDraft,createdAt \
             --jq "[.[] | select(.isDraft == false)] | sort_by(.createdAt) | reverse | .[$KEEP:][] | .tagName" \
             | while read -r tag; do
-              echo "  deleting release: $tag"
-              gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag=false 2>/dev/null && echo "    ✅ deleted" || echo "    ⚠️ skip (may be draft)"
-            done
+                echo "  deleting old release: $tag"
+                gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag=false 2>/dev/null \
+                  && echo "    ✅ deleted" || echo "    ⚠️ skip"
+              done
 
           REMAINING=$(gh release list --repo "$REPO" --limit 100 --json tagName --jq 'length')
           echo "✅ Cleanup done. Remaining releases: $REMAINING"

@@ -5,14 +5,17 @@ import { cva, type VariantProps } from "class-variance-authority"
 import { cn } from "@/lib/utils"
 
 const buttonVariants = cva(
-  // Focus indicator: previously `focus-visible:ring-2 ring-ring ring-offset-2`
-  // rendered a bright brand-ORANGE halo (because --ring = --brand) whenever a
-  // button held keyboard focus OR matched WebKit's tap-to-focus heuristics on
-  // mobile — users reported "random orange edges" on icons / ghost buttons.
-  // Now we use a thin (1px) neutral foreground-tinted ring with NO offset,
-  // which is visible enough for keyboard a11y but doesn't read as a brand
-  // accent. Per-variant hover:bg-* + active:scale still handle pointer feedback.
-  "inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-all duration-150 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.97]",
+  // Focus indicator: a thin (1px) neutral ring via `ring-ring`. History: `--ring`
+  // used to alias `--brand`, so `ring-ring` flashed an orange halo on keyboard
+  // focus / WebKit tap-to-focus ("random orange edges" on ghost buttons). That
+  // was patched with `ring-foreground/30`, but Tailwind can't apply the `/opacity`
+  // modifier to CSS-var colors (`var(--foreground)`), so that class silently
+  // failed to generate and the focus ring vanished entirely. `--ring` has since
+  // been redefined to a neutral foreground@35% (`color-mix`), so `ring-ring` is
+  // now safe AND actually renders. 1px + no offset = visible for keyboard a11y
+  // without reading as a brand accent. Per-variant hover:bg-* + active:scale
+  // handle pointer feedback.
+  "inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-all duration-150 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 active:scale-[0.97]",
   {
     variants: {
       variant: {

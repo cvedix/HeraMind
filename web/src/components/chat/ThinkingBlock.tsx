@@ -71,7 +71,7 @@ export function ThinkingBlock({
             ) : (
               <div className={cn(textBody, "leading-relaxed text-muted-foreground whitespace-pre-wrap break-words")}>
                 {thinking}
-                {isStreaming && <span className="inline-block w-1 h-3.5 bg-muted-foreground/30 animate-pulse ml-0.5 align-middle" />}
+                {isStreaming && <span className="inline-block w-1 h-3.5 bg-muted-foreground animate-pulse ml-0.5 align-middle" />}
               </div>
             )}
           </div>
@@ -120,7 +120,7 @@ export function ThinkingBlock({
           ) : (
             <div className="text-sm leading-relaxed text-muted-foreground whitespace-pre-wrap break-words">
               {thinking}
-              {isStreaming && <span className="inline-block w-1 h-4 bg-muted-foreground/30 animate-pulse ml-1 align-middle" />}
+              {isStreaming && <span className="inline-block w-1 h-4 bg-muted-foreground animate-pulse ml-1 align-middle" />}
             </div>
           )}
         </div>
@@ -154,7 +154,7 @@ function PerRoundThinking({
       )}>
         {text}
         {isStreaming && <span className={cn(
-          "bg-muted-foreground/30 animate-pulse align-middle ml-0.5 inline-block w-1 h-3.5"
+          "bg-muted-foreground animate-pulse align-middle ml-0.5 inline-block w-1 h-3.5"
         )} />}
       </div>
     )
@@ -182,7 +182,7 @@ function PerRoundThinking({
             {text}
             {idx === sortedRounds.length - 1 && isStreaming && (
               <span className={cn(
-                "bg-muted-foreground/30 animate-pulse align-middle ml-0.5 inline-block w-1 h-3.5"
+                "bg-muted-foreground animate-pulse align-middle ml-0.5 inline-block w-1 h-3.5"
               )} />
             )}
           </div>

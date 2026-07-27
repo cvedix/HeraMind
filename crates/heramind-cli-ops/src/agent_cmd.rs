@@ -162,9 +162,14 @@ pub async fn create_agent(
 
     // focused mode requires resources
     if exec_mode == "focused" && !has_resources {
-        anyhow::bail!(
-            "Focused mode requires --resources or --device-ids to bind at least one resource"
-        );
+        // Surface a concrete invocation so the caller can self-correct instead
+        // of retrying blind. Matches the data_push error_with_suggestion gold
+        // standard.
+        return Ok(CliResponse::error_with_suggestion(
+            "Focused mode requires --resources or --device-ids to bind at least one resource.",
+            "FOCUSED_REQUIRES_RESOURCES",
+            "Example: --device-ids device-001,device-002  (binds the focused agent to those devices; or pass --resources with a JSON array)",
+        ));
     }
 
     let data = client.post("/agents", &body).await?;
