@@ -8,7 +8,7 @@
 //! - Concurrent operations
 
 use heramind_core::{
-    event::{EventMetadata, MetricValue, HeraMindEvent, ProposedAction as Action},
+    event::{EventMetadata, HeraMindEvent, MetricValue, ProposedAction as Action},
     eventbus::{EventBus, SharedEventBus},
 };
 use std::sync::Arc;

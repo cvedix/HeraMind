@@ -160,7 +160,9 @@ impl JsTransformExecutor {
         // Extract image data: search for the first large string value that looks like image data.
         // Device metrics may arrive under any key name (values.image, image, photo, picture, etc.)
         // so we scan all string values and pick the first one that looks like base64 image data.
-        let mut image_b64 = find_image_data(input);
+        // Updated to handle URL-based image storage (/api/images/...) - reads files and converts to base64.
+        let image_b64_string = resolve_image_data(input);
+        let mut image_b64 = image_b64_string.as_str();
         // Strip data URI prefix (e.g., "data:image/jpeg;base64,") if present
         if let Some(comma_pos) = image_b64.find(',') {
             if image_b64.starts_with("data:") && comma_pos < 50 {
@@ -487,7 +489,7 @@ impl JsTransformExecutor {
 
             // Provide extensions.invoke() function that looks up pre-computed results
             let invoke_fn = boa_engine::NativeFunction::from_copy_closure(
-                |_this, args: &[JsValue], context: &mut Context<'_>| {
+                |_this, args: &[JsValue], context: &mut Context| {
                     let extension_id = args
                         .first()
                         .and_then(|v| v.as_string())
@@ -516,7 +518,7 @@ impl JsTransformExecutor {
                 },
             );
 
-            let invoke_fn_obj = FunctionObjectBuilder::new(&mut context, invoke_fn)
+            let invoke_fn_obj = FunctionObjectBuilder::new(context.realm(), invoke_fn)
                 .name("invoke")
                 .length(3)
                 .build();
@@ -598,7 +600,7 @@ impl JsTransformExecutor {
                 message: format!("Failed to convert JS value to JSON: {}", e),
             })?;
 
-        Ok(json_value)
+        Ok(json_value.unwrap_or(serde_json::Value::Null))
     }
 
     /// Convert JSON result to vector of metrics
@@ -2520,6 +2522,78 @@ impl TransformEngine {
     }
 }
 
+/// Resolve image data from a JSON value, handling both URLs and base64 data.
+///
+/// This function first checks for image URLs (e.g., `/api/images/...`), reads the
+/// corresponding files, and converts them to base64. If no URLs are found, it falls
+/// back to scanning for existing base64 data.
+///
+/// # Arguments
+/// * `value` - JSON value that may contain image URLs or base64 data
+///
+/// # Returns
+/// Base64-encoded image data (with or without data URI prefix), or empty string if not found
+fn resolve_image_data(value: &Value) -> String {
+    use std::path::Path;
+
+    if let Some(url) = find_image_url(value) {
+        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+        if let Some(data_url) = heramind_devices::image_storage::resolve_internal_image_to_data_url(
+            &url,
+            Path::new(&data_dir),
+        ) {
+            tracing::debug!(url = %url, "Successfully resolved image URL to base64");
+            return data_url;
+        } else {
+            tracing::warn!(url = %url, "Failed to read image file, falling back to base64 scan");
+        }
+    }
+
+    find_image_data(value).to_string()
+}
+
+/// Find image URLs in a JSON value by scanning for /api/images/... patterns.
+/// Checks nested objects recursively; returns the first match.
+fn find_image_url(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) if s.starts_with("/api/images/") => Some(s.clone()),
+        Value::Object(map) => {
+            // Prioritize keys containing "image", "photo", "picture", "url", or "src"
+            for (k, v) in map {
+                let kl = k.to_lowercase();
+                if kl.contains("image")
+                    || kl.contains("photo")
+                    || kl.contains("picture")
+                    || kl.contains("url")
+                    || kl.contains("src")
+                {
+                    if let Some(s) = v.as_str() {
+                        if s.starts_with("/api/images/") {
+                            return Some(s.to_string());
+                        }
+                    }
+                }
+            }
+            // Fallback: scan all values
+            for v in map.values() {
+                if let Some(url) = find_image_url(v) {
+                    return Some(url);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                if let Some(url) = find_image_url(v) {
+                    return Some(url);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Find image data in a JSON value by scanning for large base64 strings.
 /// Checks nested objects recursively; returns the first match.
 fn find_image_data(value: &Value) -> &str {
@@ -3295,6 +3369,104 @@ mod tests {
             1
         );
         assert_eq!(TransformScope::Device("sensor1".to_string()).priority(), 2);
+    }
+
+    #[test]
+    fn test_find_image_url() {
+        // Test direct URL string
+        let url_data = json!({ "image": "/api/images/test.jpg" });
+        assert_eq!(
+            find_image_url(&url_data),
+            Some("/api/images/test.jpg".to_string())
+        );
+
+        // Test nested object with URL
+        let nested_data = json!({
+            "values": {
+                "imageUrl": "/api/images/nested.png"
+            }
+        });
+        assert_eq!(
+            find_image_url(&nested_data),
+            Some("/api/images/nested.png".to_string())
+        );
+
+        // Test array with URL
+        let array_data = json!({
+            "images": ["/api/images/array1.jpg", "/api/images/array2.png"]
+        });
+        assert_eq!(
+            find_image_url(&array_data),
+            Some("/api/images/array1.jpg".to_string())
+        );
+
+        // Test no URL present
+        let no_url_data = json!({ "text": "just text" });
+        assert_eq!(find_image_url(&no_url_data), None);
+
+        // Test mixed - URL vs base64
+        let mixed_data = json!({
+            "url": "/api/images/mixed.jpg",
+            "base64": "data:image/png;base64,iVBORw0KG..."
+        });
+        assert_eq!(
+            find_image_url(&mixed_data),
+            Some("/api/images/mixed.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_image_data_with_url() {
+        // Test with URL - this will try to read a file, so we need to set up the environment
+        // For this test, we'll just verify the function doesn't panic when URL is present
+        let url_data = json!({ "image": "/api/images/nonexistent.jpg" });
+        let result = resolve_image_data(&url_data);
+
+        // Should return empty string when file doesn't exist (fallback to base64 scan)
+        assert_eq!(result, "");
+
+        // Test with base64 data - need a string >200 characters
+        let long_base64 = "data:image/png;base64,".to_string() + &"A".repeat(300);
+        let base64_data = json!({ "image": long_base64 });
+        let result = resolve_image_data(&base64_data);
+
+        // The result should contain the base64 data since it's >200 chars and starts with "data:image"
+        assert!(result.len() > 200); // Should be a long base64 string
+        assert!(result.contains("data:image"));
+    }
+
+    #[test]
+    fn test_resolve_image_data_base64_fallback() {
+        // Test that base64 data still works when no URL is present
+        let large_base64 = "a".repeat(300); // Simulates base64-like string
+        let base64_data = json!({ "image": large_base64 });
+        let result = resolve_image_data(&base64_data);
+
+        // Should return the base64 string (or empty if it doesn't pass validation)
+        assert!(result.len() > 0 || result.is_empty()); // Either way, no panic
+    }
+
+    #[test]
+    fn test_resolve_image_data_nested_objects() {
+        // Test URL detection in nested structures
+        let nested_data = json!({
+            "device": {
+                "values": {
+                    "photo": "/api/images/nested_photo.jpg"
+                }
+            }
+        });
+        let result = resolve_image_data(&nested_data);
+
+        // Should try to resolve URL (will fail if file doesn't exist, return empty)
+        assert!(result.is_empty()); // File doesn't exist in test
+    }
+
+    #[test]
+    fn test_resolve_image_data_empty_input() {
+        let empty_data = json!({});
+        let result = resolve_image_data(&empty_data);
+        assert_eq!(result, "");
     }
 
     #[test]

@@ -15,7 +15,8 @@ use super::{
     compact, summarize_tool_output, truncate_to, DedupOutcome, RoundData, ToolCallRecord,
     ToolLoopOutput,
 };
-use crate::agent::types::ToolCall;
+use crate::agent::streaming::resolve_cached_arguments;
+use crate::agent::types::{LargeDataCache, ToolCall};
 
 // ---------------------------------------------------------------------------
 // impl AgentExecutor — methods that use &self
@@ -55,6 +56,13 @@ impl AgentExecutor {
         // Accumulate skill tool results separately — inject as concise prompt, not full history
         let mut skill_reference = String::new();
         let mut skill_injected = false;
+
+        // Per-execution LargeDataCache. Slimmed tool results store their large/base64
+        // strings here under `$cached:<key>` references; when the LLM passes those refs
+        // back in subsequent tool calls, `resolve_cached_arguments` below substitutes the
+        // full data so image-aware tools (vision/image_edit) receive it transparently.
+        // Mirrors the chat-agent streaming layer (stream_core/stream_multimodal).
+        let mut large_data_cache = LargeDataCache::new();
 
         // Cross-round tool deduplication: track tool signatures to avoid re-executing
         // the same tool with the same arguments across rounds.
@@ -467,7 +475,10 @@ impl AgentExecutor {
             ));
 
             // Execute tools with concurrency limiting via semaphore
-            // Map sanitized tool names back to original names for registry lookup
+            // Map sanitized tool names back to original names for registry lookup.
+            // Resolve `$cached:<key>` references in tool arguments against this
+            // execution's LargeDataCache so image-aware tools receive the full
+            // binary payload (the LLM only sees the slim summary in its prompt).
             let calls: Vec<_> = tool_calls
                 .iter()
                 .map(|tc| {
@@ -475,9 +486,11 @@ impl AgentExecutor {
                         .get(&tc.name)
                         .cloned()
                         .unwrap_or_else(|| tc.name.clone());
+                    let resolved_args =
+                        resolve_cached_arguments(&tc.arguments, &large_data_cache, &original_name);
                     crate::toolkit::registry::ToolCall {
                         name: original_name,
-                        args: tc.arguments.clone(),
+                        args: resolved_args,
                         id: Some(tc.id.clone()),
                     }
                 })
@@ -516,6 +529,7 @@ impl AgentExecutor {
                     &agent.id,
                     execution_id,
                     step_num,
+                    &mut large_data_cache,
                 )
                 .await;
             step_num = new_step_num;

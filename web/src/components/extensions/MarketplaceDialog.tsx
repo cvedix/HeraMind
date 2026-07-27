@@ -26,9 +26,12 @@ import {
   ChevronLeft,
   ExternalLink,
   X,
+  FileText,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { api } from "@/lib/api"
+import ReactMarkdown from "react-markdown"
+import remarkGfm from "remark-gfm"
 import { useStore } from "@/store"
 import { useIsMobile } from "@/hooks/useMobile"
 
@@ -509,6 +512,37 @@ function ExtensionDetailView({
   isMobile,
 }: ExtensionDetailViewProps) {
   const { t } = useTranslation(["extensions", "common"])
+  const [readme, setReadme] = useState<string | null>(null)
+
+  // Fetch README asynchronously. The section renders only once content arrives,
+  // so a missing README (content: null) never flashes a title/skeleton that
+  // then vanishes — nothing appears until there's something to show.
+  useEffect(() => {
+    if (!extension.id) return
+    let cancelled = false
+    setReadme(null)
+    api
+      .get<{ content: string | null }>(`/extensions/market/${extension.id}/readme`)
+      .then((res) => {
+        if (!cancelled) setReadme(res?.content ?? null)
+      })
+      .catch((e) => {
+        if (!cancelled) console.warn("Failed to load README:", e)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [extension.id])
+
+  // Resolve a relative path inside the README to an absolute GitHub raw URL
+  // (so screenshots / doc links load instead of 404'ing against the app).
+  // Absolute URLs (http[s]:, mailto:) and in-page anchors (#) are kept as-is.
+  const resolveReadmeUrl = (raw: string | undefined): string | undefined => {
+    if (!raw) return raw
+    if (/^(https?:|mailto:|#|data:)/i.test(raw)) return raw
+    const base = `https://raw.githubusercontent.com/camthink-ai/HeraMind-Extensions/main/extensions/${extension.id}/`
+    return base + raw.replace(/^\.?\//, "")
+  }
 
   return (
     <div className="flex flex-col h-full">
@@ -632,6 +666,37 @@ function ExtensionDetailView({
                 <li key={key}>• {key}</li>
               ))}
             </ul>
+          </div>
+        )}
+
+        {/* README / Documentation — render only once content arrives, so a
+            missing README never flashes a title that then vanishes. */}
+        {readme && (
+          <div>
+            <h3 className="font-semibold mb-3 flex items-center gap-2">
+              <FileText className="h-4 w-4" />
+              {t("extensions:market.readme", "Documentation")}
+            </h3>
+            <div className="prose prose-sm dark:prose-invert max-w-none">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={{
+                  img: ({ node: _node, ...props }) => (
+                    <img {...props} src={resolveReadmeUrl(props.src)} />
+                  ),
+                  a: ({ node: _node, ...props }) => (
+                    <a
+                      {...props}
+                      href={resolveReadmeUrl(props.href)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    />
+                  ),
+                }}
+              >
+                {readme}
+              </ReactMarkdown>
+            </div>
           </div>
         )}
       </div>

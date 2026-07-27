@@ -8,7 +8,7 @@ use futures::FutureExt;
 use heramind_core::llm::backend::LlmRuntime;
 use heramind_core::{
     message::{Content, ContentPart, Message, MessageRole},
-    EventBus, MetricValue, HeraMindEvent,
+    EventBus, HeraMindEvent, MetricValue,
 };
 use heramind_devices::DeviceService;
 
@@ -286,8 +286,9 @@ pub struct AgentExecutor {
     pub(crate) recent_executions: Arc<RwLock<HashMap<String, i64>>>,
     /// LLM runtime cache: backend_id -> runtime
     /// Key format: "{backend_type}:{endpoint}:{model}" for cache invalidation
-    pub(crate) llm_runtime_cache:
-        Arc<RwLock<HashMap<String, Arc<dyn heramind_core::llm::backend::LlmRuntime + Send + Sync>>>>,
+    pub(crate) llm_runtime_cache: Arc<
+        RwLock<HashMap<String, Arc<dyn heramind_core::llm::backend::LlmRuntime + Send + Sync>>>,
+    >,
     /// Phase 3.3: Extension registry for dynamic tool loading
     pub(crate) extension_registry:
         Option<Arc<heramind_core::extension::registry::ExtensionRegistry>>,
@@ -662,10 +663,9 @@ impl AgentExecutor {
         command: &str,
         args: &serde_json::Value,
     ) -> AgentResult<serde_json::Value> {
-        let registry = self
-            .extension_registry
-            .as_ref()
-            .ok_or_else(|| HeraMindError::Config("Extension registry not configured".to_string()))?;
+        let registry = self.extension_registry.as_ref().ok_or_else(|| {
+            HeraMindError::Config("Extension registry not configured".to_string())
+        })?;
 
         registry
             .execute_command(extension_id, command, args)

@@ -4,6 +4,7 @@
   "description": "CamAI CV01 sensing camera with low-power battery support and button-triggered capture. Ideal for remote monitoring and photo capture scenarios.",
   "categories": ["Camera", "Sensing"],
   "mode": "full",
+  "store_raw": false,
   "metrics": [
     {
       "name": "ts",

@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::handlers::common::{ok, HandlerResult};
 use crate::models::error::ErrorResponse;
 use crate::server::ServerState;
-use heramind_core::event::{MetricValue as CoreMetricValue, HeraMindEvent};
+use heramind_core::event::{HeraMindEvent, MetricValue as CoreMetricValue};
 use heramind_core::extension::context::ExtensionCapability as CoreExtensionCapability;
 use heramind_devices::mdl::MetricValue as DeviceMetricValue;
 use heramind_devices::telemetry::DataPoint;

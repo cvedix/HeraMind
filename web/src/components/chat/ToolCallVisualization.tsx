@@ -212,14 +212,14 @@ function RoundContent({ content }: { content: string }) {
         onClick={() => setIsExpanded(!isExpanded)}
         className="w-full flex items-center gap-2 px-3 py-1 text-left hover:bg-muted-30 transition-colors"
       >
-        <FileText className="h-3.5 w-3.5 text-muted-foreground/50 shrink-0" />
+        <FileText className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
         {!isExpanded && (
-          <span className={cn(textMini, "text-muted-foreground/60 truncate")}>
+          <span className={cn(textMini, "text-muted-foreground truncate")}>
             {content.slice(0, 80)}{content.length > 80 && "..."}
           </span>
         )}
         {isExpanded && (
-          <span className={cn(textMini, "text-muted-foreground/60")}>Details</span>
+          <span className={cn(textMini, "text-muted-foreground")}>Details</span>
         )}
         <div className="flex-1" />
         <ChevronDown className={cn(
@@ -282,7 +282,7 @@ function ToolCallItem({
           ) : status === "completed" ? (
             <CheckCircle2 className="h-3.5 w-3.5" />
           ) : (
-            <div className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
+            <div className="h-1.5 w-1.5 rounded-full bg-muted-foreground" />
           )}
         </div>
         <span className={cn(textBody, "truncate text-muted-foreground")}>{getToolDisplayName(toolCall.name, toolCall.arguments)}</span>
@@ -299,7 +299,7 @@ function ToolCallItem({
             // 16px chevron inside (centered with 4px right padding) lands
             // at exactly parent_right - 12, matching ThinkingBlock /
             // ToolProcessBlock / RoundContent chevrons.
-            className="-mr-1 p-1 rounded text-muted-foreground/50 hover:bg-muted-30 hover:text-muted-foreground shrink-0 transition-colors"
+            className="-mr-1 p-1 rounded text-muted-foreground hover:bg-muted-30 hover:text-muted-foreground shrink-0 transition-colors"
             aria-label={t("toolCall.toggleDetails")}
           >
             <ChevronDown className={cn("h-4 w-4 transition-transform duration-200", isExpanded && "rotate-180")} />
@@ -310,7 +310,7 @@ function ToolCallItem({
         <div className="ml-5.5 mt-0.5 mb-1 space-y-1">
           {hasArguments && (
             <div className="rounded bg-muted-30 p-1.5">
-              <div className={cn(textMini, "text-muted-foreground/60 mb-0.5 flex items-center gap-1")}>
+              <div className={cn(textMini, "text-muted-foreground mb-0.5 flex items-center gap-1")}>
                 <Code className="h-3 w-3" />{t("toolCall.arguments")}
               </div>
               <pre className={cn(textMini, "font-mono text-muted-foreground whitespace-pre-wrap break-words leading-relaxed")}>
@@ -322,7 +322,7 @@ function ToolCallItem({
             <BuildCard response={buildResponse} />
           ) : hasResult && (
             <div className="rounded bg-muted-30 p-1.5">
-              <div className={cn(textMini, "text-muted-foreground/60 mb-0.5 flex items-center gap-1")}>
+              <div className={cn(textMini, "text-muted-foreground mb-0.5 flex items-center gap-1")}>
                 <CheckCircle2 className="h-3 w-3" />{t("toolCall.result")}
               </div>
               <pre className={cn(textMini, "font-mono text-muted-foreground whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed")}>

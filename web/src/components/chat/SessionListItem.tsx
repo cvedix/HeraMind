@@ -66,7 +66,7 @@ export const SessionListItem = React.memo<SessionListItemProps>(
           <div className={cn(
             "text-xs truncate",
             isActive
-              ? "text-primary-foreground/70"
+              ? "text-white/70"
               : "text-muted-foreground"
           )}>
             {formatTimestamp(session.createdAt / 1000, false)}
@@ -81,7 +81,7 @@ export const SessionListItem = React.memo<SessionListItemProps>(
               variant="ghost"
               size="icon"
               className={cn("h-6 w-6 shrink-0",
-                isActive ? "hover:bg-primary-foreground/20" : ""
+                isActive ? "hover:bg-white/20" : ""
               )}
               onClick={(e) => onRename(e, session.sessionId!, session.title || session.preview || "")}
             >
@@ -92,7 +92,7 @@ export const SessionListItem = React.memo<SessionListItemProps>(
               variant="ghost"
               size="icon"
               className={cn("h-6 w-6 shrink-0",
-                isActive ? "hover:bg-primary-foreground/20" : ""
+                isActive ? "hover:bg-white/20" : ""
               )}
               onClick={(e) => onDelete(e, session.sessionId!)}
             >

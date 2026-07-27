@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use heramind_core::{
-    event::{MetricValue, HeraMindEvent},
+    event::{HeraMindEvent, MetricValue},
     eventbus::EventBus,
     extension::{
         event_dispatcher::EventDispatcher,

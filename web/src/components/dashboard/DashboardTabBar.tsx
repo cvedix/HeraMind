@@ -12,6 +12,7 @@ import {
   Plus,
   Pencil,
   Trash2,
+  Copy,
   Check,
   X,
   PanelLeft,
@@ -47,6 +48,7 @@ export interface DashboardTabBarProps {
   onSwitch: (id: string) => void
   onCreate: (name: string) => void
   onRename: (id: string, name: string) => void
+  onDuplicate: (id: string) => void
   onDelete: (id: string) => void
   /** Persist a new manual order (array of dashboard IDs, index 0 = leftmost). */
   onReorder?: (newOrder: string[]) => void
@@ -60,6 +62,7 @@ export function DashboardTabBar({
   onSwitch,
   onCreate,
   onRename,
+  onDuplicate,
   onDelete,
   onReorder,
   onSwitchToSidebar,
@@ -129,6 +132,12 @@ export function DashboardTabBar({
     setEditingId(dashboard.id)
     setEditingName(dashboard.name)
   }, [currentDashboardId, dashboards])
+
+  const handleDuplicateCurrent = useCallback(() => {
+    if (!currentDashboardId) return
+    setMoreMenuOpen(false)
+    onDuplicate(currentDashboardId)
+  }, [currentDashboardId, onDuplicate])
 
   const commitCreate = useCallback(() => {
     const name = newDashboardName.trim()
@@ -323,6 +332,13 @@ export function DashboardTabBar({
                   {t('tabBar.rename')}
                 </DropdownMenuItem>
                 <DropdownMenuItem
+                  onClick={handleDuplicateCurrent}
+                  className="gap-2"
+                >
+                  <Copy className="h-4 w-4" />
+                  {t('sidebar.duplicateDashboard')}
+                </DropdownMenuItem>
+                <DropdownMenuItem
                   onClick={handleDeleteCurrent}
                   className="gap-2 text-error focus:text-error"
                 >
@@ -491,6 +507,10 @@ export function DashboardTabBar({
                         <DropdownMenuItem onClick={handleRenameCurrent}>
                           <Pencil className="h-4 w-4" />
                           {t('tabBar.rename')}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={handleDuplicateCurrent}>
+                          <Copy className="h-4 w-4" />
+                          {t('sidebar.duplicateDashboard')}
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           onClick={handleDeleteCurrent}

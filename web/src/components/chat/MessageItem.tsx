@@ -29,7 +29,7 @@ export const MessageItem = React.memo<MessageItemProps>(
       >
         {isAssistant && (
           <div className="flex-shrink-0 w-8 h-8 rounded-lg bg-accent-orange-bg flex items-center justify-center">
-            <Bot className="h-4.5 w-4.5 text-accent-orange" />
+            <Bot className="h-4 w-4 text-accent-orange" />
           </div>
         )}
 

@@ -5,6 +5,7 @@
 
 pub mod assets;
 pub mod extension_metrics;
+pub mod image_cleanup;
 pub mod install_service;
 pub mod middleware;
 pub mod router;
@@ -28,6 +29,7 @@ pub use state::DeviceStatusUpdate;
 pub use types::{ServerState, MAX_REQUEST_BODY_SIZE};
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -200,6 +202,34 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
                             }
                         }
                     }
+
+                    // Clean up expired image files
+                    if let Some(image_retention_hours) = config.image_retention {
+                        let data_dir = std::env::var("HERAMIND_DATA_DIR")
+                            .unwrap_or_else(|_| "data".to_string());
+                        let images_dir = PathBuf::from(&data_dir).join("images");
+
+                        match crate::server::image_cleanup::cleanup_expired_images(
+                            &images_dir,
+                            image_retention_hours,
+                        )
+                        .await
+                        {
+                            Ok((files_deleted, dirs_cleaned)) => {
+                                if files_deleted > 0 || dirs_cleaned > 0 {
+                                    tracing::info!(
+                                        files_deleted = files_deleted,
+                                        dirs_cleaned = dirs_cleaned,
+                                        retention_hours = image_retention_hours,
+                                        "Image retention cleanup completed"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Image retention cleanup failed");
+                            }
+                        }
+                    }
                 }
 
                 tokio::time::sleep(Duration::from_secs(interval_secs)).await;
@@ -302,7 +332,8 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
             // Kill orphaned extension runner processes from a previous session.
             // MUST run before init_extensions() to avoid killing newly spawned runners.
             // Orphaned runners hold dylib files open and cause dlopen() hangs.
-            heramind_core::extension::isolated::IsolatedExtensionManager::cleanup_orphaned_runners();
+            heramind_core::extension::isolated::IsolatedExtensionManager::cleanup_orphaned_runners(
+            );
             tracing::info!(
                 elapsed_ms = t_bg.elapsed().as_millis() as u64,
                 "Extension orphan cleanup done"
@@ -330,14 +361,16 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
                                     record.last_error_at = None;
                                     let _ = store.save(&record);
 
-                                    // Apply saved config if available
+                                    // Apply saved config via ConfigUpdate IPC (NOT
+                                    // execute_command, because "configure" is a
+                                    // lifecycle method, not a registered command).
                                     if let Some(ref config) = record.config {
                                         tracing::info!(
                                             extension_id = %ext_id,
                                             "Applying saved config to extension after crash recovery"
                                         );
                                         if let Err(e) = rt
-                                            .execute_command(&ext_id, "configure", config)
+                                            .send_config_update(&ext_id, config)
                                             .await
                                         {
                                             tracing::warn!(
@@ -519,6 +552,11 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
 /// Binds to 0.0.0.0 to allow LAN access.
 /// Port can be configured via config.toml [server] section or HERAMIND_PORT env var.
 pub async fn start_server() -> anyhow::Result<()> {
+    // rustls 0.23 (via reqwest's rustls-tls-...-no-provider build) does NOT
+    // auto-select a process-level CryptoProvider. Install ring before any TLS
+    // use (MQTT adapter, HTTPS LLM calls) or the first TLS op panics:
+    // "Could not automatically determine the process-level CryptoProvider".
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let (host, port) = crate::config::get_server_config();
     let bind: SocketAddr = format!("{}:{}", host, port).parse()?;
     run(bind).await

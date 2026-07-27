@@ -737,6 +737,8 @@ pub struct Agent {
         Arc<tokio::sync::RwLock<crate::smart_conversation::SmartConversationManager>>,
     /// Semantic mapper - converts natural language to technical IDs
     semantic_mapper: Arc<semantic_mapper::SemanticToolMapper>,
+    /// Resident system capability index (CLI tree + data conventions + device-type snapshot).
+    capability_index: Arc<crate::prompts::CapabilityIndex>,
     /// Shared conversation state (merged: context + followup + hash)
     shared_state: Arc<tokio::sync::RwLock<AgentSharedState>>,
     /// Tool result cache - caches recent tool executions to avoid redundant calls
@@ -774,6 +776,10 @@ impl Agent {
         let semantic_mapper = Arc::new(semantic_mapper::SemanticToolMapper::new(
             resource_index.clone(),
         ));
+        // Capability index shares the same ResourceIndex as the semantic mapper
+        // (zero new service wiring) — see prompts/capability_index.rs.
+        let capability_index =
+            Arc::new(crate::prompts::CapabilityIndex::new(resource_index.clone()));
 
         Self {
             config,
@@ -789,6 +795,7 @@ impl Agent {
                 crate::smart_conversation::SmartConversationManager::new(),
             )),
             semantic_mapper,
+            capability_index,
             shared_state: Arc::new(tokio::sync::RwLock::new(AgentSharedState {
                 conversation_context: ConversationContext::new(),
                 smart_followup: SmartFollowUpManager::new(),
@@ -796,7 +803,13 @@ impl Agent {
             })),
             tool_result_cache: Arc::new(tokio::sync::RwLock::new(ToolResultCache::new())),
             memory_snapshot: std::sync::OnceLock::new(),
-            tool_concurrency_limit: Arc::new(Semaphore::new(5)),
+            tool_concurrency_limit: Arc::new(Semaphore::new(
+                std::env::var("HERAMIND_TOOL_CONCURRENCY")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|&n| n >= 1)
+                    .unwrap_or(5),
+            )),
         }
     }
 
@@ -1215,6 +1228,13 @@ impl Agent {
             prompt.push_str(&resource_context);
         }
 
+        // === System capability index (command tree + data conventions + device-type snapshot) ===
+        let capability = self.capability_index.build().await;
+        if !capability.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&capability);
+        }
+
         // === Memory snapshot injection (frozen, loaded once per session) ===
         if let Some(snapshot) = self.memory_snapshot.get().and_then(|opt| opt.as_ref()) {
             let section = snapshot.to_prompt_section();
@@ -1349,9 +1369,14 @@ impl Agent {
             ),
         ];
 
-        // Check greetings
+        // Check greetings — EXACT match only. Prefix matching (starts_with)
+        // misfired on substantive messages: "ok here's my question..." -> "OK!",
+        // "行业发展" -> "好的，没问题." (matched "行"), "对称性" -> "是的，正确."
+        // (matched "对"). Anything that isn't exactly the greeting falls through
+        // to the LLM, which handles greetings contextually AND preserves intent
+        // (e.g. "ok, create a device" no longer short-circuits to a canned "OK!").
         for (pattern, response) in greeting_responses.iter() {
-            if trimmed == *pattern || trimmed.starts_with(*pattern) {
+            if trimmed == *pattern {
                 return Some(AgentResponse {
                     message: AgentMessage::assistant(*response),
                     tool_calls: vec![],
@@ -1362,9 +1387,9 @@ impl Agent {
             }
         }
 
-        // Check confirmations
+        // Check confirmations — EXACT match only (same rationale as greetings).
         for (pattern, response) in confirmation_responses.iter() {
-            if trimmed == *pattern || trimmed.starts_with(*pattern) {
+            if trimmed == *pattern {
                 return Some(AgentResponse {
                     message: AgentMessage::assistant(*response),
                     tool_calls: vec![],
@@ -2332,7 +2357,10 @@ END"#
                 relationships.insert(real_name, tool.definition().relationships);
             } else {
                 // No relationships found, use default
-                relationships.insert(real_name, heramind_core::tools::ToolRelationships::default());
+                relationships.insert(
+                    real_name,
+                    heramind_core::tools::ToolRelationships::default(),
+                );
             }
         }
 
@@ -3082,6 +3110,20 @@ mod tests {
 
         let state = agent.state().await;
         assert_eq!(state.id, "test_session");
+    }
+
+    #[tokio::test]
+    async fn dynamic_prompt_contains_capability_index() {
+        let agent = Agent::with_session("test_capability".to_string());
+        let prompt = agent.generate_dynamic_system_prompt().await;
+        assert!(
+            prompt.contains("## System Capability Index"),
+            "capability index missing from dynamic prompt"
+        );
+        assert!(
+            prompt.contains("### CLI Commands"),
+            "cli tree missing from dynamic prompt"
+        );
     }
 
     #[tokio::test]

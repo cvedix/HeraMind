@@ -9,7 +9,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Calendar } from '@/components/ui/calendar'
 
 import { Download, CalendarIcon } from 'lucide-react'
-import { api } from '@/lib/api'
+import { api, getServerOrigin, tokenManager, getApiKey } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
 import { textNano } from '@/design-system/tokens/typography'
 import { cn } from '@/lib/utils'
@@ -81,12 +81,65 @@ function isBase64Binary(value: unknown): value is string {
   return /^[A-Za-z0-9+/=\s]+$/.test(value.slice(0, 200))
 }
 
+/** Check if a value is a stored /api/images/ URL (image file on disk) */
+function isApiImageUrl(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  return value.startsWith('/api/images/')
+}
+
+/** True if a data point value is any kind of image content we can bundle. */
+function isImageValue(value: unknown): boolean {
+  return isBase64Image(value) || isBase64Binary(value) || isApiImageUrl(value)
+}
+
 /** Detect if the data contains image/binary content that should go to ZIP */
 function detectImageContent(data: Array<{ value: unknown }>): boolean {
   if (data.length === 0) return false
   // Check first few data points
   const sample = data.slice(0, 5)
-  return sample.some(p => isBase64Image(p.value))
+  return sample.some(p => isImageValue(p.value))
+}
+
+/** Extract a normalized image file extension from an /api/images/ URL path. */
+function extFromUrlPath(url: string): string {
+  const m = url.split('?')[0].match(/\.([a-zA-Z0-9]+)$/)
+  const ext = m ? m[1].toLowerCase() : ''
+  const known: Record<string, string> = {
+    png: 'png', jpg: 'jpg', jpeg: 'jpg', gif: 'gif',
+    webp: 'webp', bmp: 'bmp', svg: 'svg', tiff: 'tiff', tif: 'tiff',
+  }
+  return known[ext] ?? 'bin'
+}
+
+/**
+ * Resolve an image point's value to raw bytes + extension. Handles base64 data
+ * URIs, raw base64, and /api/images/ URLs (fetched with the same auth headers
+ * as the rest of the API). Returns null if it can't be resolved (e.g. file
+ * deleted) so the caller can keep the raw value instead of dropping the point.
+ */
+async function resolveImageBytes(value: string): Promise<{ bytes: Uint8Array; ext: string } | null> {
+  if (isBase64Image(value) || isBase64Binary(value)) {
+    const parsed = parseImageData(value)
+    const binaryStr = atob(parsed.base64)
+    const bytes = new Uint8Array(binaryStr.length)
+    for (let j = 0; j < binaryStr.length; j++) bytes[j] = binaryStr.charCodeAt(j)
+    return { bytes, ext: parsed.ext }
+  }
+  if (isApiImageUrl(value)) {
+    try {
+      const headers: Record<string, string> = {}
+      const token = tokenManager.getToken()
+      if (token) headers['Authorization'] = `Bearer ${token}`
+      const apiKey = getApiKey()
+      if (apiKey) headers['X-API-Key'] = apiKey
+      const resp = await fetch(getServerOrigin() + value, { headers })
+      if (!resp.ok) return null
+      return { bytes: new Uint8Array(await resp.arrayBuffer()), ext: extFromUrlPath(value) }
+    } catch {
+      return null
+    }
+  }
+  return null
 }
 
 /** Extract MIME type and extension from data URI or guess from base64 */
@@ -185,10 +238,10 @@ export function ExportDataDialog({ open, onOpenChange, source }: ExportDataDialo
           description: `${baseName}.zip`,
         })
       } else {
-        await generateExcel(baseName, data)
+        await generateCsv(baseName, data)
         toast({
           title: t('export.success'),
-          description: `${baseName}.xlsx`,
+          description: `${baseName}.csv`,
         })
       }
 
@@ -310,33 +363,41 @@ export function ExportDataDialog({ open, onOpenChange, source }: ExportDataDialo
   )
 }
 
-/** Generate and download an Excel file */
-async function generateExcel(
+/** Generate and download a CSV file (opens natively in Excel).
+ *  Replaces the former xlsx-based export: xlsx (SheetJS 0.18.x) carries high
+ *  CVEs (CVE-2023-30533, CVE-2024-22363) on its read/parse path, and this
+ *  export only ever writes our own tabular data — so CSV removes the
+ *  vulnerable dependency entirely with no new dep and the same usability. */
+async function generateCsv(
   baseName: string,
   data: Array<{ timestamp: number; value: unknown; quality: number | null }>,
 ) {
-  const XLSX = await import('xlsx')
+  // RFC 4180: quote any field containing comma / quote / newline; double inner quotes
+  const esc = (v: string) => (/[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v)
 
   const rows = data.map(p => {
     const rawValue = typeof p.value === 'object' ? JSON.stringify(p.value) : String(p.value ?? '')
-    return {
-      Timestamp: formatTimestamp(p.timestamp),
-      Value: truncateForExcel(rawValue),
-      Quality: p.quality !== null ? `${(p.quality * 100).toFixed(0)}%` : '-',
-    }
+    return [
+      formatTimestamp(p.timestamp),
+      truncateForExcel(rawValue),
+      p.quality !== null ? `${(p.quality * 100).toFixed(0)}%` : '-',
+    ]
+      .map(esc)
+      .join(',')
   })
 
-  const ws = XLSX.utils.json_to_sheet(rows)
-  // Auto-width columns
-  ws['!cols'] = [
-    { wch: 22 }, // Timestamp
-    { wch: 30 }, // Value (wider to show more content)
-    { wch: 10 }, // Quality
-  ]
-
-  const wb = XLSX.utils.book_new()
-  XLSX.utils.book_append_sheet(wb, ws, 'Data')
-  XLSX.writeFile(wb, `${baseName}.xlsx`)
+  const header = ['Timestamp', 'Value', 'Quality'].map(esc).join(',')
+  // Leading UTF-8 BOM so Excel decodes Unicode (Chinese etc.) correctly
+  const csv = '﻿' + [header, ...rows].join('\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${baseName}.csv`
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  setTimeout(() => URL.revokeObjectURL(url), 100)
 }
 
 /** Generate and download a ZIP file with decoded images */
@@ -359,33 +420,9 @@ async function generateZip(
     exported_at: new Date().toISOString(),
   }, null, 2))
 
-  // Process each data point
-  for (let i = 0; i < data.length; i++) {
-    const p = data[i]
-    const valStr = typeof p.value === 'string' ? p.value : JSON.stringify(p.value)
-    const timeStr = formatTimestamp(p.timestamp).replace(/[: ]/g, '-')
-
-    if (isBase64Image(p.value) || isBase64Binary(p.value)) {
-      // Decode base64 image → actual file
-      const parsed = parseImageData(valStr)
-      const filename = `images/${String(i + 1).padStart(4, '0')}_${timeStr}.${parsed.ext}`
-      // Convert base64 to binary
-      const binaryStr = atob(parsed.base64)
-      const bytes = new Uint8Array(binaryStr.length)
-      for (let j = 0; j < binaryStr.length; j++) {
-        bytes[j] = binaryStr.charCodeAt(j)
-      }
-      zip.file(filename, bytes)
-      imageCount++
-    } else {
-      // Non-image data point → CSV reference
-      const q = p.quality !== null ? `${(p.quality * 100).toFixed(0)}%` : '-'
-      const shortVal = valStr.length > 200 ? valStr.slice(0, 200) + '...' : valStr
-      // Will be collected into data.csv below
-    }
-  }
-
-  // data.csv with index mapping + non-image data
+  // data.csv: one row per point. Image points resolve to a file under images/;
+  // points that can't be resolved (e.g. /api/images/ file deleted) or aren't
+  // images keep their raw value so no data is lost.
   const csvRows = ['Index,Filename,Timestamp,Quality,Size']
   for (let i = 0; i < data.length; i++) {
     const p = data[i]
@@ -393,10 +430,16 @@ async function generateZip(
     const timeStr = formatTimestamp(p.timestamp).replace(/[: ]/g, '-')
     const q = p.quality !== null ? `${(p.quality * 100).toFixed(0)}%` : '-'
 
-    if (isBase64Image(p.value) || isBase64Binary(p.value)) {
-      const parsed = parseImageData(valStr)
-      const filename = `${String(i + 1).padStart(4, '0')}_${timeStr}.${parsed.ext}`
-      csvRows.push(`${i + 1},${filename},${formatTimestamp(p.timestamp)},${q},${parsed.base64.length} bytes`)
+    if (isImageValue(p.value)) {
+      const resolved = await resolveImageBytes(valStr)
+      if (resolved) {
+        const filename = `${String(i + 1).padStart(4, '0')}_${timeStr}.${resolved.ext}`
+        zip.file(`images/${filename}`, resolved.bytes)
+        imageCount++
+        csvRows.push(`${i + 1},${filename},${formatTimestamp(p.timestamp)},${q},${resolved.bytes.length} bytes`)
+      } else {
+        csvRows.push(`${i + 1},-,${formatTimestamp(p.timestamp)},${q},"${valStr.replace(/"/g, '""')}"`)
+      }
     } else {
       csvRows.push(`${i + 1},-,${formatTimestamp(p.timestamp)},${q},"${valStr.replace(/"/g, '""')}"`)
     }

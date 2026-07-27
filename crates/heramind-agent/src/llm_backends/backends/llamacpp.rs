@@ -413,15 +413,25 @@ impl LlmRuntime for LlamaCppRuntime {
             // Check for context overflow and return specific error for retry
             if body.contains("exceed_context_size_error") {
                 let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
-                let prompt_tokens = parsed
-                    .as_ref()
-                    .and_then(|v| v.get("error"))
+                let err_obj = parsed.as_ref().and_then(|v| v.get("error"));
+                let prompt_tokens = err_obj
                     .and_then(|e| e.get("n_prompt_tokens"))
                     .and_then(|t| t.as_u64())
                     .unwrap_or(0) as usize;
+                // Prefer the server-reported n_ctx — it reflects the ACTUAL
+                // --ctx-size the server was started with. Our cached
+                // max_context_length() may be stale (e.g. server restarted
+                // with a different ctx-size but capabilities not re-detected)
+                // or a theoretical default, leading to misleading messages
+                // like "11958 < 32000" when the real limit is 8192.
+                let max_context = err_obj
+                    .and_then(|e| e.get("n_ctx"))
+                    .and_then(|t| t.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or_else(|| self.max_context_length());
                 return Err(LlmError::ContextOverflow {
                     prompt_tokens,
-                    max_context: self.max_context_length(),
+                    max_context,
                 });
             }
 
@@ -621,17 +631,23 @@ impl LlmRuntime for LlamaCppRuntime {
                         // Check for context overflow and return specific error for retry
                         if body.contains("exceed_context_size_error") {
                             let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
-                            let prompt_tokens = parsed
-                                .as_ref()
-                                .and_then(|v| v.get("error"))
+                            let err_obj = parsed.as_ref().and_then(|v| v.get("error"));
+                            let prompt_tokens = err_obj
                                 .and_then(|e| e.get("n_prompt_tokens"))
                                 .and_then(|t| t.as_u64())
                                 .unwrap_or(0)
                                 as usize;
+                            // Prefer server-reported n_ctx over cached value —
+                            // see non-stream path above for rationale.
+                            let max_context = err_obj
+                                .and_then(|e| e.get("n_ctx"))
+                                .and_then(|t| t.as_u64())
+                                .map(|n| n as usize)
+                                .unwrap_or(max_context_capture);
                             let _ = tx
                                 .send(Err(LlmError::ContextOverflow {
                                     prompt_tokens,
-                                    max_context: max_context_capture,
+                                    max_context,
                                 }))
                                 .await;
                             return;

@@ -3,7 +3,7 @@
 //! Provides validation functions to check that referenced resources
 //! (devices, metrics, extensions) exist and are properly configured.
 
-use crate::models::{CompiledRule, ComparisonOperator, ExecuteTarget, RuleAction, RuleCondition};
+use crate::models::{ComparisonOperator, CompiledRule, ExecuteTarget, RuleAction, RuleCondition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

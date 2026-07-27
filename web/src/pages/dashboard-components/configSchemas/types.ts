@@ -22,7 +22,7 @@ export interface SchemaContext {
   setLayerEditorBindings: (bindings: any[]) => void
   setLayerEditorOpen: (open: boolean) => void
   agentsLoading: boolean
-  visionModels: { id: string; name: string; backendId: string; backendName: string }[]
+  visionModels: { id: string; name: string; backendId: string; backendName: string; isMultimodal?: boolean }[]
   visionModelsLoading: boolean
 }
 

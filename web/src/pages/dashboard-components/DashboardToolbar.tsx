@@ -33,6 +33,7 @@ export interface DashboardToolbarProps {
   onDashboardSwitch: (id: string) => void
   onDashboardCreate: (name: string) => Promise<void>
   onDashboardRename: (id: string, name: string) => void
+  onDashboardDuplicate: (id: string) => void
   onDashboardDelete: (id: string) => Promise<void>
   /** Persist a new manual order (array of dashboard IDs, index 0 = first). */
   onDashboardReorder?: (newOrder: string[]) => void
@@ -86,6 +87,7 @@ export function DashboardToolbar(props: DashboardToolbarProps) {
     onDashboardSwitch,
     onDashboardCreate,
     onDashboardRename,
+    onDashboardDuplicate,
     onDashboardDelete,
     onDashboardReorder,
     onSwitchToSidebar,
@@ -131,6 +133,7 @@ export function DashboardToolbar(props: DashboardToolbarProps) {
           onSwitch={onDashboardSwitch}
           onCreate={onDashboardCreate}
           onRename={onDashboardRename}
+          onDuplicate={onDashboardDuplicate}
           onDelete={onDashboardDelete}
           onReorder={onDashboardReorder}
           onSwitchToSidebar={onSwitchToSidebar}

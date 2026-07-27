@@ -663,53 +663,174 @@ pub async fn chat_handler(
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, ErrorResponse> {
+    use futures::StreamExt;
     use tokio::time::{timeout, Duration};
 
-    println!(
-        "[chat_handler] Received request for session {}, message: {}",
-        id, req.message
+    tracing::info!(
+        session_id = %id,
+        message_len = req.message.chars().count(),
+        backend_id = ?req.backend_id,
+        pinned_skills = req.selected_skills.len(),
+        "chat_handler: HTTP chat via multi-round event stream"
     );
 
-    // Add a 120-second timeout to support thinking models
-    // QWEN3 with thinking enabled can take 60-90 seconds for complex queries
-    // due to the model's repetitive thinking generation, especially with longer context
+    // Multi-round ReAct over HTTP — same event stream the WS path uses
+    // (process_stream_events_with_safeguards, MAX_TOOL_ITERATIONS=30). Previously
+    // chat_handler called process_message (single LLM call, tool results never
+    // fed back), so any HTTP client silently degraded to a single-round agent.
+    // Using the _with_backend_and_skills variant also honors ChatRequest.backend_id
+    // + selected_skills, which the old handler dropped on the floor.
+    // Prepend page context if provided (mirrors the WS path; the old single-round
+    // HTTP handler dropped this).
+    let final_message = if let Some(ref ctx) = req.page_context {
+        if !ctx.is_empty() {
+            format!("{}\n\n{}", ctx, req.message)
+        } else {
+            req.message.clone()
+        }
+    } else {
+        req.message.clone()
+    };
 
-    let response = match timeout(
-        Duration::from_secs(120),
+    // Branch on multimodal input for REST parity with WS. The old HTTP handler
+    // dropped req.images entirely, so a REST vision client silently degraded to
+    // text-only analysis.
+    let has_images = req.images.as_ref().is_some_and(|i| !i.is_empty());
+    let stream_result = if has_images {
+        // The multimodal stream variant has no selected_skills param; set pinned
+        // skills on the agent directly first (same as the WS multimodal path).
+        if !req.selected_skills.is_empty() {
+            if let Ok(agent) = state.agents.session_manager.get_session(&id).await {
+                agent.set_pinned_skills(req.selected_skills.clone()).await;
+            }
+        }
+        let images: Vec<String> = req
+            .images
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|img| img.data.clone())
+            .collect();
         state
             .agents
             .session_manager
-            .process_message(&id, &req.message),
-    )
-    .await
-    {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            // Check if it's a NotFound error and return 404
+            .process_message_multimodal_with_backend_stream(
+                &id,
+                &final_message,
+                images,
+                req.backend_id.as_deref(),
+            )
+            .await
+    } else {
+        state
+            .agents
+            .session_manager
+            .process_message_events_with_backend_and_skills(
+                &id,
+                &final_message,
+                req.backend_id.as_deref(),
+                &req.selected_skills,
+            )
+            .await
+    };
+
+    let mut stream = match stream_result {
+        Ok(s) => s,
+        Err(e) => {
             let err_msg = e.to_string();
             if err_msg.contains("Not found") || err_msg.contains("Session:") {
                 return Err(ErrorResponse::not_found("Session"));
             }
             return Err(ErrorResponse::with_message(err_msg));
         }
-        Err(_) => {
-            // Timeout - return an error response instead of hanging
-            return Ok(Json(ChatResponse {
-                response: "请求超时。模型思考时间过长，请尝试简化问题或开启新对话。".to_string(),
-                session_id: id,
-                tools_used: vec![],
-                processing_time_ms: 120000,
-                thinking: None,
-            }));
-        }
     };
 
+    // Multi-round ReAct with a thinking model can exceed the old 120s cap (eval
+    // observed 130s+). Default 300s matches the global agent execution budget;
+    // override via HTTP_CHAT_TIMEOUT_SECS.
+    let timeout_secs = std::env::var("HTTP_CHAT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300u64);
+
+    let started = std::time::Instant::now();
+    let mut response = String::new();
+    let mut thinking: Option<String> = None;
+    let mut tools_used: Vec<String> = Vec::new();
+    let mut tools_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut error_msg: Option<String> = None;
+
+    let timed_out = timeout(Duration::from_secs(timeout_secs), async {
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentEvent::Content { content } => response.push_str(&content),
+                AgentEvent::Thinking { content } => {
+                    thinking.get_or_insert_with(String::new).push_str(&content);
+                }
+                AgentEvent::ToolCallStart { tool, .. } => {
+                    // Dedup by tool name, preserve first-seen order.
+                    if tools_seen.insert(tool.clone()) {
+                        tools_used.push(tool);
+                    }
+                }
+                AgentEvent::Error { message } => {
+                    // Do NOT swallow — surface to the caller (see WS-B#1: the
+                    // stream must emit real errors, not silently keyword-fallback).
+                    error_msg = Some(message);
+                }
+                AgentEvent::End { .. } => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .is_err();
+
+    let processing_time_ms = started.elapsed().as_millis() as u64;
+
+    // Surface error / timeout inline rather than returning an empty/blank response,
+    // so the caller can distinguish a model limitation from a system failure.
+    if let Some(msg) = &error_msg {
+        if !response.is_empty() {
+            response.push_str("\n\n");
+        }
+        response.push_str("[error: ");
+        response.push_str(msg);
+        response.push(']');
+    }
+    if timed_out {
+        if !response.is_empty() {
+            response.push_str("\n\n");
+        }
+        response.push_str(&format!(
+            "[timed out after {}s — showing partial result]",
+            timeout_secs
+        ));
+    }
+
+    tracing::info!(
+        session_id = %id,
+        tools = ?tools_used,
+        elapsed_ms = processing_time_ms,
+        timed_out,
+        errored = error_msg.is_some(),
+        "chat_handler: completed"
+    );
+
+    // Persist the conversation turn to disk. The streaming path updates the
+    // agent's live history (agent.history()) but doesn't save it; persist_history
+    // reads that live history and saves it (same thing WS does on disconnect).
+    // Without this, HTTP chat turns vanish on server restart.
+    if let Err(e) = state.agents.session_manager.persist_history(&id).await {
+        tracing::warn!(session_id = %id, error = %e, "chat_handler: failed to persist history");
+    }
+
     Ok(Json(ChatResponse {
-        response: response.message.content.to_string(),
+        response,
         session_id: id,
-        tools_used: response.tools_used.clone(),
-        processing_time_ms: response.processing_time_ms,
-        thinking: response.message.thinking.clone(),
+        tools_used,
+        processing_time_ms,
+        thinking,
     }))
 }
 

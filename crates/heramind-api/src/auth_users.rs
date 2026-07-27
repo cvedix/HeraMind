@@ -168,8 +168,11 @@ pub struct ChangePasswordRequest {
 pub struct AuthUserState {
     /// Users storage (in-memory cache)
     users: Arc<RwLock<HashMap<String, User>>>,
-    /// Active sessions (token -> session info)
-    sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
+    /// Active sessions (token -> session info). std::sync::RwLock (not tokio)
+    /// so validate_token can consult it synchronously without forcing every
+    /// caller (some in sync closures) to .await. Locks are never held across
+    /// an await, so no deadlock risk.
+    sessions: Arc<std::sync::RwLock<HashMap<String, SessionInfo>>>,
     /// Database path
     db_path: &'static str,
     /// JWT secret key
@@ -213,7 +216,7 @@ impl AuthUserState {
 
         Self {
             users: Arc::new(RwLock::new(users)),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             db_path,
             jwt_secret,
             session_duration: 7 * 24 * 60 * 60, // 7 days
@@ -229,7 +232,7 @@ impl AuthUserState {
 
         Self {
             users: Arc::new(RwLock::new(users)),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             db_path: db_path_static,
             jwt_secret: jwt_secret_owned,
             session_duration: 7 * 24 * 60 * 60,
@@ -245,7 +248,7 @@ impl AuthUserState {
 
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             db_path: ":memory:", // Placeholder, won't be used
             jwt_secret,
             session_duration: 7 * 24 * 60 * 60,
@@ -433,6 +436,13 @@ impl AuthUserState {
             return Err(AuthError::ExpiredToken);
         }
 
+        // Stateful revocation: the token must still be in the active sessions
+        // map. login/register insert, logout removes — without this check
+        // logout is a no-op (a JWT's signature/exp alone cannot be revoked).
+        if !self.sessions.read().unwrap().contains_key(token) {
+            return Err(AuthError::SessionRevoked);
+        }
+
         Ok(SessionInfo {
             user_id: payload["sub"].as_str().unwrap_or("").to_string(),
             username: payload["username"].as_str().unwrap_or("").to_string(),
@@ -498,6 +508,23 @@ impl AuthUserState {
         // Generate token
         let token = self.generate_token(&user)?;
 
+        // Register issues a usable token — insert into the active sessions
+        // map so validate_token accepts it (same as login). Without this the
+        // stateful-revocation check added to validate_token would reject it.
+        {
+            let session_info = SessionInfo {
+                user_id: user.id.clone(),
+                username: user.username.clone(),
+                role: user.role.clone(),
+                created_at: chrono::Utc::now().timestamp(),
+                expires_at: chrono::Utc::now().timestamp() + self.session_duration,
+            };
+            self.sessions
+                .write()
+                .unwrap()
+                .insert(token.clone(), session_info);
+        }
+
         info!(
             category = "auth",
             username = username,
@@ -556,7 +583,7 @@ impl AuthUserState {
             created_at: chrono::Utc::now().timestamp(),
             expires_at: chrono::Utc::now().timestamp() + self.session_duration,
         };
-        let mut sessions = self.sessions.write().await;
+        let mut sessions = self.sessions.write().unwrap();
         sessions.insert(token.clone(), session_info);
         drop(sessions);
 
@@ -575,7 +602,7 @@ impl AuthUserState {
 
     /// Logout user (invalidate session).
     pub async fn logout(&self, token: &str) -> Result<(), AuthError> {
-        let mut sessions = self.sessions.write().await;
+        let mut sessions = self.sessions.write().unwrap();
         sessions.remove(token);
         Ok(())
     }
@@ -644,6 +671,8 @@ pub enum AuthError {
     UserDisabled,
     InvalidToken(String),
     ExpiredToken,
+    /// Token was revoked via logout — not in the active sessions map.
+    SessionRevoked,
     InvalidInput(String),
     DatabaseError(String),
 }
@@ -657,6 +686,7 @@ impl std::fmt::Display for AuthError {
             AuthError::UserDisabled => write!(f, "User account is disabled"),
             AuthError::InvalidToken(msg) => write!(f, "Invalid token: {}", msg),
             AuthError::ExpiredToken => write!(f, "Token has expired"),
+            AuthError::SessionRevoked => write!(f, "Session has been revoked"),
             AuthError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             AuthError::DatabaseError(msg) => write!(f, "Database error: {}", msg),
         }
@@ -679,6 +709,10 @@ impl IntoResponse for AuthError {
             }
             AuthError::InvalidToken(msg) => (HttpStatusCode::UNAUTHORIZED, msg),
             AuthError::ExpiredToken => (HttpStatusCode::UNAUTHORIZED, "Token has expired".into()),
+            AuthError::SessionRevoked => (
+                HttpStatusCode::UNAUTHORIZED,
+                "Session has been revoked".into(),
+            ),
             AuthError::InvalidInput(msg) => (HttpStatusCode::BAD_REQUEST, msg),
             AuthError::DatabaseError(msg) => (HttpStatusCode::INTERNAL_SERVER_ERROR, msg),
         };
@@ -811,6 +845,30 @@ mod tests {
 
         let session = auth.validate_token(&token).unwrap();
         assert_eq!(session.username, "testuser");
+        cleanup_test_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_logout_revokes_token() {
+        // Regression: logout must actually invalidate the JWT, not just remove
+        // a dead sessions-map entry. validate_token consults the map now, so a
+        // logged-out token is rejected with SessionRevoked.
+        let (auth, db_path) = make_test_auth("logout_revokes");
+        auth.register("testuser", "password123", UserRole::User)
+            .await
+            .unwrap();
+        let resp = auth.login("testuser", "password123").await.unwrap();
+        let token = resp.token;
+
+        // Valid before logout
+        assert!(auth.validate_token(&token).is_ok());
+
+        // Logout revokes — token no longer validates
+        auth.logout(&token).await.unwrap();
+        assert!(matches!(
+            auth.validate_token(&token),
+            Err(AuthError::SessionRevoked)
+        ));
         cleanup_test_db(&db_path);
     }
 }

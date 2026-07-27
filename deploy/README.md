@@ -48,13 +48,15 @@ The fastest way to deploy HeraMind on a server. Single container includes fronte
 
 ### Quick Start
 
+Build the HeraMind image directly from this repository:
+
 ```bash
 # Clone the repository
 git clone https://github.com/CVEDIX/HeraMind.git
 cd HeraMind
 
 # Start HeraMind
-docker compose up -d
+docker compose up -d --build
 
 # Check status
 docker compose ps
@@ -62,6 +64,8 @@ docker compose logs -f heramind
 ```
 
 Open browser and visit `http://your-server-ip:9375`
+
+> The first build compiles Rust in Docker and can take 10–30 minutes.
 
 ### Configuration
 

@@ -7,6 +7,863 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.11] - 2026-07-22
+
+Security hardening + edge (aarch64 / RK3576) readiness + the reliability
+tail of 0.9.10's silent-failure audit. The headline is closing the
+CRITICAL wasmtime aarch64 sandbox escape — the sandbox every ARM board
+we ship to runs untrusted extension code inside.
+
+### Security
+- **wasmtime 26 → 36** — fixes RUSTSEC-2026-0096, a CRITICAL (9.0) aarch64
+  Cranelift sandbox escape. Crossed 10 major versions but the port was a
+  2-line change (drop the redundant `component-model` feature + remove the
+  now-deleted `static_memory_maximum_size` knob; the core embed API is
+  stable). The official extension marketplace ships zero prebuilt WASM
+  extensions (all 26 are native binaries), so the blast radius is limited
+  to users who compile their own wasm extensions.
+- **boa_engine 0.17 → 0.21** — fixes RUSTSEC-2024-0444 (AsyncGenerator
+  DoS in the transform JS engine). The 0.20 Realm refactor needed three
+  mechanical adaptations (Context lifetime removed, FunctionObjectBuilder
+  takes `&Realm`, `to_json` returns `Option`); 19 transform tests pass.
+- **rumqttc 0.24 → 0.25** — unifies rustls 0.22 → 0.23 across the MQTT
+  stack (devices were on 0.22, data-push on 0.23). Zero breaking changes.
+  webpki 0.102 (4 advisories) remains — rumqttc 0.25.1 pins it directly,
+  upstream-blocked; re-checked on each rumqttc release.
+- **rustls CryptoProvider installed at startup** — `heramind-api`'s reqwest
+  uses a `-no-provider` rustls build, which doesn't auto-select a crypto
+  provider. `ring` is now enabled and `CryptoProvider::install_default()`
+  runs in `start_server`, fixing a startup panic on TLS-using builds.
+- **CI cargo-audit gate** — CI now fails on new advisories so debt can't
+  silently accumulate; evaluated-and-deferred ones are `--ignore`d with a
+  reason and a re-check trigger (webpki upstream-blocked, protobuf
+  output-only / not exploitable).
+- **Logout actually revokes the JWT** — `logout` now removes the server
+  session and `validate_token` checks the sessions map, so a logged-out
+  token is invalid immediately instead of being accepted until expiry.
+
+### Reliability / silent-failure
+- **No more force-seeded "Default Ollama"** — fresh installs no longer
+  create a `Default Ollama ministral-3:3b` backend that looks configured
+  but always fails (the box has no such model). Users add their own
+  backend; the active runtime returns "No active LLM backend configured"
+  instead of a phantom. Existing installs keep the stale row — delete it
+  in the UI.
+- **EventBus no longer drops events silently** — a slow subscriber used to
+  lag with only a debug log (FilteredReceiver logged nothing at all).
+  Receivers now count dropped events, warn on lag, and expose
+  `dropped_count()`.
+- **Auto-onboard is bounded** — the auto-registered device_id is
+  sanitized and the uplink sample is capped (2 MiB), so a malformed or
+  huge first payload can't pollute the registry or exhaust memory.
+
+### Edge / aarch64 (RK3576)
+- **Concurrency env overrides + target-cpu** — `HERAMIND_MAX_CONCURRENT`,
+  `HERAMIND_PER_BACKEND`, and `HERAMIND_TOOL_CONCURRENCY` (all validated
+  ≥1) let ops tune the scheduler to a board's cores; `.cargo/config.toml`
+  sets `target-cpu=cortex-a72` for aarch64-unknown-linux-gnu builds.
+- **install.sh rate-limit fix** — resolving "latest version" via the
+  GitHub API hit 403 on shared NAT IPs (60 req/h). Switched to the
+  `/releases/latest` 302-redirect endpoint, which is not rate-limited.
+- **Docker native arm64 runner** — arm64 images now build on a native
+  runner (no QEMU) and are merged into a multi-arch manifest, so they're
+  fast and binary-correct.
+
+### Added
+- **`heramind upgrade` + `heramind uninstall`** — the CLI can now
+  self-manage on Linux/systemd: `upgrade` pulls the latest release binary
+  and restarts the unit; `uninstall` removes the binary, unit, and data
+  dir.
+
+### Changed
+- **Auth-flow UI unified** — login + both setup steps now share a single
+  HeraMind-blue honeycomb background (extracted to `HoneycombBackground`),
+  a floating top-right language switcher (frees vertical space and stops
+  the setup page scrolling when the form is short), and a common card
+  style (`backdrop-blur-xl` + `color-mix`, lighter shadow). The honeycomb
+  renders invisible on first paint — base opacity lives on the cell class,
+  not the keyframes, fixing the FOUC where every cell flashed solid blue
+  before the breathe animation started.
+- **macOS app icon** — squircle reduced to ~80% of the canvas; macOS does
+  not auto-mask Tauri's icns, so the icon must carry its own rounded
+  corners (a square fill renders as a flat square, which is worse).
+- **Instance switch fail-fast** — a dead backend is detected in <100 ms
+  before any localStorage write or reload, lands on an error overlay with
+  a single Cancel, and reverts instantly; the login instance picker shows
+  live online/offline dots per backend.
+
+## [0.9.10] - 2026-07-21
+
+Agent quality + reliability. After three plumbing-hardening releases
+(0.9.7–0.9.9), this one returns to the differentiator — the local AI
+agent — fixing silent-degradation paths across the HTTP chat path, the
+event-agent runtime, telemetry persistence, and the camera image-analysis
+pipeline.
+
+### Fixed
+- **HTTP chat is now multi-round** — `POST /api/sessions/:id/chat` called
+  the single-round `process_message` (one LLM call, tool results never fed
+  back), so any HTTP client silently degraded to a single-round agent. It
+  now consumes the same ReAct event stream as WebSocket (tool results fed
+  back each round) and aggregates `AgentEvent`s into `ChatResponse` — the
+  gap that cost eval 43.5 points purely on transport (HTTP F → WS B).
+- **Telemetry no longer lost on flush failure** — `flush_buffer` drained the
+  write buffer before writing, so a failed redb write permanently lost those
+  points (disk full, IO). Failed batches are now re-queued for the next
+  flush, bounded by a hard cap so a persistent failure can't grow memory.
+- **Agent execution history no longer grows unbounded** — `cleanup_executions`
+  existed but was never scheduled; executions now prune every 6h (>30 days,
+  matching messages).
+- **Greeting/confirmation fast-path no longer misfires** — `starts_with`
+  matched substantive messages ("ok here's my question…" → "OK!";
+  "ok, create a device" short-circuited without acting). Now exact match.
+- **Stream errors no longer poison the next turn** — a partial buffer
+  (possibly mid-tool-call JSON) was saved as the assistant message on
+  stream error. Now persisted only when it looks complete.
+- **Event-agent vision misconfiguration is surfaced** — a camera event-agent
+  whose active LLM lacks vision silently analyzed text-only. Now logged at
+  error level and the LLM is told to state the limitation in its findings.
+- **Vision tool no longer wastes a round on a fake-multimodal active backend**
+  — dedicated VLMs are now preferred over the active chat backend (a text
+  model wrongly marked multimodal burned a round before health-tracking
+  demoted it).
+- **Extension image tools now get the full image** — a camera metric stored
+  as `{image_url: "/api/images/…", image_base64: "<109-byte preview>"}` gave
+  extensions either a relative URL they can't fetch (they run in a separate
+  process) or a truncated header-only base64 they can't decode — every
+  extension image call returned null. `/api/images/` Object URLs are now
+  resolved to full base64 in the data collector; sub-threshold fragments
+  are omitted.
+- **Update prompt no longer re-appears after updating** — the post-update
+  version check read `app.config().version`, which can return empty in some
+  Tauri 2.x builds, making the comparison always find an "update" so the
+  dialog re-popped on every launch once the localStorage marker was
+  consumed. Now uses the compile-time `CARGO_PKG_VERSION` and logs
+  current vs remote for diagnosis.
+- **Docker image builds again** — the multi-stage build had three latent
+  breakages (docker.yml only runs on tag push, and no tag had been pushed, so
+  CI never caught them): the `rust:1.85-alpine` pin was stale (Cargo.lock deps
+  need rustc ≥1.89 — rmqtt-net, wide, time), `rust:*-alpine` ships gcc but not
+  `make` so tikv-jemalloc-sys's C build died late, and `.dockerignore` used
+  `target/` (root-only) so `web/src-tauri/target` (~22GB) leaked into the build
+  context. Fixed: `rust:1.92-alpine` (matches rust-toolchain.toml), `apk add
+  make`, `**/target/`. The glibc bare-metal release had masked the first two.
+- **Data export writes CSV instead of xlsx** — the security hardening that
+  removed the high-CVE `xlsx` dep missed a dynamic `await import('xlsx')` in
+  the export dialog (static-import grep blind spot), breaking the frontend
+  `tsc` build. Export now emits CSV (opens in Excel, zero dependency),
+  completing the dep removal that change intended.
+- **Frontend dependency vulnerabilities cleared** — `npm audit fix` removed
+  the 4 production-path advisories (picomatch HIGH ReDoS/glob-injection,
+  postcss CSS-stringify XSS, react-router open-redirect via `//path`).
+  Production-path npm audit is now 0; remaining hits are dev-only
+  (vitest/vite-node) and don't ship. Rust-side advisories (wasmtime, boa,
+  rustls-webpki, protobuf) are major-version ports, tracked for 0.9.11.
+- **HTTP chat now persists conversation history** — the multi-round rewrite
+  consumed the event stream but never saved the turn (WS saves on disconnect),
+  so HTTP/CLI/3rd-party chat forgot every turn on server restart. Now calls
+  `persist_history` after the stream completes.
+- **HTTP chat now honors images + page context** — the rewrite dropped
+  `req.images`/`page_context`, so a REST vision client silently degraded to
+  text-only. Now branches on images (multimodal stream) and prepends page
+  context, matching the WS path.
+- **Telemetry flush isolates poison points** — on a failed batch write, points
+  are retried per-transaction so a single undecodable/oversized payload no
+  longer blocks fresh writes for that metric forever. `write_count` also no
+  longer double-counts re-queued points on retry.
+- **Image junk-filter applied consistently** — the <1 KB base64 omission now
+  also covers `/api/images/` URL resolution (both branches), so a header-only
+  frame stored under `/api/images/` no longer feeds extensions undecodable bytes.
+- **Agent-execution cleanup no longer scans at startup** — the periodic
+  cleanup's first tick (immediate) is skipped, avoiding a full-table deserialize
+  during boot against the backlog this cleanup exists to clear; cleanup
+  failures are now logged instead of silently dropped.
+- **About page shows the real version** — `get_app_version` uses compile-time
+  `CARGO_PKG_VERSION` (was `app.config().version`, which returns None/"unknown"
+  in some Tauri 2.x builds).
+
+### Added
+- **Pre-built Docker image on GHCR** (`ghcr.io/camthink-ai/heramind:<version>`,
+  amd64 + arm64) published on each release — customers can `docker compose pull`
+  instead of building from source. The ARM image sets `JEMALLOC_SYS_WITH_LG_PAGE=16`
+  so it doesn't crash on 64KB-page hosts (Raspberry Pi 5 / Jetson), matching the
+  bare-metal ARM release fix.
+- **`heramind device history --limit <N>`** — caps data points per metric
+  (the API already supported `limit`; the flag was missing, so `--limit 20`
+  errored).
+- **`rule create` / `agent create` errors ship worked examples** — bare
+  "Invalid JSON" / "Focused mode requires --resources" gave the agent
+  nothing to self-correct from; they now include copy-pasteable examples.
+- **HTTP chat honors `backend_id` + `selected_skills`** (previously dropped)
+  and exposes `HTTP_CHAT_TIMEOUT_SECS` (default 300s, matching the global
+  agent execution budget — the old 120s cap was too tight for multi-round
+  ReAct with a thinking model).
+
+### Changed
+- HTTP chat timeout: 120s → 300s (`HTTP_CHAT_TIMEOUT_SECS`).
+- Greeting/confirmation matching: prefix → exact.
+
+## [0.9.9] - 2026-07-17
+
+A consolidation release hardening 0.9.8's image-URL storage and data-push
+reliability, plus fixes surfaced by a 0.9.4→0.9.8 review.
+
+### Fixed
+- **store_raw now reaches upgraded installs** — the per-device-type `_raw` skip
+  (0.9.8) never applied to existing installs because the builtin template
+  version wasn't bumped; cameras kept writing `_raw` into telemetry. Bump so
+  the seeder rewrites them.
+- **Image URLs are no longer enumerable** — `/api/images/<dev>/<metric>/<ts>.ext`
+  had a linearly-guessable timestamp on the public route. Now
+  `<ts>_<content-id>.ext` (v5 of the bytes: same image → same file/idempotent,
+  not guessable from outside).
+- **Image retention no longer leaks `{ts}_{n}.ext` files** — collision-named
+  files weren't parsed by cleanup and leaked forever.
+- **Webhook 429/503 backs off instead of cascading** — rate-limited responses
+  now honor `Retry-After` (or a long default) instead of the aggressive
+  exponential backoff that hammered a throttled endpoint.
+- **Webhook self-loop guard** — reject push targets whose URL points at this
+  server's own ingestion endpoint (would loop forward→ingest→forward).
+- **Virtual metrics no longer double-delivered to wide filters** — transform's
+  double-publish made `*`/`device:*` deliver each virtual metric twice; deduped
+  per target within a short window.
+- **`.nep` downloads pick the right hardware variant** — jetson/cuda installs
+  got the CPU build (variant selection was skipped on the .nep branch); also
+  verify package SHA256 before install (was only checking the ZIP magic).
+- **MQTT `$SYS` survives a `#` device filter** — root wildcards no longer dedup
+  away broker presence subscriptions (broke external-broker transport state).
+- **Temp files cleaned on download write/flush failure** (was leaking up to
+  max_size on disk-full/quota).
+- **Data Explorer export bundles images stored as `/api/images/` URLs** (since
+  0.9.6 these exported as just the URL string, not image bytes).
+
+### Changed
+- Image-URL tests serialized (`serial_test`) — they set `HERAMIND_DATA_DIR` via
+  a process-global env var and raced under the multi-threaded test runner.
+
+## [0.9.8] - 2026-07-16
+
+Device image storage reliability (the headline), per-device-type raw-metric
+storage, telemetry memory tuning, delivery-history UX, plus data-push
+reliability, a nested batch format, and a real-data test send.
+
+### Fixed
+
+- **Device image loss / "image not found" on download** — the real root cause
+  of the reported "image corruption under dense reporting". The image-retention
+  cleanup task interpreted the image filename timestamp as **milliseconds**, but
+  `save_image_binary` writes **seconds** (ingest adapters pass `now.timestamp()`).
+  A brand-new image (ts ≈ 1.75e9 s) parsed as 1970-01-21 — always older than the
+  cutoff — so cleanup deleted **every image, including just-uploaded ones**, while
+  the telemetry DB still held the `/api/images/` URL; downloads then returned
+  `404 image not found`. Cleanup now compares in seconds, matching the filename
+  unit, so existing second-granularity files are no longer mass-deleted.
+- **Concurrent image-write corruption** (secondary, latent hazard in the same
+  path). `save_image_binary` derived both the temp file (`.tmp.<ts>`) and the
+  target (`<ts>.<ext>`) from the timestamp alone; two same-second saves shared a
+  single temp file and the non-atomic `fs::write` interleaved/truncated bytes,
+  producing corrupt images. Each write is now staged in a unique
+  `tempfile::NamedTempFile` and atomically `persist_noclobber`-ed into place,
+  with an idempotency check so the same frame saved twice (storage + event bus)
+  resolves to one URL.
+- **Duplicate pushed metrics** — the internal MQTT broker client subscribed to
+  `#` AND per-device telemetry topics, so rumqttc delivered each uplink once per
+  matching subscription (twice) and every metric was pushed twice (16 events
+  instead of 8). Overlap is now deduped on both the initial subscription list
+  and the dynamic per-device subscribe paths.
+- **Batch splitting** — the batch flush timer was set once at task start, so
+  after an idle period its deadline was already in the past and `sleep_until`
+  fired immediately, splitting a single uplink into spurious small batches
+  (e.g. `count:7` + `count:1`). The timer now restarts on the first event of
+  each new batch.
+- **Virtual metrics not forwarded** — transforms published their output events
+  only under `transform:{id}:`, but the source picker / telemetry dual-write
+  exposes them under `device:{id}:virtual.*`. A data-push target filtering on
+  the device namespace never matched, so virtual metrics (OCR/vision outputs,
+  etc.) were silently dropped. Transforms now also publish a
+  `device:{id}:virtual.*` DeviceMetric (`is_virtual`, feedback-safe), so
+  device-namespace filters forward them.
+- **`_raw` whole-payload dump** is dropped from push output (huge for cameras,
+  redundant with structured metrics).
+- Removed the always-null `metadata` field from push payloads (the EventBus
+  `EventMetadata` was discarded and never populated).
+- **Delivery history** now sorts newest-first by `created_at` (the table is
+  keyed by UUID, so iteration order was unrelated to recency).
+- Test-send auto-sampling skips `_raw`/`ts` but keeps `virtual.*` (extension/
+  transform outputs are valid business data).
+
+### Added
+
+- **Per-device-type `store_raw`** (`DeviceTypeTemplate.store_raw: Option<bool>`)
+  controls whether the `UnifiedExtractor` emits the `_raw` metric (full payload
+  snapshot). Precedence: template > extractor config (default `true`). NE301 /
+  NE101 cameras ship `store_raw: false`, so their telemetry no longer redundantly
+  stores the full base64 image as `_raw` — the image is already kept as
+  `/api/images/...` via the dedicated image metric.
+- **Delivery-history payload copy & preview** — the payload column in
+  `DeliveryHistoryPanel` gains per-row Copy + Preview buttons; Preview opens a
+  nested dialog showing pretty-printed JSON, byte count, and copy.
+- **Nested batch payload format** for push targets (`BatchConfig.format`:
+  `flat` | `nested`, default `flat`). Nested groups events by source into
+  `items[].{source_type, id, data}`, splitting the source_id field on `.` to
+  rebuild the object nesting that ingestion flattens (`device:9999:values.devName`
+  → `data.values.devName`). Backward compatible — existing targets stay flat.
+- **Real-data test send** — `POST /api/data-push/:id/test` now sends the latest
+  metric for a bound source (falling back to the fixed sample when nothing is
+  bound/found). Telemetry is wired into `PushManager` via `new_with_telemetry`.
+
+### Changed
+
+- **Telemetry redb cache capped** to shrink production RSS. redb 2.6.3 defaults
+  to a 1 GiB per-DB page cache; `telemetry.redb` is the only store large enough
+  to fill it (~916 MB anonymous heap, the dominant contributor to RSS ~2.4 GB).
+  Capped via `HERAMIND_TELEMETRY_CACHE_MB` (default 256 MiB); the OS page cache
+  backs reads regardless, so read perf is largely preserved while moving the
+  cache from non-reclaimable heap to reclaimable page cache. Target: RSS
+  ~2.4 GB → ~1.7 GB.
+- Batch Aggregation UI gains a Payload Format dropdown, visible field labels,
+  and description/hint text (zh/en).
+
+## [0.9.7] - 2026-07-15
+
+Hotfix for the 0.9.6 ARM64 server startup crash.
+
+### Fixed
+
+- **ARM64 server crash on 16 KB / 64 KB page-size kernels** (e.g. Raspberry Pi 5).
+  The 0.9.6 jemalloc global allocator was compiled with a fixed 4 KB page size, so
+  on any ARM64 system whose kernel page size is larger (Pi 5 = 16 KB; some ARM64
+  servers such as Kunpeng/Graviton/Ampere = 64 KB) jemalloc aborted at startup with
+  `<jemalloc>: Unsupported system page size` and the server could not start. Builds
+  jemalloc with a 64 KB page size (`JEMALLOC_SYS_WITH_LG_PAGE=16`), which covers
+  4/16/64 KB hosts — jemalloc only requires compiled page ≥ system page, so the same
+  binary runs everywhere. Linux server only; desktop, macOS, and x86_64 were
+  unaffected. (#11)
+
+## [0.9.6] - 2026-07-15
+
+Image metric URL storage migration plus cross-boundary hardening and on-disk
+file-lifecycle fixes.
+
+### Added
+
+- **Image metric URL storage** — image data (base64, ~50 KB-MB per data
+  point) is now stored as files on disk (`data/images/<device>/<metric>/<ts>.<ext>`)
+  with only a short URL (`/api/images/...`, ~50 bytes) kept in the telemetry
+  database. This reduces `telemetry.redb` size by ~1000× for image-heavy
+  deployments and eliminates multi-second telemetry queries that returned large
+  base64 payloads.
+  - **Ingestion fork conversion**: Binary → save file → URL string, passed to
+    both storage and EventBus (single conversion point, guaranteed consistency).
+  - **Authenticated image serving**: `GET /api/images/*path` (requires login,
+    cookie-based auth for dashboard `<img src>`).
+  - **Agent vision compatibility**: `image_utils::resolve_image` and
+    `data_collector::extract_image_data` resolve `/api/images/` URLs → read file
+    → base64 for LLM vision input. Old base64 data still works.
+  - **Transform compatibility**: `find_image_data` resolves URLs → file → base64
+    before injecting into JS sandbox.
+  - **Image file retention**: `cleanup_expired_images()` scans `data/images/` by
+    filename timestamp, deletes expired files + empty directories, synchronized
+    with telemetry `image_retention` (default 72h).
+  - **Retention sync fix**: `value_looks_like_image()` now recognizes
+    `/api/images/` URLs so telemetry records are deleted at `image_retention`
+    (not `default_retention`), preventing a 404 window where records outlive
+    files.
+  - **Backward compatible**: old base64 telemetry data continues to display and
+    is naturally cleaned by retention. No migration needed.
+
+- **jemalloc global allocator (Linux only)** — replaces glibc malloc to fix
+  per-thread arena fragmentation that caused server RSS to climb 4-6 GB over
+  days. jemalloc packs allocations tightly and returns freed pages to the OS
+  promptly. macOS and Windows use their own allocators (no glibc) so they're
+  unaffected. `#[cfg(target_os = "linux")]` gates both the allocator and the
+  dependency.
+
+### Fixed
+
+- `json_to_metric_value` now short-circuits `/api/images/` URLs to
+  `MetricValue::String` (prevents accidental base64 re-decoding).
+- `adapter.rs convert_metric_value` Binary→base64 kept as documented fallback
+  (ingestion fork converts Binary→URL before reaching adapter).
+
+- **Image URL storage — completed cross-boundary resolution.** Several
+  consumers of image metrics still expected base64 and silently mishandled
+  the `/api/images/` URL form. All now resolve through the centralized
+  helpers `image_storage::{read_internal_image_url,
+  resolve_internal_image_to_data_url}`:
+  - **Extension commands**: image args resolve to raw base64 before crossing
+    the extension process boundary (extensions are a separate process and
+    can't read hostless paths; previously failed with "Invalid base64").
+  - **Device command downlink**: command params carrying `/api/images/`
+    resolve to base64 data URLs before rendering, so external devices receive
+    usable bytes (mirrors the data-push outbound fix).
+  - **Chat `$cached:` references**: `LargeDataCache` recognizes `/api/images/`
+    URLs, so vision-tool chaining via cached (≥32 KB) tool results still feeds
+    vision tools the actual bytes instead of a raw JSON string.
+  - Centralized the URL→bytes / URL→data-URL read (with symlink-escape /
+    20 MB / magic-byte guards), replacing scattered local readers.
+  - data-push resolves `/api/images/` after the source filter, avoiding
+    resolution for sources that won't be delivered.
+  - Ingestion now converts base64-**string** image payloads (not just
+    `Binary`) to `/api/images/` URLs.
+  - **Unpadded / whitespace-containing base64 now decodes** (e.g. NE301 cameras
+    emit standard-alphabet base64 with no `=` padding, `len % 4 != 0`). The
+    strict `STANDARD` decoder rejected these ("Incorrect padding") and the
+    `URL_SAFE_NO_PAD` fallback used the wrong alphabet, so such images were
+    left stored as raw base64 instead of URLs. `try_decode_base64_image` now
+    strips whitespace + padding and decodes via `STANDARD_NO_PAD`.
+  - Frontend: all image preview/download components recognize `/api/images/`
+    URLs (prepend server origin; fetch-as-blob for download).
+
+- **Image file lifecycle:**
+  - Unregistering a device now purges its `data/images/<device>/` directory
+    (previously lingered until age-based cleanup, up to `image_retention`).
+    Path-component validation + canonicalize guard prevent traversal/symlink
+    escape; best-effort, never blocks unregister.
+  - `cleanup_expired_images` reclaims stale `.tmp.*` temp files left by a
+    crashed `save_image_binary` (previously never collected — slow disk leak).
+  - `detect_content_type` no longer flags a result as image merely for
+    mentioning `/api/images/` in prose (e.g. an error message); requires a
+    bare URL or a JSON string value, avoiding false vision auto-injection.
+
+### Changed
+
+- `getServerOrigin()` is computed per call (dropped the memoized cache) to
+  avoid stale-origin risk on instance switch.
+
+## [0.9.5] - 2026-07-13
+
+### Added
+
+- **Extension hardware variant selection (CUDA / Jetson)** — the extension
+  marketplace now auto-selects a CUDA/Jetson-specific build when the host
+  matches, falling back to the generic OS+arch build, then to wasm.
+  - Detection order: `HERAMIND_EXTENSION_VARIANT` env override
+    (`cpu|cuda|jetson`) → `/etc/nv_tegra_release` (Jetson, checked first) →
+    `nvidia-smi` (CUDA) → CPU. Jetson is checked before CUDA so a Jetson
+    with `nvidia-smi` present is not misclassified.
+  - New `crates/heramind-core/src/extension/accel.rs` is the single source
+    of truth (`Variant`, `fallback_keys`, `detect_variant` with `OnceLock`
+    caching + best-effort degradation). `select_build_key` in
+    `install_from_marketplace_handler` resolves
+    `linux-aarch64-jetson` → `linux-aarch64` → `wasm`.
+  - **Zero regression** — variant discrimination lives only in marketplace
+    `metadata.json` `builds` keys and release filenames; the `.nep`
+    internal `manifest.binaries` key stays the plain OS+arch (e.g.
+    `linux_arm64`), identical for CPU and Jetson builds. Pure-wasm and
+    pure-native extensions behave exactly as before; manual `.nep` upload
+    is unaffected.
+  - End-to-end Jetson auto-download additionally requires the marketplace
+    to publish a `linux-aarch64-jetson` entry in `metadata.json` `builds`
+    (HeraMind-Extensions side). Until then Jetson devices fall back to the
+    CPU build, equivalent to today's behavior.
+
+- **Extension README on the marketplace detail page** — the "View Details"
+  dialog now renders the extension's `README.md`. New best-effort endpoint
+  `GET /api/extensions/market/:id/readme` proxies the marketplace README
+  and returns `{ content: null }` when absent (so the section is simply
+  hidden, never an error). README is rendered with `react-markdown` + GFM;
+  relative links/images are rewritten to absolute GitHub raw URLs so
+  screenshots and doc links load. Loads asynchronously, never blocks the
+  detail view.
+
+### Fixed
+
+- `find_nep_binary` match arms in `heramind-core::extension::loader::native`
+  used hyphen keys (e.g. `"linux-arm64"`) while `detect_platform()` returns
+  underscore (`linux_arm64`), so every arm was dead code. Aligned the arms
+  to underscore; no behavior change for standard packages (the default
+  branch already returned the correct directory).
+
+- **Marketplace download/upload no longer buffer the whole package in memory
+  (OOM fix)** — both paths used `read_to_end`/`bytes()`, so a large `.nep`
+  (e.g. paddle-ocr-v6 + CUDA ORT, hundreds of MB) peaked at ~3× package size
+  in RAM and OOM'd edge devices. The 0.9.5 upload-ceiling bump didn't help —
+  it raised the body limit, not the in-memory buffering.
+  - Downloads (`marketplace install`) stream the body to a temp file
+    (`bytes_stream`), enforce a 1 GB cap (Content-Length + running byte
+    counter), and extract via `install_from_file` (File-backed `ZipArchive`).
+  - Uploads (`load` + `install`) stream-hash the file and read the manifest
+    via a File-backed archive instead of `read_to_end`.
+  - All zip entry extraction switched from `read_to_end` to `std::io::copy` /
+    chunked copy — the original bug, surfaced by a memory-footprint test.
+  - New `MAX_EXTENSION_DOWNLOAD_SIZE = 1 GB`; upload body limit unchanged at 512 MB.
+  - Verified by `#[ignore]` memory tests: a 150 MB package spikes RSS by
+    **0.8 MB** (download) / **2.2 MB** (upload), vs hundreds of MB before.
+
+### Overview
+
+This release fixes a class of **dark-mode rendering bugs** where many UI
+elements were silently invisible, hardens HTTP body-limit handling so
+large POST bodies are no longer rejected, raises the extension upload
+ceiling for large ML model bundles, and folds timezone selection into
+the first-run setup flow.
+
+### Dark-mode transparency (frontend)
+
+- **Root cause** — semantic colors are defined as OKLCH CSS variables
+  (e.g. `--muted-foreground`), and Tailwind v3 cannot apply its `/opacity`
+  modifier to a bare `var(--x)` color. Every `bg-muted-foreground/30`,
+  `bg-background/95`, `ring-foreground/30`, `from-muted/50`, etc.
+  **failed to generate any CSS rule**, leaving the element with no
+  background → fully transparent. Verified empirically by compiling the
+  real config: the broken classes produce no output, while `bg-muted-30`
+  / `bg-bg-95` generate correctly.
+- **Why dark mode looked worse** — the failures affect both themes, but
+  most of these elements (skeleton bars, status dots, the streaming
+  cursor, the scrollbar thumb) are meant to be *dim-but-visible*; their
+  absence against a dark surface reads as an obvious hole, whereas
+  against a light surface it is barely noticeable.
+- **Fixes** — every broken `/opacity` usage replaced with a token that
+  actually generates:
+  - Skeleton loading bars (chat history), the streaming "thinking"
+    cursor, off-line / disabled status dots, and the scrollbar thumb →
+    solid `bg-muted-foreground` (visible in both themes).
+  - Mobile chat input header `bg-background/95` → `bg-bg-95` (predefined
+    95% alpha — exact equivalent).
+  - Button keyboard-focus ring `ring-foreground/30` → `ring-ring`. This
+    also restores the ring that vanished when the earlier
+    "ring-ring-flashed-orange" workaround (from when `--ring` aliased
+    `--brand`) was switched to the broken `ring-foreground/30`; `--ring`
+    has since been redefined to a neutral `foreground@35%`, so `ring-ring`
+    is safe again and consistent with the 16 other components using it.
+  - Secondary text that used `text-muted-foreground/N` (which silently
+    fell back to full-contrast foreground) → `text-muted-foreground`.
+  - Gradient fade-outs and the skeleton shimmer mid-stop → predefined
+    alpha tokens (`from-muted-50`, `via-muted-30`).
+  - Row / element hover washes → solid `hover:bg-muted` /
+    `group-hover:bg-muted`.
+  - A second pass (the first scan's regex missed predefined alpha tokens
+    with digits in the name, e.g. `bg-bg-50`) caught seven more: the
+    **login form card** (`bg-bg-50/95` → `bg-bg-50`, the card had been
+    transparent over its background glows), the calendar date-range
+    highlight (`bg-accent/50` → `bg-accent`), the chat active-session
+    timestamp and action-button hovers plus the extension filter count
+    badge (`*-primary-foreground/N` → `white/N` — `primary-foreground`
+    resolves to white in both themes, and `white` supports the opacity
+    modifier), and the dashboard mobile edit-mode overlay
+    (`bg-bg-30/20` → `bg-muted-30`; `--bg-30` was never defined). The
+    `/opacity` bug class is now at zero across the frontend.
+
+### HTTP body-limit alignment (backend)
+
+- **Root cause** — the global `RequestBodyLimitLayer` (10 MB) was applied
+  to the API routes, but axum's `Json` / `Bytes` extractors consult a
+  *separate* `DefaultBodyLimit` whose default is 2 MB. Without an explicit
+  `DefaultBodyLimit`, large POST bodies (e.g. base64 images sent to
+  extension command endpoints) were rejected with **413** even though the
+  request layer allowed 10 MB.
+- **Fix** — `router.rs` now layers
+  `DefaultBodyLimit::max(MAX_REQUEST_BODY_SIZE)` alongside
+  `RequestBodyLimitLayer`, so both gates accept the same payload size.
+
+### Extension upload ceiling
+
+- `MAX_EXTENSION_UPLOAD_SIZE` raised from **100 MB → 512 MB** so large ML
+  model bundles (e.g. paddle-ocr-v6 with CUDA ORT libraries plus
+  multi-tier ONNX models) can be installed via the extension upload
+  endpoint without hitting the cap.
+
+### Setup flow
+
+- Timezone is now captured during first-run setup: the browser timezone
+  is auto-detected on the account-creation step and saved silently, and
+  the completion screen exposes an adjustable timezone selector (saved
+  via `PUT /settings/timezone`). Removes the need to visit Settings just
+  to set the timezone on first run.
+- Setup screens received mobile / layout polish: safe-area insets,
+  `viewport-full` sizing, responsive icon and spacing scales, and an
+  entrance animation.
+
+---
+
+## [0.9.4] - 2026-07-10
+
+### Overview
+
+This release fixes a long-standing bug where **saved extension
+configurations were never reapplied** on reload, crash recovery, or
+startup. The three code paths responsible all routed the saved config
+through `execute_command(id, "configure", ...)`, but `configure` is a
+lifecycle method, not a registered command — so it failed with
+"Command not found: configure" on every invocation, and the extension
+kept running with its default config.
+
+### Extension config application
+
+- **Root cause** — `configure` is an SDK lifecycle method invoked via
+  the dedicated `ConfigUpdate` IPC channel; it is not present in any
+  extension's `commands` list. `execute_command` only dispatches
+  registered commands, so it silently failed on every reload/recovery.
+- **Fix** — all three call sites now use the proper IPC:
+  - `reload_extension_handler` (manual reload after config edit)
+  - crash-recovery loop in `server/mod.rs` (auto-restart after a
+    crash-loop-disabled extension is re-enabled)
+  - startup load path in `extension_state.rs` (initial config apply on
+    server boot)
+- All three paths use `runtime.send_config_update(&id, cfg)`, which
+  routes through the runner's ConfigUpdate channel →
+  `heramind_extension_configure_json`, matching the hot-reload path
+  already used for live config edits.
+
+---
+
+## [0.9.3] - 2026-07-09
+
+### Overview
+
+This release fixes a critical bug where **chat and scheduled agents
+could not access base64 image metric data** — the data was silently
+truncated to `[image data, 63B]` before reaching the LLM, making it
+impossible for the agent to analyze camera snapshots, YOLO output
+frames, or any telemetry metric whose value is an image.
+
+The fix introduces a **value-level slim mechanism** that caches large
+strings out of the tool-result JSON and replaces each with a
+one-sentence natural-language summary containing a `$cached:`
+reference. The LLM reads the summary, passes the reference to the
+`vision` tool (or any image-aware tool), and the reference is
+transparently resolved back to the full binary payload at tool-call
+time. No new tools were added — the existing `vision` / `image_edit`
+pipeline picks up the cached data automatically.
+
+On the frontend side, the **AI Analyst dashboard component** gets
+i18n completeness, real-time progress events, and a streaming-bubble
+UX polish.
+
+### Agent image-data slim mechanism
+
+- **Root cause** — CLI's `sanitize_metric_value` truncated any string
+  > 80 bytes to 60 chars, then streaming's
+  `sanitize_tool_result_for_prompt` stripped `data:image/` URLs
+  entirely. Double truncation: the LLM never saw usable image data.
+- **`slim_large_strings_in_json`** (new method on `LargeDataCache`)
+  — walks the tool-result JSON tree, detects large strings
+  (`data:image/` prefix regardless of size, or any string > 64 KB),
+  stores each in the cache under a deterministic `path#8hex-hash` key
+  (multi-image safe), and replaces the value IN PLACE with a complete
+  natural-language sentence:
+  `Image data (image/jpeg, 271.4KB) cached as $cached:shell.data.metrics.values.image.value#a1b2c3d4 — pass this reference to the \`vision\` tool's \`image\` argument to analyze the content.`
+  Sibling fields in the JSON object are preserved untouched.
+- **`SLIM_THRESHOLD_BYTES = 64 KB`** — independent from
+  `CACHE_THRESHOLD_BYTES` (32 KB, which gates `store()`). Kept higher
+  so that (a) anything slim decides to cache is guaranteed to actually
+  be stored, and (b) legitimate large text payloads (compact configs,
+  multi-row query results, short logs) still reach the LLM verbatim
+  instead of being hidden behind a reference.
+- **Chat streaming path** (`stream_core.rs`, `stream_multimodal.rs`)
+  — slim runs BEFORE sanitize. After slim, the value is plain text
+  (no `data:image/` prefix), so sanitize's own stripping path is
+  skipped. The slimmed result is what enters the tool-call-results
+  vector and the LLM message history.
+- **Scheduled agent path** (`tool_loop.rs`, `tool_result.rs`) —
+  per-execution `LargeDataCache` created in `run_tool_loop`.
+  `resolve_cached_arguments` runs before `registry.execute_parallel`
+  to substitute `$cached:` references in tool-call arguments (same
+  function the chat path uses). `process_tool_results` now slims
+  before sanitize, mirroring the chat streaming pipeline. Both agent
+  execution modes (chat + scheduled) now have fully symmetric
+  slim + resolve pipelines.
+- **Privacy gate preserved** — the `IMAGE_AWARE_TOOLS` list
+  (`["image_edit", "vision"]`) still gates the omitted-field
+  auto-inject path. `$cached:` explicit-reference resolution is
+  ungated (the LLM intentionally passes the reference), but the
+  defense-in-depth "inject even when the LLM omitted image args"
+  branch only fires for tools that legitimately consume images.
+
+### CLI image-data passthrough
+
+- **`sanitize_metric_value` exception** — in agent mode
+  (`HERAMIND_JSON=1` env var set), strings starting with `data:image/`,
+  `http://`, or `https://` now pass through untouched. Previously,
+  all strings > 80 bytes were truncated to 60 chars, which (a)
+  destroyed base64 image data URLs, and (b) truncated long signed
+  HTTP URLs (e.g. pre-signed S3 image links) making them unresolvable.
+  Human terminal mode is unchanged — truncation still applies for
+  readability.
+- **`summarize_image_history`** — `device history` responses are now
+  post-processed: for each metric whose sampled values (first / mid /
+  last) look like images (`data:image/` prefix or URL ending in a
+  known image extension), the full data-point array is replaced with a
+  compact summary object containing `count`, `earliest_ts`,
+  `latest_ts`, `interval_avg_ms`, `latest_value` (the full data URL,
+  preserved so the slim layer can cache it), and a natural-language
+  `note` pointing at the `vision` tool. Non-image metrics pass through
+  untouched. Prevents 288 × 271 KB ≈ 78 MB responses from flooding
+  the agent context.
+
+### AI Analyst component improvements (frontend)
+
+- **Full i18n** — all hardcoded English strings in `AiAnalyst`,
+  `AnalystConfigPanel`, `AnalystMessageBubble`, and `AnalystTimeline`
+  replaced with `t()` calls. New locale keys added under
+  `aiAnalyst.*` in both `en` and `zh` `dashboard-components.json`.
+- **AgentProgress / AgentThinking WS events** —
+  `useAnalystSession` now handles these real-time event types,
+  showing stage-level progress ("Collecting data...", "Analyzing 5
+  data points...", "Tool-calling round 2") in the streaming bubble
+  while the agent executes. Previously the bubble showed nothing
+  until the execution completed.
+- **Streaming bubble gap fix** — on `AgentExecutionCompleted`, the
+  streaming content and message ID are no longer cleared immediately.
+  They persist until the `getExecution` API response arrives, closing
+  a blank-bubble gap between the completion event and the result
+  fetch.
+- **Persistent image dedup** — the timeline's image-enqueue dedup is
+  now persistent across rounds (was per-round). Prevents a timing
+  race where the `AgentExecutionStarted` WS event arrives before the
+  telemetry update, causing the stale previous-round image to
+  enqueue first and the fresh image to append right after (two
+  images per update).
+- **Vision model multimodal badge** — model picker entries in the
+  AI Analyst config schema now show an `Eye` icon next to models
+  flagged `isMultimodal`, making it visually clear which models can
+  process images. The `isMultimodal` field flows through
+  `SchemaContext.visionModels` → `useComponentConfigDialog` →
+  `business.tsx`.
+- **Schema regeneration on async load** — `useComponentConfigDialog`
+  now regenerates the config schema when `visionModels` or `agents`
+  arrays resolve (previously the schema was built once at dialog-open
+  time with empty arrays, leaving dropdowns empty if the fetch
+  hadn't completed yet).
+
+## [0.9.2] - 2026-07-07
+
+### Overview
+
+This release ships the **Dashboard Duplicate** feature plus a handful
+of smaller fixes that landed alongside it. The headline is a one-click
+"Duplicate" action on every dashboard that produces a fully isolated
+clone — including a deep copy of any component-owned transforms — so
+the original and the copy can be edited or deleted independently
+without breaking each other.
+
+The dashboard action UI also gets a small refactor in the same batch:
+both sidebar mode and tabs mode now expose per-dashboard actions
+through a unified `MoreVertical` ("...") dropdown instead of the
+previous row of inline hover buttons (which had grown to five icons
+after adding Duplicate).
+
+Rounding out the release are a llama.cpp context-overflow error
+message fix, a dialog overflow CSS tweak, and a README refresh for
+the extension marketplace.
+
+### Dashboard Duplicate
+
+- **New endpoint `POST /api/dashboards/:id/duplicate`** — server-side
+  clone of a source dashboard. The new dashboard gets a fresh UUID,
+  the name is suffixed with ` (copy)` (hardcoded English suffix,
+  intentionally not i18n'd), `is_default` is reset to `None` (so the
+  copy never silently steals default status from the original), and
+  `sort_order` is set to `max + 1` to append at the end of the list.
+  Emits the existing `DashboardUpdated` event with `action = "create"`
+  so all realtime subscribers (WS/SSE) refresh automatically.
+- **Component-owned transform deep cloning** — the key isolation
+  mechanism. Components can bind transforms two ways: *referenced*
+  (user picked an existing transform via the data source picker) or
+  *owned* (the component created the transform inline, marked by
+  `config._transformId`, and deletes it when the component is
+  removed). On duplicate, only **owned** transforms are deep-cloned:
+  the clone gets a fresh UUID (`transform_{uuid}`), a fresh
+  `output_prefix` (`{sanitized_source}_{8-char-uuid}`, because two
+  transforms sharing the same prefix would collide in the
+  `extensionMetric: "<prefix>.<field>"` namespace), `execution_count`
+  reset to 0, and `last_executed` cleared. All references inside the
+  cloned component are rewritten consistently —
+  `config._transformId`, `dataSource.transformId`,
+  `dataSource.sourceId`, `dataSource.id`, plus
+  `dataSource.metricId` / `dataSource.field` get their old-prefix
+  portion replaced with the new prefix.
+- **Shared references stay shared by design** — device IDs, agent
+  IDs, and extension IDs in component data sources are NOT cloned.
+  These are global resources (a temperature sensor physically exists
+  once), so the duplicated dashboard references the same source.
+  User-referenced transforms (no `_transformId` marker) are also
+  left shared, matching the user's intent.
+- **Frontend integration** — new `duplicateDashboard(id)` store
+  action calls the API, runs the response through `fromDashboardDTO`
+  (per the snake_case → camelCase dashboard DTO gotcha), appends to
+  `dashboards[]`, and calls `recordSelfSync(newId)` so the
+  backend's `DashboardUpdated` SSE event doesn't trigger a redundant
+  `fetchDashboards()` refetch race. The handler then shows a toast
+  and navigates to the new dashboard.
+- **Pure logic helpers, fully unit-tested** —
+  `new_output_prefix()` (sanitization + UUID suffix, unique across
+  calls) and `rewrite_component_transform_refs()` (5-field rewrite
+  gated on the `_transformId` ownership marker; no-op when the
+  marker is missing or doesn't match) are extracted as pure
+  functions and covered by 4 unit tests. `build_duplicate_dashboard`
+  (the in-memory clone pipeline with no I/O) adds 2 more tests
+  covering the full rewrite path and the `"X (copy)" → "X (copy)
+  (copy)"` double-suffix edge case.
+
+### Dashboard action menu unification
+
+- **Sidebar mode (`DashboardListSidebar`)** — replaces the five
+  inline hover buttons (Move Up / Move Down / Rename / Duplicate /
+  Delete) with a single `MoreVertical` trigger opening a
+  `DropdownMenu`. The trigger inherits the same hover-to-reveal
+  behavior (`opacity-0 group-hover:opacity-100`) so the row stays
+  clean at rest.
+- **Tabs mode (`DashboardTabBar`)** — the existing per-tab
+  `MoreVertical` dropdown gains a new Duplicate item between Rename
+  and Delete. Mobile switcher path also updated.
+- **Shared menu structure** — both modes now expose the same 5
+  items in the same order: Move Up / Move Down / separator / Rename
+  / Duplicate / Delete. Delete keeps the `text-error focus:text-error`
+  destructive styling.
+
+### Fixes & polish
+
+- **llama.cpp context-overflow reporting** — `ContextOverflow` errors
+  now prefer the server-reported `n_ctx` from the error body over
+  the cached `max_context_length()`. The cached value can be stale
+  (e.g. server restarted with a different `--ctx-size` but
+  capabilities not re-detected) or a theoretical default, which
+  previously produced misleading messages like `"11958 < 32000"`
+  when the real server-side limit was 8192. Both the non-streaming
+  and streaming error paths are updated.
+- **`UnifiedFormDialog` overflow** — added `overflow-hidden` to the
+  dialog content surface so child widgets no longer bleed past the
+  rounded corners on small viewports.
+- **README extensions refresh** — the official extensions list in
+  both `README.md` and `README.zh.md` is expanded from ~9 entries
+  to the current 22 (vision, voice, IoT bridges, utilities),
+  reorganized by category.
+
+### Diagnostic log archive download
+
+- **New `GET /api/logs/download?days=N` endpoint** — bundles every
+  `heramind.log.*` daily-rotated file under `<data_dir>/logs/` into a
+  single in-memory ZIP and streams it back as
+  `Content-Disposition: attachment`. Intended for support/diagnostic
+  flows: the user picks a time range in Settings → Preferences and
+  downloads a zip to email back to the team. Three defense-in-depth
+  memory caps on edge devices: 64 MiB per file, 60 files max, 512 MiB
+  total.
+- **Local-time date filter** — `tracing_appender::rolling::daily`
+  names files using LOCAL time, so the filter uses `chrono::Local`
+  (not UTC) to match. Off-by-one fix: `days=1` means today only
+  (was today + yesterday). The bare `heramind.log` active file
+  (no date suffix) always passes the filter.
+- **Canonical log path unification** — the Tauri shell now writes
+  logs to `<app_data>/data/logs/` (was `<app_data>/logs/`), matching
+  `HERAMIND_DATA_DIR` and the API handler's read path. A one-time
+  `migrate_legacy_log_dir()` runs at startup to move existing files
+  to the new location with a cross-filesystem copy+delete fallback.
+  CLI `heramind logs` checks the new path first, keeps the legacy
+  path as fallback for ≤0.9.1 upgraders.
+- **Frontend** — `DiagnosticDataCard` lives in PreferencesTab (next
+  to Data Management, both being operational features), using the
+  preferences width convention (`Select w-full sm:w-[180px]` +
+  inline `size="sm"` button). `api.downloadLogs` parses JSON errors
+  only — raw backend text never leaks to the toast.
+- **i18n fix** — pre-existing `updateAvailableWithVersion` had
+  single-brace `{version}` which i18next renders literally; fixed to
+  `{{version}}`.
+
+---
+
 ## [0.9.1] - 2026-07-06
 
 ### Overview

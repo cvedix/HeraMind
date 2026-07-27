@@ -135,19 +135,17 @@ pub struct LlmBackendInstanceManager {
 impl LlmBackendInstanceManager {
     /// Create a new instance manager
     pub fn new(storage: Arc<LlmBackendStore>) -> Self {
-        // Get active backend ID first (this may create a default instance)
-        let active_id = storage
-            .get_active_backend_id()
-            .unwrap_or_default()
-            .or_else(|| {
-                // If no active backend, try to get or create default
-                storage
-                    .get_or_create_active_backend()
-                    .ok()
-                    .map(|inst| inst.id.clone())
-            });
+        // Get active backend ID. Do NOT auto-seed a default backend here.
+        // On a fresh install with nothing configured, active_id stays None and
+        // downstream (get_active_runtime) returns a clear "No active LLM backend
+        // configured" error; the UI then prompts the user to add one manually.
+        // Previously this force-created a "Default Ollama" placeholder pointing at
+        // localhost:11434/ministral-3:3b, which looked configured but never worked
+        // on devices without that exact Ollama model installed.
+        let active_id = storage.get_active_backend_id().unwrap_or_default();
 
-        // Load instances from storage (after potentially creating default)
+        // Load instances from storage. No default is created above, so on a fresh
+        // install this is empty until the user adds a backend via the UI/API.
         // Apply capability correction to ensure consistency with list_instances/get_instance
         let instances: Vec<(String, LlmBackendInstance)> = storage
             .load_all_instances()

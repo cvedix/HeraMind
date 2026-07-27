@@ -870,12 +870,12 @@ impl WasmRuntime {
         config.consume_fuel(true);
         config.async_stack_size(8 * 1024 * 1024);
 
-        // Limit WASM linear memory growth (default 256MB, configurable via env)
-        let wasm_memory_limit = std::env::var("HERAMIND_WASM_MEMORY_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(256);
-        config.static_memory_maximum_size(wasm_memory_limit * 1024 * 1024);
+        // `Config::static_memory_maximum_size` was removed in wasmtime 36+. It
+        // set the static-allocation *virtual* memory upper bound (a memory
+        // protection optimization), NOT a real cap on `memory.growth`. WASM is
+        // bounded here by fuel (above) + the module size check (below). To truly
+        // cap linear-memory growth, set a per-store ResourceLimiter — TODO
+        // (HERAMIND_WASM_MEMORY_MB env dropped; re-add via ResourceLimiter).
 
         let engine =
             Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {}", e))?;
@@ -3084,10 +3084,7 @@ impl Runner {
                 ext.get_descriptor_fresh()
             }
             ExtensionType::Wasm => {
-                let runtime = self
-                    .wasm_runtime
-                    .as_ref()
-                    .ok_or("No WASM runtime loaded")?;
+                let runtime = self.wasm_runtime.as_ref().ok_or("No WASM runtime loaded")?;
                 runtime.get_descriptor_blocking()
             }
         }

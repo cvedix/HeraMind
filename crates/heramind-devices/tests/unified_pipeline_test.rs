@@ -53,6 +53,7 @@ async fn create_test_registry_with_template() -> DeviceRegistry {
         commands: vec![],
         uplink_samples: vec![],
         default_offline_timeout_secs: None,
+        store_raw: None,
     };
 
     registry.register_template(template).await.unwrap();
@@ -93,12 +94,14 @@ fn test_unified_extractor_dot_notation() {
         Some(json!(1234567890))
     );
 
-    // Non-existent path returns None (not an error)
+    // Non-existent path returns Some(Null) (not None, not an error) — by
+    // design, missing keys map to Value::Null so null metrics stay
+    // representable. See `extract_by_path` docs + `test_extract_by_path_simple.
     assert_eq!(
         extractor
             .extract_by_path(&data, "missing.field", 0)
             .unwrap(),
-        None
+        Some(serde_json::Value::Null)
     );
 }
 
@@ -357,4 +360,56 @@ async fn test_unified_extractor_with_real_device_payload() {
     // devMac and signal are NOT in template, so they should NOT be extracted
     assert!(!metrics.contains_key("values.devMac"));
     assert!(!metrics.contains_key("values.signal"));
+}
+
+#[tokio::test]
+async fn test_extract_store_raw_false_skips_raw_metric() {
+    // A template that declares `store_raw: Some(false)` must cause the
+    // extractor to OMIT the `_raw` metric, while still extracting the
+    // template's structured metrics. Opt-out for large-payload devices
+    // (e.g. cameras) whose `_raw` would otherwise redundantly store the
+    // full payload (including base64 images) in telemetry.redb.
+    let registry = DeviceRegistry::new();
+    let template = heramind_devices::registry::DeviceTypeTemplate {
+        device_type: "cam_store_raw_off".to_string(),
+        name: "Cam".to_string(),
+        description: String::new(),
+        categories: vec![],
+        mode: heramind_devices::registry::DeviceTypeMode::Simple,
+        metrics: vec![MetricDefinition {
+            name: "battery".to_string(),
+            display_name: "Battery".to_string(),
+            data_type: MetricDataType::Integer,
+            unit: "%".to_string(),
+            min: None,
+            max: None,
+            required: false,
+        }],
+        uplink_samples: vec![],
+        commands: vec![],
+        default_offline_timeout_secs: None,
+        store_raw: Some(false),
+    };
+    registry.register_template(template).await.unwrap();
+    let extractor = UnifiedExtractor::new(std::sync::Arc::new(registry));
+
+    let result = extractor
+        .extract("dev1", "cam_store_raw_off", &json!({ "battery": 85 }))
+        .await;
+
+    assert!(
+        !result.metrics.iter().any(|m| m.name == "_raw"),
+        "expected NO _raw metric when store_raw=Some(false), got: {:?}",
+        result.metrics.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+    assert!(
+        result.metrics.iter().any(|m| m.name == "battery"),
+        "template metric 'battery' should still be extracted even when _raw is skipped"
+    );
+    // The `raw_stored` flag must reflect that _raw was actually skipped —
+    // downstream (mqtt.rs logging) reads it, so the contract matters.
+    assert!(
+        !result.raw_stored,
+        "raw_stored must be false when store_raw=Some(false) skips _raw"
+    );
 }

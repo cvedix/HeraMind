@@ -52,7 +52,7 @@ export const RULE_TEMPLATES: RuleTemplate<DeviceOfflineTemplateOptions>[] = [
         },
         actions: [{
           type: 'notify',
-          message: `设备 ${deviceId} 已静默超过 ${durationValue} ${durationUnit === 'hours' ? '小时' : '分钟'}`,
+          message: `Device ${deviceId} has been offline for over ${durationValue} ${durationUnit === 'hours' ? 'hours' : 'minutes'}`,
           severity,
         }],
         trigger: {

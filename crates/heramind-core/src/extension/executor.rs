@@ -10,7 +10,7 @@ use super::system::{
     DynExtension, ExtensionCommand, ExtensionError, ExtensionMetricValue, ParamMetricValue, Result,
 };
 use crate::datasource::{DataPoint, DataSourceId};
-use crate::event::{EventMetadata, MetricValue, HeraMindEvent};
+use crate::event::{EventMetadata, HeraMindEvent, MetricValue};
 use crate::eventbus::EventBus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -218,7 +218,7 @@ export function CompactTaskProgress({ task, className }: TaskProgressProps) {
                 "w-2 h-2 rounded-full transition-colors",
                 isCompleted && "bg-success",
                 isCurrent && "bg-info animate-pulse",
-                !isCompleted && !isCurrent && "bg-muted-foreground/30"
+                !isCompleted && !isCurrent && "bg-muted-30"
               )}
             />
           )

@@ -169,6 +169,12 @@ export function useDataSource<T = unknown>(
     for (const ds of dataSources) {
       const mode = getUnifiedMode(ds)
       const source = getUnifiedSource(ds)
+      // Any live mode needs the device WebSocket for real-time updates. This
+      // MUST run before the `continue` statements below — timeseries sources
+      // `continue` after pushing to `tel`, which previously skipped this line
+      // and silently disabled WS for ALL telemetry components (image/chart
+      // history never updated in real time, only via the 30s poll).
+      if (mode === 'latest' || mode === 'command' || mode === 'info' || mode === 'timeseries') needsWs = true
       // Collect device IDs for WS event filtering.
       // Transform/AI sources use prefixed IDs ("transform:{id}") so WS events
       // from the backend (which publish with storage_device_id namespace) match.
@@ -180,7 +186,6 @@ export function useDataSource<T = unknown>(
       if (ds.source === 'extension') { ext.push(ds); continue }
       if (ds.mode === 'timeseries' && ds.source !== 'system') { tel.push(ds); continue }
       if (ds.source === 'system' || ds.mode === 'list') { poll.push(ds) }
-      if (mode === 'latest' || mode === 'command' || mode === 'info' || mode === 'timeseries') needsWs = true
     }
     return { telemetrySources: tel, pollingSources: poll, extensionSources: ext, needsWebSocket: needsWs, relevantDeviceIds: deviceIds, deviceInfoIds: infoIds }
   }, [dataSources])

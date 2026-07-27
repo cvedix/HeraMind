@@ -15,6 +15,9 @@ docs/superpowers/.superpowers/
 # =============================================================================
 /data/
 /config.toml
+# Nested dev/run instance data dirs (redb + encryption_key/logs/memory — never commit)
+web/data/
+docs/img/data/
 *.redb
 *.db
 *.bak*
@@ -22,7 +25,7 @@ docs/superpowers/.superpowers/
 crates/*/data/
 
 # Embedded static assets (generated during CI build)
-crates/neomind-api/static/
+crates/heramind-api/static/
 
 # =============================================================================
 # Web Frontend

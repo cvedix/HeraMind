@@ -425,7 +425,6 @@ impl rmqtt::hook::Handler for DevicePresenceHook {
     }
 }
 
-
 ///
 /// Manages the lifecycle of the embedded broker running as a tokio task.
 /// The broker can be stopped and restarted with new configuration.
@@ -601,11 +600,8 @@ impl EmbeddedBroker {
                 Arc::new(RwLock::new(HashMap::new()));
             let topic_resolver = self.topic_resolver.lock().unwrap().clone();
 
-            let presence_handler = DevicePresenceHook::new(
-                bus,
-                client_id_cache.clone(),
-                topic_resolver.clone(),
-            );
+            let presence_handler =
+                DevicePresenceHook::new(bus, client_id_cache.clone(), topic_resolver.clone());
             reg.add(
                 rmqtt::hook::Type::ClientConnected,
                 Box::new(presence_handler),
@@ -616,7 +612,11 @@ impl EmbeddedBroker {
             // disconnect hook too. We need a second boxed instance because
             // `reg.add` takes ownership of the Box.
             let presence_handler_disc = DevicePresenceHook::new(
-                self.event_bus.lock().unwrap().clone().expect("bus re-acquired"),
+                self.event_bus
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("bus re-acquired"),
                 client_id_cache.clone(),
                 topic_resolver.clone(),
             );
@@ -631,7 +631,11 @@ impl EmbeddedBroker {
             // hook is a no-op (resolver is None).
             if topic_resolver.is_some() {
                 let presence_handler_pub = DevicePresenceHook::new(
-                    self.event_bus.lock().unwrap().clone().expect("bus re-acquired"),
+                    self.event_bus
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("bus re-acquired"),
                     client_id_cache.clone(),
                     topic_resolver.clone(),
                 );

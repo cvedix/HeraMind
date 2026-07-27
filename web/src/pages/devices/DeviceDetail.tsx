@@ -65,12 +65,19 @@ function renderMetricValue(
   value: unknown,
   onImageClick?: (src: string) => void,
   truncate = true,
-  maxLength = 50
+  maxLength = 50,
+  t?: TFunction
 ): React.ReactNode {
   if (value === null || value === undefined) return <span className="text-muted-foreground">-</span>
   // Note: This is a helper function that will receive t through props when needed in i18n context
   // For now, we'll use the component's i18n context by moving this inside the component
-  if (typeof value === "boolean") return <span className={value ? "text-success" : "text-error"}>{value ? "Yes" : "No"}</span>
+  if (typeof value === "boolean") {
+    return (
+      <span className={value ? "text-success" : "text-error"}>
+        {value ? (t?.("common:yes") ?? "Yes") : (t?.("common:no") ?? "No")}
+      </span>
+    )
+  }
   if (typeof value === "number") return <span className="font-semibold tabular-nums">{parseFloat(value.toFixed(2))}</span>
   if (typeof value === "string" && isBase64Image(value)) {
     const imgSrc = getImageDataUrl(value) ?? value
@@ -260,10 +267,28 @@ export function DeviceDetail({
 
   const downloadImage = (src: string, timestamp?: string) => {
     try {
-      // Determine file extension from MIME type
+      let filename = `${device?.name || 'device'}_${selectedMetric || 'metric'}${timestamp ? '_' + timestamp.replace(/[:\s]/g, '-') : ''}`
+
+      // For /api/images/ URLs: fetch the image file, convert to blob, download
+      if (src.startsWith('http') && src.includes('/api/images/')) {
+        fetch(src).then(r => r.blob()).then(blob => {
+          const ext = blob.type.split('/')[1] === 'jpeg' ? 'jpg' : blob.type.split('/')[1] || 'png'
+          const link = document.createElement('a')
+          link.href = URL.createObjectURL(blob)
+          link.download = `${filename}.${ext}`
+          document.body.appendChild(link)
+          link.click()
+          document.body.removeChild(link)
+          URL.revokeObjectURL(link.href)
+          toast({ title: t('devices:detailPage.downloadSuccess') })
+        }).catch(() => toast({ variant: 'destructive', title: t('devices:detailPage.downloadFailed') }))
+        return
+      }
+
+      // For base64 data URLs: direct download
       const mimeMatch = src.match(/^data:image\/(\w+);/)
       const ext = mimeMatch?.[1] === 'jpeg' ? 'jpg' : mimeMatch?.[1] || 'png'
-      const filename = `${device?.name || 'device'}_${selectedMetric || 'metric'}${timestamp ? '_' + timestamp.replace(/[:\s]/g, '-') : ''}.${ext}`
+      filename += `.${ext}`
 
       const link = document.createElement('a')
       link.href = src
@@ -367,7 +392,7 @@ export function DeviceDetail({
             </details>
           )
         }
-        return <span className="text-sm">{renderMetricValue(point.value, undefined, false)}</span>
+        return <span className="text-sm">{renderMetricValue(point.value, undefined, false, 50, t)}</span>
       }
       default:
         return null
@@ -388,7 +413,7 @@ export function DeviceDetail({
                 "w-10 h-10 sm:w-12 sm:h-12 rounded-xl flex items-center justify-center shrink-0",
                 device.status === 'online'
                   ? "bg-gradient-to-br from-success-light to-accent-emerald-light"
-                  : "bg-gradient-to-br from-muted to-muted"
+                  : "bg-gradient-to-br from-card to-muted"
               )}>
                 <Zap className={cn(
                   "h-5 w-5 sm:h-6 sm:w-6",
@@ -577,7 +602,7 @@ export function DeviceDetail({
                           isMobile ? "p-3 active:scale-[0.99]" : "p-6 hover:scale-[1.02]",
                           isVirtual
                             ? "bg-gradient-to-br from-accent-purple-light to-blue-500/5 border-accent-purple-light hover:border-accent-purple"
-                            : "bg-gradient-to-br from-muted to-muted border-border hover:border-border"
+                            : "bg-gradient-to-br from-card to-muted border-border hover:border-border"
                         )}
                       >
                         <div className="flex items-start justify-between">
@@ -596,7 +621,7 @@ export function DeviceDetail({
                               {renderMetricValue(value, (src) => {
                                 setPreviewImageSrc(src)
                                 setImagePreviewOpen(true)
-                              }, true, 40)}
+                              }, true, 40, t)}
                             </div>
                           </div>
                           {isVirtual ? (
@@ -714,7 +739,7 @@ export function DeviceDetail({
 
       {/* Image Preview Dialog */}
       <Dialog open={imagePreviewOpen} onOpenChange={setImagePreviewOpen}>
-        <DialogContent className="sm:max-w-4xl p-2 z-[110]">
+        <DialogContent className="sm:max-w-4xl p-0 sm:p-0 overflow-hidden z-[110]">
           <DialogHeader className="sr-only">
             <DialogTitle>{t('devices:detailPage.preview')}</DialogTitle>
             <DialogDescription>{t('devices:detailPage.imagePreview')}</DialogDescription>
@@ -722,23 +747,25 @@ export function DeviceDetail({
           <div className="absolute right-4 top-4 flex items-center gap-2 z-10">
             {previewImageSrc && (
               <button
+                type="button"
                 onClick={() => downloadImage(previewImageSrc)}
-                className="rounded-full bg-overlay-medium p-2 text-white hover:bg-overlay-heavy transition-colors"
+                className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-overlay-medium text-white transition-colors hover:bg-overlay-heavy"
                 title={t('devices:detailPage.downloadImage')}
               >
                 <Download className="h-5 w-5" />
               </button>
             )}
             <button
+              type="button"
               onClick={() => setImagePreviewOpen(false)}
-              className="rounded-full bg-overlay-medium p-2 text-white hover:bg-overlay-heavy transition-colors"
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-overlay-medium text-white transition-colors hover:bg-overlay-heavy"
             >
               <X className="h-5 w-5" />
             </button>
           </div>
           {previewImageSrc && (
             <div className="flex items-center justify-center min-h-[300px]">
-              <img src={previewImageSrc} alt={t('devices:detailPage.preview')} className="max-w-full max-h-[70vh] object-contain rounded-lg" />
+              <img src={previewImageSrc} alt={t('devices:detailPage.preview')} className="max-w-full max-h-[70vh] object-contain" />
             </div>
           )}
         </DialogContent>

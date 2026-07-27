@@ -153,12 +153,21 @@ mod tests {
 
         let removed = cleanup_stale_temps(dir.path());
 
-        assert_eq!(removed, 2, "only the two hidden .*.tmp files should be removed");
+        assert_eq!(
+            removed, 2,
+            "only the two hidden .*.tmp files should be removed"
+        );
         assert!(!dir.path().join(".USER.md.tmp").exists());
         assert!(!dir.path().join(".KNOWLEDGE.md.tmp").exists());
         assert!(dir.path().join("USER.md").exists(), "real file preserved");
-        assert!(dir.path().join("notes.txt").exists(), "unrelated file preserved");
-        assert!(dir.path().join("data.tmp").exists(), "non-hidden .tmp file preserved");
+        assert!(
+            dir.path().join("notes.txt").exists(),
+            "unrelated file preserved"
+        );
+        assert!(
+            dir.path().join("data.tmp").exists(),
+            "non-hidden .tmp file preserved"
+        );
     }
 
     #[test]

@@ -293,7 +293,7 @@ export const ComponentPreview = memo(function ComponentPreview({
       </div>
 
       {/* Footer with component info */}
-      <div className="px-3 py-1.5 border-t bg-muted-20 shrink-0">
+      <div className="px-3 py-1.5 border-t shrink-0">
         <div className="flex items-center justify-between text-xs text-muted-foreground">
           <span>{meta?.name || componentType}</span>
           <div className="flex items-center gap-2">

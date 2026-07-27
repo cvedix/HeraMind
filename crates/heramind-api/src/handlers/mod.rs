@@ -19,6 +19,7 @@ pub mod frontend_components;
 pub mod images;
 pub mod instances;
 pub mod llm_backends;
+pub mod logs;
 pub mod memory;
 pub mod message_channels;
 pub mod messages;

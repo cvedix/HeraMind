@@ -5,11 +5,13 @@
 //! - **Role-specific prompts**: Specialized prompts for different agent roles
 
 pub mod builder;
+pub mod capability_index;
 
 // Re-export commonly used types
 pub use builder::{
     PromptBuilder, CURRENT_TIME_PLACEHOLDER, LOCAL_TIME_PLACEHOLDER, TIMEZONE_PLACEHOLDER,
 };
+pub use capability_index::CapabilityIndex;
 
 #[cfg(test)]
 mod tests {

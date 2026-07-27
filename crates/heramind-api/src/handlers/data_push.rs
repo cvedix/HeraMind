@@ -39,6 +39,41 @@ pub struct ListLogsQuery {
     pub offset: Option<usize>,
 }
 
+/// Detect a webhook self-loop: a push target whose URL points back at this
+/// server's own device-webhook ingestion endpoint. Such a target forwards
+/// data → the server ingests it → re-emits the metrics → forwards again, an
+/// unbounded loop that quickly fills logs/storage. Returns an error message
+/// when the risk is detected, else `None`. MQTT configs have no `url` field
+/// and are skipped automatically.
+fn webhook_self_loop_error(config: &serde_json::Value) -> Option<String> {
+    let url_str = config.get("url")?.as_str()?;
+    let url = reqwest::Url::parse(url_str).ok()?;
+    let host = url.host_str()?;
+
+    // Only flag ingestion endpoints — a webhook to some OTHER service on this
+    // host is the user's business.
+    let path = url.path();
+    if !(path.contains("/api/devices") && path.ends_with("/webhook")) {
+        return None;
+    }
+
+    // Host points back at us: loopback, or our own public/local host. Check
+    // loopback first (short-circuit) so the common case never triggers a
+    // local-IP detection lookup.
+    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0");
+    let points_at_us = is_loopback
+        || host.eq_ignore_ascii_case(crate::handlers::common::get_server_host().as_str());
+    if points_at_us {
+        return Some(format!(
+            "Webhook URL '{}' points back at this server's own ingestion endpoint — \
+             this would create an infinite forward→ingest→forward loop. \
+             Point it at a different destination.",
+            url_str
+        ));
+    }
+    None
+}
+
 /// Create a new push target.
 /// POST /api/data-push
 pub async fn create_push_target_handler(
@@ -50,6 +85,9 @@ pub async fn create_push_target_handler(
         .as_ref()
         .ok_or_else(|| ErrorResponse::internal("Data push manager not initialized"))?;
 
+    if let Some(msg) = webhook_self_loop_error(&request.config) {
+        return Err(ErrorResponse::bad_request(msg));
+    }
     let target = manager
         .create_target(request)
         .await
@@ -115,6 +153,11 @@ pub async fn update_push_target_handler(
         .as_ref()
         .ok_or_else(|| ErrorResponse::internal("Data push manager not initialized"))?;
 
+    if let Some(ref config) = request.config {
+        if let Some(msg) = webhook_self_loop_error(config) {
+            return Err(ErrorResponse::bad_request(msg));
+        }
+    }
     let target = manager
         .update_target(&id, request)
         .await
@@ -249,4 +292,35 @@ pub async fn get_push_stats_handler(
         .map_err(|e| ErrorResponse::internal(e.to_string()))?;
 
     ok(json!(stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_loop_flags_loopback_ingestion() {
+        let cfg = serde_json::json!({"url": "http://localhost:9375/api/devices/dev1/webhook"});
+        assert!(webhook_self_loop_error(&cfg).is_some());
+    }
+
+    #[test]
+    fn self_loop_flags_loopback_ip_ingestion() {
+        let cfg = serde_json::json!({"url": "http://127.0.0.1:9375/api/devices/webhook"});
+        assert!(webhook_self_loop_error(&cfg).is_some());
+    }
+
+    #[test]
+    fn self_loop_allows_non_ingestion_path_on_localhost() {
+        // localhost but a different endpoint — not a self-loop.
+        let cfg = serde_json::json!({"url": "http://localhost:9000/some/other/path"});
+        assert!(webhook_self_loop_error(&cfg).is_none());
+    }
+
+    #[test]
+    fn self_loop_ignores_config_without_url() {
+        // MQTT-style config has no `url` field.
+        let cfg = serde_json::json!({"broker": "localhost", "topic": "t"});
+        assert!(webhook_self_loop_error(&cfg).is_none());
+    }
 }

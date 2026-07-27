@@ -34,6 +34,7 @@
 use crate::adapter::{
     AdapterError, AdapterResult, ConnectionStatus, DeviceAdapter, DeviceEvent, DiscoveredDeviceInfo,
 };
+use crate::image_storage::save_image_binary;
 use crate::mdl::MetricValue;
 use crate::registry::DeviceRegistry;
 use crate::telemetry::TimeSeriesStorage;
@@ -45,9 +46,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
+use tracing::{debug, error};
 use tracing::{info, warn};
 
 /// Webhook device adapter configuration.
@@ -187,6 +190,8 @@ pub struct WebhookAdapter {
     discovery_count: Arc<RwLock<HashMap<String, (u32, std::time::Instant)>>>,
     /// Unified data extractor
     extractor: Arc<UnifiedExtractor>,
+    /// Data directory for image storage (runtime, not config)
+    pub data_dir: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl WebhookAdapter {
@@ -213,6 +218,7 @@ impl WebhookAdapter {
             request_count: Arc::new(RwLock::new(HashMap::new())),
             discovery_count: Arc::new(RwLock::new(HashMap::new())),
             extractor,
+            data_dir: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -235,6 +241,14 @@ impl WebhookAdapter {
     /// Set the device registry (shared with DeviceService).
     pub async fn set_shared_device_registry(&self, registry: Arc<DeviceRegistry>) {
         *self.device_registry.write().await = registry;
+    }
+
+    /// Set the data directory for image storage.
+    pub fn set_data_dir(&self, data_dir: PathBuf) {
+        let data_dir_arc = self.data_dir.clone();
+        tokio::spawn(async move {
+            *data_dir_arc.write().await = Some(data_dir);
+        });
     }
 
     /// Validate an incoming webhook request.
@@ -491,6 +505,67 @@ impl WebhookAdapter {
         Ok(metrics_count)
     }
 
+    /// Convert image data (Binary or base64 String) to URL if applicable.
+    pub async fn convert_binary_to_url(
+        device_id: &str,
+        metric_name: &str,
+        timestamp: i64,
+        value: MetricValue,
+        data_dir: Arc<RwLock<Option<PathBuf>>>,
+    ) -> MetricValue {
+        match value {
+            MetricValue::Binary(bytes) => {
+                let dir_guard = data_dir.read().await;
+                if let Some(dir) = dir_guard.as_ref() {
+                    match save_image_binary(device_id, metric_name, timestamp, &bytes, dir) {
+                        Ok(url) => {
+                            debug!(
+                                "Saved binary image for {}/{} -> {}",
+                                device_id, metric_name, url
+                            );
+                            MetricValue::String(url)
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to save binary image for {}/{}: {}",
+                                device_id, metric_name, e
+                            );
+                            MetricValue::Binary(bytes)
+                        }
+                    }
+                } else {
+                    MetricValue::Binary(bytes)
+                }
+            }
+            MetricValue::String(s) => {
+                // Webhook JSON payloads carry images as base64 strings — detect and convert
+                if let Some(bytes) = crate::image_storage::try_decode_base64_image(&s) {
+                    let dir_guard = data_dir.read().await;
+                    if let Some(dir) = dir_guard.as_ref() {
+                        match save_image_binary(device_id, metric_name, timestamp, &bytes, dir) {
+                            Ok(url) => {
+                                debug!(
+                                    "Saved string image for {}/{} -> {}",
+                                    device_id, metric_name, url
+                                );
+                                return MetricValue::String(url);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to save string image for {}/{}: {}",
+                                    device_id, metric_name, e
+                                );
+                            }
+                        }
+                    }
+                }
+                MetricValue::String(s)
+            }
+            // Not a Binary value, return unchanged
+            other => other,
+        }
+    }
+
     /// Emit a metric event to both channels and EventBus.
     async fn emit_metric_event(
         &self,
@@ -500,6 +575,16 @@ impl WebhookAdapter {
         timestamp: i64,
     ) {
         use heramind_core::HeraMindEvent;
+
+        // Convert Binary to URL before storage + event bus (fork point)
+        let value = Self::convert_binary_to_url(
+            &device_id,
+            &metric_name,
+            timestamp,
+            value,
+            self.data_dir.clone(),
+        )
+        .await;
 
         // Emit to device event channel
         let _ = self.event_tx.send(DeviceEvent::Metric {
@@ -693,6 +778,7 @@ impl Clone for WebhookAdapter {
             request_count: Arc::clone(&self.request_count),
             discovery_count: Arc::clone(&self.discovery_count),
             extractor: Arc::clone(&self.extractor),
+            data_dir: Arc::clone(&self.data_dir),
         }
     }
 }
@@ -840,7 +926,9 @@ mod tests {
             .validate_request("dev-1", Some("wrong"), None)
             .is_err());
         // Correct key
-        assert!(adapter.validate_request("dev-1", Some("secret"), None).is_ok());
+        assert!(adapter
+            .validate_request("dev-1", Some("secret"), None)
+            .is_ok());
     }
 
     #[test]
@@ -849,7 +937,9 @@ mod tests {
         // requests without an X-API-Key header are accepted.
         let adapter = make_adapter_with_config(WebhookAdapterConfig::new("t"));
         assert!(adapter.validate_request("dev-1", None, None).is_ok());
-        assert!(adapter.validate_request("dev-1", Some("anything"), None).is_ok());
+        assert!(adapter
+            .validate_request("dev-1", Some("anything"), None)
+            .is_ok());
     }
 
     // ----- discovery throttle -----
@@ -895,8 +985,7 @@ mod tests {
         // Collect all events pending for phase 1. Each post emits at least a
         // Discovery and a Metric event, so drain until the channel is idle.
         let mut discoveries_phase1 = 0u32;
-        let drain_deadline =
-            tokio::time::Instant::now() + Duration::from_millis(150);
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(150);
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(drain_deadline) => break,
@@ -930,8 +1019,7 @@ mod tests {
 
         // Drain again; only Metric events should appear.
         let mut discoveries_phase2 = 0u32;
-        let drain_deadline =
-            tokio::time::Instant::now() + Duration::from_millis(150);
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(150);
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(drain_deadline) => break,

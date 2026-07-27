@@ -1235,11 +1235,64 @@ impl AgentExecutor {
 
 /// Extract image data from a metric value.
 /// Returns (image_url, base64_data, mime_type).
+/// Minimum base64 length to consider an image usable for analysis. Below
+/// this it's a header-only / preview / truncated fragment that extensions
+/// can't decode — emitting it misleads the agent into passing broken data.
+/// Observed in production (garbage-monitoring agent): a 109-byte
+/// JPEG-header-only `image_base64` made every extension image tool return
+/// null across multiple executions. Omit sub-threshold base64 so the agent
+/// falls back to `image_url` (the full image) or honestly reports no usable
+/// image, instead of silently feeding extensions undecodable bytes.
+fn usable_image_base64(b64: String) -> Option<String> {
+    const MIN_BASE64_LEN: usize = 1024;
+    if b64.len() < MIN_BASE64_LEN {
+        tracing::warn!(
+            target: "heramind::agent::event_value",
+            len = b64.len(),
+            "extract_image_data: base64 too small to be a usable image (<{} chars) — omitting from agent context",
+            MIN_BASE64_LEN
+        );
+        None
+    } else {
+        Some(b64)
+    }
+}
+
 pub(crate) fn extract_image_data(
     value: &serde_json::Value,
 ) -> (Option<String>, Option<String>, Option<String>) {
     if let Some(s) = value.as_str() {
-        if s.starts_with("http://") || s.starts_with("https://") {
+        // HeraMind internal image URLs: /api/images/<device>/<metric>/<ts>.<ext>
+        if s.starts_with("/api/images/") {
+            tracing::info!(target: "heramind::agent::event_value", url = %s, "[DIAG] extract_image_data: matched /api/images/ branch");
+
+            let data_dir =
+                std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+            match heramind_devices::image_storage::read_internal_image_url(
+                s,
+                std::path::Path::new(&data_dir),
+            ) {
+                Ok((bytes, mime)) => {
+                    let base64 =
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+                    tracing::info!(target: "heramind::agent::event_value",
+                        url = %s, size = bytes.len(), mime = %mime,
+                        "[DIAG] extract_image_data: successfully loaded /api/images/ file"
+                    );
+                    // Route through usable_image_base64 so a header-only / preview
+                    // file stored under /api/images/ is omitted (same filter as the
+                    // base64 field) instead of feeding extensions undecodable bytes.
+                    (None, usable_image_base64(base64), Some(mime.to_string()))
+                }
+                Err(e) => {
+                    tracing::error!(target: "heramind::agent::event_value",
+                        url = %s, error = %e,
+                        "[DIAG] extract_image_data: failed to read /api/images/ file"
+                    );
+                    (None, None, None)
+                }
+            }
+        } else if s.starts_with("http://") || s.starts_with("https://") {
             tracing::info!(target: "heramind::agent::event_value", "[DIAG] extract_image_data: matched URL branch");
             (Some(s.to_string()), None, None)
         } else if s.starts_with("data:image/") {
@@ -1272,7 +1325,11 @@ pub(crate) fn extract_image_data(
             let mime_type = crate::image_utils::infer_mime_from_base64_prefix(s);
             if let Some(mt) = mime_type {
                 tracing::info!(target: "heramind::agent::event_value", "[DIAG] extract_image_data: matched magic-bytes branch, len={}, mime={}", s.len(), mt);
-                (None, Some(s.to_string()), Some(mt.to_string()))
+                (
+                    None,
+                    usable_image_base64(s.to_string()),
+                    Some(mt.to_string()),
+                )
             } else {
                 tracing::warn!(
                     target: "heramind::agent::event_value",
@@ -1302,7 +1359,47 @@ pub(crate) fn extract_image_data(
             .and_then(|v| v.as_str())
         {
             tracing::info!(target: "heramind::agent::event_value", "[DIAG] extract_image_data: matched Object URL field");
-            return (Some(url.to_string()), None, None);
+            // Relative `/api/images/` URLs aren't callable by extensions (they
+            // run in a separate process and need bytes, not a relative path),
+            // and some extensions only accept `image_base64`. Resolve to FULL
+            // base64 here — same as the String `/api/images/` branch — so the
+            // agent hands complete image bytes to any extension. Absolute
+            // http(s) URLs are left as-is (the extension can fetch them).
+            if url.starts_with("/api/images/") {
+                let data_dir =
+                    std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+                match heramind_devices::image_storage::read_internal_image_url(
+                    url,
+                    std::path::Path::new(&data_dir),
+                ) {
+                    Ok((bytes, mime)) => {
+                        let b64 = base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &bytes,
+                        );
+                        tracing::info!(
+                            target: "heramind::agent::event_value",
+                            url = %url, size = bytes.len(),
+                            "[DIAG] extract_image_data: resolved Object image_url (/api/images/) to full base64"
+                        );
+                        return (
+                            Some(url.to_string()),
+                            usable_image_base64(b64),
+                            Some(mime.to_string()),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "heramind::agent::event_value",
+                            url = %url, error = %e,
+                            "[DIAG] extract_image_data: failed to read /api/images/ for Object image_url — falling through to base64 field"
+                        );
+                        // Fall through to the base64 field below.
+                    }
+                }
+            } else {
+                return (Some(url.to_string()), None, None);
+            }
         }
         if let Some(base64) = obj
             .get("base64")
@@ -1324,7 +1421,7 @@ pub(crate) fn extract_image_data(
                     crate::image_utils::infer_mime_from_base64_prefix(base64).map(|s| s.to_string())
                 })
                 .unwrap_or_else(|| "image/jpeg".to_string());
-            return (None, Some(base64.to_string()), Some(mime));
+            return (None, usable_image_base64(base64.to_string()), Some(mime));
         }
         tracing::warn!(target: "heramind::agent::event_value", "[DIAG] extract_image_data: OBJECT branch FALLTHROUGH — no recognized image keys");
         (None, None, None)
@@ -1355,6 +1452,12 @@ pub(crate) fn is_image_metric(metric_name: &str, value: &serde_json::Value) -> b
         if s.starts_with("http://") || s.starts_with("https://") {
             return true;
         }
+        // HeraMind internal image URL (file-backed since v0.9.6). MUST be
+        // recognized here, else a non-image-keyword metric is never classified
+        // and extract_image_data never runs → silent vision loss.
+        if s.starts_with("/api/images/") {
+            return true;
+        }
         // Check for base64 image data
         if s.starts_with("data:image/") {
             return true;
@@ -1375,5 +1478,187 @@ pub(crate) fn is_image_metric(metric_name: &str, value: &serde_json::Value) -> b
             || obj.contains_key("image_data")
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[serial_test::serial]
+    #[test]
+    fn test_extract_image_data_api_images_url() {
+        // Create a temporary test directory
+        let temp_dir = std::env::temp_dir();
+        let test_data_dir = temp_dir.join(format!(
+            "heramind_test_data_collector_{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        // Set up test image directory
+        crate::testing_helpers::setup_test_image_dir(&test_data_dir)
+            .expect("Failed to set up test image directory");
+
+        // Set HERAMIND_DATA_DIR for this test
+        std::env::set_var("HERAMIND_DATA_DIR", test_data_dir.to_str().unwrap());
+
+        // The shared helper writes minimal ~1x1 images (tens of bytes). The
+        // usable_image_base64 filter (<1024 base64 chars) correctly omits those,
+        // so pad the fixtures to a realistic size here — this test exercises
+        // /api/images/ EXTRACTION; the sub-threshold filter is covered by the
+        // base64-field path.
+        let image_dir = test_data_dir.join("images/test-device-001/image");
+        for name in ["1234567890000.png", "1234567890001.jpg"] {
+            let p = image_dir.join(name);
+            let mut data = std::fs::read(&p).expect("fixture image");
+            data.extend(std::iter::repeat(0u8).take(1024));
+            std::fs::write(&p, data).expect("pad fixture");
+        }
+
+        // Test /api/images/ URL extraction
+        let url_value = serde_json::json!("/api/images/test-device-001/image/1234567890000.png");
+        let (url, base64, mime) = extract_image_data(&url_value);
+
+        assert!(url.is_none(), "URL should be None for /api/images/ URLs");
+        assert!(base64.is_some(), "Should extract base64 data");
+        assert!(mime.is_some(), "Should detect MIME type");
+        assert_eq!(mime.unwrap(), "image/png");
+
+        // Test JPEG URL
+        let jpg_url_value =
+            serde_json::json!("/api/images/test-device-001/image/1234567890001.jpg");
+        let (jpg_url, jpg_base64, jpg_mime) = extract_image_data(&jpg_url_value);
+
+        assert!(jpg_url.is_none());
+        assert!(jpg_base64.is_some());
+        assert!(jpg_mime.is_some());
+        assert_eq!(jpg_mime.unwrap(), "image/jpeg");
+
+        // Clean up
+        crate::testing_helpers::cleanup_test_image_dir(&test_data_dir)
+            .expect("Failed to clean up test directory");
+        std::env::remove_var("HERAMIND_DATA_DIR");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn test_extract_image_data_api_images_url_not_found() {
+        // Create a temporary test directory (empty, no images)
+        let temp_dir = std::env::temp_dir();
+        let test_data_dir = temp_dir.join(format!(
+            "heramind_test_data_collector_empty_{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_data_dir).expect("Failed to create temp dir");
+
+        // Set HERAMIND_DATA_DIR for this test
+        std::env::set_var("HERAMIND_DATA_DIR", test_data_dir.to_str().unwrap());
+
+        // Test /api/images/ URL with non-existent file
+        let url_value = serde_json::json!("/api/images/test-device-001/image/9999999999.png");
+        let (url, base64, mime) = extract_image_data(&url_value);
+
+        assert!(url.is_none(), "URL should be None");
+        assert!(
+            base64.is_none(),
+            "Base64 should be None for non-existent file"
+        );
+        assert!(mime.is_none(), "MIME should be None for non-existent file");
+
+        // Clean up
+        std::fs::remove_dir_all(&test_data_dir).expect("Failed to clean up test directory");
+        std::env::remove_var("HERAMIND_DATA_DIR");
+    }
+
+    #[test]
+    fn test_extract_image_data_backward_compatibility() {
+        // Test existing data URL functionality
+        let data_url = serde_json::json!("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
+        let (url, base64, mime) = extract_image_data(&data_url);
+
+        assert!(url.is_none(), "URL should be None for data URLs");
+        assert!(base64.is_some(), "Should extract base64 from data URL");
+        assert!(mime.is_some(), "Should detect MIME type");
+        assert_eq!(mime.unwrap(), "image/png");
+
+        // Test existing HTTP URL functionality
+        let http_url = serde_json::json!("http://example.com/image.jpg");
+        let (http_url_result, http_base64, http_mime) = extract_image_data(&http_url);
+
+        assert!(http_url_result.is_some(), "Should extract HTTP URL");
+        assert!(http_base64.is_none(), "Base64 should be None for HTTP URLs");
+        assert!(http_mime.is_none(), "MIME should be None for HTTP URLs");
+
+        // Test existing raw base64 functionality
+        // Use a valid base64 string with proper padding
+        let raw_base64 = serde_json::json!("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCgAyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg");
+        let (b64_url, b64_data, b64_mime) = extract_image_data(&raw_base64);
+
+        assert!(b64_url.is_none(), "URL should be None for raw base64");
+        assert!(b64_data.is_some(), "Should extract raw base64");
+        assert!(b64_mime.is_some(), "Should detect MIME from magic bytes");
+        assert_eq!(b64_mime.unwrap(), "image/jpeg");
+    }
+
+    #[test]
+    fn test_extract_image_data_non_image_string() {
+        // Test non-image string (should return None, None, None)
+        let text_value = serde_json::json!("This is just plain text");
+        let (url, base64, mime) = extract_image_data(&text_value);
+
+        assert!(url.is_none(), "URL should be None for non-image text");
+        assert!(base64.is_none(), "Base64 should be None for non-image text");
+        assert!(mime.is_none(), "MIME should be None for non-image text");
+    }
+
+    #[test]
+    fn test_is_image_metric() {
+        // Test metric name detection
+        assert!(is_image_metric("image", &serde_json::json!("some data")));
+        assert!(is_image_metric(
+            "camera_image",
+            &serde_json::json!("some data")
+        ));
+        assert!(is_image_metric("snapshot", &serde_json::json!("some data")));
+        assert!(is_image_metric("photo", &serde_json::json!("some data")));
+
+        // Test case insensitivity
+        assert!(is_image_metric("Image", &serde_json::json!("some data")));
+        assert!(is_image_metric(
+            "IMAGE_DATA",
+            &serde_json::json!("some data")
+        ));
+
+        // Test negative cases
+        assert!(!is_image_metric(
+            "temperature",
+            &serde_json::json!("some data")
+        ));
+        assert!(!is_image_metric(
+            "humidity",
+            &serde_json::json!("some data")
+        ));
+
+        // Test with object values containing image fields
+        let obj_value = serde_json::json!({"image_url": "http://example.com.jpg"});
+        assert!(is_image_metric("data", &obj_value));
+
+        // Test with base64 data
+        let base64_value = serde_json::json!("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCgAyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg");
+        assert!(is_image_metric("data", &base64_value));
+
+        // Internal /api/images/ URL with a NON-image keyword metric name.
+        // Regression guard for v0.9.6: image values are now short URL strings,
+        // so value-only detection must recognize the /api/images/ prefix.
+        assert!(is_image_metric(
+            "payload",
+            &serde_json::json!("/api/images/dev-001/feed/1700000000.jpg")
+        ));
+        assert!(is_image_metric(
+            "values.image",
+            &serde_json::json!("/api/images/9999/values.image/1784027451.jpg")
+        ));
     }
 }

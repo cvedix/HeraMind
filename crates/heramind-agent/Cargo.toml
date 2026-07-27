@@ -25,6 +25,7 @@ heramind-storage = { path = "../heramind-storage" }
 heramind-rules = { path = "../heramind-rules" }
 heramind-messages = { path = "../heramind-messages" }
 
+clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -73,3 +74,4 @@ tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 anyhow = "1.0"
 criterion = { version = "0.5", features = ["async_tokio"] }
+serial_test = "3"

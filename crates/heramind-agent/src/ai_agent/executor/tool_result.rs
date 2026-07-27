@@ -87,6 +87,7 @@ impl AgentExecutor {
         agent_id: &str,
         execution_id: &str,
         mut step_num: u32,
+        cache: &mut crate::agent::types::LargeDataCache,
     ) -> u32 {
         for result in results {
             all_tool_results.push(result.clone());
@@ -94,8 +95,33 @@ impl AgentExecutor {
                 Ok(output) => {
                     let raw = serde_json::to_string_pretty(&output.data)
                         .unwrap_or_else(|_| "Success".to_string());
+                    // Slim large/base64 strings into the cache BEFORE sanitize.
+                    // Sanitize alone strips `data:image/` to a useless `[image data, N B]`
+                    // marker — slim replaces them with `$cached:` references the LLM can
+                    // pass back to image-aware tools (vision/image_edit). Must run first
+                    // so sanitize sees plain text (no `data:image/` prefix) and skips its
+                    // own stripping path.
+                    let slimmed = {
+                        match serde_json::from_str::<serde_json::Value>(&raw) {
+                            Ok(mut v) => {
+                                let n = cache.slim_large_strings_in_json(&mut v, &result.name);
+                                if n > 0 {
+                                    tracing::debug!(
+                                        tool = %result.name,
+                                        slimmed_values = n,
+                                        "Slimmed large strings from scheduled-agent tool result"
+                                    );
+                                    serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.clone())
+                                } else {
+                                    raw
+                                }
+                            }
+                            Err(_) => raw,
+                        }
+                    };
                     // Sanitize base64/image data to prevent context bloat
-                    let sanitized = crate::agent::streaming::sanitize_tool_result_for_prompt(&raw);
+                    let sanitized =
+                        crate::agent::streaming::sanitize_tool_result_for_prompt(&slimmed);
                     // UTF-8 safe truncation (has fast-path for short strings)
                     // 128KB limit: large enough for compact time-series and multi-device
                     // queries. The compaction layer handles context window limits later.

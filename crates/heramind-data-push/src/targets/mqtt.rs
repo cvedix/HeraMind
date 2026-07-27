@@ -90,13 +90,15 @@ impl MqttTarget {
 
 #[async_trait]
 impl PushDestination for MqttTarget {
-    async fn send(&self, payload: &str) -> Result<()> {
-        self.ensure_connected().await?;
+    async fn send(&self, payload: &str) -> std::result::Result<(), super::DeliveryError> {
+        self.ensure_connected()
+            .await
+            .map_err(|e| super::DeliveryError::Other(anyhow!("MQTT connect failed: {}", e)))?;
 
         let client_guard = self.client.lock().await;
         let client = client_guard
             .as_ref()
-            .ok_or_else(|| anyhow!("MQTT client not initialized"))?;
+            .ok_or_else(|| super::DeliveryError::Other(anyhow!("MQTT client not initialized")))?;
 
         let qos = match self.config.qos {
             0 => rumqttc::QoS::AtMostOnce,
@@ -107,7 +109,7 @@ impl PushDestination for MqttTarget {
         client
             .publish(&self.config.topic, qos, false, payload.as_bytes())
             .await
-            .map_err(|e| anyhow!("MQTT publish failed: {}", e))?;
+            .map_err(|e| super::DeliveryError::Other(anyhow!("MQTT publish failed: {}", e)))?;
 
         // Poll eventloop to process the publish
         drop(client_guard);

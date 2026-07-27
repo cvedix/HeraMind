@@ -34,7 +34,7 @@ export interface UseComponentConfigDialogParams {
   // External state for schema generation
   agents: { id: string; name: string; status: string }[]
   agentsLoading: boolean
-  visionModels: { id: string; name: string; backendId: string; backendName: string }[]
+  visionModels: { id: string; name: string; backendId: string; backendName: string; isMultimodal?: boolean }[]
   visionModelsLoading: boolean
 
   // Dialog setters for map/layer/center editors (state owned by main component)
@@ -178,6 +178,16 @@ export function useComponentConfigDialog(params: UseComponentConfigDialogParams)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [componentConfig, configOpen, selectedComponent?.id, selectedComponent?.type, updateComponent])
+
+  // Regenerate schema when async-loaded context (agents / visionModels) arrives.
+  // Without this, the schema is built once with empty arrays at dialog-open time
+  // and never refreshes when the fetch resolves — leaving dropdowns empty.
+  useEffect(() => {
+    if (configOpen && selectedComponent && isInitialLoad.current) {
+      setConfigSchema(generateConfigSchema(selectedComponent.type, componentConfig))
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visionModels, visionModelsLoading, agents, agentsLoading])
 
   // Handle canceling component config - revert to original
   const handleCancelConfig = useCallback(() => {

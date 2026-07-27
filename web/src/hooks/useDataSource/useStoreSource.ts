@@ -513,6 +513,7 @@ export function useStoreSource<T = unknown>(
     },
   })
 
+
   const eventsKey = useMemo(() => {
     if (events.length === 0) return 'empty'
     const lastEvent = events[events.length - 1]

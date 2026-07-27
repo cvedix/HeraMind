@@ -36,7 +36,6 @@ import {
   Terminal,
   Zap,
   Save,
-  RefreshCw,
   Activity,
   ChevronDown,
   Play,
@@ -81,7 +80,6 @@ export function ExtensionDetailsDialog({
 
   const [health, setHealth] = useState<{ healthy: boolean } | null>(null)
   const [loading, setLoading] = useState(false)
-  const [reloading, setReloading] = useState(false)
 
   // Config state
   const [configData, setConfigData] = useState<ExtensionConfigResponse | null>(null)
@@ -293,7 +291,7 @@ export function ExtensionDetailsDialog({
 
   // Reset state when dialog closes
   const handleClose = useCallback(() => {
-    if (!saving && !reloading) {
+    if (!saving) {
       setHealth(null)
       setLogs([])
       setLogsLoading(false)
@@ -310,9 +308,8 @@ export function ExtensionDetailsDialog({
       setMetricHistoryError({})
       onOpenChange(false)
     }
-  }, [saving, reloading, onOpenChange])
+  }, [saving, onOpenChange])
 
-  // Reload extension
   // --- AI tools toggle helpers (master + per-command) ---
   // OFF asks for confirmation (changes agent capabilities); ON is immediate.
   const runMasterToggle = async (checked: boolean) => {
@@ -348,25 +345,6 @@ export function ExtensionDetailsDialog({
       runCmdToggle(pendingDisable.cmdId, false)
     }
     setPendingDisable(null)
-  }
-
-  const handleReloadExtension = async () => {
-    if (!extension) return
-
-    setReloading(true)
-    try {
-      const success = await reloadExtensionStore(extension.id)
-      if (success) {
-        toast({ title: "Extension reloaded successfully" })
-        await loadDetails()
-      } else {
-        handleError(new Error("Failed to reload extension"), { operation: "Reload extension" })
-      }
-    } catch (error) {
-      handleError(error, { operation: "Reload extension" })
-    } finally {
-      setReloading(false)
-    }
   }
 
   // Load details when dialog opens
@@ -554,8 +532,6 @@ export function ExtensionDetailsDialog({
   // Check if config has any parameters
   const hasConfigParams =
     configData?.config_schema && Object.keys(configData.config_schema.properties || {}).length > 0
-
-  const isBusy = saving || reloading || loading
 
   // Sections for navigation
   const sections: { id: SectionId; icon: typeof Info; label: string }[] = [
@@ -1039,7 +1015,7 @@ export function ExtensionDetailsDialog({
 
   const renderLogs = () => {
     return (
-      <div className="space-y-3">
+      <div className="flex h-full flex-col gap-3">
         {/* Toolbar */}
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <span className="text-xs text-muted-foreground tabular-nums">
@@ -1049,16 +1025,6 @@ export function ExtensionDetailsDialog({
             }
           </span>
           <div className="flex items-center gap-1">
-            <Button
-              variant="ghost"
-              size="xs"
-              className="gap-1.5"
-              onClick={loadLogs}
-              disabled={logsLoading}
-            >
-              <RefreshCw className="h-3.5 w-3.5" />
-              {t("extensions:logs.refresh", { defaultValue: "Refresh" })}
-            </Button>
             <Button
               variant="ghost"
               size="xs"
@@ -1074,17 +1040,17 @@ export function ExtensionDetailsDialog({
 
         {/* Log entries */}
         {logsLoading && logs.length === 0 ? (
-          <div className="flex justify-center py-8">
+          <div className="flex-1 flex items-center justify-center">
             <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
           </div>
         ) : logs.length === 0 ? (
-          <div className="text-center py-8 text-muted-foreground text-sm">
-            <FileText className="h-8 w-8 mx-auto mb-2 opacity-50" />
+          <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground text-sm">
+            <FileText className="h-8 w-8 mb-2 opacity-50" />
             <p>{t("extensions:logs.noLogs", { defaultValue: "No log entries yet" })}</p>
           </div>
         ) : (
-          <div className="border rounded-lg overflow-hidden font-mono text-xs">
-            <div ref={logListRef} className="max-h-[500px] overflow-y-auto">
+          <div className="flex-1 min-h-0 flex flex-col border rounded-lg overflow-hidden font-mono text-xs">
+            <div ref={logListRef} className="flex-1 min-h-0 overflow-y-auto">
               {logs.map((log, i) => {
                 const levelKey = (log.level || 'info').toLowerCase()
                 return (
@@ -1169,16 +1135,6 @@ export function ExtensionDetailsDialog({
         title={extension.name}
         subtitle={`v${extension.version}`}
         onClose={handleClose}
-        actions={
-          <Button variant="outline" size="sm" onClick={handleReloadExtension} disabled={isBusy}>
-            {reloading ? (
-              <Loader2 className="h-4 w-4 mr-1.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-4 w-4 mr-1.5" />
-            )}
-            {t("common:reload", { defaultValue: "Reload" })}
-          </Button>
-        }
       />
 
       <FullScreenDialogContent>

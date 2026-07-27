@@ -115,7 +115,7 @@ impl DataPushStore {
         let read_tx = self.db.begin_read()?;
         let table = read_tx.open_table(LOGS_TABLE)?;
         let mut all = Vec::new();
-        for entry in table.iter()?.rev() {
+        for entry in table.iter()? {
             let (_, value) = entry?;
             if let Ok(l) = serde_json::from_str::<DeliveryLog>(value.value()) {
                 if l.target_id == target_id {
@@ -123,6 +123,10 @@ impl DataPushStore {
                 }
             }
         }
+        // LOGS_TABLE is keyed by UUID (not time), so iteration order is
+        // unrelated to recency. Sort newest-first by `created_at` so pagination
+        // (skip/take) returns the most recent deliveries first.
+        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         let total = all.len();
         let logs: Vec<DeliveryLog> = all.into_iter().skip(offset).take(limit).collect();
         Ok((logs, total))
@@ -216,5 +220,35 @@ mod tests {
         // Cleanup old logs
         let cleaned = store.cleanup_logs(1700000001).unwrap();
         assert_eq!(cleaned, 1);
+    }
+
+    #[test]
+    fn test_delivery_logs_sorted_newest_first() {
+        // LOGS_TABLE is keyed by UUID (not time), so ordering must come from
+        // created_at. Insert with lexicographically-ascending ids but
+        // non-monotonic timestamps to prove the sort is by time, not key.
+        let store = DataPushStore::memory().unwrap();
+        let mk = |id: &str, ts: i64| DeliveryLog {
+            id: id.to_string(),
+            target_id: "t-1".to_string(),
+            status: DeliveryStatus::Success,
+            data_source_id: "device:s1:temp".to_string(),
+            payload_sent: "{}".to_string(),
+            response: None,
+            attempts: 1,
+            created_at: ts,
+            completed_at: None,
+            error: None,
+        };
+        store.save_delivery_log(&mk("a", 1000)).unwrap(); // oldest, but sorts first lexicographically
+        store.save_delivery_log(&mk("b", 3000)).unwrap(); // newest
+        store.save_delivery_log(&mk("c", 2000)).unwrap(); // middle
+
+        let (logs, total) = store.list_delivery_logs("t-1", 10, 0).unwrap();
+        assert_eq!(total, 3);
+        // newest-first by created_at — NOT key order (which would be a, b, c)
+        assert_eq!(logs[0].id, "b");
+        assert_eq!(logs[1].id, "c");
+        assert_eq!(logs[2].id, "a");
     }
 }

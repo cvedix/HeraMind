@@ -866,7 +866,11 @@ pub async fn test_rule_handler(
                         Some(heramind_rules::RuleValue::Number(*v as f64))
                     }
                     heramind_devices::MetricValue::Boolean(v) => {
-                        Some(heramind_rules::RuleValue::Number(if *v { 1.0 } else { 0.0 }))
+                        Some(heramind_rules::RuleValue::Number(if *v {
+                            1.0
+                        } else {
+                            0.0
+                        }))
                     }
                     heramind_devices::MetricValue::String(s) => {
                         Some(heramind_rules::RuleValue::Text(s.clone()))

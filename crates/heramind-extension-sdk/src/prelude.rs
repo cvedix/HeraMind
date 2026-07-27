@@ -47,8 +47,8 @@ pub use crate::{CommandBuilder, MetricBuilder};
 
 // Macros
 pub use crate::{
-    ext_debug, ext_error, ext_info, ext_log, ext_warn, metric_bool, metric_float, metric_int,
-    metric_string, metric_value, heramind_export, static_commands, static_metadata, static_metrics,
+    ext_debug, ext_error, ext_info, ext_log, ext_warn, heramind_export, metric_bool, metric_float,
+    metric_int, metric_string, metric_value, static_commands, static_metadata, static_metrics,
 };
 
 // SDK constants

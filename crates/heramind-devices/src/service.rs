@@ -259,7 +259,10 @@ impl HeartbeatConfig {
     /// and template defaults. Callers MUST use
     /// `DeviceService::effective_offline_timeout(device_id)` instead, which resolves
     /// the correct timeout via: device override > template default > global.
-    #[deprecated(since = "0.8.18", note = "use DeviceService::effective_offline_timeout() instead")]
+    #[deprecated(
+        since = "0.8.18",
+        note = "use DeviceService::effective_offline_timeout() instead"
+    )]
     pub fn is_stale(&self, last_seen: i64) -> bool {
         let now = chrono::Utc::now().timestamp();
         let elapsed = (now - last_seen) as u64;
@@ -456,7 +459,9 @@ impl DeviceService {
                         entry.update(ConnectionStatus::Disconnected);
                     }
                     heramind_core::HeraMindEvent::DeviceTransportOnline {
-                        device_id, timestamp, ..
+                        device_id,
+                        timestamp,
+                        ..
                     } => {
                         // Skip unknown clients (e.g., MQTT tools, test clients)
                         // to avoid creating phantom status entries
@@ -637,9 +642,7 @@ impl DeviceService {
                                 let mut t = config.offline_timeout;
                                 if let Some(secs) = dc.offline_timeout_secs {
                                     t = secs;
-                                } else if let Some(tpl) =
-                                    registry.get_template(&dc.device_type)
-                                {
+                                } else if let Some(tpl) = registry.get_template(&dc.device_type) {
                                     if let Some(secs) = tpl.default_offline_timeout_secs {
                                         t = secs;
                                     }
@@ -1288,7 +1291,51 @@ impl DeviceService {
             }
         });
 
+        // Phase 3: best-effort purge of on-disk image files for this device.
+        // v0.9.6 stores device images at <data_dir>/images/<device_id>/; without
+        // this they'd linger until the age-based cleanup sweep expires them — up
+        // to image_retention after the device is already gone.
+        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+        Self::purge_device_images(device_id, std::path::Path::new(&data_dir));
+
         Ok(())
+    }
+
+    /// Best-effort purge of a device's on-disk image files on unregister.
+    ///
+    /// Failures are logged, never propagated — unregister must not fail just
+    /// because image cleanup couldn't run. Reuses `validate_path_component`
+    /// (same as `save_image_binary`) so a hostile device_id can't traverse out
+    /// of `images/`, plus a canonicalize guard against symlink escape.
+    fn purge_device_images(device_id: &str, data_dir: &std::path::Path) {
+        let images_dir = data_dir.join("images");
+        let Ok(safe_device_id) = crate::image_storage::validate_path_component(device_id) else {
+            return;
+        };
+        let device_dir = images_dir.join(&safe_device_id);
+        if !device_dir.exists() {
+            return;
+        }
+        // Symlink-escape guard: refuse if the resolved path isn't under images/.
+        let canon_ok = match (images_dir.canonicalize(), device_dir.canonicalize()) {
+            (Ok(base), Ok(target)) => target.starts_with(&base),
+            _ => false,
+        };
+        if !canon_ok {
+            tracing::warn!(
+                device_id = %device_id,
+                "Refusing to purge device image dir: resolves outside images/"
+            );
+            return;
+        }
+        match std::fs::remove_dir_all(&device_dir) {
+            Ok(_) => {
+                tracing::info!(device_id = %device_id, "Purged device image dir on unregister")
+            }
+            Err(e) => {
+                tracing::warn!(device_id = %device_id, error = %e, "Failed to purge device image dir")
+            }
+        }
     }
 
     /// Update a device configuration
@@ -1460,8 +1507,7 @@ impl DeviceService {
             {
                 Ok(()) => success_count += 1,
                 Err(e) => {
-                    last_error =
-                        Some(format!("Failed to send command via adapter: {}", e));
+                    last_error = Some(format!("Failed to send command via adapter: {}", e));
                 }
             }
         }
@@ -1477,8 +1523,8 @@ impl DeviceService {
             .await;
             Ok(None)
         } else {
-            let err_msg = last_error
-                .unwrap_or_else(|| "Failed to send command on any adapter".to_string());
+            let err_msg =
+                last_error.unwrap_or_else(|| "Failed to send command on any adapter".to_string());
             self.update_command_status(
                 device_id,
                 &command_id,
@@ -1621,13 +1667,11 @@ impl DeviceService {
                 if let Some(i) = n.as_i64() {
                     Ok(MetricValue::Integer(i))
                 } else {
-                    n.as_f64()
-                        .map(MetricValue::Float)
-                        .ok_or_else(|| {
-                            DeviceError::InvalidParameter(format!(
-                                "fixed_value number not representable: {n}"
-                            ))
-                        })
+                    n.as_f64().map(MetricValue::Float).ok_or_else(|| {
+                        DeviceError::InvalidParameter(format!(
+                            "fixed_value number not representable: {n}"
+                        ))
+                    })
                 }
             }
             serde_json::Value::String(s) => Ok(MetricValue::String(s.clone())),
@@ -1677,6 +1721,14 @@ impl DeviceService {
             );
         }
 
+        // Resolve any `/api/images/` internal URLs in the merged params to
+        // base64 data URLs before rendering. Devices are external targets and
+        // cannot read hostless internal paths, so an unresolved `/api/images/`
+        // string would arrive as an unusable value. Mirrors the data-push
+        // outbound fix (scheduler.rs::resolve_image_urls_in_value).
+        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+        Self::resolve_command_image_urls(&mut merged, std::path::Path::new(&data_dir));
+
         // Delegate to the structured JSON-aware renderer. See
         // `payload_template` module docs for why string substitution
         // is unsafe (placeholder syntax drift, quote collision, type
@@ -1688,6 +1740,32 @@ impl DeviceService {
     }
 
     // ========== Data Querying ==========
+
+    /// Resolve `/api/images/` internal URLs in command params to base64 data URLs.
+    ///
+    /// Devices are external targets (separate MQTT client / HTTP endpoint) and
+    /// cannot resolve a hostless `/api/images/` path. Walk every string param and,
+    /// if it is an internal image URL, replace it with a self-contained
+    /// `data:<mime>;base64,...` string via the shared helper (same symlink/size/
+    /// magic guards as `GET /api/images/`). Unresolvable values (missing file, too
+    /// large, non-image) are left untouched so the device surfaces its own error
+    /// rather than receiving an empty value.
+    fn resolve_command_image_urls(
+        params: &mut HashMap<String, MetricValue>,
+        data_dir: &std::path::Path,
+    ) {
+        for value in params.values_mut() {
+            if let MetricValue::String(s) = value {
+                if s.starts_with("/api/images/") {
+                    if let Some(data_url) =
+                        crate::image_storage::resolve_internal_image_to_data_url(s, data_dir)
+                    {
+                        *s = data_url;
+                    }
+                }
+            }
+        }
+    }
 
     /// Query telemetry data for a device metric
     pub async fn query_telemetry(
@@ -1872,7 +1950,10 @@ impl DeviceService {
             return in_memory;
         }
         // Fallback to persisted registry value (survives restarts)
-        self.registry.get_device(device_id).map(|c| c.last_seen).unwrap_or(0)
+        self.registry
+            .get_device(device_id)
+            .map(|c| c.last_seen)
+            .unwrap_or(0)
     }
 
     /// Update device status (called by event listeners or adapters)
@@ -2221,6 +2302,111 @@ mod tests {
         assert!(payload.contains("25.5"));
     }
 
+    #[test]
+    fn test_resolve_command_image_urls_resolves_api_images() {
+        // A command param carrying an /api/images/ internal URL must be resolved
+        // to a base64 data URL before rendering — devices are external targets
+        // and can't read hostless internal paths. Mirrors the data-push fix.
+        let temp =
+            std::env::temp_dir().join(format!("heramind_test_cmd_img_{}", std::process::id()));
+        let images_dir = temp.join("images").join("dev").join("overlay");
+        std::fs::create_dir_all(&images_dir).unwrap();
+        let png = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52,
+        ];
+        std::fs::write(images_dir.join("1700000000.png"), png).unwrap();
+
+        let mut params = HashMap::new();
+        params.insert(
+            "image".to_string(),
+            MetricValue::String("/api/images/dev/overlay/1700000000.png".to_string()),
+        );
+        params.insert("label".to_string(), MetricValue::String("hi".to_string()));
+
+        DeviceService::resolve_command_image_urls(&mut params, &temp);
+
+        let img = match &params["image"] {
+            MetricValue::String(s) => s.clone(),
+            other => panic!("image should stay a string, got {other:?}"),
+        };
+        assert!(img.starts_with("data:image/png;base64,"), "got: {img}");
+        assert!(!img.contains("/api/images/"), "got: {img}");
+        // Non-image params are left untouched.
+        match &params["label"] {
+            MetricValue::String(s) => assert_eq!(s, "hi"),
+            other => panic!("label should be untouched, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_resolve_command_image_urls_missing_falls_back() {
+        // An unresolvable /api/images/ URL (missing file) is left as-is so the
+        // device surfaces its own error rather than receiving an empty value.
+        let temp =
+            std::env::temp_dir().join(format!("heramind_test_cmd_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut params = HashMap::new();
+        params.insert(
+            "image".to_string(),
+            MetricValue::String("/api/images/nope/overlay/0.png".to_string()),
+        );
+        DeviceService::resolve_command_image_urls(&mut params, &temp);
+        match &params["image"] {
+            MetricValue::String(s) => {
+                assert_eq!(s, "/api/images/nope/overlay/0.png")
+            }
+            other => panic!("should fall back to original URL, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_purge_device_images_removes_device_dir_leaves_siblings() {
+        // Unregistering a device must purge its on-disk image dir, leaving
+        // other devices' image dirs intact.
+        let temp = std::env::temp_dir().join(format!("heramind_test_purge_{}", std::process::id()));
+        let images = temp.join("images");
+        let dev_a = images.join("cam-a").join("image");
+        let dev_b = images.join("cam-b").join("image");
+        std::fs::create_dir_all(&dev_a).unwrap();
+        std::fs::create_dir_all(&dev_b).unwrap();
+        std::fs::write(dev_a.join("1.png"), b"data").unwrap();
+        std::fs::write(dev_b.join("2.png"), b"data").unwrap();
+
+        DeviceService::purge_device_images("cam-a", &temp);
+
+        assert!(!images.join("cam-a").exists(), "cam-a dir should be purged");
+        assert!(images.join("cam-b").exists(), "cam-b dir must be untouched");
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_purge_device_images_rejects_traversal_device_id() {
+        // A hostile device_id with path-traversal chars must not escape images/.
+        let temp =
+            std::env::temp_dir().join(format!("heramind_test_purge_trav_{}", std::process::id()));
+        let images = temp.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        // Nothing to purge (validate_path_component rejects "../etc"), and no
+        // panic / escape — just a no-op.
+        DeviceService::purge_device_images("../../etc", &temp);
+        assert!(images.exists());
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_purge_device_images_missing_dir_is_noop() {
+        let temp =
+            std::env::temp_dir().join(format!("heramind_test_purge_noop_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        // No images dir at all — must not panic.
+        DeviceService::purge_device_images("never-existed", &temp);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
     #[tokio::test]
     async fn test_build_command_payload_merges_fixed_values() {
         // Regression test: fixed_values declared in a CommandDefinition
@@ -2234,10 +2420,7 @@ mod tests {
 
         let mut fixed = std::collections::HashMap::new();
         fixed.insert("cmd".to_string(), serde_json::json!("capture"));
-        fixed.insert(
-            "store_to_sd".to_string(),
-            serde_json::json!(false),
-        );
+        fixed.insert("store_to_sd".to_string(), serde_json::json!(false));
 
         let command_def = CommandDefinition {
             name: "capture".to_string(),
@@ -2267,7 +2450,10 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(parsed["cmd"], "capture");
-        assert_eq!(parsed["store_to_sd"], true, "user param must override fixed_value");
+        assert_eq!(
+            parsed["store_to_sd"], true,
+            "user param must override fixed_value"
+        );
     }
 
     #[tokio::test]
@@ -2287,7 +2473,7 @@ mod tests {
             name: "capture".to_string(),
             display_name: "Capture".to_string(),
             payload_template: r#"{"cmd": "capture", "request_id": "${request_id}"}"#.to_string(),
-            parameters: vec![],  // no request_id declared — system handles it
+            parameters: vec![], // no request_id declared — system handles it
             samples: vec![],
             description: String::new(),
             fixed_values: std::collections::HashMap::new(),
@@ -2299,7 +2485,9 @@ mod tests {
             .build_command_payload(&command_def, &params)
             .expect("auto-injection should satisfy request_id");
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        let generated = parsed["request_id"].as_str().expect("request_id must be a string");
+        let generated = parsed["request_id"]
+            .as_str()
+            .expect("request_id must be a string");
         assert!(
             generated.starts_with("req-"),
             "auto-generated request_id should be prefixed with 'req-', got: {}",

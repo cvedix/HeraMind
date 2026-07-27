@@ -317,6 +317,7 @@ pub async fn approve_draft_device(
                 commands: Vec::new(),       // No commands generated yet
                 uplink_samples: Vec::new(), // Samples not stored in draft
                 default_offline_timeout_secs: None,
+                store_raw: None,
             };
 
             // Register the device type template

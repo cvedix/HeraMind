@@ -13,7 +13,7 @@ use heramind_agent::llm_backends::{OllamaConfig, OllamaRuntime};
 use heramind_core::llm::backend::{GenerationParams, LlmInput};
 use heramind_core::{
     message::{Content, Message, MessageRole},
-    EventBus, LlmRuntime, MetricValue, HeraMindEvent,
+    EventBus, HeraMindEvent, LlmRuntime, MetricValue,
 };
 use heramind_messages::{MessageManager, MessageSeverity};
 use heramind_storage::{

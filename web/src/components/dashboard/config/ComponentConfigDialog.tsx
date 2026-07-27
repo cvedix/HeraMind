@@ -428,7 +428,7 @@ export function ComponentConfigDialog({
 
               {/* Footer */}
               <div
-                className="flex items-center justify-end gap-3 px-4 py-4 border-t shrink-0 bg-background"
+                className="flex items-center justify-end gap-3 px-4 py-4 border-t shrink-0"
                 style={{ paddingBottom: `calc(1rem + ${insets.bottom}px)` }}
               >
                 <Button variant="outline" onClick={onClose} className="min-w-[80px]">

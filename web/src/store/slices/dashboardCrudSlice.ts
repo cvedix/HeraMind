@@ -13,7 +13,7 @@ import type {
   DashboardTemplate,
   DashboardLayout,
 } from '@/types/dashboard'
-import { createDashboardStorage, type DashboardStorage } from '../persistence'
+import { createDashboardStorage, fromDashboardDTO, type DashboardStorage } from '../persistence'
 import { logError } from '@/lib/errors'
 import {
   generateId,
@@ -99,6 +99,7 @@ export interface DashboardCrudSlice {
   createDashboard: (dashboard: Omit<Dashboard, 'id' | 'createdAt' | 'updatedAt'>) => Promise<string>
   updateDashboard: (id: string, updates: Partial<Dashboard>) => Promise<void>
   deleteDashboard: (id: string) => Promise<void>
+  duplicateDashboard: (id: string) => Promise<string | null>
   setCurrentDashboard: (id: string | null) => void
   setDefaultDashboard: (id: string) => Promise<void>
   /** Persist a new manual order (index 0 = top). Rolls back on failure. */
@@ -303,6 +304,22 @@ export const createDashboardCrudSlice: StateCreator<
         } : {}),
       })
       await storage.delete(id)
+    },
+
+    duplicateDashboard: async (id) => {
+      try {
+        const { api } = await import('@/lib/api')
+        const dto = await api.duplicateDashboard(id)
+        const newDash = fromDashboardDTO(dto)
+        set((s) => ({
+          dashboards: [...s.dashboards, newDash],
+        }))
+        recordSelfSync(newDash.id)
+        return newDash.id
+      } catch (err) {
+        logError(err, { operation: 'Duplicate dashboard', context: { dashboardId: id } })
+        return null
+      }
     },
 
     setCurrentDashboard: async (id) => {

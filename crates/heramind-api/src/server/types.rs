@@ -115,8 +115,16 @@ fn generate_internal_proxy_secret() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Maximum request body size for extension uploads (100 MB - base64 encoded files are ~33% larger)
-pub const MAX_EXTENSION_UPLOAD_SIZE: usize = 100 * 1024 * 1024;
+/// Maximum request body size for extension uploads (512 MB - accommodates large
+/// ML model bundles, e.g. paddle-ocr-v6 with CUDA ORT libs + multi-tier ONNX models)
+pub const MAX_EXTENSION_UPLOAD_SIZE: usize = 512 * 1024 * 1024;
+
+/// Maximum size of an extension package downloaded from the marketplace
+/// (1 GB). Higher than the upload limit because the download path streams
+/// the body to a temp file (no in-memory buffering), and marketplace
+/// packages may bundle large ML models. Enforced via Content-Length (when
+/// reported) plus a running byte counter during streaming.
+pub const MAX_EXTENSION_DOWNLOAD_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// Server state shared across all handlers.
 ///
@@ -185,8 +193,9 @@ pub struct ServerState {
     extension_event_subscription_initialized: Arc<std::sync::atomic::AtomicBool>,
 
     /// Cached extension event subscription service instance (prevents duplicate instances).
-    extension_event_subscription_service:
-        Arc<tokio::sync::Mutex<Option<heramind_core::extension::ExtensionEventSubscriptionService>>>,
+    extension_event_subscription_service: Arc<
+        tokio::sync::Mutex<Option<heramind_core::extension::ExtensionEventSubscriptionService>>,
+    >,
 
     /// Semaphore to limit concurrent telemetry DB queries (max 16).
     pub telemetry_query_semaphore: Arc<tokio::sync::Semaphore>,
@@ -504,6 +513,7 @@ impl ServerState {
         {
             mqtt.set_shared_device_registry(self.devices.service.get_registry())
                 .await;
+            mqtt.set_data_dir(self.data_dir.clone());
         }
 
         self.devices
@@ -1107,6 +1117,8 @@ impl ServerState {
             "All parallel store opens completed"
         );
 
+        let data_push_telemetry = devices.telemetry.clone();
+
         // Spawn periodic old message cleanup (every 6 hours)
         {
             let mm = core.message_manager.clone();
@@ -1120,6 +1132,44 @@ impl ServerState {
                             tracing::info!(
                                 "Periodic cleanup: removed {} messages older than 30 days",
                                 cleaned_msgs
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        // Spawn periodic old agent-execution cleanup (every 6 hours, >30 days).
+        // cleanup_executions exists on the store but was never wired to a
+        // scheduler, so execution history (input/output/journal per run) grew
+        // agents.redb without bound.
+        {
+            let agent_store = agents.agent_store.clone();
+            tokio::spawn(async move {
+                let mut cleanup_interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(6 * 60 * 60));
+                // `interval`'s first tick fires immediately — consume it so the
+                // server doesn't do a full AGENT_EXECUTIONS_TABLE scan
+                // (deserializing every record) during startup, contending with
+                // the just-booted server against the very backlog this cleanup
+                // exists to clear. First real cleanup is delayed one interval.
+                cleanup_interval.tick().await;
+                loop {
+                    cleanup_interval.tick().await;
+                    let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
+                    match agent_store.cleanup_executions(cutoff).await {
+                        Ok(cleaned) => {
+                            if cleaned > 0 {
+                                tracing::info!(
+                                    "Periodic cleanup: removed {} agent executions older than 30 days",
+                                    cleaned
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Periodic agent-execution cleanup failed — execution history may grow unbounded"
                             );
                         }
                     }
@@ -1152,9 +1202,10 @@ impl ServerState {
             telemetry_query_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             data_dir,
             data_push: {
-                let push_manager = match PushManager::new(
+                let push_manager = match PushManager::new_with_telemetry(
                     std::path::Path::new("data"),
                     event_bus.clone(),
+                    data_push_telemetry,
                 ) {
                     Ok(m) => {
                         tracing::info!("Data push manager initialized");
@@ -1318,6 +1369,7 @@ impl ServerState {
 
         // Empty GPU info for testing
         let gpu_info = Arc::new(std::sync::OnceLock::from(vec![]));
+        let data_push_telemetry = time_series_storage.clone();
 
         Self {
             core,
@@ -1344,7 +1396,7 @@ impl ServerState {
             telemetry_query_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             data_dir: std::path::PathBuf::from("data"),
             data_push: {
-                let push_manager = PushManager::memory().ok();
+                let push_manager = PushManager::memory_with_telemetry(data_push_telemetry).ok();
                 Arc::new(tokio::sync::RwLock::new(push_manager))
             },
             #[cfg(feature = "embedded-broker")]
@@ -1630,7 +1682,10 @@ impl ServerState {
                 let cache = self.credential_cache.read().unwrap();
                 if let Some(ref pass) = cache.system_password {
                     tracing::debug!("Internal MQTT adapter: using system credential from cache");
-                    (Some("__heramind_internal__".to_string()), Some(pass.clone()))
+                    (
+                        Some("__heramind_internal__".to_string()),
+                        Some(pass.clone()),
+                    )
                 } else {
                     tracing::warn!("Internal MQTT adapter: no system credential in cache, connecting without auth");
                     (None, None)
@@ -1698,6 +1753,7 @@ impl ServerState {
                 {
                     mqtt.set_shared_device_registry(self.devices.service.get_registry())
                         .await;
+                    mqtt.set_data_dir(self.data_dir.clone());
                 }
 
                 // Register adapter with device service
@@ -1747,6 +1803,7 @@ impl ServerState {
                     ) {
                         whk.set_shared_device_registry(self.devices.service.get_registry())
                             .await;
+                        whk.set_data_dir(self.data_dir.clone());
                     }
 
                     self.devices
@@ -2190,7 +2247,7 @@ impl ServerState {
         let rule_engine_for_update = rule_engine.clone();
 
         tokio::spawn(async move {
-            use heramind_core::{MetricValue, HeraMindEvent};
+            use heramind_core::{HeraMindEvent, MetricValue};
 
             tracing::info!("Starting value provider update task for rule engine");
 
@@ -2217,11 +2274,15 @@ impl ServerState {
                         MetricValue::Integer(v) => {
                             Some(heramind_rules::RuleValue::Number(*v as f64))
                         }
-                        MetricValue::Boolean(v) => {
-                            Some(heramind_rules::RuleValue::Number(if *v { 1.0 } else { 0.0 }))
-                        }
+                        MetricValue::Boolean(v) => Some(heramind_rules::RuleValue::Number(if *v {
+                            1.0
+                        } else {
+                            0.0
+                        })),
                         MetricValue::String(s) => Some(heramind_rules::RuleValue::Text(s.clone())),
-                        MetricValue::Json(v) => Some(heramind_rules::RuleValue::Text(v.to_string())),
+                        MetricValue::Json(v) => {
+                            Some(heramind_rules::RuleValue::Text(v.to_string()))
+                        }
                     };
 
                     if let Some(rv) = rule_value {
@@ -2339,7 +2400,7 @@ impl ServerState {
         let rule_engine_ext = rule_engine.clone();
 
         tokio::spawn(async move {
-            use heramind_core::{MetricValue, HeraMindEvent};
+            use heramind_core::{HeraMindEvent, MetricValue};
 
             tracing::info!("Starting extension output listener for rule engine");
 

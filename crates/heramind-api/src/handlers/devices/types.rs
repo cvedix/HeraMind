@@ -116,7 +116,9 @@ pub async fn get_device_type_handler(
         heramind_devices::registry::DeviceTypeMode::Full => "full",
     };
 
-    // Return in new simplified format (direct metrics/commands arrays)
+    // Return in new simplified format (direct metrics/commands arrays).
+    // Include store_raw + default_offline_timeout_secs so exports round-trip
+    // (GET is the path the UI export uses; omitting them drops these settings).
     ok(json!({
         "device_type": template.device_type,
         "name": template.name,
@@ -126,6 +128,8 @@ pub async fn get_device_type_handler(
         "metrics": template.metrics,
         "uplink_samples": template.uplink_samples,
         "commands": template.commands,
+        "default_offline_timeout_secs": template.default_offline_timeout_secs,
+        "store_raw": template.store_raw,
         "metric_count": template.metrics.len(),
         "command_count": template.commands.len(),
     }))

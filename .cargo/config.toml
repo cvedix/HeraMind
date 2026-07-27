@@ -1,5 +1,22 @@
 # Cargo build acceleration configuration for HeraMind
 
+[env]
+# jemalloc is compiled with a fixed page size; it aborts at startup if the
+# runtime page size is larger than its compiled page (JEMALLOC_SYS_WITH_LG_PAGE).
+# ARM64 kernels may use 4/16/64 KB pages (Pi 5 = 16 KB; Kunpeng/Graviton/Ampere
+# can be 64 KB). 2^16 = 64 KB covers all of them and runs fine on smaller pages
+# (jemalloc only requires compiled page >= system page). Linux-only effect —
+# tikv-jemalloc-sys only builds on Linux. Fixes #11 (Pi 5 16 KB startup crash).
+JEMALLOC_SYS_WITH_LG_PAGE = "16"
+
+[target.aarch64-unknown-linux-gnu]
+# Optimize codegen scheduling for Cortex-A72 (RK3576 big core; also covers Pi4
+# and mid-range edge ARM). ARMv8.0-A baseline — enables no new instructions, so
+# binaries still run fine on A53/A76/Neoverse/Jetson, just not schedule-optimal
+# for those. Server release builds run natively on ubuntu-22.04-arm, so this
+# applies to the shipped aarch64 binary automatically. x86_64/dev builds unaffected.
+rustflags = ["-C", "target-cpu=cortex-a72"]
+
 [build]
 # Use parallel compilation (8 cores for now, can be increased)
 jobs = 8
@@ -58,13 +75,13 @@ retry = 10
 [alias]
 # Quick commands for faster development
 q = "check --workspace"
-qc = "check -p neomind-core"
-qa = "check -p neomind-api"
-qd = "check -p neomind-devices"
-ql = "check -p neomind-llm"
-qag = "check -p neomind-agent"
-tc = "test -p neomind-core --lib"
-ta = "test -p neomind-agent --lib"
+qc = "check -p heramind-core"
+qa = "check -p heramind-api"
+qd = "check -p heramind-devices"
+ql = "check -p heramind-llm"
+qag = "check -p heramind-agent"
+tc = "test -p heramind-core --lib"
+ta = "test -p heramind-agent --lib"
 cl = "clean"
 
 # ========== CI/CD Optimizations ==========

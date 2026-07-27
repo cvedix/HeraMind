@@ -26,8 +26,9 @@ pub fn create_router_with_state(state: ServerState) -> Router {
     use crate::handlers::{
         agents, auth as auth_handlers, auth_users, automations, basic, capabilities, config,
         dashboards, data, data_push, devices, events, extension_stream, extensions,
-        frontend_components, images, instances, llm_backends, memory, message_channels, messages,
-        mqtt, onboarding, rules, sessions, settings, setup, skills, stats, suggestions, tools,
+        frontend_components, images, instances, llm_backends, logs, memory, message_channels,
+        messages, mqtt, onboarding, rules, sessions, settings, setup, skills, stats, suggestions,
+        tools,
     };
 
     // Public routes (no authentication required)
@@ -101,11 +102,12 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             "/api/capabilities/:name",
             get(capabilities::get_capability_handler),
         )
+        // Image static files (public — URLs contain device_id + timestamp, effectively
+        // unguessable; dashboard itself requires login; <img> can't authenticate cross-origin)
+        .route("/api/images/*path", get(images::get_image_handler))
         // Tools API (public - static metadata)
         .route("/api/tools", get(tools::list_tools_handler))
         .route("/api/tools/:name", get(tools::get_tool_handler))
-        // Image static files (served from data/images/, content-addressed)
-        .route("/api/images/:filename", get(images::get_image_handler))
         // Extension read-only routes (metadata, health, assets)
         .route(
             "/api/extensions/:id",
@@ -161,6 +163,10 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         .route(
             "/api/extensions/market/:id",
             get(extensions::get_marketplace_extension_handler),
+        )
+        .route(
+            "/api/extensions/market/:id/readme",
+            get(extensions::get_marketplace_extension_readme_handler),
         )
         .route(
             "/api/extensions/market/updates",
@@ -278,6 +284,9 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             get(data::list_all_data_sources_handler),
         )
         .route("/api/stats/system", get(stats::get_system_stats_handler))
+        // Diagnostic log archive download (admin/auth-only) — bundles
+        // data/logs/*.log.* into a zip for support flows.
+        .route("/api/logs/download", get(logs::download_logs_handler))
         // Webhook URL lookup — admin/UI helper, not for devices. Moved here from
         // public_routes to stop leaking device existence (404 vs 200) and the
         // configured HERAMIND_SERVER_URL to unauthenticated callers.
@@ -941,6 +950,10 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             post(dashboards::set_default_dashboard_handler),
         )
         .route(
+            "/api/dashboards/:id/duplicate",
+            post(dashboards::duplicate_dashboard_handler),
+        )
+        .route(
             "/api/dashboards/templates",
             get(dashboards::list_templates_handler),
         )
@@ -1160,7 +1173,13 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         // Apply global body limit to these routes
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             MAX_REQUEST_BODY_SIZE,
-        ));
+        ))
+        // Match DefaultBodyLimit to RequestBodyLimitLayer so the Json/Bytes
+        // extractors accept the same payload size. Without this, axum's
+        // default 2MB DefaultBodyLimit silently rejects large POST bodies
+        // (e.g. base64 images sent to extension command endpoints) with 413,
+        // even though RequestBodyLimitLayer allows 10MB.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_SIZE));
 
     // Combine all routes - extension_upload_routes has its own larger limit
     let router = router

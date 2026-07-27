@@ -22,10 +22,13 @@ use serde_json::json;
 use crate::handlers::common::{ok, HandlerResult};
 use crate::handlers::devices::models::TimeRangeQuery;
 use crate::models::error::ErrorResponse;
+use crate::server::types::MAX_EXTENSION_DOWNLOAD_SIZE;
 use crate::server::ServerState;
+use futures::StreamExt;
 use heramind_core::datasource::DataSourceId;
 use heramind_core::extension::{MetricDataType, ParameterDefinition};
 use heramind_storage::{ExtensionRecord, ExtensionStore};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Validate an extension ID to prevent path traversal in filesystem operations.
 /// Extension IDs are kebab-case identifiers (e.g. "weather-forecast-v2").
@@ -2074,6 +2077,48 @@ pub async fn get_marketplace_extension_handler(
     ok(metadata)
 }
 
+/// Response for the README fetch — `content` is `null` when the README
+/// doesn't exist (README is optional, so a missing one is not an error).
+#[derive(Debug, serde::Serialize)]
+pub struct ExtensionReadmeResponse {
+    pub content: Option<String>,
+}
+
+/// GET /api/extensions/market/:id/readme
+///
+/// Fetch the README.md content for a specific extension from the marketplace.
+/// Returns `{ content: null }` when the README does not exist or the fetch
+/// fails — README is optional, so this best-effort endpoint never reports a
+/// hard error (the frontend just hides the README section).
+pub async fn get_marketplace_extension_readme_handler(
+    State(_state): State<ServerState>,
+    Path(id): Path<String>,
+) -> HandlerResult<ExtensionReadmeResponse> {
+    let readme_url = format!(
+        "{}/{}/extensions/{}/README.md",
+        MARKET_BASE_URL, MARKET_BRANCH, id
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to build HTTP client: {}", e)))?;
+
+    let response = client
+        .get(&readme_url)
+        .header("User-Agent", "HeraMind-Extension-Marketplace")
+        .send()
+        .await;
+
+    // README missing (or transient fetch failure) is normal → content: null.
+    let content = match response {
+        Ok(r) if r.status().is_success() => r.text().await.ok(),
+        _ => None,
+    };
+
+    ok(ExtensionReadmeResponse { content })
+}
+
 /// Detect current platform for extension download
 /// Returns platform string in hyphen format (e.g., "darwin-aarch64")
 /// This matches the format used in marketplace metadata `builds` keys
@@ -2121,12 +2166,129 @@ fn detect_platform() -> &'static str {
     }
 }
 
+/// Select the best marketplace `builds` key for the current platform + variant.
+///
+/// Candidate order: variant-specific key(s) → base platform → `wasm` (universal).
+/// Returns the first key present in `available_keys`, or `None` if nothing matches.
+///
+/// Pure function (no I/O) so it can be unit-tested without network/state.
+/// Caller (marketplace install) is responsible for the "unknown platform" guard
+/// and for producing a user-facing error when this returns `None`.
+fn select_build_key(
+    available_keys: &std::collections::HashSet<&str>,
+    base_platform: &str,
+    variant: heramind_core::extension::accel::Variant,
+) -> Option<String> {
+    let mut candidates = heramind_core::extension::accel::fallback_keys(base_platform, variant);
+    candidates.push("wasm".to_string());
+    candidates
+        .into_iter()
+        .find(|k| available_keys.contains(k.as_str()))
+}
+
 /// Compute SHA256 checksum of file content
+/// RAII guard that removes a path when dropped (best-effort). Used to make
+/// sure a downloaded temp file is cleaned up on every exit path (success,
+/// error, panic) without a manual `remove_file` at each return.
+struct AutoRemove(std::path::PathBuf);
+impl Drop for AutoRemove {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Stream a reqwest response body to a temp file, enforcing a max size.
+/// Returns the temp file path. Size is enforced via Content-Length (when
+/// reported) AND a running byte counter during streaming (defends against
+/// wrong/missing Content-Length headers). Never buffers the whole body in
+/// memory — each chunk is written and dropped. Caller owns the returned
+/// path and is responsible for removing it (typically via [`AutoRemove`]).
+async fn download_to_temp_file(
+    response: reqwest::Response,
+    max_size: u64,
+    label: &str,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(len) = response.content_length() {
+        if len > max_size {
+            return Err(format!(
+                "Package too large: {} bytes reported (max {} bytes)",
+                len, max_size
+            ));
+        }
+    }
+    let tmp_path = std::env::temp_dir().join(format!(
+        "heramind-{}-{}-{}.tmp",
+        label,
+        std::process::id(),
+        tmp_counter()
+    ));
+    let mut file = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    let mut stream = response.bytes_stream();
+    let mut total: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            // Clean up the partial temp file on stream error.
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("Download stream error: {}", e)
+        })?;
+        total += chunk.len() as u64;
+        if total > max_size {
+            drop(file);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(format!(
+                "Package exceeded max size of {} bytes during download (got {})",
+                max_size, total
+            ));
+        }
+        file.write_all(&chunk).await.map_err(|e| {
+            // Clean up the partial temp file on write failure (disk full,
+            // quota, perms) — the chunk-error and oversize paths already
+            // do this; without it a failed install leaks up to max_size bytes.
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("Failed to write temp file: {}", e)
+        })?;
+    }
+    file.flush().await.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("Failed to flush temp file: {}", e)
+    })?;
+    tracing::info!("Downloaded {} bytes to {}", total, tmp_path.display());
+    Ok(tmp_path)
+}
+
+/// Monotonic counter for unique temp file names across concurrent installs.
+fn tmp_counter() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static C: AtomicU64 = AtomicU64::new(0);
+    C.fetch_add(1, Ordering::SeqCst)
+}
+
 fn compute_sha256(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+/// Stream-hash a file's contents for SHA256 verification without buffering
+/// the whole file in memory. Used by the download path to verify large
+/// binaries (ORT libs, model blobs) that were streamed to a temp file.
+fn compute_sha256_of_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut hasher = Sha256::new();
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// POST /api/extensions/market/install
@@ -2199,18 +2361,39 @@ pub async fn install_marketplace_extension_handler(
         }
     };
 
-    // Detect platform
+    // Detect platform + hardware variant (jetson/cuda/cpu) so jetson/cuda
+    // installs download the accelerated .nep build, not the plain CPU one.
+    // Mirrors the legacy binary branch below (which already uses select_build_key);
+    // the .nep branch previously skipped variant selection entirely.
     let platform = detect_platform();
+    let variant = heramind_core::extension::accel::detect_variant();
 
     // Build platform-specific .nep package URL from builds metadata
     // The package_url field in metadata is hardcoded to darwin_aarch64, so we ignore it
     // and use the correct URL from builds for the current platform
-    let package_url = if platform != "unknown" {
-        // Get the URL directly from builds for this platform
-        // builds keys use hyphen format (windows-x86_64), same as detect_platform()
-        metadata.builds.get(platform).map(|b| b.url.clone())
+    let (package_url, expected_sha256): (Option<String>, Option<String>) = if platform != "unknown"
+    {
+        let available_keys: std::collections::HashSet<&str> =
+            metadata.builds.keys().map(|s| s.as_str()).collect();
+        select_build_key(&available_keys, platform, variant)
+            .and_then(|key| {
+                metadata.builds.get(key.as_str()).map(|b| {
+                    (
+                        Some(b.url.clone()),
+                        if b.sha256.is_empty() {
+                            None
+                        } else {
+                            Some(b.sha256.clone())
+                        },
+                    )
+                })
+            })
+            .unwrap_or((None, None))
     } else {
-        metadata.package_url.clone()
+        (
+            metadata.package_url.clone(),
+            metadata.package_sha256.clone(),
+        )
     };
 
     // Check if .nep package is available (preferred method)
@@ -2255,28 +2438,37 @@ pub async fn install_marketplace_extension_handler(
             });
         }
 
-        let package_bytes = match package_response.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                return ok(MarketplaceInstallResponse {
-                    success: false,
-                    extension_id: req.id.clone(),
-                    downloaded: false,
-                    installed: false,
-                    path: None,
-                    error: Some(format!("Failed to read package data: {}", e)),
-                });
-            }
-        };
+        // Stream the package body to a temp file (never buffer the whole
+        // .nep in memory — large ML model bundles would OOM). The temp file
+        // is cleaned up via _guard on every exit path.
+        let tmp_path =
+            match download_to_temp_file(package_response, MAX_EXTENSION_DOWNLOAD_SIZE, &req.id)
+                .await
+            {
+                Ok(p) => p,
+                Err(msg) => {
+                    return ok(MarketplaceInstallResponse {
+                        success: false,
+                        extension_id: req.id.clone(),
+                        downloaded: false,
+                        installed: false,
+                        path: None,
+                        error: Some(msg),
+                    });
+                }
+            };
+        let _guard = AutoRemove(tmp_path.clone());
 
-        // Verify it's a valid ZIP file
-        let zip_magic: &[u8] = &[0x50, 0x4B, 0x03, 0x04];
-        let zip_empty: &[u8] = &[0x50, 0x4B, 0x05, 0x06];
-        let zip_spanned: &[u8] = &[0x50, 0x4B, 0x07, 0x08];
-
-        let is_zip = package_bytes.starts_with(zip_magic)
-            || package_bytes.starts_with(zip_empty)
-            || package_bytes.starts_with(zip_spanned);
+        // Verify it's a valid ZIP file by reading only the magic bytes from
+        // the temp file (don't load the whole package to check 4 bytes).
+        let mut magic_buf = [0u8; 4];
+        if let Ok(mut magic_file) = tokio::fs::File::open(&tmp_path).await {
+            // read_exact errors (file < 4 bytes) → magic_buf stays partial/zero → not a zip.
+            let _ = magic_file.read_exact(&mut magic_buf).await;
+        }
+        let is_zip = magic_buf == [0x50, 0x4B, 0x03, 0x04]
+            || magic_buf == [0x50, 0x4B, 0x05, 0x06]
+            || magic_buf == [0x50, 0x4B, 0x07, 0x08];
 
         if !is_zip {
             return ok(MarketplaceInstallResponse {
@@ -2289,21 +2481,53 @@ pub async fn install_marketplace_extension_handler(
             });
         }
 
+        // Verify SHA256 when the marketplace metadata provides one. Defends
+        // against CDN/transport corruption or a swapped package being loaded
+        // into the process via dlopen. The legacy binary branch already does
+        // this; the .nep branch previously only checked the 4-byte ZIP magic.
+        if let Some(ref expected) = expected_sha256 {
+            match compute_sha256_of_file(&tmp_path) {
+                Ok(actual) if actual == *expected => {
+                    tracing::debug!(extension_id = %req.id, "Package SHA256 verified");
+                }
+                Ok(actual) => {
+                    return ok(MarketplaceInstallResponse {
+                        success: false,
+                        extension_id: req.id.clone(),
+                        downloaded: true,
+                        installed: false,
+                        path: None,
+                        error: Some(format!(
+                            "Package SHA256 mismatch: expected {}, got {} — refusing to install",
+                            expected, actual
+                        )),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        extension_id = %req.id,
+                        error = %e,
+                        "Failed to compute package SHA256; skipping verification"
+                    );
+                }
+            }
+        }
+
         // Prepare target directory
         let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
         let target_dir = PathBuf::from(data_dir).join("extensions");
 
-        // Install the package
-        let package_bytes_clone = package_bytes.to_vec();
+        // Install from the temp file — streams the ZIP from disk, not memory.
+        // (install_from_file reads manifest + validates internally, so the old
+        // from_bytes() pre-check is redundant and dropped.)
+        let tmp_path_clone = tmp_path.clone();
         let target_dir_clone = target_dir.clone();
         let install_result = tokio::task::spawn_blocking(move || {
             use heramind_core::extension::package::ExtensionPackage;
-            // First validate the package
-            let _package = ExtensionPackage::from_bytes(package_bytes_clone.clone())?;
-            // Then install using the sync method
-            ExtensionPackage::install_sync(&package_bytes_clone, &target_dir_clone)
+            ExtensionPackage::install_from_file(&tmp_path_clone, &target_dir_clone)
         })
         .await;
+        // _guard drops here on early return / end of scope → removes tmp_path.
 
         match install_result {
             Ok(Ok(result)) => {
@@ -2412,14 +2636,12 @@ pub async fn install_marketplace_extension_handler(
             }),
         }
     } else {
-        // Fall back to platform-specific binary download
-        // Check if this is a WASM extension (works on all platforms)
-        let is_wasm = metadata.builds.contains_key("wasm");
-        let build_key = if is_wasm { "wasm" } else { platform };
+        // Fall back to platform-specific binary download with variant fallback.
+        // Variant chain (via accel): e.g. Jetson → linux-aarch64-jetson → linux-aarch64 → wasm.
+        let variant = heramind_core::extension::accel::detect_variant();
 
-        if is_wasm && platform == "unknown" {
-            // WASM extensions don't need platform detection
-        } else if !is_wasm && platform == "unknown" {
+        // "unknown" platform is only acceptable for pure-WASM extensions.
+        if platform == "unknown" && !metadata.builds.contains_key("wasm") {
             return ok(MarketplaceInstallResponse {
                 success: false,
                 extension_id: req.id,
@@ -2430,10 +2652,29 @@ pub async fn install_marketplace_extension_handler(
             });
         }
 
-        // Get build info for this platform/WASM
-        let build = metadata.builds.get(build_key).ok_or_else(|| {
-            ErrorResponse::bad_request(format!("No build available for platform: {}", platform))
+        let available_keys: std::collections::HashSet<&str> =
+            metadata.builds.keys().map(|s| s.as_str()).collect();
+        let build_key = select_build_key(&available_keys, platform, variant).ok_or_else(|| {
+            ErrorResponse::bad_request(format!(
+                "No compatible build for {} (variant={:?}); available builds: {:?}",
+                platform,
+                variant,
+                metadata.builds.keys().collect::<Vec<_>>()
+            ))
         })?;
+
+        // Get build info for the selected platform/variant/WASM.
+        // SAFE: select_build_key only returns a key present in `available_keys`,
+        // which we built from metadata.builds.keys() — so .get() is guaranteed Some.
+        // (If select_build_key is ever refactored to emit keys NOT derived from
+        // available_keys, this invariant breaks — keep it subset-bound.)
+        let build = metadata
+            .builds
+            .get(build_key.as_str())
+            .expect("select_build_key invariant: returned key must exist in metadata.builds");
+
+        // Determine if this is a WASM build for file extension logic (used later)
+        let is_wasm = build_key == "wasm";
 
         // Download the extension binary
         tracing::info!("Downloading extension {} from {}", req.id, build.url);
@@ -2455,14 +2696,19 @@ pub async fn install_marketplace_extension_handler(
             });
         }
 
-        let bytes = download_response
-            .bytes()
-            .await
-            .map_err(|e| ErrorResponse::internal(format!("Failed to read download: {}", e)))?;
+        // Stream the binary to a temp file (don't buffer large ORT/model
+        // blobs in memory). _guard removes the temp file on every exit path.
+        let tmp_path =
+            download_to_temp_file(download_response, MAX_EXTENSION_DOWNLOAD_SIZE, &req.id)
+                .await
+                .map_err(ErrorResponse::internal)?;
+        let _guard = AutoRemove(tmp_path.clone());
 
-        // Verify SHA256 if provided
+        // Verify SHA256 if provided — hash the temp file in a streaming fashion.
         if !build.sha256.is_empty() {
-            let checksum = compute_sha256(&bytes);
+            let checksum = compute_sha256_of_file(&tmp_path).map_err(|e| {
+                ErrorResponse::internal(format!("Failed to hash downloaded file: {}", e))
+            })?;
             if checksum != build.sha256 {
                 return ok(MarketplaceInstallResponse {
                     success: false,
@@ -2513,9 +2759,8 @@ pub async fn install_marketplace_extension_handler(
             // WASM: write both .wasm and .json files
             let wasm_path = extensions_dir.join(&wasm_filename);
 
-            std::fs::write(&wasm_path, &bytes).map_err(|e| {
-                ErrorResponse::internal(format!("Failed to write WASM file: {}", e))
-            })?;
+            std::fs::copy(&tmp_path, &wasm_path)
+                .map_err(|e| ErrorResponse::internal(format!("Failed to copy WASM file: {}", e)))?;
 
             // Download and write JSON sidecar
             let json_path = extensions_dir.join(&json_filename);
@@ -2577,8 +2822,8 @@ pub async fn install_marketplace_extension_handler(
             let filename = format!("libheramind_extension_{}{}", req.id, ext);
             let file_path = extensions_dir.join(&filename);
 
-            std::fs::write(&file_path, &bytes).map_err(|e| {
-                ErrorResponse::internal(format!("Failed to write extension file: {}", e))
+            std::fs::copy(&tmp_path, &file_path).map_err(|e| {
+                ErrorResponse::internal(format!("Failed to copy extension file: {}", e))
             })?;
 
             tracing::info!("Extension downloaded to: {:?}", file_path);
@@ -2863,12 +3108,17 @@ pub async fn reload_extension_handler(
                     }
                 }
 
-                // Apply saved config
+                // Apply saved config via the lifecycle `configure()` method.
+                // NOTE: must NOT use `execute_command(id, "configure", cfg)` —
+                // `configure` is a lifecycle method, not a dispatched command,
+                // and is not in any extension's commands list. Doing so fails
+                // with "Command not found: configure" on every reload (see
+                // the analogous hot-reload path at send_config_update above).
+                // The runtime routes send_config_update through the proper
+                // IPC channel (ConfigUpdate) that the runner turns into a
+                // call to `heramind_extension_configure_json`.
                 if let Some(ref cfg) = config {
-                    if let Err(e) = runtime
-                        .execute_command(&metadata.id, "configure", cfg)
-                        .await
-                    {
+                    if let Err(e) = runtime.send_config_update(&metadata.id, cfg).await {
                         tracing::warn!(
                             extension_id = %id,
                             error = %e,
@@ -4112,4 +4362,69 @@ pub async fn get_sync_status_handler(
         "nep_cache_dir": nep_cache_dir.to_string_lossy().to_string(),
         "install_dir": install_dir.to_string_lossy().to_string(),
     }))
+}
+
+#[cfg(test)]
+mod select_build_key_tests {
+    use super::select_build_key;
+    use heramind_core::extension::accel::Variant;
+    use std::collections::HashSet;
+
+    fn keys(v: &[&'static str]) -> HashSet<&'static str> {
+        v.iter().copied().collect()
+    }
+
+    #[test]
+    fn jetson_picks_jetson_build_when_present() {
+        let avail = keys(&["linux-aarch64-jetson", "linux-aarch64"]);
+        assert_eq!(
+            select_build_key(&avail, "linux-aarch64", Variant::Jetson),
+            Some("linux-aarch64-jetson".to_string())
+        );
+    }
+
+    #[test]
+    fn jetson_falls_back_to_plain_when_no_jetson_build() {
+        let avail = keys(&["linux-aarch64"]);
+        assert_eq!(
+            select_build_key(&avail, "linux-aarch64", Variant::Jetson),
+            Some("linux-aarch64".to_string())
+        );
+    }
+
+    #[test]
+    fn cpu_picks_plain_build() {
+        let avail = keys(&["linux-aarch64"]);
+        assert_eq!(
+            select_build_key(&avail, "linux-aarch64", Variant::Cpu),
+            Some("linux-aarch64".to_string())
+        );
+    }
+
+    #[test]
+    fn native_preferred_over_wasm_when_both_present() {
+        let avail = keys(&["linux-aarch64", "wasm"]);
+        assert_eq!(
+            select_build_key(&avail, "linux-aarch64", Variant::Jetson),
+            Some("linux-aarch64".to_string())
+        );
+    }
+
+    #[test]
+    fn wasm_picked_for_pure_wasm_extension() {
+        let avail = keys(&["wasm"]);
+        assert_eq!(
+            select_build_key(&avail, "linux-aarch64", Variant::Cpu),
+            Some("wasm".to_string())
+        );
+    }
+
+    #[test]
+    fn no_match_returns_none() {
+        let avail = keys(&["windows-x86_64"]);
+        assert_eq!(
+            select_build_key(&avail, "linux-aarch64", Variant::Jetson),
+            None
+        );
+    }
 }

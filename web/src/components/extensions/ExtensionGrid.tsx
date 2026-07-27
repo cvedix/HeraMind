@@ -321,7 +321,7 @@ export function ExtensionGrid({
                 <span className={cn(
                   "inline-flex items-center justify-center min-w-[18px] h-[16px] px-1 rounded text-[10px] font-semibold tabular-nums",
                   isSelected
-                    ? "bg-primary-foreground/20 text-primary-foreground"
+                    ? "bg-white/20 text-primary-foreground"
                     : "bg-muted text-muted-foreground"
                 )}>
                   {count}

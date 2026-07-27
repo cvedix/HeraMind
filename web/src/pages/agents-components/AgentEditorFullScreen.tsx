@@ -2394,7 +2394,7 @@ function ResourceSelectionDialog({
         <div className="flex-1 overflow-y-auto">
           {/* Recommendations */}
           {recommendations.length > 0 && (
-            <div className="px-4 py-3 border-b bg-muted shrink-0">
+            <div className="px-4 py-3 border-b shrink-0">
               <div className="flex items-center gap-2 mb-2">
                 <Sparkles className="h-4 w-4 text-primary" />
                 <span className="text-sm font-medium">{tAgent('creator.resources.dialog.recommended')}</span>
@@ -2538,7 +2538,7 @@ function ResourceSelectionDialog({
         <div className="flex-1 overflow-hidden flex flex-col min-h-0">
           {/* Recommendations */}
           {recommendations.length > 0 && (
-            <div className="px-5 py-3 border-b bg-muted shrink-0">
+            <div className="px-5 py-3 border-b shrink-0">
               <div className="flex items-center gap-2 mb-2">
                 <Sparkles className="h-4 w-4 text-primary" />
                 <span className="text-sm font-medium">{tAgent('creator.resources.dialog.recommended')}</span>

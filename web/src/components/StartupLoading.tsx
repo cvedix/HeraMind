@@ -83,7 +83,10 @@ export function StartupLoading({ onReady }: { onReady: () => void }) {
         // If still not ready after polling, wait for the backend-ready event
         // with a generous timeout. In Tauri mode, the Rust side emits
         // "backend-ready" once port 9375 is accepting connections, so the
-        // actual wait is only as long as the backend needs to start.
+        // actual wait is only as long as the backend needs to start. 30s
+        // accommodates a slow first boot (background-services init can take
+        // ~28s); switchInstance pre-validates reachability so a DEAD backend
+        // fails fast there, not here.
         timeoutId = setTimeout(() => {
                     setStatus("timeout")
           onReady()

@@ -32,6 +32,12 @@ zip = "2.1"
 # CLI
 clap = { workspace = true }
 
+# Jemalloc global allocator (Linux only) — glibc malloc arena fragmentation
+# causes RSS to climb 4-6 GB over days. macOS/Windows don't use glibc so
+# they're unaffected. tikv-jemalloc-sys doesn't compile on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"

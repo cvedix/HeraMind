@@ -1,10 +1,10 @@
 [package]
 name = "heramind-tauri"
-version = "0.9.1"
+version = "0.9.11"
 description = "HeraMind Edge AI Platform"
 authors = ["HeraMind Team"]
 license = "MIT"
-repository = "https://github.com/camthink-ai/HeraMind"
+repository = "https://github.com/cvedix/HeraMind"
 edition = "2021"
 
 [build-dependencies]

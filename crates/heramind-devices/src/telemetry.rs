@@ -73,6 +73,12 @@ impl DataPoint {
                 }
             }
             Value::String(s) => {
+                // Image URLs are stored as plain strings — don't base64 decode.
+                // Explicit guard (don't rely on base64-decode failure for URLs).
+                // Format: /api/images/<device>/<metric>/<ts>.<ext>
+                if s.starts_with("/api/images/") {
+                    return Some(MetricValue::String(s.clone()));
+                }
                 // Try to decode as base64 first (for binary data)
                 if let Ok(decoded) = BASE64.decode(s) {
                     // Check if it looks like valid binary (not just a regular string that happens to be valid base64)
