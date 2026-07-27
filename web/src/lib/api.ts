@@ -1141,6 +1141,58 @@ export const api = {
   getSystemStats: () => fetchAPI<{ version: string; uptime: number; platform: string; arch: string; cpu_count: number; total_memory: number; used_memory: number; free_memory: number; available_memory: number; gpus: Array<{ name: string; vendor: string; total_memory_mb: number | null; driver_version: string | null }> }>('/stats/system'),
   getRuleStats: () => fetchAPI<{ stats: { total_rules: number; enabled_rules: number; disabled_rules: number; by_type: Record<string, number> } }>('/stats/rules'),
 
+  /**
+   * Download a ZIP archive of `heramind.log.*` files for diagnostic / support
+   * flows. Triggers a browser download via blob URL.
+   *
+   * @param days Optional time-window filter. `1` = today only, `7` = last 7
+   *   days, `30` = last 30 days. `undefined`/`0` = all time (default).
+   * @returns the filename suggested by the server, or a fallback default.
+   */
+  downloadLogs: async (days?: number): Promise<{ filename: string; bytes: number }> => {
+    const headers: Record<string, string> = {}
+    const token = tokenManager.getToken()
+    if (token) headers['Authorization'] = `Bearer ${token}`
+    const apiKey = getApiKey()
+    if (apiKey) headers['X-API-Key'] = apiKey
+
+    const query = days && days > 0 ? `?days=${encodeURIComponent(days)}` : ''
+    const response = await fetch(`${getApiBase()}/logs/download${query}`, { headers })
+    if (!response.ok) {
+      // Parse structured error JSON instead of dumping raw body to the toast —
+      // matches `downloadMqttCaCert` pattern and avoids leaking backend
+      // internals (file paths, stack traces) into user-visible notifications.
+      try {
+        const body = await response.json()
+        const message =
+          body?.error?.message || body?.message || `Failed to download logs (${response.status})`
+        throw new Error(message)
+      } catch (e) {
+        if (e instanceof Error) throw e
+        throw new Error(`Failed to download logs (${response.status})`)
+      }
+    }
+
+    // Parse filename from Content-Disposition; fall back to timestamped default.
+    const cd = response.headers.get('content-disposition') || ''
+    const match = cd.match(/filename="?([^";]+)"?/i)
+    const filename = match?.[1] || `heramind-logs-${new Date().toISOString().slice(0, 10)}.zip`
+
+    const blob = await response.blob()
+    // Trigger browser download via object URL.
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    // Defer revoke so Safari has time to start the download.
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+
+    return { filename, bytes: blob.size }
+  },
+
   // ========== Rules API ==========
   listRules: (params?: {
     enabled?: boolean
@@ -2126,6 +2178,15 @@ export const api = {
   deleteDashboard: (id: string) =>
     fetchAPI<{ ok: boolean }>(`/dashboards/${id}`, {
       method: 'DELETE',
+    }),
+
+  /**
+   * Duplicate a dashboard
+   * POST /api/dashboards/:id/duplicate
+   */
+  duplicateDashboard: (id: string) =>
+    fetchAPI<DashboardResponse>(`/dashboards/${id}/duplicate`, {
+      method: 'POST',
     }),
 
   /**

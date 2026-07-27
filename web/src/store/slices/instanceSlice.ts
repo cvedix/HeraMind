@@ -376,6 +376,13 @@ export const createInstanceSlice: StateCreator<
       ? (getFullApiKey(id) || '') // from add/edit flow
       : ''
 
+    // Show the switch overlay immediately — on every page, including login —
+    // so the user sees "Connecting to {name}..." during the validation below.
+    // (Local + remote-no-apikey paths previously didn't set 'switching' until
+    // after validation, and reload fired immediately after, so the overlay
+    // never painted — the login page looked frozen.)
+    set({ switchingState: 'switching', switchingError: null })
+
     // For remote instances with API key: validate the key before switching
     if (!targetInstance.is_local && fullApiKey) {
       set({ switchingState: 'switching', switchingError: null })
@@ -410,6 +417,31 @@ export const createInstanceSlice: StateCreator<
           set({
             switchingState: 'error',
             switchingError: `Cannot reach ${targetInstance.url}. Please check the address.`,
+          })
+          return
+        }
+      } catch {
+        set({
+          switchingState: 'error',
+          switchingError: 'unreachable',
+        })
+        return
+      }
+    } else {
+      // Local instance — verify the app's own backend is running BEFORE
+      // committing the switch. Without this, a crashed local backend (e.g.
+      // the rustls startup panic) sent the user through window.location.reload()
+      // and then made them wait the full StartupLoading timeout (was 30s)
+      // before failing. Fail fast instead.
+      try {
+        const localUrl = (targetInstance.url || 'http://localhost:9375').replace(/\/+$/, '')
+        const res = await fetch(`${localUrl}/api/setup/status`, {
+          signal: AbortSignal.timeout(5000),
+        })
+        if (!res.ok) {
+          set({
+            switchingState: 'error',
+            switchingError: 'Local backend not running. Please restart the app.',
           })
           return
         }

@@ -5,6 +5,7 @@
 
 import type { Device } from '@/types'
 import { findDevice, buildDeviceMap } from '@/lib/deviceUtils'
+import { getServerOrigin } from '@/lib/api'
 
 // Re-export for backward compatibility
 export { findDevice, buildDeviceMap }
@@ -181,7 +182,7 @@ export function isImageData(p: unknown): boolean {
     const val = (o.value ?? o.v) as string | undefined
     if (typeof val === 'string') {
       return val.startsWith('data:image/') || val.startsWith('data:base64,') ||
-             val.startsWith('http') || val.length > 2000
+             val.startsWith('http') || val.startsWith('/api/images/') || val.length > 2000
     }
   }
   if ('data' in o && typeof o.data === 'string' && o.data.length > 100) return true
@@ -209,10 +210,21 @@ export function base64ToDataUrl(raw: string): string {
   return `data:${mime};base64,${raw}`
 }
 
-/** Pre-normalize raw base64 to data URL for image sources. No-op for non-base64. */
+/** Pre-normalize image values for display.
+ *  - /api/images/ URLs → prepend server origin (cross-origin img src needs full URL)
+ *  - Raw base64 → data URL
+ *  - Everything else → unchanged
+ */
 export function normalizeImageValue(value: unknown): unknown {
-  if (typeof value === 'string' && value.length > 100 && !value.startsWith('data:') && !value.startsWith('http')) {
-    return base64ToDataUrl(value)
+  if (typeof value === 'string') {
+    // API image URL — prepend server origin so <img src> works cross-origin (Tauri dev)
+    if (value.startsWith('/api/images/')) {
+      return getServerOrigin() + value
+    }
+    // Raw base64 → data URL (backward compat for old telemetry data)
+    if (value.length > 100 && !value.startsWith('data:') && !value.startsWith('http')) {
+      return base64ToDataUrl(value)
+    }
   }
   return value
 }

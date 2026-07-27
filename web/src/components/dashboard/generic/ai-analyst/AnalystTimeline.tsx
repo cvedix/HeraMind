@@ -1,4 +1,5 @@
 import { useRef, useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { CircleDot } from 'lucide-react'
 import { AnalystMessageBubble } from './AnalystMessageBubble'
@@ -12,17 +13,19 @@ interface AnalystTimelineProps {
 }
 
 export function AnalystTimeline({ messages, streamingContent, streamingMsgId, contextWindowSize }: AnalystTimelineProps) {
-  const bottomRef = useRef<HTMLDivElement>(null)
+  const { t } = useTranslation('dashboardComponents')
   const viewportRef = useRef<HTMLDivElement>(null)
 
-  // Auto-scroll to bottom on new messages (smart: only if near bottom)
+  // Auto-scroll to bottom on new messages (smart: only if near bottom).
+  // IMPORTANT: do NOT use element.scrollIntoView() — it scrolls ALL ancestor
+  // scroll containers (including the dashboard page itself), causing the whole
+  // page to jump. Manually set scrollTop on the ScrollArea viewport only.
   useEffect(() => {
     const el = viewportRef.current
-    if (el) {
-      const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100
-      if (isNearBottom) {
-        bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-      }
+    if (!el) return
+    const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100
+    if (isNearBottom) {
+      el.scrollTop = el.scrollHeight
     }
   }, [messages, streamingContent])
 
@@ -33,7 +36,7 @@ export function AnalystTimeline({ messages, streamingContent, streamingMsgId, co
     return (
       <div className="flex flex-col items-center justify-center py-8 text-center h-full">
         <CircleDot className="h-8 w-8 text-muted-foreground opacity-30 mb-2" />
-        <p className="text-xs text-muted-foreground">No activity yet</p>
+        <p className="text-xs text-muted-foreground">{t('aiAnalyst.noActivity')}</p>
       </div>
     )
   }
@@ -60,7 +63,6 @@ export function AnalystTimeline({ messages, streamingContent, streamingMsgId, co
             streamingContent={streamingContent}
           />
         )}
-        <div ref={bottomRef} />
       </div>
     </ScrollArea>
   )

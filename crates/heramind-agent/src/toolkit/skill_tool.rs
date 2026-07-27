@@ -323,3 +323,67 @@ When to load a skill:
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::SkillRegistry;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    /// Guard against drift between the hardcoded "Available skill IDs" list in
+    /// SkillTool::description() and the builtin skills actually loaded by the
+    /// registry. The description is the agent's startup view of which skills
+    /// exist; if it goes stale the agent won't know to load a new skill.
+    ///
+    /// When adding/removing a builtin skill, update BOTH:
+    ///   - crates/heramind-agent/src/skills/registry.rs (the `include_str!` list)
+    ///   - this file's `description()` "Available skill IDs" section
+    #[test]
+    fn description_skill_ids_match_registry_builtins() {
+        // load_all(None) loads builtins only (no data_dir → no user skills),
+        // which is exactly what description() advertises.
+        let registry = SkillRegistry::load_all(None);
+        let registry_ids: HashSet<String> = registry
+            .list()
+            .iter()
+            .map(|s| s.metadata.id.clone())
+            .collect();
+
+        let tool = SkillTool::new(Arc::new(RwLock::new(registry)));
+        let desc = tool.description();
+
+        // Parse the "- <id>: <desc>" bullets under "Available skill IDs".
+        let mut listed_ids: HashSet<String> = HashSet::new();
+        let mut in_section = false;
+        for line in desc.lines() {
+            if line.starts_with("Available skill IDs") {
+                in_section = true;
+                continue;
+            }
+            if in_section {
+                if let Some(rest) = line.strip_prefix("- ") {
+                    if let Some(id) = rest.split(':').next() {
+                        let id = id.trim();
+                        if !id.is_empty() {
+                            listed_ids.insert(id.to_string());
+                        }
+                    }
+                } else if !listed_ids.is_empty() {
+                    break; // first non-bullet line ends the section
+                }
+            }
+        }
+
+        assert_eq!(
+            registry_ids, listed_ids,
+            "skill_tool description 'Available skill IDs' drifted from registry builtins.\n\
+             registry builtins: {:#?}\n\
+             description lists: {:#?}\n\
+             Fix: when adding/removing a builtin skill, update BOTH \
+             skills/registry.rs (include_str!) AND skill_tool.rs description().",
+            registry_ids, listed_ids
+        );
+    }
+}

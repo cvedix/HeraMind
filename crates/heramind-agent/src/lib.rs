@@ -46,6 +46,7 @@ pub mod prompts;
 pub mod session;
 pub mod skills;
 pub mod smart_conversation;
+pub mod testing_helpers;
 pub mod toolkit;
 pub mod tools;
 

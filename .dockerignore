@@ -1,7 +1,11 @@
-# Build artifacts
-target/
+# Build artifacts — **/target/ catches nested Rust caches too. Plain `target/`
+# only matched the workspace root, so web/src-tauri/target (~22GB, the Tauri
+# desktop build cache) leaked into `COPY web/` and crashed the build (EIO).
+**/target/
+**/*.rs.bk
 web/node_modules/
 web/dist/
+web/src-tauri/gen/
 
 # Runtime data
 data/

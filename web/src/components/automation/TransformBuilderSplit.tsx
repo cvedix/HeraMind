@@ -1407,7 +1407,7 @@ export function TransformBuilder({
       <span
         className={cn(
           "inline-block w-2 h-2 rounded-full",
-          enabled ? "bg-success" : "bg-muted-foreground/40"
+          enabled ? "bg-success" : "bg-muted-foreground"
         )}
       />
       <span className="text-xs text-muted-foreground">

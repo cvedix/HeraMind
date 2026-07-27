@@ -1530,7 +1530,8 @@ pub async fn update_agent(
 
     // Reschedule the agent if schedule changed or if agent is active (interval/cron type)
     // This ensures scheduled agents pick up the new schedule
-    if has_schedule_update || agent.schedule.schedule_type != heramind_storage::ScheduleType::Event {
+    if has_schedule_update || agent.schedule.schedule_type != heramind_storage::ScheduleType::Event
+    {
         if let Ok(manager) = state.get_or_init_agent_manager().await {
             // First unschedule the old schedule
             let _ = manager.scheduler().unschedule_agent(&agent.id).await;

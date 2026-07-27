@@ -41,6 +41,19 @@ impl Default for RetryConfig {
     }
 }
 
+/// Output shape for a batched payload.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchFormat {
+    /// Flat list: `{ batch, count, items: [{source_id, value, timestamp}, ...] }`.
+    #[default]
+    Flat,
+    /// Nested by source: `{ batch, format, count, timestamp, data: {type: {id: {field: value}}} }`.
+    /// Field paths (e.g. `values.devName`) are split on `.` to rebuild nesting,
+    /// reversing the flattening applied at ingestion (`unified_extractor`).
+    Nested,
+}
+
 /// Batch/aggregation configuration for push delivery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchConfig {
@@ -52,6 +65,9 @@ pub struct BatchConfig {
     /// Default: 1000ms.
     #[serde(default = "default_batch_interval_ms")]
     pub batch_interval_ms: u64,
+    /// Output shape of the batch payload (flat list vs nested by source).
+    #[serde(default)]
+    pub format: BatchFormat,
 }
 
 fn default_batch_size() -> usize {
@@ -67,6 +83,7 @@ impl Default for BatchConfig {
         Self {
             batch_size: default_batch_size(),
             batch_interval_ms: default_batch_interval_ms(),
+            format: BatchFormat::default(),
         }
     }
 }
@@ -111,9 +128,19 @@ impl DataSourceFilter {
         if self.source_patterns.is_empty() {
             return true;
         }
-        self.source_patterns
-            .iter()
-            .any(|pattern| source_id.starts_with(pattern) || source_id == pattern)
+        self.source_patterns.iter().any(|pattern| {
+            if pattern == "*" {
+                return true;
+            }
+            // Trailing wildcard: "device:sensor:*" matches "device:sensor:temperature".
+            // Without this the literal '*' fails starts_with and the filter
+            // silently matches nothing — a very common user/AI expectation.
+            if let Some(prefix) = pattern.strip_suffix('*') {
+                source_id.starts_with(prefix)
+            } else {
+                source_id.starts_with(pattern) || source_id == pattern
+            }
+        })
     }
 }
 
@@ -170,7 +197,6 @@ pub struct TemplateContext {
     pub source_id: String,
     pub value: serde_json::Value,
     pub timestamp: i64,
-    pub metadata: Option<serde_json::Value>,
 }
 
 /// Aggregated statistics for push targets.
@@ -219,5 +245,25 @@ mod tests {
             only_changes: false,
         };
         assert!(filter.matches("anything"));
+    }
+
+    #[test]
+    fn test_data_source_filter_trailing_wildcard() {
+        // "device:sensor1:*" must match all fields under that device — the '*'
+        // is a wildcard, not a literal. Regression for the bug where push
+        // silently matched nothing because starts_with("...:*") failed.
+        let filter = DataSourceFilter {
+            source_patterns: vec!["device:sensor1:*".to_string()],
+            only_changes: false,
+        };
+        assert!(filter.matches("device:sensor1:temperature"));
+        assert!(filter.matches("device:sensor1:humidity"));
+        assert!(!filter.matches("device:sensor2:temperature"));
+        // Bare "*" matches everything.
+        let all = DataSourceFilter {
+            source_patterns: vec!["*".to_string()],
+            only_changes: false,
+        };
+        assert!(all.matches("anything"));
     }
 }

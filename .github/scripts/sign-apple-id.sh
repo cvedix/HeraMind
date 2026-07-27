@@ -49,7 +49,7 @@ log_info "找到 DMG: $DMG_PATH"
 log_info "签名应用..."
 
 # 挂载 DMG
-MOUNT_DIR=$(hdiutil attach "$DMG_PATH" -readonly -mountpoint /tmp/neomind-dmg -readwrite 2>/dev/null | grep "/Volumes" | awk "{print \$3}")
+MOUNT_DIR=$(hdiutil attach "$DMG_PATH" -readonly -mountpoint /tmp/heramind-dmg -readwrite 2>/dev/null | grep "/Volumes" | awk "{print \$3}")
 
 if [ -z "$MOUNT_DIR" ]; then
     log_warn "无法挂载 DMG，跳过签名"

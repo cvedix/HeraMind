@@ -7,14 +7,15 @@
 //! ## Persistence
 //!
 //! The registry supports optional disk persistence using redb storage:
-//! ```rust,no_run
+//! ```no_run
 //! use heramind_devices::DeviceRegistry;
-//!
-//! // Create registry with persistence
-//! let registry = DeviceRegistry::with_persistence("./data/devices.redb").await?;
-//!
-//! // Or create in-memory registry
-//! let registry = DeviceRegistry::new();
+//! # async fn _doc() -> Result<(), Box<dyn std::error::Error>> {
+//! // With persistence (async — requires a runtime)
+//! let _registry = DeviceRegistry::with_persistence("./data/devices.redb").await?;
+//! // In-memory (synchronous)
+//! let _in_memory = DeviceRegistry::new();
+//! # Ok(())
+//! # }
 //! ```
 
 use dashmap::DashMap;
@@ -185,6 +186,12 @@ pub struct DeviceTypeTemplate {
     /// overrides it. `None` = use the global default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_offline_timeout_secs: Option<u64>,
+    /// If `Some(false)`, skip storing the `_raw` metric (full payload snapshot)
+    /// for devices of this type. `None` (default) = inherit the extractor's
+    /// `store_raw` config. Set `Some(false)` for large-payload devices (e.g.
+    /// cameras) whose structured metrics already cover all fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_raw: Option<bool>,
 }
 
 impl DeviceTypeTemplate {
@@ -200,6 +207,7 @@ impl DeviceTypeTemplate {
             uplink_samples: Vec::new(),
             commands: Vec::new(),
             default_offline_timeout_secs: None,
+            store_raw: None,
         }
     }
 
@@ -553,6 +561,7 @@ impl DeviceRegistry {
                     })
                     .collect(),
                 default_offline_timeout_secs: storage_template.default_offline_timeout_secs,
+                store_raw: storage_template.store_raw,
             };
 
             self.templates
@@ -706,6 +715,7 @@ impl DeviceRegistry {
                     })
                     .collect(),
                 default_offline_timeout_secs: template.default_offline_timeout_secs,
+                store_raw: template.store_raw,
                 builtin_version: None,
             };
             store
@@ -842,6 +852,7 @@ impl DeviceRegistry {
                 })
                 .collect(),
             default_offline_timeout_secs: template.default_offline_timeout_secs,
+            store_raw: template.store_raw,
             builtin_version: None,
         };
 

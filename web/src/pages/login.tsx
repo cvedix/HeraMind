@@ -13,6 +13,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { BrandLogoHorizontal } from "@/components/shared/BrandName"
+import { HoneycombBackground } from "@/components/shared/HoneycombBackground"
 import { LoadingState } from "@/components/shared/LoadingState"
 import { forceViewportReset } from "@/hooks/useVisualViewport"
 import { textNano } from '@/design-system/tokens/typography'
@@ -91,12 +92,55 @@ export function LoginPage() {
   const [showInstancePicker, setShowInstancePicker] = useState(false)
 
   const cachedInstances = getCachedInstances()
+  const [instanceStatuses, setInstanceStatuses] = useState<Record<string, string>>({})
+
+  // Live health-check each backend when the picker opens, so the list shows
+  // online/offline status (like InstanceManagerDialog on the home page).
+  useEffect(() => {
+    if (!showInstancePicker) return
+    const instances = getCachedInstances()
+    setInstanceStatuses(Object.fromEntries(instances.map(i => [i.id, 'checking'])))
+    instances.forEach(async (inst) => {
+      const base = inst.is_local ? 'http://localhost:9375' : inst.url.replace(/\/+$/, '')
+      try {
+        const res = await fetch(`${base}/api/setup/status`, { signal: AbortSignal.timeout(4000) })
+        setInstanceStatuses(prev => ({ ...prev, [inst.id]: res.ok ? 'online' : 'offline' }))
+      } catch {
+        setInstanceStatuses(prev => ({ ...prev, [inst.id]: 'offline' }))
+      }
+    })
+  }, [showInstancePicker])
   const apiBase = getApiBase()
   const isRemote = !!(apiBase && apiBase !== '/api' && !apiBase.includes('localhost') && !apiBase.includes('127.0.0.1'))
 
   // Handle instance switch — use encrypted_key from backend
-  const handleInstanceSwitch = (instance: CachedInstance) => {
+  const handleInstanceSwitch = async (instance: CachedInstance) => {
     const fullKey = instance.encrypted_key ? decryptApiKey(instance.encrypted_key) : ''
+    useStore.setState({
+      switchingState: 'switching',
+      switchingError: null,
+      currentInstanceId: instance.id,
+    })
+    // Pre-validate the target backend BEFORE touching localStorage or reloading.
+    // If it's down/non-existent, error + revert INSTANTLY (no reload, no 30s
+    // StartupLoading wait) — the user stays on the current instance and sees
+    // the error/revert overlay. Only reload if the backend is actually
+    // reachable. A dead backend (e.g. connection refused) fails in <100ms.
+    try {
+      const base = instance.is_local ? 'http://localhost:9375' : instance.url.replace(/\/+$/, '')
+      const res = await fetch(`${base}/api/setup/status`, { signal: AbortSignal.timeout(3000) })
+      if (!res.ok) {
+        useStore.setState({ switchingState: 'error', switchingError: 'unreachable' })
+        return
+      }
+    } catch {
+      useStore.setState({ switchingState: 'error', switchingError: 'unreachable' })
+      return
+    }
+    // Only close the picker + reload once the backend is confirmed reachable.
+    // If pre-validation failed above, the picker stays open UNDER the error
+    // overlay, so "Return" brings the user back to the picker (not the login form).
+    setShowInstancePicker(false)
     localStorage.setItem(CURRENT_INSTANCE_KEY, instance.id)
     localStorage.setItem(PENDING_SWITCH_KEY, JSON.stringify({
       targetId: instance.id,
@@ -263,7 +307,7 @@ export function LoginPage() {
               return (
                 <button
                   key={inst.id}
-                  onClick={() => { setShowInstancePicker(false); handleInstanceSwitch(inst) }}
+                  onClick={() => handleInstanceSwitch(inst)}
                   className={`w-full flex items-center gap-4 p-4 rounded-xl bg-bg-50 border transition-colors text-left ${
                     isCurrent ? 'border-primary' : 'border-border hover:border-primary'
                   }`}
@@ -273,6 +317,13 @@ export function LoginPage() {
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="font-medium truncate flex items-center gap-2">
+                      {instanceStatuses[inst.id] && (
+                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                          instanceStatuses[inst.id] === 'online' ? 'bg-success'
+                          : instanceStatuses[inst.id] === 'offline' ? 'bg-destructive'
+                          : 'bg-muted-foreground'
+                        }`} />
+                      )}
                       {inst.is_local ? t('instances:localBackend') : inst.name}
                       {isCurrent && (
                         <span className={`inline-flex items-center gap-0.5 ${textNano} font-medium px-1.5 py-0.5 rounded-full bg-primary-light text-primary`}>
@@ -308,21 +359,14 @@ export function LoginPage() {
       <div className="fixed inset-0">
         {/* Base gradient */}
         <div className="absolute inset-0 bg-gradient-to-br from-background via-background to-muted" />
-        {/* Subtle dot grid texture */}
-        <div className="absolute inset-0" style={{
-          backgroundImage: 'radial-gradient(circle, color-mix(in oklch, var(--foreground) 8%, transparent) 1px, transparent 1px)',
-          backgroundSize: '32px 32px'
-        }} />
-        {/* Two restrained ambient glows — neutral violet/indigo, easier to
-            live with at scale than the saturated brand orange. Echoes the
-            app's aurora-bg palette. */}
+        {/* Honeycomb mesh — shared component. Pointy-top tight tiling,
+            HeraMind blue, ripple-from-center breathe. Mask fades edges. */}
+        <HoneycombBackground />
+        {/* One soft brand glow — restrained, just enough warmth to avoid
+            feeling flat. Brand blue ties to the logo. */}
         <div
-          className="absolute top-[12%] left-[8%] w-[28rem] h-[28rem] rounded-full blur-3xl"
-          style={{ background: 'color-mix(in oklch, var(--accent-indigo) 12%, transparent)' }}
-        />
-        <div
-          className="absolute bottom-[14%] right-[10%] w-[26rem] h-[26rem] rounded-full blur-3xl opacity-70"
-          style={{ background: 'color-mix(in oklch, var(--accent-purple) 10%, transparent)' }}
+          className="absolute top-[28%] left-1/2 -translate-x-1/2 w-[42rem] h-[42rem] rounded-full blur-3xl"
+          style={{ background: 'color-mix(in oklch, var(--accent-blue) 8%, transparent)' }}
         />
       </div>
 
@@ -380,7 +424,13 @@ export function LoginPage() {
         }}
       >
         <div className="w-full max-w-md">
-          <div className="bg-bg-50 backdrop-blur-md rounded-lg p-6 sm:p-8">
+          <div
+            className="backdrop-blur-xl rounded-2xl p-6 sm:p-8 border shadow-md animate-fade-in-up"
+            style={{
+              backgroundColor: 'color-mix(in oklch, var(--background) 72%, transparent)',
+              borderColor: 'color-mix(in oklch, var(--border) 55%, transparent)',
+            }}
+          >
             <h2 className="text-2xl sm:text-3xl font-semibold mb-4 sm:mb-6 text-center">{t('auth:login')}</h2>
             <form onSubmit={handleSubmit} className="flex flex-col gap-4 sm:gap-5">
               <div className="relative">

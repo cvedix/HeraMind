@@ -93,7 +93,7 @@ export function BindingDataSourceSelector({
             />
           </div>
 
-          <DialogFooter className="px-5 py-3 border-t shrink-0 bg-background">
+          <DialogFooter className="px-5 py-3 border-t shrink-0">
             <Button variant="outline" onClick={handleCancel}>
               {t('bindingSelector.cancel')}
             </Button>

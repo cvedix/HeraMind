@@ -358,7 +358,7 @@ export function getPieChartSchema(config: any, ctx: SchemaContext, u: Updaters):
                         value={config.innerRadius || '60%'}
                         onChange={(e) => updateConfig('innerRadius')(e.target.value)}
                         placeholder="60% or 60"
-                        className="w-full h-9 px-3 rounded-md border border-input bg-background text-sm"
+                        className="w-full h-9 px-3 rounded-md border border-input bg-card text-sm"
                       />
                     </Field>
                   )}
@@ -370,7 +370,7 @@ export function getPieChartSchema(config: any, ctx: SchemaContext, u: Updaters):
                       value={config.outerRadius || '80%'}
                       onChange={(e) => updateConfig('outerRadius')(e.target.value)}
                       placeholder="80% or 80"
-                      className="w-full h-9 px-3 rounded-md border border-input bg-background text-sm"
+                      className="w-full h-9 px-3 rounded-md border border-input bg-card text-sm"
                     />
                   </Field>
                 </div>

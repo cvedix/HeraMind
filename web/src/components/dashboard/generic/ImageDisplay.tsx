@@ -179,18 +179,25 @@ export const ImageDisplay = memo(function ImageDisplay({
   const imageRef = useRef<HTMLImageElement>(null)
   const prevDisplaySrcRef = useRef<string | undefined>()
 
-  // Update load state when src / loading changes
+  // Update load state when src / loading changes.
+  // For real-time WS push updates (HTTP→HTTP src change): DON'T show loading spinner.
+  // Keep showing the old image until the new one loads (like NE101 Camera pattern).
+  // Only show loading on initial load (no previous image) or API fetch loading.
   useEffect(() => {
     const srcChanged = displaySrc !== prevDisplaySrcRef.current
+    const wasHttp = prevDisplaySrcRef.current?.startsWith('http')
     if (displaySrc) prevDisplaySrcRef.current = displaySrc
 
     if (!hasDataSource) {
       setImageLoadState('no-source')
-    } else if (loading) {
+    } else if (loading && !displaySrc) {
+      // Only show loading if we have NO image yet (initial load)
       setImageLoadState('loading')
     } else if (!hasValidSource) {
       setImageLoadState('no-source')
-    } else if (srcChanged) {
+    } else if (srcChanged && !wasHttp) {
+      // Show loading only for base64→URL or no-source→source transitions.
+      // Skip for HTTP→HTTP (real-time WS push with URL storage).
       setImageLoadState('loading')
     }
   }, [displaySrc, loading, hasValidSource, hasDataSource])

@@ -46,7 +46,7 @@
     "format.excel": "Excel (.xlsx)",
     "format.zip": "ZIP (.zip)",
     "format.auto": "Auto-detect",
-    "format.autoDesc": "Excel or ZIP based on content",
+    "format.autoDesc": "CSV or ZIP based on content",
     "binaryWarning": "Binary data export is partially supported — actual file contents may not be available.",
     "success": "Download complete — saved to your downloads folder",
     "format": {

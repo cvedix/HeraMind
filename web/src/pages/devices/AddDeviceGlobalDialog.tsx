@@ -850,7 +850,7 @@ function ManualAddForm({
                   'w-9 h-9 rounded-lg flex items-center justify-center',
                   bg
                 )}>
-                  <AdapterIcon className={cn('h-4.5 w-4.5', color)} />
+                  <AdapterIcon className={cn('h-4 w-4', color)} />
                 </div>
                 <div className="min-w-0">
                   <span className={cn(

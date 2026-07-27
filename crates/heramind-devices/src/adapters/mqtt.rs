@@ -20,6 +20,7 @@
 //! ```
 
 use crate::adapter::{AdapterError, AdapterResult, ConnectionStatus, DeviceAdapter, DeviceEvent};
+use crate::image_storage::save_image_binary;
 use crate::mdl::MetricValue;
 use crate::mqtt::MqttConfig;
 use crate::protocol::ProtocolMapping;
@@ -34,6 +35,7 @@ use heramind_core::EventBus;
 use heramind_core::HeraMindEvent;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -172,6 +174,8 @@ pub struct MqttAdapter {
     outbound_command_topics: Arc<RwLock<HashSet<String>>>,
     /// Unified data extractor
     extractor: Arc<UnifiedExtractor>,
+    /// Data directory for image storage (runtime, not config)
+    data_dir: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl MqttAdapter {
@@ -197,6 +201,7 @@ impl MqttAdapter {
             topic_to_device: Arc::new(RwLock::new(HashMap::new())),
             outbound_command_topics: Arc::new(RwLock::new(HashSet::new())),
             extractor,
+            data_dir: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -232,6 +237,14 @@ impl MqttAdapter {
         *self.device_registry.write().await = registry;
     }
 
+    /// Set the data directory for image storage.
+    pub fn set_data_dir(&self, data_dir: PathBuf) {
+        let data_dir_arc = self.data_dir.clone();
+        tokio::spawn(async move {
+            *data_dir_arc.write().await = Some(data_dir);
+        });
+    }
+
     /// Create a new MQTT adapter with a protocol mapping.
     pub fn with_mapping(
         config: MqttAdapterConfig,
@@ -258,6 +271,7 @@ impl MqttAdapter {
             topic_to_device: Arc::new(RwLock::new(HashMap::new())),
             outbound_command_topics: Arc::new(RwLock::new(HashSet::new())),
             extractor,
+            data_dir: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -296,6 +310,22 @@ impl MqttAdapter {
         let mut subscribed_count = 0u32;
         for device in &devices {
             if let Some(ref telemetry_topic) = device.connection_config.telemetry_topic {
+                // Skip if already covered by an existing subscription (e.g. "#"
+                // on the internal broker) — re-subscribing would make rumqttc
+                // deliver each message twice, duplicating every metric.
+                let covered = subscribed_topics
+                    .read()
+                    .await
+                    .iter()
+                    .any(|existing| topic_filter_covers(existing, telemetry_topic));
+                if covered {
+                    debug!(
+                        "Device telemetry topic '{}' already covered on broker {}, skipping re-subscribe",
+                        telemetry_topic, broker_id
+                    );
+                    continue;
+                }
+
                 debug!(
                     "Re-subscribing to device telemetry topic '{}' for broker '{}' (device '{}')",
                     telemetry_topic, broker_id, device.device_id
@@ -309,7 +339,10 @@ impl MqttAdapter {
                         telemetry_topic, broker_id, e
                     );
                 } else {
-                    subscribed_topics.write().await.insert(telemetry_topic.clone());
+                    subscribed_topics
+                        .write()
+                        .await
+                        .insert(telemetry_topic.clone());
                     subscribed_count += 1;
                 }
             }
@@ -547,6 +580,7 @@ impl MqttAdapter {
         let extractor = self.extractor.clone();
         let topic_to_device = self.topic_to_device.clone();
         let outbound_command_topics = self.outbound_command_topics.clone();
+        let data_dir_clone = self.data_dir.clone();
 
         info!(
             "Starting event loop task for broker '{}', connecting to {}...",
@@ -584,6 +618,7 @@ impl MqttAdapter {
                             &extractor,
                             &topic_to_device,
                             &outbound_command_topics,
+                            data_dir_clone.read().await.as_ref(),
                         )
                         .await;
                     }
@@ -618,15 +653,7 @@ impl MqttAdapter {
         // and devices publishing to custom topics (e.g. "ne101/abc") are never seen.
         // add_broker_with_tls (external brokers) takes subscribe_topics as an explicit
         // parameter and is unaffected.
-        let mut initial_topics = vec![
-            "device/+/+/uplink".to_string(),
-            "device/+/+/downlink".to_string(),
-        ];
-        for topic in &self.config.subscribe_topics {
-            if !initial_topics.contains(topic) {
-                initial_topics.push(topic.clone());
-            }
-        }
+        let initial_topics = normalized_initial_subscription_topics(&self.config.subscribe_topics);
 
         // Bug 5: track subscription success so a total failure surfaces as an error
         // instead of silently marking the broker as "connected".
@@ -638,14 +665,20 @@ impl MqttAdapter {
                 "Attempting to subscribe to topic '{}' on broker '{}'...",
                 topic, broker_id
             );
-            if let Err(e) = client_for_sub.subscribe(topic, rumqttc::QoS::AtLeastOnce).await {
+            if let Err(e) = client_for_sub
+                .subscribe(topic, rumqttc::QoS::AtLeastOnce)
+                .await
+            {
                 warn!(
                     "Failed to subscribe to {} on broker {}: {}",
                     topic, broker_id, e
                 );
             } else {
                 success_count += 1;
-                subscribed_topics_for_sub.write().await.insert(topic.clone());
+                subscribed_topics_for_sub
+                    .write()
+                    .await
+                    .insert(topic.clone());
                 info!(
                     "Successfully subscribed to topic '{}' on broker '{}'",
                     topic, broker_id
@@ -837,6 +870,7 @@ impl MqttAdapter {
         let extractor = self.extractor.clone();
         let topic_to_device = self.topic_to_device.clone();
         let outbound_command_topics = self.outbound_command_topics.clone();
+        let data_dir_clone = self.data_dir.clone();
 
         let (eventloop_tx, eventloop_rx) = async_channel::unbounded();
         let event_tx_clone = event_tx.clone();
@@ -859,6 +893,7 @@ impl MqttAdapter {
                             &extractor,
                             &topic_to_device,
                             &outbound_command_topics,
+                            data_dir_clone.read().await.as_ref(),
                         )
                         .await;
                     }
@@ -918,13 +953,7 @@ impl MqttAdapter {
         // self.config.subscribe_topics loop was removed (the API handler already sets
         // config.subscribe_topics from the same broker data, so adding it twice
         // caused rumqttc to receive duplicate SUBSCRIBE requests).
-        let mut initial_topics = vec![
-            "device/+/+/uplink".to_string(),
-            "device/+/+/downlink".to_string(),
-        ];
-        for topic in &subscribe_topics {
-            initial_topics.push(topic.clone());
-        }
+        let initial_topics = normalized_initial_subscription_topics(&subscribe_topics);
 
         // Bug 5: track subscription success so a total failure surfaces as an error
         // instead of silently marking the broker as "connected".
@@ -936,14 +965,20 @@ impl MqttAdapter {
                 "Attempting to subscribe to topic '{}' on broker '{}'...",
                 topic, broker_id
             );
-            if let Err(e) = client_for_sub.subscribe(topic, rumqttc::QoS::AtLeastOnce).await {
+            if let Err(e) = client_for_sub
+                .subscribe(topic, rumqttc::QoS::AtLeastOnce)
+                .await
+            {
                 warn!(
                     "Failed to subscribe to {} on broker {}: {}",
                     topic, broker_id, e
                 );
             } else {
                 success_count += 1;
-                subscribed_topics_for_sub.write().await.insert(topic.clone());
+                subscribed_topics_for_sub
+                    .write()
+                    .await
+                    .insert(topic.clone());
                 info!(
                     "Successfully subscribed to topic '{}' on broker '{}'",
                     topic, broker_id
@@ -1405,9 +1440,7 @@ impl DeviceAdapter for MqttAdapter {
                 .connection_config
                 .telemetry_topic
                 .clone()
-                .unwrap_or_else(|| {
-                    format!("device/{}/{}/uplink", device.device_type, device_id)
-                });
+                .unwrap_or_else(|| format!("device/{}/{}/uplink", device.device_type, device_id));
             self.subscribe_topic(&topic).await?;
             info!(
                 "Subscribed to device {} telemetry topic: {}",
@@ -1511,6 +1544,27 @@ impl MqttAdapter {
                 continue;
             }
 
+            // Skip if an existing subscription already covers this topic. The
+            // internal broker subscribes to "#", so a per-device
+            // "device/.../uplink" is fully redundant — and worse, rumqttc
+            // delivers each matching message once PER subscription (twice here),
+            // duplicating every metric. Mirrors the overlap-dedup the initial
+            // topic list gets via normalized_initial_subscription_topics.
+            let covered = inner
+                .subscribed_topics
+                .read()
+                .await
+                .iter()
+                .any(|existing| topic_filter_covers(existing, topic));
+            if covered {
+                debug!(
+                    "Topic '{}' already covered by an existing subscription on broker {}, skipping to avoid duplicate delivery",
+                    topic, broker_id
+                );
+                subscribed_count += 1;
+                continue;
+            }
+
             match inner
                 .client
                 .subscribe(topic, rumqttc::QoS::AtLeastOnce)
@@ -1578,6 +1632,64 @@ impl MqttAdapter {
         Ok(())
     }
 
+    /// Convert image data (Binary or base64 String) to URL if applicable.
+    pub fn convert_binary_to_url(
+        device_id: &str,
+        metric_name: &str,
+        timestamp: i64,
+        value: MetricValue,
+        data_dir: Option<&PathBuf>,
+    ) -> MetricValue {
+        match value {
+            MetricValue::Binary(bytes) => {
+                if let Some(dir) = data_dir {
+                    match save_image_binary(device_id, metric_name, timestamp, &bytes, dir) {
+                        Ok(url) => {
+                            debug!(
+                                "Saved binary image for {}/{} -> {}",
+                                device_id, metric_name, url
+                            );
+                            MetricValue::String(url)
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to save binary image for {}/{}: {}",
+                                device_id, metric_name, e
+                            );
+                            MetricValue::Binary(bytes)
+                        }
+                    }
+                } else {
+                    MetricValue::Binary(bytes)
+                }
+            }
+            MetricValue::String(s) => {
+                // MQTT JSON payloads carry images as base64 strings — detect and convert
+                if let Some(bytes) = crate::image_storage::try_decode_base64_image(&s) {
+                    if let Some(dir) = data_dir {
+                        match save_image_binary(device_id, metric_name, timestamp, &bytes, dir) {
+                            Ok(url) => {
+                                debug!(
+                                    "Saved string image for {}/{} -> {}",
+                                    device_id, metric_name, url
+                                );
+                                return MetricValue::String(url);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to save string image for {}/{}: {}",
+                                    device_id, metric_name, e
+                                );
+                            }
+                        }
+                    }
+                }
+                MetricValue::String(s)
+            }
+            other => other,
+        }
+    }
+
     /// Handle MQTT notification from a specific broker.
     /// This is a static method that processes incoming messages.
     async fn handle_mqtt_notification(
@@ -1596,6 +1708,7 @@ impl MqttAdapter {
         extractor: &Arc<UnifiedExtractor>,
         topic_to_device: &Arc<RwLock<HashMap<String, String>>>,
         outbound_command_topics: &Arc<RwLock<HashSet<String>>>,
+        data_dir: Option<&PathBuf>,
     ) {
         match notification {
             rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish)) => {
@@ -1625,9 +1738,7 @@ impl MqttAdapter {
                 // the adapter's own bridge connection) to avoid firing phantom
                 // transport events for our own session.
                 if topic.starts_with("$SYS/brokers/") {
-                    if let Some((sys_client_id, is_online)) =
-                        parse_sys_presence_topic(&topic)
-                    {
+                    if let Some((sys_client_id, is_online)) = parse_sys_presence_topic(&topic) {
                         if sys_client_id.starts_with("heramind-") {
                             debug!(
                                 "Skipping $SYS presence for internal client '{}'",
@@ -1723,20 +1834,29 @@ impl MqttAdapter {
 
                                 // Emit all extracted metrics
                                 for metric in result.metrics {
+                                    // Convert Binary to URL before storage + event bus (fork point)
+                                    let value = Self::convert_binary_to_url(
+                                        &device_id,
+                                        &metric.name,
+                                        now.timestamp(),
+                                        metric.value.clone(),
+                                        data_dir,
+                                    );
+
                                     // Update metric cache
                                     {
                                         let mut cache = metric_cache.write().await;
-                                        cache.entry(device_id.clone()).or_default().insert(
-                                            metric.name.clone(),
-                                            (metric.value.clone(), now),
-                                        );
+                                        cache
+                                            .entry(device_id.clone())
+                                            .or_default()
+                                            .insert(metric.name.clone(), (value.clone(), now));
                                     }
 
                                     // Store in telemetry storage
                                     if let Some(storage) = telemetry_storage.read().await.as_ref() {
                                         let data_point = crate::telemetry::DataPoint {
                                             timestamp: now.timestamp(),
-                                            value: metric.value.clone(),
+                                            value: value.clone(),
                                             quality: None,
                                         };
                                         if let Err(e) = storage
@@ -1754,7 +1874,7 @@ impl MqttAdapter {
                                         } else {
                                             debug!(
                                                 "Stored metric {} = {:?} for device {}",
-                                                metric.name, metric.value, device_id
+                                                metric.name, value, device_id
                                             );
                                         }
                                     }
@@ -1763,7 +1883,7 @@ impl MqttAdapter {
                                     if let Err(e) = event_tx.send(DeviceEvent::Metric {
                                         device_id: device_id.clone(),
                                         metric: metric.name.clone(),
-                                        value: metric.value.clone(),
+                                        value: value.clone(),
                                         timestamp: now.timestamp(),
                                     }) {
                                         error!(
@@ -1807,6 +1927,15 @@ impl MqttAdapter {
                         if let Ok(value) = MqttAdapter::default_parse_value(&payload) {
                             let metric_name = extract_metric_name_from_topic(&topic)
                                 .unwrap_or_else(|| "value".to_string());
+
+                            // Convert Binary to URL before storage + event bus (fork point)
+                            let value = Self::convert_binary_to_url(
+                                &device_id,
+                                &metric_name,
+                                now.timestamp(),
+                                value,
+                                data_dir,
+                            );
 
                             // Update metric cache
                             {
@@ -1952,20 +2081,29 @@ impl MqttAdapter {
                                 }
 
                                 for metric in result.metrics {
+                                    // Convert Binary to URL before storage + event bus (fork point)
+                                    let value = Self::convert_binary_to_url(
+                                        device_id,
+                                        &metric.name,
+                                        now.timestamp(),
+                                        metric.value.clone(),
+                                        data_dir,
+                                    );
+
                                     // Update metric cache
                                     {
                                         let mut cache = metric_cache.write().await;
-                                        cache.entry(device_id.clone()).or_default().insert(
-                                            metric.name.clone(),
-                                            (metric.value.clone(), now),
-                                        );
+                                        cache
+                                            .entry(device_id.clone())
+                                            .or_default()
+                                            .insert(metric.name.clone(), (value.clone(), now));
                                     }
 
                                     // Store in telemetry storage
                                     if let Some(storage) = telemetry_storage.read().await.as_ref() {
                                         let data_point = crate::telemetry::DataPoint {
                                             timestamp: now.timestamp(),
-                                            value: metric.value.clone(),
+                                            value: value.clone(),
                                             quality: None,
                                         };
                                         if let Err(e) = storage
@@ -1988,7 +2126,7 @@ impl MqttAdapter {
                                     if let Err(e) = event_tx.send(DeviceEvent::Metric {
                                         device_id: device_id.clone(),
                                         metric: metric.name.clone(),
-                                        value: metric.value.clone(),
+                                        value: value.clone(),
                                         timestamp: now.timestamp(),
                                     }) {
                                         error!(
@@ -2001,6 +2139,15 @@ impl MqttAdapter {
                                 // No device type - try simple value extraction
                                 if let Ok(value) = MqttAdapter::default_parse_value(&payload) {
                                     let metric_name = "value";
+
+                                    // Convert Binary to URL before storage + event bus (fork point)
+                                    let value = Self::convert_binary_to_url(
+                                        device_id,
+                                        metric_name,
+                                        now.timestamp(),
+                                        value,
+                                        data_dir,
+                                    );
 
                                     // Update metric cache
                                     {
@@ -2082,7 +2229,10 @@ impl MqttAdapter {
 
                         // Generate a device_id for auto-discovery
                         // Try to extract from topic, or use a hash-based ID
+                        // Sanitize the extracted id (length + charset); fall back to a
+                        // hash-derived id (already safe format) if missing/invalid.
                         let auto_device_id = extract_device_id_from_topic(&topic, config)
+                            .and_then(sanitize_auto_device_id)
                             .unwrap_or_else(|| {
                                 // Use topic hash as device_id
                                 format!("mqtt_{}", {
@@ -2093,6 +2243,18 @@ impl MqttAdapter {
                                     format!("{:x}", hasher.finish())
                                 })
                             });
+
+                        // Bound the discovery sample — a huge payload would be stored
+                        // verbatim as the onboarding sample (audit: no size limit).
+                        if payload.len() > MAX_AUTOONBOARD_SAMPLE_BYTES {
+                            tracing::warn!(
+                                topic = %topic,
+                                size = payload.len(),
+                                limit = MAX_AUTOONBOARD_SAMPLE_BYTES,
+                                "Auto-onboard payload exceeds sample size limit, skipping"
+                            );
+                            return;
+                        }
 
                         // Determine data format and prepare sample
                         // Extract the actual device data from payload.data if it exists
@@ -2210,6 +2372,104 @@ fn parse_sys_presence_topic(topic: &str) -> Option<(String, bool)> {
 }
 
 /// Helper function to extract device ID from topic.
+fn normalized_initial_subscription_topics(configured_topics: &[String]) -> Vec<String> {
+    let topics = [
+        "device/+/+/uplink".to_string(),
+        "device/+/+/downlink".to_string(),
+    ]
+    .into_iter()
+    .chain(configured_topics.iter().cloned());
+
+    normalize_subscription_topics(topics)
+}
+
+fn normalize_subscription_topics<I>(topics: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut normalized: Vec<String> = Vec::new();
+
+    for topic in topics {
+        let topic = topic.trim();
+        if topic.is_empty() {
+            continue;
+        }
+
+        if normalized
+            .iter()
+            .any(|existing| topic_filter_covers(existing, topic))
+        {
+            continue;
+        }
+
+        normalized.retain(|existing| !topic_filter_covers(topic, existing));
+        normalized.push(topic.to_string());
+    }
+
+    normalized
+}
+
+fn topic_filter_covers(covering: &str, covered: &str) -> bool {
+    if covering == covered {
+        return true;
+    }
+
+    // MQTT spec: a root-level wildcard filter ("#", "+/...") never matches a
+    // topic whose first level starts with '$' (e.g. $SYS/...). Such topics
+    // require an explicit "$..." filter. Without this guard, a user's "#"
+    // device subscription would make normalize_subscription_topics treat the
+    // broker's $SYS presence subscriptions as redundant and drop them —
+    // silently breaking external-broker transport online/offline detection.
+    let covering_first = covering.split('/').next().unwrap_or("");
+    let covered_first = covered.split('/').next().unwrap_or("");
+    if covered_first.starts_with('$') && matches!(covering_first, "#" | "+") {
+        return false;
+    }
+
+    let covering_parts: Vec<&str> = covering.split('/').collect();
+    let covered_parts: Vec<&str> = covered.split('/').collect();
+    let mut i = 0usize;
+
+    loop {
+        match covering_parts.get(i).copied() {
+            Some("#") => return i == covering_parts.len() - 1,
+            Some("+") => match covered_parts.get(i).copied() {
+                Some("#") | None => return false,
+                Some(_) => i += 1,
+            },
+            Some(covering_part) => match covered_parts.get(i).copied() {
+                Some("#") | Some("+") | None => return false,
+                Some(covered_part) if covering_part == covered_part => i += 1,
+                Some(_) => return false,
+            },
+            None => return i == covered_parts.len(),
+        }
+    }
+}
+
+/// Max auto-onboard device_id length (extracted from topic; hash fallback is shorter).
+const MAX_AUTOONBOARD_DEVICE_ID_LEN: usize = 128;
+/// Max auto-onboard sample payload size. Bounds memory against malicious/buggy
+/// publishers (audit: sample was unbounded -> OOM). 2 MB lets camera image
+/// payloads through (HeraMind has camera device types) while still capping the
+/// worst case; MQTT brokers also cap packet size independently.
+const MAX_AUTOONBOARD_SAMPLE_BYTES: usize = 2 * 1024 * 1024; // 2 MB
+
+/// Sanitize an auto-onboard device_id extracted from an MQTT topic: keep only
+/// device-id-safe chars (ascii alnum, `-`, `_`, `:`, `.`), cap length. Returns
+/// None if empty/over-length so the caller falls back to a hash-derived id.
+fn sanitize_auto_device_id(id: String) -> Option<String> {
+    let cleaned: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+        .collect();
+    if cleaned.is_empty() || cleaned.len() > MAX_AUTOONBOARD_DEVICE_ID_LEN {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 fn extract_device_id_from_topic(topic: &str, config: &MqttAdapterConfig) -> Option<String> {
     let parts: Vec<&str> = topic.split('/').collect();
 
@@ -2479,6 +2739,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_sanitize_auto_device_id() {
+        // valid id (mixed safe chars) kept verbatim
+        assert_eq!(
+            sanitize_auto_device_id("sensor-01_room.a:b".to_string()).as_deref(),
+            Some("sensor-01_room.a:b")
+        );
+        // unsafe chars (path separators) stripped; '.' kept
+        assert_eq!(
+            sanitize_auto_device_id("dev/../etc".to_string()).as_deref(),
+            Some("dev..etc")
+        );
+        // only-unsafe chars (no alnum/_-:.) -> None (caller falls back to hash)
+        assert_eq!(sanitize_auto_device_id("///".to_string()), None);
+        // empty -> None
+        assert_eq!(sanitize_auto_device_id(String::new()), None);
+        // over-length -> None
+        let long = "a".repeat(MAX_AUTOONBOARD_DEVICE_ID_LEN + 1);
+        assert_eq!(sanitize_auto_device_id(long), None);
+        // exactly at limit -> kept
+        let at = "a".repeat(MAX_AUTOONBOARD_DEVICE_ID_LEN);
+        assert!(sanitize_auto_device_id(at).is_some());
+    }
+
+    #[test]
     fn test_default_parse_value() {
         assert!(matches!(
             MqttAdapter::default_parse_value(b"25.5"),
@@ -2495,6 +2779,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_normalized_initial_topics_removes_topics_covered_by_hash() {
+        let topics = normalized_initial_subscription_topics(&["#".to_string()]);
+        assert_eq!(topics, vec!["#"]);
+    }
+
+    #[test]
+    fn test_normalized_initial_topics_removes_topics_covered_by_device_hash() {
+        let topics = normalized_initial_subscription_topics(&["device/#".to_string()]);
+        assert_eq!(topics, vec!["device/#"]);
+    }
+
+    #[test]
+    fn test_normalized_initial_topics_keeps_uncovered_custom_topics() {
+        let topics = normalized_initial_subscription_topics(&["sensors/+/temperature".to_string()]);
+        assert_eq!(
+            topics,
+            vec![
+                "device/+/+/uplink".to_string(),
+                "device/+/+/downlink".to_string(),
+                "sensors/+/temperature".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_topic_filter_covers_standard_cases() {
+        assert!(topic_filter_covers("#", "device/+/+/uplink"));
+        assert!(topic_filter_covers("device/#", "device/+/+/uplink"));
+        assert!(topic_filter_covers(
+            "device/+/+/uplink",
+            "device/+/+/uplink"
+        ));
+        assert!(!topic_filter_covers("device/+/+/uplink", "device/#"));
+        assert!(topic_filter_covers(
+            "device/+/+/uplink",
+            "device/abc/001/uplink"
+        ));
+        assert!(!topic_filter_covers(
+            "device/abc/001/uplink",
+            "device/+/+/uplink"
+        ));
+    }
+
+    /// MQTT spec: root-level wildcards ("#", "+") must NOT cover `$`-prefixed
+    /// topics (e.g. `$SYS/...`). Otherwise a user's "#" device subscription
+    /// would dedup away the broker `$SYS` presence subscriptions and silently
+    /// break external-broker transport online/offline detection.
+    #[test]
+    fn test_topic_filter_covers_wildcards_skip_dollar_topics() {
+        // Root "#" must not cover a $SYS topic
+        assert!(!topic_filter_covers(
+            "#",
+            "$SYS/brokers/emqx@host/clients/sensor-001/connected"
+        ));
+        // Root "+/..." must not cover a $SYS topic either
+        assert!(!topic_filter_covers("+/brokers", "$SYS/brokers"));
+        // But an explicit "$SYS/..." filter still covers $SYS topics normally
+        assert!(topic_filter_covers(
+            "$SYS/brokers/#",
+            "$SYS/brokers/emqx@host/clients/sensor-001/connected"
+        ));
+        assert!(topic_filter_covers(
+            "$SYS/brokers/+/clients/+/connected",
+            "$SYS/brokers/emqx@host/clients/sensor-001/connected"
+        ));
+        // Non-$ topics are unaffected: "#" still covers device topics
+        assert!(topic_filter_covers("#", "device/abc/001/uplink"));
+    }
+
     /// `$SYS` presence topics are the ONLY `$SYS` shape we synthesize
     /// transport events from. The parser must:
     /// - accept EMQX-style `$SYS/brokers/{node}/clients/{cid}/connected|disconnected`
@@ -2503,18 +2857,16 @@ mod tests {
     #[test]
     fn test_parse_sys_presence_topic_emqx_style() {
         // connected → online=true
-        let (cid, online) = parse_sys_presence_topic(
-            "$SYS/brokers/emqx@10.0.0.1/clients/sensor-001/connected",
-        )
-        .expect("EMQX connected topic must parse");
+        let (cid, online) =
+            parse_sys_presence_topic("$SYS/brokers/emqx@10.0.0.1/clients/sensor-001/connected")
+                .expect("EMQX connected topic must parse");
         assert_eq!(cid, "sensor-001");
         assert!(online);
 
         // disconnected → online=false
-        let (cid, online) = parse_sys_presence_topic(
-            "$SYS/brokers/emqx@10.0.0.1/clients/sensor-001/disconnected",
-        )
-        .expect("EMQX disconnected topic must parse");
+        let (cid, online) =
+            parse_sys_presence_topic("$SYS/brokers/emqx@10.0.0.1/clients/sensor-001/disconnected")
+                .expect("EMQX disconnected topic must parse");
         assert_eq!(cid, "sensor-001");
         assert!(!online);
     }
@@ -2524,15 +2876,9 @@ mod tests {
         // Aggregate stats topic (Mosquitto-style) — not per-client
         assert!(parse_sys_presence_topic("$SYS/broker/clients/connected").is_none());
         // Metrics topic
-        assert!(parse_sys_presence_topic(
-            "$SYS/brokers/emqx@node/metrics/bytes.sent"
-        )
-        .is_none());
+        assert!(parse_sys_presence_topic("$SYS/brokers/emqx@node/metrics/bytes.sent").is_none());
         // Unknown suffix
-        assert!(parse_sys_presence_topic(
-            "$SYS/brokers/emqx@node/clients/cid/kicked"
-        )
-        .is_none());
+        assert!(parse_sys_presence_topic("$SYS/brokers/emqx@node/clients/cid/kicked").is_none());
     }
 
     #[test]
@@ -2540,10 +2886,7 @@ mod tests {
         // Too few segments
         assert!(parse_sys_presence_topic("$SYS/brokers").is_none());
         // Wrong root prefix
-        assert!(parse_sys_presence_topic(
-            "devices/brokers/n/clients/c/connected"
-        )
-        .is_none());
+        assert!(parse_sys_presence_topic("devices/brokers/n/clients/c/connected").is_none());
         // Missing `clients` segment
         assert!(parse_sys_presence_topic("$SYS/brokers/n/sessions/c/connected").is_none());
     }
@@ -2553,14 +2896,11 @@ mod tests {
         // The parser returns the id verbatim; the caller is responsible for
         // filtering `heramind-` prefixed ids (this mirrors the embedded-broker
         // `is_internal_client` convention).
-        let (cid, _) = parse_sys_presence_topic(
-            "$SYS/brokers/n/clients/heramind-external-b1/connected",
-        )
-        .expect("Internal client id still parses; caller filters");
+        let (cid, _) =
+            parse_sys_presence_topic("$SYS/brokers/n/clients/heramind-external-b1/connected")
+                .expect("Internal client id still parses; caller filters");
         assert_eq!(cid, "heramind-external-b1");
     }
-
-
 
     /// Regression: LWT/status broadcast topics must NOT trigger
     /// auto-onboarding. Real-world example from NE301 field deployment:
@@ -2574,7 +2914,9 @@ mod tests {
         // Status-broadcast topics
         assert!(looks_like_non_telemetry_topic("aicam/status/offline"));
         assert!(looks_like_non_telemetry_topic("aicam/status/online"));
-        assert!(looks_like_non_telemetry_topic("homeassistant/status/online"));
+        assert!(looks_like_non_telemetry_topic(
+            "homeassistant/status/online"
+        ));
         assert!(looks_like_non_telemetry_topic("devices/status/connected"));
 
         // Bare LWT signatures
@@ -2583,9 +2925,15 @@ mod tests {
         assert!(looks_like_non_telemetry_topic("dev/abc/will"));
 
         // Real telemetry MUST pass through
-        assert!(!looks_like_non_telemetry_topic("ne301/2A0015/upload/report"));
-        assert!(!looks_like_non_telemetry_topic("device/ne301_camera/2819FD/uplink"));
-        assert!(!looks_like_non_telemetry_topic("sensors/temp-001/temperature"));
+        assert!(!looks_like_non_telemetry_topic(
+            "ne301/2A0015/upload/report"
+        ));
+        assert!(!looks_like_non_telemetry_topic(
+            "device/ne301_camera/2819FD/uplink"
+        ));
+        assert!(!looks_like_non_telemetry_topic(
+            "sensors/temp-001/temperature"
+        ));
         assert!(!looks_like_non_telemetry_topic("stat/deviceid/power"));
     }
 

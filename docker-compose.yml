@@ -17,10 +17,11 @@
 
 services:
   heramind:
+    # Build the branded HeraMind image from this checkout.
+    image: ${HERAMIND_IMAGE:-heramind:latest}
     build:
       context: .
       dockerfile: Dockerfile
-    image: heramind:latest
     container_name: heramind
     restart: unless-stopped
     ports:

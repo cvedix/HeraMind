@@ -1,7 +1,7 @@
 {
   "name": "heramind-web",
   "private": true,
-  "version": "0.9.1",
+  "version": "0.9.11",
   "type": "module",
   "scripts": {
     "dev": "NODE_OPTIONS='--max-http-header-size=65536' vite",
@@ -75,7 +75,6 @@
     "recharts": "^3.7.0",
     "remark-gfm": "^4.0.1",
     "tailwind-merge": "^2.3.0",
-    "xlsx": "^0.18.5",
     "zod": "^4.3.5",
     "zustand": "^4.5.0"
   },

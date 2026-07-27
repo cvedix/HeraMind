@@ -4,6 +4,7 @@
   "description": "CamAI CV301 Edge AI Camera with built-in YOLOv8 Nano object detection model supporting 80-class recognition. Features WiFi connectivity and battery power.",
   "categories": ["Camera", "AI", "Edge Computing"],
   "mode": "full",
+  "store_raw": false,
   "metrics": [
     {
       "name": "metadata.image_id",

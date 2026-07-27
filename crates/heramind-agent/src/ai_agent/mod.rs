@@ -13,7 +13,9 @@
 pub mod executor;
 pub mod scheduler;
 
-use heramind_storage::{AgentExecutionRecord, AgentSchedule, AgentStatus, AiAgent, ExecutionStatus};
+use heramind_storage::{
+    AgentExecutionRecord, AgentSchedule, AgentStatus, AiAgent, ExecutionStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -121,9 +123,11 @@ pub struct AgentExecutionSummary {
 
 impl AiAgentManager {
     /// Create a new AI Agent manager.
-    pub async fn new(config: AgentExecutorConfig) -> Result<Arc<Self>, crate::error::HeraMindError> {
+    pub async fn new(
+        config: AgentExecutorConfig,
+    ) -> Result<Arc<Self>, crate::error::HeraMindError> {
         // Create scheduler first so we can share its backend semaphores with the executor
-        let scheduler_config = SchedulerConfig::default();
+        let scheduler_config = SchedulerConfig::default().with_env_concurrency();
         let scheduler = Arc::new(AgentScheduler::new(scheduler_config).await?);
 
         // Share backend semaphores between scheduler and executor
@@ -284,7 +288,10 @@ impl AiAgentManager {
     }
 
     /// Get an agent by ID.
-    pub async fn get_agent(&self, id: &str) -> Result<Option<AiAgent>, crate::error::HeraMindError> {
+    pub async fn get_agent(
+        &self,
+        id: &str,
+    ) -> Result<Option<AiAgent>, crate::error::HeraMindError> {
         Ok(self.executor.store().get_agent(id).await?)
     }
 

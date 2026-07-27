@@ -218,11 +218,8 @@ export default defineConfig({
             return 'vendor-hls'
           }
 
-          // Heavy export libraries — lazy loaded via dynamic import()
-          if (
-            id.includes('node_modules/xlsx') ||
-            id.includes('node_modules/jszip')
-          ) {
+          // jszip — lazy loaded via dynamic import()
+          if (id.includes('node_modules/jszip')) {
             return 'vendor-export'
           }
 

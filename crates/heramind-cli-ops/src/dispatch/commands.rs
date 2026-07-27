@@ -26,7 +26,9 @@ pub struct Args {
 #[derive(Subcommand, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
-    /// Start the web server.
+    /// Start the web server (API on :9375, swagger at /api/docs).
+    ///
+    /// Example: `heramind serve --port 9375`
     Serve {
         /// Host to bind to.
         #[arg(long, default_value = "0.0.0.0")]
@@ -35,7 +37,9 @@ pub enum Command {
         #[arg(short, long, default_value_t = 9375)]
         port: u16,
     },
-    /// Run a single prompt and exit.
+    /// Run a single prompt and exit (non-interactive).
+    ///
+    /// Example: `heramind prompt "Summarize the latest sensor readings"`
     Prompt {
         /// The prompt to process.
         prompt: String,
@@ -47,20 +51,34 @@ pub enum Command {
         temperature: f32,
     },
     /// Chat mode (interactive REPL with session persistence).
+    ///
+    /// Resume an existing session with --session <ID>.
+    ///
+    /// Example: `heramind chat`
+    /// Example: `heramind chat --session sess-001`
     Chat {
         /// Session ID to resume (optional).
         #[arg(short, long)]
         session: Option<String>,
     },
     /// List available models from Ollama.
+    ///
+    /// Prefer `llm models` for the same result under a clearer namespace.
+    ///
+    /// Example: `heramind list-models --endpoint http://localhost:11434`
     ListModels {
         /// Ollama endpoint.
         #[arg(long, default_value = "http://localhost:11434")]
         endpoint: String,
     },
     /// Check system health and status.
+    ///
+    /// Example: `heramind health`
     Health,
     /// View system logs.
+    ///
+    /// Example: `heramind logs --tail 100 --follow`
+    /// Example: `heramind logs --level ERROR --since 1h`
     Logs {
         /// Number of lines to show (default: 50).
         #[arg(long, default_value_t = 50)]
@@ -76,7 +94,36 @@ pub enum Command {
         since: Option<String>,
     },
     /// Check for updates.
+    ///
+    /// Example: `heramind check-update`
     CheckUpdate,
+    /// Self-upgrade the HeraMind server binary (and web frontend) to the latest
+    /// release. Downloads the host-arch server tarball, verifies its version,
+    /// backs up the current binary, swaps it in, and restarts the systemd
+    /// service if one is running. Linux only.
+    ///
+    /// Examples: `heramind upgrade`, `heramind upgrade --version 0.9.11 --yes`
+    Upgrade {
+        /// Specific version to upgrade to (default: latest release).
+        #[arg(long)]
+        version: Option<String>,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Uninstall HeraMind: stop + disable the systemd service and remove the
+    /// binary + service unit. `--purge` also deletes the data and web dirs.
+    /// Linux only.
+    ///
+    /// Examples: `heramind uninstall`, `heramind uninstall --purge --yes`
+    Uninstall {
+        /// Also remove the data directory and web files.
+        #[arg(long)]
+        purge: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// LLM backend management commands.
     Llm {
         #[command(subcommand)]
@@ -154,6 +201,9 @@ pub enum Command {
     ///
     /// After `heramind login`, the CLI works from any working directory without
     /// needing `HERAMIND_API_KEY`. Mirrors `gh auth login`.
+    ///
+    /// Example: `heramind login`
+    /// Example: `heramind login --data-dir /var/lib/heramind --force`
     Login {
         /// Server data directory (auto-detected if omitted).
         #[arg(long)]
@@ -163,8 +213,14 @@ pub enum Command {
         force: bool,
     },
     /// Remove the locally saved API key credential.
+    ///
+    /// After logout the CLI falls back to HERAMIND_API_KEY env var or fails auth.
+    ///
+    /// Example: `heramind logout`
     Logout,
     /// Show the current API key and validate it against the server.
+    ///
+    /// Example: `heramind whoami`
     Whoami,
 }
 
@@ -214,8 +270,7 @@ pub enum LlmCommand {
     /// Use the ID as --llm-backend value in agent create/update.
     ///
     /// Example: `heramind llm list`
-    List {
-    },
+    List {},
     /// Get LLM backend details.
     ///
     /// Shows full backend config including endpoint, model, and parameters.
@@ -512,17 +567,23 @@ pub enum DeviceCommand {
     },
     /// Get device details (metadata + metrics + commands).
     ///
-    /// Returns full device info: metadata, connection config, all current
-    /// metric values, and available commands. This is the single command for
-    /// deep inspection of a specific device.
+    /// Returns full device info: metadata, connection config, current metric
+    /// values, and available commands. Pass `--metric` to return only that one
+    /// metric's current value — avoids pulling all metrics (e.g. AI-camera
+    /// inference fields) when you want a single reading like battery level.
     ///
     /// Workflow: Use `device list` for overview, then `device get <ID>` for detail.
     ///
     /// Example: `heramind device get device-001`
+    /// Example: `heramind device get device-001 --metric values.battery`
     Get {
         /// Device ID.
         #[arg(required = true)]
         id: String,
+        /// Return only this metric's current value (e.g. `values.battery`).
+        /// Omit to get all metrics.
+        #[arg(long)]
+        metric: Option<String>,
     },
     /// Create a new device.
     ///
@@ -622,6 +683,10 @@ pub enum DeviceCommand {
         /// Use --compress=true to enable or --compress=false to disable.
         #[arg(long)]
         compress: Option<bool>,
+        /// Max data points per metric (API range 1-5000, default 100). Caps
+        /// payload size when you only need recent points.
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Send control command.
     ///
@@ -710,8 +775,7 @@ pub enum DraftCommand {
     ///
     /// Shows all unapproved devices that have sent data but aren't registered yet.
     /// Example: `heramind device drafts list`
-    List {
-    },
+    List {},
     /// Get draft details including sample data.
     ///
     /// Shows the device's auto-detected metrics and recent data samples.
@@ -837,8 +901,7 @@ pub enum DashboardCommand {
     /// Workflow: Use this to find dashboard IDs for get/update/delete/share commands.
     ///
     /// Example: `heramind dashboard list`
-    List {
-    },
+    List {},
     /// Get dashboard details.
     ///
     /// Shows full dashboard config including layout and all widget components.
@@ -1723,12 +1786,28 @@ pub enum PushCommand {
         /// New name.
         #[arg(long)]
         name: Option<String>,
-        /// New config as JSON.
+        /// New target config as JSON (target-specific: webhook url/headers,
+        /// mqtt broker/topic). NOTE: data_filter/schedule/template are NOT
+        /// config — use --sources / --schedule / --template instead.
         #[arg(long)]
         config: Option<String>,
         /// Enable or disable.
         #[arg(long)]
         enabled: Option<bool>,
+        /// Comma-separated source patterns (TOP-LEVEL filter, e.g.
+        /// "device:sensor-001:"). Only matching DataSourceIds are pushed.
+        #[arg(long)]
+        sources: Option<String>,
+        /// Schedule: "event" (real-time) or "interval" (every 60s).
+        #[arg(long)]
+        schedule: Option<String>,
+        /// Handlebars template as a JSON string (transforms each payload).
+        #[arg(long)]
+        template: Option<String>,
+        /// Only push when the value changes. Requires --sources (the whole
+        /// data_filter is replaced, so patterns must be supplied with it).
+        #[arg(long)]
+        only_changes: Option<bool>,
     },
     /// Delete a push target.
     ///
@@ -1815,8 +1894,7 @@ pub enum WidgetCommand {
     ///
     /// Shows widget ID, name, type, and version.
     /// Example: `heramind widget list`
-    List {
-    },
+    List {},
     /// Get widget details.
     ///
     /// Shows widget manifest, config schema, and supported data sources.
@@ -1873,8 +1951,7 @@ pub enum WidgetCommand {
     ///
     /// Shows all widgets available in the marketplace registry.
     /// Example: `heramind widget market-list`
-    MarketList {
-    },
+    MarketList {},
     /// Install widget from marketplace.
     ///
     /// Downloads and installs a widget from the marketplace registry.
@@ -1893,28 +1970,47 @@ pub enum WidgetCommand {
 #[derive(Subcommand, Debug)]
 pub enum SystemCommand {
     /// Show system infrastructure info (MQTT broker, webhook URL, network).
-    Info {
-    },
+    ///
+    /// Returns MQTT broker address, webhook base URL, local IP, and API endpoint.
+    /// Use this to discover connection endpoints for devices and connectors.
+    ///
+    /// Example: `heramind system info`
+    Info {},
 }
 
 /// System settings subcommands (timezone, data retention).
 #[derive(Subcommand, Debug)]
 pub enum SettingsCommand {
     /// Get the current global timezone.
-    Timezone {
-    },
+    ///
+    /// Returns the IANA timezone used for cron schedule evaluation and timestamp display.
+    ///
+    /// Example: `heramind settings timezone`
+    Timezone {},
     /// Set the global timezone (IANA format, e.g. Asia/Shanghai).
+    ///
+    /// Affects cron schedule evaluation and displayed timestamps. Run `settings timezones`
+    /// to see valid values.
+    ///
+    /// Example: `heramind settings set-timezone Asia/Shanghai`
     SetTimezone {
         /// Timezone in IANA format (e.g. "Asia/Shanghai", "UTC").
         #[arg(required = true)]
         timezone: String,
     },
     /// List available timezones.
-    Timezones {
-    },
+    ///
+    /// Shows all IANA timezone identifiers accepted by `settings set-timezone`.
+    ///
+    /// Example: `heramind settings timezones`
+    Timezones {},
     /// Get data retention configuration.
-    Retention {
-    },
+    ///
+    /// Returns whether automatic cleanup is enabled, the cleanup interval, and
+    /// retention limits for telemetry and image data. Change with `settings set-retention`.
+    ///
+    /// Example: `heramind settings retention`
+    Retention {},
     /// Update data retention configuration.
     ///
     /// Controls automatic cleanup of telemetry data in `data/telemetry.redb`.
@@ -1934,8 +2030,13 @@ pub enum SettingsCommand {
         image_retention: Option<u64>,
     },
     /// Trigger a manual data cleanup now.
-    Cleanup {
-    },
+    ///
+    /// Immediately applies retention rules to delete expired telemetry/image data,
+    /// without waiting for the next scheduled cleanup. Review limits with
+    /// `settings retention` first.
+    ///
+    /// Example: `heramind settings cleanup`
+    Cleanup {},
 }
 
 /// Data connector subcommands (MQTT, webhook, HTTP, etc.).
@@ -1945,8 +2046,7 @@ pub enum ConnectorCommand {
     ///
     /// Shows connector ID, name, host, port, type, and connection status.
     /// Example: `heramind connector list`
-    List {
-    },
+    List {},
     /// Get connector details and connection status.
     ///
     /// Shows connection state, subscriptions, and message statistics.
@@ -2072,8 +2172,7 @@ pub enum ConnectorCommand {
     ///
     /// Shows all active topic subscriptions across all connectors.
     /// Example: `heramind connector subscriptions`
-    Subscriptions {
-    },
+    Subscriptions {},
     /// Subscribe to a custom MQTT topic.
     ///
     /// Adds a new topic subscription to the embedded broker.

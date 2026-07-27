@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState, useRef } from "react"
 import { Routes, Route, Navigate, useLocation } from "react-router-dom"
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary"
+import { BrandGradientDef } from "@/components/shared/BrandGradientDef"
 import { useStore } from "@/store"
 import { shallow } from "zustand/shallow"
 import { TopNav } from "@/components/layout/TopNav"
@@ -448,6 +449,7 @@ function App() {
   return (
     <>
       <NavigationProgress />
+      <BrandGradientDef />
       <Suspense fallback={<PageLoading />}>
         <Routes>
           {/* Setup route - protected, only accessible when setup required */}

@@ -170,7 +170,9 @@ impl UnifiedExtractor {
                 let metric_value = self.value_to_metric_value(&value);
                 debug!(
                     "System metric '{}' extracted for device '{}': value_type={}",
-                    sys_key, device_id, metric_value.type_name()
+                    sys_key,
+                    device_id,
+                    metric_value.type_name()
                 );
                 metrics.push(ExtractedMetric {
                     name: sys_key.to_string(),
@@ -180,8 +182,18 @@ impl UnifiedExtractor {
             }
         }
 
-        // Step 1: Always store raw data if configured
-        if self.config.store_raw {
+        // Look up the device-type template ONCE, reused by Step 1 (to honor a
+        // per-type `store_raw` override) and Step 2 (metric extraction).
+        let template = self.device_registry.get_template(device_type);
+
+        // Step 1: Store raw data as `_raw` unless this device type opts out.
+        // Precedence: template.store_raw (Some) > extractor config.store_raw.
+        // `None` inherits the config default — unchanged for existing types.
+        let store_raw = template
+            .as_ref()
+            .and_then(|t| t.store_raw)
+            .unwrap_or(self.config.store_raw);
+        if store_raw {
             let raw_value = self.value_to_metric_value(raw_data);
             metrics.push(ExtractedMetric {
                 name: "_raw".to_string(),
@@ -191,9 +203,7 @@ impl UnifiedExtractor {
             raw_stored = true;
         }
 
-        // Step 2: Try template-driven extraction
-        let template = self.device_registry.get_template(device_type);
-
+        // Step 2: Template-driven metric extraction (template fetched above)
         let mode = if let Some(template) = template {
             // Check if template has defined metrics
             if !template.metrics.is_empty() {
@@ -805,10 +815,7 @@ mod tests {
         // __webhook_image as a regular field, which is fine — it just means
         // the metric is doubly visible). Assert the system metric is present
         // by name.
-        let has_webhook_image = result
-            .metrics
-            .iter()
-            .any(|m| m.name == "__webhook_image");
+        let has_webhook_image = result.metrics.iter().any(|m| m.name == "__webhook_image");
         assert!(
             has_webhook_image,
             "expected __webhook_image system metric in results: {:?}",
@@ -833,10 +840,7 @@ mod tests {
 
         let result = extractor.extract("cam1", "unknown_type", &data).await;
 
-        let has_phantom = result
-            .metrics
-            .iter()
-            .any(|m| m.name == "__webhook_image");
+        let has_phantom = result.metrics.iter().any(|m| m.name == "__webhook_image");
         assert!(
             !has_phantom,
             "phantom __webhook_image metric synthesized when payload did not contain it: {:?}",

@@ -17,7 +17,7 @@
 
 2. **添加 GitHub Secrets**
    
-   访问: https://github.com/camthink-ai/HeraMind/settings/secrets/actions
+   访问: https://github.com/cvedix/HeraMind/settings/secrets/actions
    
    添加以下 Secrets:
    
@@ -60,7 +60,7 @@
 
 3. **添加 GitHub Secrets**
    
-   访问: https://github.com/camthink-ai/HeraMind/settings/secrets/actions
+   访问: https://github.com/cvedix/HeraMind/settings/secrets/actions
    
    | Secret 名称 | 值 | 必填 |
    |------------|-----|------|
@@ -84,7 +84,7 @@ git push origin v0.3.0
 
 ### 方式 2: 手动触发
 
-1. 访问: https://github.com/camthink-ai/HeraMind/actions
+1. 访问: https://github.com/cvedix/HeraMind/actions
 2. 选择「Build and Release」workflow
 3. 点击「Run workflow」
 4. 输入版本号（如 `v0.3.0`）
@@ -95,7 +95,7 @@ git push origin v0.3.0
 
 构建成功后，DMG 文件会自动上传到 GitHub Release:
 
-https://github.com/camthink-ai/HeraMind/releases
+https://github.com/cvedix/HeraMind/releases
 
 ---
 

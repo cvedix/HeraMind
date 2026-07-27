@@ -85,7 +85,20 @@ pub async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
         // last-resort safety net so the update dialog doesn't re-appear on
         // the very version we just installed (the primary guard is the
         // frontend's localStorage marker — see useUpdateCheck.ts).
-        let current_version = app.config().version.clone().unwrap_or_default();
+        //
+        // Use the compile-time version (env!("CARGO_PKG_VERSION")) rather
+        // than app.config().version: the latter can return None/empty in
+        // some Tauri 2.x builds, which makes this comparison always fail
+        // ("" != "<remote>") and the update dialog re-appears on every
+        // launch once the localStorage marker is consumed/lost. The Cargo
+        // version is baked in at build time and always matches the release
+        // tag (both bumped together).
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+        tracing::info!(
+            current_version = %current_version,
+            remote_version = %update.version,
+            "check_update: installed vs remote version"
+        );
         let normalize = |v: &str| {
             v.trim_start_matches('v')
                 .trim()
@@ -139,7 +152,7 @@ pub async fn download_and_install(
             match check_response {
                 Some(update) => {
                     // Defensive: skip if remote version matches current
-                    let current_version = app.config().version.clone().unwrap_or_default();
+                    let current_version = env!("CARGO_PKG_VERSION").to_string();
                     let normalize = |v: &str| {
                         v.trim_start_matches('v')
                             .trim()
@@ -200,13 +213,12 @@ pub async fn download_and_install(
 
 /// Get the current application version
 ///
-/// Returns the version string from the Tauri config.
+/// Uses the compile-time `CARGO_PKG_VERSION` (baked from src-tauri/Cargo.toml,
+/// bumped alongside the release tag). `app.config().version` can return None/empty
+/// in some Tauri 2.x builds — same reason check_update was migrated off it.
 #[tauri::command]
-pub async fn get_app_version(app: AppHandle) -> Result<String, String> {
-    app.config()
-        .version
-        .clone()
-        .ok_or_else(|| "Failed to get app version".to_string())
+pub async fn get_app_version(_app: AppHandle) -> Result<String, String> {
+    Ok(env!("CARGO_PKG_VERSION").to_string())
 }
 
 /// Restart the application

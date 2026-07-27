@@ -13,7 +13,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use heramind_agent::skills::{match_skills, Skill, SkillCategory, SkillRegistry, TokenBudgetConfig};
+use heramind_agent::skills::{
+    match_skills, Skill, SkillCategory, SkillRegistry, TokenBudgetConfig,
+};
 
 use super::ServerState;
 

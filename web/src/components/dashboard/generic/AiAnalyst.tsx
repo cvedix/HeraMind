@@ -10,6 +10,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import {
   ScanEye,
   Loader2,
@@ -119,6 +120,7 @@ export function AiAnalyst({
   contextWindowSize: contextWindowSizeProp,
   onConfigChange,
 }: AiAnalystProps) {
+  const { t } = useTranslation('dashboardComponents')
   // Stable component ID — locked on first render so it doesn't change
   // when agentId is saved back as a prop (which would trigger cleanup and delete the agent)
   const componentIdRef = useRef<string | null>(null)
@@ -264,20 +266,14 @@ export function AiAnalyst({
   }, [dsData, dataSourceProp])
 
   // Send data to timeline during active execution rounds only.
-  // Single effect handles both round-start (isStreaming transition) and
-  // dsData updates, with unified dedup to prevent duplicate entries.
-  const prevStreamingRef = useRef(false)
+  // Dedup is PERSISTENT across rounds — prevents the timing race where
+  // AgentExecutionStarted WS event arrives BEFORE the telemetry update,
+  // causing the stale previous-round image to be enqueued first and the
+  // fresh image appended right after (resulting in two images per update).
+  // Trade-off: if the same value repeats across rounds, it's only shown once
+  // (which is desirable — repeated identical images are visual noise).
   useEffect(() => {
-    if (editMode || dsData == null || !isStreaming) {
-      prevStreamingRef.current = isStreaming
-      return
-    }
-
-    // New round started — reset dedup so first data is always sent
-    if (!prevStreamingRef.current) {
-      lastEnqueuedRef.current = null
-    }
-    prevStreamingRef.current = true
+    if (editMode || dsData == null || !isStreaming) return
 
     const latestValue = extractLatestValue()
     if (latestValue == null) return
@@ -335,7 +331,7 @@ export function AiAnalyst({
             <ScanEye className="h-6 w-6 text-primary" />
           </div>
           <p className="text-sm text-muted-foreground">
-            Configure a data source to start
+            {t('aiAnalyst.emptyState')}
           </p>
         </div>
       </div>
@@ -371,7 +367,7 @@ export function AiAnalyst({
           <AlertCircle className="h-12 w-12 opacity-20 text-muted-foreground mx-auto mb-3" />
           <p className="text-sm text-muted-foreground mb-3">{sessionError}</p>
           <Button size="sm" variant="outline" onClick={() => initSession()}>
-            Retry
+            {t('aiAnalyst.retry')}
           </Button>
         </div>
       </div>
@@ -407,25 +403,25 @@ export function AiAnalyst({
           {/* Info */}
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-1">
-              <h3 className={cn(indicatorFontWeight.title, 'truncate')}>{title || 'AI Analyst'}</h3>
+              <h3 className={cn(indicatorFontWeight.title, 'truncate')}>{title || t('aiAnalyst.defaultTitle')}</h3>
               {isStreaming ? (
                 <Badge
                   variant="default"
                   className={cn(textNano, "h-5 gap-0.5 px-1.5")}
                 >
                   <Loader2 className="h-2.5 w-2.5 animate-spin" />
-                  Analyzing
+                  {t('aiAnalyst.analyzing')}
                 </Badge>
               ) : isConnected ? (
                 <Badge
                   variant="outline"
                   className={cn(textNano, "h-5 text-success border-success-light")}
                 >
-                  Live
+                  {t('aiAnalyst.live')}
                 </Badge>
               ) : (
                 <Badge variant="secondary" className={cn(textNano, "h-5")}>
-                  Offline
+                  {t('aiAnalyst.offline')}
                 </Badge>
               )}
             </div>
@@ -434,12 +430,12 @@ export function AiAnalyst({
             <div className={cn("flex items-center gap-3", textMini, "text-muted-foreground")}>
               <span className="flex items-center gap-1">
                 <MessageSquare className="h-4 w-4" />
-                {messageCount} msgs
+                {t('aiAnalyst.messagesCount', { count: messageCount })}
               </span>
               {avgDuration > 0 && (
                 <span className="flex items-center gap-1">
                   <Clock className="h-4 w-4" />
-                  {avgDuration}s avg
+                  {t('aiAnalyst.avgDuration', { count: avgDuration })}
                 </span>
               )}
               {config.modelName && (
@@ -457,7 +453,7 @@ export function AiAnalyst({
             size="icon"
             className="h-8 w-8 shrink-0"
             onClick={() => setConfigOpen(true)}
-            aria-label="Analyst settings"
+            aria-label={t('aiAnalyst.settingsAriaLabel')}
           >
             <Settings2 className="h-4 w-4" />
           </Button>

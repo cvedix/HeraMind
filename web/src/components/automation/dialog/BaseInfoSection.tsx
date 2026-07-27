@@ -76,7 +76,7 @@ export function BaseInfoSection({
   const defaultNamePlaceholder = namePlaceholder || t('baseInfo.namePlaceholder')
   const defaultDescriptionPlaceholder = descriptionPlaceholder || t('baseInfo.descriptionPlaceholder')
   return (
-    <section className="px-4 md:px-8 py-4 md:py-6 border-b bg-muted shrink-0">
+    <section className="px-4 md:px-8 py-4 md:py-6 border-b shrink-0">
       <div className="max-w-4xl mx-auto">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
           {/* Name */}

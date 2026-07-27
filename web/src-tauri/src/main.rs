@@ -87,6 +87,63 @@ fn cleanup_old_logs(log_dir: &std::path::Path) {
     }
 }
 
+/// Move any `heramind.log.*` files from the legacy `<app_data>/logs/`
+/// directory (used by app versions ≤ 0.9.2) into the canonical
+/// `<app_data>/data/logs/` location. Files in the destination that already
+/// exist with the same name are kept (the legacy copy is deleted to avoid
+/// double-archiving). Idempotent — safe to call on every startup.
+fn migrate_legacy_log_dir(app_data_dir: &std::path::Path, dest_dir: &std::path::Path) {
+    let legacy_dir = app_data_dir.join("logs");
+    if legacy_dir == *dest_dir || !legacy_dir.is_dir() {
+        return;
+    }
+    let entries = match fs::read_dir(&legacy_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut moved = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.starts_with("heramind.log") {
+            continue;
+        }
+        let dest = dest_dir.join(name);
+        // rename (move) is atomic on the same filesystem. If the destination
+        // already exists (re-running migration), just remove the legacy copy.
+        // On cross-filesystem rename failures (rare, but possible if the user
+        // mounted `<app_data>` across volumes), fall back to copy + delete.
+        match fs::rename(&path, &dest) {
+            Ok(_) => moved += 1,
+            Err(_) => {
+                if dest.exists() {
+                    let _ = fs::remove_file(&path);
+                } else if fs::copy(&path, &dest).is_ok() {
+                    let _ = fs::remove_file(&path);
+                    moved += 1;
+                }
+            }
+        }
+    }
+    if moved > 0 {
+        tracing::info!(
+            "Migrated {} legacy log file(s) from {} to {}",
+            moved,
+            legacy_dir.display(),
+            dest_dir.display()
+        );
+        // Best-effort cleanup of the now-empty legacy directory. Remove only
+        // if empty (fs::remove_dir fails harmlessly if anything remains).
+        let _ = fs::remove_dir(&legacy_dir);
+    }
+}
+
 /// Show the main window
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -183,9 +240,17 @@ fn start_axum_server(
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    // Log to file in app data directory: ~/.heramind/logs/
-    let log_dir = get_app_data_dir(app_handle).join("logs");
+    // Log to file under the canonical data dir: <app_data>/data/logs/
+    // This matches HERAMIND_DATA_DIR (set in setup()) and the storage layout
+    // convention in CLAUDE.md, so the API's /api/logs/download handler
+    // (which reads state.data_dir.join("logs")) finds the same files.
+    let log_dir = get_app_data_dir(app_handle).join("data").join("logs");
     let _ = fs::create_dir_all(&log_dir);
+    // One-time migration: move any logs written by previous versions to the
+    // legacy `<app_data>/logs/` path into the canonical `<app_data>/data/logs/`
+    // so users don't lose their 7-day history. Idempotent — if the source dir
+    // is empty or already migrated, this is a no-op.
+    migrate_legacy_log_dir(&get_app_data_dir(app_handle), &log_dir);
     let file_appender = tracing_appender::rolling::daily(&log_dir, "heramind.log");
 
     use tracing_subscriber::layer::SubscriberExt;

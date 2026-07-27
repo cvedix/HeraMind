@@ -7,8 +7,9 @@ fn test_parse_extension_package() {
     // This test requires a .nep file to be present
     // For now, we'll test the module compiles correctly
 
-    let package_path =
-        Path::new("/Users/shenmingming/HeraMind-Extension/heramind.weather.forecast.wasm-0.5.9.nep");
+    let package_path = Path::new(
+        "/Users/shenmingming/HeraMind-Extension/heramind.weather.forecast.wasm-0.5.9.nep",
+    );
 
     if !package_path.exists() {
         println!(

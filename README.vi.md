@@ -199,7 +199,7 @@ docker compose up -d
 
 **Phiên bản cụ thể:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | VERSION=0.9.1 sh
+curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | VERSION=0.9.11 sh
 ```
 
 **Thư mục tùy chỉnh:**
@@ -219,7 +219,7 @@ curl -fsSL ... | USE_NGINX=true sh
 
 **Cài đặt thủ công:**
 ```bash
-VERSION=0.9.1
+VERSION=0.9.11
 wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-server-linux-amd64.tar.gz
 wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-web-${VERSION}.tar.gz
 tar xzf heramind-server-linux-amd64.tar.gz

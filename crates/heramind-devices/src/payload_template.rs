@@ -304,11 +304,12 @@ fn interpolate_substrings(
         let after_prefix = &rest[prefix_start + SENTINEL_PREFIX.len()..];
 
         // Find the suffix.
-        let suffix_pos = after_prefix
-            .find(SENTINEL_SUFFIX)
-            .ok_or_else(|| RenderError::InvalidTemplate(serde::de::Error::custom(
-                format!("malformed sentinel in template leaf: {}", rest),
-            )))?;
+        let suffix_pos = after_prefix.find(SENTINEL_SUFFIX).ok_or_else(|| {
+            RenderError::InvalidTemplate(serde::de::Error::custom(format!(
+                "malformed sentinel in template leaf: {}",
+                rest
+            )))
+        })?;
         let name = &after_prefix[..suffix_pos];
         if !is_valid_name(name) {
             return Err(RenderError::InvalidTemplate(serde::de::Error::custom(
@@ -434,10 +435,12 @@ mod tests {
         // request_id is auto-injected by DeviceService::build_command_payload
         // before this renderer sees it.
         let template = r#"{"cmd": "capture", "request_id": "${request_id}"}"#;
-        let params: HashMap<String, MetricValue> =
-            [param("request_id", MetricValue::String("req-abc-123".into()))]
-                .into_iter()
-                .collect();
+        let params: HashMap<String, MetricValue> = [param(
+            "request_id",
+            MetricValue::String("req-abc-123".into()),
+        )]
+        .into_iter()
+        .collect();
 
         let bytes = render(template, &params).expect("render");
         let parsed: Value = serde_json::from_slice(&bytes).expect("valid JSON");
@@ -490,10 +493,9 @@ mod tests {
     #[test]
     fn unquoted_integer_placeholder_becomes_number() {
         let template = r#"{"value": ${value}}"#;
-        let params: HashMap<String, MetricValue> =
-            [param("value", MetricValue::Integer(42))]
-                .into_iter()
-                .collect();
+        let params: HashMap<String, MetricValue> = [param("value", MetricValue::Integer(42))]
+            .into_iter()
+            .collect();
 
         let bytes = render(template, &params).expect("render");
         let parsed: Value = serde_json::from_slice(&bytes).expect("valid JSON");
@@ -503,10 +505,9 @@ mod tests {
     #[test]
     fn unquoted_boolean_placeholder_becomes_bool() {
         let template = r#"{"enabled": ${enabled}}"#;
-        let params: HashMap<String, MetricValue> =
-            [param("enabled", MetricValue::Boolean(true))]
-                .into_iter()
-                .collect();
+        let params: HashMap<String, MetricValue> = [param("enabled", MetricValue::Boolean(true))]
+            .into_iter()
+            .collect();
 
         let bytes = render(template, &params).expect("render");
         let parsed: Value = serde_json::from_slice(&bytes).expect("valid JSON");
@@ -518,10 +519,9 @@ mod tests {
     #[test]
     fn substring_interpolation_inside_larger_string() {
         let template = r#"{"path": "/users/${user_id}/info"}"#;
-        let params: HashMap<String, MetricValue> =
-            [param("user_id", MetricValue::Integer(42))]
-                .into_iter()
-                .collect();
+        let params: HashMap<String, MetricValue> = [param("user_id", MetricValue::Integer(42))]
+            .into_iter()
+            .collect();
 
         let bytes = render(template, &params).expect("render");
         let parsed: Value = serde_json::from_slice(&bytes).expect("valid JSON");

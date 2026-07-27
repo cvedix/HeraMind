@@ -123,7 +123,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
     removeComponent, duplicateComponent, createDashboard, updateDashboard,
     deleteDashboard, persistDashboard, setCurrentDashboard, setComponentLibraryOpen,
     fetchDashboards, fetchDevices, fetchDeviceTypes, fetchDevicesCurrentBatch,
-    sendCommand,
+    sendCommand, duplicateDashboard,
   } = useStore((s) => ({
     setEditMode: s.setEditMode, addComponent: s.addComponent, updateComponent: s.updateComponent,
     batchUpdatePositions: s.batchUpdatePositions, removeComponent: s.removeComponent,
@@ -133,7 +133,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
     setComponentLibraryOpen: s.setComponentLibraryOpen,
     fetchDashboards: s.fetchDashboards, fetchDevices: s.fetchDevices,
     fetchDeviceTypes: s.fetchDeviceTypes, fetchDevicesCurrentBatch: s.fetchDevicesCurrentBatch,
-    sendCommand: s.sendCommand,
+    sendCommand: s.sendCommand, duplicateDashboard: s.duplicateDashboard,
   }))
 
   // Marketplace store selectors — single subscription
@@ -252,7 +252,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
   const [agentsLoading, setAgentsLoading] = useState(false)
 
   // Vision models for ai-analyst config
-  const [visionModels, setVisionModels] = useState<{ id: string; name: string; backendId: string; backendName: string }[]>([])
+  const [visionModels, setVisionModels] = useState<{ id: string; name: string; backendId: string; backendName: string; isMultimodal?: boolean }[]>([])
   const [visionModelsLoading, setVisionModelsLoading] = useState(false)
 
   // Fullscreen state
@@ -365,6 +365,17 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
   const handleDashboardRename = useCallback((id: string, name: string) => {
     updateDashboard(id, { name })
   }, [updateDashboard])
+
+  const handleDashboardDuplicate = useCallback(async (id: string) => {
+    const newId = await duplicateDashboard(id)
+    if (!newId) {
+      toast({ title: t('visualDashboard.duplicateFailed'), variant: 'destructive' })
+      return
+    }
+    toast({ title: t('visualDashboard.duplicated') })
+    await setCurrentDashboard(newId)
+    navigate(`/visual-dashboard/${newId}`)
+  }, [duplicateDashboard, setCurrentDashboard, navigate, t])
 
   const handleDashboardDelete = useCallback(async (id: string) => {
     const confirmed = await confirm({
@@ -542,7 +553,10 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
   // NOTE: agents are accessed directly via the `agents` state variable in
   // generateConfigSchema closure — no need to inject them into componentConfig.
 
-  // Load vision models when config opens for ai-analyst
+  // Load LLM backends available as analysis models for ai-analyst.
+  // All backends are listed (multimodal is NOT required — AI Analyst can run on
+  // text/numeric data). Multimodal capability is surfaced as an Eye badge in the
+  // picker. This matches the runtime AnalystConfigPanel behavior (useAnalystModels).
   useEffect(() => {
     const loadVisionModels = async () => {
       if (configOpen && selectedComponent?.type === 'ai-analyst') {
@@ -550,20 +564,19 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
         try {
           const resp = await api.listLlmBackends()
           const backends = resp?.backends || []
-          const models: { id: string; name: string; backendId: string; backendName: string }[] = []
+          const models: { id: string; name: string; backendId: string; backendName: string; isMultimodal?: boolean }[] = []
           for (const backend of backends) {
-            if (backend.capabilities?.supports_multimodal) {
-              models.push({
-                id: backend.id,
-                name: backend.name || backend.model,
-                backendId: backend.id,
-                backendName: backend.name || backend.id,
-              })
-            }
+            models.push({
+              id: backend.id,
+              name: backend.name || backend.model,
+              backendId: backend.id,
+              backendName: backend.name || backend.id,
+              isMultimodal: backend.capabilities?.supports_multimodal ?? false,
+            })
           }
           setVisionModels(models)
         } catch (error) {
-          handleError(error, { operation: 'Load vision models for dashboard', showToast: false })
+          handleError(error, { operation: 'Load analysis models for dashboard', showToast: false })
           setVisionModels([])
         } finally {
           setVisionModelsLoading(false)
@@ -971,6 +984,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
           onSwitch={handleDashboardSwitch}
           onCreate={handleDashboardCreate}
           onRename={handleDashboardRename}
+          onDuplicate={handleDashboardDuplicate}
           onDelete={handleDashboardDelete}
           onReorder={(newOrder) => useStore.getState().reorderDashboards(newOrder)}
           open={sidebarOpen}
@@ -996,6 +1010,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
           onDashboardSwitch={handleDashboardSwitch}
           onDashboardCreate={handleDashboardCreate}
           onDashboardRename={handleDashboardRename}
+          onDashboardDuplicate={handleDashboardDuplicate}
           onDashboardDelete={handleDashboardDelete}
           onDashboardReorder={(newOrder) => useStore.getState().reorderDashboards(newOrder)}
           onSwitchToSidebar={handleSwitchToSidebar}

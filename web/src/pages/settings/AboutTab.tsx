@@ -178,7 +178,7 @@ function ExternalLinkValue({ href, text }: { href: string; text: string }) {
       className="inline-flex items-center gap-1 font-mono text-info hover:underline"
     >
       <span>{text}</span>
-      <ExternalLink className="h-3 w-3 text-muted-foreground/70" />
+      <ExternalLink className="h-3 w-3 text-muted-foreground" />
     </a>
   )
 }
@@ -455,7 +455,7 @@ export function AboutTab() {
                     >
                       <div className="flex items-center gap-3 min-w-0">
                         <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-brand-bg text-brand">
-                          <Monitor className="h-4.5 w-4.5" />
+                          <Monitor className="h-4 w-4" />
                         </div>
                         <div className="min-w-0">
                           <div className="text-sm font-medium truncate">{gpu.name}</div>
@@ -570,7 +570,6 @@ export function AboutTab() {
       <div className="text-center text-xs text-muted-foreground">
         © CVEDIX AI 2026 · HeraMind
       </div>
-
       <InstanceManagerDialog
         open={instanceManagerOpen}
         onOpenChange={setInstanceManagerOpen}

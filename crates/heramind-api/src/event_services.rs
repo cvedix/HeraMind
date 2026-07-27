@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::automation::{store::SharedAutomationStore, TransformEngine};
 use heramind_core::eventbus::EventBus;
-use heramind_core::{MetricValue, HeraMindEvent};
+use heramind_core::{HeraMindEvent, MetricValue};
 use heramind_devices::DeviceRegistry;
 use heramind_rules::RuleEngine;
 
@@ -331,6 +331,27 @@ impl TransformEventService {
                                             let _ = event_bus_clone
                                                 .publish(HeraMindEvent::DeviceMetric {
                                                     device_id: storage_device_id.clone(),
+                                                    metric: transformed_metric.metric.clone(),
+                                                    value: transformed_metric.value.clone(),
+                                                    timestamp: transformed_metric.timestamp,
+                                                    quality: transformed_metric.quality,
+                                                    is_virtual: Some(true),
+                                                })
+                                                .await;
+
+                                            // Also publish in the original device namespace
+                                            // (device:{device_id}:{metric}) so event-driven consumers that
+                                            // select the device's virtual metrics — e.g. data-push targets
+                                            // filtering on `device:9999:virtual.*` — actually receive them.
+                                            // The dual-write below stores these under device:{id} for REST
+                                            // discovery, but the event above was only published under
+                                            // transform:{id}, so device-namespace filters never matched and
+                                            // the virtual metrics were never pushed. is_virtual keeps this
+                                            // feedback-safe (transform trigger + frontend WS both skip
+                                            // is_virtual events).
+                                            let _ = event_bus_clone
+                                                .publish(HeraMindEvent::DeviceMetric {
+                                                    device_id: device_id_clone.clone(),
                                                     metric: transformed_metric.metric.clone(),
                                                     value: transformed_metric.value.clone(),
                                                     timestamp: transformed_metric.timestamp,

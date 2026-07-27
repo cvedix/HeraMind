@@ -37,7 +37,6 @@ use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
 
 use crate::extension::types::ExtensionError;
 
@@ -372,22 +371,37 @@ impl From<PackageError> for ExtensionError {
 }
 
 impl ExtensionPackage {
+    /// Stream-hash a file's contents for the checksum without buffering the
+    /// whole file in memory. Used by [`load`](Self::load) so opening a large
+    /// `.nep` (e.g. ML model bundle) for upload doesn't OOM.
+    async fn stream_hash_file(path: &Path) -> Result<String, PackageError> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open(path).await?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
     /// Load a package from a file
     pub async fn load(path: &Path) -> Result<Self, PackageError> {
-        // Read file
-        let mut file = tokio::fs::File::open(path).await?;
-        let metadata = file.metadata().await?;
-        let size = metadata.len();
+        let size = tokio::fs::metadata(path).await?.len();
 
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer).await?;
+        // Stream-hash the file for the checksum — do NOT read_to_end, large
+        // packages would OOM.
+        let checksum = Self::stream_hash_file(path).await?;
 
-        // Calculate checksum
-        let checksum = Self::calculate_checksum(&buffer);
-
-        // Parse ZIP archive
-        let cursor = Cursor::new(buffer);
-        let mut archive = ZipArchive::new(cursor).map_err(|e| PackageError::Zip(e.to_string()))?;
+        // Parse the manifest only, via a File-backed archive (no full buffer).
+        let std_file = std::fs::File::open(path)?;
+        let mut archive =
+            ZipArchive::new(std_file).map_err(|e| PackageError::Zip(e.to_string()))?;
 
         // Read manifest.json
         let manifest_content = Self::read_file_from_zip(&mut archive, "manifest.json")?;
@@ -501,18 +515,21 @@ impl ExtensionPackage {
         let ext_dir = target_dir.join(ext_id);
         tokio::fs::create_dir_all(&ext_dir).await?;
 
-        // Load ZIP archive
-        let data = if let Some(path) = &self.path {
-            tokio::fs::read(path).await?
-        } else {
-            return Err(PackageError::Io(std::io::Error::new(
+        // Load ZIP archive from file — do NOT tokio::fs::read (would buffer
+        // the whole package in memory). Open async, hand the std File to
+        // ZipArchive; entries are then streamed by extract_file/extract_directory.
+        let path = self.path.clone().ok_or_else(|| {
+            PackageError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Package has no file path",
-            )));
-        };
-
-        let cursor = Cursor::new(data);
-        let mut archive = ZipArchive::new(cursor).map_err(|e| PackageError::Zip(e.to_string()))?;
+            ))
+        })?;
+        // Open the file synchronously (brief, just the open — not a full read)
+        // and hand the std File to ZipArchive. Entries are then streamed by
+        // extract_file/extract_directory, so the package is never buffered
+        // whole. std File is used because ZipArchive needs std Read+Seek.
+        let file = std::fs::File::open(&path)?;
+        let mut archive = ZipArchive::new(file).map_err(|e| PackageError::Zip(e.to_string()))?;
 
         // Extract manifest.json
         let manifest_path = ext_dir.join("manifest.json");
@@ -606,27 +623,80 @@ impl ExtensionPackage {
 
     /// Install the package synchronously (for use in spawn_blocking)
     /// Takes raw package bytes since from_bytes() doesn't store them
+    /// Install the package synchronously (for use in spawn_blocking).
+    /// Takes raw package bytes since from_bytes() doesn't store them.
+    /// In-memory variant — used by the upload path where the body limit
+    /// already bounds the size. The download path should use
+    /// [`install_from_file`](Self::install_from_file) to avoid buffering
+    /// large packages in memory.
     pub fn install_sync(data: &[u8], target_dir: &Path) -> Result<InstallResult, PackageError> {
         tracing::info!(
-            "install_sync step 1/9: parse zip ({} bytes, target={})",
+            "install_sync: {} bytes, target={}",
             data.len(),
             target_dir.display()
         );
+        let checksum = Self::calculate_checksum(data);
         let cursor = Cursor::new(data.to_vec());
-        let mut archive = ZipArchive::new(cursor).map_err(|e| {
-            tracing::error!("install_sync FAILED step 1 (zip parse): {}", e);
-            PackageError::Zip(e.to_string())
-        })?;
+        let mut archive = ZipArchive::new(cursor).map_err(|e| PackageError::Zip(e.to_string()))?;
+        Self::install_from_archive(&mut archive, target_dir, checksum)
+    }
 
+    /// Install a package from a file path — streams the ZIP from the file
+    /// instead of buffering it in memory. Used by the marketplace download
+    /// path so that large `.nep` packages (ML model bundles + CUDA ORT) do
+    /// not OOM. Only the file header + individual entries are held in memory
+    /// at a time, never the whole archive.
+    pub fn install_from_file(
+        data_path: &Path,
+        target_dir: &Path,
+    ) -> Result<InstallResult, PackageError> {
+        tracing::info!(
+            "install_from_file: {}, target={}",
+            data_path.display(),
+            target_dir.display()
+        );
+
+        // Stream-hash the file for the checksum (do not buffer it all).
+        let checksum = {
+            use std::io::Read;
+            let mut hasher = Sha256::new();
+            let mut f = std::fs::File::open(data_path)?;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            format!("{:x}", hasher.finalize())
+        };
+
+        let file = std::fs::File::open(data_path)?;
+        let mut archive = ZipArchive::new(file).map_err(|e| PackageError::Zip(e.to_string()))?;
+        Self::install_from_archive(&mut archive, target_dir, checksum)
+    }
+
+    /// Core install logic over an already-opened ZIP archive. Generic over
+    /// the reader so the in-memory path ([`install_sync`](Self::install_sync),
+    /// via `Cursor`) and the file-backed path
+    /// ([`install_from_file`](Self::install_from_file), via `File`) share one
+    /// implementation. `checksum` is computed by the caller — it requires the
+    /// raw package bytes/stream, which the archive abstraction does not expose.
+    fn install_from_archive<R: Read + std::io::Seek>(
+        archive: &mut ZipArchive<R>,
+        target_dir: &Path,
+        checksum: String,
+    ) -> Result<InstallResult, PackageError> {
         // Read manifest from archive
-        let manifest_content = Self::read_file_from_zip(&mut archive, "manifest.json")?;
+        let manifest_content = Self::read_file_from_zip(archive, "manifest.json")?;
         let manifest: ExtensionPackageManifest = serde_json::from_str(&manifest_content)?;
 
         Self::validate_manifest(&manifest)?;
 
         let ext_id = &manifest.id;
         let version = &manifest.version;
-        tracing::info!("install_sync step 2/9: manifest OK ({} v{})", ext_id, version);
+        tracing::info!("install: manifest OK ({} v{})", ext_id, version);
 
         // Create extension directory
         let ext_dir = target_dir.join(ext_id);
@@ -634,7 +704,7 @@ impl ExtensionPackage {
 
         // Extract manifest.json
         let manifest_path = ext_dir.join("manifest.json");
-        Self::extract_file_sync(&mut archive, "manifest.json", &manifest_path)?;
+        Self::extract_file_sync(archive, "manifest.json", &manifest_path)?;
 
         // Get binary path for current platform
         let platform = detect_platform();
@@ -646,7 +716,7 @@ impl ExtensionPackage {
             .ok_or_else(|| {
                 let available_platforms: Vec<String> = manifest.binaries.keys().cloned().collect();
                 tracing::error!(
-                    "install_sync FAILED step 3: no binary for platform '{}' (have: {})",
+                    "install FAILED: no binary for platform '{}' (have: {})",
                     platform,
                     available_platforms.join(", ")
                 );
@@ -657,11 +727,7 @@ impl ExtensionPackage {
                 ))
             })?;
 
-        tracing::info!(
-            "install_sync step 3/9: platform {} -> {}",
-            platform,
-            binary_rel_path
-        );
+        tracing::info!("install: platform {} -> {}", platform, binary_rel_path);
 
         // Extract binary and preserve directory structure.
         // Route through safe_join_within to reject `..` / absolute paths
@@ -669,8 +735,8 @@ impl ExtensionPackage {
         // (the async install path uses `file_name()` to flatten; this path
         // preserves subdirs for shared libraries, so we must guard instead).
         let binary_file = Self::safe_join_within(&ext_dir, &binary_rel_path)?;
-        Self::extract_file_sync(&mut archive, &binary_rel_path, &binary_file)?;
-        tracing::info!("install_sync step 4/9: binary extracted");
+        Self::extract_file_sync(archive, &binary_rel_path, &binary_file)?;
+        tracing::info!("install: binary extracted");
 
         // Extract all sibling files in the same directory as the binary
         // These are bundled shared libraries (e.g. libonnxruntime.dylib)
@@ -718,12 +784,12 @@ impl ExtensionPackage {
         // This allows safe discovery without loading native libraries
         let sidecar_json = binary_file.with_extension("json");
         Self::create_sidecar_json_sync(&manifest, &sidecar_json)?;
-        tracing::info!("install_sync step 5/9: sidecar json + sibling libs done");
+        tracing::info!("install: sidecar json + sibling libs done");
 
         // Extract frontend directory if exists
         let frontend_dir = if manifest.frontend.is_some() {
             let frontend_path = ext_dir.join("frontend");
-            Self::extract_directory_sync(&mut archive, "frontend/", &frontend_path)?;
+            Self::extract_directory_sync(archive, "frontend/", &frontend_path)?;
             Some(frontend_path)
         } else {
             None
@@ -731,16 +797,16 @@ impl ExtensionPackage {
 
         // Extract models directory if exists (for AI/ML extensions)
         let models_path = ext_dir.join("models");
-        Self::extract_directory_sync(&mut archive, "models/", &models_path)?;
+        Self::extract_directory_sync(archive, "models/", &models_path)?;
 
         // Extract assets directory if exists (for static assets)
         let assets_path = ext_dir.join("assets");
-        Self::extract_directory_sync(&mut archive, "assets/", &assets_path)?;
+        Self::extract_directory_sync(archive, "assets/", &assets_path)?;
 
         // Extract config directory if exists (for configuration files)
         let config_path = ext_dir.join("config");
-        Self::extract_directory_sync(&mut archive, "config/", &config_path)?;
-        tracing::info!("install_sync step 6/9: resource dirs done");
+        Self::extract_directory_sync(archive, "config/", &config_path)?;
+        tracing::info!("install: resource dirs done");
 
         // 🔧 macOS: Re-sign all extracted dylibs after installation.
         // When a .nep replaces an existing extension, macOS may cache the old code signature
@@ -750,9 +816,9 @@ impl ExtensionPackage {
         #[cfg(target_os = "macos")]
         {
             if let Some(binary_dir) = binary_file.parent() {
-                tracing::info!("install_sync step 7/9: re-signing dylibs (macOS)");
+                tracing::info!("install: re-signing dylibs (macOS)");
                 Self::resign_dylibs_macos(binary_dir);
-                tracing::info!("install_sync step 7/9: resign done");
+                tracing::info!("install: resign done");
             }
         }
 
@@ -762,9 +828,6 @@ impl ExtensionPackage {
             .as_ref()
             .map(|f| f.components.clone())
             .unwrap_or_default();
-
-        // Calculate checksum
-        let checksum = Self::calculate_checksum(data);
 
         // ✨ Determine which resource directories were extracted
         let models_dir = if models_path.exists() {
@@ -780,7 +843,7 @@ impl ExtensionPackage {
             None
         };
 
-        tracing::info!("install_sync step 9/9: success ({} v{})", ext_id, version);
+        tracing::info!("install: success ({} v{})", ext_id, version);
         Ok(InstallResult {
             extension_id: ext_id.clone(),
             version: version.clone(),
@@ -843,11 +906,7 @@ impl ExtensionPackage {
                                 false
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "codesign failed for {}: {}",
-                                    path.display(),
-                                    e
-                                );
+                                tracing::warn!("codesign failed for {}: {}", path.display(), e);
                                 false
                             }
                         }
@@ -880,22 +939,22 @@ impl ExtensionPackage {
             .by_name(src_path)
             .map_err(|e| PackageError::MissingFile(format!("{}: {}", src_path, e)))?;
 
-        let mut content = Vec::new();
-        file.read_to_end(&mut content)?;
-
         // Create parent directory
         if let Some(parent) = dst_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         // macOS: clear any existing file first — code-signed dylibs with
-        // `com.apple.provenance` xattr reject fs::write with EACCES on
+        // `com.apple.provenance` xattr reject File::create with EACCES on
         // re-install. remove_file clears xattrs + inode.
         if dst_path.exists() {
             let _ = std::fs::remove_file(dst_path);
         }
 
-        std::fs::write(dst_path, content)?;
+        // Stream the entry to disk — never read_to_end, since large model or
+        // binary entries would OOM. std::io::copy uses an 8 KB buffer.
+        let mut out = std::fs::File::create(dst_path)?;
+        std::io::copy(&mut file, &mut out)?;
         Ok(())
     }
 
@@ -906,7 +965,10 @@ impl ExtensionPackage {
     /// and `extract_directory` MUST route every zip entry through this helper.
     /// A malicious `.nep` package could otherwise include an entry such as
     /// `frontend/../../etc/cron.d/backdoor` and write outside the install dir.
-    fn safe_join_within(dst_dir: &Path, rel_path: &str) -> Result<std::path::PathBuf, PackageError> {
+    fn safe_join_within(
+        dst_dir: &Path,
+        rel_path: &str,
+    ) -> Result<std::path::PathBuf, PackageError> {
         let mut resolved = dst_dir.to_path_buf();
         for component in std::path::Path::new(rel_path).components() {
             match component {
@@ -955,10 +1017,13 @@ impl ExtensionPackage {
                     std::fs::create_dir_all(parent)?;
                 }
 
-                // Extract file
-                let mut content = Vec::new();
-                file.read_to_end(&mut content)?;
-                std::fs::write(dst_path, content)?;
+                // Extract file — streamed (std::io::copy, 8 KB buffer) so a
+                // large entry doesn't get buffered in memory.
+                if dst_path.exists() {
+                    let _ = std::fs::remove_file(&dst_path);
+                }
+                let mut out = std::fs::File::create(&dst_path)?;
+                std::io::copy(&mut file, &mut out)?;
             }
         }
 
@@ -1066,15 +1131,31 @@ impl ExtensionPackage {
             .by_name(src_path)
             .map_err(|e| PackageError::MissingFile(format!("{}: {}", src_path, e)))?;
 
-        let mut content = Vec::new();
-        file.read_to_end(&mut content)?;
-
         // Create parent directory
         if let Some(parent) = dst_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        tokio::fs::write(dst_path, content).await?;
+        // macOS: clear existing (code-signed xattr blocks create on re-install)
+        if dst_path.exists() {
+            let _ = tokio::fs::remove_file(dst_path).await;
+        }
+
+        // Stream the entry to disk in chunks — never read_to_end, since large
+        // model/binary entries would OOM. ZipFile is a blocking reader, so we
+        // pull 64 KB at a time through std Read + tokio AsyncWrite.
+        use std::io::Read;
+        use tokio::io::AsyncWriteExt;
+        let mut out = tokio::fs::File::create(dst_path).await?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).await?;
+        }
+        out.flush().await?;
         Ok(())
     }
 
@@ -1105,10 +1186,22 @@ impl ExtensionPackage {
                     tokio::fs::create_dir_all(parent).await?;
                 }
 
-                // Extract file
-                let mut content = Vec::new();
-                file.read_to_end(&mut content)?;
-                tokio::fs::write(dst_path, content).await?;
+                // Stream-extract (chunked) — never read_to_end large entries.
+                use std::io::Read as _;
+                use tokio::io::AsyncWriteExt;
+                if dst_path.exists() {
+                    let _ = tokio::fs::remove_file(&dst_path).await;
+                }
+                let mut out = tokio::fs::File::create(&dst_path).await?;
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    out.write_all(&buf[..n]).await?;
+                }
+                out.flush().await?;
             }
         }
 
@@ -1310,7 +1403,10 @@ mod tests {
 
         // Normal relative path resolves within dst_dir
         let ok = ExtensionPackage::safe_join_within(dst, "frontend/dist/bundle.js").unwrap();
-        assert!(ok.starts_with(dst), "normal path should stay within dst_dir");
+        assert!(
+            ok.starts_with(dst),
+            "normal path should stay within dst_dir"
+        );
 
         // '..' in rel_path must be rejected (zip slip)
         assert!(
@@ -1419,5 +1515,232 @@ mod tests {
 
         assert_eq!(manifest.id, "test-extension");
         assert!(manifest.frontend.is_none());
+    }
+
+    fn unique_nonce() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Build a minimal valid .nep (in-memory) for the current platform, so
+    /// install tests don't depend on a real extension package.
+    fn build_test_nep() -> Vec<u8> {
+        use std::io::Write;
+        let platform = detect_platform();
+        let lib_ext = if platform.starts_with("windows") {
+            "dll"
+        } else if platform.starts_with("darwin") {
+            "dylib"
+        } else {
+            "so"
+        };
+        let binary_entry = format!("binaries/{}/extension.{}", platform, lib_ext);
+        let manifest = format!(
+            r#"{{"format":"heramind-extension-package","abi_version":3,"id":"test-install-file","name":"Test","version":"9.9.9","binaries":{{"{}":"{}"}},"type":"native"}}"#,
+            platform, binary_entry
+        );
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zw = zip::ZipWriter::new(buf);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("manifest.json", opts).unwrap();
+        zw.write_all(manifest.as_bytes()).unwrap();
+        zw.start_file(&binary_entry, opts).unwrap();
+        zw.write_all(b"fake binary").unwrap();
+        zw.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn test_install_from_file_streams_archive() {
+        // install_from_file must match install_sync for identical package
+        // data (both share install_from_archive) — proves the file-backed
+        // path works end-to-end without buffering the archive in memory.
+        let zip_bytes = build_test_nep();
+        let tmp =
+            std::env::temp_dir().join(format!("heramind-test-install-{}.nep", unique_nonce()));
+        std::fs::write(&tmp, &zip_bytes).unwrap();
+
+        let target_sync =
+            std::env::temp_dir().join(format!("heramind-test-sync-{}", unique_nonce()));
+        let target_file =
+            std::env::temp_dir().join(format!("heramind-test-file-{}", unique_nonce()));
+        std::fs::create_dir_all(&target_sync).unwrap();
+        std::fs::create_dir_all(&target_file).unwrap();
+
+        let via_sync = ExtensionPackage::install_sync(&zip_bytes, &target_sync);
+        let via_file = ExtensionPackage::install_from_file(&tmp, &target_file);
+
+        // cleanup
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&target_sync);
+        let _ = std::fs::remove_dir_all(&target_file);
+
+        let via_sync = via_sync.expect("install_sync should succeed on test package");
+        let via_file = via_file.expect("install_from_file should succeed on test package");
+
+        // Same package → same metadata + checksum (computed via &[u8] vs a
+        // streamed file, but the underlying bytes are identical).
+        assert_eq!(via_file.extension_id, via_sync.extension_id);
+        assert_eq!(via_file.version, via_sync.version);
+        assert_eq!(via_file.checksum, via_sync.checksum);
+        assert_eq!(via_file.extension_id, "test-install-file");
+        assert!(!via_file.checksum.is_empty());
+    }
+
+    /// Current process RSS in KB (ps-based; works on macOS + Linux).
+    fn current_rss_kb() -> u64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps failed");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    /// Proves install_from_file does NOT buffer the whole package in memory.
+    /// Builds a ~150 MB package streaming to disk (1 MB write buffer, so the
+    /// build itself stays low-memory), then measures RSS before/after install.
+    /// A streaming install's RSS delta is far below the package size; an
+    /// in-memory install would spike by ~3x the package size and fail.
+    #[test]
+    #[ignore]
+    fn test_install_from_file_memory_footprint() {
+        use std::io::Write;
+        let platform = detect_platform();
+        let lib_ext = if platform.starts_with("windows") {
+            "dll"
+        } else if platform.starts_with("darwin") {
+            "dylib"
+        } else {
+            "so"
+        };
+        let binary_entry = format!("binaries/{}/extension.{}", platform, lib_ext);
+        let manifest = format!(
+            r#"{{"format":"heramind-extension-package","abi_version":3,"id":"test-mem","name":"T","version":"1.0.0","binaries":{{"{}":"{}"}},"type":"native"}}"#,
+            platform, binary_entry
+        );
+
+        // Stream-build a ~150 MB Stored (uncompressed) zip: 1 MB buffer in a
+        // loop, so the package bytes are never all in memory during build.
+        let target_pkg_mb: u64 = 150;
+        let tmp = std::env::temp_dir().join(format!("heramind-memtest-{}.nep", unique_nonce()));
+        {
+            let file = std::fs::File::create(&tmp).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("manifest.json", opts).unwrap();
+            zw.write_all(manifest.as_bytes()).unwrap();
+            zw.start_file(&binary_entry, opts).unwrap();
+            let chunk = vec![0xABu8; 1024 * 1024]; // 1 MB
+            for _ in 0..target_pkg_mb {
+                zw.write_all(&chunk).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let pkg_size = std::fs::metadata(&tmp).unwrap().len();
+        let pkg_mb = pkg_size as f64 / 1024.0 / 1024.0;
+        println!("package size: {:.0} MB", pkg_mb);
+
+        let target =
+            std::env::temp_dir().join(format!("heramind-memtest-target-{}", unique_nonce()));
+        std::fs::create_dir_all(&target).unwrap();
+
+        let rss_before = current_rss_kb();
+        let result = ExtensionPackage::install_from_file(&tmp, &target);
+        let rss_after = current_rss_kb();
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&target);
+
+        result.expect("install_from_file should succeed on a large package");
+
+        let delta_mb = (rss_after as i64 - rss_before as i64) as f64 / 1024.0;
+        println!(
+            "RSS before: {} KB, after: {} KB, delta: {:.1} MB (package {:.0} MB)",
+            rss_before, rss_after, delta_mb, pkg_mb
+        );
+        // Streaming: delta must be far below the package size — only chunk
+        // buffers + zip metadata are held. An in-memory install would spike
+        // by ~3x package size. Allow 30% headroom for allocator/page artifacts.
+        assert!(
+            delta_mb < pkg_mb * 0.3,
+            "RSS grew {:.1} MB for a {:.0} MB package — install_from_file is buffering the whole package in memory!",
+            delta_mb,
+            pkg_mb
+        );
+    }
+
+    /// Upload path = load (stream hash + manifest) + install (file-backed
+    /// extract). Proves the async path also streams — a 150 MB upload must
+    /// not spike RSS the way the old read_to_end + Cursor did.
+    #[tokio::test]
+    #[ignore]
+    async fn test_upload_path_memory_footprint() {
+        use std::io::Write;
+        let platform = detect_platform();
+        let lib_ext = if platform.starts_with("windows") {
+            "dll"
+        } else if platform.starts_with("darwin") {
+            "dylib"
+        } else {
+            "so"
+        };
+        let binary_entry = format!("binaries/{}/extension.{}", platform, lib_ext);
+        let manifest = format!(
+            r#"{{"format":"heramind-extension-package","abi_version":3,"id":"test-upload-mem","name":"T","version":"1.0.0","binaries":{{"{}":"{}"}},"type":"native"}}"#,
+            platform, binary_entry
+        );
+
+        let target_pkg_mb: u64 = 150;
+        let tmp =
+            std::env::temp_dir().join(format!("heramind-upload-memtest-{}.nep", unique_nonce()));
+        {
+            let file = std::fs::File::create(&tmp).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("manifest.json", opts).unwrap();
+            zw.write_all(manifest.as_bytes()).unwrap();
+            zw.start_file(&binary_entry, opts).unwrap();
+            let chunk = vec![0xABu8; 1024 * 1024];
+            for _ in 0..target_pkg_mb {
+                zw.write_all(&chunk).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let pkg_size = std::fs::metadata(&tmp).unwrap().len();
+        let pkg_mb = pkg_size as f64 / 1024.0 / 1024.0;
+
+        let target =
+            std::env::temp_dir().join(format!("heramind-upload-memtest-target-{}", unique_nonce()));
+        std::fs::create_dir_all(&target).unwrap();
+
+        let rss_before = current_rss_kb();
+        let package = ExtensionPackage::load(&tmp)
+            .await
+            .expect("load should succeed");
+        let _result = package
+            .install(&target)
+            .await
+            .expect("install should succeed");
+        let rss_after = current_rss_kb();
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&target);
+
+        let delta_mb = (rss_after as i64 - rss_before as i64) as f64 / 1024.0;
+        println!(
+            "upload path RSS before: {} KB, after: {} KB, delta: {:.1} MB (package {:.0} MB)",
+            rss_before, rss_after, delta_mb, pkg_mb
+        );
+        assert!(
+            delta_mb < pkg_mb * 0.3,
+            "upload path RSS grew {:.1} MB for {:.0} MB package — load/install not streaming!",
+            delta_mb,
+            pkg_mb
+        );
     }
 }

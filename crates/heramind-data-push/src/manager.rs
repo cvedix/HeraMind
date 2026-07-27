@@ -7,6 +7,7 @@ use crate::template::TemplateRenderer;
 use crate::types::*;
 use anyhow::{anyhow, Result};
 use heramind_core::EventBus;
+use heramind_devices::TimeSeriesStorage;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
@@ -16,11 +17,29 @@ pub struct PushManager {
     store: Arc<DataPushStore>,
     scheduler: Arc<PushScheduler>,
     renderer: Arc<TemplateRenderer>,
+    telemetry_storage: Option<Arc<TimeSeriesStorage>>,
 }
 
 impl PushManager {
     /// Create a new PushManager.
     pub fn new(data_dir: &Path, event_bus: Option<Arc<EventBus>>) -> Result<Self> {
+        Self::open(data_dir, event_bus, None)
+    }
+
+    /// Create a new PushManager with telemetry access for latest-value tests.
+    pub fn new_with_telemetry(
+        data_dir: &Path,
+        event_bus: Option<Arc<EventBus>>,
+        telemetry_storage: Arc<TimeSeriesStorage>,
+    ) -> Result<Self> {
+        Self::open(data_dir, event_bus, Some(telemetry_storage))
+    }
+
+    fn open(
+        data_dir: &Path,
+        event_bus: Option<Arc<EventBus>>,
+        telemetry_storage: Option<Arc<TimeSeriesStorage>>,
+    ) -> Result<Self> {
         let db_path = data_dir.join("data-push.redb");
         let store = DataPushStore::open(&db_path)?;
         let store = Arc::new(store);
@@ -35,11 +54,21 @@ impl PushManager {
             store,
             scheduler,
             renderer,
+            telemetry_storage,
         })
     }
 
     /// Create a new PushManager with in-memory storage (for testing).
     pub fn memory() -> Result<Self> {
+        Self::memory_inner(None)
+    }
+
+    /// Create a new in-memory PushManager with telemetry access (for testing).
+    pub fn memory_with_telemetry(telemetry_storage: Arc<TimeSeriesStorage>) -> Result<Self> {
+        Self::memory_inner(Some(telemetry_storage))
+    }
+
+    fn memory_inner(telemetry_storage: Option<Arc<TimeSeriesStorage>>) -> Result<Self> {
         let store = Arc::new(DataPushStore::memory()?);
         let renderer = Arc::new(TemplateRenderer::new());
         let scheduler = Arc::new(PushScheduler::new(store.clone(), None, renderer.clone()));
@@ -47,6 +76,7 @@ impl PushManager {
             store,
             scheduler,
             renderer,
+            telemetry_storage,
         })
     }
 
@@ -205,7 +235,9 @@ impl PushManager {
         self.store.list_targets()
     }
 
-    /// Test a push target by sending sample data.
+    /// Test a push target. If it is bound to a concrete source/metric (or
+    /// source prefix), use the latest real telemetry value; otherwise send a
+    /// synthetic sample.
     pub async fn test_target(&self, id: &str) -> Result<DeliveryLog> {
         let target = self
             .store
@@ -214,12 +246,14 @@ impl PushManager {
 
         let dest = create_destination(&target.target_type, &target.config)?;
 
-        let ctx = TemplateContext {
-            source_id: "test:sample:value".to_string(),
-            value: json!({"test": true, "value": 42}),
-            timestamp: chrono::Utc::now().timestamp(),
-            metadata: None,
+        let ctx = if let Some(telemetry) = &self.telemetry_storage {
+            latest_context_from_filter(telemetry, &target.data_filter)
+                .await?
+                .unwrap_or_else(sample_test_context)
+        } else {
+            sample_test_context()
         };
+        let data_source_id = ctx.source_id.clone();
 
         let payload = self.renderer.render(&target.template, &ctx)?;
         let now = chrono::Utc::now().timestamp();
@@ -228,7 +262,7 @@ impl PushManager {
             id: uuid::Uuid::new_v4().to_string(),
             target_id: target.id.clone(),
             status: DeliveryStatus::Pending,
-            data_source_id: "test:sample:value".to_string(),
+            data_source_id,
             payload_sent: payload.clone(),
             response: None,
             attempts: 1,
@@ -281,6 +315,118 @@ impl PushManager {
     }
 }
 
+fn sample_test_context() -> TemplateContext {
+    let now = chrono::Utc::now().timestamp();
+    TemplateContext {
+        source_id: "test:sample:value".to_string(),
+        value: json!({"test": true, "value": 42}),
+        timestamp: now,
+    }
+}
+
+async fn latest_context_from_filter(
+    telemetry: &TimeSeriesStorage,
+    filter: &DataSourceFilter,
+) -> Result<Option<TemplateContext>> {
+    let mut best: Option<TemplateContext> = None;
+
+    for pattern in &filter.source_patterns {
+        let Some(candidate) = query_latest_for_pattern(telemetry, pattern).await? else {
+            continue;
+        };
+
+        if best
+            .as_ref()
+            .is_none_or(|current| candidate.timestamp > current.timestamp)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    Ok(best)
+}
+
+async fn query_latest_for_pattern(
+    telemetry: &TimeSeriesStorage,
+    pattern: &str,
+) -> Result<Option<TemplateContext>> {
+    let Some((source_id, metric)) = parse_bound_source_pattern(pattern) else {
+        return Ok(None);
+    };
+
+    if let Some(metric) = metric {
+        return latest_context_for_metric(telemetry, &source_id, &metric).await;
+    }
+
+    let metrics = telemetry.list_metrics(&source_id).await?;
+    let mut best: Option<TemplateContext> = None;
+
+    for metric in metrics {
+        // Skip non-business metrics when auto-selecting a sample: `_raw` is the
+        // whole-payload dump and `ts` is the device clock (a timestamp, not a
+        // reading). `virtual.*` (extension/transform outputs) ARE valid business
+        // data — keep them. Explicitly binding any field as an exact metric is
+        // unaffected either way (that path above never filtered).
+        if metric == "_raw" || metric == "ts" {
+            continue;
+        }
+        let Some(candidate) = latest_context_for_metric(telemetry, &source_id, &metric).await?
+        else {
+            continue;
+        };
+
+        if best
+            .as_ref()
+            .is_none_or(|current| candidate.timestamp > current.timestamp)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    Ok(best)
+}
+
+fn parse_bound_source_pattern(pattern: &str) -> Option<(String, Option<String>)> {
+    let normalized = pattern.trim().trim_end_matches('*').trim_end_matches(':');
+    if normalized.is_empty() || normalized == "*" {
+        return None;
+    }
+
+    let mut parts = normalized.splitn(3, ':');
+    let source_type = parts.next()?;
+    let source_name = parts.next()?;
+    if source_type.is_empty() || source_name.is_empty() {
+        return None;
+    }
+
+    let source_id = format!("{}:{}", source_type, source_name);
+    let metric = parts
+        .next()
+        .filter(|metric| !metric.is_empty())
+        .map(ToOwned::to_owned);
+
+    Some((source_id, metric))
+}
+
+async fn latest_context_for_metric(
+    telemetry: &TimeSeriesStorage,
+    source_id: &str,
+    metric: &str,
+) -> Result<Option<TemplateContext>> {
+    let Some(point) = telemetry.latest(source_id, metric).await? else {
+        return Ok(None);
+    };
+
+    let mut value = point.value.to_json_value();
+    crate::scheduler::resolve_image_urls_in_value(&mut value);
+
+    Ok(Some(TemplateContext {
+        source_id: format!("{}:{}", source_id, metric),
+        value,
+        timestamp: point.timestamp,
+    }))
+}
+
 // ========== Request DTOs ==========
 
 /// Request to create a new push target.
@@ -309,4 +455,135 @@ pub struct UpdateTargetRequest {
     pub enabled: Option<bool>,
     pub retry_config: Option<RetryConfig>,
     pub batch_config: Option<BatchConfig>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use heramind_devices::{DataPoint, MetricValue, TimeSeriesStorage};
+
+    #[tokio::test]
+    async fn test_latest_context_from_exact_metric_pattern() {
+        let telemetry = TimeSeriesStorage::memory().unwrap();
+        telemetry
+            .write(
+                "device:sensor-1",
+                "temperature",
+                DataPoint::new(1700000000, MetricValue::Float(23.5)),
+            )
+            .await
+            .unwrap();
+
+        let filter = DataSourceFilter {
+            source_patterns: vec!["device:sensor-1:temperature".to_string()],
+            only_changes: false,
+        };
+
+        let ctx = latest_context_from_filter(&telemetry, &filter)
+            .await
+            .unwrap()
+            .expect("latest context");
+        assert_eq!(ctx.source_id, "device:sensor-1:temperature");
+        assert_eq!(ctx.value, json!(23.5));
+        assert_eq!(ctx.timestamp, 1700000000);
+    }
+
+    #[tokio::test]
+    async fn test_latest_context_from_source_prefix_pattern_uses_newest_metric() {
+        let telemetry = TimeSeriesStorage::memory().unwrap();
+        telemetry
+            .write(
+                "device:sensor-1",
+                "temperature",
+                DataPoint::new(1700000000, MetricValue::Float(23.5)),
+            )
+            .await
+            .unwrap();
+        telemetry
+            .write(
+                "device:sensor-1",
+                "humidity",
+                DataPoint::new(1700000020, MetricValue::Integer(61)),
+            )
+            .await
+            .unwrap();
+
+        // The prefix-pattern branch goes through `list_metrics`, which reads the
+        // persisted `metrics_info` index — populated on flush, NOT by `write`
+        // (which only updates the latest-value cache that `latest()` reads).
+        // Flush so the index reflects the just-written metrics, mirroring
+        // production where the background flush task keeps it fresh.
+        telemetry.flush().unwrap();
+
+        let filter = DataSourceFilter {
+            source_patterns: vec!["device:sensor-1:*".to_string()],
+            only_changes: false,
+        };
+
+        let ctx = latest_context_from_filter(&telemetry, &filter)
+            .await
+            .unwrap()
+            .expect("latest context");
+        assert_eq!(ctx.source_id, "device:sensor-1:humidity");
+        assert_eq!(ctx.value, json!(61));
+        assert_eq!(ctx.timestamp, 1700000020);
+    }
+
+    #[tokio::test]
+    async fn test_latest_context_keeps_virtual_skips_raw_and_ts() {
+        let telemetry = TimeSeriesStorage::memory().unwrap();
+        // virtual/transform outputs are valid business data — keep them.
+        telemetry
+            .write(
+                "device:s1",
+                "virtual.ocr.detections",
+                DataPoint::new(1700000020, MetricValue::String("[{}]".to_string())),
+            )
+            .await
+            .unwrap();
+        // _raw (dump) and ts (device clock) are not business data — skip them,
+        // even though they're newer than the virtual metric.
+        telemetry
+            .write(
+                "device:s1",
+                "_raw",
+                DataPoint::new(1700000030, MetricValue::String("{}".to_string())),
+            )
+            .await
+            .unwrap();
+        telemetry
+            .write(
+                "device:s1",
+                "ts",
+                DataPoint::new(1700000040, MetricValue::Integer(1740640441220)),
+            )
+            .await
+            .unwrap();
+        telemetry.flush().unwrap();
+
+        let filter = DataSourceFilter {
+            source_patterns: vec!["device:s1:*".to_string()],
+            only_changes: false,
+        };
+        let ctx = latest_context_from_filter(&telemetry, &filter)
+            .await
+            .unwrap()
+            .expect("latest context");
+        // virtual is the newest eligible metric — _raw and ts are skipped.
+        assert_eq!(ctx.source_id, "device:s1:virtual.ocr.detections");
+    }
+
+    #[tokio::test]
+    async fn test_latest_context_ignores_unbound_patterns() {
+        let telemetry = TimeSeriesStorage::memory().unwrap();
+        let filter = DataSourceFilter {
+            source_patterns: vec!["*".to_string()],
+            only_changes: false,
+        };
+
+        let ctx = latest_context_from_filter(&telemetry, &filter)
+            .await
+            .unwrap();
+        assert!(ctx.is_none());
+    }
 }

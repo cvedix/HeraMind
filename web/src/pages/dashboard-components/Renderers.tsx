@@ -332,7 +332,7 @@ const ComponentWrapper = memo(function ComponentWrapper({
         </div>
       )}
       {isMobile && editMode && (
-        <div className={cn('absolute inset-0 z-10 flex items-center justify-center rounded-lg', isSelected ? 'bg-transparent' : 'bg-bg-30/20')}>
+        <div className={cn('absolute inset-0 z-10 flex items-center justify-center rounded-lg', isSelected ? 'bg-transparent' : 'bg-muted-30')}>
           {onSelect && (
             <button className={cn('absolute inset-0', isSelected ? 'pointer-events-none' : 'cursor-pointer')}
               onClick={handleEditButtonMouseEvent} onTouchEnd={handleEditButtonTouchEvent} aria-label="Select component" />

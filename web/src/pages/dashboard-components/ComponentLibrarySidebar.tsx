@@ -201,7 +201,7 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
                                 className={`w-full h-[72px] flex items-center gap-3 py-2 px-3 rounded-xl border bg-background hover:shadow-sm transition-all duration-200 cursor-pointer active:scale-[0.98] text-left ${isHighlighted ? 'border-primary shadow-sm ring-2 ring-primary animate-[fadeHighlight_2s_ease-out_forwards]' : 'border-border'}`}
                               >
                                 <span className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${category.categoryColor}`}>
-                                  <Icon className="h-4.5 w-4.5 shrink-0" />
+                                  <Icon className="h-4 w-4 shrink-0" />
                                 </span>
                                 <div className="flex-1 min-w-0">
                                   <span className="text-xs font-medium block truncate">{item.name}</span>

@@ -56,9 +56,18 @@ pub struct DeviceTypeTemplate {
     /// `None` = use global default. Forward-compatible via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_offline_timeout_secs: Option<u64>,
-    /// Builtin template version (e.g. "1.0.0"). Only set for official templates.
-    /// When present, the seeder will update the template if a newer version is bundled.
-    /// User-created templates have this as None and are never overwritten by the seeder.
+    /// If `Some(false)`, skip storing the `_raw` metric (full payload snapshot)
+    /// for devices of this type. `None` (default) = inherit the extractor's
+    /// `store_raw` config (currently always true). Set `Some(false)` for
+    /// large-payload devices (e.g. cameras) whose structured metrics already
+    /// cover all fields. Forward-compatible via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_raw: Option<bool>,
+    /// Builtin template version — historical/provenance marker only.
+    /// Older HeraMind builds set this when seeding built-in templates; the
+    /// seeder is now insert-only (never overwrites existing templates), so
+    /// this field drives no behavior. Kept for backward-compatible
+    /// deserialization of records written by older installs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin_version: Option<String>,
 }
@@ -325,26 +334,6 @@ pub enum CommandStatus {
 pub struct DeviceRegistryStore {
     db: Arc<Database>,
     path: String,
-}
-
-/// Compare semver-style version strings (e.g. "1.2.3" > "1.2.0").
-/// Returns true if `new_ver` is strictly newer than `old_ver`.
-fn is_newer_version(new_ver: &str, old_ver: &str) -> bool {
-    let parse = |s: &str| -> Vec<u32> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
-    let new_parts = parse(new_ver);
-    let old_parts = parse(old_ver);
-    let len = new_parts.len().max(old_parts.len());
-    for i in 0..len {
-        let n = new_parts.get(i).copied().unwrap_or(0);
-        let o = old_parts.get(i).copied().unwrap_or(0);
-        if n > o {
-            return true;
-        }
-        if n < o {
-            return false;
-        }
-    }
-    false
 }
 
 /// Global device registry store singleton (thread-safe).
@@ -867,12 +856,11 @@ impl DeviceRegistryStore {
 
     /// Seed built-in device type templates (NE101, NE301, etc.).
     ///
-    /// Behavior:
-    /// - Template doesn't exist → **insert** (fresh install)
-    /// - Template exists AND has a `builtin_version` → **update** if bundled version is newer
-    /// - Template exists but has NO `builtin_version` → **skip** (user-created or user-modified)
-    ///
-    /// This allows official template updates to propagate while preserving user customizations.
+    /// Insert-only: a template is written **only when it does not yet exist**.
+    /// Existing templates are never overwritten — software upgrades must not
+    /// clobber a user's local device types (whether from a prior seed, a cloud
+    /// import, or an edit). To update a type to the latest official definition,
+    /// the user re-imports it from the cloud repo, which overwrites.
     pub fn seed_builtin_templates(&self) -> Result<usize, Error> {
         let templates: &[(&str, &str)] = &[
             (
@@ -887,33 +875,16 @@ impl DeviceRegistryStore {
 
         let mut changed = 0;
         for (device_type, json) in templates {
-            let mut bundled: DeviceTypeTemplate = serde_json::from_str(json).map_err(|e| {
+            // Already exists (prior seed / cloud import / user edit) → never
+            // overwrite. Upgrades must not touch local device types.
+            if self.load_template(device_type)?.is_some() {
+                continue;
+            }
+            let bundled: DeviceTypeTemplate = serde_json::from_str(json).map_err(|e| {
                 Error::Serialization(format!("Invalid builtin template {}: {}", device_type, e))
             })?;
-            // Builtin template version. Bump when pulling updated templates from
-            // CVEDIX/HeraMind-DeviceTypes to propagate updates to existing installs.
-            bundled.builtin_version = Some("1.0.1".to_string());
-
-            match self.load_template(device_type)? {
-                // Doesn't exist → insert
-                None => {
-                    self.save_template(&bundled)?;
-                    changed += 1;
-                }
-                // Exists → check if it's a builtin that needs updating
-                Some(existing) => {
-                    // Only update if the stored template was seeded by the builtin system
-                    if let Some(ref stored_ver) = existing.builtin_version {
-                        if let Some(ref bundled_ver) = bundled.builtin_version {
-                            if is_newer_version(bundled_ver, stored_ver) {
-                                self.save_template(&bundled)?;
-                                changed += 1;
-                            }
-                        }
-                    }
-                    // else: user-created template (no builtin_version) → skip
-                }
-            }
+            self.save_template(&bundled)?;
+            changed += 1;
         }
         Ok(changed)
     }
@@ -1038,6 +1009,7 @@ mod tests {
             uplink_samples: vec![],
             commands: vec![],
             default_offline_timeout_secs: None,
+            store_raw: None,
             builtin_version: None,
         };
 
@@ -1221,8 +1193,6 @@ mod tests {
         assert_eq!(ne101.device_type, "ne101_camera");
         assert!(ne101.name.contains("NE101") || ne101.name.contains("Sensing"));
         assert!(!ne101.metrics.is_empty());
-        // Builtin templates should have version set
-        assert_eq!(ne101.builtin_version.as_deref(), Some("1.0.1"));
 
         // Verify NE301 content
         let ne301 = store.load_template("ne301_camera").unwrap().unwrap();
@@ -1230,11 +1200,44 @@ mod tests {
         assert!(ne301.name.contains("NE301") || ne301.name.contains("Edge AI"));
         assert!(!ne301.metrics.is_empty());
         assert!(!ne301.commands.is_empty()); // NE301 has capture/sleep commands
-        assert_eq!(ne301.builtin_version.as_deref(), Some("1.0.1"));
 
-        // Second seed should not overwrite (same version = idempotent)
+        // Second seed is a no-op (insert-only: existing templates are never touched)
         let seeded_again = store.seed_builtin_templates().unwrap();
         assert_eq!(seeded_again, 0);
+    }
+
+    #[test]
+    fn test_seed_never_overwrites_existing_template() {
+        // Software upgrades must not overwrite a user's local device types.
+        // Pre-seed NE101 with custom content; the seeder must leave it
+        // untouched and only insert the still-absent NE301. Users update a
+        // type explicitly via cloud import — never via the builtin seeder.
+        let store = create_temp_store();
+
+        // Pre-seed NE101 with custom user content (store_raw unset on purpose)
+        let custom = DeviceTypeTemplate {
+            device_type: "ne101_camera".to_string(),
+            name: "My Custom NE101".to_string(),
+            description: "user-modified".to_string(),
+            categories: vec![],
+            mode: DeviceTypeMode::Full,
+            metrics: vec![],
+            uplink_samples: vec![],
+            commands: vec![],
+            default_offline_timeout_secs: None,
+            store_raw: None,
+            builtin_version: None,
+        };
+        store.save_template(&custom).unwrap();
+
+        // Seed must NOT overwrite the existing NE101; only insert NE301 fresh
+        let seeded = store.seed_builtin_templates().unwrap();
+        assert_eq!(seeded, 1, "only NE301 inserted; existing NE101 untouched");
+
+        // Existing NE101 is preserved verbatim (not reset to the bundled one)
+        let loaded = store.load_template("ne101_camera").unwrap().unwrap();
+        assert_eq!(loaded.name, "My Custom NE101");
+        assert_eq!(loaded.store_raw, None);
     }
 
     #[test]
@@ -1253,6 +1256,7 @@ mod tests {
             commands: vec![],
             default_offline_timeout_secs: None,
             builtin_version: None, // No version = user-created
+            store_raw: None,
         };
         store.save_template(&user_template).unwrap();
 

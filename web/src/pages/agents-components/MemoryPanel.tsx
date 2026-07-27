@@ -723,32 +723,37 @@ export const MemoryPanel = forwardRef<MemoryPanelRef, MemoryPanelProps>(function
           onClose={() => setCreateDialogOpen(false)}
         />
 
-        <FullScreenDialogContent>
-          <div className="space-y-4 p-6 max-w-lg mx-auto">
-            <div className="space-y-2">
-              <Label>{t("systemMemory.custom.fileName", "File Name")}</Label>
-              <Input
-                value={newFileName}
-                onChange={(e) => {
-                  const val = e.target.value.replace(/[^a-z0-9_-]/g, "")
-                  if (val.length <= 32) setNewFileName(val)
-                }}
-                placeholder="e.g. device-map"
-                className="font-mono"
-              />
-              <p className="text-xs text-muted-foreground">
-                {t("systemMemory.custom.fileNameHint", "Lowercase letters, digits, hyphens, underscores. 1-32 chars.")}
-              </p>
-            </div>
-            <div className="space-y-2">
-              <Label>{t("systemMemory.custom.fileContent", "Content (Markdown)")}</Label>
-              <textarea
-                className="w-full h-48 rounded-md border border-input bg-background px-3 py-2 text-sm font-mono resize-none focus:outline-none focus:ring-2 focus:ring-ring"
-                value={newFileContent}
-                onChange={(e) => setNewFileContent(e.target.value)}
-                placeholder="# My Custom Knowledge..."
-              />
-            </div>
+        <FullScreenDialogContent className="flex-col">
+          {/* File name — compact bar at top, full width */}
+          <div className="px-6 pt-4 pb-3 border-b shrink-0 space-y-1.5">
+            <Label>{t("systemMemory.custom.fileName", "File Name")}</Label>
+            <Input
+              value={newFileName}
+              onChange={(e) => {
+                const val = e.target.value.replace(/[^a-z0-9_-]/g, "")
+                if (val.length <= 32) setNewFileName(val)
+              }}
+              placeholder="e.g. device-map"
+              className="font-mono"
+            />
+            <p className="text-xs text-muted-foreground">
+              {t("systemMemory.custom.fileNameHint", "Lowercase letters, digits, hyphens, underscores. 1-32 chars.")}
+            </p>
+          </div>
+          {/* Content editor — fills the rest (mirrors the View/Edit dialog) */}
+          <div className="w-full flex-1 min-h-0 overflow-hidden">
+            <CodeMirror
+              value={newFileContent}
+              height="100%"
+              onChange={(value) => setNewFileContent(value)}
+              theme={isDark ? "dark" : "light"}
+              style={{
+                fontSize: "14px",
+                fontFamily: fontMonoStack,
+                height: "100%",
+                width: "100%",
+              }}
+            />
           </div>
         </FullScreenDialogContent>
 

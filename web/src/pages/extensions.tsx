@@ -138,7 +138,7 @@ export function ExtensionsPage() {
           <div className="px-4 py-2 sm:px-6 md:px-8">
             <div className="flex shrink-0 flex-wrap items-center gap-1.5 sm:gap-2">
               <Button
-                variant="outline"
+                variant="default"
                 size="sm"
                 onClick={() => setMarketplaceDialogOpen(true)}
               >

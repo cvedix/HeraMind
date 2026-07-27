@@ -1,4 +1,5 @@
 import React from 'react'
+import { Eye } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { chartColorsHex } from '@/design-system/tokens/color'
 import { Field } from '@/components/ui/field'
@@ -115,6 +116,9 @@ export function getAIAnalystSchema(config: any, ctx: SchemaContext, u: Updaters)
                               <div className="flex items-center gap-2">
                                 <span>{model.name}</span>
                                 <span className="text-xs text-muted-foreground">({model.backendName})</span>
+                                {model.isMultimodal && (
+                                  <Eye className="h-3 w-3 text-info" />
+                                )}
                               </div>
                             </SelectItem>
                           ))}

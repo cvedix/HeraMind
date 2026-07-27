@@ -7,6 +7,31 @@ use crate::api_client::extract_inner_data;
 use crate::types::{BuildMeta, CliResponse};
 use crate::ApiClient;
 
+/// Parse comma-separated source patterns into a Vec<String>.
+/// Empty/blank input → `[]` (matches all sources). Filters blank pieces so
+/// "a,,b" → ["a","b"] and "" → [] (previously "" produced the bogus [""]).
+fn parse_source_patterns(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Lift mistakenly-nested top-level fields (data_filter, schedule, template)
+/// out of `--config` into the request body. Prevents the common error where
+/// `--config '{"...","data_filter":{...}}'` silently no-ops because those are
+/// PushTarget top-level fields, not webhook/mqtt config.
+fn lift_top_level_fields(config: &mut serde_json::Value, body: &mut serde_json::Value) {
+    const TOP_LEVEL: &[&str] = &["data_filter", "schedule", "template"];
+    if let Some(obj) = config.as_object_mut() {
+        for key in TOP_LEVEL {
+            if let Some(val) = obj.remove(*key) {
+                body[*key] = val;
+            }
+        }
+    }
+}
+
 /// List push targets with compact summary.
 ///
 /// Returns id, name, type, and enabled per target.
@@ -79,7 +104,7 @@ pub async fn create_target(
     }
 
     // 3. Validate config is valid JSON
-    let config_val: serde_json::Value = match serde_json::from_str(config) {
+    let mut config_val: serde_json::Value = match serde_json::from_str(config) {
         Ok(v) => v,
         Err(e) => {
             return Ok(CliResponse::error_with_suggestion(
@@ -117,16 +142,19 @@ pub async fn create_target(
         }),
     };
 
-    let body = json!({
+    let mut body = json!({
         "name": name,
         "target_type": target_type,
-        "config": config_val,
         "schedule": schedule,
         "data_filter": {
-            "source_patterns": source_patterns.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>(),
+            "source_patterns": parse_source_patterns(source_patterns),
             "only_changes": false
         }
     });
+    // Lift any top-level fields (data_filter/schedule/template) an AI/user may
+    // have nested inside --config, then attach the cleaned config.
+    lift_top_level_fields(&mut config_val, &mut body);
+    body["config"] = config_val;
 
     let data = client.post("/data-push", &body).await?;
     let data = extract_inner_data(data);
@@ -148,22 +176,54 @@ pub async fn create_target(
 }
 
 /// Update a push target.
+#[allow(clippy::too_many_arguments)]
 pub async fn update_target(
     client: &ApiClient,
     id: &str,
     name: Option<&str>,
     config: Option<&str>,
     enabled: Option<bool>,
+    sources: Option<&str>,
+    schedule: Option<&str>,
+    template: Option<&str>,
+    only_changes: Option<bool>,
 ) -> Result<CliResponse> {
     let mut body = json!({});
     if let Some(n) = name {
         body["name"] = json!(n);
     }
     if let Some(c) = config {
-        body["config"] = serde_json::from_str(c).unwrap_or_else(|_| json!({"url": c}));
+        // Parse config; lift any mistakenly-nested top-level fields out so they
+        // take effect instead of being silently swallowed by the webhook/mqtt
+        // config parser.
+        let mut cfg_val: serde_json::Value =
+            serde_json::from_str(c).unwrap_or_else(|_| json!({"url": c}));
+        lift_top_level_fields(&mut cfg_val, &mut body);
+        body["config"] = cfg_val;
     }
     if let Some(e) = enabled {
         body["enabled"] = json!(e);
+    }
+    // Source filter. only_changes only takes effect together with --sources,
+    // because data_filter is replaced as a whole (we can't patch one field
+    // without knowing the existing patterns from the server side).
+    if let Some(src) = sources {
+        body["data_filter"] = json!({
+            "source_patterns": parse_source_patterns(src),
+            "only_changes": only_changes.unwrap_or(false),
+        });
+    }
+    if let Some(sched) = schedule {
+        body["schedule"] = match sched {
+            "interval" => json!({ "type": "interval", "interval_secs": 60 }),
+            _ => json!({
+                "type": "event_driven",
+                "event_types": ["device_metric", "extension_output"]
+            }),
+        };
+    }
+    if let Some(tpl) = template {
+        body["template"] = serde_json::from_str(tpl).unwrap_or_else(|_| json!(tpl));
     }
 
     let data = client.put(&format!("/data-push/{}", id), &body).await?;
@@ -236,4 +296,57 @@ pub async fn get_stats(client: &ApiClient) -> Result<CliResponse> {
         extract_inner_data(data),
         "Push stats retrieved",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_source_patterns_empty_is_empty_vec_not_empty_string() {
+        // Regression: "" used to produce the bogus [""] via split(',').
+        assert_eq!(parse_source_patterns(""), Vec::<String>::new());
+        assert_eq!(parse_source_patterns("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_source_patterns_splits_trims_and_drops_blanks() {
+        assert_eq!(
+            parse_source_patterns("device:a:, device:b: "),
+            vec!["device:a:", "device:b:"]
+        );
+        // "a,,b," → ["a","b"] (blank pieces dropped)
+        assert_eq!(parse_source_patterns("a,,b,"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn lift_top_level_fields_moves_data_filter_and_schedule() {
+        let mut config = json!({
+            "url": "https://example.com",
+            "data_filter": { "source_patterns": ["device:x:"], "only_changes": true },
+            "schedule": { "type": "event_driven" }
+        });
+        let mut body = json!({});
+        lift_top_level_fields(&mut config, &mut body);
+
+        // lifted to body top level
+        assert_eq!(body["data_filter"]["source_patterns"], json!(["device:x:"]));
+        assert_eq!(body["data_filter"]["only_changes"], true);
+        assert_eq!(body["schedule"]["type"], "event_driven");
+        // removed from config
+        assert!(config.get("data_filter").is_none());
+        assert!(config.get("schedule").is_none());
+        // target-specific config preserved
+        assert_eq!(config["url"], "https://example.com");
+    }
+
+    #[test]
+    fn lift_top_level_fields_noop_when_clean_config() {
+        let mut config = json!({ "url": "https://example.com", "headers": {} });
+        let mut body = json!({});
+        lift_top_level_fields(&mut config, &mut body);
+        assert!(body.as_object().unwrap().is_empty());
+        assert_eq!(config["url"], "https://example.com");
+    }
 }

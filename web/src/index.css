@@ -646,11 +646,21 @@ html {
     background-size: 150% 150%;
   }
 
-  /* Respect reduced-motion: freeze the gradient (still visible, just static).
-     Also the sensible default for battery/perf-sensitive contexts. */
+  /* Respect reduced-motion: freeze the aurora gradient (still visible, just
+     static) AND neutralize decorative animations/transitions app-wide. The
+     0.01ms duration (not `none`) lets Radix enter/exit animations still fire
+     their animationend/unmount so nothing gets stuck mid-transition. */
   @media (prefers-reduced-motion: reduce) {
     .aurora-bg {
       animation: none;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
     }
   }
 
@@ -1388,4 +1398,18 @@ html {
     outline: 2px solid var(--primary);
     outline-offset: 2px;
   }
+}
+/* Brand icon gradient — paints an SVG icon's stroke with HeraMind's
+   blue gradient (see <BrandGradientDef/>).
+   CSS `stroke`/`stroke-width` (specificity 0,1,0) override lucide's
+   stroke="currentColor" / stroke-width="2" presentation attributes. */
+.brand-icon-stroke {
+  stroke: url(#brand-icon-gradient);
+  stroke-width: 2.5;
+}
+
+/* Disable the Button base's active:scale-[0.97] press feedback on nav
+   icons — on small icons the 3% press-and-release reads as jitter. */
+.no-press-scale:active {
+  transform: none !important;
 }

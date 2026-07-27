@@ -15,10 +15,19 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
-
 // Clap command types now live in heramind_cli_ops::dispatch::commands
 use heramind_cli_ops::dispatch::commands::*;
 
+mod self_update;
+
+// Jemalloc global allocator (Linux only): glibc malloc's per-thread arenas
+// fragment over time and don't return freed memory to the OS (server RSS
+// climbed to 4-6 GB over days). jemalloc packs allocations tightly and
+// releases freed pages promptly. macOS/Windows use their own allocators
+// (not glibc) so they don't have this problem.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // Custom runtime with increased worker threads for better concurrent performance
 // Default is num_cpus, but we use more to handle block_in_place alternatives
@@ -121,52 +130,54 @@ async fn main() -> Result<()> {
         } => run_logs(tail, follow, level, since).await,
         Command::Extension { extension_cmd } => run_extension_cmd(extension_cmd).await,
         Command::CheckUpdate => run_check_update().await,
+        Command::Upgrade { version, yes } => self_update::run_upgrade(version, yes).await,
+        Command::Uninstall { purge, yes } => self_update::run_uninstall(purge, yes).await,
         Command::ApiKey { key_cmd } => run_api_key_cmd(key_cmd).await,
-        Command::Llm { llm_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_llm_cmd(llm_cmd).await,
-        ),
-        Command::Device { device_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_device_cmd(device_cmd).await,
-        ),
+        Command::Llm { llm_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_llm_cmd(llm_cmd).await)
+        }
+        Command::Device { device_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_device_cmd(device_cmd).await)
+        }
         Command::Dashboard { dashboard_cmd } => print_result(
             heramind_cli_ops::dispatch::handlers::run_dashboard_cmd(dashboard_cmd).await,
         ),
-        Command::Rule { rule_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_rule_cmd(rule_cmd).await,
-        ),
+        Command::Rule { rule_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_rule_cmd(rule_cmd).await)
+        }
         Command::Transform { transform_cmd } => print_result(
             heramind_cli_ops::dispatch::handlers::run_transform_cmd(transform_cmd).await,
         ),
-        Command::Agent { agent_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_agent_cmd(agent_cmd).await,
-        ),
-        Command::Message { message_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_message_cmd(message_cmd).await,
-        ),
-        Command::Push { push_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_push_cmd(push_cmd).await,
-        ),
-        Command::Widget { widget_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_widget_cmd(widget_cmd).await,
-        ),
-        Command::System { system_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_system_cmd(system_cmd).await,
-        ),
+        Command::Agent { agent_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_agent_cmd(agent_cmd).await)
+        }
+        Command::Message { message_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_message_cmd(message_cmd).await)
+        }
+        Command::Push { push_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_push_cmd(push_cmd).await)
+        }
+        Command::Widget { widget_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_widget_cmd(widget_cmd).await)
+        }
+        Command::System { system_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_system_cmd(system_cmd).await)
+        }
         Command::Connector { connector_cmd } => print_result(
             heramind_cli_ops::dispatch::handlers::run_connector_cmd(connector_cmd).await,
         ),
-        Command::Settings { settings_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_settings_cmd(settings_cmd).await,
-        ),
-        Command::Login { data_dir, force } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_login_cmd(data_dir, force).await,
-        ),
-        Command::Logout => print_result(
-            heramind_cli_ops::dispatch::handlers::run_logout_cmd().await,
-        ),
-        Command::Whoami => print_result(
-            heramind_cli_ops::dispatch::handlers::run_whoami_cmd().await,
-        ),
+        Command::Settings { settings_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_settings_cmd(settings_cmd).await)
+        }
+        Command::Login { data_dir, force } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_login_cmd(data_dir, force).await)
+        }
+        Command::Logout => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_logout_cmd().await)
+        }
+        Command::Whoami => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_whoami_cmd().await)
+        }
     }
 }
 
@@ -479,7 +490,7 @@ async fn run_check_update() -> Result<()> {
         .build()?;
 
     let response = client
-        .get("https://api.github.com/repos/camthink-ai/HeraMind/releases/latest")
+        .get("https://api.github.com/repos/cvedix/HeraMind/releases/latest")
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to check for updates: {}", e))?;
@@ -554,7 +565,7 @@ async fn run_check_update() -> Result<()> {
 
             println!("\nUpdate command:");
             println!(
-                "  curl -fsSL https://raw.githubusercontent.com/camthink-ai/HeraMind/main/scripts/install.sh | sh"
+                "  curl -fsSL https://raw.githubusercontent.com/cvedix/HeraMind/main/scripts/install.sh | sh"
             );
         }
     } else {
@@ -797,12 +808,20 @@ async fn run_logs(
 
     let log_dirs = [
         std::path::PathBuf::from("data/logs"),
-        // macOS: ~/Library/Application Support/com.heramind.heramind/logs/
+        // Current Tauri path (≥ 0.9.2): <app_data>/data/logs/
+        // macOS
+        std::path::PathBuf::from(&home)
+            .join("Library/Application Support/com.heramind.heramind/data/logs"),
+        // Linux
+        std::path::PathBuf::from(&home).join(".local/share/com.heramind.heramind/data/logs"),
+        // Windows
+        std::path::PathBuf::from(&appdata).join("com.heramind.heramind/data/logs"),
+        // Legacy Tauri path (≤ 0.9.1): <app_data>/logs/ — kept for one release
+        // so users upgrading from older versions can still read pre-migration
+        // logs via `heramind logs` before restarting the desktop app.
         std::path::PathBuf::from(&home)
             .join("Library/Application Support/com.heramind.heramind/logs"),
-        // Linux: ~/.local/share/com.heramind.heramind/logs/
         std::path::PathBuf::from(&home).join(".local/share/com.heramind.heramind/logs"),
-        // Windows: %APPDATA%/com.heramind.heramind/logs/
         std::path::PathBuf::from(&appdata).join("com.heramind.heramind/logs"),
         // Fallback: ~/.heramind/logs/
         std::path::PathBuf::from(&home).join(".heramind/logs"),
@@ -975,9 +994,7 @@ async fn run_extension_cmd(cmd: ExtensionCommand) -> Result<()> {
             unreachable!()
         }
         // API commands — delegate to cli-ops handler (shared with in-process dispatch).
-        _ => print_result(
-            heramind_cli_ops::dispatch::handlers::run_extension_cmd(cmd).await,
-        ),
+        _ => print_result(heramind_cli_ops::dispatch::handlers::run_extension_cmd(cmd).await),
     }
 }
 
@@ -1487,7 +1504,10 @@ fn build_extension(path: &std::path::PathBuf) -> Result<()> {
     let manifest = if manifest_path.exists() {
         let raw = fs::read_to_string(&manifest_path)?;
         serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
-            anyhow::anyhow!("Failed to parse manifest.json: {}. Please fix the JSON syntax.", e)
+            anyhow::anyhow!(
+                "Failed to parse manifest.json: {}. Please fix the JSON syntax.",
+                e
+            )
         })?
     } else {
         anyhow::bail!(
@@ -1619,7 +1639,10 @@ fn build_extension(path: &std::path::PathBuf) -> Result<()> {
     println!("✅ Extension packaged successfully!");
     println!("  Package: {}", nep_path.display());
     println!("  Size:    {} bytes", nep_size);
-    println!("  Install: heramind extension install {}", nep_path.display());
+    println!(
+        "  Install: heramind extension install {}",
+        nep_path.display()
+    );
     println!();
     // Structured marker for downstream parsing (agent, scripts).
     println!("NEP_PATH={}", nep_path.display());
@@ -1716,4 +1739,3 @@ async fn run_api_key_cmd(cmd: ApiKeyCommand) -> Result<()> {
     }
     Ok(())
 }
-

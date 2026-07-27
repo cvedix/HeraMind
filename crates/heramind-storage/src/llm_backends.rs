@@ -680,50 +680,6 @@ impl LlmBackendStore {
         }
     }
 
-    /// Get or create the default active backend
-    ///
-    /// If no active backend is set, this will:
-    /// 1. Try to migrate from legacy LlmSettings
-    /// 2. Or create a default Ollama instance
-    pub fn get_or_create_active_backend(&self) -> Result<LlmBackendInstance, Error> {
-        // Try to get existing active backend
-        if let Some(backend) = self.get_active_backend()? {
-            return Ok(backend);
-        }
-
-        // Try to migrate from legacy settings
-        #[cfg(feature = "settings")]
-        {
-            if let Ok(Some(legacy_backend)) = self.try_migrate_legacy() {
-                self.set_active_backend(&legacy_backend.id)?;
-                return Ok(legacy_backend);
-            }
-        }
-
-        // Create default Ollama instance
-        let default_instance = LlmBackendInstance::new(
-            "ollama-default".to_string(),
-            "Default Ollama".to_string(),
-            LlmBackendType::Ollama,
-        );
-
-        self.save_instance(&default_instance)?;
-        self.set_active_backend(&default_instance.id)?;
-
-        Ok(default_instance)
-    }
-
-    /// Try to migrate from legacy LlmSettings
-    ///
-    /// Note: Since LLM backends now use a separate database file (data/llm_backends.redb)
-    /// from the settings store (data/settings.redb), the legacy migration is disabled.
-    /// Users will need to configure their LLM backends through the new API.
-    #[cfg(feature = "settings")]
-    fn try_migrate_legacy(&self) -> Result<Option<LlmBackendInstance>, Error> {
-        // Legacy migration disabled - LLM backends use a separate database now
-        Ok(None)
-    }
-
     /// Generate a unique ID for a new instance
     pub fn generate_id(prefix: &str) -> String {
         format!(

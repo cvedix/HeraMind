@@ -990,6 +990,10 @@ export function DevicesPage() {
         open={cloudImportOpen}
         onOpenChange={setCloudImportOpen}
         onImportComplete={() => {
+          // Cloud import overwrites device types in storage; invalidate the
+          // fetchCache so the list refetches instead of showing stale data
+          // within the 10s TTL (otherwise imported updates look like no-ops).
+          fetchCache.invalidate('deviceTypes')
           fetchDeviceTypes()
           setCloudImportOpen(false)
         }}

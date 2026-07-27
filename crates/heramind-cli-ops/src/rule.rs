@@ -59,15 +59,26 @@ pub async fn get_rule(client: &ApiClient, id: &str) -> Result<CliResponse> {
 /// Create a new rule via JSON body.
 ///
 /// Accepts a raw JSON string that is forwarded to the API.
-pub async fn create_rule(
-    client: &ApiClient,
-    json_body: &str,
-) -> Result<CliResponse> {
-    let body: serde_json::Value = serde_json::from_str(json_body)
-        .map_err(|e| anyhow::anyhow!("Invalid JSON: {}", e))?;
+pub async fn create_rule(client: &ApiClient, json_body: &str) -> Result<CliResponse> {
+    let body: serde_json::Value = match serde_json::from_str(json_body) {
+        Ok(v) => v,
+        Err(e) => {
+            // Surface a copy-pasteable rule example so the caller (LLM agent
+            // or user) can self-correct instead of retrying blind. Matches the
+            // data_push/message error_with_suggestion gold standard.
+            return Ok(CliResponse::error_with_suggestion(
+                format!("Invalid JSON: {}", e),
+                "INVALID_JSON",
+                "Example: --body '{\"name\":\"HighTemp\",\"condition\":{\"condition_type\":\"comparison\",\"source\":\"device:sensor-001:temperature\",\"operator\":\"greater_than\",\"threshold\":30},\"actions\":[{\"type\":\"notify\",\"message\":\"Too hot!\"}]}'",
+            ));
+        }
+    };
 
     let data = client.post("/rules", &body).await?;
-    let rule = data.get("data").and_then(|d| d.get("rule")).unwrap_or(&data);
+    let rule = data
+        .get("data")
+        .and_then(|d| d.get("rule"))
+        .unwrap_or(&data);
     let rule_id = rule["id"].as_str().unwrap_or("unknown").to_string();
     let rule_name = rule["name"].as_str().unwrap_or("(unnamed)").to_string();
 
@@ -83,13 +94,20 @@ pub async fn create_rule(
 }
 
 /// Update rule via JSON body.
-pub async fn update_rule(
-    client: &ApiClient,
-    id: &str,
-    json_body: &str,
-) -> Result<CliResponse> {
-    let body: serde_json::Value = serde_json::from_str(json_body)
-        .map_err(|e| anyhow::anyhow!("Invalid JSON: {}", e))?;
+pub async fn update_rule(client: &ApiClient, id: &str, json_body: &str) -> Result<CliResponse> {
+    let body: serde_json::Value = match serde_json::from_str(json_body) {
+        Ok(v) => v,
+        Err(e) => {
+            // Surface a copy-pasteable rule example so the caller (LLM agent
+            // or user) can self-correct instead of retrying blind. Matches the
+            // data_push/message error_with_suggestion gold standard.
+            return Ok(CliResponse::error_with_suggestion(
+                format!("Invalid JSON: {}", e),
+                "INVALID_JSON",
+                "Example: --body '{\"name\":\"HighTemp\",\"condition\":{\"condition_type\":\"comparison\",\"source\":\"device:sensor-001:temperature\",\"operator\":\"greater_than\",\"threshold\":30},\"actions\":[{\"type\":\"notify\",\"message\":\"Too hot!\"}]}'",
+            ));
+        }
+    };
 
     let data = client.put(&format!("/rules/{}", id), &body).await?;
     Ok(CliResponse::success(data, "Rule updated"))

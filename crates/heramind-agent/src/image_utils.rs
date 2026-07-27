@@ -236,7 +236,46 @@ pub async fn resolve_image(
         return Ok((bytes, mime));
     }
 
-    // 3. Block non-http URL schemes with a clear error
+    // 3. Handle HeraMind internal image URLs (/api/images/<device>/<metric>/<ts>.<ext>)
+    //    This MUST come before local file path check because these URLs start with '/'
+    if input.starts_with("/api/images/") {
+        // Delegate to the shared read-side helper in heramind-devices (next to
+        // save_image_binary). Avoids read_local_image (canonicalize + system-
+        // path/extension/magic gate meant for arbitrary local paths); the
+        // helper centralizes path construction + traversal guard + MIME.
+        use heramind_devices::image_storage::{read_internal_image_url, ImageStorageError};
+
+        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+
+        let (bytes, mime) = read_internal_image_url(input, std::path::Path::new(&data_dir))
+            .map_err(|e| match e {
+                ImageStorageError::InvalidPathComponent(_) => {
+                    ImageIoError::PermissionDenied(e.to_string())
+                }
+                ImageStorageError::IoError(_) => ImageIoError::InvalidArguments(format!(
+                    "Failed to read /api/images/ URL {input}: {e}"
+                )),
+                ImageStorageError::UnknownFileType => {
+                    ImageIoError::InvalidArguments(format!("Unrecognized image file for {input}"))
+                }
+                ImageStorageError::TooLarge(_) => ImageIoError::InvalidArguments(format!(
+                    "Image file too large for /api/images/ URL {input}: {e}"
+                )),
+            })?;
+
+        tracing::info!(url = %input, size = bytes.len(), "Resolved /api/images/ URL");
+
+        if bytes.len() > max_size {
+            return Err(ImageIoError::InvalidArguments(format!(
+                "Image file too large: {} bytes (max {})",
+                bytes.len(),
+                max_size
+            )));
+        }
+        return Ok((bytes, mime.to_string()));
+    }
+
+    // 4. Block non-http URL schemes with a clear error
     if input.contains("://") {
         return Err(ImageIoError::InvalidArguments(format!(
             "Unsupported URL scheme in '{}'. Only http:// and https:// are supported.",
@@ -244,7 +283,7 @@ pub async fn resolve_image(
         )));
     }
 
-    // 4. Raw base64 detection (MUST come before local file path check).
+    // 5. Raw base64 detection (MUST come before local file path check).
     //
     // Why: a stripped JPEG base64 starts with "/9j/" and a PNG base64 starts
     // with "iVBORw0KGgo". The "/" prefix would otherwise be misclassified
@@ -286,7 +325,7 @@ pub async fn resolve_image(
         return Ok((bytes, mime));
     }
 
-    // 5. Local file path
+    // 6. Local file path
     if input.starts_with('/') || input.starts_with("./") {
         let bytes = read_local_image(input, max_size)?;
         let mime = detect_mime_from_bytes(&bytes)
@@ -295,7 +334,7 @@ pub async fn resolve_image(
         return Ok((bytes, mime));
     }
 
-    // 6. Fallback: treat as raw base64
+    // 7. Fallback: treat as raw base64
     if input.is_empty() {
         return Err(ImageIoError::InvalidArguments("Image data is empty".into()));
     }
@@ -965,6 +1004,132 @@ mod tests {
                 &bytes[..8],
                 &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
             );
+        }
+
+        #[serial_test::serial]
+        #[tokio::test]
+        async fn resolve_image_api_images_url_reads_file() {
+            // Create a temporary test directory
+            let temp_dir = std::env::temp_dir();
+            let test_data_dir =
+                temp_dir.join(format!("heramind_test_api_images_{}", uuid::Uuid::new_v4()));
+
+            // Set up test image directory
+            crate::testing_helpers::setup_test_image_dir(&test_data_dir)
+                .expect("Failed to set up test image directory");
+
+            // Set HERAMIND_DATA_DIR for this test
+            std::env::set_var("HERAMIND_DATA_DIR", test_data_dir.to_str().unwrap());
+
+            let client = make_client();
+
+            // Test /api/images/ URL resolution
+            let url = "/api/images/test-device-001/image/1234567890000.png";
+            let (bytes, mime) = resolve_image(url, &client, 10 * 1024 * 1024)
+                .await
+                .expect("resolve /api/images/ URL");
+
+            assert_eq!(mime, "image/png");
+            assert!(!bytes.is_empty());
+            assert_eq!(
+                &bytes[..8],
+                &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+            );
+
+            // Test JPEG URL
+            let jpg_url = "/api/images/test-device-001/image/1234567890001.jpg";
+            let (jpg_bytes, jpg_mime) = resolve_image(jpg_url, &client, 10 * 1024 * 1024)
+                .await
+                .expect("resolve /api/images/ JPEG URL");
+
+            assert_eq!(jpg_mime, "image/jpeg");
+            assert!(!jpg_bytes.is_empty());
+            assert_eq!(&jpg_bytes[..2], &[0xFF, 0xD8]);
+
+            // Clean up
+            crate::testing_helpers::cleanup_test_image_dir(&test_data_dir)
+                .expect("Failed to clean up test directory");
+            std::env::remove_var("HERAMIND_DATA_DIR");
+        }
+
+        #[serial_test::serial]
+        #[tokio::test]
+        async fn resolve_image_api_images_url_file_not_found() {
+            // Create a temporary test directory (empty, no images)
+            let temp_dir = std::env::temp_dir();
+            let test_data_dir = temp_dir.join(format!(
+                "heramind_test_api_images_empty_{}",
+                uuid::Uuid::new_v4()
+            ));
+
+            std::fs::create_dir_all(&test_data_dir).expect("Failed to create temp dir");
+
+            // Set HERAMIND_DATA_DIR for this test
+            std::env::set_var("HERAMIND_DATA_DIR", test_data_dir.to_str().unwrap());
+
+            let client = make_client();
+
+            // Test /api/images/ URL with non-existent file
+            let url = "/api/images/test-device-001/image/9999999999.png";
+            let result = resolve_image(url, &client, 10 * 1024 * 1024).await;
+
+            assert!(result.is_err(), "Should fail for non-existent file");
+
+            // Clean up
+            std::fs::remove_dir_all(&test_data_dir).expect("Failed to clean up test directory");
+            std::env::remove_var("HERAMIND_DATA_DIR");
+        }
+
+        #[serial_test::serial]
+        #[tokio::test]
+        async fn resolve_image_api_images_url_rejects_traversal() {
+            let temp_dir = std::env::temp_dir();
+            let test_data_dir = temp_dir.join(format!(
+                "heramind_test_api_images_traversal_{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&test_data_dir).expect("Failed to create temp dir");
+            std::env::set_var("HERAMIND_DATA_DIR", test_data_dir.to_str().unwrap());
+
+            let client = make_client();
+
+            for evil in [
+                "/api/images/../../etc/passwd",
+                "/api/images/test-device/../../../etc/passwd",
+                "/api/images/test-device/image/../../../etc/shadow.png",
+            ] {
+                let result = resolve_image(evil, &client, 10 * 1024 * 1024).await;
+                assert!(
+                    matches!(result, Err(ImageIoError::PermissionDenied(_))),
+                    "traversal URL {:?} should be rejected as PermissionDenied, got {:?}",
+                    evil,
+                    result
+                );
+            }
+
+            std::fs::remove_dir_all(&test_data_dir).expect("Failed to clean up test directory");
+            std::env::remove_var("HERAMIND_DATA_DIR");
+        }
+
+        #[tokio::test]
+        async fn resolve_image_api_images_url_backward_compatibility() {
+            // Ensure existing data URL, http URL, and base64 still work
+            let client = make_client();
+
+            // Test data URL (existing functionality)
+            let data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+            let (_bytes, mime) = resolve_image(data_url, &client, 10 * 1024 * 1024)
+                .await
+                .expect("data URL should still work");
+            assert_eq!(mime, "image/png");
+
+            // Test raw base64 (existing functionality)
+            // Use a valid base64 string with proper padding
+            let raw_base64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCgAyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg";
+            let (_b64_bytes, b64_mime) = resolve_image(raw_base64, &client, 10 * 1024 * 1024)
+                .await
+                .expect("raw base64 should still work");
+            assert_eq!(b64_mime, "image/jpeg");
         }
     }
 }

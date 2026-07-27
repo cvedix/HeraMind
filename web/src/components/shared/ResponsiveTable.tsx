@@ -121,7 +121,7 @@ export function ResponsiveTable({
         <div className="hidden md:block rounded-lg border bg-card overflow-hidden">
           <table className={cn("w-full caption-bottom text-sm", className)}>
             <thead className="[&_tr]:border-b">
-              <tr className="bg-muted rounded-t-lg">
+              <tr className="rounded-t-lg">
                 {columns.map((column) => (
                   <th
                     key={column.key}
@@ -190,7 +190,7 @@ export function ResponsiveTable({
             "[&_tr]:border-b",
             stickyHeader && "sticky top-0 z-10 bg-card"
           )}>
-            <tr className="bg-muted rounded-t-xl">
+            <tr className="rounded-t-xl">
               {columns.map((column) => (
                 <th
                   key={column.key}
@@ -342,7 +342,7 @@ export function ResponsiveTable({
                           <Button
                             variant="ghost"
                             size="icon"
-                            className="h-8 w-8 shrink-0 hover:bg-muted-foreground/10"
+                            className="h-8 w-8 shrink-0 hover:bg-muted"
                             aria-label="Actions"
                           >
                             <MoreVertical className="h-4 w-4" />

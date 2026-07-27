@@ -41,6 +41,7 @@ pub use stream_multimodal::process_multimodal_stream_events_with_safeguards;
 pub use thinking::cleanup_thinking_content;
 
 // Re-exports for internal crate use and test access
+pub(crate) use resolve::resolve_cached_arguments;
 pub(crate) use sanitize::{sanitize_tool_result_for_prompt, truncate_result_utf8};
 
 #[cfg(test)]
