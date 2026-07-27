@@ -175,14 +175,29 @@ export async function fetchHistoricalTelemetry(
 
       // Use unified telemetry endpoint for transform/ai sources, device endpoint otherwise
       const isUnifiedSource = deviceId.startsWith('transform:') || deviceId.startsWith('ai:')
+      const serverAggregate = (
+        aggregate === 'avg' ||
+        aggregate === 'min' ||
+        aggregate === 'max' ||
+        aggregate === 'sum' ||
+        aggregate === 'count'
+      ) ? aggregate : undefined
       let metricData: unknown[] | undefined
+      let serverAggregateValue: number | undefined
 
       const apiStart = performance.now()
       if (isUnifiedSource) {
-        const response = await api.queryTelemetry(deviceId, metricId, startSec, endSec, fetchLimit, false)
+        const response = await api.queryTelemetry(
+          deviceId, metricId, startSec, endSec, fetchLimit, false, serverAggregate,
+        )
         metricData = response?.data as unknown[] | undefined
+        if (serverAggregate && typeof response?.value === 'number') {
+          serverAggregateValue = response.value
+        }
       } else {
-        const response = await api.getDeviceTelemetry(deviceId, metricId, startSec, endSec, fetchLimit, undefined, false)
+        const response = await api.getDeviceTelemetry(
+          deviceId, metricId, startSec, endSec, fetchLimit, undefined, false, serverAggregate,
+        )
 
         // Find metric data — exact match, then case-insensitive
         if (response?.data && typeof response.data === 'object') {
@@ -198,12 +213,31 @@ export async function fetchHistoricalTelemetry(
               }
             }
           }
+
+          if (serverAggregate && metricData?.length) {
+            const point = metricData[0]
+            if (typeof point === 'object' && point !== null) {
+              const aggregatePoint = point as Record<string, unknown>
+              const aggregateValue = serverAggregate === 'avg'
+                ? aggregatePoint.value
+                : aggregatePoint[serverAggregate]
+              if (typeof aggregateValue === 'number') {
+                serverAggregateValue = aggregateValue
+              }
+            }
+          }
         }
       }
 
       const apiElapsed = performance.now() - apiStart
       if (apiElapsed > 2000) {
         console.warn(`[Telemetry] Slow query: ${deviceId}/${metricId} took ${Math.round(apiElapsed)}ms`)
+      }
+
+      if (serverAggregateValue !== undefined) {
+        const values = [serverAggregateValue]
+        telemetryCache.set(cacheKey, { data: values }, { cachedAt: Date.now() })
+        return { data: values, success: true }
       }
 
       if (Array.isArray(metricData) && metricData.length > 0) {

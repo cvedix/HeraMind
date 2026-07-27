@@ -156,6 +156,23 @@ export function processTelemetryEvent(
     else return
     if (eventValue === undefined) return
 
+    // Server-side count sources hold a single aggregate value. A live event
+    // increments that value instead of mixing the raw point into the aggregate.
+    if (ds.aggregateExt === 'count') {
+      setData((prevData: unknown) => {
+        const first = Array.isArray(prevData) ? prevData[0] : prevData
+        let current = 0
+        if (typeof first === 'number') current = first
+        else if (typeof first === 'object' && first !== null) {
+          const value = (first as Record<string, unknown>).value
+          if (typeof value === 'number') current = value
+        }
+        return [current + 1]
+      })
+      setLastUpdate(Date.now())
+      return
+    }
+
     const isImg = isImageDataSource(ds)
     const maxLimit = getDataSourceLimit(ds)
     const normalizedValue = isImg ? normalizeImageValue(eventValue) : eventValue

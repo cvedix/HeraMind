@@ -441,6 +441,9 @@ export function useStoreSource<T = unknown>(
               if (!cv || typeof cv !== 'object') continue
 
               for (const { ds, idx } of telSourcesWithIndex) {
+                // Aggregate values are maintained by server queries and WS events.
+                // Merging the store's latest raw value would replace/corrupt them.
+                if (ds.aggregateExt && ds.aggregateExt !== 'raw') continue
                 // Only device-sourced telemetry can match changedDeviceIds
                 if (ds.source !== 'device') continue
                 const dsId = getUnifiedId(ds)
