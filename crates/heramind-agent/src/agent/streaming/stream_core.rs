@@ -14,7 +14,11 @@ use super::context::{
     build_context_window_with_config, build_context_window_with_summary, ToolExecutionResult,
 };
 use super::dedup::deduplicate_tool_results;
-use super::intent::build_list_only_dead_end_prompt;
+use super::intent::{
+    build_data_query_failure_response, build_incomplete_data_query_prompt,
+    build_list_only_dead_end_prompt, build_no_tool_data_query_prompt, data_query_was_satisfied,
+    user_message_requires_data_query,
+};
 use super::resolve::resolve_cached_arguments;
 use super::result_format::format_tool_results;
 use super::sanitize::sanitize_tool_result_for_prompt;
@@ -128,6 +132,8 @@ pub async fn process_stream_events_with_safeguards(
     // This helps reduce cognitive load and provides better visualization
     let classifier = IntentClassifier::default();
     let intent_result = classifier.classify(&user_message);
+    let requires_data_tool = intent_result.category == IntentCategory::Data
+        && user_message_requires_data_query(&user_message);
 
     tracing::info!(
         "Intent recognized: category={:?}, confidence={:.2}, keywords={:?}",
@@ -296,6 +302,10 @@ pub async fn process_stream_events_with_safeguards(
         // Track whether an incomplete tool call JSON was suppressed
         // (LLM stopped mid-JSON, e.g. hit backend token limit)
         let mut incomplete_tool_json = false;
+        // A small model may describe the query instead of executing it. Give it
+        // up to two tightly constrained recovery rounds before accepting text.
+        let mut no_tool_data_recovery_attempts = 0usize;
+        const MAX_NO_TOOL_DATA_RECOVERY_ATTEMPTS: usize = 2;
 
         // === INTENT & PLAN VISUALIZATION ===
         // Send intent and plan events first to show user what's happening
@@ -330,10 +340,19 @@ pub async fn process_stream_events_with_safeguards(
                 drop(state_guard);
 
                 let context_msg = if recently_executed.is_empty() {
-                    format!(
-                        "Round {} of processing. Call ALL needed tools in ONE batch using JSON array format. Give the final response if no more tools needed.",
-                        tool_iteration_count + 1
-                    )
+                    if no_tool_data_recovery_attempts > 0 && all_round_tool_results.is_empty() {
+                        build_no_tool_data_query_prompt(&user_message).unwrap_or_else(|| {
+                            format!(
+                                "Round {} of processing. Call ALL needed tools in ONE batch using JSON array format.",
+                                tool_iteration_count + 1
+                            )
+                        })
+                    } else {
+                        format!(
+                            "Round {} of processing. Call ALL needed tools in ONE batch using JSON array format. Give the final response if no more tools needed.",
+                            tool_iteration_count + 1
+                        )
+                    }
                 } else {
                     let executed_summary = if recently_executed_commands.is_empty() {
                         recently_executed.iter()
@@ -353,7 +372,13 @@ pub async fn process_stream_events_with_safeguards(
                     // inject a FORCED continuation prompt to push the LLM to complete the task.
                     let commands_ref: Vec<&str> = recently_executed_commands.iter().map(|s| s.as_str()).collect();
 
-                    if let Some(dead_end_msg) = build_list_only_dead_end_prompt(
+                    if let Some(incomplete_query_msg) = build_incomplete_data_query_prompt(
+                        &user_message,
+                        &commands_ref,
+                        &all_round_tool_results,
+                    ) {
+                        incomplete_query_msg
+                    } else if let Some(dead_end_msg) = build_list_only_dead_end_prompt(
                         &user_message,
                         &commands_ref,
                         &all_round_tool_results,
@@ -740,7 +765,22 @@ pub async fn process_stream_events_with_safeguards(
                                     }
                                 } else if !text.is_empty() {
                                     // Safe to yield — no JSON pattern detected
-                                    yield AgentEvent::content(text.clone());
+                                    // Hold the first analytics response until we know it
+                                    // contains a tool call. This prevents a prose-only
+                                    // plan from flashing in the UI before recovery.
+                                    let commands_ref: Vec<&str> = recently_executed_commands
+                                        .iter()
+                                        .map(|command| command.as_str())
+                                        .collect();
+                                    if !(requires_data_tool
+                                        && !data_query_was_satisfied(
+                                            &user_message,
+                                            &commands_ref,
+                                            !all_round_tool_results.is_empty(),
+                                        ))
+                                    {
+                                        yield AgentEvent::content(text.clone());
+                                    }
                                     yielded_up_to = buffer.len();
                                 }
                             }
@@ -797,12 +837,22 @@ pub async fn process_stream_events_with_safeguards(
             // and should be discarded (it will not be displayed).
             if !tool_calls_detected && yielded_up_to < buffer.len() {
                 let remaining = &buffer[yielded_up_to..];
+                let commands_ref: Vec<&str> = recently_executed_commands
+                    .iter()
+                    .map(|command| command.as_str())
+                    .collect();
+                let hold_for_data_recovery = requires_data_tool
+                    && !data_query_was_satisfied(
+                        &user_message,
+                        &commands_ref,
+                        !all_round_tool_results.is_empty(),
+                    );
                 // Filter out incomplete tool call JSON patterns that leaked through
                 // (happens when LLM hits max_tokens mid-tool-call or stream ends abruptly)
                 let should_suppress = remaining.trim_start().starts_with('[')
                     && (remaining.contains("\"name\"") || remaining.contains("\"arguments\""))
                     && !remaining.trim_end().ends_with(']');
-                if !remaining.is_empty() && !should_suppress {
+                if !remaining.is_empty() && !should_suppress && !hold_for_data_recovery {
                     content_before_tools.push_str(remaining);
                     yield AgentEvent::content(remaining);
                 } else if should_suppress {
@@ -1204,6 +1254,64 @@ pub async fn process_stream_events_with_safeguards(
                 } else {
                     content_before_tools.clone()
                 };
+
+                // === RECOVERY: Read-only analytics must execute a tool ===
+                // Never accept "I will query..." as the answer to a current/recent
+                // data question. Re-prompt without persisting the prose-only plan.
+                let commands_ref: Vec<&str> = recently_executed_commands
+                    .iter()
+                    .map(|command| command.as_str())
+                    .collect();
+                if requires_data_tool
+                    && !data_query_was_satisfied(
+                        &user_message,
+                        &commands_ref,
+                        !all_round_tool_results.is_empty(),
+                    )
+                    && no_tool_data_recovery_attempts < MAX_NO_TOOL_DATA_RECOVERY_ATTEMPTS
+                {
+                    no_tool_data_recovery_attempts += 1;
+                    tool_iteration_count += 1;
+                    tracing::warn!(
+                        attempt = no_tool_data_recovery_attempts,
+                        response_len = raw_response.len(),
+                        "Data query returned no tool calls; forcing another tool-enabled round"
+                    );
+
+                    buffer.clear();
+                    yielded_up_to = 0;
+                    tool_calls_detected = false;
+                    tool_calls.clear();
+                    content_before_tools.clear();
+                    thinking_content.clear();
+                    has_content = false;
+                    has_thinking = false;
+                    incomplete_tool_json = false;
+                    recent_chunks.clear();
+
+                    yield AgentEvent::progress(
+                        "Querying HeraMind data...".to_string(),
+                        "executing",
+                        stream_start.elapsed().as_millis() as u64,
+                    );
+                    yield AgentEvent::IntermediateEnd;
+                    continue 'multi_round_loop;
+                }
+
+                // Recovery is bounded. If the model still refuses or cannot
+                // call the telemetry tool, discard its prose plan and return an
+                // honest localized failure instead of pretending work remains
+                // to be done.
+                if requires_data_tool
+                    && !data_query_was_satisfied(
+                        &user_message,
+                        &commands_ref,
+                        !all_round_tool_results.is_empty(),
+                    )
+                {
+                    raw_response = build_data_query_failure_response(&user_message);
+                    yield AgentEvent::content(raw_response.clone());
+                }
 
                 // === RECOVERY: Incomplete tool call JSON ===
                 // LLM stopped mid-tool-call (e.g. backend token limit).

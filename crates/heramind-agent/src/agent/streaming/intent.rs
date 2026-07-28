@@ -64,6 +64,355 @@ pub(crate) fn user_message_requires_action(msg: &str) -> bool {
     ACTION_VERBS.iter().any(|verb| msg_lower.contains(verb))
 }
 
+/// Check whether a message asks for live/recent HeraMind data that must be
+/// retrieved with a read-only tool call before it can be answered.
+///
+/// Keep this separate from mutation detection: analytics questions should run
+/// immediately, but must never be mistaken for permission to edit a dashboard.
+pub(crate) fn user_message_requires_data_query(msg: &str) -> bool {
+    let msg_lower = msg.to_lowercase();
+
+    // Questions about how to use the product are documentation requests, not
+    // requests to retrieve the current value.
+    const HELP_PATTERNS: &[&str] = &[
+        "how to",
+        "how can",
+        "làm sao",
+        "làm thế nào",
+        "cách hỏi",
+        "hướng dẫn",
+        "怎么",
+        "如何",
+    ];
+    if HELP_PATTERNS
+        .iter()
+        .any(|pattern| msg_lower.contains(pattern))
+    {
+        return false;
+    }
+
+    const DATA_SUBJECTS: &[&str] = &[
+        // Vietnamese
+        "số xe",
+        "phương tiện",
+        "số lượng",
+        "dữ liệu",
+        "chỉ số",
+        "metric",
+        "telemetry",
+        // English
+        "vehicle",
+        "count",
+        "data",
+        "metric",
+        "telemetry",
+        // Chinese
+        "数据",
+        "指标",
+        "车辆",
+        "数量",
+        "遥测",
+    ];
+    const QUERY_TERMS: &[&str] = &[
+        // Vietnamese
+        "bao nhiêu",
+        "đếm được",
+        "so sánh",
+        "tăng",
+        "giảm",
+        "hiện tại",
+        "giờ qua",
+        "trước đó",
+        "lịch sử",
+        "xu hướng",
+        // English
+        "how many",
+        "compare",
+        "increase",
+        "decrease",
+        "current",
+        "last hour",
+        "previous",
+        "history",
+        "trend",
+        // Chinese
+        "多少",
+        "比较",
+        "当前",
+        "上一",
+        "历史",
+        "趋势",
+    ];
+
+    DATA_SUBJECTS
+        .iter()
+        .any(|subject| msg_lower.contains(subject))
+        && QUERY_TERMS.iter().any(|term| msg_lower.contains(term))
+}
+
+/// Vehicle totals are derived telemetry, not dashboard metadata. A dashboard
+/// list/get call can discover the binding, but it cannot return the measured
+/// value, so these requests must continue through a telemetry history query.
+pub(crate) fn user_message_requires_metric_history(msg: &str) -> bool {
+    let msg_lower = msg.to_lowercase();
+    const METRIC_SUBJECTS: &[&str] = &["số xe", "phương tiện", "vehicle", "车辆"];
+
+    user_message_requires_data_query(msg)
+        && METRIC_SUBJECTS
+            .iter()
+            .any(|subject| msg_lower.contains(subject))
+}
+
+/// Return whether the executed commands contain a query that can provide the
+/// actual telemetry value. Discovery-only calls such as `dashboard list` and
+/// `dashboard get/inspect` deliberately do not satisfy a vehicle-count request.
+pub(crate) fn data_query_was_satisfied(
+    user_message: &str,
+    executed_commands: &[&str],
+    has_any_tool_results: bool,
+) -> bool {
+    if !user_message_requires_data_query(user_message) {
+        return true;
+    }
+
+    if !user_message_requires_metric_history(user_message) {
+        return has_any_tool_results;
+    }
+
+    executed_commands.iter().any(|command| {
+        let normalized = command.to_lowercase();
+        normalized.contains("device history")
+            || (normalized.contains("api get") && normalized.contains("telemetry"))
+    })
+}
+
+/// Build a forced continuation for a read-only analytics request when the
+/// model described what it would do but did not call any tool.
+pub(crate) fn build_no_tool_data_query_prompt(user_message: &str) -> Option<String> {
+    if !user_message_requires_data_query(user_message) {
+        return None;
+    }
+
+    tracing::warn!(
+        "No-tool analytics dead end detected. Injecting forced data-query continuation."
+    );
+
+    Some(format!(
+        "⚠️ CRITICAL: The user's request below is a READ-ONLY DATA QUERY, but your previous \
+response executed ZERO tools.\n\n\
+Original request: {user_message}\n\n\
+You MUST retrieve the real HeraMind data now. Do not describe a plan, do not ask for \
+permission, and do not create or update a dashboard/widget.\n\
+- Output a tool call NOW.\n\
+- Use the `shell` tool with `heramind device history` for time-window metrics.\n\
+- If the real device ID or metric is unknown, call `heramind device list` or \
+`heramind device get <ID>` first; never guess them.\n\
+- For a current-window versus previous-window comparison, execute both history queries \
+in one JSON array. Use the same `--time-range` and `--aggregate`; add `--offset` only \
+to the previous window.\n\
+DO NOT output explanatory text before the tool call."
+    ))
+}
+
+/// Build a forced continuation when discovery tools ran but the agent still
+/// has not queried the telemetry value requested by the user.
+pub(crate) fn build_incomplete_data_query_prompt(
+    user_message: &str,
+    executed_commands: &[&str],
+    tool_results: &[(String, String)],
+) -> Option<String> {
+    if !user_message_requires_metric_history(user_message)
+        || data_query_was_satisfied(user_message, executed_commands, true)
+    {
+        return None;
+    }
+
+    let executed = if executed_commands.is_empty() {
+        "- none".to_string()
+    } else {
+        executed_commands
+            .iter()
+            .map(|command| format!("- {command}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    tracing::warn!(
+        "Discovery-only analytics dead end detected. Requiring a telemetry history query."
+    );
+
+    let verified_next_command = resolve_metric_history_command(tool_results)
+        .map(|command| {
+            format!(
+                "\nVERIFIED NEXT COMMAND (derived from successful dashboard/device results):\n\
+`{command}`\n\
+Execute this exact command now. Do not inspect or list again.\n"
+            )
+        })
+        .unwrap_or_default();
+
+    Some(format!(
+        "⚠️ CRITICAL: The user asked for a REAL TELEMETRY VALUE, but the calls so far \
+only discovered metadata and did not query that value.\n\n\
+Original request: {user_message}\n\n\
+Previously executed commands:\n{executed}\n\n\
+You MUST continue with tool calls now. Do not give a summary yet.\n\
+{verified_next_command}\
+- If dashboard context identifies the relevant dashboard, use `heramind dashboard inspect <ID>` \
+to discover the widget's real device/metric binding and configured time window.\n\
+- Then call `heramind device history <DEVICE_ID> --metric <METRIC> --time-range <WINDOW> \
+--aggregate <METHOD>` using the dashboard's configured aggregate to retrieve the count. \
+Never guess IDs, metric names, the window, or the aggregation method.\n\
+- A dashboard list/get/inspect result is configuration metadata, NOT the measured vehicle count.\n\
+Output the next required tool call(s) now; do not output explanatory prose."
+    ))
+}
+
+fn resolve_metric_history_command(tool_results: &[(String, String)]) -> Option<String> {
+    let payloads = tool_results
+        .iter()
+        .filter_map(|(_, result)| {
+            let outer: serde_json::Value = serde_json::from_str(result).ok()?;
+            let cli = outer
+                .get("stdout")
+                .and_then(|stdout| stdout.as_str())
+                .and_then(|stdout| serde_json::from_str::<serde_json::Value>(stdout).ok())
+                .unwrap_or(outer);
+            Some(cli.get("data").cloned().unwrap_or(cli))
+        })
+        .collect::<Vec<_>>();
+
+    let mut metric = None;
+    let mut time_range = None;
+    let mut aggregate = None;
+    let mut device_id = None;
+
+    for payload in &payloads {
+        let Some(components) = payload.get("components").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for component in components {
+            let title = component
+                .get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            for source in data_source_objects(component.get("data_source")) {
+                let candidate_metric = source
+                    .get("metricId")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let candidate_aggregate = source
+                    .get("aggregateExt")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let is_vehicle_total = (title.contains("phương tiện") || title.contains("vehicle"))
+                    && (candidate_aggregate == "count"
+                        || candidate_metric.ends_with("vehicle_seen"));
+                if is_vehicle_total {
+                    metric = valid_cli_token(candidate_metric).map(str::to_string);
+                    time_range = source
+                        .get("timeRange")
+                        .and_then(|value| value.as_u64())
+                        .map(|hours| format!("{hours}h"));
+                    aggregate = match candidate_aggregate {
+                        "avg" | "min" | "max" | "sum" | "count" | "last" => {
+                            Some(candidate_aggregate.to_string())
+                        }
+                        _ => None,
+                    };
+                    if let Some(source_id) = source.get("sourceId").and_then(|value| value.as_str())
+                    {
+                        if !source_id.starts_with("transform:") {
+                            device_id = valid_cli_token(source_id).map(str::to_string);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let metric = metric?;
+
+    if device_id.is_none() {
+        for payload in &payloads {
+            let Some(types) = payload.get("types").and_then(|value| value.as_array()) else {
+                continue;
+            };
+            for device_type in types {
+                let supports_metric = device_type
+                    .get("metric_fields")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|fields| {
+                        fields.iter().any(|field| field.as_str() == Some(&metric))
+                    });
+                if !supports_metric {
+                    continue;
+                }
+                device_id = device_type
+                    .pointer("/devices/list/0/id")
+                    .and_then(|value| value.as_str())
+                    .and_then(valid_cli_token)
+                    .map(str::to_string);
+                if device_id.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    Some(format!(
+        "heramind device history {} --metric {} --time-range {} --aggregate {}",
+        device_id?,
+        metric,
+        time_range.unwrap_or_else(|| "24h".to_string()),
+        aggregate.unwrap_or_else(|| "count".to_string())
+    ))
+}
+
+fn data_source_objects(value: Option<&serde_json::Value>) -> Vec<&serde_json::Value> {
+    match value {
+        Some(serde_json::Value::Array(items)) => items.iter().collect(),
+        Some(value @ serde_json::Value::Object(_)) => vec![value],
+        _ => Vec::new(),
+    }
+}
+
+fn valid_cli_token(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':')))
+    .then_some(value)
+}
+
+/// Return an honest localized failure instead of leaking a model-generated
+/// plan when the bounded telemetry recovery attempts are exhausted.
+pub(crate) fn build_data_query_failure_response(user_message: &str) -> String {
+    let lower = user_message.to_lowercase();
+    if [
+        "số lượng",
+        "phương tiện",
+        "bao nhiêu",
+        "đếm được",
+        "dữ liệu",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+    {
+        "Không thể truy vấn giá trị telemetry thực sau nhiều lần thử. Tôi chưa có số liệu đáng tin cậy để trả lời; vui lòng thử lại hoặc kiểm tra kết nối model.".to_string()
+    } else if ["数据", "指标", "车辆", "数量", "遥测"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        "多次尝试后仍无法查询真实遥测值。我目前没有可靠数据可供回答；请重试或检查模型连接。"
+            .to_string()
+    } else {
+        "I could not retrieve the real telemetry value after multiple attempts. I do not have reliable data to answer with; please retry or check the model connection.".to_string()
+    }
+}
+
 /// Check if ALL executed tool calls so far were read-only (list/get/query).
 /// Takes the actual shell command strings (not tool names) for accurate detection.
 /// Returns true if no mutation command was found in any tool call.
@@ -321,6 +670,74 @@ mod tests {
         assert!(user_message_requires_action("STOP the service"));
         assert!(!user_message_requires_action("list devices"));
         assert!(!user_message_requires_action("get status"));
+    }
+
+    #[test]
+    fn test_user_message_requires_data_query_vietnamese() {
+        assert!(user_message_requires_data_query(
+            "So sánh số xe trong 1 giờ qua với 1 giờ trước đó"
+        ));
+        assert!(user_message_requires_data_query(
+            "Hiện tại số lượng phương tiện là bao nhiêu?"
+        ));
+        assert!(user_message_requires_data_query(
+            "Số lượng phương tiện đếm được"
+        ));
+        assert!(!user_message_requires_data_query(
+            "Làm sao người dùng có thể hỏi AI về số lượng phương tiện?"
+        ));
+        assert!(!user_message_requires_data_query(
+            "Tạo biểu đồ số lượng phương tiện"
+        ));
+    }
+
+    #[test]
+    fn test_build_no_tool_data_query_prompt() {
+        let prompt =
+            build_no_tool_data_query_prompt("So sánh số xe trong 1 giờ qua với 1 giờ trước đó")
+                .expect("analytics request should force a tool call");
+        assert!(prompt.contains("ZERO tools"));
+        assert!(prompt.contains("heramind device history"));
+        assert!(prompt.contains("--offset"));
+
+        assert!(build_no_tool_data_query_prompt(
+            "Làm sao người dùng có thể hỏi AI về số lượng phương tiện?"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_vehicle_count_requires_real_metric_history() {
+        let request = "Số lượng phương tiện đếm được";
+        assert!(user_message_requires_metric_history(request));
+        assert!(!data_query_was_satisfied(
+            request,
+            &["heramind dashboard list"],
+            true
+        ));
+        assert!(!data_query_was_satisfied(
+            request,
+            &[
+                "heramind dashboard list",
+                "heramind dashboard get dashboard-1"
+            ],
+            true
+        ));
+        assert!(data_query_was_satisfied(
+            request,
+            &[
+                "heramind dashboard get dashboard-1",
+                "heramind device history camera-1 --metric vehicle_seen --time-range 24h --aggregate sum"
+            ],
+            true
+        ));
+
+        let prompt = build_incomplete_data_query_prompt(request, &["heramind dashboard list"], &[])
+            .expect("dashboard metadata alone must force a telemetry query");
+        assert!(prompt.contains("dashboard inspect"));
+        assert!(prompt.contains("device history"));
+        assert!(prompt.contains("NOT the measured vehicle count"));
+        assert!(build_data_query_failure_response(request).starts_with("Không thể truy vấn"));
     }
 
     #[test]

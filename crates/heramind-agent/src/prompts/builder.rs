@@ -169,6 +169,7 @@ mod tests {
         assert!(prompt.contains("Highest Priority"));
         let prompt_lower = prompt.to_lowercase();
         assert!(prompt_lower.contains("same language"));
+        assert!(prompt.contains("User writes in Vietnamese → respond in Vietnamese"));
     }
 
     #[test]
@@ -212,6 +213,8 @@ mod tests {
         assert!(prompt.contains("Task Workflow"));
         assert!(prompt.contains("BATCH RULE"));
         assert!(prompt.contains("Domain Boundaries"));
+        assert!(prompt.contains("Read-only analytics execute immediately"));
+        assert!(prompt.contains("--offset 1h --aggregate sum"));
     }
 
     #[test]

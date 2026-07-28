@@ -461,6 +461,8 @@ pub async fn get_telemetry_history(
     id: &str,
     metric: Option<&str>,
     time_range: Option<&str>,
+    offset: Option<&str>,
+    aggregate: Option<&str>,
     compress: bool,
     limit: Option<usize>,
 ) -> Result<CliResponse> {
@@ -469,12 +471,27 @@ pub async fn get_telemetry_history(
     if let Some(m) = metric {
         params.push(format!("metric={}", m));
     }
-    // Parse --time-range (e.g., "1h", "24h", "7d", "30d") to Unix seconds and set start
-    if let Some(tr) = time_range {
-        let end = chrono::Utc::now().timestamp();
-        let start = parse_time_range_to_timestamp(tr, end).unwrap_or(end - 86400);
+    // Parse a relative query window. `--offset 1h` shifts both boundaries one
+    // hour into the past, which makes adjacent-period comparisons exact.
+    if time_range.is_some() || offset.is_some() {
+        let now = chrono::Utc::now().timestamp();
+        let offset_secs = match offset {
+            Some(value) => parse_duration_seconds(value)
+                .ok_or_else(|| anyhow::anyhow!("Invalid --offset '{}'", value))?,
+            None => 0,
+        };
+        let duration_secs = match time_range {
+            Some(value) => parse_duration_seconds(value)
+                .ok_or_else(|| anyhow::anyhow!("Invalid --time-range '{}'", value))?,
+            None => 86400,
+        };
+        let end = now - offset_secs;
+        let start = end - duration_secs;
         params.push(format!("start={}", start));
         params.push(format!("end={}", end));
+    }
+    if let Some(method) = aggregate {
+        params.push(format!("aggregate={}", method));
     }
     if compress {
         params.push("compress=true".to_string());
@@ -640,8 +657,8 @@ fn format_ts(ts_ms: i64) -> String {
         .unwrap_or_else(|| ts_ms.to_string())
 }
 
-/// Parse a human-readable time range string (e.g., "1h", "24h", "7d", "30d") to a start timestamp.
-fn parse_time_range_to_timestamp(range: &str, now_ts: i64) -> Option<i64> {
+/// Parse a human-readable duration (e.g. "30m", "1h", "7d") to seconds.
+fn parse_duration_seconds(range: &str) -> Option<i64> {
     let range = range.trim();
     if range.is_empty() {
         return None;
@@ -663,7 +680,7 @@ fn parse_time_range_to_timestamp(range: &str, now_ts: i64) -> Option<i64> {
         "mo" | "month" | "months" => num * 30 * 86400,
         _ => return None,
     };
-    Some(now_ts - secs)
+    Some(secs)
 }
 
 /// Send control command to a device

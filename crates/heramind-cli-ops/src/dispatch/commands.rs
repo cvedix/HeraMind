@@ -20,6 +20,12 @@ pub struct Args {
     /// Verbose output.
     #[arg(short, long, global = true)]
     pub verbose: bool,
+
+    /// Compatibility flag for LLM-generated commands. Agent shell output is
+    /// already structured JSON via HERAMIND_JSON, so this flag is accepted and
+    /// intentionally ignored.
+    #[arg(long, global = true, hide = true)]
+    pub json: bool,
 }
 
 /// Available commands.
@@ -666,6 +672,9 @@ pub enum DeviceCommand {
     ///   1. `device history <ID>` — all metrics, last 24h
     ///   2. `device history <ID> --metric temperature --time-range 7d` — specific metric
     ///   3. `device history <ID> --compress` — compact for AI consumption
+    ///   4. `device history <ID> --metric vehicle_seen --time-range 1h --aggregate sum`
+    ///      — exact total for the last hour
+    ///   5. Add `--offset 1h` to query the preceding one-hour window
     ///
     /// Example: `heramind device history device-001 --metric temperature --time-range 24h`
     History {
@@ -678,6 +687,14 @@ pub enum DeviceCommand {
         /// Time range: "1h", "24h", "7d", "30d" (default: 24h).
         #[arg(short, long)]
         time_range: Option<String>,
+        /// Shift the query window into the past (e.g. "1h" means the window
+        /// ends one hour ago). Useful for comparing adjacent periods.
+        #[arg(long)]
+        offset: Option<String>,
+        /// Return server-side aggregate statistics instead of raw points.
+        /// The response includes count, sum, avg, min, and max.
+        #[arg(long, value_parser = ["avg", "min", "max", "sum", "count", "last"])]
+        aggregate: Option<String>,
         /// AI compression mode: lossless adaptive series (kept/fluctuated).
         /// Allows up to 90 days. Designed for AI consumption, not frontend charts.
         /// Use --compress=true to enable or --compress=false to disable.
@@ -909,6 +926,17 @@ pub enum DashboardCommand {
     ///
     /// Example: `heramind dashboard get dash-001`
     Get {
+        /// Dashboard ID.
+        #[arg(required = true)]
+        id: String,
+    },
+    /// Inspect dashboard data bindings in a compact AI-friendly form.
+    ///
+    /// Returns component IDs, titles, types, and data sources without layout
+    /// or display configuration. Prefer this for read-only dashboard questions.
+    ///
+    /// Example: `heramind dashboard inspect dash-001`
+    Inspect {
         /// Dashboard ID.
         #[arg(required = true)]
         id: String,
@@ -2385,6 +2413,49 @@ mod unify_enable_disable_tests {
                 assert_eq!(compress, Some(false));
             }
             other => panic!("expected Device::History, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_history_accepts_aggregate_and_offset() {
+        let cmd = parse(
+            "device history HERACAM-RV1126B-DEMO --metric heracam_vehicle.vehicle_seen_numeric \
+             --time-range 1h --offset 1h --aggregate sum",
+        );
+        let Command::Device { device_cmd } = cmd else {
+            panic!("expected Device, got {cmd:?}");
+        };
+        match device_cmd {
+            super::DeviceCommand::History {
+                id,
+                metric,
+                time_range,
+                offset,
+                aggregate,
+                ..
+            } => {
+                assert_eq!(id, "HERACAM-RV1126B-DEMO");
+                assert_eq!(
+                    metric.as_deref(),
+                    Some("heracam_vehicle.vehicle_seen_numeric")
+                );
+                assert_eq!(time_range.as_deref(), Some("1h"));
+                assert_eq!(offset.as_deref(), Some("1h"));
+                assert_eq!(aggregate.as_deref(), Some("sum"));
+            }
+            other => panic!("expected Device::History, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dashboard_inspect_accepts_trailing_json_compatibility_flag() {
+        let cmd = parse("dashboard inspect dash-001 --json");
+        let Command::Dashboard { dashboard_cmd } = cmd else {
+            panic!("expected Dashboard, got {cmd:?}");
+        };
+        match dashboard_cmd {
+            super::DashboardCommand::Inspect { id } => assert_eq!(id, "dash-001"),
+            other => panic!("expected Dashboard::Inspect, got {other:?}"),
         }
     }
 

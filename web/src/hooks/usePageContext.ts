@@ -9,12 +9,11 @@
  * the first message of a new conversation.
  */
 import { useMemo } from 'react'
-import { useLocation, useParams } from 'react-router-dom'
+import { useLocation } from 'react-router-dom'
 import { useStore } from '@/store'
 
 export function usePageContext(): string {
   const location = useLocation()
-  const params = useParams()
 
   // Read relevant store slices (lightweight selectors)
   const devices = useStore((s) => s.devices)
@@ -30,10 +29,11 @@ export function usePageContext(): string {
 
     // Dashboard page
     if (path.startsWith('/visual-dashboard')) {
+      const id = currentDashboard?.id
       const name = currentDashboard?.name
       const count = currentDashboard?.components?.length
       if (name) {
-        return `[context] page:dashboard "${name}"${count != null ? `, ${count} components` : ''}`
+        return `[context] page:dashboard, id:"${id ?? ''}", name:"${name}"${count != null ? `, ${count} components` : ''}`
       }
       return '[context] page:dashboard'
     }
@@ -74,5 +74,5 @@ export function usePageContext(): string {
     }
 
     return ''
-  }, [location.pathname, currentDashboard?.name, currentDashboard?.components?.length, devices])
+  }, [location.pathname, currentDashboard?.id, currentDashboard?.name, currentDashboard?.components?.length, devices])
 }
