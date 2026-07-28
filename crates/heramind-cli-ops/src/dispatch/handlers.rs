@@ -211,6 +211,8 @@ pub async fn run_device_cmd(cmd: DeviceCommand) -> Result<(CliResponse, OutputFo
             id,
             metric,
             time_range,
+            offset,
+            aggregate,
             compress,
             limit,
         } => (
@@ -219,6 +221,8 @@ pub async fn run_device_cmd(cmd: DeviceCommand) -> Result<(CliResponse, OutputFo
                 &id,
                 metric.as_deref(),
                 time_range.as_deref(),
+                offset.as_deref(),
+                aggregate.as_deref(),
                 compress.unwrap_or(false),
                 limit,
             )
@@ -366,6 +370,10 @@ pub async fn run_dashboard_cmd(cmd: DashboardCommand) -> Result<(CliResponse, Ou
         }
         DashboardCommand::Get { id } => {
             let resp = get_dashboard(&client, &id).await?;
+            (resp, output_format)
+        }
+        DashboardCommand::Inspect { id } => {
+            let resp = inspect_dashboard(&client, &id).await?;
             (resp, output_format)
         }
         DashboardCommand::Create {

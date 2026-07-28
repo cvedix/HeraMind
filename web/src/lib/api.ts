@@ -1117,7 +1117,7 @@ export const api = {
     }),
 
   // Device Telemetry
-  getDeviceTelemetry: (deviceId: string, metric?: string, start?: number, end?: number, limit?: number, offset?: number, bucketed?: boolean) =>
+  getDeviceTelemetry: (deviceId: string, metric?: string, start?: number, end?: number, limit?: number, offset?: number, bucketed?: boolean, aggregate?: 'avg' | 'min' | 'max' | 'sum' | 'count') =>
     fetchAPI<TelemetryDataResponse>(
       `/devices/${deviceId}/telemetry?${new URLSearchParams({
         ...(metric && { metric }),
@@ -1126,6 +1126,7 @@ export const api = {
         ...(limit && { limit: limit.toString() }),
         ...(offset !== undefined && offset > 0 && { offset: offset.toString() }),
         ...(bucketed && { bucketed: 'true' }),
+        ...(aggregate && { aggregate }),
       })}`
     ),
   getDeviceTelemetrySummary: (deviceId: string, hours?: number) =>
@@ -1804,15 +1805,23 @@ export const api = {
    * Query telemetry time-series data for any source type
    * GET /api/telemetry?source=...&metric=...&start=...&end=...&limit=...
    */
-  queryTelemetry: (source: string, metric: string, start: number, end: number, limit?: number, bucketed?: boolean) => {
+  queryTelemetry: (source: string, metric: string, start: number, end: number, limit?: number, bucketed?: boolean, aggregate?: 'avg' | 'min' | 'max' | 'sum' | 'count') => {
     const qs = new URLSearchParams({
       source, metric,
       start: String(start),
       end: String(end),
       ...(limit ? { limit: String(limit) } : {}),
       ...(bucketed ? { bucketed: 'true' } : {}),
+      ...(aggregate ? { aggregate } : {}),
     }).toString()
-    return fetchAPI<{ source_id: string; data: Array<{ timestamp: number; value: unknown; quality: number | null }>; count: number; total_count?: number }>(`/telemetry?${qs}`)
+    return fetchAPI<{
+      source_id: string
+      data?: Array<{ timestamp: number; value: unknown; quality: number | null }>
+      value?: number | null
+      count: number
+      total_count?: number
+      aggregation?: string
+    }>(`/telemetry?${qs}`)
   },
 
   // ========== Bulk Operations API ==========

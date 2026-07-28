@@ -101,6 +101,17 @@ impl IntentCategory {
             IntentCategory::Data => &[
                 "数据",
                 "data",
+                // Vietnamese data and analytics terms
+                "dữ liệu",
+                "số lượng",
+                "số xe",
+                "phương tiện",
+                "bao nhiêu",
+                "so sánh",
+                "giờ qua",
+                "trước đó",
+                "lịch sử",
+                "xu hướng",
                 "查询",
                 "query",
                 "历史",
@@ -355,6 +366,20 @@ mod tests {
         // Test general query that doesn't match any specific category
         let result = classifier.classify("今天天气怎么样");
         assert_eq!(result.category, IntentCategory::General);
+    }
+
+    #[test]
+    fn test_intent_classification_vietnamese_vehicle_analytics() {
+        let classifier = IntentClassifier::default();
+        let result = classifier.classify("So sánh số xe trong 1 giờ qua với 1 giờ trước đó");
+        assert_eq!(result.category, IntentCategory::Data);
+        assert!(result.confidence > 0.0);
+
+        let dashboard_result = classifier.classify(
+            "[context] page:dashboard, id:\"dashboard-1\", name:\"Báo cáo phương tiện\"\n\n\
+             Số lượng phương tiện đếm được",
+        );
+        assert_eq!(dashboard_result.category, IntentCategory::Data);
     }
 
     #[test]

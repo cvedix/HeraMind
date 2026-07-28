@@ -886,18 +886,29 @@ impl Agent {
 
                 // Set capabilities override if provided
                 if let Some(caps) = capabilities {
+                    let reported_max_context = caps.max_context.unwrap_or(128000);
+                    // The service-level cap is authoritative even when a
+                    // persisted capability is stale. The Ollama request path
+                    // already caps `num_ctx`; prompt budgeting must use the
+                    // same effective value.
+                    let max_context = std::env::var("HERAMIND_MAX_CONTEXT")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .map(|cap| reported_max_context.min(cap))
+                        .unwrap_or(reported_max_context);
                     tracing::debug!(
                         multimodal = %caps.multimodal,
                         thinking_display = %caps.thinking_display,
                         function_calling = %caps.function_calling,
-                        max_context = %caps.max_context.unwrap_or(128000),
+                        reported_max_context = %reported_max_context,
+                        max_context = %max_context,
                         "Applying capabilities override to OllamaRuntime"
                     );
                     runtime = runtime.with_capabilities_override(
                         caps.multimodal,
                         caps.thinking_display,
                         caps.function_calling,
-                        caps.max_context.unwrap_or(128000),
+                        max_context,
                         caps.supports_audio,
                     );
                 } else {

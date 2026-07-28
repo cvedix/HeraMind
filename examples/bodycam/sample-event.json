@@ -1,0 +1,91 @@
+[
+  {
+    "$id": "attribute",
+    "$version": 1,
+    "event_timestamp_ms": 1763965,
+    "instance_id": "3e0d9c56-3f25-c54b-2933-ba0e23720611",
+    "name": "smoking",
+    "ref_tracking_id": "bad2589b-e393-479f-855e-99b3942b5772",
+    "system_datetime": "2026-07-27T08:13:42Z",
+    "system_timestamp": 1785140022547,
+    "value": "false"
+  },
+  {
+    "$id": "attribute",
+    "$version": 1,
+    "event_timestamp_ms": 1763965,
+    "instance_id": "3e0d9c56-3f25-c54b-2933-ba0e23720611",
+    "name": "face_covered",
+    "ref_tracking_id": "bad2589b-e393-479f-855e-99b3942b5772",
+    "system_datetime": "2026-07-27T08:13:42Z",
+    "system_timestamp": 1785140022547,
+    "value": "true"
+  },
+  {
+    "$id": "attribute",
+    "$version": 1,
+    "event_timestamp_ms": 1763965,
+    "instance_id": "3e0d9c56-3f25-c54b-2933-ba0e23720611",
+    "name": "age",
+    "ref_tracking_id": "bad2589b-e393-479f-855e-99b3942b5772",
+    "system_datetime": "2026-07-27T08:13:42Z",
+    "system_timestamp": 1785140022547,
+    "value": "adult"
+  },
+  {
+    "$id": "attribute",
+    "$version": 1,
+    "event_timestamp_ms": 1763965,
+    "instance_id": "3e0d9c56-3f25-c54b-2933-ba0e23720611",
+    "name": "gender",
+    "ref_tracking_id": "bad2589b-e393-479f-855e-99b3942b5772",
+    "system_datetime": "2026-07-27T08:13:42Z",
+    "system_timestamp": 1785140022547,
+    "value": "female"
+  },
+  {
+    "$id": "attribute",
+    "$version": 1,
+    "event_timestamp_ms": 1763965,
+    "instance_id": "3e0d9c56-3f25-c54b-2933-ba0e23720611",
+    "name": "upper_clothing_color",
+    "ref_tracking_id": "bad2589b-e393-479f-855e-99b3942b5772",
+    "system_datetime": "2026-07-27T08:13:42Z",
+    "system_timestamp": 1785140022547,
+    "value": "blue"
+  },
+  {
+    "$id": "attribute",
+    "$version": 1,
+    "event_timestamp_ms": 1763965,
+    "instance_id": "3e0d9c56-3f25-c54b-2933-ba0e23720611",
+    "name": "phone",
+    "ref_tracking_id": "bad2589b-e393-479f-855e-99b3942b5772",
+    "system_datetime": "2026-07-27T08:13:42Z",
+    "system_timestamp": 1785140022547,
+    "value": "false"
+  },
+  {
+    "$id": "crop",
+    "$version": 1,
+    "confidence": 0.91,
+    "crop_timestamp_ms": 1763965,
+    "event_timestamp_ms": 1763965,
+    "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "instance_id": "3e0d9c56-3f25-c54b-2933-ba0e23720611",
+    "ref_event_id": "sample-intrusion-event",
+    "ref_tracking_id": "bad2589b-e393-479f-855e-99b3942b5772",
+    "system_datetime": "2026-07-27T08:13:42Z",
+    "system_timestamp": 1785140022547
+  },
+  {
+    "$id": "event-intrusion",
+    "$version": 1,
+    "event_id": "sample-intrusion-event",
+    "event_timestamp_ms": 1763965,
+    "instance_id": "3e0d9c56-3f25-c54b-2933-ba0e23720611",
+    "ref_tracking_id": "bad2589b-e393-479f-855e-99b3942b5772",
+    "system_datetime": "2026-07-27T08:13:42Z",
+    "system_timestamp": 1785140022547
+  }
+]

@@ -110,6 +110,9 @@ export interface TimeSeriesMappingConfig extends DataMappingConfig {
   /** Time aggregation level */
   timeAggregate?: 'raw' | '1m' | '5m' | '15m' | '1h' | '1d' | '1w'
 
+  /** Fill empty time buckets with zero so event-count charts show idle periods */
+  fillMissingBuckets?: boolean
+
   /** Chart styling */
   smooth?: boolean
   fillArea?: boolean
@@ -513,19 +516,68 @@ export class DataMapper {
   /**
    * Map array to time series points
    */
-  static mapToTimeSeries(data: unknown[], config?: DataMappingConfig): TimeSeriesPoint[] {
+  static mapToTimeSeries(data: unknown[], config?: TimeSeriesMappingConfig): TimeSeriesPoint[] {
     const points = this.mapToDataPoints(data, config)
 
     // Sort by timestamp if available
     if (points.some(p => p.timestamp !== undefined)) {
-      return points
+      const sortedPoints = points
         .filter(p => p.timestamp !== undefined)
         .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0))
-        .map(p => ({
+
+      const rawSeries = sortedPoints.map(p => ({
           timestamp: p.timestamp ?? 0,
           value: p.value,
           label: p.label,
         }))
+
+      const timeAggregate = config?.timeAggregate ?? 'raw'
+      if (timeAggregate === 'raw' || rawSeries.length === 0) {
+        return rawSeries
+      }
+
+      const intervalSeconds: Record<Exclude<TimeSeriesMappingConfig['timeAggregate'], undefined | 'raw'>, number> = {
+        '1m': 60,
+        '5m': 5 * 60,
+        '15m': 15 * 60,
+        '1h': 60 * 60,
+        '1d': 24 * 60 * 60,
+        '1w': 7 * 24 * 60 * 60,
+      }
+      // Telemetry normally uses seconds, but preserve millisecond timestamps when
+      // a custom data source supplies them.
+      const timestampScale = rawSeries[0].timestamp > 10_000_000_000 ? 1000 : 1
+      const interval = intervalSeconds[timeAggregate] * timestampScale
+      const buckets = new Map<number, number[]>()
+
+      for (const point of rawSeries) {
+        const bucketTimestamp = Math.floor(point.timestamp / interval) * interval
+        const bucketValues = buckets.get(bucketTimestamp)
+        if (bucketValues) bucketValues.push(point.value)
+        else buckets.set(bucketTimestamp, [point.value])
+      }
+
+      const aggregateMethod = config?.aggregate && config.aggregate !== 'none'
+        ? config.aggregate
+        : 'avg'
+      const bucketTimestamps = Array.from(buckets.keys()).sort((a, b) => a - b)
+      const firstBucket = bucketTimestamps[0]
+      const lastBucket = bucketTimestamps[bucketTimestamps.length - 1]
+      const result: TimeSeriesPoint[] = []
+
+      for (let timestamp = firstBucket; timestamp <= lastBucket; timestamp += interval) {
+        const values = buckets.get(timestamp)
+        if (values) {
+          result.push({
+            timestamp,
+            value: this.aggregate(values, aggregateMethod),
+          })
+        } else if (config?.fillMissingBuckets) {
+          result.push({ timestamp, value: 0 })
+        }
+      }
+
+      return result
     }
 
     // No timestamps - use index as time

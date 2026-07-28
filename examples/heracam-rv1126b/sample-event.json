@@ -1,0 +1,63 @@
+[
+  {
+    "$id": "event-line-crossing",
+    "$version": 1,
+    "crossing_direction": "up",
+    "event_id": "ad90be2e-d7cb-497a-9337-b00273ba796c",
+    "event_timestamp_ms": 262344,
+    "instance_id": "8a329a3f-d9fc-e038-3435-676656695b07",
+    "location": {
+      "height": 0.07228226214647293,
+      "width": 0.04968705400824547,
+      "x": 0.5706393718719482,
+      "y": 0.21223142743110657
+    },
+    "object_class": "Vehicle",
+    "ref_tracking_id": "efde08cb-0459-4420-a744-fe09936d90b2",
+    "system_datetime": "2026-07-27T14:10:53Z",
+    "system_timestamp": 1785161453812,
+    "tripwire_id": "d6190c82-6bfc-46ef-8500-3bd9c61dc364",
+    "tripwire_name": "Line crossing 1"
+  },
+  {
+    "$id": "attribute",
+    "$version": 1,
+    "event_timestamp_ms": 262344,
+    "instance_id": "8a329a3f-d9fc-e038-3435-676656695b07",
+    "name": "vehicle_class",
+    "ref_tracking_id": "efde08cb-0459-4420-a744-fe09936d90b2",
+    "system_datetime": "2026-07-27T14:10:53Z",
+    "system_timestamp": 1785161453812,
+    "value": "car"
+  },
+  {
+    "$id": "attribute",
+    "$version": 1,
+    "event_timestamp_ms": 262344,
+    "instance_id": "8a329a3f-d9fc-e038-3435-676656695b07",
+    "name": "vehicle_color",
+    "ref_tracking_id": "efde08cb-0459-4420-a744-fe09936d90b2",
+    "system_datetime": "2026-07-27T14:10:53Z",
+    "system_timestamp": 1785161453812,
+    "value": "black"
+  },
+  {
+    "$id": "crop",
+    "$version": 1,
+    "confidence": 0.970703125,
+    "crop_timestamp_ms": 262344,
+    "event_timestamp_ms": 262344,
+    "image": "/9j/4AAQSkZJRgABAQAAAQABAAD/2w==",
+    "instance_id": "8a329a3f-d9fc-e038-3435-676656695b07",
+    "location": {
+      "height": 0.525134801864624,
+      "width": 0.2953883111476898,
+      "x": 0.6258445978164673,
+      "y": 0.47486522793769836
+    },
+    "ref_event_id": "ad90be2e-d7cb-497a-9337-b00273ba796c",
+    "ref_tracking_id": "efde08cb-0459-4420-a744-fe09936d90b2",
+    "system_datetime": "2026-07-27T14:10:53Z",
+    "system_timestamp": 1785161453812
+  }
+]

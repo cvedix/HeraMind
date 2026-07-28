@@ -36,6 +36,26 @@ pub use crate::llm_backends::{
 /// is loaded from environment variable AGENT_CONCURRENT_LIMIT with fallback to 3.
 pub const DEFAULT_CONCURRENT_LIMIT: usize = 3;
 
+/// The full resident-engineer prompt plus native tool schemas can consume
+/// almost an entire 8K context before the model has room to emit a tool call.
+/// Keep the compact variant operational: it must still tell small models to
+/// use real HeraMind data and to answer in the operator's language.
+const COMPACT_TOOL_SYSTEM_PROMPT: &str = "\
+You are HeraMind, an IoT operations assistant. Reply in the exact same language as the operator; \
+reply in Vietnamese when the operator writes Vietnamese.\n\
+Use tools for every request about devices, dashboards, telemetry, counts, or current platform data. \
+Never invent IDs, commands, metric names, or values, and never present a plan as the final answer.\n\
+Use the `shell` tool with the `heramind` CLI. For dashboard questions, run \
+`heramind dashboard inspect <ID>` to inspect the real widget binding. Discover the device and metric \
+with `heramind device list` or `heramind device get <ID>`, then query time-window values with \
+`heramind device history <ID> --metric <METRIC> --time-range <WINDOW> --aggregate <METHOD>`.\n\
+For a count or telemetry question, call the required tools immediately and answer only after the \
+real value is returned. Dashboard metadata alone is not a measured value.";
+
+fn should_use_compact_tool_prompt(max_context: usize, prompt_budget: usize) -> bool {
+    max_context <= 8_192 || prompt_budget < 6_000
+}
+
 /// Simple atomic-based concurrency limiter.
 ///
 /// This is simpler than using a semaphore for streams because it doesn't
@@ -446,11 +466,17 @@ impl LlmInterface {
         user_message: &str,
         history_msg_count: usize,
         include_tools: bool,
+        compact_tools: bool,
     ) -> (usize, usize) {
         // Use more conservative budget for small contexts
         // < 8k: 50% for prompt, 50% for generation + overhead
         // < 16k: 60%, >= 16k: 70%
-        let prompt_ratio = if max_ctx < 8192 {
+        let prompt_ratio = if compact_tools && max_ctx <= 8192 {
+            // The compact 8K path exposes only the shell schema. Reserve enough
+            // prompt space for the latest compact tool result while retaining
+            // at least 2K tokens for the model's next call/final response.
+            75
+        } else if max_ctx < 8192 {
             50
         } else if max_ctx < 16384 {
             60
@@ -467,6 +493,7 @@ impl LlmInterface {
             } else {
                 tools
                     .iter()
+                    .filter(|tool| !compact_tools || tool.name == "shell")
                     .map(|t| {
                         estimate_tokens(&t.name)
                             + estimate_tokens(&t.description)
@@ -548,16 +575,24 @@ impl LlmInterface {
     ///
     /// Returns a conservative default (4096) if the LLM is not ready.
     pub async fn max_context_length(&self) -> usize {
+        let apply_service_cap = |reported: usize| {
+            std::env::var("HERAMIND_MAX_CONTEXT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .map(|cap| reported.min(cap))
+                .unwrap_or(reported)
+        };
+
         // First, try to query the runtime directly (most accurate)
         if let Ok(runtime) = self.get_runtime().await {
-            return runtime.max_context_length();
+            return apply_service_cap(runtime.max_context_length());
         }
 
         // Fall back to instance manager if runtime is not available
         if self.uses_instance_manager() {
             if let Some(manager) = &self.instance_manager {
                 if let Some(instance) = manager.get_active_instance() {
-                    return instance.capabilities.max_context;
+                    return apply_service_cap(instance.capabilities.max_context);
                 }
             }
         }
@@ -1129,6 +1164,7 @@ impl LlmInterface {
                     &user_message,
                     history_msgs.len(),
                     has_tools,
+                    false,
                 )
                 .await;
 
@@ -1333,6 +1369,7 @@ impl LlmInterface {
                     &user_text,
                     history_msgs.len(),
                     has_tools,
+                    false,
                 )
                 .await;
 
@@ -1589,6 +1626,7 @@ impl LlmInterface {
                     &user_text,
                     history_msgs.len(),
                     include_tools,
+                    false,
                 )
                 .await;
 
@@ -1713,15 +1751,20 @@ impl LlmInterface {
         // Check model context capacity for adaptive prompt sizing
         let max_ctx = self.max_context_length().await;
         // Use more conservative budget for small contexts
-        let prompt_budget = if max_ctx < 8192 {
-            (max_ctx * 50) / 100
+        let prompt_budget = if max_ctx <= 8192 {
+            // Compact prompt + shell-only schema leaves room for useful tool
+            // history; the previous 60% cap discarded every dashboard result.
+            (max_ctx * 75) / 100
         } else if max_ctx < 16384 {
             (max_ctx * 60) / 100
         } else {
             (max_ctx * 70) / 100
         };
 
-        let use_compact_prompt = prompt_budget < 3000; // < ~3000 tokens → use compact prompt
+        // Native tool schemas are sizeable. At 8K context, the full system
+        // prompt leaves virtually no generation room (observed as prompt_eval
+        // 8162 + eval 30), so use the operational compact prompt.
+        let use_compact_prompt = should_use_compact_tool_prompt(max_ctx, prompt_budget);
         let skip_history = prompt_budget < 1500; // < ~1500 tokens → skip history entirely
         let skip_tools = prompt_budget < 2000; // < ~2000 tokens → no tool definitions
 
@@ -1737,11 +1780,7 @@ impl LlmInterface {
         // Build system prompt (with or without tools based on phase)
         let system_prompt = if include_tools {
             if use_compact_prompt {
-                // Compact prompt for small context models (< 4096)
-                "You are HeraMind, a helpful IoT assistant. Answer questions concisely. \
-                 You can help with device management, data queries, and automation rules. \
-                 Keep responses brief."
-                    .to_string()
+                COMPACT_TOOL_SYSTEM_PROMPT.to_string()
             } else {
                 self.build_system_prompt_with_tools(Some(&user_message))
                     .await
@@ -1913,6 +1952,7 @@ impl LlmInterface {
                     &user_message,
                     history_msgs.len(),
                     include_tools,
+                    use_compact_prompt,
                 )
                 .await;
 
@@ -1979,10 +2019,19 @@ impl LlmInterface {
 
         // Get tool definitions
         let tools = self.tool_definitions.read().await;
-        let tools_input = if tools.is_empty() {
+        let selected_tools = if use_compact_prompt {
+            tools
+                .iter()
+                .filter(|tool| tool.name == "shell")
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            tools.clone()
+        };
+        let tools_input = if selected_tools.is_empty() {
             None
         } else {
-            Some(tools.clone())
+            Some(selected_tools)
         };
         drop(tools);
 
@@ -2209,6 +2258,16 @@ mod tests {
         assert_eq!(config.top_p, 0.7);
         assert_eq!(config.max_tokens, 4096);
         assert_eq!(config.concurrent_limit, DEFAULT_CONCURRENT_LIMIT);
+    }
+
+    #[test]
+    fn compact_tool_prompt_preserves_data_query_rules_for_8k_models() {
+        assert!(should_use_compact_tool_prompt(8_192, 4_915));
+        assert!(!should_use_compact_tool_prompt(32_768, 22_937));
+        assert!(COMPACT_TOOL_SYSTEM_PROMPT.contains("heramind dashboard inspect"));
+        assert!(COMPACT_TOOL_SYSTEM_PROMPT.contains("heramind device history"));
+        assert!(COMPACT_TOOL_SYSTEM_PROMPT.contains("Vietnamese"));
+        assert!(COMPACT_TOOL_SYSTEM_PROMPT.contains("never present a plan as the final answer"));
     }
 
     #[test]

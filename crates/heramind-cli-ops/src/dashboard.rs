@@ -1,7 +1,7 @@
 use crate::types::{BuildMeta, CliResponse};
 use crate::ApiClient;
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// List all dashboards with compact summary.
 ///
@@ -78,6 +78,68 @@ pub async fn list_dashboards(client: &ApiClient) -> Result<CliResponse> {
 pub async fn get_dashboard(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client.get(&format!("/dashboards/{}", id)).await?;
     Ok(CliResponse::success(data, "Dashboard retrieved"))
+}
+
+/// Inspect dashboard bindings with a compact response suitable for an LLM.
+pub async fn inspect_dashboard(client: &ApiClient, id: &str) -> Result<CliResponse> {
+    let data = client.get(&format!("/dashboards/{}", id)).await?;
+    // API responses may be wrapped more than once (`data.data`). Peel only
+    // object wrappers until the actual dashboard (which has `components`) is
+    // reached.
+    let mut dashboard = &data;
+    while dashboard.get("components").is_none() {
+        let Some(inner) = dashboard.get("data") else {
+            break;
+        };
+        dashboard = inner;
+    }
+    let components = dashboard
+        .get("components")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|component| {
+                    let data_source = component.get("data_source")?;
+                    if data_source.is_null() {
+                        return None;
+                    }
+                    Some(json!({
+                        "id": component.get("id"),
+                        "title": component.get("title"),
+                        "type": component.get("type"),
+                        "data_source": compact_data_source(data_source),
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(CliResponse::success(
+        json!({
+            "id": dashboard.get("id"),
+            "name": dashboard.get("name"),
+            "components": components,
+        }),
+        "Dashboard bindings inspected",
+    ))
+}
+
+fn compact_data_source(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(compact_data_source).collect()),
+        Value::Object(source) => {
+            const BINDING_KEYS: &[&str] = &["sourceId", "metricId", "timeRange", "aggregateExt"];
+            let mut compact = serde_json::Map::new();
+            for key in BINDING_KEYS {
+                if let Some(field) = source.get(*key) {
+                    compact.insert((*key).to_string(), field.clone());
+                }
+            }
+            Value::Object(compact)
+        }
+        other => other.clone(),
+    }
 }
 
 /// Create a new dashboard

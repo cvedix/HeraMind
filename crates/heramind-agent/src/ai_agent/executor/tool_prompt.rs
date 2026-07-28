@@ -36,7 +36,7 @@ pub(crate) fn build_tool_system_prompt(
     // Canonical source: crates/heramind-agent/src/prompts/system_prompt.md
     let preamble = "\
 ## Language Policy\n\
-Respond in the same language as the task definition and operator messages. Never mix languages in a single response. When uncertain, default to English.\n\n\
+Respond in the same language as the task definition and operator messages, including Vietnamese when the operator writes in Vietnamese. Never mix languages in a single response. When uncertain, default to English.\n\n\
 ## Task Workflow\n\
 1. **Understand**: What does this task actually require before reaching for tools?\n\
 2. **Gather**: Collect real data through tools — never fabricate IDs, metric names, or values.\n\

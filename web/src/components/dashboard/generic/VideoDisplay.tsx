@@ -232,7 +232,7 @@ function VideoPlayer({
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             if (isCancelled || isDestroyingRef.current) return
             onLoadingChange(false)
-            if (autoplay && video && !video.paused) {
+            if (autoplay && video.paused) {
               playPromiseRef.current = video.play().catch((e) => {
                 console.warn('[HLS] Autoplay prevented:', e)
               })
