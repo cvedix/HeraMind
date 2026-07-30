@@ -35,6 +35,7 @@ import { confirm } from '@/components/ui/use-confirm'
 import { CommandButton } from '@/components/dashboard/generic/CommandButton'
 import { ImageDisplay } from '@/components/dashboard/generic/ImageDisplay'
 import { ImageHistory } from '@/components/dashboard/generic/ImageHistory'
+import { EventList } from '@/components/dashboard/generic/EventList'
 import { WebDisplay } from '@/components/dashboard/generic/WebDisplay'
 import { MarkdownDisplay } from '@/components/dashboard/generic/MarkdownDisplay'
 import { MapDisplay } from '@/components/dashboard/generic/MapDisplay'
@@ -45,7 +46,7 @@ const builtInTypes = new Set([
   'value-card', 'counter', 'metric-card',
   'led-indicator', 'sparkline', 'progress-bar',
   'line-chart', 'area-chart', 'bar-chart', 'pie-chart',
-  'toggle-switch', 'image-display', 'image-history',
+  'toggle-switch', 'image-display', 'image-history', 'event-list',
   'web-display', 'markdown-display', 'map-display', 'video-display', 'custom-layer',
 ])
 
@@ -63,6 +64,7 @@ const builtInComponentMap: Record<string, React.ComponentType<any>> = {
   'toggle-switch': CommandButton,
   'image-display': ImageDisplay,
   'image-history': ImageHistory,
+  'event-list': EventList,
   'web-display': WebDisplay,
   'markdown-display': MarkdownDisplay,
   'map-display': MapDisplay,

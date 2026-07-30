@@ -39,6 +39,7 @@ import {
   // Display & Content
   Image,
   Play,
+  ListFilter,
   Globe,
   FileText,
   // Spatial & Media
@@ -346,6 +347,30 @@ export const componentRegistry: ComponentRegistry = {
       showIndex: true,
       showTimestamp: true,
       showLabel: false,
+    },
+  },
+
+  'event-list': {
+    type: 'event-list',
+    name: 'Event List',
+    description: 'Review structured events, images, and dynamic attributes',
+    category: 'display',
+    icon: ListFilter,
+    sizeConstraints: getSizeConstraints('event-list'),
+    hasDataSource: true,
+    hasDisplayConfig: true,
+    hasActions: false,
+    acceptsProp: (prop) => [
+      'title', 'limit', 'timeRange', 'pageSize', 'showSearch',
+      'showFilters', 'showImage', 'className',
+    ].includes(prop),
+    defaultProps: {
+      limit: 200,
+      timeRange: 48,
+      pageSize: 10,
+      showSearch: true,
+      showFilters: true,
+      showImage: true,
     },
   },
 

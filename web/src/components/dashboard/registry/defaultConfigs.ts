@@ -53,6 +53,15 @@ export const DEFAULT_COMPONENT_CONFIGS: Record<string, Record<string, unknown>> 
     limit: 50,
     timeRange: 24,
   },
+  'event-list': {
+    dataSource: undefined,
+    limit: 200,
+    timeRange: 48,
+    pageSize: 10,
+    showSearch: true,
+    showFilters: true,
+    showImage: true,
+  },
   'web-display': {
     src: 'https://example.com',
     title: 'Website',

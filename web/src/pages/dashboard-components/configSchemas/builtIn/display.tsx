@@ -302,6 +302,100 @@ export function getImageHistorySchema(config: any, ctx: SchemaContext, u: Update
         }
 }
 
+export function getEventListSchema(config: any, ctx: SchemaContext, u: Updaters): ComponentConfigSchema {
+  const { t } = ctx
+  const { updateConfig, updateDataSource } = u
+  return {
+    dataSourceSections: [
+      {
+        type: 'data-source' as const,
+        props: {
+          dataSource: config.dataSource,
+          onChange: updateDataSource,
+          allowedTypes: ['device-metric', 'extension', 'transform'],
+        },
+      },
+    ],
+    styleSections: [
+      {
+        type: 'custom' as const,
+        render: () => (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-3">
+              <Field>
+                <Label>{t('eventList.maxEvents')}</Label>
+                <Input
+                  type="number"
+                  value={config.limit ?? 200}
+                  onChange={(e) => updateConfig('limit')(Number(e.target.value))}
+                  min={1}
+                  max={1000}
+                  className="h-9"
+                />
+              </Field>
+              <Field>
+                <Label>{t('visualDashboard.timeRangeHours')}</Label>
+                <Input
+                  type="number"
+                  value={config.timeRange ?? 48}
+                  onChange={(e) => updateConfig('timeRange')(Number(e.target.value))}
+                  min={1}
+                  max={720}
+                  className="h-9"
+                />
+              </Field>
+              <Field>
+                <Label>{t('eventList.rowsPerPage')}</Label>
+                <Input
+                  type="number"
+                  value={config.pageSize ?? 10}
+                  onChange={(e) => updateConfig('pageSize')(Number(e.target.value))}
+                  min={5}
+                  max={50}
+                  className="h-9"
+                />
+              </Field>
+            </div>
+          </div>
+        ),
+      },
+    ],
+    displaySections: [
+      {
+        type: 'custom' as const,
+        render: () => (
+          <div className="space-y-3">
+            <Field>
+              <Label>{t('visualDashboard.title')}</Label>
+              <Input
+                value={config.title || ''}
+                onChange={(e) => updateConfig('title')(e.target.value)}
+                placeholder={t('eventList.title')}
+                className="h-9"
+              />
+            </Field>
+            <div className="flex flex-wrap gap-4">
+              {([
+                ['showSearch', 'eventList.showSearch'],
+                ['showFilters', 'eventList.showFilters'],
+                ['showImage', 'eventList.showImage'],
+              ] as const).map(([key, label]) => (
+                <label key={key} className="flex cursor-pointer items-center gap-2">
+                  <Checkbox
+                    checked={config[key] ?? true}
+                    onCheckedChange={(checked) => updateConfig(key)(!!checked)}
+                  />
+                  <span className="text-sm">{t(label)}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        ),
+      },
+    ],
+  }
+}
+
 export function getWebDisplaySchema(config: any, ctx: SchemaContext, u: Updaters): ComponentConfigSchema {
   const { t } = ctx
   const { updateConfig, updateDataSource } = u

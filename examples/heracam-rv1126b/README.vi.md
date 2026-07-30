@@ -40,6 +40,10 @@ Script tạo dashboard **HERACAM RV1126B - Báo cáo phương tiện** gồm:
 - Biểu đồ số lượng phương tiện theo thời gian trong 6 giờ.
 - Ảnh event mới nhất từ crop.
 - Lịch sử ảnh event trong 48 giờ.
+- Danh sách phương tiện trong 48 giờ, có tìm kiếm, lọc theo loại phương tiện
+  và phân trang.
+- Chi tiết từng event gồm ảnh crop, event ID, loại/màu/hướng phương tiện,
+  độ tin cậy và toàn bộ attribute động đi kèm.
 - Các thẻ thông tin: màu sắc, loại phương tiện, hướng di chuyển, độ tin cậy,
   thời gian event.
 

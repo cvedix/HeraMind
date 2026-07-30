@@ -100,7 +100,7 @@ export function ComponentConfigDialog({
   // Compute suggestedMode for DataSource config based on component type
   const suggestedMode = useMemo((): DataSourceMode | undefined => {
     const latestTypes = ['led-indicator', 'value-card', 'progress-bar', 'markdown-display', 'image-display', 'video-display', 'web-display']
-    const timeseriesTypes = ['line-chart', 'area-chart', 'bar-chart', 'pie-chart', 'sparkline', 'image-history', 'ai-analyst']
+    const timeseriesTypes = ['line-chart', 'area-chart', 'bar-chart', 'pie-chart', 'sparkline', 'image-history', 'event-list', 'ai-analyst']
     const commandTypes = ['toggle-switch']
     const infoTypes = ['map-display', 'custom-layer']
     if (latestTypes.includes(componentType)) return 'latest'

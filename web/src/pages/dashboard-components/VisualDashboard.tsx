@@ -694,6 +694,17 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
           timeRange: 24,
         }
         break
+      case 'event-list':
+        defaultConfig = {
+          dataSource: undefined,
+          limit: 200,
+          timeRange: 48,
+          pageSize: 10,
+          showSearch: true,
+          showFilters: true,
+          showImage: true,
+        }
+        break
       case 'web-display':
         defaultConfig = {
           src: 'https://example.com',

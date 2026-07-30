@@ -57,7 +57,7 @@ const MOBILE_MIN_H: Record<string, number> = {
   'ai-analyst': 3,
   'line-chart': 3, 'area-chart': 3, 'bar-chart': 3, 'pie-chart': 3,
   'map-display': 3, 'video-display': 3, 'web-display': 3, 'custom-layer': 3,
-  'image-history': 3, 'agent-monitor-widget': 4,
+  'image-history': 3, 'event-list': 4, 'agent-monitor-widget': 4,
 }
 
 /**

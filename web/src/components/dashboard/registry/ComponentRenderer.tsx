@@ -46,6 +46,7 @@ import { CommandButton } from '../generic/CommandButton'
 // Display & Content
 import { ImageDisplay } from '../generic/ImageDisplay'
 import { ImageHistory } from '../generic/ImageHistory'
+import { EventList } from '../generic/EventList'
 import { WebDisplay } from '../generic/WebDisplay'
 import { MarkdownDisplay } from '../generic/MarkdownDisplay'
 
@@ -77,6 +78,7 @@ const componentMap: Record<GenericComponentType, React.ComponentType<any>> = {
   // Display & Content
   'image-display': ImageDisplay,
   'image-history': ImageHistory,
+  'event-list': EventList,
   'web-display': WebDisplay,
   'markdown-display': MarkdownDisplay,
 

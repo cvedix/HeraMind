@@ -15,7 +15,7 @@ import type { SchemaContext, SchemaFactory } from './types'
 import { getValueCardSchema, getSparklineSchema, getProgressBarSchema, getLEDIndicatorSchema } from './builtIn/indicators'
 import { getLineChartSchema, getAreaChartSchema, getBarChartSchema, getPieChartSchema } from './builtIn/charts'
 import { getToggleSwitchSchema } from './builtIn/controls'
-import { getImageDisplaySchema, getImageHistorySchema, getWebDisplaySchema, getMarkdownDisplaySchema, getVideoDisplaySchema } from './builtIn/display'
+import { getImageDisplaySchema, getImageHistorySchema, getEventListSchema, getWebDisplaySchema, getMarkdownDisplaySchema, getVideoDisplaySchema } from './builtIn/display'
 import { getMapDisplaySchema, getCustomLayerSchema } from './builtIn/spatial'
 import { getAgentMonitorSchema, getAIAnalystSchema } from './builtIn/business'
 
@@ -50,6 +50,7 @@ const registry: Record<string, SchemaFactory> = {
   // Display
   'image-display': getImageDisplaySchema,
   'image-history': getImageHistorySchema,
+  'event-list': getEventListSchema,
   'web-display': getWebDisplaySchema,
   'markdown-display': getMarkdownDisplaySchema,
   'video-display': getVideoDisplaySchema,

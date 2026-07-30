@@ -274,6 +274,25 @@ crop_image_source() {
     }'
 }
 
+raw_event_source() {
+  jq -n \
+    --arg device_id "$DEVICE_ID" \
+    '{
+      type: "telemetry",
+      sourceId: $device_id,
+      metricId: "_raw",
+      timeRange: 48,
+      limit: 200,
+      aggregateExt: "raw",
+      source: "device",
+      id: $device_id,
+      field: "_raw",
+      mode: "timeseries",
+      transform: "raw",
+      params: {includeRawPoints: true}
+    }'
+}
+
 component() {
   local id="$1"
   local type="$2"
@@ -331,7 +350,9 @@ for spec in \
   components="$(jq --argjson item "$(component "heracam-${metric}" value-card "$title" "$x" "$y" "$w" "$h" "$(transform_source "$metric")" "{\"size\":\"md\",\"variant\":\"default\",\"showTrend\":false,\"icon\":\"${icon}\"}")" '. + [$item]' <<<"$components")"
 done
 
-components="$(jq --argjson item "$(component heracam-crop-history image-history "Lịch sử hình ảnh event · 48 giờ" 0 12 12 5 "$(crop_image_source)" "$crop_history_config")" '. + [$item]' <<<"$components")"
+event_list_config='{"limit":200,"timeRange":48,"pageSize":10,"showSearch":true,"showFilters":true,"showImage":true}'
+components="$(jq --argjson item "$(component heracam-event-list event-list "Danh sách phương tiện và attribute event · 48 giờ" 0 12 12 7 "$(raw_event_source)" "$event_list_config")" '. + [$item]' <<<"$components")"
+components="$(jq --argjson item "$(component heracam-crop-history image-history "Lịch sử hình ảnh event · 48 giờ" 0 19 12 5 "$(crop_image_source)" "$crop_history_config")" '. + [$item]' <<<"$components")"
 
 dashboard_payload="$(make_temp_json)"
 jq -n \

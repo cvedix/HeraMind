@@ -418,6 +418,7 @@ export type GenericComponentType =
   // Display & Content
   | 'image-display'
   | 'image-history'
+  | 'event-list'
   | 'web-display'
   | 'markdown-display'
   // Spatial & Media
@@ -565,6 +566,7 @@ export const COMPONENT_SIZE_CONSTRAINTS: Partial<Record<ImplementedComponentType
   // Display & Content
   'image-display': { minW: 2, minH: 2, defaultW: 4, defaultH: 3, maxW: 12, maxH: 12 },
   'image-history': { minW: 4, minH: 3, defaultW: 6, defaultH: 5, maxW: 12, maxH: 12 },
+  'event-list': { minW: 6, minH: 4, defaultW: 12, defaultH: 6, maxW: 12, maxH: 12 },
   'web-display': { minW: 3, minH: 3, defaultW: 6, defaultH: 4, maxW: 12, maxH: 12 },
   'markdown-display': { minW: 2, minH: 2, defaultW: 4, defaultH: 3, maxW: 12, maxH: 12 },
 
@@ -611,7 +613,7 @@ export function isGenericComponent(component: DashboardComponent): component is 
     'value-card', 'led-indicator', 'sparkline', 'progress-bar',
     'line-chart', 'area-chart', 'bar-chart', 'pie-chart',
     'toggle-switch',
-    'image-display', 'image-history', 'web-display', 'markdown-display',
+    'image-display', 'image-history', 'event-list', 'web-display', 'markdown-display',
     'map-display', 'video-display', 'custom-layer',
   ]
   return genericTypes.includes(component.type as GenericComponentType)
