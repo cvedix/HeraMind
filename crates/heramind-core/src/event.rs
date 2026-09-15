@@ -90,6 +90,38 @@ pub enum HeraMindEvent {
         timestamp: i64,
     },
 
+    // ========== Builtin LLM Events ==========
+    /// Builtin LLM model download progress (WS/SSE 推送给前端进度条)。
+    ModelDownloadProgress {
+        model_id: String,
+        downloaded: u64,
+        total: Option<u64>,
+        status: String, // "downloading" | "complete" | "error"
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    // ========== System Upgrade Events ==========
+    /// Server self-upgrade progress (web-triggered from the About page).
+    /// Not part of any `is_*_event()` category — subscribe on the unfiltered
+    /// stream (`category=all`), like `ModelDownloadProgress`.
+    SystemUpgradeProgress {
+        /// "checking" | "downloading" | "verifying" | "staged"
+        /// | "applying" | "restarting" | "done" | "error"
+        phase: String,
+        current_version: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        downloaded: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     // ========== Rule Events ==========
     /// Rule condition was evaluated
     RuleEvaluated {
@@ -153,6 +185,16 @@ pub enum HeraMindEvent {
 
     /// Message was resolved
     MessageResolved { message_id: String, timestamp: i64 },
+
+    /// IM message received from a bridge (Telegram/Feishu/...)
+    ImMessageReceived {
+        platform: String,
+        im_chat_id: String,
+        sender_id: String,
+        text: String,
+        msg_id: String,
+        timestamp: i64,
+    },
 
     // ========== Agent Events (User-defined AI Agents) ==========
     /// Agent execution started
@@ -408,6 +450,21 @@ pub enum HeraMindEvent {
         timestamp: i64,
     },
 
+    /// A mutating REST request (POST/PUT/PATCH/DELETE) succeeded on a data
+    /// domain. Published by the API's data-change middleware for ANY actor —
+    /// the AI agent driving the heramind CLI, another client, a background
+    /// job — so web pages can refresh their caches without manual reload.
+    DataChanged {
+        /// Data domain, derived from the path segment (e.g. "devices",
+        /// "automations", "dashboards", "extensions").
+        domain: String,
+        /// HTTP method of the mutating request.
+        method: String,
+        /// Full request path (for debugging / fine-grained client handling).
+        path: String,
+        timestamp: i64,
+    },
+
     /// Custom event for extensions and plugins
     ///
     /// Allows third-party components to publish their own events
@@ -474,6 +531,8 @@ impl HeraMindEvent {
             Self::DeviceMetric { .. } => "DeviceMetric",
             Self::DeviceCommandResult { .. } => "DeviceCommandResult",
             Self::DeviceDiscovered { .. } => "DeviceDiscovered",
+            Self::ModelDownloadProgress { .. } => "ModelDownloadProgress",
+            Self::SystemUpgradeProgress { .. } => "SystemUpgradeProgress",
             Self::RuleEvaluated { .. } => "RuleEvaluated",
             Self::RuleTriggered { .. } => "RuleTriggered",
             Self::RuleExecuted { .. } => "RuleExecuted",
@@ -482,6 +541,7 @@ impl HeraMindEvent {
             Self::MessageCreated { .. } => "MessageCreated",
             Self::MessageAcknowledged { .. } => "MessageAcknowledged",
             Self::MessageResolved { .. } => "MessageResolved",
+            Self::ImMessageReceived { .. } => "ImMessageReceived",
             Self::AgentExecutionStarted { .. } => "AgentExecutionStarted",
             Self::AgentThinking { .. } => "AgentThinking",
             Self::AgentDecision { .. } => "AgentDecision",
@@ -502,6 +562,7 @@ impl HeraMindEvent {
             Self::ExtensionCommandCompleted { .. } => "ExtensionCommandCompleted",
             Self::ExtensionCommandFailed { .. } => "ExtensionCommandFailed",
             Self::DashboardUpdated { .. } => "DashboardUpdated",
+            Self::DataChanged { .. } => "DataChanged",
             Self::Custom { .. } => "Custom",
             Self::AgentStreamChunk { .. } => "AgentStreamChunk",
             Self::AgentStreamEnd { .. } => "AgentStreamEnd",
@@ -536,6 +597,7 @@ impl HeraMindEvent {
             | Self::MessageCreated { timestamp, .. }
             | Self::MessageAcknowledged { timestamp, .. }
             | Self::MessageResolved { timestamp, .. }
+            | Self::ImMessageReceived { timestamp, .. }
             | Self::AgentExecutionStarted { timestamp, .. }
             | Self::AgentThinking { timestamp, .. }
             | Self::AgentDecision { timestamp, .. }
@@ -556,10 +618,19 @@ impl HeraMindEvent {
             | Self::ExtensionCommandCompleted { timestamp, .. }
             | Self::ExtensionCommandFailed { timestamp, .. }
             | Self::DashboardUpdated { timestamp, .. }
+            | Self::DataChanged { timestamp, .. }
             | Self::AgentStreamChunk { timestamp, .. }
             | Self::AgentStreamEnd { timestamp, .. } => *timestamp,
             Self::Custom { .. } => {
                 // Custom events don't have a timestamp, use current time
+                chrono::Utc::now().timestamp()
+            }
+            Self::ModelDownloadProgress { .. } => {
+                // Model download progress has no timestamp field, use current time
+                chrono::Utc::now().timestamp()
+            }
+            Self::SystemUpgradeProgress { .. } => {
+                // Upgrade progress has no timestamp field, use current time
                 chrono::Utc::now().timestamp()
             }
         }
@@ -682,6 +753,11 @@ impl HeraMindEvent {
                 | Self::ExtensionCommandCompleted { .. }
                 | Self::ExtensionCommandFailed { .. }
         )
+    }
+
+    /// Check if this is a builtin LLM model download progress event.
+    pub fn is_model_download_progress(&self) -> bool {
+        matches!(self, Self::ModelDownloadProgress { .. })
     }
 }
 
@@ -1074,5 +1150,21 @@ mod tests {
             }
             _ => panic!("Expected ExtensionOutput event"),
         }
+    }
+
+    #[test]
+    fn model_download_progress_event_name_and_tags() {
+        let e = HeraMindEvent::ModelDownloadProgress {
+            model_id: "lfm25-2.6b".to_string(),
+            downloaded: 10,
+            total: Some(100),
+            status: "downloading".to_string(),
+            error: None,
+        };
+        assert_eq!(e.type_name(), "ModelDownloadProgress");
+        assert!(e.is_model_download_progress());
+        // serde 序列化走通
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("lfm25-2.6b"));
     }
 }

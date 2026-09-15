@@ -55,10 +55,12 @@ mod tests {
             start: None,
             end: None,
             limit: None,
+            hours: None,
         };
         assert_eq!(query.start, None);
         assert_eq!(query.end, None);
         assert_eq!(query.limit, None);
+        assert_eq!(query.hours, None);
     }
 
     #[tokio::test]
@@ -67,10 +69,12 @@ mod tests {
             start: Some(1234567890),
             end: Some(1234567900),
             limit: Some(100),
+            hours: Some(6),
         };
         assert_eq!(query.start, Some(1234567890));
         assert_eq!(query.end, Some(1234567900));
         assert_eq!(query.limit, Some(100));
+        assert_eq!(query.hours, Some(6));
     }
 
     #[tokio::test]
@@ -85,6 +89,7 @@ mod tests {
                 "address": "localhost:1883",
                 "topic": "test/topic",
             }),
+            offline_timeout_secs: None,
         };
 
         assert_eq!(request.device_id, Some(device_id));
@@ -188,6 +193,7 @@ mod tests {
             connection_config: json!({
                 "address": "localhost:1883",
             }),
+            offline_timeout_secs: None,
         };
 
         assert!(request.device_id.is_none());

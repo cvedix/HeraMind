@@ -15,6 +15,7 @@ import { MoreVertical, Loader2, Inbox } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
 import { EmptyStateCompact } from '@/components/shared/EmptyState'
 import { cn } from '@/lib/utils'
+import { interactiveCardHover } from '@/design-system/tokens/size'
 import { textMini } from "@/design-system/tokens/typography"
 
 export interface TableColumn {
@@ -25,26 +26,26 @@ export interface TableColumn {
   className?: string
 }
 
-export interface TableRowAction {
+export interface TableRowAction<T = Record<string, unknown>> {
   label: string
   icon?: ReactNode
-  onClick: (rowData?: Record<string, unknown>) => void
+  onClick: (rowData: T) => void
   variant?: 'default' | 'destructive'
   disabled?: boolean
-  show?: (rowData: Record<string, unknown>) => boolean
+  show?: (rowData: T) => boolean
 }
 
-export interface ResponsiveTableProps {
+export interface ResponsiveTableProps<T = Record<string, unknown>> {
   columns: TableColumn[]
-  data: Record<string, unknown>[]
-  renderCell: (columnKey: string, rowData: Record<string, unknown>) => ReactNode
-  rowKey: (rowData: Record<string, unknown>) => string
-  actions?: TableRowAction[]
-  onRowClick?: (rowData: Record<string, unknown>) => void
+  data: T[]
+  renderCell: (columnKey: string, rowData: T) => ReactNode
+  rowKey: (rowData: T) => string
+  actions?: TableRowAction<T>[]
+  onRowClick?: (rowData: T) => void
   className?: string
   loading?: boolean
   emptyState?: ReactNode
-  getRowClassName?: (rowData: Record<string, unknown>) => string
+  getRowClassName?: (rowData: T) => string
   /** Enable sticky header for table */
   stickyHeader?: boolean
   /** Max height for table body scrolling (e.g., '400px', 'calc(100vh-200px)') */
@@ -57,13 +58,13 @@ export interface ResponsiveTableProps {
    *  Use this when the default key-value layout produces asymmetric or
    *  truncated content (e.g., multi-line cells, centered badges, mixed
    *  cell shapes in one row). */
-  renderMobileBody?: (rowData: Record<string, unknown>) => ReactNode
+  renderMobileBody?: (rowData: T) => ReactNode
   /** Extra content rendered in the top-right of the mobile card header.
    *  Occupies the same slot as the actions menu (and is hidden if actions
    *  are present). Useful for surfacing a status badge or chevron when
    *  the table has no row actions but the right side of the header would
    *  otherwise be empty. */
-  renderMobileHeaderExtra?: (rowData: Record<string, unknown>) => ReactNode
+  renderMobileHeaderExtra?: (rowData: T) => ReactNode
   /** Flatten the mobile card header — drop the `bg-muted` band and the
    *  border under it so the header and body read as one continuous
    *  surface. Use when the body already provides enough visual structure
@@ -83,7 +84,7 @@ function renderColumnLabel(label: string | ReactNode): ReactNode {
  * Desktop: Standard table
  * Mobile: Card layout
  */
-export function ResponsiveTable({
+export function ResponsiveTable<T extends object>({
   columns,
   data,
   renderCell,
@@ -100,7 +101,7 @@ export function ResponsiveTable({
   renderMobileBody,
   renderMobileHeaderExtra,
   mobileFlatHeader = false,
-}: ResponsiveTableProps) {
+}: ResponsiveTableProps<T>) {
   const { t } = useTranslation('common')
   // Show empty state only on mobile when no data
   const showEmptyState = data.length === 0 && !loading
@@ -117,16 +118,17 @@ export function ResponsiveTable({
     const skeletonRows = 8
     return (
       <>
-        {/* Desktop skeleton */}
-        <div className="hidden md:block rounded-lg border bg-card overflow-hidden">
-          <table className={cn("w-full caption-bottom text-sm", className)}>
+        {/* Desktop skeleton — wrapper scrolls internally when the table
+            outgrows it (min-w-full keeps the table filling the container) */}
+        <div className="hidden md:block w-full overflow-x-auto rounded-lg border bg-card">
+          <table className={cn("min-w-full caption-bottom text-sm", className)}>
             <thead className="[&_tr]:border-b">
               <tr className="rounded-t-lg">
                 {columns.map((column) => (
                   <th
                     key={column.key}
                     className={cn(
-                      "h-12 px-4 align-middle text-[11px] font-semibold uppercase tracking-wider text-foreground",
+                      "h-12 px-4 align-middle text-mini font-semibold uppercase tracking-wide text-muted-foreground",
                       column.align === 'center' && 'text-center',
                       column.align === 'right' && 'text-right',
                       !column.align && 'text-left',
@@ -183,9 +185,11 @@ export function ResponsiveTable({
 
   return (
     <>
-      {/* Desktop Table - uses page scroll with sticky header */}
-      <div className="hidden md:block rounded-lg border bg-card overflow-hidden">
-        <table className={cn("w-full caption-bottom text-sm", className)}>
+      {/* Desktop Table - w-full wrapper scrolls internally (overflow-x-auto)
+          when the table outgrows it; min-w-full keeps the table filling the
+          container width so it adapts to window resizes */}
+      <div className="hidden md:block w-full overflow-x-auto rounded-lg border bg-card">
+        <table className={cn("min-w-full caption-bottom text-sm", className)}>
           <thead className={cn(
             "[&_tr]:border-b",
             stickyHeader && "sticky top-0 z-10 bg-card"
@@ -195,7 +199,7 @@ export function ResponsiveTable({
                 <th
                   key={column.key}
                   className={cn(
-                    "h-12 px-4 align-middle text-[11px] font-semibold uppercase tracking-wider text-foreground",
+                    "h-12 px-4 align-middle text-mini font-semibold uppercase tracking-wide text-muted-foreground",
                     column.align === 'center' && 'text-center',
                     column.align === 'right' && 'text-right',
                     !column.align && 'text-left',
@@ -228,11 +232,11 @@ export function ResponsiveTable({
                   <tr
                     key={rowKey(rowData)}
                     className={cn(
-                      "border-b transition-colors duration-150 hover:bg-muted-30 animate-fade-in-up",
+                      "border-b transition-colors duration-fast hover:bg-muted-30 animate-fade-in-up",
                       onRowClick && 'cursor-pointer',
                       rowClass
                     )}
-                    style={{ animationDelay: `${index * 30}ms`, animationFillMode: 'both' }}
+                    style={{ animationDelay: `calc(${index} * var(--stagger-step))`, animationFillMode: 'both' }}
                     onClick={() => onRowClick?.(rowData)}
                   >
                     {columns.map((column) => (
@@ -265,6 +269,7 @@ export function ResponsiveTable({
                               size="icon"
                               className="h-8 w-8 p-0"
                               aria-label="Actions"
+                              onClick={(e) => e.stopPropagation()}
                             >
                               <MoreVertical className="h-4 w-4" />
                             </Button>
@@ -316,11 +321,12 @@ export function ResponsiveTable({
               <Card
                 key={rowKey(rowData)}
                 className={cn(
-                  'overflow-hidden border-border shadow-sm animate-fade-in-up hover:shadow-md hover:-translate-y-0.5 transition-all duration-200',
+                  'overflow-hidden border-border shadow-sm animate-fade-in-up',
+                  interactiveCardHover,
                   onRowClick && 'cursor-pointer active:scale-[0.99]',
                   rowClass
                 )}
-                style={{ animationDelay: `${index * 40}ms`, animationFillMode: 'both' }}
+                style={{ animationDelay: `calc(${index} * var(--stagger-step))`, animationFillMode: 'both' }}
                 onClick={() => onRowClick?.(rowData)}
               >
                 {/* Card Header - First column as title */}
@@ -328,7 +334,7 @@ export function ResponsiveTable({
                   "px-3 py-2.5",
                   mobileFlatHeader
                     ? "pb-1"
-                    : "bg-muted border-b border-border rounded-t-xl",
+                    : "bg-muted border-b border-border rounded-t-lg",
                 )}>
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
@@ -437,7 +443,7 @@ export function MobileCard({ title, subtitle, icon, actions, children, className
   return (
     <Card className={cn('overflow-hidden border-border rounded-lg shadow-sm', onClick && 'cursor-pointer active:scale-[0.99] transition-all', className)}>
       {/* Card Header */}
-      <div className="bg-muted px-3 py-2.5 border-b border-border rounded-t-xl">
+      <div className="bg-muted px-3 py-2.5 border-b border-border rounded-t-lg">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
             {icon && <div className="shrink-0">{icon}</div>}

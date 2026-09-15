@@ -17,11 +17,12 @@ use serde::{Deserialize, Serialize};
 
 use heramind_core::llm::backend::{
     BackendCapabilities, BackendId, BackendMetrics, FinishReason, LlmError, LlmInput, LlmOutput,
-    LlmRuntime, StreamChunk, TokenUsage,
+    LlmRuntime, ReasoningCapabilities, ReasoningControl, StreamChunk, ThinkingEffort, TokenUsage,
 };
 use heramind_core::message::{Content, ContentPart, ImageDetail, Message, MessageRole};
 
 use super::super::rate_limited_client::{ProviderRateLimits, RateLimitedClient};
+use super::super::text_tool_calls;
 
 /// Cloud API provider.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +57,10 @@ pub enum CloudProvider {
 }
 
 impl CloudProvider {
-    /// Get the base URL for this provider.
+    /// Get the base URL for this provider. Only used when the backend carries
+    /// no explicit endpoint — every other default in the codebase points GLM
+    /// at the public paas endpoint, so the earlier coding-endpoint default
+    /// here silently routed endpoint-less GLM instances elsewhere.
     fn base_url(&self) -> &str {
         match self {
             Self::OpenAI => "https://api.openai.com/v1",
@@ -66,23 +70,25 @@ impl CloudProvider {
             Self::Custom => "",
             Self::Qwen => "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Self::DeepSeek => "https://api.deepseek.com/v1",
-            Self::GLM => "https://open.bigmodel.cn/api/coding/paas/v4",
+            Self::GLM => "https://open.bigmodel.cn/api/paas/v4",
             Self::MiniMax => "https://api.minimax.chat/v1",
         }
     }
 
-    /// Get the default model for this provider.
+    /// Get the default model for this provider. Effectively unreachable in
+    /// production (every construction path sets a model) — kept current with
+    /// the fresh-model list so it can't resurface as a stale default.
     fn default_model(&self) -> &str {
         match self {
-            Self::OpenAI => "gpt-4o-mini",
-            Self::Anthropic => "claude-3-5-sonnet-20241022",
-            Self::Google => "gemini-1.5-flash",
-            Self::Grok => "grok-beta",
+            Self::OpenAI => "gpt-4.1-mini",
+            Self::Anthropic => "claude-sonnet-4-5",
+            Self::Google => "gemini-2.5-flash",
+            Self::Grok => "grok-3-mini",
             Self::Custom => "unknown",
-            Self::Qwen => "qwen-max-latest",
-            Self::DeepSeek => "deepseek-v3",
-            Self::GLM => "glm-4-plus",
-            Self::MiniMax => "m2-1-19b",
+            Self::Qwen => "qwen-plus",
+            Self::DeepSeek => "deepseek-chat",
+            Self::GLM => "glm-4.5-flash",
+            Self::MiniMax => "MiniMax-M2",
         }
     }
 
@@ -121,6 +127,13 @@ pub struct CloudConfig {
     /// Request timeout in seconds (default: 60).
     #[serde(default = "default_cloud_timeout_secs")]
     pub timeout_secs: u64,
+
+    /// Context window override. `None` = provider table default. Custom
+    /// endpoints MUST be able to declare this — guessing too small (the old
+    /// hardcoded 4096) collapses the history budget to zero and silently
+    /// kills cross-turn memory for every model behind the endpoint.
+    #[serde(default)]
+    pub max_context: Option<usize>,
 }
 
 /// Default timeout in seconds for cloud backends.
@@ -142,6 +155,7 @@ impl CloudConfig {
             model: None,
             base_url: None,
             timeout_secs: 60,
+            max_context: None,
         }
     }
 
@@ -153,6 +167,7 @@ impl CloudConfig {
             model: None,
             base_url: None,
             timeout_secs: 60,
+            max_context: None,
         }
     }
 
@@ -164,6 +179,7 @@ impl CloudConfig {
             model: None,
             base_url: None,
             timeout_secs: 60,
+            max_context: None,
         }
     }
 
@@ -175,6 +191,7 @@ impl CloudConfig {
             model: None,
             base_url: None,
             timeout_secs: 60,
+            max_context: None,
         }
     }
 
@@ -186,6 +203,7 @@ impl CloudConfig {
             model: None,
             base_url: Some(base_url.into()),
             timeout_secs: 60,
+            max_context: None,
         }
     }
 
@@ -197,6 +215,7 @@ impl CloudConfig {
             model: None,
             base_url: None,
             timeout_secs: 60,
+            max_context: None,
         }
     }
 
@@ -208,6 +227,7 @@ impl CloudConfig {
             model: None,
             base_url: None,
             timeout_secs: 60,
+            max_context: None,
         }
     }
 
@@ -219,6 +239,7 @@ impl CloudConfig {
             model: None,
             base_url: None,
             timeout_secs: 60,
+            max_context: None,
         }
     }
 
@@ -230,6 +251,7 @@ impl CloudConfig {
             model: None,
             base_url: None,
             timeout_secs: 60,
+            max_context: None,
         }
     }
 
@@ -242,6 +264,14 @@ impl CloudConfig {
     /// Set the timeout in seconds.
     pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Override the context window used for history budgeting. Set this for
+    /// custom endpoints — the provider table cannot know what a proxy/vLLM
+    /// deployment actually serves.
+    pub fn with_max_context(mut self, max_context: usize) -> Self {
+        self.max_context = Some(max_context);
         self
     }
 
@@ -260,10 +290,25 @@ impl CloudConfig {
 
     /// Get the effective base URL.
     fn get_base_url(&self) -> String {
-        if let Some(base) = &self.base_url {
+        let base = if let Some(base) = &self.base_url {
             base.clone()
         } else {
             self.provider.base_url().to_string()
+        };
+        // Anthropic path: requests join base + "/messages". The ecosystem
+        // convention (Anthropic SDK / Claude Code) is a base WITHOUT /v1
+        // that the client expands to /v1/messages — accept both forms so
+        // users can paste either (also covers Anthropic-compatible entries
+        // like GLM's open.bigmodel.cn/api/anthropic).
+        if matches!(self.provider, CloudProvider::Anthropic) {
+            let trimmed = base.trim_end_matches('/');
+            if trimmed.ends_with("/v1") {
+                trimmed.to_string()
+            } else {
+                format!("{}/v1", trimmed)
+            }
+        } else {
+            base
         }
     }
 
@@ -293,7 +338,6 @@ struct CloudCapabilities {
     supports_thinking: bool,
     supports_tools: bool,
     max_context: usize,
-    supports_audio: bool,
 }
 
 impl CloudRuntime {
@@ -349,14 +393,12 @@ impl CloudRuntime {
         supports_thinking: bool,
         supports_tools: bool,
         max_context: usize,
-        supports_audio: bool,
     ) -> Self {
         self.capabilities_override = Some(CloudCapabilities {
             supports_multimodal,
             supports_thinking,
             supports_tools,
             max_context,
-            supports_audio,
         });
         self
     }
@@ -585,6 +627,25 @@ impl CloudRuntime {
             stop_sequences: input.params.stop.clone(),
             stream,
             tools,
+            // Unified effort → Anthropic thinking. Explicit disable sends
+            // `{type:"disabled"}`; any enable sends `{type:"enabled", budget}`.
+            // Omitted → model default (adaptive thinking on modern Claude).
+            thinking: match input.params.thinking_effort {
+                Some(ThinkingEffort::None) => Some(AnthropicThinking::Disabled),
+                Some(_) => Some(AnthropicThinking::Enabled {
+                    // Rough budget: ~32K is safe headroom for thinking + answer.
+                    budget_tokens: MAX_TOKENS_CAP.min(32000),
+                }),
+                None => input.params.thinking_enabled.map(|enabled| {
+                    if enabled {
+                        AnthropicThinking::Enabled {
+                            budget_tokens: MAX_TOKENS_CAP.min(32000),
+                        }
+                    } else {
+                        AnthropicThinking::Disabled
+                    }
+                }),
+            },
         };
 
         let url = format!(
@@ -592,6 +653,25 @@ impl CloudRuntime {
             self.config.get_base_url(),
             self.config.provider.chat_path()
         );
+
+        // === SFT trace hook ===
+        // When HERAMIND_TRACE_DIR is set, dump the full Anthropic request
+        // (system prompt + messages + tools) the LLM actually received, so
+        // SFT training data can be reconstructed with exact input fidelity.
+        // Zero overhead when the env var is unset. See memory: minicpm5-heramind-baseline.
+        if let Ok(dir) = std::env::var("HERAMIND_TRACE_DIR") {
+            if let Ok(json) = serde_json::to_string(&request) {
+                let path = std::path::Path::new(&dir).join("anthropic_trace.jsonl");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", json);
+                }
+            }
+        }
 
         (request, url)
     }
@@ -605,6 +685,36 @@ impl CloudRuntime {
     /// `stream` controls both the `stream` flag and whether `stream_options`
     /// is populated (OpenAI requires `include_usage: true` to receive token
     /// counts in the final chunk).
+    /// Declared provider refined by endpoint sniffing — the param-level view
+    /// of where these requests actually go. Protocol-first Cloud AI (and
+    /// `--type openai` + vendor endpoint on the CLI) reaches DashScope /
+    /// DeepSeek as plain OpenAI-compatible backends, which would otherwise
+    /// lose the vendor-specific param wiring (enable_thinking for DashScope
+    /// hybrid models, the thinking on/off toggle for DeepSeek) and emit
+    /// reasoning_effort where the vendor doesn't accept it. Sniff the base
+    /// URL so the gates follow the endpoint regardless of how the backend
+    /// was typed; native vendor types pass through unchanged.
+    fn param_provider(&self) -> CloudProvider {
+        if matches!(
+            self.config.provider,
+            CloudProvider::OpenAI | CloudProvider::Custom
+        ) {
+            let base = self.config.get_base_url();
+            // Both DashScope regions: cn (dashscope.aliyuncs.com) and the
+            // international site (dashscope-intl.aliyuncs.com) — the intl
+            // host doesn't contain the cn substring.
+            if base.contains("dashscope.aliyuncs.com")
+                || base.contains("dashscope-intl.aliyuncs.com")
+            {
+                return CloudProvider::Qwen;
+            }
+            if base.contains("api.deepseek.com") {
+                return CloudProvider::DeepSeek;
+            }
+        }
+        self.config.provider
+    }
+
     fn build_chat_request(&self, input: LlmInput, stream: bool) -> ChatCompletionRequest {
         let model = input.model.unwrap_or_else(|| self.model.clone());
 
@@ -624,15 +734,76 @@ impl CloudRuntime {
         // tool_result.rs (gotcha #7) was silently dropped on cloud, while the
         // Ollama path (ollama.rs:826-844) honored it. Other OpenAI-compatible
         // providers may reject unknown fields, so emit ONLY for Qwen.
-        let enable_thinking = if matches!(self.config.provider, CloudProvider::Qwen) {
-            input.params.thinking_enabled
+        // `param_provider()` also catches DashScope reached via --type openai
+        // (protocol-first Cloud AI).
+        //
+        // Unified effort takes precedence: `None` → disable, any other → enable.
+        let enable_thinking = if matches!(self.param_provider(), CloudProvider::Qwen) {
+            input
+                .params
+                .thinking_effort
+                .map(|e| !e.is_disabled())
+                .or(input.params.thinking_enabled)
         } else {
             None
         };
 
-        ChatCompletionRequest {
+        // OpenAI/GPT-5-style reasoning effort. Maps the unified effort enum to
+        // the `reasoning_effort` string the OpenAI-compatible endpoints accept.
+        // Emitted only for providers that accept it (OpenAI, Custom, GLM);
+        // others reject unknown fields. Gemini via OpenAI-compat also accepts it.
+        let reasoning_effort = if matches!(
+            self.param_provider(),
+            CloudProvider::OpenAI
+                | CloudProvider::Custom
+                | CloudProvider::GLM
+                | CloudProvider::Google
+        ) {
+            input.params.thinking_effort.map(|e| e.as_str().to_string())
+        } else {
+            None
+        };
+
+        // DeepSeek thinking-mode toggle. DeepSeek defaults thinking ON at
+        // `high` effort; an explicit `{"type":"disabled"}` is required to turn
+        // it off. Only emitted for DeepSeek (`param_provider()` also catches
+        // DeepSeek reached via --type openai).
+        let thinking = if matches!(self.param_provider(), CloudProvider::DeepSeek) {
+            // Effort takes precedence; otherwise honor thinking_enabled
+            // (Some(false) from analyzer.rs / intent.rs — gotcha #7), and
+            // default to enabled when unset (DeepSeek's own default).
+            let disabled = input
+                .params
+                .thinking_effort
+                .map(|e| e.is_disabled())
+                .unwrap_or_else(|| !input.params.thinking_enabled.unwrap_or(true));
+            Some(Thinking {
+                thinking_type: if disabled { "disabled" } else { "enabled" }.to_string(),
+            })
+        } else {
+            None
+        };
+
+        // Text tool-calling fallback (shared with Ollama / llama.cpp —
+        // `llm_backends::text_tool_calls`): when the effective capability says
+        // the model has no native function calling — `CloudProvider::Custom`
+        // defaults to false in the `capabilities()` heuristic, as does any
+        // stored override that turned tools off — teach the JSON protocol in
+        // the system message so the agent-layer `tool_parser` can act on the
+        // reply. Without this, custom OpenAI-compatible endpoints carried the
+        // `tools` schema but the model was never taught how to answer, and
+        // every tool-aware turn degraded to plain prose. Computed before
+        // `input.tools` is moved into the request below. Native providers
+        // produce byte-identical messages.
+        let messages = text_tool_calls::prepare_messages(
+            input.messages,
+            input.tools.as_deref(),
+            self.capabilities().function_calling,
+        );
+
+        let request = ChatCompletionRequest {
             model,
-            messages: self.messages_to_api(&input.messages),
+            messages: self.messages_to_api(&messages),
             temperature: input.params.temperature,
             top_p: input.params.top_p,
             max_tokens,
@@ -651,7 +822,79 @@ impl CloudRuntime {
                 None
             },
             enable_thinking,
+            reasoning_effort,
+            thinking,
+        };
+
+        // === SFT trace hook (OpenAI-compatible path) ===
+        // Mirror of `build_anthropic_request`: when HERAMIND_TRACE_DIR is set,
+        // dump the full ChatCompletionRequest the LLM received so SFT training
+        // data can be reconstructed for OpenAI-compatible backends too. The
+        // system prompt rides as `messages[0]` (role "system") on this path —
+        // distinct from Anthropic's top-level `system` field. Written to a
+        // SEPARATE file (`openai_trace.jsonl`) so teacher (Anthropic = golden
+        // traces) and student (e.g. MiniCPM5 served via llama.cpp's /v1)
+        // never collide. Zero overhead when the env var is unset.
+        // See memory: minicpm5-heramind-baseline.
+        if let Ok(dir) = std::env::var("HERAMIND_TRACE_DIR") {
+            if let Ok(json) = serde_json::to_string(&request) {
+                let path = std::path::Path::new(&dir).join("openai_trace.jsonl");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", json);
+                }
+            }
         }
+
+        request
+    }
+
+    /// Parse tool calls that leaked into the assistant `content` as XML.
+    ///
+    /// Some local runtimes (e.g. the Nanbeige llama.cpp fork) fail to lift
+    /// tool calls into the OpenAI `tool_calls` field: their PEG parser's
+    /// `content_before_tools` rule bails when the model emits preamble text
+    /// before `<tool_call>`, so the whole call lands in `content` as
+    /// `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`.
+    /// This recovers those calls so the agent can still act.
+    fn parse_xml_tool_calls(content: &str) -> Vec<serde_json::Value> {
+        use regex::Regex;
+        let block_re = Regex::new(r"(?s)<tool_call>\s*(.*?)\s*</tool_call>").unwrap();
+        let func_re = Regex::new(r"(?s)<function=([\w-]+)>(.*?)</function>").unwrap();
+        let param_re = Regex::new(r"(?s)<parameter=([\w-]+)>(.*?)</parameter>").unwrap();
+        let mut out = Vec::new();
+        for b in block_re.captures_iter(content) {
+            let inner = b.get(1).map(|m| m.as_str()).unwrap_or("");
+            if let Some(fc) = func_re.captures(inner) {
+                let name = fc
+                    .get(1)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+                let body = fc.get(2).map(|m| m.as_str()).unwrap_or("");
+                let mut args = serde_json::Map::new();
+                for pc in param_re.captures_iter(body) {
+                    let k = pc
+                        .get(1)
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
+                    let v = pc
+                        .get(2)
+                        .map(|m| m.as_str().trim().to_string())
+                        .unwrap_or_default();
+                    args.insert(k, serde_json::Value::String(v));
+                }
+                out.push(serde_json::json!({
+                    "id": serde_json::Value::Null,
+                    "name": name,
+                    "arguments": serde_json::Value::Object(args),
+                }));
+            }
+        }
+        out
     }
 
     /// OpenAI-compatible non-streaming generation path.
@@ -755,6 +998,27 @@ impl CloudRuntime {
         } else {
             None
         };
+
+        // Fallback: recover tool calls that leaked into content as XML when the
+        // upstream parser (e.g. llama.cpp fork) failed to populate `tool_calls`.
+        // See `parse_xml_tool_calls` for the cause.
+        let native_tool_calls =
+            if native_tool_calls.is_none() && response_text.contains("<tool_call>") {
+                let parsed = Self::parse_xml_tool_calls(&response_text);
+                if !parsed.is_empty() {
+                    tracing::debug!(
+                        "OpenAI: recovered {} tool call(s) from content XML fallback",
+                        parsed.len()
+                    );
+                    let json_str = serde_json::to_string(&parsed).unwrap_or_default();
+                    response_text.push_str(&json_str);
+                    Some(parsed)
+                } else {
+                    None
+                }
+            } else {
+                native_tool_calls
+            };
 
         let result = Ok(LlmOutput {
             text: response_text,
@@ -900,6 +1164,10 @@ impl CloudRuntime {
                         "arguments": input
                     }));
                 }
+                // Thinking blocks are model reasoning, not visible output.
+                AnthropicContentBlock::Thinking { .. }
+                | AnthropicContentBlock::RedactedThinking { .. }
+                | AnthropicContentBlock::Unknown => {}
             }
         }
 
@@ -980,6 +1248,10 @@ impl CloudRuntime {
         let provider = self.config.provider;
 
         let request = self.build_chat_request(input, true);
+        // Idle timeout for the streaming read (see the bytes_stream loop below):
+        // computed OUTSIDE the async-move block so it's a plain owned Duration,
+        // not a borrow of `self`.
+        let read_idle_timeout = self.config.timeout();
 
         tokio::spawn(async move {
             // Create rate limit key
@@ -988,12 +1260,25 @@ impl CloudRuntime {
             // Acquire rate limit permit before making request
             rate_limiter.acquire(&rate_limit_key).await;
 
-            let result = inner_client
+            // Bound only the wait-for-HEADERS, not the whole request: a
+            // single-slot backend may queue a request and never send headers,
+            // but a long healthy generation must not be killed by a
+            // request-wide budget. 30s to receive headers, then the
+            // read-side idle timeout governs the body.
+            let send_fut = inner_client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .json(&request)
-                .send()
-                .await;
+                .send();
+            let send_result =
+                tokio::time::timeout(std::time::Duration::from_secs(30), send_fut).await;
+            let result: Result<_, LlmError> = match send_result {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(LlmError::Network(e.to_string())),
+                Err(_elapsed) => Err(LlmError::Generation(
+                    "Timed out waiting for streaming response headers".to_string(),
+                )),
+            };
 
             match result {
                 Ok(response) => {
@@ -1030,8 +1315,23 @@ impl CloudRuntime {
                         u32,
                         AccumulatedToolCall,
                     > = std::collections::HashMap::new();
+                    // Accumulate content for fallback XML tool-call recovery at [DONE].
+                    let mut accumulated_content = String::new();
 
-                    while let Some(chunk_result) = stream.next().await {
+                    // Idle timeout on the raw HTTP read: without this, a stalled
+                    // upstream SSE connection (no chunk within `config.timeout()` —
+                    // default 60s) blocks `stream.next()` forever, hanging every
+                    // consumer (PermitStream in chat_stream_internal, the
+                    // stream_core/multimodal loops) — observed as an 8h eval hang
+                    // on Gemma4 QAT. Normal generation emits chunks continuously,
+                    // so a 60s zero-chunk gap is unambiguously a dead connection.
+                    // `unwrap_or(None)` treats a stall as end-of-stream: the loop
+                    // exits and the [DONE] flush path below still runs.
+                    while let Some(chunk_result) =
+                        tokio::time::timeout(read_idle_timeout, stream.next())
+                            .await
+                            .unwrap_or(None)
+                    {
                         // If the consumer dropped the receiver (chat UI closed,
                         // agent execution cancelled/timed out), stop draining the
                         // upstream HTTP body. Without this check we'd keep pulling
@@ -1087,6 +1387,22 @@ impl CloudRuntime {
                                             let json_str = serde_json::to_string(&tool_calls_json)
                                                 .unwrap_or_default();
                                             let _ = tx.send(Ok((json_str, false))).await;
+                                        } else if accumulated_content.contains("<tool_call>") {
+                                            // Fallback: upstream parser failed to populate
+                                            // delta.tool_calls (preamble before <tool_call>
+                                            // confused its content_before_tools), so recover
+                                            // the calls from accumulated content XML.
+                                            let parsed =
+                                                Self::parse_xml_tool_calls(&accumulated_content);
+                                            if !parsed.is_empty() {
+                                                tracing::debug!(
+                                                    "OpenAI stream: recovered {} tool call(s) from content XML fallback",
+                                                    parsed.len()
+                                                );
+                                                let json_str = serde_json::to_string(&parsed)
+                                                    .unwrap_or_default();
+                                                let _ = tx.send(Ok((json_str, false))).await;
+                                            }
                                         }
                                         let _ = tx.send(Ok((String::new(), false))).await;
                                         continue;
@@ -1114,6 +1430,7 @@ impl CloudRuntime {
                                                 // Handle content
                                                 if let Some(ref content) = choice.delta.content {
                                                     if !content.is_empty() {
+                                                        accumulated_content.push_str(content);
                                                         let _ = tx
                                                             .send(Ok((content.clone(), false)))
                                                             .await;
@@ -1215,19 +1532,33 @@ impl CloudRuntime {
         let api_key = self.config.api_key.clone();
         let rate_limiter = self.client.clone();
         let inner_client = self.client.inner().clone();
+        // Idle timeout for the streaming read (see the bytes_stream loop below):
+        // owned Duration moved into the async block (not a borrow of `self`).
+        let read_idle_timeout = self.config.timeout();
 
         tokio::spawn(async move {
             let rate_limit_key = format!("Anthropic:{:x}", hash_api_key(&api_key));
             rate_limiter.acquire(&rate_limit_key).await;
 
-            let result = inner_client
+            // Same as the openai streaming path: bound only the header wait
+            // (30s) with tokio::time, not the whole request (which would kill
+            // long healthy generations).
+            let send_fut = inner_client
                 .post(&url)
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
                 .json(&request)
-                .send()
-                .await;
+                .send();
+            let send_result =
+                tokio::time::timeout(std::time::Duration::from_secs(30), send_fut).await;
+            let result: Result<_, LlmError> = match send_result {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(LlmError::Network(e.to_string())),
+                Err(_elapsed) => Err(LlmError::Generation(
+                    "Timed out waiting for streaming response headers".to_string(),
+                )),
+            };
 
             match result {
                 Ok(response) => {
@@ -1281,7 +1612,11 @@ impl CloudRuntime {
                         (Option<String>, Option<String>, String),
                     > = std::collections::HashMap::new();
 
-                    while let Some(chunk_result) = stream.next().await {
+                    while let Some(chunk_result) =
+                        tokio::time::timeout(read_idle_timeout, stream.next())
+                            .await
+                            .unwrap_or(None)
+                    {
                         // If the consumer dropped the receiver (chat UI closed,
                         // agent execution cancelled/timed out), stop draining the
                         // upstream HTTP body. Without this check we'd keep pulling
@@ -1487,6 +1822,11 @@ impl LlmRuntime for CloudRuntime {
     }
 
     fn max_context_length(&self) -> usize {
+        // Explicit per-endpoint override wins (CloudConfig field / stored
+        // instance settings) — provider tables are guesses.
+        if let Some(max) = self.config.max_context {
+            return max;
+        }
         match self.config.provider {
             CloudProvider::OpenAI => 128000,
             CloudProvider::Anthropic => 200000,
@@ -1496,7 +1836,12 @@ impl LlmRuntime for CloudRuntime {
             CloudProvider::DeepSeek => 128000,
             CloudProvider::GLM => 128000,
             CloudProvider::MiniMax => 512000,
-            CloudProvider::Custom => 4096,
+            // 32k floor: virtually every model served behind a custom
+            // OpenAI-compatible endpoint today is >=32k, and under-guessing
+            // truncates conversation history to nothing (the Custom=4096 bug
+            // made chat memory silently dead). A too-large guess degrades
+            // gracefully — overflow is rescued by the compact-retry ladder.
+            CloudProvider::Custom => 32768,
         }
     }
 
@@ -1513,43 +1858,34 @@ impl LlmRuntime for CloudRuntime {
 
     fn capabilities(&self) -> BackendCapabilities {
         // Use override if available (from storage), otherwise detect from name
-        let (
-            supports_multimodal,
-            supports_function_calling,
-            supports_thinking,
-            max_context,
-            supports_audio,
-        ) = if let Some(ref caps) = self.capabilities_override {
-            (
-                caps.supports_multimodal,
-                caps.supports_tools,
-                caps.supports_thinking,
-                caps.max_context,
-                caps.supports_audio,
-            )
-        } else {
-            // Fall back to name-based heuristics
-            let supports_multimodal = self.supports_multimodal();
-            let supports_function_calling = matches!(
-                self.config.provider,
-                CloudProvider::OpenAI
-                    | CloudProvider::Qwen
-                    | CloudProvider::DeepSeek
-                    | CloudProvider::GLM
-                    | CloudProvider::MiniMax
-                    | CloudProvider::Google
-                    | CloudProvider::Grok
-            );
-            let model_lower = self.model.to_lowercase();
-            let supports_audio = is_audio_model(&self.config.provider, &model_lower);
-            (
-                supports_multimodal,
-                supports_function_calling,
-                false, // thinking not detected by name
-                self.max_context_length(),
-                supports_audio,
-            )
-        };
+        let (supports_multimodal, supports_function_calling, supports_thinking, max_context) =
+            if let Some(ref caps) = self.capabilities_override {
+                (
+                    caps.supports_multimodal,
+                    caps.supports_tools,
+                    caps.supports_thinking,
+                    caps.max_context,
+                )
+            } else {
+                // Fall back to name-based heuristics
+                let supports_multimodal = self.supports_multimodal();
+                let supports_function_calling = matches!(
+                    self.config.provider,
+                    CloudProvider::OpenAI
+                        | CloudProvider::Qwen
+                        | CloudProvider::DeepSeek
+                        | CloudProvider::GLM
+                        | CloudProvider::MiniMax
+                        | CloudProvider::Google
+                        | CloudProvider::Grok
+                );
+                (
+                    supports_multimodal,
+                    supports_function_calling,
+                    false, // thinking not detected by name
+                    self.max_context_length(),
+                )
+            };
 
         BackendCapabilities {
             streaming: true,
@@ -1560,7 +1896,10 @@ impl LlmRuntime for CloudRuntime {
             modalities: vec!["text".to_string()],
             thinking_display: supports_thinking,
             supports_images: supports_multimodal,
-            supports_audio,
+            // param_provider: the persisted reasoning control must match what
+            // requests actually do — an openai-typed DashScope/DeepSeek
+            // endpoint is Boolean-controlled, not effort-leveled.
+            reasoning: reasoning_capabilities_for(self.param_provider(), supports_thinking),
         }
     }
 
@@ -1572,6 +1911,53 @@ impl LlmRuntime for CloudRuntime {
                 e.into_inner()
             })
             .clone()
+    }
+}
+
+/// Declare the reasoning/thinking capabilities for an OpenAI-compatible
+/// cloud provider, based on what `build_chat_request` actually emits:
+/// - OpenAI/Custom/GLM/Google → `reasoning_effort` (discrete levels, incl. none)
+/// - DeepSeek → `thinking: {enabled|disabled}` + `reasoning_effort`
+/// - Qwen → `enable_thinking: bool`
+/// - Anthropic → `thinking: {enabled|disabled}` (native /messages path)
+/// - MiniMax/Grok → no request-side control (read-only)
+fn reasoning_capabilities_for(
+    provider: CloudProvider,
+    supports_thinking: bool,
+) -> ReasoningCapabilities {
+    use ReasoningControl::{Boolean, Effort, ReadOnly};
+    let control = match provider {
+        CloudProvider::OpenAI
+        | CloudProvider::Custom
+        | CloudProvider::GLM
+        | CloudProvider::Google => Effort,
+        CloudProvider::DeepSeek | CloudProvider::Anthropic | CloudProvider::Qwen => Boolean,
+        CloudProvider::MiniMax | CloudProvider::Grok => ReadOnly,
+    };
+    let supported_efforts = if control != ReadOnly && supports_thinking {
+        match control {
+            Effort => vec![
+                ThinkingEffort::None,
+                ThinkingEffort::Low,
+                ThinkingEffort::Medium,
+                ThinkingEffort::High,
+                ThinkingEffort::XHigh,
+                ThinkingEffort::Max,
+            ],
+            _ => vec![ThinkingEffort::None, ThinkingEffort::High],
+        }
+    } else {
+        Vec::new()
+    };
+    ReasoningCapabilities {
+        supported_efforts,
+        default_effort: if supports_thinking {
+            Some(ThinkingEffort::High)
+        } else {
+            None
+        },
+        mandatory: false,
+        control,
     }
 }
 
@@ -1644,6 +2030,23 @@ struct ChatCompletionRequest {
     /// (ollama.rs:826-844).
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
+    /// OpenAI/GPT-5-style reasoning effort (`none`/`minimal`/`low`/`medium`/
+    /// `high`/`xhigh`). Emitted for OpenAI-compatible providers that accept it
+    /// (OpenAI, Custom, GLM); others reject unknown fields so it's skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    /// DeepSeek thinking-mode toggle: `{"type":"enabled"|"disabled"}`.
+    /// DeepSeek defaults thinking ON at `high` effort, so an explicit
+    /// "disabled" is required to turn it off. Only emitted for DeepSeek.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Thinking>,
+}
+
+/// DeepSeek thinking-mode toggle (`thinking: {"type": "enabled"|"disabled"}`).
+#[derive(Debug, Serialize)]
+struct Thinking {
+    #[serde(rename = "type")]
+    thinking_type: String,
 }
 
 /// Stream options to request usage data in final chunk
@@ -1868,6 +2271,20 @@ struct AnthropicRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AnthropicTool>>,
+    /// Extended thinking config. `{type: "disabled"}` when the caller
+    /// explicitly disables thinking; `{type: "enabled", budget_tokens: N}`
+    /// when enabling. Omitted → Anthropic model default (adaptive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum AnthropicThinking {
+    #[serde(rename = "enabled")]
+    Enabled { budget_tokens: u32 },
+    #[serde(rename = "disabled")]
+    Disabled,
 }
 
 #[derive(Debug, Serialize)]
@@ -1902,6 +2319,28 @@ enum AnthropicContentBlock {
         name: String,
         input: serde_json::Value,
     },
+    /// Extended-thinking blocks — emitted by the official API (and
+    /// Anthropic-compatible providers like GLM) when thinking is enabled.
+    /// Not part of the visible text; skipped during extraction — the fields
+    /// exist for deserialization tolerance only, hence dead-code-allowed.
+    #[serde(rename = "thinking")]
+    #[allow(dead_code)]
+    Thinking {
+        #[serde(default)]
+        thinking: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
+    },
+    #[serde(rename = "redacted_thinking")]
+    #[allow(dead_code)]
+    RedactedThinking {
+        #[serde(default)]
+        data: Option<String>,
+    },
+    /// Future/unknown block types — tolerate instead of failing the whole
+    /// response (a provider adding a block kind must not break chat).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2026,41 +2465,6 @@ fn known_vision_family(model_name: &str) -> bool {
     false
 }
 
-/// Detect audio-capable models by name. Used only when no override is set
-/// (i.e. the instance manager / runtime was constructed without consulting
-/// the LiteLLM registry or runtime API).
-///
-/// Match surface is intentionally narrow — only explicit audio branding.
-/// `gpt-4o-audio` here is the audio variant family; OpenAI text tiers (`gpt-4`,
-/// `gpt-4-turbo`, `gpt-4.1`, bare `gpt-4o`) are deliberately excluded.
-fn is_audio_model(
-    // `_provider` is currently unused but reserved for future per-provider
-    // audio quirks (e.g. some providers expose audio only on specific
-    // regional endpoints, or brand audio-capable tiers differently). Keeping
-    // the param avoids a breaking signature churn at every call site when
-    // that distinction is needed.
-    _provider: &CloudProvider,
-    model_name: &str,
-) -> bool {
-    // Primary: centralized detector. After the C1 fix this shortlists
-    // `audio/tts/asr/whisper/gpt-4o-audio/qwen-audio/qwen-tts/qwen-omni` —
-    // bare `gpt-4o` and `gpt-4o-mini` are intentionally NOT matched.
-    // Authoritative for registered models.
-    if heramind_core::llm::capability::model_supports(model_name, "audio") {
-        return true;
-    }
-    let m = model_name.to_lowercase();
-    // Fallback: explicit audio branding not in the registry shortlist.
-    m.contains("qwen2-audio")
-        || m.contains("qwen2.5-omni")
-        || m.contains("qwen3-omni")
-        || m.contains("qwen-omni")
-        || m.contains("audio-preview")
-        || m.contains("gpt-4o-audio")
-        || m.contains("step-1o")
-        || m.contains("step-audio")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2094,6 +2498,63 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta"
         );
         assert_eq!(CloudProvider::Grok.base_url(), "https://api.x.ai/v1");
+    }
+
+    #[test]
+    fn test_anthropic_base_url_normalization() {
+        let cfg = |base: &str| CloudConfig {
+            api_key: "k".into(),
+            provider: CloudProvider::Anthropic,
+            model: None,
+            base_url: Some(base.into()),
+            timeout_secs: 60,
+            max_context: None,
+        };
+        // Ecosystem convention: base without /v1 → client expands it.
+        assert_eq!(
+            cfg("https://open.bigmodel.cn/api/anthropic").get_base_url(),
+            "https://open.bigmodel.cn/api/anthropic/v1"
+        );
+        assert_eq!(
+            cfg("https://api.anthropic.com").get_base_url(),
+            "https://api.anthropic.com/v1"
+        );
+        // Already-/v1 forms pass through untouched (trailing slash trimmed).
+        assert_eq!(
+            cfg("https://api.anthropic.com/v1").get_base_url(),
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(
+            cfg("https://open.bigmodel.cn/api/anthropic/v1/").get_base_url(),
+            "https://open.bigmodel.cn/api/anthropic/v1"
+        );
+        // Other providers are not normalized.
+        let mut openai_cfg = cfg("https://api.deepseek.com");
+        openai_cfg.provider = CloudProvider::Custom;
+        assert_eq!(openai_cfg.get_base_url(), "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn test_anthropic_response_tolerates_thinking_blocks() {
+        // GLM's Anthropic-compatible endpoint emits thinking blocks (as does
+        // the official API with extended thinking). The response must parse
+        // and extraction must keep only text + tool_use.
+        let body = r#"{"content":[
+            {"type":"thinking","thinking":"reasoning…","signature":"sig"},
+            {"type":"redacted_thinking","data":"opaque"},
+            {"type":"text","text":"Hello!"},
+            {"type":"some_future_block","foo":1}
+        ],"stop_reason":"end_turn","usage":{"input_tokens":13,"output_tokens":4}}"#;
+        let resp: AnthropicResponse = serde_json::from_str(body).expect("parses");
+        let text: String = resp
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                AnthropicContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello!");
     }
 
     #[test]
@@ -2190,40 +2651,6 @@ mod tests {
         assert!(!is_vision_model(&CloudProvider::Qwen, "qwen-7b"));
         assert!(!is_vision_model(&CloudProvider::Qwen, "qwen-14b"));
         assert!(!is_vision_model(&CloudProvider::Qwen, "qwen-72b"));
-    }
-
-    /// `is_audio_model` should match explicit audio-branding (qwen-omni /
-    /// qwen2-audio / gpt-4o-audio / whisper / etc.) but NOT match generic
-    /// text/vision tiers. The centralized detector (post-C1 fix) already
-    /// excludes bare `gpt-4o` / `gpt-4o-mini` from the audio shortlist, so
-    /// we verify both paths: the centralized shortlist via the positive
-    /// audio-branded cases below, and the local fallback via `step-audio`
-    /// and the dated `gpt-4o-audio-*` variants.
-    #[test]
-    fn test_is_audio_model_patterns() {
-        // Explicit audio branding — should match.
-        assert!(is_audio_model(&CloudProvider::Qwen, "qwen-omni-turbo"));
-        assert!(is_audio_model(&CloudProvider::Qwen, "qwen2-audio-7b"));
-        assert!(is_audio_model(&CloudProvider::Qwen, "qwen2.5-omni-7b"));
-        assert!(is_audio_model(&CloudProvider::Qwen, "qwen3-omni"));
-        assert!(is_audio_model(
-            &CloudProvider::OpenAI,
-            "gpt-4o-audio-preview"
-        ));
-        assert!(is_audio_model(&CloudProvider::OpenAI, "gpt-4o-audio"));
-        assert!(is_audio_model(&CloudProvider::Custom, "step-audio-1"));
-
-        // Text-only / vision-only — MUST stay false.
-        assert!(!is_audio_model(&CloudProvider::OpenAI, "gpt-4-turbo"));
-        assert!(!is_audio_model(&CloudProvider::OpenAI, "gpt-4.1"));
-        assert!(!is_audio_model(
-            &CloudProvider::Anthropic,
-            "claude-3-5-sonnet"
-        ));
-        assert!(!is_audio_model(&CloudProvider::Qwen, "qwen-max"));
-        assert!(!is_audio_model(&CloudProvider::Qwen, "qwen-plus"));
-        assert!(!is_audio_model(&CloudProvider::Qwen, "qwen3-vl-plus"));
-        assert!(!is_audio_model(&CloudProvider::DeepSeek, "deepseek-chat"));
     }
 
     /// Regression: a text-only model must never receive `image_url` content
@@ -2444,6 +2871,287 @@ mod tests {
                 .map(|v| v.is_null())
                 .unwrap_or(true),
             "non-Qwen providers must not receive enable_thinking field"
+        );
+    }
+
+    // ── text tool-calling teaching for non-native providers ─────────────
+    //
+    // Regression guard for the Custom-endpoint gap: the request always went
+    // out with the `tools` schema, but models behind custom OpenAI-compatible
+    // endpoints default to function_calling=false (provider heuristic in
+    // `capabilities()`) and were never TAUGHT the JSON protocol the
+    // agent-layer `tool_parser` understands — every tool-aware turn degraded
+    // to plain prose while the Ollama backend taught its models. The teaching
+    // must ride the system message exactly when the Ollama backend would
+    // inject it: no native calling + tools attached.
+
+    fn one_tool() -> heramind_core::llm::backend::ToolDefinition {
+        heramind_core::llm::backend::ToolDefinition {
+            name: "list_devices".to_string(),
+            description: "List registered devices".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    #[test]
+    fn test_custom_endpoint_teaches_text_tool_calling() {
+        let runtime = CloudRuntime::new(
+            CloudConfig::custom("sk-test", "http://localhost:8080/v1").with_model("local-model"),
+        )
+        .expect("runtime builds");
+
+        let input = LlmInput {
+            messages: vec![
+                Message::new(MessageRole::System, Content::text("You are helpful.")),
+                Message::new(MessageRole::User, Content::text("hi")),
+            ],
+            params: GenerationParams::default(),
+            model: None,
+            stream: false,
+            tools: Some(vec![one_tool()]),
+        };
+
+        let request = runtime.build_chat_request(input, false);
+        let json = serde_json::to_value(&request).expect("serialize");
+        let sys = json["messages"][0]["content"]
+            .as_str()
+            .expect("system content serializes as text");
+        assert!(
+            sys.contains("Tool Calling Format (JSON)"),
+            "custom endpoints default to no native function calling — the system message must teach the JSON protocol"
+        );
+        assert!(
+            sys.starts_with("You are helpful.\n\n"),
+            "teaching is appended after the original system prompt"
+        );
+        assert!(
+            json["tools"].is_array(),
+            "tools schema still rides the request alongside the teaching"
+        );
+    }
+
+    #[test]
+    fn test_native_tool_provider_skips_text_tool_teaching() {
+        // OpenAI sits in the native-function-calling heuristic — the model
+        // gets the tools schema only, byte-identical to pre-teaching requests.
+        let runtime = CloudRuntime::new(CloudConfig::openai("sk-test").with_model("gpt-4o"))
+            .expect("runtime builds");
+
+        let input = LlmInput {
+            messages: vec![
+                Message::new(MessageRole::System, Content::text("You are helpful.")),
+                Message::new(MessageRole::User, Content::text("hi")),
+            ],
+            params: GenerationParams::default(),
+            model: None,
+            stream: false,
+            tools: Some(vec![one_tool()]),
+        };
+
+        let request = runtime.build_chat_request(input, false);
+        let json = serde_json::to_value(&request).expect("serialize");
+        let sys = json["messages"][0]["content"].as_str().expect("text");
+        assert!(
+            !sys.contains("Tool Calling Format"),
+            "native tool-calling providers must not receive the teaching"
+        );
+    }
+
+    #[test]
+    fn test_function_calling_override_skips_text_tool_teaching() {
+        // A stored/user override that turns native tools ON for a custom
+        // endpoint suppresses the injection — the native protocol wins, and
+        // double-teaching would only waste tokens.
+        let runtime = CloudRuntime::new(
+            CloudConfig::custom("sk-test", "http://localhost:8080/v1").with_model("local-model"),
+        )
+        .expect("runtime builds")
+        .with_capabilities_override(false, false, true, 8192);
+
+        let input = LlmInput {
+            messages: vec![Message::new(
+                MessageRole::System,
+                Content::text("You are helpful."),
+            )],
+            params: GenerationParams::default(),
+            model: None,
+            stream: false,
+            tools: Some(vec![one_tool()]),
+        };
+
+        let request = runtime.build_chat_request(input, false);
+        let json = serde_json::to_value(&request).expect("serialize");
+        let sys = json["messages"][0]["content"].as_str().expect("text");
+        assert!(
+            !sys.contains("Tool Calling Format"),
+            "an override declaring native tool support must suppress the teaching"
+        );
+    }
+
+    // ── protocol-first Cloud AI: vendor endpoints via --type openai ──────
+    //
+    // The Cloud AI card (and the CLI `--type openai` + vendor endpoint path)
+    // creates DashScope/DeepSeek backends typed as plain OpenAI-compatible.
+    // Regression guard: the vendor-specific param wiring must survive —
+    // `param_provider()` sniffs the endpoint so enable_thinking /
+    // thinking-toggle follow where the requests actually go, and
+    // reasoning_effort is NOT sent to vendors that reject it.
+
+    fn llm_input_with_thinking_disabled() -> LlmInput {
+        LlmInput {
+            messages: vec![Message::new(MessageRole::User, Content::text("hi"))],
+            params: GenerationParams {
+                thinking_enabled: Some(false),
+                ..Default::default()
+            },
+            model: None,
+            stream: false,
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn test_openai_typed_dashscope_endpoint_keeps_enable_thinking() {
+        // backend_type "openai" + DashScope endpoint — exactly what the
+        // Cloud AI dialog creates for Qwen today. Covers both regions: cn
+        // (dashscope.aliyuncs.com) and intl (dashscope-intl.aliyuncs.com).
+        for host in [
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        ] {
+            let cfg = CloudConfig::openai("sk-test")
+                .with_model("qwen3.7-plus")
+                .with_base_url_opt(Some(host.into()));
+            let runtime = CloudRuntime::new(cfg).expect("runtime builds");
+
+            let request = runtime.build_chat_request(llm_input_with_thinking_disabled(), false);
+            let json = serde_json::to_value(&request).expect("serialize");
+            assert_eq!(
+                json["enable_thinking"],
+                serde_json::Value::Bool(false),
+                "openai-typed DashScope endpoint ({host}) must still wire enable_thinking"
+            );
+            assert!(
+                json.get("reasoning_effort")
+                    .map(|v| v.is_null())
+                    .unwrap_or(true),
+                "openai-typed DashScope endpoint ({host}) must NOT receive reasoning_effort"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openai_typed_deepseek_endpoint_keeps_thinking_toggle() {
+        // DeepSeek defaults thinking ON; without the toggle the disable
+        // request is silently dropped.
+        let cfg = CloudConfig::openai("sk-test")
+            .with_model("deepseek-chat")
+            .with_base_url_opt(Some("https://api.deepseek.com/v1".into()));
+        let runtime = CloudRuntime::new(cfg).expect("runtime builds");
+
+        let request = runtime.build_chat_request(llm_input_with_thinking_disabled(), false);
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            json["thinking"]["type"], "disabled",
+            "openai-typed DeepSeek endpoint must still emit the thinking disabled toggle"
+        );
+    }
+
+    #[test]
+    fn test_openai_endpoint_unrelated_to_vendors_stays_openai() {
+        // A genuinely generic OpenAI-compatible endpoint (vLLM etc.) must not
+        // be sniffed into a vendor — reasoning_effort stays available.
+        let cfg = CloudConfig::openai("sk-test")
+            .with_model("my-model")
+            .with_base_url_opt(Some("http://gpu-host:8000/v1".into()));
+        let runtime = CloudRuntime::new(cfg).expect("runtime builds");
+
+        let input = LlmInput {
+            params: GenerationParams {
+                thinking_effort: Some(ThinkingEffort::Medium),
+                ..Default::default()
+            },
+            ..llm_input_with_thinking_disabled()
+        };
+        let request = runtime.build_chat_request(input, false);
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert!(
+            json.get("enable_thinking")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "generic endpoint must not receive enable_thinking"
+        );
+        assert!(
+            json.get("thinking").map(|v| v.is_null()).unwrap_or(true),
+            "generic endpoint must not receive the DeepSeek thinking toggle"
+        );
+    }
+
+    /// SFT contract — OpenAI-compatible path. The `openai_trace.jsonl` hook
+    /// dumps the ChatCompletionRequest; the system prompt MUST survive as
+    /// `messages[0]` (role "system"). Without it, student traces (MiniCPM5
+    /// via llama.cpp's /v1 endpoint) can't be used to diagnose why the model
+    /// grabs file_write/skill/memory instead of shell. See memory:
+    /// minicpm5-heramind-baseline.
+    #[test]
+    fn openai_request_carries_system_prompt_as_message_for_sft() {
+        let runtime = CloudRuntime::new(CloudConfig::openai("sk-test").with_model("gpt-test"))
+            .expect("runtime builds");
+
+        let input = LlmInput {
+            messages: vec![
+                Message::new(MessageRole::System, Content::text("You are HeraMind.")),
+                Message::new(MessageRole::User, Content::text("hi")),
+            ],
+            params: GenerationParams::default(),
+            model: None,
+            stream: false,
+            tools: None,
+        };
+
+        let request = runtime.build_chat_request(input, false);
+        let json = serde_json::to_value(&request).expect("serialize");
+        let msgs = json["messages"].as_array().expect("messages array");
+        assert!(!msgs.is_empty(), "messages must not be empty");
+        assert_eq!(
+            msgs[0]["role"], "system",
+            "system prompt must be messages[0]"
+        );
+        assert_eq!(msgs[0]["content"], "You are HeraMind.");
+    }
+
+    /// SFT contract — Anthropic path (= golden teacher traces). The
+    /// `anthropic_trace.jsonl` hook dumps the AnthropicRequest; the system
+    /// prompt MUST survive serialization as a top-level `system` field. This
+    /// is the entire reason the hook exists — history previously stored zero
+    /// system messages, so SFT data had no prompt to train against.
+    /// See memory: minicpm5-heramind-baseline.
+    #[test]
+    fn anthropic_request_carries_system_prompt_as_field_for_sft() {
+        let runtime =
+            CloudRuntime::new(CloudConfig::anthropic("sk-test").with_model("claude-test"))
+                .expect("runtime builds");
+
+        let input = LlmInput {
+            messages: vec![
+                Message::new(
+                    MessageRole::System,
+                    Content::text("You are HeraMind. Use the shell tool."),
+                ),
+                Message::new(MessageRole::User, Content::text("create a device")),
+            ],
+            params: GenerationParams::default(),
+            model: None,
+            stream: false,
+            tools: None,
+        };
+
+        let (request, _url) = runtime.build_anthropic_request(&input, false);
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            json["system"].as_str().unwrap(),
+            "You are HeraMind. Use the shell tool.",
+            "Anthropic trace must carry the system prompt as a top-level field"
         );
     }
 }

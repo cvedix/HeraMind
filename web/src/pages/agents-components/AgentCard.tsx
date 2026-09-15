@@ -24,9 +24,11 @@ import {
   AlertTriangle,
   Loader2,
   Clock,
+  CheckCircle2,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { formatTimestamp } from "@/lib/utils/format"
+import { interactiveCard } from "@/design-system/tokens/size"
 import type { AiAgent } from "@/types"
 
 interface AgentCardProps {
@@ -44,6 +46,9 @@ const STATUS_CONFIG: Record<string, { icon: typeof Activity; color: string; bg: 
   Paused: { icon: Pause, color: 'text-muted-foreground', bg: 'bg-muted-50' },
   Error: { icon: AlertTriangle, color: 'text-error', bg: 'bg-error-light' },
   Executing: { icon: Loader2, color: 'text-info', bg: 'bg-info-light' },
+  // One-shot task finished — check icon, quiet green; falls back to Paused
+  // styling via the `|| STATUS_CONFIG.Paused` default in the component.
+  Completed: { icon: CheckCircle2, color: 'text-success', bg: 'bg-muted-50' },
 }
 
 export function AgentCard({
@@ -91,8 +96,8 @@ export function AgentCard({
   return (
     <div
       className={cn(
-        "group relative bg-card rounded-lg border transition-all cursor-pointer p-4 h-full",
-        "hover:shadow-md hover:-translate-y-0.5"
+        "group relative p-4 h-full cursor-pointer",
+        interactiveCard,
       )}
       onClick={onClick}
     >

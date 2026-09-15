@@ -267,7 +267,7 @@ impl TimeSeriesStorage {
             // Reverse scan → newest N points, then reverse to ASC for callers.
             let rev = self
                 .store()
-                .query_range_rev(source_id, metric, start_timestamp, end_timestamp, limit)
+                .query_range_rev(source_id, metric, start_timestamp, end_timestamp, limit, 0)
                 .await
                 .map_err(|e| {
                     tracing::error!("query_range_rev failed for {}/{}: {}", source_id, metric, e);
@@ -329,16 +329,24 @@ impl TimeSeriesStorage {
         start_timestamp: i64,
         end_timestamp: i64,
         limit: Option<usize>,
+        offset: usize,
     ) -> Result<(Vec<DataPoint>, Option<usize>), DeviceError> {
         tracing::debug!(
-            "TimeSeriesStorage::query_with_limit: source_id={}, metric={}, start={}, end={}, limit={:?}",
-            source_id, metric, start_timestamp, end_timestamp, limit
+            "TimeSeriesStorage::query_with_limit: source_id={}, metric={}, start={}, end={}, limit={:?}, offset={}",
+            source_id, metric, start_timestamp, end_timestamp, limit, offset
         );
 
         let (filtered, total_count) = if limit.is_some() {
             let rev = self
                 .store()
-                .query_range_rev(source_id, metric, start_timestamp, end_timestamp, limit)
+                .query_range_rev(
+                    source_id,
+                    metric,
+                    start_timestamp,
+                    end_timestamp,
+                    limit,
+                    offset,
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!("query_range_rev failed for {}/{}: {}", source_id, metric, e);
@@ -526,9 +534,20 @@ impl TimeSeriesStorage {
         for metric in metrics {
             let source_id: Vec<&str> = metric.split(':').collect();
             if source_id.len() == 2 {
-                let _ = store
+                // A failed range delete must be visible: retention silently
+                // skipping work meant the disk was never reclaimed and the
+                // only symptom was a slowly-filling edge device.
+                if let Err(e) = store
                     .delete_range(source_id[0], source_id[1], i64::MIN, before_timestamp)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        category = "telemetry",
+                        error = %e,
+                        metric = %metric,
+                        "Retention delete failed — disk space not reclaimed for this metric"
+                    );
+                }
             }
         }
 

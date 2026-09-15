@@ -16,6 +16,10 @@ anthropic = ["cloud"]
 google = ["cloud"]
 xai = ["cloud"]
 all = ["ollama", "cloud", "llamacpp", "openai", "anthropic", "google", "xai"]
+# Exposes test doubles (MockLlmRuntime) for use in this crate's integration
+# tests and downstream test crates. Off by default so it never ships in a
+# release binary. Enable via `--features test-utils`.
+test-utils = []
 
 [dependencies]
 heramind-core = { path = "../heramind-core" }
@@ -51,7 +55,11 @@ cron = "0.12"
 image = { workspace = true }
 # Image drawing/editing operations for the `image_edit` tool.
 # imageproc 0.27 depends on image 0.25 + ab_glyph (verified P1).
-imageproc = "0.27"
+# default-features=false drops imageproc's `image/default` (its default enables
+# image/default-formats, which unifies-on image's avif → rav1e/ravif, a huge AV1
+# encoder we never use). Keep `rayon` (parallel) + `text` (ab_glyph, required by
+# draw_text_mut). image's actual decoders stay governed by the workspace image decl.
+imageproc = { version = "0.27", default-features = false, features = ["rayon", "text"] }
 ab_glyph = "0.2"
 
 # Memory system dependencies (merged from heramind-memory)
@@ -75,3 +83,8 @@ tempfile = { workspace = true }
 anyhow = "1.0"
 criterion = { version = "0.5", features = ["async_tokio"] }
 serial_test = "3"
+
+# Schema-only dependency: DTO types referenced by heramind-api's OpenAPI spec.
+[dependencies.utoipa]
+version = "4"
+features = ["chrono", "uuid"]

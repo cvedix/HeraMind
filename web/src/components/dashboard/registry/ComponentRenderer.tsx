@@ -7,7 +7,8 @@
  */
 
 import { lazy, Suspense, memo, useMemo, useState, useEffect, useCallback, useRef } from 'react'
-import { AlertTriangle } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { AlertTriangle, Puzzle } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
@@ -131,13 +132,18 @@ interface UnknownComponentProps {
 }
 
 function UnknownComponent({ type, className }: UnknownComponentProps) {
+  const { t } = useTranslation('dashboardComponents')
   return (
     <Card className={cn('border-dashed border-2', className)}>
       <div className="flex items-center justify-center h-full min-h-[120px] p-4 text-center">
         <div className="text-muted-foreground">
-          <p className="font-medium">Unknown Component</p>
+          <Puzzle className="h-5 w-5 mx-auto mb-2 opacity-70" />
+          <p className="font-medium">{t('renderer.componentUnavailable')}</p>
           <p className="text-sm text-muted-foreground mt-1">
-            Type: <code className="text-xs bg-muted px-1 py-0.5 rounded">{type}</code>
+            {t('renderer.componentUnavailableHint')}
+          </p>
+          <p className="text-xs text-muted-foreground/70 mt-2">
+            <code className="bg-muted px-1 py-0.5 rounded">{type}</code>
           </p>
         </div>
       </div>
@@ -155,7 +161,10 @@ interface ComponentErrorFallbackProps {
   className?: string
 }
 
-function ComponentErrorFallback({ className }: ComponentErrorFallbackProps) {
+// Exported for reuse by the built-in widget path in Renderers.tsx, which has
+// no per-card boundary of its own (ComponentRenderer only covers dynamic,
+// community, and business components).
+export function ComponentErrorFallback({ className }: ComponentErrorFallbackProps) {
   return (
     <Card className={cn('border-error-light', className)}>
       <div className="flex flex-col items-center justify-center h-full min-h-[120px] p-4 text-center">
@@ -163,7 +172,7 @@ function ComponentErrorFallback({ className }: ComponentErrorFallbackProps) {
           <AlertTriangle className="h-4 w-4 text-error" />
         </div>
         <p className="text-xs font-medium text-error">Component Error</p>
-        <p className="text-[10px] text-muted-foreground mt-1">Check config or remove this component</p>
+        <p className="text-nano text-muted-foreground mt-1">Check config or remove this component</p>
       </div>
     </Card>
   )
@@ -274,6 +283,13 @@ const ComponentRenderer = memo(function ComponentRenderer({
   const [loadError, setLoadError] = useState<Error | null>(null)
   const [attemptCount, setAttemptCount] = useState(0)
   const [registrationPollCount, setRegistrationPollCount] = useState(0)
+  // Retry timer lives inside loadDynamicComponent — tracked so unmount can
+  // cancel it instead of letting it fire setState on a dead component.
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => () => {
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current)
+  }, [])
 
   // Heuristic: check if this looks like an extension component (not in any registry)
   const isUnknownType = !isBuiltIn
@@ -336,7 +352,7 @@ const ComponentRenderer = memo(function ComponentRenderer({
       // Auto-retry if we haven't exceeded max attempts
       if (attempt < MAX_LOAD_RETRIES) {
         const retryType = componentType // capture current type
-        setTimeout(() => {
+        retryTimerRef.current = setTimeout(() => {
           // Only retry if the component type hasn't changed during the delay
           setAttemptCount(prev => prev === attempt ? attempt + 1 : prev)
         }, LOAD_RETRY_DELAY)
@@ -562,7 +578,7 @@ const ComponentRenderer = memo(function ComponentRenderer({
   // Only recreate when actual component data changes
   // IMPORTANT: Must be before any early returns to follow React Hooks rules
   const props = useMemo(() => {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+
     const { editMode, key: _key, ref: _ref, children: _children, ...restConfig } = componentConfig
 
     // Build props for the component (NOT including key - key must be passed directly)

@@ -1,6 +1,6 @@
 {
   "title": "AI Agents",
-  "description": "User-defined AI automation agents with persistent memory",
+  "description": "Create and manage AI agents — memory, skills, and tools",
   "createButton": "Create",
   "detailTitle": "Agent Details",
   "preview": {
@@ -182,7 +182,8 @@
     "active": "Active",
     "paused": "Paused",
     "error": "Error",
-    "executing": "Running"
+    "executing": "Running",
+    "completed": "Completed"
   },
   "executionStatus": {
     "running": "Running",
@@ -697,5 +698,6 @@
     "save": "Save",
     "saving": "Saving"
   },
-  "executionNotFound": "Execution Not Found"
+  "executionNotFound": "Execution Not Found",
+  "noAgentsNoBackendDesc": "Agents need an AI model to run. Download the built-in model (offline, no API key) — or configure your own backend first."
 }

@@ -1,10 +1,13 @@
 import { useState, useEffect } from "react"
 import { useTranslation } from "react-i18next"
+import { LanAccessSection } from "@/components/settings/LanAccessSection"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
 import { logError } from "@/lib/errors"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Label } from "@/components/ui/label"
+import { SettingsRow } from "./SettingsRow"
+import { MemorySettingsSection } from "./MemorySettingsSection"
+import { AutoOnboardSettings } from "./AutoOnboardSettings"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import {
   Select,
   SelectContent,
@@ -13,19 +16,17 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import {
-  Clock,
   Check,
   Info,
   Loader2,
-  Globe,
   Database,
   SwitchCamera,
-  ScrollText,
   Download,
 } from "lucide-react"
 import { Switch } from "@/components/ui/switch"
 import { useToast } from "@/hooks/use-toast"
 import { api } from "@/lib/api"
+import { useStore } from "@/store"
 import { useGlobalTimezone } from "@/hooks/useTimeFormat"
 import { getLocalizedTimezones } from "@/lib/time"
 
@@ -76,7 +77,16 @@ export function PreferencesTab() {
   const { t, i18n } = useTranslation(["common", "settings"])
   const { handleError } = useErrorHandler()
   const { toast } = useToast()
-  const [preferences, setPreferences] = useState<Preferences>(loadPreferences)
+  const [preferences, setPreferences] = useState<Preferences>(() => ({
+    ...loadPreferences(),
+    // The displayed language must reflect what i18n is ACTUALLY running.
+    // heramind_preferences.language drifts from reality because the other
+    // language switchers (sidebar, global controls, mobile nav, login,
+    // system page) call i18n.changeLanguage directly without writing this
+    // record — showing the stored value displayed "简体中文" on an English
+    // UI until the user happened to save.
+    language: i18n.language.startsWith("vi") ? "vi" : i18n.language.startsWith("zh") ? "zh" : "en",
+  }))
   const [hasChanges, setHasChanges] = useState(false)
 
   // Global timezone for scheduling (separate from UI display)
@@ -127,9 +137,22 @@ export function PreferencesTab() {
 
   // Get localized timezone list
   const localizedTimezones = getLocalizedTimezones(t)
+  // The backend list (/api/settings/timezones) carries fixed Chinese display
+  // names; remap to the frontend i18n catalog by id so the dropdown follows
+  // the UI language. Server names only survive as fallback for zones outside
+  // the frontend catalog.
+  const timezoneSource =
+    availableTimezones.length > 0 ? availableTimezones : localizedTimezones
+  const timezoneOptions = timezoneSource.map((tz: { id: string; name: string }) => ({
+    ...tz,
+    name: localizedTimezones.find((l) => l.id === tz.id)?.name ?? tz.name,
+  }))
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-8">
+      {/* Desktop-only LAN access control (renders nothing in web builds) */}
+      <LanAccessSection />
+
       {/* Actions */}
       {hasChanges && (
         <div className="flex items-center justify-between p-4 bg-muted-50 rounded-lg">
@@ -150,24 +173,16 @@ export function PreferencesTab() {
       )}
 
       {/* Language & Region Settings */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Globe className="h-5 w-5 text-info" />
-            {t("settings:languageRegion")}
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <section>
+        <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+          {t("settings:languageRegion")}
+        </h3>
+        <div className="rounded-lg bg-card border border-border shadow-sm p-5 space-y-4">
           {/* Language */}
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-            <div>
-              <Label className="text-sm font-medium">
-                {t("settings:language")}
-              </Label>
-              <p className="text-xs text-muted-foreground mt-0.5">
-                {t("settings:languageDesc")}
-              </p>
-            </div>
+          <SettingsRow
+            label={t("settings:language")}
+            description={t("settings:languageDesc")}
+          >
             <Select
               value={preferences.language}
               onValueChange={(v) => updatePreference("language", v as Language)}
@@ -183,29 +198,21 @@ export function PreferencesTab() {
                 ))}
               </SelectContent>
             </Select>
-          </div>
-        </CardContent>
-      </Card>
+          </SettingsRow>
+        </div>
+      </section>
 
       {/* Time Settings */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Clock className="h-5 w-5 text-success" />
-            {t("settings:timeSettings")}
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <section>
+        <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+          {t("settings:timeSettings")}
+        </h3>
+        <div className="rounded-lg bg-card border border-border shadow-sm p-5 space-y-4">
           {/* Time Format */}
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-            <div>
-              <Label className="text-sm font-medium">
-                {t("settings:timeFormat")}
-              </Label>
-              <p className="text-xs text-muted-foreground mt-0.5">
-                {t("settings:timeFormatDesc")}
-              </p>
-            </div>
+          <SettingsRow
+            label={t("settings:timeFormat")}
+            description={t("settings:timeFormatDesc")}
+          >
             <Select
               value={preferences.timeFormat}
               onValueChange={(v) => updatePreference("timeFormat", v as TimeFormat)}
@@ -221,59 +228,52 @@ export function PreferencesTab() {
                 ))}
               </SelectContent>
             </Select>
-          </div>
+          </SettingsRow>
 
           {/* System Timezone */}
-          <div className="space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-              <div className="flex-1">
-                <Label className="text-sm font-medium">
-                  {t("settings:systemTimezone")}
-                </Label>
-                <p className="text-xs text-muted-foreground mt-0.5">
-                  {t("settings:systemTimezoneDesc")}
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                {timezoneLoading && (
-                  <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-                )}
-                <Select
-                  value={globalTimezone}
-                  onValueChange={async (value) => {
-                    try {
-                      await updateTimezone(value)
-                      toast({
-                        title: t("settings:timezoneUpdated"),
-                      })
-                    } catch (e) {
-                      toast({
-                        title: t("settings:timezoneUpdateFailed"),
-                        variant: "destructive",
-                      })
-                    }
-                  }}
-                  disabled={timezoneLoading}
-                >
-                  <SelectTrigger className="w-full sm:w-[280px]">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {(availableTimezones.length > 0 ? availableTimezones : localizedTimezones).map(
-                      (tz: { id: string; name: string }) => (
-                        <SelectItem key={tz.id} value={tz.id}>
-                          {tz.name}
-                        </SelectItem>
-                      )
-                    )}
-                  </SelectContent>
-                </Select>
-              </div>
+          <SettingsRow
+            label={t("settings:systemTimezone")}
+            description={t("settings:systemTimezoneDesc")}
+          >
+            <div className="flex items-center gap-2">
+              {timezoneLoading && (
+                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+              )}
+              <Select
+                value={globalTimezone}
+                onValueChange={async (value) => {
+                  try {
+                    await updateTimezone(value)
+                    toast({
+                      title: t("settings:timezoneUpdated"),
+                    })
+                  } catch (e) {
+                    toast({
+                      title: t("settings:timezoneUpdateFailed"),
+                      variant: "destructive",
+                    })
+                  }
+                }}
+                disabled={timezoneLoading}
+              >
+                <SelectTrigger className="w-full sm:w-[280px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {timezoneOptions.map(
+                    (tz: { id: string; name: string }) => (
+                      <SelectItem key={tz.id} value={tz.id}>
+                        {tz.name}
+                      </SelectItem>
+                    )
+                  )}
+                </SelectContent>
+              </Select>
             </div>
-          </div>
+          </SettingsRow>
 
           {/* Current Time Preview */}
-          <div className="pt-4 border-t">
+          <div className="pt-3">
             <div className="text-center p-4 bg-muted-50 rounded-lg">
               <div className="text-xs text-muted-foreground mb-1">
                 {t("settings:currentTime")}
@@ -283,14 +283,32 @@ export function PreferencesTab() {
               </div>
             </div>
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </section>
+
+      {/* AI Agent Defaults */}
+      <AgentDefaultsSection />
+
+      {/* Memory System — moved from agents-page MemoryPanel config dialog */}
+      <MemorySettingsSection />
+
+      {/* Auto-onboarding — moved from devices-page pending-drafts dialog */}
+      <AutoOnboardSettings />
+
+      {/* Device Defaults */}
+      <DeviceDefaultsSection />
 
       {/* Data Management */}
-      <DataManagementCard />
+      <DataManagementSection />
+
+      {/* Backup schedule */}
+      <BackupSettingsSection />
+
+      {/* Extension marketplace source */}
+      <MarketSourceSection />
 
       {/* Diagnostic Data — log archive download */}
-      <DiagnosticDataCard />
+      <DiagnosticDataSection />
 
       {/* Info */}
       <div className="text-sm text-muted-foreground text-center py-4">
@@ -321,7 +339,206 @@ function optionToHours(value: string): number | null {
   return Number(value)
 }
 
-function DataManagementCard() {
+function AgentDefaultsSection() {
+  const { t } = useTranslation(["common", "settings"])
+  const { toast } = useToast()
+  const [config, setConfig] = useState<{
+    max_rounds: number
+    execution_timeout_secs: number
+    tool_concurrency: number
+    default_temperature: number
+    default_top_p: number
+    default_thinking_enabled: boolean | null
+    chat_history_depth: number
+    chat_turn_timeout_secs: number
+  } | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    api.get("/settings/agent")
+      .then((data: any) => setConfig(data))
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [])
+
+  const saveConfig = async (updates: Partial<typeof config>) => {
+    if (!config) return
+    const next = { ...config, ...updates }
+    setConfig(next)
+    try {
+      await api.put("/settings/agent", next)
+    } catch {
+      toast({ title: "Failed to save", variant: "destructive" })
+      setConfig(config)
+    }
+  }
+
+  if (loading || !config) {
+    return <div className="h-32 w-full animate-pulse rounded-md bg-muted" />
+  }
+
+  const roundOpts = [10, 20, 30, 40, 50]
+  const timeoutOpts = [
+    { v: 60, l: "1 min" }, { v: 180, l: "3 min" }, { v: 300, l: "5 min" },
+    { v: 600, l: "10 min" }, { v: 1800, l: "30 min" },
+  ]
+  // Chat turn budget: include the stored value even when it was set via API
+  // outside this list, so the Select never renders blank. A pre-0.9.24
+  // backend omits the field entirely — treat that as the server default
+  // (1800s) instead of rendering "NaN min".
+  const chatTurnValue = config.chat_turn_timeout_secs || 1800
+  const baseTurnOpts = [
+    { v: 300, l: "5 min" }, { v: 600, l: "10 min" }, { v: 1200, l: "20 min" },
+    { v: 1800, l: "30 min" }, { v: 3600, l: "1 h" }, { v: 7200, l: "2 h" },
+  ]
+  const chatTurnOpts = baseTurnOpts.some((o) => o.v === chatTurnValue)
+    ? baseTurnOpts
+    : [...baseTurnOpts, { v: chatTurnValue, l: `${Math.round(chatTurnValue / 60)} min` }].sort((a, b) => a.v - b.v)
+  const concOpts = [2, 4, 6, 8, 12, 16]
+  const tempOpts = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  const topPOpts = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  const depthOpts = [10, 20, 30, 50, 100, 200]
+
+  return (
+    <section>
+      <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        {t("settings:agentDefaults")}
+      </h3>
+      <div className="rounded-lg bg-card border border-border shadow-sm p-5 space-y-4">
+        <SettingsRow label={t("settings:maxRounds")} description={t("settings:maxRoundsDesc")}>
+          <Select value={String(config.max_rounds)} onValueChange={(v) => saveConfig({ max_rounds: +v })}>
+            <SelectTrigger className="w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {roundOpts.map((r) => <SelectItem key={r} value={String(r)}>{r}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+        <SettingsRow label={t("settings:executionTimeout")} description={t("settings:executionTimeoutDesc")}>
+          <Select value={String(config.execution_timeout_secs)} onValueChange={(v) => saveConfig({ execution_timeout_secs: +v })}>
+            <SelectTrigger className="w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {timeoutOpts.map((o) => <SelectItem key={o.v} value={String(o.v)}>{o.l}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+        <SettingsRow label={t("settings:chatTurnTimeout")} description={t("settings:chatTurnTimeoutDesc")}>
+          <Select value={String(chatTurnValue)} onValueChange={(v) => saveConfig({ chat_turn_timeout_secs: +v })}>
+            <SelectTrigger className="w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {chatTurnOpts.map((o) => <SelectItem key={o.v} value={String(o.v)}>{o.l}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+        <SettingsRow label={t("settings:toolConcurrency")} description={t("settings:toolConcurrencyDesc")}>
+          <Select value={String(config.tool_concurrency)} onValueChange={(v) => saveConfig({ tool_concurrency: +v })}>
+            <SelectTrigger className="w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {concOpts.map((c) => <SelectItem key={c} value={String(c)}>{c}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+        <SettingsRow label={t("settings:defaultTemperature")} description={t("settings:defaultTemperatureDesc")}>
+          <Select value={config.default_temperature.toFixed(1)} onValueChange={(v) => saveConfig({ default_temperature: +v })}>
+            <SelectTrigger className="w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {tempOpts.map((tp) => <SelectItem key={tp} value={tp.toFixed(1)}>{tp.toFixed(1)}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+        <SettingsRow label={t("settings:chatHistoryDepth")} description={t("settings:chatHistoryDepthDesc")}>
+          <Select value={String(config.chat_history_depth)} onValueChange={(v) => saveConfig({ chat_history_depth: +v })}>
+            <SelectTrigger className="w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {depthOpts.map((d) => <SelectItem key={d} value={String(d)}>{d}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+        <SettingsRow label={t("settings:defaultTopP")} description={t("settings:defaultTopPDesc")}>
+          <Select value={config.default_top_p.toFixed(1)} onValueChange={(v) => saveConfig({ default_top_p: +v })}>
+            <SelectTrigger className="w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {topPOpts.map((tp) => <SelectItem key={tp} value={tp.toFixed(1)}>{tp.toFixed(1)}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+        <SettingsRow label={t("settings:defaultThinking")} description={t("settings:defaultThinkingDesc")}>
+          <Select
+            value={config.default_thinking_enabled === null ? "auto" : String(config.default_thinking_enabled)}
+            onValueChange={(v) => saveConfig({ default_thinking_enabled: v === "auto" ? null : v === "true" })}
+          >
+            <SelectTrigger className="w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="auto">{t("settings:thinkingAuto")}</SelectItem>
+              <SelectItem value="true">On</SelectItem>
+              <SelectItem value="false">Off</SelectItem>
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+      </div>
+    </section>
+  )
+}
+
+function DeviceDefaultsSection() {
+  const { t } = useTranslation(["common", "settings"])
+  const { toast } = useToast()
+  const [config, setConfig] = useState<{
+    default_offline_timeout_secs: number
+    auto_onboard_enabled: boolean
+  } | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    api.get("/settings/device")
+      .then((data: any) => setConfig(data))
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [])
+
+  const saveConfig = async (updates: Partial<typeof config>) => {
+    if (!config) return
+    const next = { ...config, ...updates }
+    setConfig(next)
+    try {
+      await api.put("/settings/device", next)
+    } catch {
+      toast({ title: "Failed to save", variant: "destructive" })
+      setConfig(config)
+    }
+  }
+
+  if (loading || !config) {
+    return <div className="h-20 w-full animate-pulse rounded-md bg-muted" />
+  }
+
+  const timeoutOpts = [
+    { v: 60, l: "1 min" }, { v: 120, l: "2 min" }, { v: 300, l: "5 min" },
+    { v: 600, l: "10 min" }, { v: 1800, l: "30 min" },
+  ]
+
+  return (
+    <section>
+      <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        {t("settings:deviceDefaults")}
+      </h3>
+      <div className="rounded-lg bg-card border border-border shadow-sm p-5 space-y-4">
+        <SettingsRow label={t("settings:defaultOfflineTimeout")} description={t("settings:defaultOfflineTimeoutDesc")}>
+          <Select value={String(config.default_offline_timeout_secs)} onValueChange={(v) => saveConfig({ default_offline_timeout_secs: +v })}>
+            <SelectTrigger className="w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {timeoutOpts.map((o) => <SelectItem key={o.v} value={String(o.v)}>{o.l}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+        <SettingsRow label={t("settings:autoOnboardEnabled")} description={t("settings:autoOnboardEnabledDesc")}>
+          <Switch checked={config.auto_onboard_enabled} onCheckedChange={(checked) => saveConfig({ auto_onboard_enabled: checked })} />
+        </SettingsRow>
+      </div>
+    </section>
+  )
+}
+
+function DataManagementSection() {
   const { t } = useTranslation(["common", "settings"])
   const { toast } = useToast()
   const [config, setConfig] = useState<{
@@ -367,60 +584,33 @@ function DataManagementCard() {
   }
 
   if (loading) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Database className="h-5 w-5 text-accent-orange" />
-            {t("settings:dataManagement")}
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-center justify-center py-6">
-            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-          </div>
-        </CardContent>
-      </Card>
-    )
+    return <div className="h-40 w-full animate-pulse rounded-md bg-muted" />
   }
 
   if (!config) return null
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Database className="h-5 w-5 text-accent-orange" />
-          {t("settings:dataManagement")}
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-5">
+    <section>
+      <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        {t("settings:dataManagement")}
+      </h3>
+      <div className="rounded-lg bg-card border border-border shadow-sm p-5 space-y-5">
         {/* Auto Cleanup Toggle */}
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex-1">
-            <Label className="text-sm font-medium">
-              {t("settings:autoCleanup")}
-            </Label>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              {t("settings:autoCleanupDesc")}
-            </p>
-          </div>
+        <SettingsRow
+          label={t("settings:autoCleanup")}
+          description={t("settings:autoCleanupDesc")}
+        >
           <Switch
             checked={config.enabled}
             onCheckedChange={(checked) => saveConfig({ enabled: checked })}
           />
-        </div>
+        </SettingsRow>
 
         {/* Default Retention */}
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-          <div>
-            <Label className="text-sm font-medium">
-              {t("settings:defaultRetention")}
-            </Label>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              {t("settings:defaultRetentionDesc")}
-            </p>
-          </div>
+        <SettingsRow
+          label={t("settings:defaultRetention")}
+          description={t("settings:defaultRetentionDesc")}
+        >
           <Select
             value={hoursToOption(config.default_retention)}
             onValueChange={(v) => saveConfig({ default_retention: optionToHours(v) })}
@@ -437,21 +627,14 @@ function DataManagementCard() {
               ))}
             </SelectContent>
           </Select>
-        </div>
+        </SettingsRow>
 
         {/* Image Retention */}
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <SwitchCamera className="h-4 w-4 text-muted-foreground" />
-            <div>
-              <Label className="text-sm font-medium">
-                {t("settings:imageRetention")}
-              </Label>
-              <p className="text-xs text-muted-foreground mt-0.5">
-                {t("settings:imageRetentionDesc")}
-              </p>
-            </div>
-          </div>
+        <SettingsRow
+          label={t("settings:imageRetention")}
+          description={t("settings:imageRetentionDesc")}
+          leadingIcon={<SwitchCamera className="h-4 w-4 text-muted-foreground" />}
+        >
           <Select
             value={hoursToOption(config.image_retention)}
             onValueChange={(v) => saveConfig({ image_retention: optionToHours(v) })}
@@ -468,10 +651,10 @@ function DataManagementCard() {
               ))}
             </SelectContent>
           </Select>
-        </div>
+        </SettingsRow>
 
         {/* Manual Cleanup */}
-        <div className="pt-4 border-t">
+        <div className="pt-3">
           <Button
             variant="outline"
             size="sm"
@@ -486,12 +669,12 @@ function DataManagementCard() {
             {cleaning ? t("settings:cleanupRunning") : t("settings:cleanupNow")}
           </Button>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   )
 }
 
-function DiagnosticDataCard() {
+function DiagnosticDataSection() {
   const { t } = useTranslation(["common", "settings"])
   const { handleError, showSuccess } = useErrorHandler()
   const [downloading, setDownloading] = useState(false)
@@ -516,23 +699,15 @@ function DiagnosticDataCard() {
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <ScrollText className="h-5 w-5 text-info" />
-          {t("settings:diagnosticData")}
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-          <div>
-            <Label className="text-sm font-medium">
-              {t("settings:logTimeRange")}
-            </Label>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              {t("settings:diagnosticDataDesc")}
-            </p>
-          </div>
+    <section>
+      <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        {t("settings:diagnosticData")}
+      </h3>
+      <div className="rounded-lg bg-card border border-border shadow-sm p-5 space-y-4">
+        <SettingsRow
+          label={t("settings:logTimeRange")}
+          description={t("settings:diagnosticDataDesc")}
+        >
           <Select value={logDays} onValueChange={setLogDays}>
             <SelectTrigger className="w-full sm:w-[180px]">
               <SelectValue />
@@ -543,8 +718,8 @@ function DiagnosticDataCard() {
               <SelectItem value="7">{t("settings:logRangeLast7Days")}</SelectItem>
             </SelectContent>
           </Select>
-        </div>
-        <div className="pt-4 border-t">
+        </SettingsRow>
+        <div className="pt-3">
           <Button
             variant="outline"
             size="sm"
@@ -559,8 +734,8 @@ function DiagnosticDataCard() {
             {downloading ? t("settings:downloadingLogs") : t("settings:downloadLogs")}
           </Button>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   )
 }
 
@@ -592,4 +767,244 @@ export function usePreferences() {
   }
 
   return { preferences, updatePreferences }
+}
+
+function BackupSettingsSection() {
+  const { t } = useTranslation(["common", "settings"])
+  const { toast } = useToast()
+  const isAdmin = useStore((s) => s.user?.role === "admin")
+  const [config, setConfig] = useState<{
+    enabled: boolean
+    interval_secs: number
+    keep: number
+  } | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [backing, setBacking] = useState(false)
+  const [lastBackup, setLastBackup] = useState<{
+    id: string
+    created_at: string
+    total_bytes: number
+  } | null>(null)
+
+  const refreshLastBackup = () => {
+    api
+      .get("/settings/backups")
+      .then((data: any) => {
+        const list = data?.backups ?? []
+        setLastBackup(list.length > 0 ? list[0] : null)
+      })
+      .catch(() => {})
+  }
+
+  useEffect(() => {
+    api
+      .get("/settings/backup-config")
+      .then((data: any) => setConfig(data))
+      .catch(() => {})
+      .finally(() => setLoading(false))
+    refreshLastBackup()
+  }, [])
+
+  const saveConfig = async (updates: Partial<NonNullable<typeof config>>) => {
+    if (!config) return
+    const next = { ...config, ...updates }
+    setConfig(next)
+    try {
+      await api.put("/settings/backup-config", next)
+    } catch {
+      toast({ title: t("common:failed"), variant: "destructive" })
+      setConfig(config)
+    }
+  }
+
+  const runNow = async () => {
+    setBacking(true)
+    try {
+      await api.post("/settings/backup", {})
+      toast({ title: t("settings:backupNowDone") })
+      refreshLastBackup()
+    } catch {
+      toast({ title: t("common:failed"), variant: "destructive" })
+    } finally {
+      setBacking(false)
+    }
+  }
+
+  if (loading || !config) {
+    return <div className="h-32 w-full animate-pulse rounded-md bg-muted" />
+  }
+
+  const intervalOpts = [
+    { v: 6 * 3600, l: t("settings:backupInterval6h") },
+    { v: 12 * 3600, l: t("settings:backupInterval12h") },
+    { v: 24 * 3600, l: t("settings:backupInterval1d") },
+    { v: 48 * 3600, l: t("settings:backupInterval2d") },
+    { v: 7 * 24 * 3600, l: t("settings:backupInterval7d") },
+  ]
+  const keepOpts = [1, 2, 3, 5, 7, 14]
+  const lastLabel = lastBackup
+    ? `${new Date(lastBackup.created_at).toLocaleString()} (${(lastBackup.total_bytes / 1024 / 1024).toFixed(1)} MB)`
+    : t("settings:backupLastNone")
+
+  return (
+    <section>
+      <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        {t("settings:backupSchedule")}
+      </h3>
+      <div className="rounded-lg bg-card border border-border shadow-sm p-5 space-y-4">
+        <SettingsRow
+          label={t("settings:backupEnabled")}
+          description={t("settings:backupEnabledDesc")}
+        >
+          <Switch
+            checked={config.enabled}
+            onCheckedChange={(v) => saveConfig({ enabled: v })}
+          />
+        </SettingsRow>
+        <SettingsRow
+          label={t("settings:backupInterval")}
+          description={t("settings:backupIntervalDesc")}
+        >
+          <Select
+            value={String(config.interval_secs)}
+            onValueChange={(v) => saveConfig({ interval_secs: +v })}
+            disabled={!config.enabled}
+          >
+            <SelectTrigger className="w-full sm:w-[180px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {intervalOpts.map((o) => (
+                <SelectItem key={o.v} value={String(o.v)}>
+                  {o.l}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+        <SettingsRow label={t("settings:backupKeep")} description={t("settings:backupKeepDesc")}>
+          <Select
+            value={String(config.keep)}
+            onValueChange={(v) => saveConfig({ keep: +v })}
+            disabled={!config.enabled}
+          >
+            <SelectTrigger className="w-full sm:w-[180px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {keepOpts.map((k) => (
+                <SelectItem key={k} value={String(k)}>
+                  {k}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+          <span className="text-sm text-muted-foreground">
+            {t("settings:backupLast")}: {lastLabel}
+          </span>
+          {isAdmin && (
+            <Button variant="outline" size="sm" onClick={runNow} disabled={backing}>
+              {backing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
+              {t("settings:backupNow")}
+            </Button>
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function MarketSourceSection() {
+  const { t } = useTranslation(["common", "settings"])
+  const { toast } = useToast()
+  const isAdmin = useStore((s) => s.user?.role === "admin")
+  const [config, setConfig] = useState<{
+    market_url: string
+    saved_url: string | null
+    default_url: string
+  } | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [draft, setDraft] = useState("")
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    api
+      .get("/settings/market")
+      .then((data: any) => {
+        setConfig(data)
+        setDraft(data.market_url ?? "")
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (!isAdmin) return null
+  if (loading || !config) {
+    return <div className="h-32 w-full animate-pulse rounded-md bg-muted" />
+  }
+
+  const save = async (url: string) => {
+    setSaving(true)
+    try {
+      const data: any = await api.put("/settings/market", { market_url: url })
+      setConfig((c) => (c ? { ...c, market_url: data.market_url, saved_url: data.saved_url } : c))
+      setDraft(data.market_url ?? "")
+      toast({ title: t("settings:marketSourceSaved") })
+    } catch {
+      toast({ title: t("common:failed"), variant: "destructive" })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const isDefault = !config.saved_url
+
+  return (
+    <section>
+      <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+        {t("settings:marketSource")}
+      </h3>
+      <div className="rounded-lg bg-card border border-border shadow-sm p-5 space-y-4">
+        <SettingsRow
+          label={t("settings:marketSourceUrl")}
+          description={t("settings:marketSourceDesc")}
+        >
+          <Input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder={config.default_url}
+            className="w-full sm:w-[420px] font-mono text-xs"
+            spellCheck={false}
+          />
+        </SettingsRow>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+          <span className="text-xs text-muted-foreground">
+            {isDefault ? t("settings:marketSourceDefault") : t("settings:marketSourceCustom")}
+          </span>
+          <div className="flex gap-2">
+            {!isDefault && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => save("")}
+                disabled={saving}
+              >
+                {t("settings:marketSourceReset")}
+              </Button>
+            )}
+            <Button
+              size="sm"
+              onClick={() => save(draft)}
+              disabled={saving || draft.trim() === config.market_url}
+            >
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {t("common:save")}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </section>
+  )
 }

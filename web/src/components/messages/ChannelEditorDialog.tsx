@@ -679,7 +679,7 @@ export function ChannelEditorDialog({
                       )}
                     >
                       <Icon className="h-4 w-4 shrink-0" />
-                      <span className="text-[11px] font-medium leading-none truncate w-full text-center">
+                      <span className="text-mini font-medium leading-none truncate w-full text-center">
                         {t(ct.labelKey)}
                       </span>
                     </button>
@@ -690,7 +690,7 @@ export function ChannelEditorDialog({
           )}
 
           <FullScreenDialogMain>
-            <div className="p-4 md:p-6 space-y-4 max-w-2xl">
+            <div className="p-4 md:p-6 space-y-4 max-w-2xl mx-auto">
               {/* Channel name */}
               <FormField
                 label={t('messages.channels.name')}

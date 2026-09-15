@@ -659,6 +659,9 @@ impl TimeSeriesStore {
         } else {
             builder.create(path_ref)?
         };
+        // Rollback guard: refuse databases stamped by a newer build (see schema.rs).
+        crate::schema::check_or_stamp(&db)
+            .map_err(|e| Error::Storage(format!("schema version: {e}")))?;
 
         let store = Arc::new(TimeSeriesStore {
             db: Arc::new(db),
@@ -861,6 +864,21 @@ impl TimeSeriesStore {
 
         let total_count: usize = groups.values().map(|v| v.len()).sum();
 
+        // Fast path: write ALL groups in a single redb transaction (one fsync)
+        // on the common no-poison path. If it fails for any reason — e.g. a
+        // poison payload (value exceeding redb's max_value_size) in any group —
+        // the whole transaction rolls back and we fall through to the per-group
+        // isolation loop below, so a single bad point still only affects its
+        // own group. Worst case (fast path always fails) behaves exactly like
+        // the previous per-group-only implementation.
+        if self.write_all_groups_sync(&groups).is_ok() {
+            if let Ok(mut stats) = self.stats.try_write() {
+                stats.write_count += total_count as u64;
+                stats.total_write_ns += start.elapsed().as_nanos() as u64;
+            }
+            return;
+        }
+
         // Write each group in a single transaction. On failure, isolate the
         // offending point by retrying per-point in its own transaction —
         // otherwise a single poison payload (e.g. a value exceeding redb's
@@ -943,6 +961,49 @@ impl TimeSeriesStore {
         failed
     }
 
+    /// Write ALL buffered groups in a single redb transaction — the fast path
+    /// used by `flush_buffer` to turn N per-group fsyncs into one. Updates
+    /// `metrics_info` for every group exactly like `write_batch_sync` would.
+    /// On any error the caller falls back to per-group (then per-point)
+    /// isolation, so poison payloads are still contained to their own group.
+    fn write_all_groups_sync(
+        &self,
+        groups: &std::collections::HashMap<(String, String), Vec<DataPoint>>,
+    ) -> Result<(), Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(TIMESERIES_TABLE)?;
+            for ((source_id, metric), points) in groups.iter() {
+                for point in points.iter() {
+                    let key = (source_id.as_str(), metric.as_str(), point.timestamp);
+                    let value = serde_json::to_vec(point)?;
+                    table.insert(key, value.as_slice())?;
+                }
+            }
+        }
+        write_txn.commit()?;
+
+        // Update metrics info for every group (mirrors write_batch_sync).
+        for ((source_id, metric), points) in groups.iter() {
+            let metric_key = format!("{}:{}", source_id, metric);
+            let last_ts = points.last().map(|p| p.timestamp).unwrap_or(0);
+            let n = points.len() as u64;
+            self.metrics_info
+                .entry(metric_key)
+                .and_modify(|entry| {
+                    entry.last_update = last_ts;
+                    entry.point_count += n;
+                })
+                .or_insert_with(|| MetricInfo {
+                    last_update: last_ts,
+                    point_count: n,
+                });
+        }
+        self.metrics_initialized.store(true, Ordering::Release);
+
+        Ok(())
+    }
+
     /// Synchronous batch write (used by flush_buffer).
     fn write_batch_sync(
         &self,
@@ -1009,31 +1070,43 @@ impl TimeSeriesStore {
         metric: &str,
         points: Vec<DataPoint>,
     ) -> Result<(), Error> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(TIMESERIES_TABLE)?;
-            for point in &points {
-                let key = (source_id, metric, point.timestamp);
-                let value = serde_json::to_vec(point)?;
-                table.insert(key, value.as_slice())?;
+        // [fake-async fix] The redb write transaction blocks the executor
+        // thread — every device metric write used to stall a tokio worker.
+        // Run the transaction on the blocking pool; the lock-free in-memory
+        // cache updates below stay on the async side.
+        let now = Utc::now().timestamp();
+        let last_ts = points.last().map(|p| p.timestamp).unwrap_or(now);
+        let count = points.len();
+        let (src, met) = (source_id.to_string(), metric.to_string());
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let write_txn = db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(TIMESERIES_TABLE)?;
+                for point in &points {
+                    let key = (src.as_str(), met.as_str(), point.timestamp);
+                    let value = serde_json::to_vec(point)?;
+                    table.insert(key, value.as_slice())?;
+                }
             }
-        }
-        write_txn.commit()?;
+            write_txn.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("write_batch join error: {}", e)))??;
 
         // Update metrics info - DashMap entry API is lock-free
         let metric_key = format!("{}:{}", source_id, metric);
-        let now = Utc::now().timestamp();
-        let last_ts = points.last().map(|p| p.timestamp).unwrap_or(now);
 
         self.metrics_info
             .entry(metric_key)
             .and_modify(|entry| {
                 entry.last_update = last_ts;
-                entry.point_count += points.len() as u64;
+                entry.point_count += count as u64;
             })
             .or_insert_with(|| MetricInfo {
                 last_update: last_ts,
-                point_count: points.len() as u64,
+                point_count: count as u64,
             });
 
         // Mark metrics_info as populated (prevents cold-start full scan in list_metrics)
@@ -1056,7 +1129,28 @@ impl TimeSeriesStore {
         end: i64,
         limit: Option<usize>,
     ) -> Result<TimeSeriesResult, Error> {
-        let read_txn = self.db.begin_read()?;
+        // [fake-async fix] The full-range redb iteration below blocks the
+        // executor thread (every dashboard read used to stall a worker).
+        // The body only needs the database handle, so an Arc clone is all
+        // that crosses to the blocking pool.
+        let db = self.db.clone();
+        let (src, met) = (source_id.to_string(), metric.to_string());
+        tokio::task::spawn_blocking(move || {
+            Self::query_range_impl(&db, &src, &met, start, end, limit)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("query_range join error: {}", e)))?
+    }
+
+    fn query_range_impl(
+        db: &Database,
+        source_id: &str,
+        metric: &str,
+        start: i64,
+        end: i64,
+        limit: Option<usize>,
+    ) -> Result<TimeSeriesResult, Error> {
+        let read_txn = db.begin_read()?;
 
         // Handle case where table doesn't exist yet (no data has been written)
         let table = match read_txn.open_table(TIMESERIES_TABLE) {
@@ -1148,8 +1242,28 @@ impl TimeSeriesStore {
         start: i64,
         end: i64,
         limit: Option<usize>,
+        offset: usize,
     ) -> Result<TimeSeriesResult, Error> {
-        let read_txn = self.db.begin_read()?;
+        // [fake-async fix] see query_range.
+        let db = self.db.clone();
+        let (src, met) = (source_id.to_string(), metric.to_string());
+        tokio::task::spawn_blocking(move || {
+            Self::query_range_rev_impl(&db, &src, &met, start, end, limit, offset)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("query_range_rev join error: {}", e)))?
+    }
+
+    fn query_range_rev_impl(
+        db: &Database,
+        source_id: &str,
+        metric: &str,
+        start: i64,
+        end: i64,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<TimeSeriesResult, Error> {
+        let read_txn = db.begin_read()?;
 
         let table = match read_txn.open_table(TIMESERIES_TABLE) {
             Ok(t) => t,
@@ -1170,46 +1284,43 @@ impl TimeSeriesStore {
         let cap = limit.map(|n| n.min(5000)).unwrap_or(0);
         let mut points = Vec::with_capacity(cap);
         let mut collected = 0usize;
+        let mut skipped = 0usize;
         let mut total_count = 0u32;
 
-        // Iterate in reverse (newest first)
+        // Iterate in reverse (newest first). The scan always runs to the end of
+        // the range so total_count is exact even when limit truncates the
+        // collected points; offset skips the newest `offset` records first —
+        // together they give server-side pagination over newest-first order.
         for result in table.range(start_key..=end_key)?.rev() {
             total_count += 1;
-            let (_key, value) = result?;
-
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
             if limit.is_none_or(|n| collected < n) {
+                let (_key, value) = result?;
                 let point: DataPoint = serde_json::from_slice(value.value())?;
                 points.push(point);
                 collected += 1;
-            } else {
-                // Continue counting total but don't collect more
             }
         }
 
-        // Note: total_count may be inaccurate when limit is hit because we stopped
-        // iterating early. This is acceptable for pagination (caller uses the primary
-        // path's total count). If exact total is needed, caller should query without limit.
-        if limit.is_some() && collected >= limit.unwrap_or(usize::MAX) {
-            // We may have stopped early, total_count is just the points we saw
-            // The caller will use a separate count or accept approximate total
-        }
-
         tracing::debug!(
-            "query_range_rev: source_id={}, metric={}, found {} points",
+            "query_range_rev: source_id={}, metric={}, found {} points (skipped {}, total {})",
             source_id,
             metric,
             collected,
+            skipped,
+            total_count,
         );
 
         Ok(TimeSeriesResult {
             source_id: source_id.to_string(),
             metric: metric.to_string(),
             points,
-            total_count: if limit.is_some() {
-                None
-            } else {
-                Some(total_count as usize)
-            },
+            // Exact: the scan counts every record in range regardless of
+            // limit/offset truncation.
+            total_count: Some(total_count as usize),
         })
     }
 
@@ -1224,7 +1335,23 @@ impl TimeSeriesStore {
         start: i64,
         end: i64,
     ) -> Result<AggregateResult, Error> {
-        let read_txn = self.db.begin_read()?;
+        // [fake-async fix] see query_range — dashboard aggregate reads were
+        // blocking a tokio worker per call.
+        let db = self.db.clone();
+        let (src, met) = (source_id.to_string(), metric.to_string());
+        tokio::task::spawn_blocking(move || Self::aggregate_range_impl(&db, &src, &met, start, end))
+            .await
+            .map_err(|e| Error::Storage(format!("aggregate_range join error: {}", e)))?
+    }
+
+    fn aggregate_range_impl(
+        db: &Database,
+        source_id: &str,
+        metric: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<AggregateResult, Error> {
+        let read_txn = db.begin_read()?;
 
         let table = match read_txn.open_table(TIMESERIES_TABLE) {
             Ok(t) => t,
@@ -1530,7 +1657,20 @@ impl TimeSeriesStore {
         source_id: &str,
         metric: &str,
     ) -> Result<Option<DataPoint>, Error> {
-        let read_txn = self.db.begin_read()?;
+        // [fake-async fix] see query_range.
+        let db = self.db.clone();
+        let (src, met) = (source_id.to_string(), metric.to_string());
+        tokio::task::spawn_blocking(move || Self::query_latest_uncached_impl(&db, &src, &met))
+            .await
+            .map_err(|e| Error::Storage(format!("query_latest_uncached join error: {}", e)))?
+    }
+
+    fn query_latest_uncached_impl(
+        db: &Database,
+        source_id: &str,
+        metric: &str,
+    ) -> Result<Option<DataPoint>, Error> {
+        let read_txn = db.begin_read()?;
         let table = match read_txn.open_table(TIMESERIES_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -2121,6 +2261,15 @@ impl TimeSeriesStore {
                     if removed > 0 {
                         total_removed += removed as u64;
                         metrics_cleaned.insert(metric_key.clone());
+                        // [orphan fix] A metric whose points have ALL aged out
+                        // used to keep its metrics_info entry for the process
+                        // lifetime (only full-range deletes pruned it). Probe
+                        // for remaining points and drop the entry when empty —
+                        // the boot rebuild would prune it anyway, but between
+                        // restarts it kept dead sources in list_metrics.
+                        if !self.has_any_point(source_id, metric).await {
+                            self.metrics_info.remove(&metric_key);
+                        }
                     }
                 }
             } else {
@@ -2147,6 +2296,31 @@ impl TimeSeriesStore {
     /// many raw points exist — perfect for chart rendering.
     ///
     /// If total points ≤ target_count, returns all points without bucketing.
+    /// Cheap existence probe: does (source, metric) have at least one point?
+    async fn has_any_point(&self, source_id: &str, metric: &str) -> bool {
+        let db = self.db.clone();
+        let (src, met) = (source_id.to_string(), metric.to_string());
+        tokio::task::spawn_blocking(move || {
+            let read_txn = match db.begin_read() {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            let table = match read_txn.open_table(TIMESERIES_TABLE) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            let mut range = match table.range(
+                (src.as_str(), met.as_str(), i64::MIN)..=(src.as_str(), met.as_str(), i64::MAX),
+            ) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            range.next().is_some()
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     pub async fn query_range_bucketed(
         &self,
         source_id: &str,
@@ -2155,7 +2329,25 @@ impl TimeSeriesStore {
         end: i64,
         target_count: usize,
     ) -> Result<TimeSeriesResult, Error> {
-        let read_txn = self.db.begin_read()?;
+        // [fake-async fix] see query_range.
+        let db = self.db.clone();
+        let (src, met) = (source_id.to_string(), metric.to_string());
+        tokio::task::spawn_blocking(move || {
+            Self::query_range_bucketed_impl(&db, &src, &met, start, end, target_count)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("query_range_bucketed join error: {}", e)))?
+    }
+
+    fn query_range_bucketed_impl(
+        db: &Database,
+        source_id: &str,
+        metric: &str,
+        start: i64,
+        end: i64,
+        target_count: usize,
+    ) -> Result<TimeSeriesResult, Error> {
+        let read_txn = db.begin_read()?;
 
         let table = match read_txn.open_table(TIMESERIES_TABLE) {
             Ok(t) => t,
@@ -2849,6 +3041,92 @@ mod tests {
             .unwrap();
         assert_eq!(result.points.len(), 10);
         assert_eq!(result.total_count, Some(11)); // 11 points in range (1000-1200 inclusive)
+    }
+
+    #[tokio::test]
+    async fn test_query_range_rev_pagination() {
+        // The data explorer pages through newest-first data with
+        // offset/limit; total_count drives the pager and the export
+        // truncation warning, so page contents and the exact total are
+        // contract.
+        let store = TimeSeriesStore::memory().unwrap();
+
+        // 15 points: timestamps 1000..2400 step 100, values 0..14
+        for i in 0..15 {
+            store
+                .write("device1", "temp", DataPoint::new(1000 + i * 100, i as f64))
+                .await
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        // Page 1: newest 5, newest-first within the page (the explorer
+        // displays newest-first and re-sorts defensively)
+        let p1 = store
+            .query_range_rev("device1", "temp", 1000, 2400, Some(5), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            p1.points
+                .iter()
+                .map(|p| p.as_f64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![14.0, 13.0, 12.0, 11.0, 10.0]
+        );
+        assert_eq!(p1.total_count, Some(15));
+
+        // Page 2: next-newest 5
+        let p2 = store
+            .query_range_rev("device1", "temp", 1000, 2400, Some(5), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            p2.points
+                .iter()
+                .map(|p| p.as_f64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![9.0, 8.0, 7.0, 6.0, 5.0]
+        );
+        assert_eq!(p2.total_count, Some(15));
+
+        // Last page: remainder only
+        let p3 = store
+            .query_range_rev("device1", "temp", 1000, 2400, Some(5), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            p3.points
+                .iter()
+                .map(|p| p.as_f64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![4.0, 3.0, 2.0, 1.0, 0.0]
+        );
+
+        // Offset beyond the data: empty page, exact total still reported
+        let p4 = store
+            .query_range_rev("device1", "temp", 1000, 2400, Some(5), 15)
+            .await
+            .unwrap();
+        assert!(p4.points.is_empty());
+        assert_eq!(p4.total_count, Some(15));
+
+        // Offset into the final element: single point
+        let p5 = store
+            .query_range_rev("device1", "temp", 1000, 2400, Some(5), 14)
+            .await
+            .unwrap();
+        assert_eq!(p5.points.len(), 1);
+        assert_eq!(p5.points[0].as_f64(), Some(0.0));
+
+        // No limit: full range newest-first, exact total
+        let full = store
+            .query_range_rev("device1", "temp", 1000, 2400, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(full.points.len(), 15);
+        assert_eq!(full.points.first().unwrap().as_f64(), Some(14.0));
+        assert_eq!(full.points.last().unwrap().as_f64(), Some(0.0));
+        assert_eq!(full.total_count, Some(15));
     }
 
     #[tokio::test]

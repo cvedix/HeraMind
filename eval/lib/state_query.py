@@ -77,8 +77,15 @@ def _find_by_name(base: str, key: str, list_path: str, name: str) -> bool:
                 items = arr
                 break
     for it in items:
-        if isinstance(it, dict) and it.get("name") == name:
+        if not isinstance(it, dict):
+            continue
+        n = it.get("name")
+        if isinstance(n, str) and n == name:
             return True
+        if isinstance(n, dict):
+            # Localized name {en: "...", zh: "..."} — match any locale value.
+            if any(v == name for v in n.values() if isinstance(v, str)):
+                return True
     return False
 
 
@@ -138,7 +145,8 @@ def _resolve_id_or_name(base: str, key: str, list_path: str,
             items = arr
         else:
             for k in ("devices", "rules", "agents", "channels", "messages",
-                      "dashboards", "automations", "transforms", "data", "items"):
+                      "dashboards", "automations", "transforms", "data", "items",
+                      "targets"):
                 a = v.get(k)
                 if isinstance(a, list):
                     items = a
@@ -179,8 +187,13 @@ def _field_with_name_fallback(base: str, key: str, list_path: str,
     return v.get(field) if isinstance(v, dict) else None
 
 
-def run_query(q: dict, base: str, key: str) -> dict:
+def run_query(q: dict, base: str, key: str, response: str | None = None) -> dict:
     """Run one state_query; returns {type, params, expected, actual, passed}.
+
+    `response` is the final assistant message (when the caller has it) — used
+    by `response_contains` to assert the model's *answer* mentions a value,
+    which is how cross-turn recall cases (remember-then-remember-back) get a
+    hard assertion instead of a judge score.
 
     Supported assertion shapes:
     - `expected: <value>` → exact equality (default).
@@ -196,7 +209,17 @@ def run_query(q: dict, base: str, key: str) -> dict:
     expected = q.get("expected")
     expected_min = q.get("expected_min")
 
-    if t == "device_exists":
+    if t == "response_contains":
+        # Assert the model's final answer contains the expected text — the
+        # hard signal for "did the agent recall what it learned earlier".
+        needle = str(expected if expected is not None else params.get("text", ""))
+        actual = (response or "") if response is not None else ""
+        return {
+            "type": t, "params": params,
+            "expected": needle, "expected_min": None,
+            "actual": actual[:200], "passed": (needle in actual) if needle else False,
+        }
+    elif t == "device_exists":
         actual = _id_or_name_exists(base, key, "/devices", "/devices/{id}", params)
     elif t == "rule_exists":
         actual = _id_or_name_exists(base, key, "/rules", "/rules/{id}", params)
@@ -218,11 +241,16 @@ def run_query(q: dict, base: str, key: str) -> dict:
         stats = v.get("stats") if isinstance(v, dict) else None
         actual = stats.get("total_executions") if isinstance(stats, dict) else 0
     elif t == "push_enabled":
-        actual = _field(base, key, f"/data-push/{_sid(params, 'id')}", "enabled")
+        # Need the record's id: support name fallback (list + match by name),
+        # since agents create pushes with auto-generated ids.
+        v = _get_with_name_fallback(base, key, "/data-push", "/data-push/{id}", "data", params)
+        actual = v.get("enabled") if isinstance(v, dict) else None
     elif t == "device_count":
         actual = _count(base, key, "/devices")
     elif t == "message_count":
         actual = _count(base, key, "/messages")
+    elif t == "rule_count":
+        actual = _count(base, key, "/rules")
     elif t == "transform_count":
         # GET /automations returns all automations (transforms included);
         # the response carries either an `automations` array or a top-level list.
@@ -231,18 +259,202 @@ def run_query(q: dict, base: str, key: str) -> dict:
         v = _get_with_name_fallback(base, key, "/dashboards", "/dashboards/{id}", "dashboards", params)
         comps = v.get("components") if isinstance(v, dict) else None
         actual = len(comps) if isinstance(comps, list) else 0
+    elif t == "dashboard_component_bound":
+        # Verify a dashboard component's data_source references the expected
+        # device + metric (tests correct data binding, not just existence).
+        # data_source format: {type:"telemetry", source:"device", id:"<dev>",
+        # field:"<metric>", sourceId, metricId, ...} or array for multi-series.
+        v = _get_with_name_fallback(base, key, "/dashboards", "/dashboards/{id}", "dashboards", params)
+        comps = v.get("components") if isinstance(v, dict) else None
+        want_dev = str(params.get("device_id", "")).lower()
+        want_metric = str(params.get("metric", "")).lower()
+        actual = False
+        if isinstance(comps, list):
+            for comp in comps:
+                if not isinstance(comp, dict):
+                    continue
+                ds = comp.get("data_source")
+                sources = ds if isinstance(ds, list) else ([ds] if isinstance(ds, dict) else [])
+                for src in sources:
+                    if not isinstance(src, dict):
+                        continue
+                    src_dev = str(src.get("id") or src.get("sourceId") or "").lower()
+                    src_metric = str(src.get("field") or src.get("metricId") or "").lower()
+                    dev_ok = (not want_dev) or (want_dev in src_dev)
+                    metric_ok = (not want_metric) or (want_metric in src_metric)
+                    if dev_ok and metric_ok:
+                        actual = True
+                        break
+                if actual:
+                    break
+    elif t == "dashboard_component_expr":
+        # Verify a component binds an inline EXPRESSION data source
+        # (source:"expression") whose expr contains all given substrings.
+        v = _get_with_name_fallback(base, key, "/dashboards", "/dashboards/{id}", "dashboards", params)
+        comps = v.get("components") if isinstance(v, dict) else None
+        want = [str(x).lower() for x in (params.get("expr_contains") or [])]
+        actual = False
+        if isinstance(comps, list):
+            for comp in comps:
+                if not isinstance(comp, dict):
+                    continue
+                ds = comp.get("data_source")
+                sources = ds if isinstance(ds, list) else ([ds] if isinstance(ds, dict) else [])
+                for src in sources:
+                    if isinstance(src, dict) and src.get("source") == "expression":
+                        expr = str(src.get("expr", "")).lower()
+                        if all(w in expr for w in want):
+                            actual = True
+                            break
+                if actual:
+                    break
+    elif t == "extension_installed":
+        actual = _id_or_name_exists(base, key, "/extensions", "/extensions/{id}", params)
+    elif t == "widget_exists":
+        actual = _id_or_name_exists(base, key, "/frontend-components",
+                                    "/frontend-components/{id}", params)
+    elif t == "llm_backend_exists":
+        actual = _id_or_name_exists(base, key, "/llm-backends", "/llm-backends/{id}", params)
+    elif t == "settings_value":
+        # GET /settings/<key> → {success, data}; extract a sub-field if `field`
+        # param given, else compare the whole value.
+        v = _get_json(base, key, f"/settings/{_sid(params, 'key')}")
+        if isinstance(v, dict) and params.get("field"):
+            actual = v.get(params["field"])
+        else:
+            actual = v
+    elif t == "device_type_has_metric":
+        # A device-type template defining params.metric exists, matched by id
+        # OR name (normalized — ignores case and -/_/space separators, so an
+        # auto-generated id like 'mystery_wibration_sensor' matches an asserted
+        # 'mystery-vibration-sensor' / name 'Mystery Vibration Sensor').
+        # For the "AI infers a template from raw samples and creates it"
+        # scenario: assert the created template defines the expected metric.
+        import re as _re
+        want = _re.sub(r"[^a-z0-9]", "", _sid(params, "id").lower())
+        v = _get_json(base, key, "/device-types")
+        templates = []
+        if isinstance(v, list):
+            templates = v
+        elif isinstance(v, dict):
+            arr = v.get("device_types") or v.get("data") or []
+            if isinstance(arr, list):
+                templates = arr
+        tpl = None
+        for tm in templates:
+            if not isinstance(tm, dict):
+                continue
+            for key_field in ("device_type", "name"):
+                val = _re.sub(r"[^a-z0-9]", "", str(tm.get(key_field, "")).lower())
+                if val and val == want:
+                    tpl = tm
+                    break
+            if tpl:
+                break
+        names = []
+        if isinstance(tpl, dict):
+            ms = tpl.get("metrics")
+            if isinstance(ms, list):
+                names = [m.get("name") for m in ms if isinstance(m, dict)]
+        actual = params.get("metric") in names
+    elif t == "device_command_sent":
+        # GET /devices/:id/commands → command history; does it include
+        # params.command? Downlink assertion. The platform records every
+        # command in history BEFORE routing (service.rs send_command), so this
+        # works even for offline simulated devices.
+        want_id = _sid(params, "id")
+        v = _get_json(base, key, f"/devices/{want_id}/commands")
+        records = []
+        if isinstance(v, list):
+            records = v
+        elif isinstance(v, dict):
+            for k in ("commands", "data", "history", "items"):
+                arr = v.get(k)
+                if isinstance(arr, list):
+                    records = arr
+                    break
+        names = [
+            str(c.get("command_name") or c.get("command") or c.get("name") or "").lower()
+            for c in records if isinstance(c, dict)
+        ]
+        actual = str(params.get("command", "")).lower() in names
+    elif t == "rule_references_source":
+        # Depth assertion: does a rule's condition reference the expected data
+        # source (e.g. a transform output, or a specific device metric)?
+        # Walks comparison.source + recurses logical.conditions.
+        rule = _get_with_name_fallback(base, key, "/rules", "/rules/{id}", "rules", params)
+        want = str(params.get("source", "")).lower()
+        sources = []
+
+        def _walk(cond):
+            if isinstance(cond, dict):
+                s = cond.get("source")
+                if isinstance(s, str):
+                    sources.append(s.lower())
+                for sub in cond.get("conditions") or []:
+                    _walk(sub)
+
+        _walk(rule.get("condition") if isinstance(rule, dict) else None)
+        actual = (any(want in s for s in sources) if want else len(sources) > 0)
+    elif t == "rule_action_type":
+        # Depth assertion: does a rule have an action of the expected type
+        # (notify / execute / trigger_agent)? For the rule→agent handoff case.
+        rule = _get_with_name_fallback(base, key, "/rules", "/rules/{id}", "rules", params)
+        want = str(params.get("action_type", "")).lower()
+        acts = rule.get("actions") if isinstance(rule, dict) else None
+        types = [
+            str(a.get("type", "")).lower()
+            for a in acts if isinstance(a, dict)
+        ] if isinstance(acts, list) else []
+        actual = (want in types) if want else (len(types) > 0)
+    elif t == "latest_telemetry":
+        # GET /devices/:id/telemetry?metric=<m>&limit=<n>. The handler flushes
+        # the write buffer before querying (telemetry.rs:243), so the point is
+        # readable immediately after MQTT ingest. Response may be a bare list,
+        # a dict keyed by metric → [{timestamp,value},...], or double-enveloped
+        # (nested `data`). Resolve the series for `metric` from any of these.
+        device_id = _sid(params, "device_id")
+        metric = _sid(params, "metric")
+        limit = int(params.get("limit", 10))
+        v = _get_json(base, key, f"/devices/{device_id}/telemetry?metric={metric}&limit={limit}")
+        series = None
+
+        def _find_series(node, depth=0):
+            if depth > 3 or not isinstance(node, dict):
+                return None
+            direct = node.get(metric)
+            if isinstance(direct, list):
+                return direct
+            inner = node.get("data")
+            if isinstance(inner, list):
+                # Maybe the whole series array lives under `data`.
+                return inner if not inner or isinstance(inner[0], dict) else None
+            if isinstance(inner, dict):
+                return _find_series(inner, depth + 1)
+            return None
+
+        if isinstance(v, list):
+            series = v
+        elif isinstance(v, dict):
+            series = _find_series(v)
+        actual = None
+        if isinstance(series, list) and series:
+            last = series[-1]
+            actual = last.get("value") if isinstance(last, dict) else last
     else:
         raise ValueError(f"unknown state_query type: {t}")
 
+    # actual may be None when the metric has no data yet — treat as not-passed
+    # rather than raising on `None >= expected_min`.
+    if expected_min is not None:
+        passed = actual is not None and actual >= expected_min
+    else:
+        passed = actual == expected
     return {
         "type": t,
         "params": params,
         "expected": expected,
         "expected_min": expected_min,
         "actual": actual,
-        "passed": (
-            actual >= expected_min
-            if expected_min is not None
-            else actual == expected
-        ),
+        "passed": passed,
     }

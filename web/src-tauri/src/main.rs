@@ -156,6 +156,13 @@ fn show_main_window(app: &AppHandle) {
 
 /// Properly shutdown the server before exiting
 fn clean_shutdown(app_handle: &AppHandle) {
+    // Stop the embedded llama-server children BEFORE tearing the runtime
+    // down: the embedded server runs on this runtime (never through the
+    // standalone serve shutdown path), and kill_on_drop alone would leave
+    // the process alive until app exit — force-quit paths could still leak
+    // a ~2 GB model process. Explicit, immediate, idempotent.
+    edge_api::builtin_llm::server::stop_all_llama_servers();
+
     // Try to get server state and shutdown
     if let Some(state) = app_handle.try_state::<ServerState>() {
         // Shutdown the tokio runtime
@@ -266,6 +273,7 @@ fn start_axum_server(
     let file_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_writer(file_appender)
+        .with_ansi(false)
         .with_filter(filter);
 
     tracing_subscriber::registry()
@@ -279,6 +287,12 @@ fn start_axum_server(
     // Clone the Arc before moving into the closure
     let runtime_arc = Arc::clone(&state.runtime);
     let server_thread = Arc::clone(&state.server_thread);
+    // Clone the AppHandle so the server thread can emit a "backend-start-failed"
+    // event if start_server() errors (e.g. port 9375 already in use). Without
+    // this the failure is only eprintln'd to stderr, the Tauri window stays open
+    // with no backend, and the user stares at an endless "Reconnecting" with no
+    // clue why. Symmetric to the "backend-ready" event emitted on success.
+    let app_handle_for_errors = app_handle.clone();
 
     let thread_handle = std::thread::spawn(move || {
         let rt = match runtime_arc.lock() {
@@ -294,9 +308,22 @@ fn start_axum_server(
             return;
         };
 
-        rt.block_on(async {
+        rt.block_on(async move {
             if let Err(e) = edge_api::start_server().await {
-                eprintln!("Failed to start server: {}", e);
+                let err_str = e.to_string();
+                eprintln!("Failed to start server: {}", err_str);
+                // Surface the failure to the frontend so the user sees a clear
+                // error page instead of an endless "Reconnecting". Detect the
+                // common case (port already in use) to give targeted guidance.
+                let port_conflict = err_str.contains("AddrInUse")
+                    || err_str.to_lowercase().contains("address already in use");
+                let _ = app_handle_for_errors.emit(
+                    "backend-start-failed",
+                    serde_json::json!({
+                        "error": err_str,
+                        "port_conflict": port_conflict,
+                    }),
+                );
             }
         });
     });
@@ -351,6 +378,9 @@ pub fn run() {
         .manage(server_state)
         .manage(update::UpdateCache(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
+            get_lan_access,
+            set_lan_access,
+            dismiss_lan_notice,
             update::check_update,
             update::download_and_install,
             update::get_app_version,
@@ -381,7 +411,127 @@ pub fn run() {
 }
 
 /// Application setup function
+// ============================================================================
+// LAN access policy (desktop hardening, server deployments unaffected)
+// ============================================================================
+
+/// Desktop-side settings that never belong in the server's own stores.
+/// Lives at <app_data>/desktop-settings.json.
+const DESKTOP_SETTINGS_FILE: &str = "desktop-settings.json";
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct DesktopSettings {
+    /// Explicit user choice for "allow LAN devices to connect".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allow_lan: Option<bool>,
+    /// How the current value came to be: "user" (explicit toggle), "compat"
+    /// (kept on for an upgrading install), "default" (fresh install off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lan_source: Option<String>,
+    /// One-time notice for compat-default installs already shown.
+    #[serde(default)]
+    lan_compat_notice_shown: bool,
+}
+
+fn desktop_settings_path(app_handle: &AppHandle) -> PathBuf {
+    get_app_data_dir(app_handle).join(DESKTOP_SETTINGS_FILE)
+}
+
+fn read_desktop_settings(app_handle: &AppHandle) -> DesktopSettings {
+    fs::read_to_string(desktop_settings_path(app_handle))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_desktop_settings(app_handle: &AppHandle, settings: &DesktopSettings) {
+    let path = desktop_settings_path(app_handle);
+    if let Ok(json) = serde_json::to_string_pretty(settings) {
+        if let Err(e) = fs::write(&path, json) {
+            eprintln!("Failed to write desktop settings: {}", e);
+        }
+    }
+}
+
+/// Resolve this launch's LAN policy.
+///
+/// Explicit choice wins. With no explicit choice, LAN is ON — edge
+/// devices must keep connecting out of the box (product call
+/// 2026-09-15, superseding the fresh-install-loopback plan that never
+/// shipped). Turning it off is one explicit toggle and sticky.
+fn resolve_lan_policy(app_handle: &AppHandle) -> (bool, &'static str) {
+    let settings = read_desktop_settings(app_handle);
+    if let Some(explicit) = settings.allow_lan {
+        return (explicit, "user");
+    }
+    // Product call (2026-09-15): LAN stays ON by default everywhere —
+    // edge devices must keep connecting out of the box. The user can
+    // turn it off explicitly; that choice is sticky ("user" source).
+    (true, "default")
+}
+
+/// Apply the LAN decision to the embedded server for THIS process. Session
+/// env only — HERAMIND_HOST is already honored by the server config, and
+/// HERAMIND_MQTT_BIND is a session-level override of the broker listen
+/// address (deliberately never persisted into the server's own settings,
+/// so this side stays authoritative per launch).
+fn apply_lan_binding(enabled: bool) {
+    let bind = if enabled { "0.0.0.0" } else { "127.0.0.1" };
+    // HERAMIND_HOST alone loses to a config.toml in the working directory
+    // (the app-data dir); HERAMIND_BIND_OVERRIDE is checked FIRST in
+    // get_server_config so the toggle is actually authoritative.
+    env::set_var("HERAMIND_HOST", bind);
+    env::set_var("HERAMIND_BIND_OVERRIDE", bind);
+    env::set_var("HERAMIND_MQTT_BIND", bind);
+    info!(bind, lan = enabled, "LAN access policy applied to embedded server");
+}
+
+#[tauri::command]
+fn get_lan_access(app_handle: AppHandle) -> serde_json::Value {
+    let settings = read_desktop_settings(&app_handle);
+    let desired = settings.allow_lan.unwrap_or(true);
+    let effective = env::var("HERAMIND_HOST")
+        .map(|h| h != "127.0.0.1")
+        .unwrap_or(true);
+    serde_json::json!({
+        "desired": desired,
+        "effective": effective,
+        "restartRequired": desired != effective,
+        // The compat notice fires once for upgrading installs whose LAN
+        // access was silently kept on — those users never opted in.
+        "compatNoticePending": settings.lan_source.as_deref() == Some("compat")
+            && !settings.lan_compat_notice_shown,
+    })
+}
+
+#[tauri::command]
+fn set_lan_access(app_handle: AppHandle, enabled: bool) -> serde_json::Value {
+    let mut settings = read_desktop_settings(&app_handle);
+    settings.allow_lan = Some(enabled);
+    settings.lan_source = Some("user".to_string());
+    write_desktop_settings(&app_handle, &settings);
+    let effective = env::var("HERAMIND_HOST")
+        .map(|h| h != "127.0.0.1")
+        .unwrap_or(true);
+    serde_json::json!({ "desired": enabled, "effective": effective, "restartRequired": enabled != effective })
+}
+
+#[tauri::command]
+fn dismiss_lan_notice(app_handle: AppHandle) {
+    let mut settings = read_desktop_settings(&app_handle);
+    settings.lan_compat_notice_shown = true;
+    write_desktop_settings(&app_handle, &settings);
+}
+
 fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    // Follow the OS appearance explicitly. Without this the webview's
+    // effective appearance can stay light (WKWebView on macOS dark
+    // systems reports prefers-color-scheme: light), which breaks the
+    // frontend "system" theme mode. `None` = follow the system.
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_theme(None);
+    }
+
     // Get and set up data directory
     let app_data_dir = get_app_data_dir(app.handle());
     fs::create_dir_all(&app_data_dir)?;
@@ -405,6 +555,22 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // - Use RUST_LOG or environment variables for debugging if needed
     // - Do NOT use ./data in development as it causes path inconsistencies
     env::set_var("HERAMIND_DATA_DIR", &data_dir);
+
+    // LAN access policy must be resolved BEFORE the embedded server starts
+    // (it reads HERAMIND_HOST at boot). Upgrade compat: an install that has
+    // run before keeps LAN on unless the user explicitly opts out; fresh
+    // installs default to loopback with a one-toggle opt-in.
+    {
+        let (enabled, source) = resolve_lan_policy(app.handle());
+        let mut settings = read_desktop_settings(app.handle());
+        let first_resolution = settings.allow_lan.is_none();
+        if first_resolution {
+            settings.allow_lan = Some(enabled);
+            settings.lan_source = Some(source.to_string());
+            write_desktop_settings(app.handle(), &settings);
+        }
+        apply_lan_binding(enabled);
+    }
 
     #[cfg(debug_assertions)]
     {

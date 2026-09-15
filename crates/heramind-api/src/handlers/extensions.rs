@@ -31,7 +31,7 @@ use heramind_storage::{ExtensionRecord, ExtensionStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Validate an extension ID to prevent path traversal in filesystem operations.
-/// Extension IDs are kebab-case identifiers (e.g. "weather-forecast-v2").
+/// Extension IDs are kebab-case identifiers (e.g. "weather-forecast").
 /// Rejects empty, too-long, or characters outside [a-zA-Z0-9-_].
 fn validate_extension_id(id: &str) -> Result<(), ErrorResponse> {
     if id.is_empty()
@@ -76,6 +76,13 @@ pub struct ExtensionDto {
     /// Last error timestamp if any
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_at: Option<i64>,
+    /// Consecutive crashes (0 = healthy / stopped on purpose). Non-zero
+    /// while stopped means the extension crashed.
+    #[serde(default)]
+    pub consecutive_crashes: u32,
+    /// Reason for the most recent crash, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_crash_reason: Option<String>,
     /// Commands provided by this extension
     #[serde(default)]
     pub commands: Vec<CommandDescriptorDto>,
@@ -206,7 +213,7 @@ pub struct ListExtensionsQuery {
 }
 
 /// Request to register an extension.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct RegisterExtensionRequest {
     /// Path to the extension file
     pub file_path: String,
@@ -216,7 +223,7 @@ pub struct RegisterExtensionRequest {
 }
 
 /// Request to execute an extension command.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct ExecuteCommandRequest {
     /// Command name
     pub command: String,
@@ -227,6 +234,17 @@ pub struct ExecuteCommandRequest {
 
 /// GET /api/extensions
 /// List all registered extensions (including failed to load).
+#[utoipa::path(
+    get,
+    path = "/api/extensions",
+    tag = "extensions",
+    params(
+        ("state" = Option<String>, Query, description = "Filter by lifecycle state"),
+    ),
+    responses(
+        (status = 200, description = "Registered extensions"),
+    )
+)]
 pub async fn list_extensions_handler(
     State(state): State<ServerState>,
     Query(query): Query<ListExtensionsQuery>,
@@ -235,11 +253,7 @@ pub async fn list_extensions_handler(
     let loaded_extensions = state.extensions.runtime.list().await;
 
     // Also get all extension records from storage (including failed ones)
-    let stored_records = if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
-        store.load_all().unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let stored_records = state.extensions.store.load_all().unwrap_or_default();
 
     // Build a set of loaded extension IDs for quick lookup
     let loaded_ids: std::collections::HashSet<String> = loaded_extensions
@@ -251,7 +265,7 @@ pub async fn list_extensions_handler(
 
     // First, add all successfully loaded extensions
     for info in loaded_extensions {
-        extensions.push(extension_info_to_dto(&info));
+        extensions.push(extension_info_to_dto(&info, &state.extensions.store));
     }
 
     // Then, add extensions from storage that failed to load
@@ -279,6 +293,8 @@ pub async fn list_extensions_handler(
             health_status: record.health_status,
             last_error: record.last_error,
             last_error_at: record.last_error_at,
+            consecutive_crashes: 0,
+            last_crash_reason: None,
             commands: Vec::new(),
             metrics: Vec::new(),
             config_parameters: None,
@@ -296,15 +312,16 @@ pub async fn list_extensions_handler(
 }
 
 /// Helper function to convert ExtensionInfo to ExtensionDto
-fn extension_info_to_dto(info: &heramind_core::extension::ExtensionRuntimeInfo) -> ExtensionDto {
+fn extension_info_to_dto(
+    info: &heramind_core::extension::ExtensionRuntimeInfo,
+    store: &ExtensionStore,
+) -> ExtensionDto {
     use heramind_core::extension::system::ParamMetricValue;
 
     // Load persisted record (if any) to get enabled flag + disabled_commands.
     // Defaults: enabled=true, no disabled commands. Same lookup is reused for
     // health_status below, so we cache it once.
-    let record_opt: Option<ExtensionRecord> = ExtensionStore::open("data/extensions.redb")
-        .ok()
-        .and_then(|store| store.load(&info.metadata.id).ok().flatten());
+    let record_opt: Option<ExtensionRecord> = store.load(&info.metadata.id).ok().flatten();
     let (enabled, disabled_commands): (bool, Vec<String>) = record_opt
         .as_ref()
         .map(|r| (r.enabled, r.disabled_commands.clone()))
@@ -386,8 +403,12 @@ fn extension_info_to_dto(info: &heramind_core::extension::ExtensionRuntimeInfo) 
         None => ("unknown".to_string(), None, None),
     };
 
-    // Determine state based on is_running and health_status
-    let state_str = if !info.is_running {
+    // Determine state based on is_running and health_status. A stopped
+    // extension with crash-loop counters did not stop on purpose — it
+    // crashed; the old derivation hid that behind "Stopped".
+    let state_str = if !info.is_running && info.consecutive_crashes > 0 {
+        "Crashed"
+    } else if !info.is_running {
         "Stopped"
     } else if health_status == "error" {
         "Error"
@@ -411,6 +432,8 @@ fn extension_info_to_dto(info: &heramind_core::extension::ExtensionRuntimeInfo) 
         health_status,
         last_error,
         last_error_at,
+        consecutive_crashes: info.consecutive_crashes,
+        last_crash_reason: info.last_crash_reason.clone(),
         commands,
         metrics,
         config_parameters,
@@ -421,6 +444,18 @@ fn extension_info_to_dto(info: &heramind_core::extension::ExtensionRuntimeInfo) 
 
 /// GET /api/extensions/:id
 /// Get a specific extension.
+#[utoipa::path(
+    get,
+    path = "/api/extensions/{id}",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Extension metadata"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_extension_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -433,11 +468,19 @@ pub async fn get_extension_handler(
         .await
         .ok_or_else(|| ErrorResponse::not_found(format!("Extension {}", id)))?;
 
-    ok(extension_info_to_dto(&info))
+    ok(extension_info_to_dto(&info, &state.extensions.store))
 }
 
 /// GET /api/extensions/types
 /// List available extension types.
+#[utoipa::path(
+    get,
+    path = "/api/extensions/types",
+    tag = "extensions",
+    responses(
+        (status = 200, description = "Static list of built-in extension types"),
+    )
+)]
 pub async fn list_extension_types_handler() -> HandlerResult<Vec<ExtensionTypeDto>> {
     let types = vec![
         ExtensionTypeDto {
@@ -470,15 +513,99 @@ pub async fn list_extension_types_handler() -> HandlerResult<Vec<ExtensionTypeDt
     ok(types)
 }
 
+/// Fall back to the release-level `checksums.txt` for a package sha256.
+///
+/// The marketplace index does not carry per-build sha256; the Extensions CI
+/// uploads a `checksums.txt` (sha256sum format) to the SAME release as the
+/// .nep assets, so integrity data is at least as fresh as the package
+/// itself. Derives the checksum URL from the package URL and looks up the
+/// matching filename.
+async fn fetch_release_checksum(
+    client: &reqwest::Client,
+    package_url: &str,
+    nep_filename: &str,
+) -> Option<String> {
+    let base = package_url.rsplit_once('/')?.0;
+    let url = format!("{base}/checksums.txt");
+    let text = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .header("User-Agent", "HeraMind-Extension-Marketplace")
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(sha), Some(name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if name == nep_filename && sha.len() == 64 {
+            return Some(sha.to_string());
+        }
+    }
+    None
+}
+
+/// Resolve a client-provided package/library path, confining it to the
+/// server's data directory.
+///
+/// `file_path` used to accept any host path, which made the register/upload/
+/// validate endpoints a read-and-try-load primitive for arbitrary files on
+/// the machine for anyone holding credentials. Relative paths resolve
+/// against the data dir; absolute paths must land inside it (after
+/// canonicalization, so `..` and symlinks can't escape).
+pub(crate) fn resolve_confined_package_path(raw: &str) -> Result<PathBuf, ErrorResponse> {
+    let data_dir = heramind_core::paths::data_dir()
+        .to_string_lossy()
+        .to_string();
+    let data_root = std::path::PathBuf::from(&data_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&data_dir));
+
+    let candidate = PathBuf::from(raw);
+    let joined = if candidate.is_absolute() {
+        candidate
+    } else {
+        data_root.join(candidate)
+    };
+    let canonical = joined
+        .canonicalize()
+        .map_err(|_| ErrorResponse::not_found(format!("Package file not found: {}", raw)))?;
+    if !canonical.starts_with(&data_root) {
+        return Err(ErrorResponse::bad_request(
+            "file_path must point inside the server data directory",
+        ));
+    }
+    Ok(canonical)
+}
+
 /// POST /api/extensions
 /// Register a new extension from file path.
+#[utoipa::path(
+    post,
+    path = "/api/extensions",
+    tag = "extensions",
+    request_body = RegisterExtensionRequest,
+    responses(
+        (status = 200, description = "Extension registered from a path"),
+    )
+)]
 pub async fn register_extension_handler(
     State(state): State<ServerState>,
     Json(req): Json<RegisterExtensionRequest>,
 ) -> HandlerResult<serde_json::Value> {
     let runtime = &state.extensions.runtime;
 
-    let path = PathBuf::from(&req.file_path);
+    // Store the resolved canonical path: load_from_storage replays
+    // record.file_path verbatim on every boot, so persisting the raw
+    // request string would keep an outside-data-dir path loadable forever
+    // (the confinement would only ever check the write side).
+    let path = resolve_confined_package_path(&req.file_path)?;
 
     let metadata = runtime.load(&path).await.map_err(|e| {
         // Check for specific error types to return appropriate HTTP status codes
@@ -500,11 +627,14 @@ pub async fn register_extension_handler(
 
     // Save to persistent storage for auto-load on server restart
     // V2: Use empty string for extension_type (storage API still requires it)
-    if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+    let store = state.extensions.store.clone();
+    {
         let record = heramind_storage::ExtensionRecord::new(
             ext_id.clone(),
             ext_name.clone(),
-            req.file_path.clone(),
+            // Canonical, data-dir-confined path (NOT the raw request value) —
+            // replayed verbatim by load_from_storage on every boot.
+            path.display().to_string(),
             String::new(), // V2: No extension_type, use empty string
             ext_version.clone(),
         )
@@ -532,6 +662,18 @@ pub async fn register_extension_handler(
 
 /// DELETE /api/extensions/:id
 /// Unregister an extension.
+#[utoipa::path(
+    delete,
+    path = "/api/extensions/{id}",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Extension unregistered (files kept)"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn unregister_extension_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -540,11 +682,7 @@ pub async fn unregister_extension_handler(
 
     // Check if extension exists in memory or storage
     let in_memory = runtime.contains(&id).await;
-    let in_storage = if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
-        store.load(&id).ok().flatten().is_some()
-    } else {
-        false
-    };
+    let in_storage = state.extensions.store.load(&id).ok().flatten().is_some();
 
     // Extension must exist somewhere to unregister
     if !in_memory && !in_storage {
@@ -564,7 +702,8 @@ pub async fn unregister_extension_handler(
 
     // Mark as uninstalled in storage (instead of deleting) to prevent auto-discovery
     // from re-registering it on server restart
-    if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+    let store = state.extensions.store.clone();
+    {
         if let Err(e) = store.mark_uninstalled(&id) {
             tracing::warn!("Failed to mark extension as uninstalled: {}", e);
         }
@@ -619,6 +758,18 @@ async fn cleanup_extension_metrics(state: &ServerState, extension_id: &str) {
 ///
 /// Note: In the new extension system, extensions are always active once registered.
 /// This endpoint exists for API compatibility only.
+#[utoipa::path(
+    post,
+    path = "/api/extensions/{id}/start",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Extension started"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn start_extension_handler(
     State(_state): State<ServerState>,
     Path(id): Path<String>,
@@ -636,6 +787,18 @@ pub async fn start_extension_handler(
 ///
 /// Note: In the new extension system, extensions cannot be stopped.
 /// They remain active until unregistered. This endpoint exists for API compatibility only.
+#[utoipa::path(
+    post,
+    path = "/api/extensions/{id}/stop",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Extension stopped"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn stop_extension_handler(
     State(_state): State<ServerState>,
     Path(id): Path<String>,
@@ -650,6 +813,18 @@ pub async fn stop_extension_handler(
 
 /// GET /api/extensions/:id/health
 /// Check extension health.
+#[utoipa::path(
+    get,
+    path = "/api/extensions/{id}/health",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Extension health snapshot"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn extension_health_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -686,6 +861,18 @@ pub struct ExtensionLogEntryDto {
 
 /// GET /api/extensions/:id/logs
 /// Get extension log entries.
+#[utoipa::path(
+    get,
+    path = "/api/extensions/{id}/logs",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Recent extension log lines"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_extension_logs_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -717,6 +904,18 @@ pub async fn get_extension_logs_handler(
 
 /// DELETE /api/extensions/:id/logs
 /// Clear extension log entries.
+#[utoipa::path(
+    delete,
+    path = "/api/extensions/{id}/logs",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Extension logs cleared"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn clear_extension_logs_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -834,6 +1033,19 @@ async fn publish_extension_metrics(
 /// Execute a command on an extension.
 ///
 /// Includes panic protection to prevent server crashes from buggy extensions.
+#[utoipa::path(
+    post,
+    path = "/api/extensions/{id}/command",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    request_body = ExecuteCommandRequest,
+    responses(
+        (status = 200, description = "Command dispatched; result payload returned"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn execute_extension_command_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -920,7 +1132,7 @@ async fn publish_extension_metrics_safe(
 // ============================================================================
 
 /// Request to invoke an extension.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct InvokeExtensionRequest {
     /// Command/function to invoke
     pub command: String,
@@ -934,6 +1146,19 @@ pub struct InvokeExtensionRequest {
 ///
 /// This is a simplified version of execute_extension_command_handler
 /// that returns results in a more JSON-friendly format for AI agents.
+#[utoipa::path(
+    post,
+    path = "/api/extensions/{id}/invoke",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    request_body = InvokeExtensionRequest,
+    responses(
+        (status = 200, description = "Tool-style invocation of an extension entry point"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn invoke_extension_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1089,6 +1314,18 @@ pub struct DataSourceInfoDto {
 /// GET /api/extensions/:id/commands
 ///
 /// List all commands for an extension (V2 format)
+#[utoipa::path(
+    get,
+    path = "/api/extensions/{id}/commands",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Toolbox commands exposed by an extension"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn list_extension_commands_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1102,10 +1339,7 @@ pub async fn list_extension_commands_handler(
 
     // Load persisted disable state so `disabled` flag reflects current setting.
     let (ext_enabled, disabled_cmds): (bool, std::collections::HashSet<String>) =
-        match ExtensionStore::open("data/extensions.redb")
-            .ok()
-            .and_then(|s| s.load(&id).ok().flatten())
-        {
+        match state.extensions.store.load(&id).ok().flatten() {
             Some(r) => (r.enabled, r.disabled_commands.iter().cloned().collect()),
             None => (true, Default::default()),
         };
@@ -1133,7 +1367,7 @@ pub async fn list_extension_commands_handler(
 }
 
 /// Request body for tool-enable toggles.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct SetToolEnabledRequest {
     pub enabled: bool,
 }
@@ -1148,7 +1382,8 @@ async fn refresh_tool_registry_disabled(state: &ServerState) {
     };
 
     let mut disabled: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+    let store = state.extensions.store.clone();
+    {
         if let Ok(records) = store.load_all() {
             for r in records {
                 if !r.enabled {
@@ -1180,6 +1415,19 @@ async fn refresh_tool_registry_disabled(state: &ServerState) {
 /// extension's tools from the LLM-facing list; `enabled=true` restores them
 /// (subject to per-command disables). Storage is the source of truth; the
 /// live ToolRegistry is refreshed from storage after the write.
+#[utoipa::path(
+    patch,
+    path = "/api/extensions/{id}/enabled",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    request_body = SetToolEnabledRequest,
+    responses(
+        (status = 200, description = "Master enable flag updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn set_extension_enabled_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1187,8 +1435,9 @@ pub async fn set_extension_enabled_handler(
 ) -> HandlerResult<serde_json::Value> {
     validate_extension_id(&id)?;
 
-    let store = ExtensionStore::open("data/extensions.redb")
-        .map_err(|e| ErrorResponse::internal(format!("Extension store: {e}")))?;
+    // Shared pre-opened store from ServerState (was: per-request
+    // ExtensionStore::open, whose failure swallowed into a 500).
+    let store = state.extensions.store.clone();
     let mut record = store
         .load(&id)
         .map_err(|e| ErrorResponse::internal(format!("Load extension: {e}")))?
@@ -1216,6 +1465,20 @@ pub async fn set_extension_enabled_handler(
 /// `disabled_commands`; `enabled=true` removes it. Master `enabled` flag is
 /// untouched. Storage is the source of truth; the live ToolRegistry is
 /// refreshed from storage after the write.
+#[utoipa::path(
+    patch,
+    path = "/api/extensions/{id}/commands/{cmd}/enabled",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+        ("cmd" = String, Path, description = "Command name"),
+    ),
+    request_body = SetToolEnabledRequest,
+    responses(
+        (status = 200, description = "Per-command enable flag updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn set_extension_command_enabled_handler(
     State(state): State<ServerState>,
     Path((id, cmd)): Path<(String, String)>,
@@ -1228,8 +1491,9 @@ pub async fn set_extension_command_enabled_handler(
         ));
     }
 
-    let store = ExtensionStore::open("data/extensions.redb")
-        .map_err(|e| ErrorResponse::internal(format!("Extension store: {e}")))?;
+    // Shared pre-opened store from ServerState (was: per-request
+    // ExtensionStore::open, whose failure swallowed into a 500).
+    let store = state.extensions.store.clone();
     let mut record = store
         .load(&id)
         .map_err(|e| ErrorResponse::internal(format!("Load extension: {e}")))?
@@ -1259,6 +1523,18 @@ pub async fn set_extension_command_enabled_handler(
 /// GET /api/extensions/:id/event-subscriptions
 ///
 /// Get event subscriptions for an extension.
+#[utoipa::path(
+    get,
+    path = "/api/extensions/{id}/event-subscriptions",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Server events an extension subscribes to"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_event_subscriptions_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1278,6 +1554,18 @@ pub async fn get_event_subscriptions_handler(
 /// GET /api/extensions/:id/descriptor
 ///
 /// Get the full extension descriptor (metadata, commands, metrics, capabilities).
+#[utoipa::path(
+    get,
+    path = "/api/extensions/{id}/descriptor",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Raw extension descriptor (manifest)"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_extension_descriptor_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1310,6 +1598,23 @@ pub async fn get_extension_descriptor_handler(
 /// Query historical data for an extension metric
 ///
 /// Uses typed DataSourceId for data source identification.
+#[utoipa::path(
+    get,
+    path = "/api/extensions/{id}/metrics/{metric}/data",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+        ("metric" = String, Path, description = "Metric name"),
+        ("start" = Option<i64>, Query, description = "Unix-seconds range start"),
+        ("end" = Option<i64>, Query, description = "Unix-seconds range end"),
+        ("limit" = Option<usize>, Query, description = "Max points"),
+        ("hours" = Option<i64>, Query, description = "Lookback window in hours (alternative to start/end)"),
+    ),
+    responses(
+        (status = 200, description = "Time-range points for an extension metric"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn query_extension_metric_data_handler(
     State(state): State<ServerState>,
     Path((extension_id, metric)): Path<(String, String)>,
@@ -1318,7 +1623,14 @@ pub async fn query_extension_metric_data_handler(
     use heramind_devices::mdl::MetricValue;
 
     let end = query.end.unwrap_or_else(|| chrono::Utc::now().timestamp());
-    let start = query.start.unwrap_or(end - 86400); // Default 24 hours
+    // `hours` beats the 24 h default when given; explicit start still wins.
+    // The gym-tracker Traffic chart sent `?hours=6` for months while this
+    // struct had no such field — axum dropped it silently and every "last
+    // 6h" chart actually plotted a 24 h window.
+    let start = query
+        .start
+        .or_else(|| query.hours.map(|h| end - h * 3600))
+        .unwrap_or(end - 86400); // Default 24 hours
 
     // Use typed DataSourceId
     let source_id = DataSourceId::extension(&extension_id, &metric);
@@ -1340,9 +1652,14 @@ pub async fn query_extension_metric_data_handler(
     const MAX_METRIC_QUERY_LIMIT: usize = 10000;
     let effective_limit = query.limit.unwrap_or(1000).min(MAX_METRIC_QUERY_LIMIT);
 
+    // Keep the NEWEST `limit` points, not the oldest: points come back in
+    // chronological order, so `.take(limit)` truncates from the front —
+    // once a store outgrew the cap (1440 pts/24h at 1/min vs the 1000
+    // default) the chart froze on the oldest slice and never advanced.
+    let skip = points.len().saturating_sub(effective_limit);
     let data_points: Vec<serde_json::Value> = points
         .iter()
-        .take(effective_limit)
+        .skip(skip)
         .map(|point| {
             let value_json = match &point.value {
                 MetricValue::Integer(n) => serde_json::json!(n),
@@ -1381,6 +1698,19 @@ pub async fn query_extension_metric_data_handler(
 /// enabling real-time data updates without waiting for the next poll cycle.
 ///
 /// Body: `{ "metrics": { "temperature_c": 23.2, "humidity": 80 } }`
+#[utoipa::path(
+    post,
+    path = "/api/extensions/{id}/push-metrics",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Metrics accepted for persistence"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn push_extension_metrics_handler(
     State(state): State<ServerState>,
     Path(extension_id): Path<String>,
@@ -1442,7 +1772,10 @@ pub async fn push_extension_metrics_handler(
     let mut stored = 0;
 
     for (name, value) in &metrics {
-        let dp = heramind_devices::telemetry::DataPoint::new(timestamp_ms, value.clone());
+        // [unit fix] the extension-metrics store is SECONDS (the collection
+        // path divides by 1000 at extension_metrics.rs); this wrote millis,
+        // corrupting range queries and the metrics-data endpoint.
+        let dp = heramind_devices::telemetry::DataPoint::new(timestamp_secs, value.clone());
         if let Err(e) = state
             .extensions
             .metrics_storage
@@ -1493,6 +1826,18 @@ pub async fn push_extension_metrics_handler(
 /// List data sources (metrics) provided by an extension
 ///
 /// Uses typed DataSourceId for clean data source identification.
+#[utoipa::path(
+    get,
+    path = "/api/extensions/{id}/data-sources",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Data sources contributed by an extension"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn list_extension_data_sources_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1570,6 +1915,14 @@ pub struct ExtensionToolDto {
 /// Get all extension capabilities for dashboard/automation integration
 ///
 /// V2: Uses extension metrics and command parameters schema
+#[utoipa::path(
+    get,
+    path = "/api/extensions/capabilities",
+    tag = "extensions",
+    responses(
+        (status = 200, description = "Capabilities contributed by every extension"),
+    )
+)]
 pub async fn list_extension_capabilities_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<Vec<ExtensionCapabilityDto>> {
@@ -1650,7 +2003,47 @@ pub async fn list_extension_capabilities_handler(
 
 /// Configuration for cloud extension marketplace
 const MARKET_BRANCH: &str = "main";
-const MARKET_BASE_URL: &str = "https://raw.githubusercontent.com/camthink-ai/HeraMind-Extensions";
+const DEFAULT_EXTENSION_MARKET_BASE_URL: &str =
+    "https://raw.githubusercontent.com/camthink-ai/NeoMind-Extensions";
+
+/// Effective extension-marketplace base URL.
+///
+/// Precedence: saved value (Settings → Preferences, admin) >
+/// `HERAMIND_EXTENSION_MARKET_URL` env > built-in default. The default host
+/// (`raw.githubusercontent.com`) is often unreachable from CN networks —
+/// before this existed the source was hardcoded with NO override at all,
+/// while the component market and LLM catalog both had env overrides.
+/// Mirrors follow the component-market shape:
+/// `https://ghfast.top/https://raw.githubusercontent.com/camthink-ai/...`
+pub(crate) fn extension_market_base_url() -> String {
+    let saved = heramind_storage::SettingsStore::open_default()
+        .ok()
+        .and_then(|s| s.load("extension_market_url").ok().flatten());
+    if let Some(url) = saved {
+        if let Some(clean) = normalize_market_url(&url) {
+            return clean;
+        }
+    }
+    if let Ok(url) = std::env::var("HERAMIND_EXTENSION_MARKET_URL") {
+        if let Some(clean) = normalize_market_url(&url) {
+            return clean;
+        }
+    }
+    DEFAULT_EXTENSION_MARKET_BASE_URL.to_string()
+}
+
+/// Accept an http(s) URL, trimmed of trailing slashes. Empty or non-URL
+/// values fall back to `None` (→ the built-in default).
+fn normalize_market_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if (trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+        && trimmed.len() > "https://".len()
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
 
 /// Cloud extension metadata from index
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1942,7 +2335,7 @@ pub struct MarketplaceListResponse {
 }
 
 /// Request to install an extension from marketplace
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct MarketplaceInstallRequest {
     pub id: String,
     #[serde(default)]
@@ -1965,6 +2358,14 @@ pub struct MarketplaceInstallResponse {
 /// GET /api/extensions/market/list
 ///
 /// List available extensions from the marketplace
+#[utoipa::path(
+    get,
+    path = "/api/extensions/market/list",
+    tag = "extensions",
+    responses(
+        (status = 200, description = "Marketplace catalog"),
+    )
+)]
 pub async fn list_marketplace_extensions_handler(
     State(_state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -1976,7 +2377,9 @@ pub async fn list_marketplace_extensions_handler(
         .unwrap_or(0);
     let index_url = format!(
         "{}/{}/extensions/index.json?t={}",
-        MARKET_BASE_URL, MARKET_BRANCH, cache_buster
+        extension_market_base_url().as_str(),
+        MARKET_BRANCH,
+        cache_buster
     );
 
     let client = reqwest::Client::builder()
@@ -2041,13 +2444,28 @@ pub async fn list_marketplace_extensions_handler(
 /// GET /api/extensions/market/:id
 ///
 /// Get detailed metadata for a specific extension from marketplace
+#[utoipa::path(
+    get,
+    path = "/api/extensions/market/{id}",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Marketplace listing detail"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_marketplace_extension_handler(
     State(_state): State<ServerState>,
     Path(id): Path<String>,
 ) -> HandlerResult<MarketplaceExtensionMetadata> {
+    validate_extension_id(&id)?;
     let metadata_url = format!(
         "{}/{}/extensions/{}/metadata.json",
-        MARKET_BASE_URL, MARKET_BRANCH, id
+        extension_market_base_url().as_str(),
+        MARKET_BRANCH,
+        id
     );
 
     let client = reqwest::Client::builder()
@@ -2090,13 +2508,28 @@ pub struct ExtensionReadmeResponse {
 /// Returns `{ content: null }` when the README does not exist or the fetch
 /// fails — README is optional, so this best-effort endpoint never reports a
 /// hard error (the frontend just hides the README section).
+#[utoipa::path(
+    get,
+    path = "/api/extensions/market/{id}/readme",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Marketplace listing README (markdown)"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_marketplace_extension_readme_handler(
     State(_state): State<ServerState>,
     Path(id): Path<String>,
 ) -> HandlerResult<ExtensionReadmeResponse> {
+    validate_extension_id(&id)?;
     let readme_url = format!(
         "{}/{}/extensions/{}/README.md",
-        MARKET_BASE_URL, MARKET_BRANCH, id
+        extension_market_base_url().as_str(),
+        MARKET_BRANCH,
+        id
     );
 
     let client = reqwest::Client::builder()
@@ -2294,6 +2727,15 @@ fn compute_sha256_of_file(path: &std::path::Path) -> std::io::Result<String> {
 /// POST /api/extensions/market/install
 ///
 /// Download and install an extension from the marketplace
+#[utoipa::path(
+    post,
+    path = "/api/extensions/market/install",
+    tag = "extensions",
+    request_body = MarketplaceInstallRequest,
+    responses(
+        (status = 200, description = "Marketplace extension downloaded and installed"),
+    )
+)]
 pub async fn install_marketplace_extension_handler(
     State(state): State<ServerState>,
     Json(req): Json<MarketplaceInstallRequest>,
@@ -2301,6 +2743,11 @@ pub async fn install_marketplace_extension_handler(
     let install_start = std::time::Instant::now();
     let runtime = &state.extensions.runtime;
 
+    // Same id grammar as the local endpoints: req.id is interpolated into
+    // a URL path — `../..` would turn the marketplace client into a
+    // limited arbitrary-GET gadget against whatever host the (admin-set)
+    // market base points at.
+    validate_extension_id(&req.id)?;
     tracing::info!(extension_id = %req.id, "Starting marketplace extension install");
 
     // First fetch metadata to get download URL
@@ -2311,7 +2758,10 @@ pub async fn install_marketplace_extension_handler(
         .unwrap_or(0);
     let metadata_url = format!(
         "{}/{}/extensions/{}/metadata.json?t={}",
-        MARKET_BASE_URL, MARKET_BRANCH, req.id, cache_buster
+        extension_market_base_url().as_str(),
+        MARKET_BRANCH,
+        req.id,
+        cache_buster
     );
 
     let client = reqwest::Client::builder()
@@ -2481,6 +2931,47 @@ pub async fn install_marketplace_extension_handler(
             });
         }
 
+        // The marketplace index does not carry sha256 yet (the release
+        // pipeline computes checksums but never publishes them), so the
+        // verify branch below is effectively dead for today's metadata.
+        // Surface that loudly instead of installing silently unverified, and
+        // give strict deployments a fail-closed switch.
+        let mut expected_sha256 = expected_sha256;
+        if expected_sha256.is_none() {
+            let filename = package_url.rsplit('/').next().unwrap_or("");
+            if let Some(sha) = fetch_release_checksum(&client, package_url, filename).await {
+                tracing::info!(
+                    extension_id = %req.id,
+                    "Package SHA256 sourced from the release checksums.txt"
+                );
+                expected_sha256 = Some(sha);
+            }
+        }
+        if expected_sha256.is_none() {
+            let strict = std::env::var("HERAMIND_STRICT_PACKAGE_SHA256")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if strict {
+                let _ = std::fs::remove_file(&tmp_path);
+                return ok(MarketplaceInstallResponse {
+                    success: false,
+                    extension_id: req.id.clone(),
+                    downloaded: true,
+                    installed: false,
+                    path: None,
+                    error: Some(
+                        "Marketplace metadata carries no sha256 and HERAMIND_STRICT_PACKAGE_SHA256 is enabled — refusing to install an unverified package"
+                            .to_string(),
+                    ),
+                });
+            }
+            tracing::warn!(
+                extension_id = %req.id,
+                url = %package_url,
+                "Marketplace metadata carries no sha256 — integrity check skipped (set HERAMIND_STRICT_PACKAGE_SHA256=1 to refuse unverified packages)"
+            );
+        }
+
         // Verify SHA256 when the marketplace metadata provides one. Defends
         // against CDN/transport corruption or a swapped package being loaded
         // into the process via dlopen. The legacy binary branch already does
@@ -2504,17 +2995,26 @@ pub async fn install_marketplace_extension_handler(
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    // Fail CLOSED: the whole point of the pinned sha is that
+                    // an unverifiable artifact never reaches dlopen. A read
+                    // error means we cannot prove integrity — refuse.
+                    tracing::error!(
                         extension_id = %req.id,
                         error = %e,
-                        "Failed to compute package SHA256; skipping verification"
+                        "Failed to compute package SHA256 — refusing to install"
                     );
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(ErrorResponse::internal(format!(
+                        "Failed to verify package integrity (sha256 read error: {e}) — install aborted"
+                    )));
                 }
             }
         }
 
         // Prepare target directory
-        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+        let data_dir = heramind_core::paths::data_dir()
+            .to_string_lossy()
+            .to_string();
         let target_dir = PathBuf::from(data_dir).join("extensions");
 
         // Install from the temp file — streams the ZIP from disk, not memory.
@@ -2571,9 +3071,18 @@ pub async fn install_marketplace_extension_handler(
                             .unwrap_or("native")
                             .to_string();
 
-                        // Save to storage
-                        if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
-                            let record = ExtensionRecord::new(
+                        // Save to storage. An upgrade/reinstall overwrites the
+                        // whole row — carry the previous user config (YOLO
+                        // thresholds, bindings, …) into the new record so it
+                        // survives, instead of resetting to defaults.
+                        let store = state.extensions.store.clone();
+                        let preserved_config = store
+                            .load(&ext_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|old| old.config.clone());
+                        {
+                            let mut record = ExtensionRecord::new(
                                 ext_id.clone(),
                                 ext_metadata.name.clone(),
                                 result.binary_path.to_string_lossy().to_string(),
@@ -2590,6 +3099,9 @@ pub async fn install_marketplace_extension_handler(
                                     .as_ref()
                                     .map(|p| p.to_string_lossy().to_string()),
                             );
+                            if let Some(cfg) = preserved_config.clone() {
+                                record = record.with_config(cfg);
+                            }
 
                             if let Err(e) = store.save(&record) {
                                 tracing::warn!("Failed to save extension to storage: {}", e);
@@ -2598,6 +3110,25 @@ pub async fn install_marketplace_extension_handler(
 
                         // Rebuild tool registry so the new extension's tools are visible to the LLM
                         state.refresh_extension_tools().await;
+
+                        // Push the preserved config to the freshly-started
+                        // runtime — without this the running process stays on
+                        // defaults until the next restart (same gap the reload
+                        // path closes with its send_config_update).
+                        if let Some(cfg) = preserved_config {
+                            if let Err(e) = state
+                                .extensions
+                                .runtime
+                                .send_config_update(&ext_id, &cfg)
+                                .await
+                            {
+                                tracing::warn!(
+                                    extension_id = %ext_id,
+                                    error = %e,
+                                    "Failed to apply preserved config after market upgrade"
+                                );
+                            }
+                        }
 
                         ok(MarketplaceInstallResponse {
                             success: true,
@@ -2742,7 +3273,9 @@ pub async fn install_marketplace_extension_handler(
         };
 
         // Create extensions directory using HERAMIND_DATA_DIR for consistency
-        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+        let data_dir = heramind_core::paths::data_dir()
+            .to_string_lossy()
+            .to_string();
         let extensions_dir = PathBuf::from(data_dir).join("extensions");
 
         std::fs::create_dir_all(&extensions_dir).map_err(|e| {
@@ -2833,7 +3366,8 @@ pub async fn install_marketplace_extension_handler(
         match runtime.load(&file_path).await {
             Ok(_) => {
                 // Save to persistent storage
-                if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+                let store = state.extensions.store.clone();
+                {
                     let record = ExtensionRecord::new(
                         metadata.id.clone(),
                         metadata.name.clone(),
@@ -2887,6 +3421,14 @@ pub async fn install_marketplace_extension_handler(
 /// GET /api/extensions/market/updates
 ///
 /// Check for updates for installed extensions
+#[utoipa::path(
+    get,
+    path = "/api/extensions/market/updates",
+    tag = "extensions",
+    responses(
+        (status = 200, description = "Available updates for installed extensions"),
+    )
+)]
 pub async fn check_marketplace_updates_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -2901,7 +3443,9 @@ pub async fn check_marketplace_updates_handler(
         // Fetch metadata from marketplace
         let metadata_url = format!(
             "{}/{}/extensions/{}/metadata.json",
-            MARKET_BASE_URL, MARKET_BRANCH, ext_id
+            extension_market_base_url().as_str(),
+            MARKET_BRANCH,
+            ext_id
         );
 
         let client = reqwest::Client::builder()
@@ -2917,8 +3461,19 @@ pub async fn check_marketplace_updates_handler(
             {
                 if response.status().is_success() {
                     if let Ok(metadata) = response.json::<MarketplaceExtensionMetadata>().await {
-                        // Compare versions (simple string comparison for now)
-                        if metadata.version != ext_info.metadata.version {
+                        // Semver comparison, and only upgrades count. The old
+                        // string `!=` flagged downgrades and build-suffix
+                        // mismatches as "updates" — combined with extensions
+                        // that hardcoded their version, some entries showed a
+                        // permanent false "update available".
+                        let newer = matches!(
+                            (
+                                metadata.version.parse::<semver::Version>(),
+                                ext_info.metadata.version.parse::<semver::Version>(),
+                            ),
+                            (Ok(new), Ok(cur)) if new > cur
+                        );
+                        if newer {
                             updates.push(serde_json::json!({
                                 "id": ext_id,
                                 "name": ext_info.metadata.name,
@@ -2946,6 +3501,18 @@ pub async fn check_marketplace_updates_handler(
 /// GET /api/extensions/:id/config
 ///
 /// Get the configuration schema and current values for an extension.
+#[utoipa::path(
+    get,
+    path = "/api/extensions/{id}/config",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Extension config panel values"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_extension_config_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -2959,12 +3526,13 @@ pub async fn get_extension_config_handler(
         .ok_or_else(|| ErrorResponse::not_found(format!("Extension {}", id)))?;
 
     // Get current config from storage
-    let current_config: Option<serde_json::Value> =
-        if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
-            store.load(&id).ok().flatten().and_then(|r| r.config)
-        } else {
-            None
-        };
+    let current_config: Option<serde_json::Value> = state
+        .extensions
+        .store
+        .load(&id)
+        .ok()
+        .flatten()
+        .and_then(|r| r.config);
 
     // Build config schema from extension metadata
     let config_schema = if let Some(config_params) = &ext_info.metadata.config_parameters {
@@ -2988,6 +3556,19 @@ pub async fn get_extension_config_handler(
 ///
 /// Note: This updates the stored configuration. The extension will need to be
 /// reloaded for the new configuration to take effect.
+#[utoipa::path(
+    put,
+    path = "/api/extensions/{id}/config",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Config panel values saved"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_extension_config_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -3008,7 +3589,8 @@ pub async fn update_extension_config_handler(
     }
 
     // Save config to storage
-    if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+    let store = state.extensions.store.clone();
+    {
         if let Ok(Some(mut record)) = store.load(&id) {
             record.config = Some(config.clone());
             store.save(&record)?;
@@ -3064,6 +3646,18 @@ pub async fn update_extension_config_handler(
 /// Uses the unified extension service which handles both native and WASM extensions
 /// via process isolation.
 #[axum::debug_handler]
+#[utoipa::path(
+    post,
+    path = "/api/extensions/{id}/reload",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Extension reloaded from disk"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn reload_extension_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -3079,12 +3673,13 @@ pub async fn reload_extension_handler(
     let file_path = ext_info.path.clone();
 
     // Get current config
-    let config: Option<serde_json::Value> =
-        if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
-            store.load(&id).ok().flatten().and_then(|r| r.config)
-        } else {
-            None
-        };
+    let config: Option<serde_json::Value> = state
+        .extensions
+        .store
+        .load(&id)
+        .ok()
+        .flatten()
+        .and_then(|r| r.config);
 
     // Unload the extension
     runtime
@@ -3099,7 +3694,8 @@ pub async fn reload_extension_handler(
         match runtime.load(path).await {
             Ok(metadata) => {
                 // Clear error status on successful reload
-                if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+                let store = state.extensions.store.clone();
+                {
                     if let Ok(Some(mut record)) = store.load(&id) {
                         record.health_status = "ok".to_string();
                         record.last_error = None;
@@ -3142,7 +3738,8 @@ pub async fn reload_extension_handler(
             }
             Err(e) => {
                 // Record the reload failure in storage so the UI shows Error state
-                if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+                let store = state.extensions.store.clone();
+                {
                     let _ = store.update_error_status(&id, &format!("Reload failed: {}", e));
                 }
                 return Err(ErrorResponse::internal(format!(
@@ -3528,6 +4125,18 @@ pub struct FrontendConfigDef {
 
 /// GET /api/extensions/:id/components
 /// Get dashboard components provided by an extension.
+#[utoipa::path(
+    get,
+    path = "/api/extensions/{id}/components",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Frontend components contributed by an extension"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_extension_components_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -3553,13 +4162,15 @@ pub async fn get_extension_components_handler(
 }
 
 /// Load dashboard components from extension manifest.
-fn load_extension_components(
+pub(crate) fn load_extension_components(
     // Log path configuration for debugging
     extension_id: &str,
     file_path: Option<&std::path::PathBuf>,
 ) -> Option<Vec<DashboardComponentDto>> {
     // Log path configuration for debugging
-    let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let data_dir = heramind_core::paths::data_dir()
+        .to_string_lossy()
+        .to_string();
     tracing::debug!(
         extension_id = %extension_id,
         data_dir = %data_dir,
@@ -3571,7 +4182,9 @@ fn load_extension_components(
         fp.clone()
     } else {
         // Try to find extension in data/extensions directory
-        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+        let data_dir = heramind_core::paths::data_dir()
+            .to_string_lossy()
+            .to_string();
         std::path::PathBuf::from(data_dir)
             .join("extensions")
             .join(extension_id)
@@ -3744,14 +4357,24 @@ pub async fn serve_extension_asset_handler(
     use axum::body::Body;
     use axum::http::{header, StatusCode};
 
-    // Prevent directory traversal via id or asset_path
+    // Prevent directory traversal AND absolute-path escape via asset_path.
+    // `PathBuf::join` REPLACES the base when the argument is absolute — an
+    // asset_path of "/etc/passwd" (no ".." anywhere) sailed through the old
+    // check and served the file. Reject absolute paths, dot segments, and
+    // verify the resolved file stays inside the extension dir.
     validate_extension_id(&id)?;
-    if asset_path.contains("..") {
+    if asset_path.contains("..")
+        || asset_path.starts_with('/')
+        || asset_path.starts_with('\\')
+        || asset_path.split('/').any(|seg| seg == ".")
+    {
         return Err(ErrorResponse::bad_request("Invalid asset path"));
     }
 
     // Extension directory is always data/extensions/{id}
-    let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let data_dir = heramind_core::paths::data_dir()
+        .to_string_lossy()
+        .to_string();
     let ext_dir = std::path::PathBuf::from(data_dir)
         .join("extensions")
         .join(&id);
@@ -3761,6 +4384,16 @@ pub async fn serve_extension_asset_handler(
     // Check if file exists
     if !asset_file.exists() {
         return Err(ErrorResponse::not_found("Asset not found"));
+    }
+    // Belt-and-suspenders: the resolved file MUST live under the extension
+    // dir (canonicalized comparison defeats every remaining join trick).
+    if let (Ok(real_file), Ok(real_dir)) = (
+        std::fs::canonicalize(&asset_file),
+        std::fs::canonicalize(&ext_dir),
+    ) {
+        if !real_file.starts_with(&real_dir) {
+            return Err(ErrorResponse::bad_request("Invalid asset path"));
+        }
     }
 
     // Read file content
@@ -3813,6 +4446,14 @@ pub async fn serve_extension_asset_handler(
 ///
 /// This endpoint only returns components from extensions that are currently registered.
 /// When an extension is unregistered, its components will no longer appear.
+#[utoipa::path(
+    get,
+    path = "/api/extensions/dashboard-components",
+    tag = "extensions",
+    responses(
+        (status = 200, description = "Dashboard components contributed by every extension"),
+    )
+)]
 pub async fn get_all_dashboard_components_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<Vec<DashboardComponentDto>> {
@@ -3839,14 +4480,7 @@ pub async fn upload_extension_package_handler(
 ) -> HandlerResult<serde_json::Value> {
     use heramind_core::extension::package::ExtensionPackage;
 
-    let file_path = PathBuf::from(&req.file_path);
-
-    if !file_path.exists() {
-        return Err(ErrorResponse::not_found(format!(
-            "Package file not found: {}",
-            req.file_path
-        )));
-    }
+    let file_path = resolve_confined_package_path(&req.file_path)?;
 
     // Load the package
     let package = ExtensionPackage::load(&file_path)
@@ -3879,7 +4513,9 @@ pub async fn upload_extension_package_handler(
     }
 
     // Install the package
-    let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let data_dir = heramind_core::paths::data_dir()
+        .to_string_lossy()
+        .to_string();
     let target_dir = PathBuf::from(data_dir).join("extensions");
 
     let install_result = package
@@ -3903,7 +4539,8 @@ pub async fn upload_extension_package_handler(
         .map_err(|e| ErrorResponse::internal(format!("Failed to load extension binary: {}", e)))?;
 
     // Save to storage
-    if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+    let store = state.extensions.store.clone();
+    {
         let record = ExtensionRecord::new(
             ext_id.clone(),
             name.clone(),
@@ -3961,14 +4598,7 @@ pub async fn validate_extension_package_handler(
 ) -> HandlerResult<serde_json::Value> {
     use heramind_core::extension::package::ExtensionPackage;
 
-    let file_path = PathBuf::from(&req.file_path);
-
-    if !file_path.exists() {
-        return Err(ErrorResponse::not_found(format!(
-            "Package file not found: {}",
-            req.file_path
-        )));
-    }
+    let file_path = resolve_confined_package_path(&req.file_path)?;
 
     let package = ExtensionPackage::load(&file_path)
         .await
@@ -4019,6 +4649,18 @@ pub struct ValidatePackageRequest {
 
 /// DELETE /api/extensions/:id/uninstall
 /// Completely uninstall an extension (remove all files).
+#[utoipa::path(
+    delete,
+    path = "/api/extensions/{id}/uninstall",
+    tag = "extensions",
+    params(
+        ("id" = String, Path, description = "Extension id"),
+    ),
+    responses(
+        (status = 200, description = "Extension uninstalled and files removed"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn uninstall_extension_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -4041,23 +4683,50 @@ pub async fn uninstall_extension_handler(
     }
 
     // Mark as uninstalled in storage
-    if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+    let store = state.extensions.store.clone();
+    {
         if let Err(e) = store.mark_uninstalled(&id) {
             tracing::warn!("Failed to mark extension as uninstalled: {}", e);
         }
     }
 
     // Clean up extension directory
-    let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let data_dir = heramind_core::paths::data_dir()
+        .to_string_lossy()
+        .to_string();
     let extensions_dir = PathBuf::from(data_dir).join("extensions");
     let ext_dir = extensions_dir.join(&id);
 
     let mut removed_files = Vec::new();
     if ext_dir.exists() {
-        tracing::info!("Removing extension directory: {}", ext_dir.display());
-        tokio::fs::remove_dir_all(&ext_dir).await.map_err(|e| {
-            ErrorResponse::internal(format!("Failed to remove extension directory: {}", e))
+        tracing::info!(
+            "Removing extension directory (data/ preserved): {}",
+            ext_dir.display()
+        );
+        // Preserve the platform-guaranteed private `data/` subdir — it holds
+        // user state (pipelines, face libraries, licenses) that must survive
+        // uninstall; everything else (package files) goes.
+        let preserved_data_dir = ext_dir.join("data");
+        let mut entries = tokio::fs::read_dir(&ext_dir).await.map_err(|e| {
+            ErrorResponse::internal(format!("Failed to read extension directory: {}", e))
         })?;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            ErrorResponse::internal(format!("Failed to read extension directory: {}", e))
+        })? {
+            let path = entry.path();
+            if path == preserved_data_dir {
+                continue;
+            }
+            if path.is_dir() {
+                tokio::fs::remove_dir_all(&path).await.map_err(|e| {
+                    ErrorResponse::internal(format!("Failed to remove extension directory: {}", e))
+                })?;
+            } else {
+                tokio::fs::remove_file(&path).await.map_err(|e| {
+                    ErrorResponse::internal(format!("Failed to remove extension file: {}", e))
+                })?;
+            }
+        }
         removed_files.push(ext_dir.to_string_lossy().to_string());
     }
 
@@ -4097,7 +4766,7 @@ pub async fn uninstall_extension_handler(
 ///   -H "Content-Type: application/json" \
 ///   -d "{\"data\": \"$BASE64_DATA\"}"
 /// ```
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct UploadExtensionFileRequest {
     /// Base64-encoded .nep file data
     pub data: String,
@@ -4106,6 +4775,15 @@ pub struct UploadExtensionFileRequest {
 }
 
 #[axum::debug_handler]
+#[utoipa::path(
+    post,
+    path = "/api/extensions/upload/file",
+    tag = "extensions",
+    request_body = UploadExtensionFileRequest,
+    responses(
+        (status = 200, description = "Package file accepted for staging (100MB limit)"),
+    )
+)]
 pub async fn upload_extension_file_handler(
     State(state): State<ServerState>,
     Json(req): Json<UploadExtensionFileRequest>,
@@ -4151,7 +4829,9 @@ pub async fn upload_extension_file_handler(
     }
 
     // Prepare target directory
-    let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let data_dir = heramind_core::paths::data_dir()
+        .to_string_lossy()
+        .to_string();
     let target_dir = PathBuf::from(data_dir).join("extensions");
 
     // Step 1: Parse the package to get extension ID (validation only, no install yet)
@@ -4234,7 +4914,8 @@ pub async fn upload_extension_file_handler(
         .to_string();
 
     // Save to storage
-    if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+    let store = state.extensions.store.clone();
+    {
         let record = ExtensionRecord::new(
             ext_id.clone(),
             metadata.name.clone(),
@@ -4288,21 +4969,130 @@ pub async fn upload_extension_file_handler(
 /// POST /api/extensions/sync
 ///
 /// Manually trigger extension synchronization from /extensions/ directory.
+/// Register an on-disk-installed extension with the runtime: unregister the
+/// old instance if any, load the binary, and upsert the ExtensionRecord
+/// carrying the previous user config forward (same contract as the
+/// marketplace install path). Shared by the sync handler and the startup
+/// cache scan so they can't drift apart again.
+pub(crate) async fn register_installed_package(
+    state: &ServerState,
+    pkg: &crate::server::install_service::InstalledPackage,
+) -> Result<(), String> {
+    let runtime = state.extensions.runtime.clone();
+
+    // Replace a registered instance (mirrors the marketplace flow). An
+    // unregister failure is fatal there; here we propagate the error too —
+    // a half-replaced extension is worse than a reported failure.
+    if runtime.contains(&pkg.extension_id).await {
+        runtime
+            .unregister(&pkg.extension_id)
+            .await
+            .map_err(|e| format!("failed to unregister old instance: {e}"))?;
+    }
+
+    let metadata = runtime
+        .load(&pkg.binary_path)
+        .await
+        .map_err(|e| format!("failed to load extension: {e}"))?;
+
+    let extension_type = pkg
+        .binary_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| if e == "wasm" { "wasm" } else { "native" })
+        .unwrap_or("native")
+        .to_string();
+
+    let store = state.extensions.store.clone();
+    let preserved_config = store
+        .load(&pkg.extension_id)
+        .ok()
+        .flatten()
+        .and_then(|old| old.config.clone());
+    {
+        let mut record = ExtensionRecord::new(
+            pkg.extension_id.clone(),
+            metadata.name.clone(),
+            pkg.binary_path.to_string_lossy().to_string(),
+            extension_type,
+            pkg.version.clone(),
+        )
+        .with_description(metadata.description.clone())
+        .with_author(metadata.author.clone())
+        .with_checksum(Some(pkg.checksum.clone()))
+        .with_auto_start(true)
+        .with_frontend_path(
+            pkg.frontend_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+        );
+        if let Some(cfg) = preserved_config.clone() {
+            record = record.with_config(cfg);
+        }
+        if let Err(e) = store.save(&record) {
+            tracing::warn!(
+                extension_id = %pkg.extension_id,
+                error = %e,
+                "Failed to save extension record after sync install"
+            );
+        }
+    }
+
+    state.refresh_extension_tools().await;
+
+    if let Some(cfg) = preserved_config {
+        if let Err(e) = runtime.send_config_update(&pkg.extension_id, &cfg).await {
+            tracing::warn!(
+                extension_id = %pkg.extension_id,
+                error = %e,
+                "Failed to apply preserved config after sync install"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/extensions/sync",
+    tag = "extensions",
+    responses(
+        (status = 200, description = "Extensions directory re-scanned"),
+    )
+)]
 pub async fn sync_extensions_handler(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
     use crate::server::ExtensionInstallService;
 
-    let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
-    let install_dir = std::path::PathBuf::from(data_dir).join("extensions");
-    let nep_cache_dir = std::path::PathBuf::from("extensions");
-
-    let install_service = ExtensionInstallService::new(&install_dir, &nep_cache_dir);
+    let data_dir = heramind_core::paths::data_dir()
+        .to_string_lossy()
+        .to_string();
+    let extensions_dir = std::path::PathBuf::from(&data_dir).join("extensions");
+    // The cache IS the extensions dir: the marketplace download path already
+    // drops .nep files there. (This used to scan a CWD-relative "extensions/"
+    // that had nothing to do with the data dir.)
+    let install_service = ExtensionInstallService::new(&extensions_dir, &extensions_dir);
 
     let report = install_service
         .sync_nep_cache()
         .await
         .map_err(|e| ErrorResponse::internal(format!("Sync failed: {}", e)))?;
+
+    // Disk install is only half the job — register what changed. This sync
+    // used to report "installed: N" while doing neither half.
+    let mut registered = 0usize;
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+    for pkg in &report.installed_packages {
+        match register_installed_package(&state, pkg).await {
+            Ok(()) => registered += 1,
+            Err(e) => errors.push(serde_json::json!({
+                "extension_id": pkg.extension_id,
+                "error": e,
+            })),
+        }
+    }
 
     ok(serde_json::json!({
         "message": "Extensions synchronized",
@@ -4310,17 +5100,30 @@ pub async fn sync_extensions_handler(
         "installed": report.installed,
         "upgraded": report.upgraded,
         "skipped": report.skipped,
+        "failed": report.failed,
+        "registered": registered,
+        "errors": errors,
     }))
 }
 
 /// GET /api/extensions/sync-status
+#[utoipa::path(
+    get,
+    path = "/api/extensions/sync-status",
+    tag = "extensions",
+    responses(
+        (status = 200, description = "Last sync result"),
+    )
+)]
 pub async fn get_sync_status_handler(
     State(_state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
     use heramind_core::extension::package::ExtensionPackage;
 
     let nep_cache_dir = std::path::PathBuf::from("extensions");
-    let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let data_dir = heramind_core::paths::data_dir()
+        .to_string_lossy()
+        .to_string();
     let install_dir = std::path::PathBuf::from(data_dir).join("extensions");
 
     let mut nep_packages = Vec::new();

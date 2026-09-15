@@ -3,7 +3,6 @@ import { useTranslation } from 'react-i18next'
 import { useErrorHandler } from '@/hooks/useErrorHandler'
 import { showErrorToast } from '@/lib/error-messages'
 import {
-  ArrowLeft,
   Server,
   Edit,
   Trash2,
@@ -33,7 +32,15 @@ import {
   DialogTitle,
   DialogContentBody,
 } from '@/components/ui/dialog'
-import { EmptyState, LoadingState } from '@/components/shared'
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { EmptyState, LoadingState, ListToolbar } from '@/components/shared'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { useServerUrl } from '@/lib/server-url'
@@ -42,6 +49,7 @@ import { EmbeddedBrokerConfigDialog } from './EmbeddedBrokerConfigDialog'
 import type { PluginConfigSchema, AdapterType } from '@/types'
 import { useToast } from '@/hooks/use-toast'
 import { ADAPTER_TYPES } from '@/constants/deviceAdapters'
+import { copyToClipboard } from '@/lib/clipboard'
 
 // Icon mapping for adapter types
 const ICON_MAP: Record<string, LucideIcon> = {
@@ -111,10 +119,15 @@ const getAdapterSchema = (adapterType: string): PluginConfigSchema => {
             description: 'Extra custom topics to subscribe (one per line). System topics (device/+/+/uplink, device/+/+/downlink) are always auto-subscribed. Wildcards: + matches single level, # matches all levels (must be last).',
             default: ['device/#'],
           },
+          device_id_field: {
+            type: 'string',
+            format: 'multiline',
+            description: 'Payload fields used as the device identity when auto-discovery cannot uniquely identify a device from the topic (e.g. a gateway forwarding many devices on one topic). One field name per line, tried in order. Leave empty to auto-detect common fields (device_id, sn, mac, ...).',
+          },
         },
         required: ['broker'],
         ui_hints: {
-          field_order: ['broker', 'port', 'username', 'password', 'client_id', 'tls', 'ca_cert', 'client_cert', 'client_key', 'subscribe_topics'],
+          field_order: ['broker', 'port', 'username', 'password', 'client_id', 'tls', 'ca_cert', 'client_cert', 'client_key', 'subscribe_topics', 'device_id_field'],
           display_names: {
             broker: 'Broker Address',
             port: 'Port',
@@ -126,12 +139,14 @@ const getAdapterSchema = (adapterType: string): PluginConfigSchema => {
             client_key: 'Client Private Key',
             client_id: 'Client ID',
             subscribe_topics: 'Subscribe Topics',
+            device_id_field: 'Device ID Field (payload)',
           },
           placeholders: {
             ca_cert: '-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----',
             client_cert: '-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----',
             client_key: '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----',
             client_id: 'Auto-generated if empty',
+            device_id_field: 'device_id\nsn\nmac',
           },
           help_texts: {
             ca_cert: 'Required for self-signed or private CA certificates. Leave empty for public CAs.',
@@ -139,6 +154,7 @@ const getAdapterSchema = (adapterType: string): PluginConfigSchema => {
             client_key: 'Required for mutual TLS (mTLS) authentication.',
             client_id: 'Unique identifier for this MQTT connection. Auto-generated if not specified.',
             subscribe_topics: 'System auto-subscribes: device/+/+/uplink, device/+/+/downlink. Add extra custom topics here.',
+            device_id_field: 'For gateways that forward many devices on one topic: these payload fields carry each device\'s unique id. One field name per line, tried in order. Leave empty to auto-detect common fields (device_id, sn, mac, ...).',
           },
           visibility_rules: [
             {
@@ -228,7 +244,7 @@ function WebhookTokenDisplay({ token }: { token?: string }) {
         size="sm"
         className="h-6 w-6 p-0 shrink-0"
         onClick={async () => {
-          await navigator.clipboard.writeText(token)
+          await copyToClipboard(token)
           setCopied(true)
           toast({ title: t('devices:add.webhookTokenCopied') })
           setTimeout(() => setCopied(false), 2000)
@@ -342,7 +358,7 @@ export function UnifiedDeviceConnectionsTab() {
 
   const copyWebhookUrl = async () => {
     const url = getWebhookUrl()
-    await navigator.clipboard.writeText(url)
+    await copyToClipboard(url)
     setWebhookUrlCopied(true)
     toast({
       title: 'Webhook URL copied to clipboard',
@@ -511,7 +527,7 @@ export function UnifiedDeviceConnectionsTab() {
     return (
       <>
         {/* Connection Type Cards Grid - Dynamically loaded */}
-        <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        <div className="grid gap-4 grid-cols-[repeat(auto-fill,minmax(max(25%_-_1rem,260px),1fr))]">
           {adapterTypes.map((type) => {
             const isActive = getConnectionStatus(type.id)
             const deviceCount = getDeviceCount(type.id)
@@ -521,30 +537,31 @@ export function UnifiedDeviceConnectionsTab() {
               <Card
                 key={type.id}
                 className={cn(
-                  "cursor-pointer transition-all duration-200 hover:shadow-md",
+                  "cursor-pointer transition-all duration-normal hover:shadow-md",
                   isActive && "border-success border-2"
                 )}
                 onClick={() => handleTypeSelect(type.id)}
               >
-                <CardHeader className="pb-3">
-                  <div className={cn("flex items-center justify-center w-12 h-12 rounded-lg", type.icon_bg)}>
-                    <IconComponent className="h-6 w-6" />
+                <CardContent className="p-4">
+                  <div className="flex items-start gap-3">
+                    <div className={cn("flex items-center justify-center h-10 w-10 rounded-lg shrink-0", type.icon_bg)}>
+                      <IconComponent className="h-5 w-5" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <CardTitle className="text-base truncate min-w-0">{type.name}</CardTitle>
+                        <span className={cn("text-xs font-medium shrink-0", isActive ? "text-success" : "text-muted-foreground")}>
+                          {isActive ? t('plugins:llm.running') : t('plugins:llm.notConfigured')}
+                        </span>
+                      </div>
+                      <CardDescription className="mt-1 text-xs line-clamp-1">
+                        {type.description}
+                      </CardDescription>
+                    </div>
                   </div>
-                  <CardTitle className="text-base mt-3">{type.name}</CardTitle>
-                  <CardDescription className="mt-1 text-xs line-clamp-2 min-h-[2.5em]">
-                    {type.description}
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="text-sm">
-                  <div className="flex justify-between items-center">
-                    <span className="text-muted-foreground">{t('plugins:llm.status')}:</span>
-                    <span className={isActive ? "text-success dark:text-success font-medium" : "text-muted-foreground font-medium"}>
-                      {isActive ? t('plugins:llm.running') : t('plugins:llm.notConfigured')}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center mt-2">
-                    <span className="text-muted-foreground">{t('plugins:llm.devices')}:</span>
-                    <span className="font-medium">{deviceCount}</span>
+                  <div className="mt-3 flex items-center justify-between text-xs">
+                    <span className="text-muted-foreground">{t('plugins:llm.devices')}</span>
+                    <span className="font-medium text-foreground">{deviceCount}</span>
                   </div>
                 </CardContent>
               </Card>
@@ -565,24 +582,16 @@ export function UnifiedDeviceConnectionsTab() {
 
       return (
         <>
-          {/* Header with back button — sticky. ::before pseudo-element fills
-              the scroll container's pt-2 top padding on mobile so scrolled
-              instances don't bleed through. (-mt-2 doesn't work with sticky.) */}
-          <div className="sticky top-0 z-10 -mx-4 sm:-mx-6 md:-mx-8 px-4 sm:px-6 md:px-8 pb-2 bg-background flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 mb-4 before:content-[''] before:absolute before:inset-x-0 before:-top-2 before:h-2 before:bg-background md:before:hidden">
-            <Button variant="ghost" size="sm" onClick={() => setView('list')} className="gap-1 self-start -ml-2">
-              <ArrowLeft className="h-4 w-4" />
-              {t('plugins:llm.back')}
-            </Button>
-            <div className="flex items-center gap-3">
-              <div className={cn("flex items-center justify-center w-10 sm:w-12 h-10 sm:h-12 rounded-lg shrink-0", adapterType?.icon_bg)}>
-                <IconComponent className="h-5 w-5 sm:h-6 sm:w-6" />
-              </div>
-              <div className="min-w-0">
-                <h2 className="text-lg sm:text-2xl font-bold truncate">{adapterType?.name}</h2>
-                <p className="text-sm text-muted-foreground line-clamp-2">{adapterType?.description}</p>
-              </div>
-            </div>
-          </div>
+          {/* Header with back button — sticky (see shared ListToolbar). */}
+          <ListToolbar
+            onBack={() => setView('list')}
+            backLabel={t('plugins:llm.back')}
+            icon={<IconComponent className="h-5 w-5 sm:h-6 sm:w-6" />}
+            iconBg={adapterType?.icon_bg || ""}
+            title={adapterType?.name || ""}
+            description={adapterType?.description}
+            responsiveIcon
+          />
 
           {/* Webhook Info Card */}
           <Card className="mb-6">
@@ -619,7 +628,7 @@ export function UnifiedDeviceConnectionsTab() {
               {/* Request Format */}
               <div className="space-y-2">
                 <Label>Request Format</Label>
-                <div className="rounded-lg bg-muted p-3 sm:p-4 -mx-1 sm:mx-0">
+                <div className="rounded-lg p-3 sm:p-4 -mx-1 sm:mx-0">
                   <pre className="text-xs sm:text-sm overflow-x-auto whitespace-pre">
 {`POST ${getWebhookUrl()}
 
@@ -638,7 +647,7 @@ export function UnifiedDeviceConnectionsTab() {
               {/* Response Format */}
               <div className="space-y-2">
                 <Label>Response Format</Label>
-                <div className="rounded-lg bg-muted p-3 sm:p-4 -mx-1 sm:mx-0">
+                <div className="rounded-lg p-3 sm:p-4 -mx-1 sm:mx-0">
                   <pre className="text-xs sm:text-sm overflow-x-auto whitespace-pre">
 {`{
   "success": true,
@@ -685,7 +694,7 @@ export function UnifiedDeviceConnectionsTab() {
               <div className="space-y-2">
                 <Label>{t('devices:add.webhookAuthHeader')}</Label>
                 <p className="text-xs text-muted-foreground">{t('devices:add.webhookAuthDesc')}</p>
-                <div className="rounded-lg bg-muted p-3 sm:p-4 -mx-1 sm:mx-0 space-y-2">
+                <div className="rounded-lg p-3 sm:p-4 -mx-1 sm:mx-0 space-y-2">
                   <div>
                     <span className="text-xs font-medium">Authorization Header:</span>
                     <pre className="text-xs font-mono">Authorization: Bearer {'<token>'}</pre>
@@ -736,24 +745,15 @@ export function UnifiedDeviceConnectionsTab() {
 
     return (
       <>
-        {/* Header with back button — sticky. ::before pseudo-element fills
-            the scroll container's pt-2 top padding on mobile so scrolled
-            instances don't bleed through. (-mt-2 doesn't work with sticky.) */}
-        <div className="sticky top-0 z-10 -mx-4 sm:-mx-6 md:-mx-8 px-4 sm:px-6 md:px-8 pb-2 bg-background flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 mb-4 before:content-[''] before:absolute before:inset-x-0 before:-top-2 before:h-2 before:bg-background md:before:hidden">
-          <Button variant="ghost" size="sm" onClick={() => setView('list')} className="gap-1 self-start -ml-2">
-            <ArrowLeft className="h-4 w-4" />
-            {t('plugins:llm.back')}
-          </Button>
-          <div className="flex items-center gap-3">
-            <div className={cn("flex items-center justify-center w-10 h-10 rounded-lg shrink-0", adapterType?.icon_bg)}>
-              <IconComponent className="h-6 w-6" />
-            </div>
-            <div className="min-w-0">
-              <h2 className="text-lg sm:text-2xl font-bold truncate">{adapterType?.name}</h2>
-              <p className="text-sm text-muted-foreground line-clamp-2">{adapterType?.description}</p>
-            </div>
-          </div>
-        </div>
+        {/* Header with back button — sticky (see shared ListToolbar). */}
+        <ListToolbar
+          onBack={() => setView('list')}
+          backLabel={t('plugins:llm.back')}
+          icon={<IconComponent className="h-6 w-6" />}
+          iconBg={adapterType?.icon_bg || ""}
+          title={adapterType?.name || ""}
+          description={adapterType?.description}
+        />
 
         {/* Instance Cards */}
         {pluginInstances.length === 0 ? (
@@ -790,7 +790,7 @@ export function UnifiedDeviceConnectionsTab() {
                 <Card
                   key={instance.id}
                   className={cn(
-                    "transition-all duration-200 hover:shadow-md",
+                    "transition-all duration-normal hover:shadow-md",
                     instance.running && "border-success"
                   )}
                 >
@@ -957,27 +957,27 @@ export function UnifiedDeviceConnectionsTab() {
         />
 
         {/* Delete Confirmation Dialog */}
-        <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
-          <DialogContent className="sm:max-w-md z-[200]">
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2">
+        <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+          <AlertDialogContent className="sm:max-w-md z-[200]">
+            <AlertDialogHeader>
+              <AlertDialogTitle className="flex items-center gap-2">
                 <AlertTriangle className="h-5 w-5 text-error" />
                 {t('plugins:deleteConfirmTitle', { defaultValue: 'Delete Broker?' })}
-              </DialogTitle>
-              <DialogDescription>
+              </AlertDialogTitle>
+              <AlertDialogDescription>
                 {t('plugins:deleteConfirmDesc', {
                   defaultValue: 'Are you sure you want to delete "{{name}}"? This action cannot be undone.',
                   name: instanceToDelete?.name || ''
                 })}
-              </DialogDescription>
-            </DialogHeader>
+              </AlertDialogDescription>
+            </AlertDialogHeader>
 
             <DialogContentBody className="px-4 pt-6 pb-4 sm:px-6">
               <p className="text-sm text-muted-foreground">
                 {t('plugins:deleteWarning', { defaultValue: 'This action cannot be undone.' })}
               </p>
             </DialogContentBody>
-            <DialogFooter>
+            <AlertDialogFooter>
               <Button
                 variant="outline"
                 onClick={() => setDeleteDialogOpen(false)}
@@ -999,9 +999,9 @@ export function UnifiedDeviceConnectionsTab() {
                   t('plugins:delete', { defaultValue: 'Delete' })
                 )}
               </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </>
     )
   }

@@ -163,7 +163,7 @@ impl Default for SchedulerConfig {
             tick_interval_ms: 1000, // Check every second
             max_concurrent: 10,
             max_concurrent_per_backend: 2,
-            default_timezone: Some("Asia/Shanghai".to_string()),
+            default_timezone: Some(heramind_storage::DEFAULT_GLOBAL_TIMEZONE.to_string()),
         }
     }
 }
@@ -174,8 +174,10 @@ impl SchedulerConfig {
     /// Tuning knob for resource-constrained edge devices (e.g. RK3576 with
     /// 4-8 GB RAM): the defaults (global 10 / per-backend 2) can OOM small
     /// devices when many agents fire at once.
+    ///
     /// - `HERAMIND_MAX_CONCURRENT` (global execution limit, default 10)
     /// - `HERAMIND_MAX_CONCURRENT_PER_BACKEND` (per-LLM-backend, default 2)
+    ///
     /// Unset or invalid values keep the defaults.
     pub fn with_env_concurrency(mut self) -> Self {
         if let Some(n) = parse_concurrency_env("HERAMIND_MAX_CONCURRENT") {
@@ -238,6 +240,9 @@ pub struct ScheduledTask {
     pub timezone: Option<String>,
     /// Whether this task is enabled
     pub enabled: bool,
+    /// Agent priority (0-255, higher = more urgent). Used to decide which due
+    /// agents get execution slots when the concurrency limit is reached.
+    pub priority: u8,
 }
 
 /// Agent scheduler for executing agents on schedule.
@@ -301,6 +306,15 @@ impl AgentScheduler {
     }
 
     /// Get a reference to the shared backend semaphores (for wiring into executor).
+    /// The global execution-count semaphore (default 10). Shared with the
+    /// event-trigger path so event-spawned executions are accounted against
+    /// the same global bound as scheduled ones (previously event executions
+    /// only held a per-backend permit, so a burst could stack past the
+    /// global limit).
+    pub fn execution_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.execution_semaphore
+    }
+
     pub fn backend_semaphores(&self) -> &BackendSemaphores {
         &self.backend_semaphores
     }
@@ -342,6 +356,7 @@ impl AgentScheduler {
             cron_schedule,
             timezone: agent.schedule.timezone.clone(),
             enabled: agent.status == heramind_storage::AgentStatus::Active,
+            priority: agent.priority,
         };
 
         let agent_id = agent.id.clone();
@@ -418,43 +433,28 @@ impl AgentScheduler {
 
                 // Check for tasks to execute
                 let now = Utc::now().timestamp();
-                let (tasks_to_execute, skipped_tasks) = {
-                    let mut tasks_guard = tasks.write().await;
-                    let mut running_guard = running_executions.write().await;
-                    let mut to_execute = Vec::new();
-                    let mut skipped = Vec::new();
-
-                    for (agent_id, task) in tasks_guard.iter_mut() {
-                        if !task.enabled {
-                            continue;
+                // Reservation phase runs in its OWN task: a panic inside
+                // (e.g. an arithmetic bug on a bad schedule value) is
+                // confined to the child and logged, instead of unwinding
+                // this loop — one panicking task used to silently kill the
+                // scheduler and stop EVERY agent on the platform.
+                let reserve = tokio::spawn(reserve_due_tasks(
+                    tasks.clone(),
+                    running_executions.clone(),
+                    now,
+                    max_concurrent,
+                ));
+                let (tasks_to_execute, skipped_tasks) = match reserve.await {
+                    Ok(result) => result,
+                    Err(join_err) => {
+                        if join_err.is_panic() {
+                            tracing::error!(
+                                error = %join_err,
+                                "Scheduler tick reservation panicked — tick skipped, scheduler loop alive"
+                            );
                         }
-
-                        if now >= task.next_execution {
-                            // Atomic check-and-insert to prevent exceeding concurrency limit
-                            if running_guard.len() >= max_concurrent {
-                                skipped.push((
-                                    agent_id.clone(),
-                                    task.next_execution,
-                                    now - task.next_execution,
-                                ));
-                                tracing::warn!(
-                                    agent_id = %agent_id,
-                                    running_count = running_guard.len(),
-                                    max_concurrent = max_concurrent,
-                                    overdue_seconds = now - task.next_execution,
-                                    "Scheduler at concurrency limit, skipping agent execution"
-                                );
-                                continue;
-                            }
-
-                            // Reserve slot BEFORE releasing lock
-                            running_guard.insert(agent_id.clone());
-                            to_execute.push((agent_id.clone(), task.cron_schedule.clone()));
-                            Self::update_next_execution(task, now);
-                        }
+                        continue;
                     }
-
-                    (to_execute, skipped)
                 };
 
                 // Log summary of skipped tasks (if any)
@@ -774,7 +774,22 @@ impl AgentScheduler {
         let now = Utc::now();
 
         match schedule.schedule_type {
+            // Manual-only: never auto-scheduled. The agent runs via manual
+            // invoke/execute (repeatable) and shows Completed while idle.
+            // A never-due time keeps the task registered but inert (enabled
+            // flag also gates, this is belt-and-suspenders).
+            ScheduleType::Manual => Ok((i64::MAX, None)),
             ScheduleType::Interval => {
+                // `interval_seconds: Some(0)` is the frontend's "on-demand"
+                // convention (AgentEditorFullScreen: manual-only agent, no
+                // auto-trigger). Map it to a next_execution that never comes
+                // due — the agent runs only via manual invoke/execute.
+                // i64::MAX is safe: the tick loop compares
+                // `now >= task.next_execution`, and arithmetic below only
+                // ever reads this value.
+                if schedule.interval_seconds == Some(0) {
+                    return Ok((i64::MAX, None));
+                }
                 let interval = schedule.interval_seconds.unwrap_or(300);
                 Ok((now.timestamp() + interval as i64, None))
             }
@@ -850,6 +865,15 @@ impl AgentScheduler {
     /// calculate forward from the current time.
     fn update_next_execution(task: &mut ScheduledTask, now: i64) {
         if let Some(interval) = task.interval_seconds {
+            // `Some(0)` = on-demand (manual-only). Reschedule to "never" —
+            // the division below would otherwise divide by zero and PANIC,
+            // killing the whole scheduler loop (one bad task used to stop
+            // every agent on the platform). Legacy rows with 0 may still be
+            // in storage, so guard defensively on every path.
+            if interval == 0 {
+                task.next_execution = i64::MAX;
+                return;
+            }
             // Interval: use the previous scheduled time to prevent drift
             // E.g., if scheduled for 8:00 but executed at 8:00:01,
             // next should be 8:05 (not 8:05:01)
@@ -902,6 +926,74 @@ impl AgentScheduler {
     }
 }
 
+/// One scheduler tick's reservation phase: collect due tasks, sort by
+/// priority, apply the concurrency limit, reserve slots, and advance
+/// `next_execution`. Runs inside its own spawned task (see the tick loop) so
+/// a panic here cannot kill the scheduler loop.
+///
+/// Extracted verbatim from the tick loop; behavior is unchanged.
+async fn reserve_due_tasks(
+    tasks: Arc<RwLock<HashMap<String, ScheduledTask>>>,
+    running_executions: Arc<RwLock<std::collections::HashSet<String>>>,
+    now: i64,
+    max_concurrent: usize,
+) -> (Vec<(String, Option<Schedule>)>, Vec<(String, i64, i64)>) {
+    let mut tasks_guard = tasks.write().await;
+    let mut running_guard = running_executions.write().await;
+
+    // 1. Collect due agent IDs
+    let mut due: Vec<String> = Vec::new();
+    for (agent_id, task) in tasks_guard.iter() {
+        if !task.enabled {
+            continue;
+        }
+        if now >= task.next_execution {
+            due.push(agent_id.clone());
+        }
+    }
+
+    // 2. Sort by priority descending — when the concurrency limit
+    //    is reached, high-priority agents get the slots first
+    //    (was: random HashMap iteration order → dead priority field).
+    due.sort_by(|a, b| {
+        let pa = tasks_guard.get(a).map(|t| t.priority).unwrap_or(0);
+        let pb = tasks_guard.get(b).map(|t| t.priority).unwrap_or(0);
+        pb.cmp(&pa)
+    });
+
+    // 3. Apply concurrency limit + reserve slots
+    let mut to_execute = Vec::new();
+    let mut skipped: Vec<(String, i64, i64)> = Vec::new();
+    for agent_id in &due {
+        if running_guard.len() >= max_concurrent {
+            let next_exec = tasks_guard
+                .get(agent_id)
+                .map(|t| t.next_execution)
+                .unwrap_or(now);
+            skipped.push((agent_id.clone(), next_exec, now - next_exec));
+            tracing::warn!(
+                agent_id = %agent_id,
+                running_count = running_guard.len(),
+                max_concurrent = max_concurrent,
+                overdue_seconds = now - next_exec,
+                "Scheduler at concurrency limit, skipping agent execution"
+            );
+            continue;
+        }
+        running_guard.insert(agent_id.clone());
+        let cron = if let Some(task) = tasks_guard.get_mut(agent_id) {
+            let cron = task.cron_schedule.clone();
+            AgentScheduler::update_next_execution(task, now);
+            cron
+        } else {
+            None
+        };
+        to_execute.push((agent_id.clone(), cron));
+    }
+
+    (to_execute, skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -927,6 +1019,83 @@ mod tests {
             .unwrap();
 
         assert!(next >= now + 299 && next <= now + 301);
+    }
+
+    /// `ScheduleType::Manual` = manual-only: never auto-due.
+    #[tokio::test]
+    async fn test_calculate_next_execution_manual_never_due() {
+        let scheduler = AgentScheduler::new(SchedulerConfig::default())
+            .await
+            .unwrap();
+
+        let once = AgentSchedule {
+            schedule_type: ScheduleType::Manual,
+            cron_expression: None,
+            interval_seconds: None,
+            event_filter: None,
+            timezone: None,
+        };
+
+        let (next, _) = scheduler.calculate_next_execution(&once).await.unwrap();
+        assert_eq!(
+            next,
+            i64::MAX,
+            "Manual tasks must never come due on their own"
+        );
+    }
+
+    /// `interval_seconds: Some(0)` is the on-demand (manual-only) convention.
+    /// It must schedule to a never-due time — NOT `now + 0`, which made the
+    /// agent due on the very next tick.
+    #[tokio::test]
+    async fn test_calculate_next_execution_interval_zero_is_manual_only() {
+        let scheduler = AgentScheduler::new(SchedulerConfig::default())
+            .await
+            .unwrap();
+
+        let on_demand = AgentSchedule {
+            schedule_type: ScheduleType::Interval,
+            cron_expression: None,
+            interval_seconds: Some(0),
+            event_filter: None,
+            timezone: None,
+        };
+
+        let (next, _) = scheduler
+            .calculate_next_execution(&on_demand)
+            .await
+            .unwrap();
+        assert_eq!(
+            next,
+            i64::MAX,
+            "interval=0 (on-demand) must never come due on its own"
+        );
+    }
+
+    /// THE panic regression: an interval-0 task that comes due used to hit
+    /// `(now - scheduled_next) / 0` in `update_next_execution` — a division
+    /// by zero that killed the entire scheduler loop (every agent on the
+    /// platform silently stopped). It must now reschedule to never-due.
+    #[tokio::test]
+    async fn test_update_next_execution_interval_zero_does_not_panic() {
+        let mut task = ScheduledTask {
+            agent_id: "agent-on-demand".to_string(),
+            next_execution: Utc::now().timestamp() - 30, // already due
+            interval_seconds: Some(0),
+            cron_expression: None,
+            cron_schedule: None,
+            timezone: None,
+            enabled: true,
+            priority: 5,
+        };
+
+        AgentScheduler::update_next_execution(&mut task, Utc::now().timestamp());
+
+        assert_eq!(
+            task.next_execution,
+            i64::MAX,
+            "interval=0 task must be pushed to never-due, not divide by zero"
+        );
     }
 
     #[tokio::test]
@@ -1077,6 +1246,7 @@ mod tests {
             cron_schedule: None,
             timezone: None,
             enabled: true,
+            priority: 128,
         };
 
         // Update next execution (this should use scheduled time, not execution time)
@@ -1109,6 +1279,7 @@ mod tests {
             cron_schedule: None,
             timezone: None,
             enabled: true,
+            priority: 128,
         };
 
         // Simulate first update (scheduled_time -> scheduled_time + 5 min)
@@ -1150,6 +1321,7 @@ mod tests {
             cron_schedule: None,
             timezone: None,
             enabled: true,
+            priority: 128,
         };
 
         // Simulate 10 executions, each with varying delays

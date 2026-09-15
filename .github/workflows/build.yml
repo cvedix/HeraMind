@@ -19,12 +19,13 @@ on:
           - debug
         default: test
 
-# 正式发布时自动触发（创建 tag 或 release 时）
+# 正式发布时由 tag push 触发。不要加 `release: published`:
+#  ① release 事件时 github.ref 是默认分支而非 tag,release job 的
+#     `if: contains(github.ref, 'refs/tags/')` 守门会被跳过,白跑一次;
+#  ② 若 release 由 UI/PAT 发布,还会叠加 release-notify 双发 Discord。
   push:
     tags:
       - 'v*'
-  release:
-    types: [published]
 
 permissions:
   contents: write
@@ -35,7 +36,6 @@ env:
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
   # 使用优化的 profile
-  CARGO_PROFILE: ci-release
   # 禁用 sccache（CI 环境中不可用）
   SCACHE_CACHE_SIZE: 0
   RUSTC_WRAPPER: ""
@@ -95,20 +95,20 @@ jobs:
       - name: Create frontend release package
         if: contains(github.ref, 'refs/tags/')
         run: |
-          # Extract version from tag (e.g., v0.6.2 -> 0.6.2)
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          # Web bundle name is unversioned (matches heramind-server-*), so the
+          # releases/latest/download/heramind-web.tar.gz URL always resolves.
           cd web/dist
-          tar czvf ../../heramind-web-${VERSION}.tar.gz .
+          tar czvf ../../heramind-web.tar.gz .
           cd ../..
-          echo "✅ Frontend package created: heramind-web-${VERSION}.tar.gz"
-          ls -lh heramind-web-${VERSION}.tar.gz
+          echo "✅ Frontend package created: heramind-web.tar.gz"
+          ls -lh heramind-web.tar.gz
 
       - name: Upload frontend release artifact
         if: contains(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: heramind-web
-          path: heramind-web-*.tar.gz
+          path: heramind-web.tar.gz
           retention-days: 30
 
   # ========== 桌面应用构建（使用并行策略）==========
@@ -197,6 +197,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev \
             build-essential \
+            cmake \
+            git \
             curl \
             wget \
             file \
@@ -233,6 +235,7 @@ jobs:
 
           echo "✅ External binary built for ${{ matrix.target }}"
           ls -lh web/src-tauri/binaries/
+
 
       - name: Clean old bundle artifacts
         shell: bash
@@ -405,16 +408,50 @@ jobs:
           # Verify binaries exist
           ls -la target/${{ matrix.target }}/release/heramind target/${{ matrix.target }}/release/heramind-extension-runner
 
+      # Ship small binaries + an optional debug-symbol sidecar.
+      # [profile.release] keeps line-tables DWARF so on-device perf profiles
+      # symbolize (see Cargo.toml) — on this workspace that DWARF is ~200 MB
+      # per Linux binary (v0.9.23 tarballs ballooned 30→91 MB from it). Split
+      # it out at packaging time instead of making every edge device download
+      # it: --strip-debug removes the DWARF but keeps .symtab so panic
+      # backtraces still show function names, and .gnu_debuglink lets
+      # perf/gdb re-attach the symbols when the extracted .debug file sits
+      # next to the binary (or under /usr/lib/debug).
+      # Binaries are staged into release-stage/ BEFORE stripping — mutating
+      # target/ in place would poison the actions/cache above: a restored
+      # cache would hold stripped binaries, cargo would skip the rebuild,
+      # and later runs would silently produce empty sidecars.
+      # macOS needs no split: rustc leaves DWARF in the .o files there, so
+      # the linked binary only grew its symtab (~3 MB) — acceptable.
       - name: Create release archive
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../heramind-server-${{ matrix.os }}-${{ matrix.arch }}.tar.gz heramind heramind-extension-runner
+          set -e
+          STAGE=release-stage
+          mkdir -p "$STAGE"
+          cp target/${{ matrix.target }}/release/heramind \
+             target/${{ matrix.target }}/release/heramind-extension-runner "$STAGE/"
+          cd "$STAGE"
+
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            for bin in heramind heramind-extension-runner; do
+              objcopy --only-keep-debug "$bin" "$bin.debug"
+              objcopy --strip-debug "$bin"
+              objcopy --add-gnu-debuglink="$bin.debug" "$bin"
+            done
+            tar czf "../heramind-server-${{ matrix.os }}-${{ matrix.arch }}-debug-symbols.tar.gz" \
+              heramind.debug heramind-extension-runner.debug
+          fi
+
+          tar czf "../heramind-server-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" heramind heramind-extension-runner
 
       - name: Upload server artifact
         uses: actions/upload-artifact@v4
         with:
           name: heramind-server-${{ matrix.os }}-${{ matrix.arch }}
-          path: heramind-server-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+          path: |
+            heramind-server-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+            heramind-server-${{ matrix.os }}-${{ matrix.arch }}-debug-symbols.tar.gz
           retention-days: 30
 
   # ========== Release job ==========
@@ -437,6 +474,22 @@ jobs:
 
       - name: Display structure of downloaded files
         run: ls -R artifacts
+
+      - name: Extract CHANGELOG section
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          # CHANGELOG.md is the single source of truth for release notes.
+          #   short -> OTA updater `notes` field + Discord embed (glanceable)
+          #   full  -> GitHub Release body (long-form)
+          # Falls back to a plain version label so a missing/empty section
+          # never breaks the release pipeline.
+          python3 scripts/extract_changelog.py --version "${VERSION}" --mode short > changelog_short.md || true
+          python3 scripts/extract_changelog.py --version "${VERSION}" --mode full  > changelog_full.md  || true
+          [ -s changelog_short.md ] || echo "HeraMind ${VERSION}" > changelog_short.md
+          [ -s changelog_full.md ]  || echo "## HeraMind ${VERSION}" > changelog_full.md
+          echo "===== OTA/Discord short version ====="; cat changelog_short.md; echo
+          echo "===== release body full version: $(wc -c < changelog_full.md) chars ====="
 
       - name: Generate latest-update.json
         id: update_manifest
@@ -511,8 +564,12 @@ jobs:
           }
           EOFJ
 
-            # Validate and pretty-print with jq
-            jq '.' latest-update.json > latest-update-tmp.json && mv latest-update-tmp.json latest-update.json
+            # Validate, pretty-print, and inject the curated short changelog
+            # into the OTA `notes` field (replaces the version-only placeholder).
+            # jq safely JSON-escapes the multi-line notes text.
+            NOTES="$(cat changelog_short.md)"
+            jq --arg notes "${NOTES}" '.notes = $notes' latest-update.json > latest-update-tmp.json \
+              && mv latest-update-tmp.json latest-update.json
 
             echo "✅ Generated latest-update.json with ${FOUND} platforms:"
             cat latest-update.json
@@ -523,8 +580,13 @@ jobs:
         id: notes
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
-          cat > release_notes.md << 'EOF'
-          # HeraMind ${{ github.ref_name }}
+          # Lead with the curated CHANGELOG section (single source of truth),
+          # then the downloads/install template. GitHub's auto-generated commit
+          # log (generate_release_notes: true below) appends after the body.
+          cp changelog_full.md release_notes.md
+          cat >> release_notes.md << 'EOF'
+
+          ---
 
           ## Downloads
 
@@ -537,8 +599,11 @@ jobs:
           1. **Backend Server**: Download `heramind-server-{os}-{arch}.tar.gz`
              - Extract and run: `./heramind serve`
              - Default port: 9375
+             - Optional `*-debug-symbols.tar.gz` (Linux): DWARF sidecars for perf
+               profiling / core-dump analysis. Not needed for normal operation;
+               extract next to the binaries to symbolize on-device.
 
-          2. **Frontend Static Files**: Download `heramind-web-{version}.tar.gz`
+          2. **Frontend Static Files**: Download `heramind-web.tar.gz`
 
           **All-in-One** (default, no nginx needed):
           - Extract frontend to `/var/www/heramind` (or configure `HERAMIND_WEB_DIR`)

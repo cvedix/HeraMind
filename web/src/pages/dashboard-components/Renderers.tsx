@@ -6,7 +6,7 @@
  * Also used by SharedDashboard.tsx.
  */
 
-import { useState, useCallback, memo } from 'react'
+import { useState, useCallback, useMemo, memo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 import { createStableKey as createStableCacheKey } from '@/lib/stable-key'
@@ -19,7 +19,10 @@ import {
 import { Button } from '@/components/ui/button'
 import type { DashboardComponent, DataSourceOrList, DataSource } from '@/types/dashboard'
 import { getSourceId } from '@/types/dashboard'
-import ComponentRenderer from '@/components/dashboard/registry/ComponentRenderer'
+import ComponentRenderer, { ComponentErrorFallback } from '@/components/dashboard/registry/ComponentRenderer'
+import { ErrorBoundary } from '@/components/shared/ErrorBoundary'
+import { useDeviceBindingStatus } from '@/components/dashboard/shared/useDeviceBindingStatus'
+import { DanglingBindingState, StaleDataBadge } from '@/components/dashboard/shared/BindingStateOverlays'
 
 // Direct imports for built-in components (bypass ComponentRenderer to avoid
 // its store subscriptions causing blank frames during scroll)
@@ -92,12 +95,25 @@ const BuiltInComponent = memo(function BuiltInComponent({
   className?: string
 }) {
   const Comp = builtInComponentMap[component.type]
+  const bindingStatus = useDeviceBindingStatus(dataSource)
+
   if (!Comp) return null
+
+  // Every bound device was removed from the registry — the widget can never
+  // receive data again. Say so instead of a misleading "No Data Available".
+  if (bindingStatus.allDangling) {
+    return (
+      <DanglingBindingState
+        deviceIds={bindingStatus.danglingDeviceIds}
+        className={className}
+      />
+    )
+  }
 
   const { editMode: _em, transform: _t, ...restConfig } = config
   const { transform: _dt, ...restDisplay } = display
 
-  return (
+  const widget = (
     <Comp
       dataSource={dataSource}
       editMode={editMode}
@@ -107,6 +123,24 @@ const BuiltInComponent = memo(function BuiltInComponent({
       className={className}
     />
   )
+
+  // Bound device exists but is offline/idle — the card keeps showing the last
+  // reported value. A corner dot (not a text pill — compact cards have no room
+  // for one) badges it so it can't be mistaken for a live reading.
+  // Hidden in edit mode (the hover action toolbar occupies the same corner).
+  if (bindingStatus.staleDevices.length > 0 && !editMode) {
+    return (
+      <div className="relative w-full h-full">
+        {widget}
+        <StaleDataBadge
+          devices={bindingStatus.staleDevices}
+          className="absolute top-1.5 right-1.5 z-10"
+        />
+      </div>
+    )
+  }
+
+  return widget
 })
 
 // ============================================================================
@@ -259,15 +293,25 @@ export function renderDashboardComponent(
     )
   }
 
+  // Per-card boundary for built-in widgets. Without it a single throwing card
+  // bubbles to the route-level boundary and replaces the whole dashboard page.
+  // This is the SYNCHRONOUS render path (direct component, no async loading),
+  // so it does not hit the StrictMode double-mount + async-ErrorBoundary race
+  // that CLAUDE.md gotcha #11 warns about for ComponentRenderer's load branch.
   return (
-    <BuiltInComponent
-      component={component}
-      config={config}
-      dataSource={dataSource}
-      display={display}
-      editMode={editMode}
-      className="w-full h-full"
-    />
+    <ErrorBoundary
+      resetKey={`${component.id}:${component.type}`}
+      fallback={<ComponentErrorFallback className="w-full h-full" />}
+    >
+      <BuiltInComponent
+        component={component}
+        config={config}
+        dataSource={dataSource}
+        display={display}
+        editMode={editMode}
+        className="w-full h-full"
+      />
+    </ErrorBoundary>
   )
 }
 
@@ -327,7 +371,7 @@ const ComponentWrapper = memo(function ComponentWrapper({
           <Button variant="secondary" size="icon" className="bg-bg-90 backdrop-blur" onClick={handleDuplicateClick}>
             <Copy className="h-4 w-4" />
           </Button>
-          <Button variant="secondary" size="icon" className="bg-bg-90 backdrop-blur hover:bg-destructive hover:text-error-foreground transition-colors"
+          <Button variant="secondary" size="icon" className="bg-bg-90 backdrop-blur hover:bg-destructive hover:text-destructive-foreground transition-colors"
             onClick={() => { confirm({ title: t('componentWrapper.remove'), description: t('componentWrapper.removeConfirm'), confirmText: t('componentWrapper.remove'), variant: 'destructive' }).then(ok => { if (ok) onRemove(component.id) }) }}>
             <Trash2 className="h-4 w-4" />
           </Button>
@@ -347,7 +391,7 @@ const ComponentWrapper = memo(function ComponentWrapper({
               <Button variant="secondary" size="xs" onClick={handleDuplicateClick}>
                 <Copy className="h-3 w-3 mr-1" />{t('componentWrapper.copy')}
               </Button>
-              <Button variant="secondary" size="xs" className="hover:bg-destructive hover:text-error-foreground"
+              <Button variant="secondary" size="xs" className="hover:bg-destructive hover:text-destructive-foreground"
                 onClick={() => { confirm({ title: t('componentWrapper.remove'), description: t('componentWrapper.removeConfirm'), confirmText: t('componentWrapper.remove'), variant: 'destructive' }).then(ok => { if (ok) onRemove(component.id) }) }}>
                 <Trash2 className="h-3 w-3 mr-1" />{t('componentWrapper.remove')}
               </Button>

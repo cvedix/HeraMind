@@ -9,6 +9,7 @@ import { useEffect, useState, useCallback, useRef, useMemo, memo } from 'react'
 import '@/lib/debug-scroll' // Auto-inits if DEBUG_SCROLL=true in localStorage
 import { createPortal } from 'react-dom'
 import { getPortalRoot } from '@/lib/portal'
+import { usePageSidebarSlot, PageSidebarColumn } from '@/components/layout/PageSidebarSlot'
 import { useTranslation } from 'react-i18next'
 import { useStore } from '@/store'
 import { shallow } from 'zustand/shallow'
@@ -23,14 +24,17 @@ import { cn } from '@/lib/utils'
 import { chartColorsHex } from '@/design-system/tokens/color'
 import { useIsMobile } from '@/hooks/useMobile'
 import { MobilePageHeader } from '@/components/layout/MobilePageHeader'
+import { PageHeader } from '@/components/layout/PageHeader'
 import {
   LayoutDashboard,
   Plus,
   Minimize,
   Hash,
-  ToggleLeft,
   Monitor,
   Grid,
+  Settings2,
+  Sparkles,
+  ChevronRight,
 } from 'lucide-react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
@@ -134,7 +138,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
     fetchDashboards: s.fetchDashboards, fetchDevices: s.fetchDevices,
     fetchDeviceTypes: s.fetchDeviceTypes, fetchDevicesCurrentBatch: s.fetchDevicesCurrentBatch,
     sendCommand: s.sendCommand, duplicateDashboard: s.duplicateDashboard,
-  }))
+  }), shallow)
 
   // Marketplace store selectors — single subscription
   const {
@@ -147,12 +151,11 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
     fetchInstalled: s.fetchInstalled, installFromMarket: s.installFromMarket,
     uninstall: s.uninstall, refreshComponent: s.refreshComponent,
     updatesAvailable: s.updatesAvailable, checkUpdates: s.checkUpdates,
-  }))
+  }), shallow)
 
   // Extension lifecycle management for hot updates
   const { refreshVersion } = useExtensionLifecycle({
     autoSyncOnRegister: true,
-    autoRemoveOnUnregister: true,
   })
 
   // Community component lifecycle
@@ -179,7 +182,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
 
   // Component library search
   const [librarySearch, setLibrarySearch] = useState('')
-  const [libraryTab, setLibraryTab] = useState<'components' | 'marketplace'>('components')
+  const [libraryTab, setLibraryTab] = useState<'components' | 'extensions' | 'marketplace' | 'custom'>('components')
   const [importDialogOpen, setImportDialogOpen] = useState(false)
   const [installingId, setInstallingId] = useState<string | null>(null)
 
@@ -233,6 +236,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
   // Mobile editing state
   const isMobile = useIsMobile()
   const isDesktop = !isMobile
+  const pageSidebarSlot = usePageSidebarSlot()
   const [mobileSelectedId, setMobileSelectedId] = useState<string | null>(null)
   const [mobileEditBarOpen, setMobileEditBarOpen] = useState(false)
 
@@ -899,7 +903,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
           )}
           {/* Skeleton main content */}
           <div className="flex-1 flex flex-col">
-            <div className="flex items-center justify-between px-4 h-11 border-b border-border">
+            <div className="flex items-center justify-between px-4 h-11 ">
               {isTabMode ? (
                 <div className="flex items-center gap-2 flex-1 min-w-0">
                   {/* Left: toggle + add skeletons */}
@@ -936,17 +940,24 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
       )
     }
 
-    // No dashboard found - show empty state with create button
+    // No dashboard found - guided empty state: manual create is primary,
+    // "let AI build it" opens the in-page side chat panel (the floating
+    // button's panel) instead of navigating away to /chat.
     return (
-      <div className="flex items-center justify-center h-screen">
-        <div className="text-center space-y-4 px-4">
-          <LayoutDashboard className="h-16 w-16 mx-auto text-muted-foreground" />
-          <div>
-            <h2 className="text-lg font-medium mb-1">{t('visualDashboard.noDashboardFound')}</h2>
-            <p className="text-sm text-muted-foreground mb-4">
-              {t('visualDashboard.createFirstDashboard')}
-            </p>
+      <div className="flex items-center justify-center h-screen bg-background">
+        <div className="text-center max-w-md px-6">
+          <div className="mx-auto mb-5 flex size-14 items-center justify-center rounded-xl bg-primary-light text-primary">
+            <LayoutDashboard className="size-7" />
+          </div>
+          <h2 className="mb-2 text-lg font-semibold tracking-tight">
+            {t('visualDashboard.noDashboardFound')}
+          </h2>
+          <p className="text-sm text-muted-foreground mb-6 leading-relaxed">
+            {t('visualDashboard.emptyGuideDesc')}
+          </p>
+          <div className="flex items-center justify-center gap-3">
             <Button
+              className="h-11 sm:h-10"
               onClick={() => {
                 handleDashboardCreate('Overview').catch((err) => {
                   console.error('[VisualDashboard] Failed to create dashboard:', err)
@@ -956,6 +967,31 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
               <Plus className="h-4 w-4 mr-1" />
               {t('visualDashboard.createDashboard')}
             </Button>
+            <Button
+              variant="secondary"
+              className="h-11 sm:h-10 gap-2"
+              onClick={() => useStore.getState().openChatPanel()}
+            >
+              <Sparkles className="h-4 w-4" />
+              {t('visualDashboard.emptyAskAi')}
+            </Button>
+          </div>
+          {/* Three-step path so a first-time user knows what "building a
+              dashboard" involves before clicking. */}
+          <div className="mt-6 flex items-center justify-center gap-x-2 text-xs text-muted-foreground">
+            {[
+              t('visualDashboard.emptyStep1'),
+              t('visualDashboard.emptyStep2'),
+              t('visualDashboard.emptyStep3'),
+            ].map((label, i) => (
+              <span key={label} className="flex items-center gap-1.5 whitespace-nowrap">
+                {i > 0 && <ChevronRight className="size-3 opacity-50 mr-1" />}
+                <span className="flex size-4 items-center justify-center rounded-full bg-muted text-[10px] font-medium">
+                  {i + 1}
+                </span>
+                {label}
+              </span>
+            ))}
           </div>
         </div>
       </div>
@@ -987,22 +1023,44 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
         getPortalRoot()
       )}
 
-      {/* Sidebar - separate column (only in sidebar layout mode) */}
+      {/* Sidebar - separate column (only in sidebar layout mode). On desktop
+          it's hoisted to the shell's full-height slot (left of the TopBar,
+          level with the AppSidebar); mobile keeps the drawer. */}
       {!isFullscreen && layoutMode === 'sidebar' && (
-        <DashboardListSidebar
-          dashboards={sortedDashboards}
-          currentDashboardId={currentDashboardId}
-          onSwitch={handleDashboardSwitch}
-          onCreate={handleDashboardCreate}
-          onRename={handleDashboardRename}
-          onDuplicate={handleDashboardDuplicate}
-          onDelete={handleDashboardDelete}
-          onReorder={(newOrder) => useStore.getState().reorderDashboards(newOrder)}
-          open={sidebarOpen}
-          onOpenChange={setSidebarOpen}
-          isDesktop={isDesktop}
-          onSwitchToTabs={handleSwitchToTabs}
-        />
+        isDesktop && pageSidebarSlot ? createPortal(
+          <PageSidebarColumn>
+            <DashboardListSidebar
+              dashboards={sortedDashboards}
+              currentDashboardId={currentDashboardId}
+              onSwitch={handleDashboardSwitch}
+              onCreate={handleDashboardCreate}
+              onRename={handleDashboardRename}
+              onDuplicate={handleDashboardDuplicate}
+              onDelete={handleDashboardDelete}
+              onReorder={(newOrder) => useStore.getState().reorderDashboards(newOrder)}
+              open={sidebarOpen}
+              onOpenChange={setSidebarOpen}
+              isDesktop={true}
+              onSwitchToTabs={handleSwitchToTabs}
+            />
+          </PageSidebarColumn>,
+          pageSidebarSlot
+        ) : (
+          <DashboardListSidebar
+            dashboards={sortedDashboards}
+            currentDashboardId={currentDashboardId}
+            onSwitch={handleDashboardSwitch}
+            onCreate={handleDashboardCreate}
+            onRename={handleDashboardRename}
+            onDuplicate={handleDashboardDuplicate}
+            onDelete={handleDashboardDelete}
+            onReorder={(newOrder) => useStore.getState().reorderDashboards(newOrder)}
+            open={sidebarOpen}
+            onOpenChange={setSidebarOpen}
+            isDesktop={isDesktop}
+            onSwitchToTabs={handleSwitchToTabs}
+          />
+        )
       )}
 
       {/* Main content area */}
@@ -1013,10 +1071,32 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
         {isMobile && (
           <MobilePageHeader title={t('common:nav.visual-dashboard')} />
         )}
+        {/* Desktop title row — identical to PageLayout's so the floating
+            global controls (top-right) align with every other page. Sidebar
+            mode shows the current dashboard's name as the page title (the
+            sidebar rail is a nav rail, not a title); tabs mode keeps the
+            page label — the active tab already renders the name at the
+            highest visual weight, and a second copy above it is pure
+            duplication. Zero dashboards falls back to the page label. */}
+        {!isMobile && (
+          <div className="shrink-0 bg-background">
+            <div className="w-full px-4 pt-4 pb-2 sm:px-6 sm:pt-5 sm:pb-3 md:px-8 md:pt-6 md:pb-3">
+              {layoutMode === 'sidebar' && currentDashboard ? (
+                <h1
+                  key={currentDashboard.id}
+                  className="animate-in fade-in duration-200 truncate text-xl font-bold tracking-tight sm:text-2xl"
+                >
+                  {currentDashboard.name}
+                </h1>
+              ) : (
+                <PageHeader title={t('common:nav.visual-dashboard')} />
+              )}
+            </div>
+          </div>
+        )}
         <DashboardToolbar
           sortedDashboards={sortedDashboards}
           currentDashboardId={currentDashboardId}
-          currentDashboard={currentDashboard}
           layoutMode={layoutMode}
           onDashboardSwitch={handleDashboardSwitch}
           onDashboardCreate={handleDashboardCreate}
@@ -1043,6 +1123,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
           marketComponents={marketComponents}
           marketLoading={marketLoading}
           installedComponents={installedComponents}
+          onRefreshMarket={fetchMarket}
           installingId={installingId}
           onInstall={installFromMarket}
           onUninstall={uninstallComponent}
@@ -1062,7 +1143,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
               <p className="text-sm mt-2">
                 {editMode ? t('visualDashboard.addComponentsHint') : t('visualDashboard.enterEditModeHint')}
               </p>
-              {editMode && (
+              {editMode ? (
                 <Button
                   variant="outline"
                   size="sm"
@@ -1071,6 +1152,16 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
                 >
                   <Plus className="h-4 w-4 mr-1" />
                   {t('visualDashboard.addComponent')}
+                </Button>
+              ) : (
+                <Button
+                  variant="default"
+                  size="sm"
+                  className="mt-4"
+                  onClick={() => setEditMode(true)}
+                >
+                  <Settings2 className="h-4 w-4 mr-1" />
+                  {t('common:editDashboard')}
                 </Button>
               )}
             </div>

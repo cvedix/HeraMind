@@ -18,6 +18,53 @@ struct ScheduledHandle {
     join_handle: tokio::task::JoinHandle<()>,
 }
 
+/// Per-target concurrent in-flight deliveries for the immediate push path.
+const DATA_PUSH_MAX_INFLIGHT_DELIVERIES: usize = 4;
+
+/// Hard entry cap for the batched push buffer (independent of the configured
+/// batch_size) — bounds memory under event bursts with image-inlined values.
+const DATA_PUSH_MAX_BUFFER_ENTRIES: usize = 1000;
+
+/// Rate-limits backpressure-drop warnings: log once per window instead of
+/// once per dropped event (a storm would otherwise flood the logs).
+#[derive(Default)]
+struct BackpressureDropCounter {
+    dropped: u64,
+    window_start: Option<tokio::time::Instant>,
+}
+
+impl BackpressureDropCounter {
+    /// Records one drop; returns `Some(total_dropped_in_window)` when a
+    /// warning should be emitted, then starts a fresh window.
+    ///
+    /// Two bugs in the first version: (a) the window opened on the FIRST
+    /// drop and only logged if a LATER drop arrived ≥60s on — a burst that
+    /// ended inside the minute logged nothing at all, contradicting the
+    /// "dropped with a warn" contract; (b) the count was `take`n and thrown
+    /// away, so the operator could not size the loss. Now the first drop of
+    /// a window is reported immediately and each window reports its total.
+    fn record_drop(&mut self) -> Option<u64> {
+        let now = tokio::time::Instant::now();
+        match self.window_start {
+            None => {
+                // First drop — open the window and report it now.
+                self.window_start = Some(now);
+                self.dropped = 1;
+                Some(1)
+            }
+            Some(start) if now.duration_since(start).as_secs() >= 60 => {
+                let total = std::mem::replace(&mut self.dropped, 1);
+                self.window_start = Some(now);
+                Some(total) // total in the window that just closed
+            }
+            Some(_) => {
+                self.dropped += 1;
+                None // inside the window — one report per minute is enough
+            }
+        }
+    }
+}
+
 impl ScheduledHandle {
     async fn stop(self) {
         let _ = self.cancel.send(true);
@@ -130,8 +177,11 @@ impl PushScheduler {
 
             let mut rx = bus.subscribe();
             let mut matcher = DataSourceMatcher::new(target.data_filter.clone());
-            let dest = match create_destination(&target.target_type, &target.config) {
-                Ok(d) => d,
+            let dest: std::sync::Arc<dyn crate::targets::PushDestination> = match create_destination(
+                &target.target_type,
+                &target.config,
+            ) {
+                Ok(d) => std::sync::Arc::from(d),
                 Err(e) => {
                     tracing::error!(target_id = %target.id, error = %e, "Failed to create destination");
                     return;
@@ -153,17 +203,32 @@ impl PushScheduler {
 
             // Buffer for batched events
             let mut buffer: Vec<(String, serde_json::Value, i64)> = Vec::new();
+            // Immediate-path concurrency cap (see [backpressure] below).
+            let delivery_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(
+                DATA_PUSH_MAX_INFLIGHT_DELIVERIES,
+            ));
+            let mut dropped_under_backpressure = BackpressureDropCounter::default();
             let mut flush_timer = tokio::time::Instant::now() + batch_interval;
             // Per-target dedup of transform's double-published virtual metrics.
-            let mut recent_virtual: std::collections::HashMap<(String, i64), tokio::time::Instant> =
-                std::collections::HashMap::new();
+            let mut recent_virtual: std::collections::HashMap<
+                (String, String, i64),
+                tokio::time::Instant,
+            > = std::collections::HashMap::new();
 
             loop {
                 tokio::select! {
                     _ = cancel.changed() => {
                         // Flush remaining buffer before stopping
                         if !buffer.is_empty() {
-                            flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, None).await;
+                            // [bounded teardown] the final flush used to run the FULL retry loop
+                            // (endpoint timeout x retries + backoffs = minutes) with no bound - a dead
+                            // endpoint wedged stop()/update/delete, which the API handler awaits while
+                            // holding the data-push state lock. 30s cap: still attempts delivery.
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, None),
+                            )
+                            .await;
                         }
                         tracing::info!(target_id = %target.id, "Event-driven target stopped");
                         return;
@@ -171,7 +236,15 @@ impl PushScheduler {
                     result = rx.recv() => {
                         if cancel.has_changed().unwrap_or(false) {
                             if !buffer.is_empty() {
-                                flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, None).await;
+                                // [bounded teardown] the final flush used to run the FULL retry loop
+                                // (endpoint timeout x retries + backoffs = minutes) with no bound - a dead
+                                // endpoint wedged stop()/update/delete, which the API handler awaits while
+                                // holding the data-push state lock. 30s cap: still attempts delivery.
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(30),
+                                    flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, None),
+                                )
+                                .await;
                             }
                             return;
                         }
@@ -184,7 +257,7 @@ impl PushScheduler {
                                     let value_str = value.to_string();
                                     if matcher.should_push(&source_id, &value_str) {
                                         if is_virtual
-                                            && is_duplicate_virtual(&mut recent_virtual, &value_str, ts)
+                                            && is_duplicate_virtual(&mut recent_virtual, &source_id, &value_str, ts)
                                         {
                                             tracing::debug!(
                                                 target_id = %target.id,
@@ -194,18 +267,64 @@ impl PushScheduler {
                                         }
                                         resolve_image_urls_in_value(&mut value);
                                         if !batch_enabled {
-                                            // Immediate delivery (batch_size=1)
-                                            if let Err(e) = deliver_with_retry(
-                                                &target,
-                                                &store,
-                                                &renderer,
-                                                dest.as_ref(),
-                                                &source_id,
-                                                &value,
-                                                ts,
-                                                Some(&cancel),
-                                            ).await {
-                                                tracing::warn!(target_id = %target.id, error = %e, "Delivery failed after retries");
+                                            // [backpressure] Immediate delivery used to be
+                                            // awaited INLINE: one dead endpoint (4 attempts ×
+                                            // 30s timeout + 5/10/20s backoffs, worst case
+                                            // ~12 min) stalled rx.recv() for the whole window,
+                                            // the 1000-slot broadcast bus lagged, and the
+                                            // telemetry being pushed was silently DROPPED —
+                                            // the push subsystem lost data exactly when the
+                                            // endpoint was down. Deliver in a spawned task
+                                            // under a per-target in-flight cap instead: the
+                                            // consumer keeps draining; when the cap is
+                                            // exhausted the newest event is dropped with a
+                                            // warn (visible, bounded loss — the same policy
+                                            // the EventBus itself applies under lag).
+                                            // NOTE: deliveries are no longer strictly
+                                            // ordered per target (up to 4 concurrent) —
+                                            // event N+1 can overtake N while N retries.
+                                            // Consumers must tolerate reversals; state
+                                            // transitions should key on timestamps, not
+                                            // arrival order.
+                                            // Owned permit: the spawned task outlives this
+                                            // loop iteration, so the permit must be 'static.
+                                            match delivery_permits.clone().try_acquire_owned() {
+                                                Ok(_permit) => {
+                                                    let target = target.clone();
+                                                    let store = store.clone();
+                                                    let renderer = renderer.clone();
+                                                    let dest = dest.clone();
+                                                    let cancel = cancel.clone();
+                                                    let source_id = source_id.clone();
+                                                    tokio::spawn(async move {
+                                                        let _permit = _permit;
+                                                        if let Err(e) = deliver_with_retry(
+                                                            &target,
+                                                            &store,
+                                                            &renderer,
+                                                            dest.as_ref(),
+                                                            &source_id,
+                                                            &value,
+                                                            ts,
+                                                            Some(&cancel),
+                                                        ).await {
+                                                            tracing::warn!(target_id = %target.id, error = %e, "Delivery failed after retries");
+                                                        }
+                                                    });
+                                                }
+                                                Err(_) => {
+                                                    if let Some(total) =
+                                                        dropped_under_backpressure
+                                                            .record_drop()
+                                                    {
+                                                        tracing::warn!(
+                                                            target_id = %target.id,
+                                                            dropped_in_window = total,
+                                                            in_flight_cap = DATA_PUSH_MAX_INFLIGHT_DELIVERIES,
+                                                            "Push backpressure: in-flight delivery cap reached — events dropped (count covers this window)"
+                                                        );
+                                                    }
+                                                }
                                             }
                                         } else {
                                             // Buffer for batch. Restart the interval timer on the first
@@ -219,7 +338,15 @@ impl PushScheduler {
                                             if was_empty {
                                                 flush_timer = tokio::time::Instant::now() + batch_interval;
                                             }
-                                            if buffer.len() >= batch_size {
+                                            // [buffer cap] A large configured batch_size
+                                            // with a high event rate (and image-inlined
+                                            // values) used to grow the buffer without
+                                            // bound until batch_size was reached —
+                                            // memory pressure on the edge box. Flush at
+                                            // a hard entry cap as well.
+                                            if buffer.len() >= batch_size
+                                                || buffer.len() >= DATA_PUSH_MAX_BUFFER_ENTRIES
+                                            {
                                                 flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, Some(&cancel)).await;
                                                 flush_timer = tokio::time::Instant::now() + batch_interval;
                                             }
@@ -229,7 +356,15 @@ impl PushScheduler {
                             }
                             None => {
                                 if !buffer.is_empty() {
-                                    flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, None).await;
+                                    // [bounded teardown] the final flush used to run the FULL retry loop
+                                    // (endpoint timeout x retries + backoffs = minutes) with no bound - a dead
+                                    // endpoint wedged stop()/update/delete, which the API handler awaits while
+                                    // holding the data-push state lock. 30s cap: still attempts delivery.
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_secs(30),
+                                        flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, None),
+                                    )
+                                    .await;
                                 }
                                 return;
                             }
@@ -273,8 +408,10 @@ impl PushScheduler {
             let mut buffer: Vec<(String, serde_json::Value, i64)> = Vec::new();
             let flush_interval = std::time::Duration::from_secs(interval_secs);
             // Per-target dedup of transform's double-published virtual metrics.
-            let mut recent_virtual: std::collections::HashMap<(String, i64), tokio::time::Instant> =
-                std::collections::HashMap::new();
+            let mut recent_virtual: std::collections::HashMap<
+                (String, String, i64),
+                tokio::time::Instant,
+            > = std::collections::HashMap::new();
 
             tracing::info!(target_id = %target.id, interval_secs, "Interval push target started");
 
@@ -288,7 +425,15 @@ impl PushScheduler {
                     _ = cancel.changed() => {
                         // Flush remaining buffer before stopping
                         if !buffer.is_empty() {
-                            flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, None).await;
+                            // [bounded teardown] the final flush used to run the FULL retry loop
+                            // (endpoint timeout x retries + backoffs = minutes) with no bound - a dead
+                            // endpoint wedged stop()/update/delete, which the API handler awaits while
+                            // holding the data-push state lock. 30s cap: still attempts delivery.
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, None),
+                            )
+                            .await;
                         }
                         tracing::info!(target_id = %target.id, "Interval target stopped");
                         return;
@@ -296,7 +441,15 @@ impl PushScheduler {
                     result = rx.recv() => {
                         if cancel.has_changed().unwrap_or(false) {
                             if !buffer.is_empty() {
-                                flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, None).await;
+                                // [bounded teardown] the final flush used to run the FULL retry loop
+                                // (endpoint timeout x retries + backoffs = minutes) with no bound - a dead
+                                // endpoint wedged stop()/update/delete, which the API handler awaits while
+                                // holding the data-push state lock. 30s cap: still attempts delivery.
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(30),
+                                    flush_batch(&target, &store, &renderer, dest.as_ref(), &mut buffer, None),
+                                )
+                                .await;
                             }
                             return;
                         }
@@ -305,7 +458,7 @@ impl PushScheduler {
                                 let value_str = value.to_string();
                                 if matcher.should_push(&source_id, &value_str) {
                                     if is_virtual
-                                        && is_duplicate_virtual(&mut recent_virtual, &value_str, ts)
+                                        && is_duplicate_virtual(&mut recent_virtual, &source_id, &value_str, ts)
                                     {
                                         continue;
                                     }
@@ -430,18 +583,23 @@ fn extract_event_data(
 /// seconds is plenty.
 const VIRTUAL_DEDUP_WINDOW_SECS: u64 = 5;
 
-/// Returns `true` (without recording) if this `(value, ts)` virtual metric was
+/// Returns `true` (without recording) if this `(source, value, ts)` virtual metric was
 /// already seen within the dedup window — i.e. the second copy of a transform
 /// double-publish that a wide filter (`*` / `device:*`) matched twice.
 /// Otherwise records it and returns `false`. Keeps the map bounded.
 fn is_duplicate_virtual(
-    recent: &mut std::collections::HashMap<(String, i64), tokio::time::Instant>,
+    recent: &mut std::collections::HashMap<(String, String, i64), tokio::time::Instant>,
+    source_id: &str,
     value_str: &str,
     ts: i64,
 ) -> bool {
     let now = tokio::time::Instant::now();
     let window = std::time::Duration::from_secs(VIRTUAL_DEDUP_WINDOW_SECS);
-    let key = (value_str.to_string(), ts);
+    // Key includes source_id: two DIFFERENT virtual metrics (different
+    // devices/transforms) publishing the same serialized value within the
+    // same second-granularity timestamp used to collide and the second was
+    // silently dropped.
+    let key = (source_id.to_string(), value_str.to_string(), ts);
     if let Some(seen) = recent.get(&key) {
         if now.duration_since(*seen) < window {
             return true;
@@ -510,7 +668,9 @@ async fn deliver_with_retry(
             Ok(()) => {
                 log.status = DeliveryStatus::Success;
                 log.completed_at = Some(chrono::Utc::now().timestamp());
-                let _ = store.save_delivery_log(&log);
+                if let Err(e) = store.save_delivery_log(&log) {
+                    tracing::warn!(target: "heramind::data_push", error = %e, "Delivery-log persist failed — audit trail diverges from actual delivery state");
+                }
                 tracing::debug!(target_id = %target.id, attempt, "Delivery successful");
                 return Ok(());
             }
@@ -533,7 +693,9 @@ async fn deliver_with_retry(
                 log.error = Some(e.to_string());
                 if attempt < max_retries {
                     log.status = DeliveryStatus::Retrying;
-                    let _ = store.save_delivery_log(&log);
+                    if let Err(e) = store.save_delivery_log(&log) {
+                        tracing::warn!(target: "heramind::data_push", error = %e, "Delivery-log persist failed — audit trail diverges from actual delivery state");
+                    }
                     tracing::warn!(
                         target_id = %target.id,
                         attempt,
@@ -548,7 +710,9 @@ async fn deliver_with_retry(
                         log.status = DeliveryStatus::Failed;
                         log.error = Some(format!("Cancelled during retry backoff: {}", e));
                         log.completed_at = Some(chrono::Utc::now().timestamp());
-                        let _ = store.save_delivery_log(&log);
+                        if let Err(e) = store.save_delivery_log(&log) {
+                            tracing::warn!(target: "heramind::data_push", error = %e, "Delivery-log persist failed — audit trail diverges from actual delivery state");
+                        }
                         tracing::info!(
                             target_id = %target.id,
                             attempt,
@@ -562,7 +726,9 @@ async fn deliver_with_retry(
                 } else {
                     log.status = DeliveryStatus::Failed;
                     log.completed_at = Some(chrono::Utc::now().timestamp());
-                    let _ = store.save_delivery_log(&log);
+                    if let Err(e) = store.save_delivery_log(&log) {
+                        tracing::warn!(target: "heramind::data_push", error = %e, "Delivery-log persist failed — audit trail diverges from actual delivery state");
+                    }
                     return Err(anyhow::Error::new(e));
                 }
             }
@@ -782,7 +948,9 @@ async fn flush_batch(
             Ok(()) => {
                 log.status = DeliveryStatus::Success;
                 log.completed_at = Some(chrono::Utc::now().timestamp());
-                let _ = store.save_delivery_log(&log);
+                if let Err(e) = store.save_delivery_log(&log) {
+                    tracing::warn!(target: "heramind::data_push", error = %e, "Delivery-log persist failed — audit trail diverges from actual delivery state");
+                }
                 tracing::debug!(
                     target_id = %target.id,
                     batch_count = count,
@@ -810,7 +978,9 @@ async fn flush_batch(
                 log.error = Some(e.to_string());
                 if attempt < max_retries {
                     log.status = DeliveryStatus::Retrying;
-                    let _ = store.save_delivery_log(&log);
+                    if let Err(e) = store.save_delivery_log(&log) {
+                        tracing::warn!(target: "heramind::data_push", error = %e, "Delivery-log persist failed — audit trail diverges from actual delivery state");
+                    }
                     tracing::warn!(
                         target_id = %target.id,
                         batch_count = count,
@@ -826,7 +996,9 @@ async fn flush_batch(
                         log.status = DeliveryStatus::Failed;
                         log.error = Some(format!("Cancelled during retry backoff: {}", e));
                         log.completed_at = Some(chrono::Utc::now().timestamp());
-                        let _ = store.save_delivery_log(&log);
+                        if let Err(e) = store.save_delivery_log(&log) {
+                            tracing::warn!(target: "heramind::data_push", error = %e, "Delivery-log persist failed — audit trail diverges from actual delivery state");
+                        }
                         tracing::info!(
                             target_id = %target.id,
                             batch_count = count,
@@ -842,7 +1014,9 @@ async fn flush_batch(
                 } else {
                     log.status = DeliveryStatus::Failed;
                     log.completed_at = Some(chrono::Utc::now().timestamp());
-                    let _ = store.save_delivery_log(&log);
+                    if let Err(e) = store.save_delivery_log(&log) {
+                        tracing::warn!(target: "heramind::data_push", error = %e, "Delivery-log persist failed — audit trail diverges from actual delivery state");
+                    }
                     tracing::warn!(
                         target_id = %target.id,
                         batch_count = count,
@@ -867,16 +1041,54 @@ mod tests {
     fn virtual_dedup_skips_second_copy_within_window() {
         let mut recent = std::collections::HashMap::new();
         // First copy of a virtual metric → recorded, not a duplicate.
-        assert!(!is_duplicate_virtual(&mut recent, "value-1", 1000));
-        // Second copy (same value + ts, transform double-publish) → duplicate.
-        assert!(is_duplicate_virtual(&mut recent, "value-1", 1000));
+        assert!(!is_duplicate_virtual(
+            &mut recent,
+            "device:a",
+            "value-1",
+            1000
+        ));
+        // Second copy (same source + value + ts, transform double-publish) → duplicate.
+        assert!(is_duplicate_virtual(
+            &mut recent,
+            "device:a",
+            "value-1",
+            1000
+        ));
         // Different value at same ts → not a duplicate (different metric).
-        assert!(!is_duplicate_virtual(&mut recent, "value-2", 1000));
+        assert!(!is_duplicate_virtual(
+            &mut recent,
+            "device:a",
+            "value-2",
+            1000
+        ));
+        // Different SOURCE, same value + ts → not a duplicate (the old key
+        // collided distinct metrics that happened to serialize identically).
+        assert!(!is_duplicate_virtual(
+            &mut recent,
+            "device:b",
+            "value-1",
+            1000
+        ));
         // Same value at different ts → not a duplicate (different frame).
-        assert!(!is_duplicate_virtual(&mut recent, "value-1", 2000));
-        // Those new (value, ts) keys got recorded; their repeats are dups.
-        assert!(is_duplicate_virtual(&mut recent, "value-2", 1000));
-        assert!(is_duplicate_virtual(&mut recent, "value-1", 2000));
+        assert!(!is_duplicate_virtual(
+            &mut recent,
+            "device:a",
+            "value-1",
+            2000
+        ));
+        // Those new (source, value, ts) keys got recorded; their repeats are dups.
+        assert!(is_duplicate_virtual(
+            &mut recent,
+            "device:a",
+            "value-2",
+            1000
+        ));
+        assert!(is_duplicate_virtual(
+            &mut recent,
+            "device:a",
+            "value-1",
+            2000
+        ));
     }
     use serde_json::json;
 

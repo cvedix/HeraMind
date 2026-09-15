@@ -35,6 +35,7 @@ fn code_block_obj_re() -> &'static Regex {
 /// 1. JSON array: `[{"id": "call_123", "name": "tool1", "arguments": {...}}]`
 /// 2. JSON object: `{"id": "call_123", "name": "tool_name", "arguments": {...}}`
 /// 3. XML (fallback): `<tool_calls><invoke name="tool_name">...</invoke></tool_calls>`
+/// 4. Hermes (fallback): `<function name="tool_name"><param name="key">value</param></function>`
 ///
 /// Returns the remaining text along with any parsed tool calls.
 pub fn parse_tool_calls(text: &str) -> Result<(String, Vec<ToolCall>)> {
@@ -54,7 +55,181 @@ pub fn parse_tool_calls(text: &str) -> Result<(String, Vec<ToolCall>)> {
         return result;
     }
 
+    // === PRIORITY 4: Hermes format ===
+    // Fallback for Hermes-finetuned models (e.g. MiniCPM5-1B-Agentic-Tooluse) that
+    // write the tool call into the response text instead of producing structured
+    // `tool_calls`. Without this the call is shown to the user as plain text.
+    if let Some(result) = try_parse_hermes(text) {
+        return result;
+    }
+
+    // === PRIORITY 5: Pythonic format ===
+    // LFM2.5's native protocol (LiquidAI): `[tool_name(key='value', ...)]` —
+    // a Python-style call list, emitted after the model's <think> block.
+    // rkNN-converted LFM deployments reply in exactly this shape.
+    if let Some(result) = try_parse_pythonic(text) {
+        return result;
+    }
+
     Ok((text.to_string(), Vec::new()))
+}
+
+/// Try to parse Pythonic-style tool calls (LFM2.5 native format).
+///
+/// Accepts `[name(key='value')]`, possibly several calls inside one bracket
+/// list, or a bare `name(key='value')` on its own line. Values may be single-
+/// or double-quoted strings, integers, floats, or true/false. When the reply
+/// carries a `<think>...</think>` block, only the text after it is scanned so
+/// calls merely *planned* inside the reasoning never become phantom invokes.
+fn try_parse_pythonic(text: &str) -> Option<Result<(String, Vec<ToolCall>)>> {
+    let scan = match text.find("</think>") {
+        Some(pos) => &text[pos + "</think>".len()..],
+        None => text,
+    };
+
+    let call_re = call_re();
+    let mut tool_calls = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+
+    for cap in call_re.captures_iter(scan) {
+        let whole = cap.get(0)?;
+        let name = cap.get(1)?.as_str().to_string();
+        let args_src = cap.get(2)?.as_str();
+
+        // Require at least one keyword argument — `f(x)` with a bare body is
+        // far more likely to be prose (function application in an example,
+        // math) than a tool call.
+        if !args_src.contains('=') {
+            continue;
+        }
+
+        let mut arguments = serde_json::Map::new();
+        let mut parsed_any = false;
+        for part in split_top_level_commas(args_src) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((key, raw_value)) = part.split_once('=') {
+                let key = key.trim().trim_matches('"').trim_matches('\'').to_string();
+                if key.is_empty() {
+                    continue;
+                }
+                arguments.insert(key, Value::String(parse_pythonic_value(raw_value.trim())));
+                parsed_any = true;
+            }
+        }
+        if !parsed_any {
+            continue;
+        }
+
+        spans.push((whole.start(), whole.end()));
+        tool_calls.push(ToolCall {
+            name,
+            id: Uuid::new_v4().to_string(),
+            arguments: Value::Object(arguments),
+            result: None,
+            round: None,
+        });
+    }
+
+    if tool_calls.is_empty() {
+        return None;
+    }
+
+    // Remove the matched call spans from the reply text. When every call sits
+    // inside one `[...]` group whose leftover content is only separators, drop
+    // the whole group so the user doesn't see a bare "[]" remnant.
+    let mut remaining = String::with_capacity(scan.len());
+    let group = scan.find('[').zip(scan.rfind(']')).filter(|(open, close)| {
+        close > open
+            && spans.iter().all(|(s, e)| *s > *open && *e <= *close)
+            && scan[open + 1..*close].char_indices().all(|(off, c)| {
+                let abs = open + 1 + off;
+                c == ',' || c.is_whitespace() || spans.iter().any(|(s, e)| abs >= *s && abs <= *e)
+            })
+    });
+    if let Some((open, close)) = group {
+        remaining.push_str(&scan[..open]);
+        remaining.push_str(&scan[close + 1..]);
+        return Some(Ok((remaining, tool_calls)));
+    }
+    let mut cursor = 0;
+    for (start, end) in &spans {
+        remaining.push_str(&scan[cursor..*start]);
+        cursor = *end;
+    }
+    remaining.push_str(&scan[cursor..]);
+
+    Some(Ok((remaining, tool_calls)))
+}
+
+/// Lazy pre-compiled regex for one Pythonic call: `name(key=value, ...)`.
+/// Arguments must be parenthesis-free (LFM2.5 emits flat keyword calls).
+fn call_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\(([^()]*)\)")
+            .expect("pythonic call regex is a compile-time constant")
+    })
+}
+
+/// Split on commas that are not inside single/double quotes.
+fn split_top_level_commas(src: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for c in src.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_single || in_double => {
+                escaped = true;
+                current.push(c);
+            }
+            '\'' if in_single => {
+                in_single = false;
+                current.push(c);
+            }
+            '\'' if !in_double => {
+                in_single = true;
+                current.push(c);
+            }
+            '"' if in_double => {
+                in_double = false;
+                current.push(c);
+            }
+            '"' if !in_single => {
+                in_double = true;
+                current.push(c);
+            }
+            ',' if !in_single && !in_double => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    parts.push(current);
+    parts
+}
+
+/// Interpret a Pythonic argument value: quoted string, bool, number — else raw.
+fn parse_pythonic_value(raw: &str) -> String {
+    let raw = raw.trim();
+    if (raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2)
+        || (raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2)
+    {
+        return raw[1..raw.len() - 1]
+            .replace("\\'", "'")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
+    }
+    raw.to_string()
 }
 
 /// Try to parse JSON array format tool calls.
@@ -62,11 +237,30 @@ pub fn parse_tool_calls(text: &str) -> Result<(String, Vec<ToolCall>)> {
 fn try_parse_json_array(text: &str) -> Option<Result<(String, Vec<ToolCall>)>> {
     let start = text.find('[')?;
 
-    // Find matching closing bracket
+    // Find matching closing bracket — STRING-AWARE (mirror of the detector
+    // in tool_detect.rs). A ']' or '[' inside a string argument — shell
+    // globs like `ls foo[1].txt`, regexes, JSON-in-JSON — used to break the
+    // balance: the string-aware detector extracted the span but this parser
+    // failed to close it, and the attempted tool call was silently swallowed.
     let mut bracket_count = 0;
+    let mut in_string = false;
+    let mut escaped = false;
     let mut end = start;
     for (i, c) in text[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match c {
+            '"' => in_string = true,
             '[' => bracket_count += 1,
             ']' => {
                 bracket_count -= 1;
@@ -114,11 +308,51 @@ fn try_parse_json_array(text: &str) -> Option<Result<(String, Vec<ToolCall>)>> {
 fn try_parse_json_object(text: &str) -> Option<Result<(String, Vec<ToolCall>)>> {
     let start = text.find('{')?;
 
-    // Find matching closing brace
+    // Guard: a bare JSON object is treated as a tool call only when it leads
+    // the content (the model emitting the call AS the response, optionally
+    // behind a ```json fence), OR when the object carries an explicit
+    // `arguments`/`params`/`parameters` field — that's the tool-call shape,
+    // and a small model may emit it after a short preamble ("Sure, let me
+    // check. {"name": "...", "arguments": {...}}"). A data object quoted
+    // mid-prose — e.g. {"name":"obs-target","url":...} — has no arguments
+    // field and stays as content (avoids the `":` corruption, see eval run
+    // qwen4b-en push-observability).
+    let prefix = text[..start].trim();
+    if !prefix.is_empty() && !prefix.starts_with("```") {
+        // Look ahead for a tool-call-shaped object (has arguments/params).
+        if let Ok(v) = serde_json::from_str::<Value>(&text[start..]) {
+            if v.get("arguments").is_none()
+                && v.get("params").is_none()
+                && v.get("parameters").is_none()
+            {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    // Find matching closing brace — STRING-AWARE (same fix as the array
+    // scanner above; a '}' inside a string argument broke the balance).
     let mut brace_count = 0;
+    let mut in_string = false;
+    let mut escaped = false;
     let mut end = start;
     for (i, c) in text[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match c {
+            '"' => in_string = true,
             '{' => brace_count += 1,
             '}' => {
                 brace_count -= 1;
@@ -223,6 +457,132 @@ fn try_parse_xml(text: &str) -> Option<Result<(String, Vec<ToolCall>)>> {
     }
 
     Some(Ok((content.trim().to_string(), tool_calls)))
+}
+
+/// Try to parse Hermes-style tool calls emitted as *text* (rather than
+/// structured `tool_calls`) by Hermes-finetuned models such as
+/// MiniCPM5-1B-Agentic-Tooluse or Mistral-Nemo.
+///
+/// Format: `<function name="tool_name"><param name="key">value</param>...</function>`
+///
+/// Multiple sibling `<function>` blocks are treated as parallel tool calls. Any
+/// text outside the `<function>` spans is preserved as response content.
+fn try_parse_hermes(text: &str) -> Option<Result<(String, Vec<ToolCall>)>> {
+    // Fast path: no function-call markers at all.
+    if !text.contains("<function") {
+        return None;
+    }
+
+    let mut tool_calls = Vec::new();
+    // Byte ranges of matched `<function>...</function>` spans, stripped from content.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < text.len() {
+        let Some(rel) = text[cursor..].find("<function") else {
+            break;
+        };
+        let func_start = cursor + rel;
+
+        // End of the opening tag `<function ...>`.
+        let Some(open_end_rel) = text[func_start..].find('>') else {
+            break;
+        };
+        let open_end = func_start + open_end_rel;
+
+        // Matching `</function>` closing this block.
+        let body_start = open_end + 1;
+        let Some(close_rel) = text[body_start..].find("</function>") else {
+            break;
+        };
+        let func_end = body_start + close_rel + "</function>".len();
+
+        let open_tag = &text[func_start..=open_end];
+        let body = &text[body_start..body_start + close_rel];
+
+        spans.push((func_start, func_end));
+
+        // A `<function>` without a name is unusable — drop the span from content
+        // but don't emit a tool call for it.
+        if let Some(name) = extract_xml_attr(open_tag, "name") {
+            tool_calls.push(ToolCall {
+                name,
+                id: Uuid::new_v4().to_string(),
+                arguments: Value::Object(parse_hermes_params(body)),
+                result: None,
+                round: None,
+            });
+        }
+
+        cursor = func_end;
+    }
+
+    if tool_calls.is_empty() {
+        return None;
+    }
+
+    // Rebuild content by removing every matched `<function>...</function>` span.
+    let mut content = String::with_capacity(text.len());
+    let mut prev = 0usize;
+    for (start, end) in &spans {
+        content.push_str(&text[prev..*start]);
+        prev = *end;
+    }
+    content.push_str(&text[prev..]);
+
+    Some(Ok((content.trim().to_string(), tool_calls)))
+}
+
+/// Extract the value of a `name="value"` style attribute from an XML/HTML-ish
+/// opening tag. Returns `None` when the attribute is absent.
+fn extract_xml_attr(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Parse every `<param name="key">value</param>` entry from a `<function>` body
+/// into a JSON object. Self-closing `<param name="key"/>` maps to an empty string.
+fn parse_hermes_params(body: &str) -> serde_json::Map<String, Value> {
+    let mut args = serde_json::Map::new();
+    let mut cursor = 0usize;
+
+    while cursor < body.len() {
+        let Some(rel) = body[cursor..].find("<param") else {
+            break;
+        };
+        let p_start = cursor + rel;
+
+        let Some(tag_end_rel) = body[p_start..].find('>') else {
+            break;
+        };
+        let tag_end = p_start + tag_end_rel;
+        let tag = &body[p_start..=tag_end];
+
+        let Some(name) = extract_xml_attr(tag, "name") else {
+            cursor = tag_end + 1;
+            continue;
+        };
+
+        if tag.trim_end().ends_with("/>") {
+            args.insert(name, Value::String(String::new()));
+            cursor = tag_end + 1;
+            continue;
+        }
+
+        let val_start = tag_end + 1;
+        if let Some(close_rel) = body[val_start..].find("</param>") {
+            let value = body[val_start..val_start + close_rel].trim().to_string();
+            args.insert(name, Value::String(value));
+            cursor = val_start + close_rel + "</param>".len();
+        } else {
+            cursor = tag_end + 1;
+        }
+    }
+
+    args
 }
 
 /// Parse a single <invoke> element from XML.
@@ -342,6 +702,14 @@ pub fn remove_tool_calls_from_response(response: &str) -> String {
 
     // Remove JSON object format
     while let Some(start) = result.find('{') {
+        // Guard: only strip a bare object tool call when it leads the content
+        // (only whitespace before it). Code-block objects were already removed
+        // by code_block_obj_re above; any other {...} here is data quoted in
+        // prose (e.g. a push target {"name":..,"url":..} echoed in a summary),
+        // which must be preserved — stripping it truncated answers to fragments.
+        if !result[..start].trim().is_empty() {
+            break;
+        }
         let mut brace_count = 0;
         let mut end = start;
 
@@ -527,6 +895,127 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_hermes_function_format() {
+        // Hermes-style tool call, emitted as *text* by Hermes-finetuned models
+        // (e.g. MiniCPM5-1B-Agentic-Tooluse) when the model writes the call into
+        // content instead of producing structured `tool_calls`. Without a parser
+        // for this format the call is shown to the user as plain text.
+        let text = r#"<function name="get_weather_by_city_zone"><param name="city_zone">US</param></function>"#;
+        let (content, calls) = parse_tool_calls(text).unwrap();
+
+        assert!(
+            content.is_empty(),
+            "no leading prose → content should be empty, got: {content:?}"
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather_by_city_zone");
+        assert_eq!(calls[0].arguments["city_zone"], "US");
+        // Hermes text format carries no tool id → a UUID must be generated.
+        assert!(!calls[0].id.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hermes_multiple_params() {
+        let text = r#"<function name="set_thermostat"><param name="device_id">living-room</param><param name="temperature">22</param><param name="unit">celsius</param></function>"#;
+        let (_content, calls) = parse_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "set_thermostat");
+        assert_eq!(calls[0].arguments["device_id"], "living-room");
+        assert_eq!(calls[0].arguments["temperature"], "22");
+        assert_eq!(calls[0].arguments["unit"], "celsius");
+    }
+
+    #[test]
+    fn test_parse_hermes_parallel_functions() {
+        // Two sibling <function> blocks = parallel tool calls.
+        let text = r#"<function name="get_weather"><param name="city">北京</param></function><function name="get_time"><param name="zone">UTC</param></function>"#;
+        let (_content, calls) = parse_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments["city"], "北京"); // multibyte value
+        assert_eq!(calls[1].name, "get_time");
+        assert_eq!(calls[1].arguments["zone"], "UTC");
+    }
+
+    #[test]
+    fn test_parse_pythonic_lfm25_bracket_call() {
+        // LFM2.5 native format (rkNN deployments reply in exactly this shape).
+        let (content, calls) = parse_tool_calls("[shell(command='heramind device list')]").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "heramind device list");
+        assert!(
+            content.trim().is_empty(),
+            "call span removed, got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_pythonic_after_think_block() {
+        // Only text after </think> is scanned: planned-but-not-made calls in
+        // the reasoning must not become phantom invokes.
+        let text = "<think>I could call shell(command='X') here.\n</think>[shell(command='heramind device list')]";
+        let (_content, calls) = parse_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["command"], "heramind device list");
+    }
+
+    #[test]
+    fn test_parse_pythonic_multiple_and_multibyte() {
+        let text = "[device_data(device_id='sensor_01'), shell(command='heramind 规则 列表')]";
+        let (_content, calls) = parse_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "device_data");
+        assert_eq!(calls[0].arguments["device_id"], "sensor_01");
+        assert_eq!(calls[1].arguments["command"], "heramind 规则 列表");
+    }
+
+    #[test]
+    fn test_parse_pythonic_ignores_prose_without_keyword_args() {
+        // `f(x)` with no key= inside must not be mistaken for a tool call.
+        let (content, calls) = parse_tool_calls("The result is max(a, b) in general.").unwrap();
+        assert!(calls.is_empty());
+        assert!(content.contains("max(a, b)"));
+    }
+
+    #[test]
+    fn test_parse_hermes_preserves_surrounding_text_and_trims_values() {
+        let text = "Let me check the weather.\n<function name=\"get_weather\"><param name=\"city\">  北京  </param></function>\nDone.";
+        let (content, calls) = parse_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments["city"], "北京"); // value trimmed
+        assert!(
+            content.contains("Let me check the weather."),
+            "leading prose must survive as content, got: {content:?}"
+        );
+        assert!(
+            content.contains("Done."),
+            "trailing prose must survive as content, got: {content:?}"
+        );
+        assert!(
+            !content.contains("<function"),
+            "function span must be stripped from content, got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_hermes_no_params() {
+        // Real emission from MiniCPM5-1B-Agentic in HeraMind chat (2026-07-24):
+        // user asked "今天是什么日子？", model wrote a parameter-less call as text.
+        let text = r#"<function name="get_datetime"></function>"#;
+        let (content, calls) = parse_tool_calls(text).unwrap();
+        assert!(content.is_empty(), "got: {content:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_datetime");
+        assert!(
+            calls[0].arguments.as_object().unwrap().is_empty(),
+            "no <param> → empty arguments object"
+        );
+        assert!(!calls[0].id.is_empty());
+    }
+
+    #[test]
     fn test_json_priority_over_xml() {
         // When both formats exist, JSON should be parsed first
         let text = r#"[{"id": "call_json", "name": "list_devices"}]<tool_calls><invoke name="list_rules"></invoke></tool_calls>"#;
@@ -557,6 +1046,62 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_does_not_steal_quoted_json_object_in_prose() {
+        // Regression (eval qwen4b-en push-observability, 2026-08-03): a model
+        // summary that quotes a data object carrying a "name" field (here a
+        // push target echoed from a tool result) must NOT be parsed as a tool
+        // call — doing so stole the object and truncated the answer to `":`.
+        let text = "Here are the delivery logs:\n\
+            {\"name\": \"obs-target\", \"type\": \"webhook\", \"url\": \"https://example.com/obs\"}\n\
+            No deliveries yet.";
+        let (content, calls) = parse_tool_calls(text).unwrap();
+        assert!(
+            calls.is_empty(),
+            "quoted data object must not be parsed as a tool call"
+        );
+        assert_eq!(content, text, "content must be preserved verbatim");
+    }
+
+    #[test]
+    fn test_parse_does_not_steal_deeply_nested_quoted_object() {
+        // Same class: a config/payload object quoted inside a longer summary,
+        // where the leading `{` is not the first non-whitespace token.
+        let text = "Payload sent: {\"name\": \"event\", \"value\": 42, \"meta\": {\"ok\": true}} — delivered.";
+        let (content, calls) = parse_tool_calls(text).unwrap();
+        assert!(calls.is_empty());
+        assert_eq!(content, text);
+    }
+
+    #[test]
+    fn test_remove_tool_calls_preserves_quoted_object_in_prose() {
+        let text = "Logs for {\"name\": \"obs-target\", \"type\": \"webhook\"} show 0 deliveries.";
+        let cleaned = remove_tool_calls_from_response(text);
+        assert_eq!(
+            cleaned, text,
+            "quoted data object in prose must not be stripped"
+        );
+    }
+
+    #[test]
+    fn test_parse_leading_bare_json_object_still_parses() {
+        // Sanity: the "object must lead" guard must not break a genuine
+        // bare-object tool call emitted as the whole response.
+        let text = "{\"name\": \"list_devices\", \"arguments\": {\"type\": \"sensor\"}}";
+        let (_content, calls) = parse_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list_devices");
+        assert_eq!(calls[0].arguments["type"], "sensor");
+    }
+
+    #[test]
+    fn test_remove_tool_calls_strips_leading_bare_object() {
+        // Sanity: a leading bare-object tool call IS still stripped.
+        let text = "{\"name\": \"list_devices\", \"arguments\": {}}";
+        let cleaned = remove_tool_calls_from_response(text);
+        assert_eq!(cleaned, "");
+    }
+
+    #[test]
     fn test_remove_tool_calls() {
         let response = r#"Checking... [{"id": "call_1", "name": "test"}] done"#;
         let cleaned = remove_tool_calls_from_response(response);
@@ -564,5 +1109,29 @@ mod tests {
         assert!(cleaned.contains("Checking..."));
         assert!(cleaned.contains("done"));
         assert!(!cleaned.contains("call_1"));
+    }
+}
+
+#[cfg(test)]
+mod string_aware_tests {
+    use super::*;
+
+    #[test]
+    fn json_array_tool_call_with_bracket_in_string_arg() {
+        // The detector is string-aware; the parser used not to be — a `]`
+        // inside a string argument broke the balance and the extracted call
+        // was silently swallowed.
+        let text = r#"[{"name": "shell", "arguments": {"command": "ls foo[1].txt"}}]"#;
+        let (_content, calls) = parse_tool_calls(text).expect("parse ok");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn json_object_tool_call_with_brace_in_string_arg() {
+        let text = r#"{"name": "file_edit", "arguments": {"old_string": "fn main() {", "new_string": "fn main() {}"}}"#;
+        let (_content, calls) = parse_tool_calls(text).expect("parse ok");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_edit");
     }
 }

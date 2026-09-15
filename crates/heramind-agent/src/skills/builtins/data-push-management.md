@@ -1,6 +1,7 @@
 ---
 id: data-push-management
 name: Data Push Management & Target Configuration
+description: Use when the user wants to forward or export data to external systems — webhook/MQTT push targets, push schedules, delivery history, test pushes. Covers push create/update/test/logs even without saying 'push' (e.g. '把数据转发到我的服务器', '数据导出'). Includes 数据推送/转发/导出/webhook 推送.
 category: push
 origin: builtin
 priority: 75
@@ -17,6 +18,23 @@ anti_triggers:
 # Data Push Management & Target Configuration
 
 Data Push forwards device metrics and extension outputs to external systems (webhook, MQTT broker) in real-time or on a schedule.
+
+## Command Cheat-Sheet (run these via `shell`)
+
+Always RUN the command yourself and report the real output. The CLI group is `heramind push` (not `data-push`).
+
+| Command | Purpose |
+|---|---|
+| `heramind push list` | List push targets |
+| `heramind push get <id>` | Push target details |
+| `heramind push create` | Create a push target |
+| `heramind push update <id>` | Update a push target |
+| `heramind push delete <id>` | Delete a push target |
+| `heramind push enable <id>` | Enable a target (alias for `push start`) |
+| `heramind push disable <id>` | Disable a target (alias for `push stop`) |
+| `heramind push test <id>` | Test a push target |
+| `heramind push logs <id>` | Delivery logs for a target |
+| `heramind push stats` | Push statistics |
 
 ## CRITICAL Rules
 
@@ -132,6 +150,9 @@ Use `--sources` to filter which data sources get forwarded. Format: `{type}:{id}
 
 # Push all data from an extension
 --sources "extension:weather:*"
+
+# Push a transform's output metric (transform's id + plain field, NOT output_prefix)
+--sources "transform:<transform_id>:roi_count"
 
 # Push everything (default, omit --sources)
 ```

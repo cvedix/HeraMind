@@ -73,6 +73,7 @@ COPY crates/heramind-messages/Cargo.toml crates/heramind-messages/Cargo.toml
 COPY crates/heramind-extension-sdk/Cargo.toml crates/heramind-extension-sdk/Cargo.toml
 COPY crates/heramind-extension-runner/Cargo.toml crates/heramind-extension-runner/Cargo.toml
 COPY crates/heramind-data-push/Cargo.toml crates/heramind-data-push/Cargo.toml
+COPY crates/heramind-core/tests/fixtures/smoke-extension/Cargo.toml crates/heramind-core/tests/fixtures/smoke-extension/Cargo.toml
 
 # Create dummy source files for dependency caching
 RUN mkdir -p crates/heramind-core/src && echo "" > crates/heramind-core/src/lib.rs && \
@@ -86,7 +87,9 @@ RUN mkdir -p crates/heramind-core/src && echo "" > crates/heramind-core/src/lib.
     mkdir -p crates/heramind-messages/src && echo "" > crates/heramind-messages/src/lib.rs && \
     mkdir -p crates/heramind-extension-sdk/src && echo "" > crates/heramind-extension-sdk/src/lib.rs && \
     mkdir -p crates/heramind-extension-runner/src && echo "" > crates/heramind-extension-runner/src/lib.rs && \
-    mkdir -p crates/heramind-data-push/src && echo "" > crates/heramind-data-push/src/lib.rs
+    mkdir -p crates/heramind-data-push/src && echo "" > crates/heramind-data-push/src/lib.rs && \
+    mkdir -p crates/heramind-core/tests/fixtures/smoke-extension/src && echo "" > crates/heramind-core/tests/fixtures/smoke-extension/src/lib.rs && \
+    mkdir -p crates/heramind-core/tests/fixtures/smoke-extension && echo "fn main(){}" > crates/heramind-core/tests/fixtures/smoke-extension/build.rs
 
 # jemalloc (heramind-cli global allocator) must assume 64KB pages on ARM, else it
 # crashes on 64KB-page hosts like Raspberry Pi 5 / Jetson (the arm64 container
@@ -95,22 +98,71 @@ RUN mkdir -p crates/heramind-core/src && echo "" > crates/heramind-core/src/lib.
 RUN if [ "$TARGETARCH" = "arm64" ] || [ "$TARGETARCH" = "aarch64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
     cargo build --release -p heramind-cli -p heramind-extension-runner 2>/dev/null || true
 
-# Copy real source code and build
+# Copy real source code and build.
 COPY crates/ crates/
-RUN if [ "$TARGETARCH" = "arm64" ] || [ "$TARGETARCH" = "aarch64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
+# COPY preserves the context's (git-checkout) mtimes, which can be OLDER than
+# the dummy-source artifacts from the dependency-cache layer above — cargo's
+# mtime fingerprints then consider the real sources unchanged and silently
+# reuses the EMPTY dummy crates (observed: extension-runner importing an SDK
+# that "has no symbols"). Touching every source file after the copy forces a
+# rebuild of all workspace crates while keeping the dependency cache.
+RUN find crates/ -name "*.rs" -exec touch {} + && \
+    if [ "$TARGETARCH" = "arm64" ] || [ "$TARGETARCH" = "aarch64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
     cargo build --release -p heramind-cli -p heramind-extension-runner
 
 # ---------------------------------------------------------------------------
 # Stage 3: Runtime (ubuntu:22.04 = glibc 2.35, same as build)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Stage 3: Bundled llama-server (llama.cpp) for the builtin LFM model.
+#   amd64 → GGML_AMX_INT8=OFF (llama.cpp #19184: AMX breaks LFM shortconv)
+#   arm64 → default (NEON)
+# ---------------------------------------------------------------------------
+FROM --platform=$TARGETPLATFORM ubuntu:22.04 AS llamaserver
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates cmake build-essential \
+    && rm -rf /var/lib/apt/lists/*
+# curl+tarball (not git clone) — Docker build networks often block git; the
+# tarball is a plain HTTPS GET and is uniformly reliable.
+RUN curl -fsSL -o /tmp/llama.cpp.tar.gz \
+      https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10545.tar.gz \
+    && mkdir -p /build/llama.cpp \
+    && tar -xzf /tmp/llama.cpp.tar.gz -C /build/llama.cpp --strip-components=1 \
+    && rm /tmp/llama.cpp.tar.gz
+WORKDIR /build/llama.cpp
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_AMX_INT8=OFF; \
+    else \
+      cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF; \
+    fi \
+    && cmake --build build --target llama-server -j"$(nproc)"
+
 FROM ubuntu:22.04 AS runtime
+
+# Which builtin model to pre-bundle into the image (out-of-box agent use).
+#   lfm25-2.6b | qwen3.5-4b | gemma4-e2b | none
+# `none` skips the ~1.5-3GB download — for deployments that bring their own
+# LLM backend or want the smallest image (the in-app wizard can still
+# download a model on demand).
+ARG HERAMIND_BUNDLE_MODEL=lfm25-2.6b
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # apt-get upgrade patches base-image packages between refreshes (the main
 # source of "high" findings in image scans). Then add runtime deps.
+#
+# python3 + python3-pip: agents and Python-sidecar extensions (voice / TTS /
+# ASR / OCR-VL…) invoke `python3` for data processing and sidecar services.
+# Without it, `python3` in the container exits 127 and those workloads fail.
+# python-is-python3: scripts/extensions that hardcode `python` get it too.
+#
+# ffmpeg intentionally NOT included: +~326MB for media/stream pipelines
+# (stream-player, video extensions). If you need it, add `ffmpeg` to the apt
+# line below — the image then grows to ~450MB.
 RUN apt-get update && apt-get upgrade -y && \
-    apt-get install -y --no-install-recommends ca-certificates curl tzdata && \
+    apt-get install -y --no-install-recommends ca-certificates curl tzdata \
+        python3 python3-pip python-is-python3 \
+        libgomp1 && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --system heramind && useradd --system --gid heramind --home-dir /app heramind
 
@@ -120,18 +172,53 @@ WORKDIR /app
 COPY --from=backend /build/target/release/heramind /usr/local/bin/heramind
 COPY --from=backend /build/target/release/heramind-extension-runner /usr/local/bin/heramind-extension-runner
 
+# Copy the bundled llama-server (spawned by the builtin LFM bootstrap).
+# NOTE: links against libgomp (OpenMP) — the runtime stage's `libgomp1` is
+# what makes this binary exec; removing it silently breaks the builtin LLM.
+COPY --from=llamaserver /build/llama.cpp/build/bin/llama-server /usr/local/bin/heramind-llama-server
+
 # Copy frontend build output
 COPY --from=frontend /build/web/dist /var/www/heramind
 
-# Create data directory
-RUN mkdir -p /app/data && chown -R heramind:heramind /app/data
+# Pre-bundle the chosen builtin model (or none). The bootstrap reads the
+# manifest, so both the GGUF and manifest.json must land under
+# /app/data/models/<id>/. The VOLUME at /app/data initializes from this
+# content on first run; a bind-mounted /app/data skips the seed (use the
+# download API there).
+#
+# Each model maps to its HF repo file + the canonical local name + pinned
+# sha (must match crates/heramind-core/src/builtin_llm/manifest.rs).
+RUN set -eu; \
+    mkdir -p /app/data; \
+    id="$HERAMIND_BUNDLE_MODEL"; \
+    case "$id" in \
+      none) echo "HERAMIND_BUNDLE_MODEL=none — no model pre-bundled";; \
+      lfm25-2.6b) \
+        d=/app/data/models/lfm25-2.6b; mkdir -p "$d"; \
+        curl -fsSL -o "$d/lfm25-2.6b-qad_q4_0.gguf" https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/resolve/main/LFM2.5-2.6B-QAD-Q4_0.gguf; \
+        printf '{"id":"lfm25-2.6b","version":"1.0","file_name":"lfm25-2.6b-qad_q4_0.gguf","sha256":"a247afd6414918eac8e520a9e6137dc271235461ecbe1180462221d5b8d40b03","quant":"qad_q4_0"}' > "$d/manifest.json";; \
+      qwen3.5-4b) \
+        d=/app/data/models/qwen3.5-4b; mkdir -p "$d"; \
+        curl -fsSL -o "$d/qwen3.5-4b-q4_k_m.gguf" https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf; \
+        printf '{"id":"qwen3.5-4b","version":"1.0","file_name":"qwen3.5-4b-q4_k_m.gguf","sha256":"00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4","quant":"q4_k_m"}' > "$d/manifest.json";; \
+      gemma4-e2b) \
+        d=/app/data/models/gemma4-e2b; mkdir -p "$d"; \
+        curl -fsSL -o "$d/gemma-4-E2B_q4_0-it.qat.gguf" https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf; \
+        printf '{"id":"gemma4-e2b","version":"1.0","file_name":"gemma-4-E2B_q4_0-it.qat.gguf","sha256":"fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634","quant":"qat_q4_0"}' > "$d/manifest.json";; \
+      *) echo "Unknown HERAMIND_BUNDLE_MODEL: $id" >&2; exit 1;; \
+    esac; \
+    chown -R heramind:heramind /app/data
 
 # Environment defaults
 ENV HERAMIND_WEB_DIR=/var/www/heramind
+# Marker for the self-upgrade feature: containers upgrade by replacing the
+# image (docker compose pull && up -d), never in-place — the About page
+# shows that hint instead of an upgrade button.
+ENV HERAMIND_IN_DOCKER=1
 ENV RUST_LOG=heramind=info
 ENV RUST_BACKTRACE=1
 
-EXPOSE 9375 1883
+EXPOSE 9375 1883 8081
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

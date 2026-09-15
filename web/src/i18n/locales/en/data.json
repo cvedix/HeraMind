@@ -1,6 +1,6 @@
 {
   "title": "Data Explorer",
-  "subtitle": "Browse all data sources across devices, extensions, and transforms",
+  "subtitle": "Browse data sources and push them to external systems",
   "tabs": {
     "all": "Data Sources",
     "device": "Devices",
@@ -61,5 +61,13 @@
     "6h": "6h",
     "24h": "24h",
     "7d": "7d"
+  },
+  "historyLoadFailed": "Failed to load historical data",
+  "retry": "Retry",
+  "chartTruncated": "Showing the latest {{count}} points",
+  "stats": {
+    "min": "Min",
+    "max": "Max",
+    "avg": "Avg"
   }
 }

@@ -383,6 +383,11 @@ pub struct CommandDefinition {
     /// Display name
     #[serde(default)]
     pub display_name: String,
+    /// Description (optional — defaults to empty). A command without a
+    /// description is valid; this matches the tolerance of every other field
+    /// here and of MetricDefinition. Previously required, which 422'd valid
+    /// template-registration payloads missing it.
+    #[serde(default)]
     pub description: String,
 
     /// Payload template (supports ${param} variables)
@@ -849,20 +854,20 @@ impl MdlRegistry {
                             }
                         }
                     }
-                    MetricDataType::Enum { options } => {
-                        if !param.allowed_values.is_empty() && !options.is_empty() {
-                            // Check that allowed_values match the enum options
-                            for allowed in &param.allowed_values {
-                                let allowed_str = match allowed {
-                                    MetricValue::String(s) => s.as_str(),
-                                    _ => continue,
-                                };
-                                if !options.iter().any(|v| v == allowed_str) {
-                                    return Err(DeviceError::InvalidParameter(format!(
+                    MetricDataType::Enum { options }
+                        if !param.allowed_values.is_empty() && !options.is_empty() =>
+                    {
+                        // Check that allowed_values match the enum options
+                        for allowed in &param.allowed_values {
+                            let allowed_str = match allowed {
+                                MetricValue::String(s) => s.as_str(),
+                                _ => continue,
+                            };
+                            if !options.iter().any(|v| v == allowed_str) {
+                                return Err(DeviceError::InvalidParameter(format!(
                                         "command '{}', parameter '{}': allowed_value '{}' is not in enum options",
                                         command.name, param.name, allowed_str
                                     )));
-                                }
                             }
                         }
                     }

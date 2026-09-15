@@ -1,69 +1,56 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react"
 import { createPortal } from "react-dom"
+import { usePageSidebarSlot, PageSidebarColumn } from "@/components/layout/PageSidebarSlot"
 import { useTranslation } from "react-i18next"
 import { useStore } from "@/store"
 import { shallow } from "zustand/shallow"
 import { useParams, useNavigate, useSearchParams } from "react-router-dom"
 import { generateId } from "@/lib/id"
-import { Settings, Send, Sparkles, PanelLeft, MessageSquare, Zap, ChevronDown, X, Image as ImageIcon, Loader2, Eye, Brain, Wrench, RotateCcw, Plus, Check, ArrowUp } from "lucide-react"
+import { Settings, Sparkles, MessageSquare, Loader2, RotateCcw, Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-  DropdownMenuLabel,
-} from "@/components/ui/dropdown-menu"
 import { SessionSidebar } from "@/components/session/SessionSidebar"
 import { WelcomeArea } from "@/components/chat/WelcomeArea"
-import { MarkdownMessage } from "@/components/chat/MarkdownMessage"
-import { ThinkingBlock } from "@/components/chat/ThinkingBlock"
+import { ChatMessages } from "@/components/chat/ChatMessages"
+import { ChatComposer } from "@/components/chat/ChatComposer"
+import { ConnectionStatus } from "@/components/chat/ConnectionStatus"
 import { MobilePageHeader } from "@/components/layout/MobilePageHeader"
-import { ToolProcessBlock, isThinkingDuplicate } from "@/components/chat/ToolCallVisualization"
-import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { ws, type ConnectionState } from "@/lib/websocket"
 import { api } from "@/lib/api"
 import type { Message, ServerMessage, ChatImage } from "@/types"
 import { cn } from "@/lib/utils"
-import { textNano, textMini, textMicro } from "@/design-system/tokens/typography"
 import { getPortalRoot } from "@/lib/portal"
-import { formatTimestamp } from "@/lib/utils/format"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
+import { LoadingState } from "@/components/shared"
 import { forceViewportReset } from "@/hooks/useVisualViewport"
 import { useToast } from "@/hooks/use-toast"
-import { mergeMessagesForDisplay, cleanToolCallJson } from "@/lib/messageUtils"
-import { useOnboarding } from "@/hooks/useOnboarding"
-import { OnboardingDialog } from "@/components/onboarding/OnboardingDialog"
+import { LlmSetupGuide } from "@/components/llm/LlmSetupGuide"
 
-/** Image gallery component for user messages */
-function MessageImages({ images }: { images: ChatImage[] }) {
-  if (!images || images.length === 0) return null
-
-  return (
-    <div className={images.length === 1 ? "mb-2" : "mb-2 grid grid-cols-2 gap-2"}>
-      {images.map((img, idx) => (
-        <img
-          key={idx}
-          src={img.data}
-          alt={`Image ${idx + 1}`}
-          className="rounded-lg max-w-full max-h-64 object-cover"
-          loading="lazy"
-        />
-      ))}
-    </div>
-  )
+// Hook to detect desktop breakpoint — md: 768px, matching the app-wide
+// breakpoint (useIsMobile < 768). The old 1024 left the 768–1024 band in a
+// hybrid state.
+// Character estimator with the backend's weights (CJK ≈1.8 tokens/char,
+// ASCII ≈0.25/char, ×1.1 buffer) — the old chars/3 underestimated Chinese
+// ~5x, which made the ring look like it RESET on every send.
+function estimateTokens(text: string): number {
+  let cjk = 0, ascii = 0, digits = 0, special = 0
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0
+    if ((cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0x3400 && cp <= 0x4dbf) || (cp >= 0x3000 && cp <= 0x303f) || (cp >= 0xff00 && cp <= 0xffef)) cjk++
+    else if (ch >= '0' && ch <= '9') digits++
+    else if (/[a-zA-Z]/.test(ch)) ascii++
+    else special++
+  }
+  return Math.ceil((cjk * 1.8 + ascii * 0.25 + digits * 0.3 + special * 0.5) * 1.1)
 }
 
-// Hook to detect desktop breakpoint (lg: 1024px)
 function useIsDesktop() {
   const [isDesktop, setIsDesktop] = useState(() => {
     if (typeof window === 'undefined') return false
-    return window.innerWidth >= 1024
+    return window.innerWidth >= 768
   })
 
   useEffect(() => {
-    const checkIsDesktop = () => setIsDesktop(window.innerWidth >= 1024)
+    const checkIsDesktop = () => setIsDesktop(window.innerWidth >= 768)
     window.addEventListener("resize", checkIsDesktop)
     return () => window.removeEventListener("resize", checkIsDesktop)
   }, [])
@@ -79,97 +66,20 @@ function getActiveBackendSupportsMultimodal(llmBackends: any[], activeBackendId:
 }
 
 // Convert file to base64 data URL
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(reader.result as string)
-    reader.onerror = reject
-    reader.readAsDataURL(file)
-  })
-}
-
-// Compress image to target size (default 2MB)
-async function compressImage(file: File, maxSizeMB: number = 2): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = (e) => {
-      const img = new Image()
-      img.onload = () => {
-        const canvas = document.createElement('canvas')
-        let width = img.width
-        let height = img.height
-
-        // Calculate new dimensions to reduce file size
-        const maxDimension = 2048
-        if (width > maxDimension || height > maxDimension) {
-          if (width > height) {
-            height = (height / width) * maxDimension
-            width = maxDimension
-          } else {
-            width = (width / height) * maxDimension
-            height = maxDimension
-          }
-        }
-
-        canvas.width = width
-        canvas.height = height
-
-        const ctx = canvas.getContext('2d')
-        if (!ctx) {
-          reject(new Error('Failed to get canvas context'))
-          return
-        }
-
-        ctx.drawImage(img, 0, 0, width, height)
-
-        // Try different quality levels to meet size target
-        let quality = 0.9
-        const tryCompress = () => {
-          canvas.toBlob(
-            (blob) => {
-              if (!blob) {
-                reject(new Error('Failed to compress image'))
-                return
-              }
-
-              const sizeMB = blob.size / (1024 * 1024)
-
-              // If size is acceptable or quality is too low, use this result
-              if (sizeMB <= maxSizeMB || quality <= 0.5) {
-                const reader = new FileReader()
-                reader.onload = () => resolve(reader.result as string)
-                reader.onerror = reject
-                reader.readAsDataURL(blob)
-              } else {
-                // Try lower quality
-                quality -= 0.1
-                tryCompress()
-              }
-            },
-            'image/jpeg',
-            quality
-          )
-        }
-
-        tryCompress()
-      }
-      img.onerror = () => reject(new Error('Failed to load image'))
-      img.src = e.target?.result as string
-    }
-    reader.onerror = reject
-    reader.readAsDataURL(file)
-  })
-}
 
 export function ChatPage() {
   const { t } = useTranslation(['common', 'chat'])
   const { toast } = useToast()
   const { sessionId: urlSessionId } = useParams<{ sessionId?: string }>()
   const navigate = useNavigate()
+  const openSettings = useStore((s) => s.openSettings)
   const [searchParams, setSearchParams] = useSearchParams()
   const { handleError } = useErrorHandler()
   const llmBackends = useStore((state) => state.llmBackends)
   const llmBackendLoading = useStore((state) => state.llmBackendLoading)
+  // True once a load has resolved with an empty list — distinguishes the
+  // first load (skeleton) from refetches (keep the guide mounted).
+  const everLoadedBackendsRef = useRef(false)
   const activeBackendId = useStore((state) => state.activeBackendId)
   const activateBackend = useStore((state) => state.activateBackend)
   const loadBackends = useStore((state) => state.loadBackends)
@@ -202,9 +112,28 @@ export function ChatPage() {
   const [streamingContent, setStreamingContent] = useState("")
   const [streamingThinking, setStreamingThinking] = useState("")
   const [streamingToolCalls, setStreamingToolCalls] = useState<any[]>([])
-  const [lastTokenUsage, setLastTokenUsage] = useState<{ promptTokens: number } | null>(null)
+  const [lastTokenUsage, setLastTokenUsage] = useState<{ promptTokens: number; systemPromptTokens?: number; toolTokens?: number } | null>(null)
+
+  // Token usage survives reloads/session switches — the context it measured
+  // is unchanged until the next reply, so a restored session shows real
+  // numbers instead of falling back to the character estimate.
+  const tokenUsageKey = (sid: string) => `heramind:tokenUsage:${sid}`
+  const restoreTokenUsage = (sid: string | undefined) => {
+    if (!sid) { setLastTokenUsage(null); return }
+    try {
+      const raw = localStorage.getItem(tokenUsageKey(sid))
+      setLastTokenUsage(raw ? JSON.parse(raw) : null)
+    } catch { setLastTokenUsage(null) }
+  }
+  const persistTokenUsage = (sid: string | undefined, usage: { promptTokens: number; systemPromptTokens?: number; toolTokens?: number } | null) => {
+    if (!sid) return
+    try {
+      if (usage) localStorage.setItem(tokenUsageKey(sid), JSON.stringify(usage))
+      else localStorage.removeItem(tokenUsageKey(sid))
+    } catch { /* storage unavailable */ }
+  }
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const pageSidebarSlot = usePageSidebarSlot()
   // Track the ID of the last assistant message for tool call result updates
   const [lastAssistantMessageId, setLastAssistantMessageId] = useState<string | null>(null)
 
@@ -221,8 +150,6 @@ export function ChatPage() {
 
   // Image upload state
   const [attachedImages, setAttachedImages] = useState<ChatImage[]>([])
-  const [isUploadingImage, setIsUploadingImage] = useState(false)
-  const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Responsive
   const isDesktop = useIsDesktop()
@@ -236,6 +163,11 @@ export function ChatPage() {
   // Round tracking for multi-round tool calling
   const [roundContents, setRoundContents] = useState<Record<number, string>>({})
   const [streamingRoundThinking, setStreamingRoundThinking] = useState<Record<number, string>>({})
+  // Active tool-loop round, derived from the last in-flight tool call — no
+  // own state to reset (all streaming resets clear streamingToolCalls).
+  const activeToolRound = streamingToolCalls.length > 0
+    ? (streamingToolCalls[streamingToolCalls.length - 1].round ?? null)
+    : null
   const currentRoundRef = useRef(1)
   const roundContentsAccumulatorRef = useRef<Record<number, string>>({})
   // Accumulate thinking across all rounds (interleaved thinking pattern)
@@ -266,21 +198,6 @@ export function ChatPage() {
     }
   }, [])
 
-  // Onboarding auto-detect: show getting-started dialog for new installations
-  const [onboardingOpen, setOnboardingOpen] = useState(false)
-  const hasShownOnboarding = useRef(false)
-  const { status: onboardingStatus, dismiss: dismissOnboarding, fetchStatus: fetchOnboardingStatus } = useOnboarding()
-
-  useEffect(() => {
-    if (hasShownOnboarding.current || !onboardingStatus) return
-    // Auto-open onboarding if not dismissed and has incomplete steps
-    if (!onboardingStatus.dismissed && (!onboardingStatus.steps.llm.completed || !onboardingStatus.steps.device.completed)) {
-      hasShownOnboarding.current = true
-      const timer = setTimeout(() => setOnboardingOpen(true), 1000)
-      return () => clearTimeout(timer)
-    }
-  }, [onboardingStatus])
-
   // Refresh backends when window gains focus (e.g., returning from settings page)
   useEffect(() => {
     const handleFocus = () => {
@@ -292,6 +209,25 @@ export function ChatPage() {
 
   // Get sessions from store for navigation logic
   const sessions = useStore((state) => state.sessions)
+
+  // Prune per-session token-usage keys whose session no longer exists —
+  // deleting a session never removed its key, so entries accumulated for
+  // the life of the browser profile.
+  useEffect(() => {
+    if (sessions.length === 0) return
+    const live = new Set(sessions.map(s => s.sessionId))
+    try {
+      const stale: string[] = []
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i)
+        if (key?.startsWith('heramind:tokenUsage:')) {
+          const sid = key.slice('heramind:tokenUsage:'.length)
+          if (!live.has(sid)) stale.push(key)
+        }
+      }
+      stale.forEach(k => localStorage.removeItem(k))
+    } catch { /* storage unavailable */ }
+  }, [sessions])
 
   // Load session from URL parameter (only when on /chat/:sessionId)
   // This effect handles all session switches triggered by URL changes:
@@ -311,6 +247,8 @@ export function ChatPage() {
       clearMessages()
       setLastTokenUsage(null)
     }
+    // Restore the persisted per-session usage (falls back to estimate if absent)
+    restoreTokenUsage(urlSessionId)
   }, [urlSessionId, switchSession, handleError, clearMessages])
 
   // Handle deleted session redirects and root path
@@ -361,6 +299,9 @@ export function ChatPage() {
   // list. We only auto-scroll on new content while pinned. If the user has
   // scrolled up to read history, auto-scrolling would yank them back down —
   // extremely annoying when waiting for a long response while reviewing context.
+  // First streamed-event timestamp of the current reply — used at `end`
+  // to report wall time + an estimated tok/s figure on the message.
+  const streamStartRef = useRef<number | null>(null)
   const isPinnedToBottomRef = useRef(true)
 
   const handleScroll = useCallback(() => {
@@ -416,6 +357,7 @@ export function ChatPage() {
     const handleMessage = (data: ServerMessage) => {
       switch (data.type) {
         case "Thinking":
+          if (streamStartRef.current === null) streamStartRef.current = Date.now()
           setIsStreaming(true)
           // Immediately update ref synchronously before setState
           capturedStreamingRef.current.thinking += (data.content || "")
@@ -423,6 +365,7 @@ export function ChatPage() {
           break
 
         case "Content":
+          if (streamStartRef.current === null) streamStartRef.current = Date.now()
           setIsStreaming(true)
           // Immediately update ref synchronously before setState
           capturedStreamingRef.current.content += (data.content || "")
@@ -468,7 +411,13 @@ export function ChatPage() {
         case "end": {
           // Capture token usage from backend
           if (data.tokenUsage?.promptTokens) {
-            setLastTokenUsage({ promptTokens: data.tokenUsage.promptTokens })
+            const usage = {
+              promptTokens: data.tokenUsage.promptTokens,
+              systemPromptTokens: data.tokenUsage.systemPromptTokens,
+              toolTokens: data.tokenUsage.toolTokens,
+            }
+            setLastTokenUsage(usage)
+            persistTokenUsage(data.sessionId || urlSessionId, usage)
           }
           const toolCalls = capturedStreamingRef.current.toolCalls
           // Accumulate thinking from current round into total
@@ -488,11 +437,18 @@ export function ChatPage() {
           const messageContent = lastRoundContent
           if (messageContent || thinking || toolCalls.length > 0) {
             const messageId = streamingMessageIdRef.current || generateId()
+            // Reply metric: wall time from the first streamed event. The
+            // per-second figure shown next to it is chars/s (exact — the
+            // frontend has the full text; token counts would be a guess).
+            const generationMs = streamStartRef.current !== null
+              ? Date.now() - streamStartRef.current
+              : undefined
             const completeMessage: Message = {
               id: messageId,
               role: "assistant",
               content: messageContent,
               timestamp: Date.now(),
+              generationMs,
               thinking: thinking || undefined,
               tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
               round_contents: hasRoundContents ? roundContentsAccumulatorRef.current : undefined,
@@ -509,6 +465,29 @@ export function ChatPage() {
           setStreamingRoundThinking({})
           // Reset captured ref
           capturedStreamingRef.current = { content: "", thinking: "", toolCalls: [] }
+          streamStartRef.current = null
+          streamingMessageIdRef.current = null
+          currentRoundRef.current = 1
+          roundContentsAccumulatorRef.current = {}
+          thinkingAccumulatorRef.current = ""
+          roundThinkingAccumulatorRef.current = {}
+          break
+        }
+
+        case "cancelled": {
+          // Server acknowledged __CANCEL__. No trailing 'end' is guaranteed
+          // on this path — reset ALL stream state here or the composer
+          // stays locked and the bubble spins forever. (The user-initiated
+          // path already rendered a local notice; this covers cancels from
+          // other tabs/devices on the same session.)
+          setIsStreaming(false)
+          setStreamingContent("")
+          setStreamingThinking("")
+          setStreamingToolCalls([])
+          setRoundContents({})
+          setStreamingRoundThinking({})
+          capturedStreamingRef.current = { content: "", thinking: "", toolCalls: [] }
+          streamStartRef.current = null
           streamingMessageIdRef.current = null
           currentRoundRef.current = 1
           roundContentsAccumulatorRef.current = {}
@@ -689,52 +668,6 @@ export function ChatPage() {
   }
 
   // Toggle skill selection
-  // Handle image file selection
-  const handleImageSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files
-    if (!files || files.length === 0) return
-
-    setIsUploadingImage(true)
-    try {
-      const newImages: ChatImage[] = []
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i]
-        if (!file.type.startsWith('image/')) continue
-
-        // Limit original file size to 10MB
-        if (file.size > 10 * 1024 * 1024) {
-          toast({ title: `Image ${file.name} is too large. Maximum size is 10MB.`, variant: "destructive" })
-          continue
-        }
-
-        // Compress image to 2MB for better performance
-        const dataUrl = await compressImage(file, 2)
-        newImages.push({
-          data: dataUrl,
-          mimeType: 'image/jpeg', // Compressed images are always JPEG
-        })
-      }
-
-      if (newImages.length > 0) {
-        setAttachedImages(prev => [...prev, ...newImages])
-      }
-    } catch (error) {
-      handleError(error, { operation: 'Process images', showToast: false })
-      toast({ title: t('common:imageProcessFailed'), variant: "destructive" })
-    } finally {
-      setIsUploadingImage(false)
-      // Reset file input
-      if (fileInputRef.current) {
-        fileInputRef.current.value = ''
-      }
-    }
-  }
-
-  // Remove attached image
-  const removeAttachedImage = (index: number) => {
-    setAttachedImages(prev => prev.filter((_, i) => i !== index))
-  }
-
   // Check if multimodal is supported
   const supportsMultimodal = getActiveBackendSupportsMultimodal(llmBackends, activeBackendId)
 
@@ -835,42 +768,64 @@ export function ChatPage() {
     [messages]
   )
 
-  const displayMessages = useMemo(() =>
-    mergeMessagesForDisplay(filteredMessages),
-    [filteredMessages]
-  )
-
   // Show chat area if there are messages or currently streaming
   const hasMessages = filteredMessages.length > 0 || isStreaming
 
-  // Show LLM setup prompt if not configured (only after loading completes)
-  if (!llmBackendLoading && (!llmBackends || llmBackends.length === 0)) {
-    return (
-      <div className="flex h-full items-center justify-center bg-background">
-        <div className="text-center max-w-md px-6">
-          <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-xl bg-muted">
-            <Settings className="h-8 w-8 text-muted-foreground" />
-          </div>
-          <h2 className="mb-3 text-lg font-semibold">{t('chat:notConfigured.title')}</h2>
-          <p className="text-sm text-muted-foreground mb-6">
-            {t('chat:notConfigured.description')}
-          </p>
-          <Button
-            onClick={() => navigate('/settings')}
-            className="gap-2"
-            size="default"
-          >
-            <Settings className="h-4 w-4" />
-            {t('chat:notConfigured.goToSettings')}
-          </Button>
-        </div>
-      </div>
-    )
+  // Settled-messages token estimate (backend CJK-aware weights) — memoized
+  // separately from the streaming delta so chunks don't resc an the history.
+  const messageTokensEstimate = useMemo(
+    () => estimateTokens(messages.map(m => m.content ?? '').join('\n')),
+    [messages],
+  )
+
+  // Context usage — real prompt tokens after a turn, chars/3 estimate otherwise
+  const contextUsage = useMemo(() => {
+    if (messages.length === 0 || isWelcomeMode) return null
+    const activeBackend = llmBackends.find(b => b.id === activeBackendId)
+    const maxContext = activeBackend?.capabilities?.max_context ?? 8192
+    const promptTokens = lastTokenUsage?.promptTokens
+    let used: number
+    if (promptTokens != null && !isStreaming) {
+      used = promptTokens
+    } else {
+      // Only the streaming delta is re-estimated per chunk — the settled
+      // messages' total is memoized below, so each chunk costs O(delta)
+      // instead of a full-history join + scan.
+      const streamCorpus = (streamingContent ?? '') + (streamingThinking ?? '')
+        + streamingToolCalls.map(tc => (tc.arguments ?? '') + (tc.result ?? '')).join('')
+      used = messageTokensEstimate + estimateTokens(streamCorpus)
+      // While streaming with a known real baseline, never dip below it — the
+      // in-flight request's at least the last measured prompt.
+      if (promptTokens != null) used = Math.max(used, promptTokens)
+    }
+    const system = lastTokenUsage?.systemPromptTokens
+    const tools = lastTokenUsage?.toolTokens
+    const history = system != null && tools != null && promptTokens != null
+      ? Math.max(0, used - system - tools)
+      : undefined
+    const estimated = promptTokens == null || isStreaming
+    return { used, max: maxContext, system, tools, history, estimated, messageCount: messages.length }
+  }, [messages, isWelcomeMode, llmBackends, activeBackendId, lastTokenUsage, isStreaming, streamingContent, streamingThinking, streamingToolCalls])
+
+  // Show LLM setup prompt if not configured. First-ever load shows a
+  // skeleton; a REFETCH (focus/click re-triggers loadBackends, which flips
+  // llmBackendLoading true) keeps the guide mounted — the old gate fell
+  // through to the real chat UI for a frame on every refetch, flashing the
+  // conversation beneath the guide.
+  if (!llmBackends || llmBackends.length === 0) {
+    if (llmBackendLoading && !everLoadedBackendsRef.current) {
+      return <LoadingState variant="page" />
+    }
+    everLoadedBackendsRef.current = true
+    return <LlmSetupGuide />
   }
 
   return (
     <>
     <div className="fixed left-0 right-0 flex flex-row overflow-hidden safe-top" style={{
+      // Offset past BOTH the desktop AppSidebar and the page sidebar column
+      // (sessions list, hoisted to the shell slot). Both are 0 on mobile.
+      left: 'calc(var(--app-sidebar-width, 0px) + var(--page-sidebar-width, 0px))',
       // Anchor to the top of the VISIBLE area, not the layout viewport. iOS
       // PWA standalone doesn't honor `interactive-widget=resizes-content`, so
       // when the soft keyboard opens iOS scrolls the visualViewport
@@ -880,12 +835,8 @@ export function ChatPage() {
       // visible area. Use --visual-viewport-offset-top to follow the visible
       // area. Always 0 in Safari (where the layout viewport itself shrinks).
       top: 'var(--visual-viewport-offset-top, 0px)',
-      // Desktop: TopNav height (set by useVisualViewport via --topnav-height).
-      // Mobile: --topnav-height is 0 (no global nav); safe-top class handles
-      // the notch via env(safe-area-inset-top). Don't combine them in a
-      // `var()` fallback — when the variable is explicitly "0px" the fallback
-      // is ignored and chat content ends up under the notch.
-      paddingTop: 'var(--topnav-height, 0px)',
+      // No global top bar anymore (desktop chrome = sidebar rail) — the
+      // safe-top class handles the mobile notch; desktop needs no top pad.
       // Drive height from `--app-height` (visualViewport.height) so the chat
       // page shrinks with the soft keyboard on iOS PWA standalone, where
       // `interactive-widget=resizes-content` is NOT honored and 100dvh stays
@@ -947,25 +898,48 @@ export function ChatPage() {
         getPortalRoot()
       )}
 
-      {/* Desktop Sidebar - always show when there are sessions or in chat mode */}
+      {/* Desktop Sidebar - always show when there are sessions or in chat mode.
+          Hoisted to the shell's full-height slot (left of the content) so it
+          sits level with the AppSidebar; falls back to in-flow if the slot
+          is unavailable. Fixed width — never collapses. */}
       {isDesktop && (sessions.length > 0 || !isWelcomeMode) && (
+        pageSidebarSlot ? createPortal(
+          <PageSidebarColumn>
+            <SessionSidebar
+              open={true}
+              onClose={() => {}}
+              isDesktop={true}
+            />
+          </PageSidebarColumn>,
+          pageSidebarSlot
+        ) : (
         <div className="shrink-0 self-stretch">
           <SessionSidebar
             open={true}
             onClose={() => {}}
-            collapsed={sidebarCollapsed}
-            onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
             isDesktop={true}
           />
         </div>
+        )
       )}
       {/* Desktop sidebar skeleton while sessions are loading (only when sidebar isn't shown yet) */}
       {isDesktop && !sessionsLoaded && !(sessions.length > 0 || !isWelcomeMode) && (
+        pageSidebarSlot ? createPortal(
+          <PageSidebarColumn>
+            <div className="w-64 h-full border-r flex flex-col p-3 space-y-2">
+              <div className="h-8 w-full bg-muted rounded-lg animate-pulse" />
+              <div className="h-8 w-full bg-muted rounded-lg animate-pulse" />
+              <div className="h-8 w-2/3 bg-muted rounded-lg animate-pulse" />
+            </div>
+          </PageSidebarColumn>,
+          pageSidebarSlot
+        ) : (
         <div className="shrink-0 self-stretch w-64 border-r flex flex-col p-3 space-y-2">
           <div className="h-8 w-full bg-muted rounded-lg animate-pulse" />
           <div className="h-8 w-full bg-muted rounded-lg animate-pulse" />
           <div className="h-8 w-2/3 bg-muted rounded-lg animate-pulse" />
         </div>
+        )
       )}
 
       {/* Mobile Sidebar - drawer */}
@@ -1030,7 +1004,7 @@ export function ChatPage() {
         ) : isWelcomeMode ? (
           /* Welcome Area - shown on /chat (no sessionId), scrollable on mobile */
           <div
-            className="touch-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-4 sm:px-6 py-4 sm:py-6 pb-6"
+            className={cn("touch-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-4 sm:px-6 py-4 sm:py-6 pb-6", isDesktop && "pt-14")}
             onClick={(e) => {
               // If clicking outside interactive elements, dismiss keyboard
               if ((e.target as HTMLElement).closest('button, a, input, textarea, [role="button"]')) return
@@ -1039,14 +1013,18 @@ export function ChatPage() {
           >
             <WelcomeArea className="min-h-full" onQuickAction={handleQuickAction} />
           </div>
-        ) : isLoadingSession ? (
-          /* Loading State - shown when switching sessions, with skeleton messages */
-          <div className="flex-1 min-h-0 overflow-y-auto px-2 sm:px-4 py-2 sm:py-4">
+        ) : isLoadingSession || (urlSessionId && sessionId !== urlSessionId) ? (
+          /* Loading State - shown while a session loads: during an explicit
+             switch AND on first entry with a sessionId in the URL, where the
+             store's sessionId is still null for the first frame — without
+             the second condition the "Empty chat" default flashes for one
+             frame before the real messages arrive. */
+          <div className={cn("flex-1 min-h-0 overflow-y-auto px-2 sm:px-4 py-2 sm:py-4", isDesktop && "pt-12")}>
             <div className="max-w-3xl mx-auto space-y-4 sm:space-y-6">
               {/* Skeleton message - user */}
               <div className="flex gap-2 sm:gap-3 justify-end animate-pulse">
                 <div className="max-w-[85%] sm:max-w-[80%]">
-                  <div className="rounded-2xl px-3 py-2 sm:px-4 sm:py-3 bg-muted">
+                  <div className="rounded-lg px-3 py-2 sm:px-4 sm:py-3 bg-muted">
                     <div className="h-4 w-48 bg-muted rounded" />
                   </div>
                 </div>
@@ -1056,7 +1034,7 @@ export function ChatPage() {
               <div className="flex gap-2 sm:gap-3 justify-start animate-pulse">
                 <div className="flex-shrink-0 w-6 h-6 sm:w-8 sm:h-8 rounded-lg bg-muted" />
                 <div className="max-w-[85%] sm:max-w-[80%]">
-                  <div className="rounded-2xl px-3 py-2 sm:px-4 sm:py-3 bg-muted">
+                  <div className="rounded-lg px-3 py-2 sm:px-4 sm:py-3 bg-muted">
                     <div className="space-y-2">
                       <div className="h-4 w-full bg-muted rounded" />
                       <div className="h-4 w-3/4 bg-muted rounded" />
@@ -1068,7 +1046,7 @@ export function ChatPage() {
               {/* Another skeleton message - user */}
               <div className="flex gap-2 sm:gap-3 justify-end animate-pulse">
                 <div className="max-w-[85%] sm:max-w-[80%]">
-                  <div className="rounded-2xl px-3 py-2 sm:px-4 sm:py-3 bg-muted">
+                  <div className="rounded-lg px-3 py-2 sm:px-4 sm:py-3 bg-muted">
                     <div className="h-4 w-32 bg-muted rounded" />
                   </div>
                 </div>
@@ -1081,196 +1059,27 @@ export function ChatPage() {
           <div
             ref={scrollContainerRef}
             onScroll={handleScroll}
-            className="touch-scroll flex-1 min-h-0 overflow-y-auto px-2 sm:px-4 py-2 sm:py-4 pb-4"
+            className={cn("touch-scroll relative flex-1 min-h-0 overflow-y-auto px-2 sm:px-4 pt-6 pb-2 sm:pb-4 pb-4 md:pt-20")}
             onClick={(e) => {
               // If clicking outside interactive elements, dismiss keyboard
               if ((e.target as HTMLElement).closest('button, a, input, textarea, [role="button"]')) return
               handleBackdropClick()
             }}
           >
-            <div className="max-w-3xl mx-auto space-y-4 sm:space-y-6">
-              {(() => {
-                // Build display list including streaming message (same loop = same React key = no flicker)
-                const allMessages = [...displayMessages]
-                if (isStreaming) {
-                  // Build per-round thinking: completed rounds + current round
-                  const mergedRoundThinking = { ...streamingRoundThinking }
-                  const completedThinking = Object.values(streamingRoundThinking).join("")
-                  const currentRoundThinking = streamingThinking.startsWith(completedThinking)
-                    ? streamingThinking.slice(completedThinking.length)
-                    : streamingThinking
-                  if (currentRoundThinking) {
-                    mergedRoundThinking[currentRoundRef.current] = currentRoundThinking
-                  }
-                  // Streaming message: same shape as persisted messages
-                  // content = final answer (streams at bottom), tool_calls = process (above)
-                  // Clean round_contents to remove JSON/markdown artifacts from small models
-                  const cleanedStreamingRoundContents = Object.keys(roundContents).length > 0
-                    ? Object.fromEntries(
-                        Object.entries(roundContents).map(([k, v]) => [k, cleanToolCallJson(v)])
-                      )
-                    : undefined;
-                  allMessages.push({
-                    id: streamingMessageIdRef.current || '__streaming__',
-                    role: 'assistant' as const,
-                    content: streamingContent,
-                    thinking: streamingThinking || undefined,
-                    tool_calls: streamingToolCalls.length > 0 ? streamingToolCalls : undefined,
-                    timestamp: Date.now(),
-                    round_thinking: Object.keys(mergedRoundThinking).length > 0 ? mergedRoundThinking : undefined,
-                    round_contents: cleanedStreamingRoundContents,
-                    _isStreaming: true,
-                  } as Message & { _isStreaming?: boolean })
-                }
-                return allMessages.map((message, idx) => {
-                  const isCurrentlyStreaming = !!(message as any)._isStreaming
-                  return (
-                <div
-                  key={message.id || `msg-${idx}`}
-                  className={`flex gap-2 sm:gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}
-                >
-                  {message.role === "assistant" && (
-                    <div className="flex-shrink-0 w-6 h-6 sm:w-8 sm:h-8 rounded-lg bg-foreground flex items-center justify-center">
-                      <Sparkles className={cn(
-                        "h-4 w-4 sm:h-4 sm:w-4 text-background",
-                        isCurrentlyStreaming && "animate-pulse"
-                      )} />
-                    </div>
-                  )}
-
-                  <div className={`max-w-[85%] sm:max-w-[80%] ${message.role === "user" ? "order-1" : ""}`}>
-                    <div
-                      className={cn(
-                        message.role === "user"
-                          ? "rounded-2xl px-3 py-2 sm:px-4 sm:py-3 bg-foreground text-background"
-                          : ""
-                      )}
-                    >
-                      <div className={message.role === "user" ? "message-bubble-user" : "message-bubble-assistant"}>
-                      {/* Images for user messages */}
-                      {message.role === "user" && message.images && message.images.length > 0 && (
-                        <MessageImages images={message.images} />
-                      )}
-                      {/* User messages: just content */}
-                      {message.role === "user" && message.content && (
-                        <MarkdownMessage content={message.content} variant="user" />
-                      )}
-                      {/* Assistant messages: tool process + final content */}
-                      {message.role === "assistant" && (() => {
-                        const hasTools = message.tool_calls && message.tool_calls.length > 0
-                        // Clean embedded tool call JSON from content for display
-                        const displayContent = hasTools ? cleanToolCallJson(message.content || '') : (message.content || '')
-                        // Clean round contents to remove any JSON/markdown artifacts from small models
-                        const cleanedRoundContents = message.round_contents
-                          ? Object.fromEntries(
-                              Object.entries(message.round_contents).map(([k, v]) => [k, cleanToolCallJson(v)])
-                            )
-                          : undefined
-
-                        // Three-layer design:
-                        // 1. Thinking (top) - with per-round differentiation
-                        // 2. Task Process (middle) - tool calls + round content
-                        // 3. Final Answer (bottom) - markdown content
-
-                        // Determine thinking to show
-                        const hasRoundThinking = message.round_thinking && Object.keys(message.round_thinking).length > 0
-                        const hasThinking = !!message.thinking
-                        // Skip thinking if it duplicates final content (Phase 2 LLM echo)
-                        const thinkingDupesContent = hasThinking && message.content
-                          && isThinkingDuplicate(message.thinking, message.content)
-                        // For round_thinking, dedup last round against content
-                        let filteredRoundThinking = message.round_thinking
-                        if (hasRoundThinking && message.content) {
-                          const rounds = Object.entries(message.round_thinking!)
-                            .map(([k, v]) => [Number(k), v] as [number, string])
-                            .sort((a, b) => a[0] - b[0])
-                          if (rounds.length > 0) {
-                            const lastRound = rounds[rounds.length - 1]
-                            if (isThinkingDuplicate(lastRound[1], message.content)) {
-                              // Remove last round if it duplicates content
-                              filteredRoundThinking = { ...message.round_thinking! }
-                              delete filteredRoundThinking[lastRound[0]]
-                              if (Object.keys(filteredRoundThinking).length === 0) {
-                                filteredRoundThinking = undefined
-                              }
-                            }
-                          }
-                        }
-
-                        const showThinking = (hasRoundThinking && !!filteredRoundThinking) || (hasThinking && !thinkingDupesContent && !hasRoundThinking)
-
-                        if (hasTools) {
-                          return (
-                            <>
-                              {showThinking && (
-                                <ThinkingBlock
-                                  thinking={!hasRoundThinking ? message.thinking : undefined}
-                                  roundThinking={filteredRoundThinking}
-                                  isStreaming={isCurrentlyStreaming}
-                                  defaultExpanded={false}
-                                />
-                              )}
-                              <ToolProcessBlock
-                                toolCalls={message.tool_calls!}
-                                roundContents={cleanedRoundContents}
-                                isStreaming={isCurrentlyStreaming}
-                              />
-                              {displayContent ? (
-                                <MarkdownMessage content={displayContent} variant="assistant" className="px-3" />
-                              ) : isCurrentlyStreaming ? (
-                                <div className="flex items-center gap-1 px-3 py-1">
-                                  <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '0ms' }} />
-                                  <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '150ms' }} />
-                                  <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '300ms' }} />
-                                </div>
-                              ) : null}
-                            </>
-                          )
-                        }
-
-                        // Path B: simple response → Thinking + Content
-                        return (
-                          <>
-                            {showThinking && (
-                              <ThinkingBlock
-                                thinking={message.thinking}
-                                roundThinking={filteredRoundThinking}
-                                isStreaming={isCurrentlyStreaming}
-                              />
-                            )}
-                            {displayContent ? (
-                              <MarkdownMessage content={displayContent} variant="assistant" className="px-3" />
-                            ) : isCurrentlyStreaming ? (
-                              <div className="flex items-center gap-1 px-3 py-1">
-                                <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '0ms' }} />
-                                <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '150ms' }} />
-                                <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '300ms' }} />
-                              </div>
-                            ) : null}
-                          </>
-                        )
-                      })()}
-                      </div>
-                    </div>
-
-                    <p className="text-xs text-muted-foreground mt-2 px-3">
-                      {formatTimestamp(message.timestamp, false)}
-                    </p>
-                  </div>
-
-                  {message.role === "user" && user && (
-                    <Avatar className="h-6 w-6 sm:h-8 sm:w-8 order-2">
-                      <AvatarFallback className={cn("bg-muted text-muted-foreground", textNano, "sm:text-xs")}>
-                        {getUserInitials(user.username)}
-                      </AvatarFallback>
-                    </Avatar>
-                  )}
-                </div>
-                )})
-              })()}
-
-              <div ref={messagesEndRef} />
-            </div>
+            <ChatMessages
+              messages={filteredMessages}
+              user={user}
+              isStreaming={isStreaming}
+              streamingContent={streamingContent}
+              streamingThinking={streamingThinking}
+              streamingRoundThinking={streamingRoundThinking}
+              streamingToolCalls={streamingToolCalls}
+              roundContents={roundContents}
+              currentRound={currentRoundRef.current}
+              streamingMessageId={streamingMessageIdRef.current}
+              onScrollToBottom={scrollToBottom}
+              endRef={messagesEndRef}
+            />
           </div>
         ) : (
           /* Empty chat - shown on /chat/:sessionId with no messages yet */
@@ -1283,7 +1092,7 @@ export function ChatPage() {
             }}
           >
             <div className="text-center space-y-4 max-w-md">
-              <div className="w-16 h-16 rounded-2xl bg-muted flex items-center justify-center mx-auto">
+              <div className="w-16 h-16 rounded-xl bg-muted flex items-center justify-center mx-auto">
                 <Sparkles className="h-8 w-8 text-muted-foreground" />
               </div>
               <div>
@@ -1302,228 +1111,64 @@ export function ChatPage() {
             chat root's `height: 100dvh` shrinks naturally on keyboard open
             (iOS 16.4+ / Android Chrome), and `shrink-0` keeps the input
             pinned to the bottom of the visible area — no fixed-position
-            hacks needed. */}
-        <div className={cn(
-          "shrink-0 px-2.5 sm:px-4 pt-3 pb-5 sm:pt-3 sm:pb-6 safe-bottom",
-          isDesktop ? "border-0" : "bg-bg-95 backdrop-blur-xl"
-        )} style={isDesktop ? undefined : { paddingBottom: 'max(1rem, env(safe-area-inset-bottom, 12px))' }}>
+            hacks needed. No background: transparent to match the
+            conversation area above and the desktop input. */}
+        <div
+          className="shrink-0 px-2.5 sm:px-4 pt-3 pb-[calc(1.25rem+env(safe-area-inset-bottom,0px))] sm:pt-3 sm:pb-[calc(1.5rem+env(safe-area-inset-bottom,0px))] border-0"
+          style={isDesktop ? undefined : { paddingBottom: 'max(1rem, env(safe-area-inset-bottom, 12px))' }}
+        >
           <div className="max-w-3xl mx-auto">
-            {/* Image previews */}
-            {attachedImages.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 mb-1">
-                {attachedImages.map((image, index) => (
-                  <div key={index} className="relative group">
-                    <img
-                      src={image.data}
-                      alt={`Attached ${index + 1}`}
-                      className="h-8 w-8 sm:h-9 sm:w-9 object-cover rounded-md border border-border"
-                    />
-                    <button
-                      type="button"
-                      className="absolute -top-1 -right-1 h-2.5 w-2.5 rounded-full bg-destructive text-destructive-foreground flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity p-0"
-                      onClick={() => removeAttachedImage(index)}
-                    >
-                      <X className="h-2 w-2" />
-                    </button>
-                  </div>
-                ))}
+            {/* Connection status — only surfaces when the WebSocket is not
+                connected, so a healthy connection adds zero visual noise.
+                Reuses the already-subscribed connectionState and the
+                previously-dead handleManualReconnect. */}
+            {(connectionState.status === 'error' || connectionState.status === 'disconnected') && (
+              <div className="flex justify-center mb-2">
+                <ConnectionStatus
+                  state={connectionState}
+                  onManualReconnect={handleManualReconnect}
+                />
               </div>
             )}
 
-            {/* Single unified input box — everything inside one container */}
-            <div className="rounded-2xl border border-input bg-card shadow-sm transition-colors">
-              {/* Textarea — fills the top, borderless */}
-              <textarea
-                ref={inputRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder={t('chat:input.placeholder')}
-                rows={1}
-                className={cn(
-                  "w-full block px-4 pt-3 pb-1 resize-none text-sm leading-5 bg-transparent",
-                  "placeholder:text-muted-foreground",
-                  "focus:outline-none",
-                  "max-h-[100px] lg:max-h-40 scroll-mb-32"
-                )}
-                style={{ minHeight: "44px" }}
-                onInput={(e) => {
-                  const target = e.target as HTMLTextAreaElement
-                  target.style.height = "auto"
-                  const maxHeight = isDesktop ? 160 : 100
-                  target.style.height = Math.max(44, Math.min(target.scrollHeight, maxHeight)) + "px"
-                }}
-              />
-
-              {/* Bottom toolbar — left: image + model + context, right: send */}
-              <div className="flex items-center gap-1 px-2 pb-2">
-                {/* Image upload */}
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  className="hidden"
-                  onChange={handleImageSelect}
-                  disabled={isStreaming || !supportsMultimodal}
-                />
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={isStreaming || !supportsMultimodal}
-                  className={cn(
-                    "h-8 w-8 rounded-lg flex-shrink-0 text-muted-foreground hover:text-foreground",
-                    !supportsMultimodal && "opacity-50"
-                  )}
-                  title={supportsMultimodal ? t('chat:model.addImage') : t('chat:model.notSupportImage')}
-                >
-                  {isUploadingImage ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : attachedImages.length > 0 ? (
-                    <div className="relative">
-                      <ImageIcon className="h-4 w-4" />
-                      <span className="absolute -top-1 -right-1 bg-primary text-primary-foreground text-[10px] rounded-full h-4 w-4 flex items-center justify-center font-semibold tabular-nums">
-                        {attachedImages.length}
-                      </span>
-                    </div>
-                  ) : (
-                    <ImageIcon className="h-4 w-4" />
-                  )}
-                </Button>
-
-                {/* Model selector */}
-                {llmBackends.length > 0 && (
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-8 px-2 rounded-lg text-muted-foreground hover:text-foreground text-xs gap-1 max-w-[120px] sm:max-w-[140px]"
-                      >
-                        <span className="truncate">
-                          {llmBackends.find(b => b.id === activeBackendId)?.name ||
-                           llmBackends.find(b => b.id === activeBackendId)?.model ||
-                           t('chat:input.selectModel')}
-                        </span>
-                        <ChevronDown className="h-3.5 w-3.5 shrink-0" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="start" className="w-64 max-h-[50vh] overflow-y-auto">
-                      <DropdownMenuLabel className="text-xs text-muted-foreground">
-                        {t('chat:input.selectLLMModel')}
-                      </DropdownMenuLabel>
-                      <DropdownMenuSeparator />
-                      {llmBackends.map((backend) => (
-                        <DropdownMenuItem
-                          key={backend.id}
-                          onClick={() => activateBackend(backend.id)}
-                          className={cn(
-                            "flex items-center gap-2 py-2",
-                            backend.id === activeBackendId && "bg-muted"
-                          )}
-                        >
-                          <div className={cn(
-                            "w-1.5 h-1.5 rounded-full shrink-0",
-                            backend.healthy ? "bg-success" : "bg-muted-foreground"
-                          )} />
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-1.5">
-                              <p className="text-sm truncate">{backend.name || backend.model}</p>
-                              <div className="flex items-center gap-1 shrink-0">
-                                {backend.capabilities?.supports_multimodal && (
-                                  <span title={t('chat:model.supportsVision')} className={cn("inline-flex items-center px-1 h-4 rounded font-medium bg-muted-30 text-muted-foreground", textMicro)}>{t('chat:capability.vision', { defaultValue: 'Vision' })}</span>
-                                )}
-                                {backend.capabilities?.supports_tools && (
-                                  <span title={t('chat:model.supportsTools')} className={cn("inline-flex items-center px-1 h-4 rounded font-medium bg-muted-30 text-muted-foreground", textMicro)}>{t('chat:capability.tools', { defaultValue: 'Tools' })}</span>
-                                )}
-                                {backend.capabilities?.supports_thinking && (
-                                  <span title={t('chat:model.supportsThinking')} className={cn("inline-flex items-center px-1 h-4 rounded font-medium bg-muted-30 text-muted-foreground", textMicro)}>{t('chat:capability.thinking', { defaultValue: 'Thinking' })}</span>
-                                )}
-                              </div>
-                            </div>
-                            <p className={cn(textNano, "text-muted-foreground truncate")}>
-                              {backend.backend_type} · {backend.model}
-                            </p>
-                          </div>
-                          {backend.id === activeBackendId && (
-                            <Check className="h-4 w-4 text-primary shrink-0" />
-                          )}
-                        </DropdownMenuItem>
-                      ))}
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                )}
-
-                {/* Context usage indicator */}
-                {(() => {
-                  const activeBackend = llmBackends.find(b => b.id === activeBackendId)
-                  const maxContext = activeBackend?.capabilities?.max_context ?? 8192
-                  const promptTokens = lastTokenUsage?.promptTokens
-                  let displayTokens: number
-                  let ratio: number
-                  if (promptTokens != null && !isStreaming) {
-                    displayTokens = promptTokens
-                    ratio = promptTokens / maxContext
-                  } else {
-                    const msgChars = messages.reduce((sum, m) => sum + (m.content?.length ?? 0), 0)
-                    const streamChars = (streamingContent?.length ?? 0) + (streamingThinking?.length ?? 0)
-                      + streamingToolCalls.reduce((s, tc) => s + (tc.arguments?.length ?? 0) + (tc.result?.length ?? 0), 0)
-                    displayTokens = Math.ceil((msgChars + streamChars) / 3)
-                    ratio = displayTokens / maxContext
-                  }
-                  if (messages.length === 0 || isWelcomeMode) return null
-                  return (
-                    <span className={cn(
-                      textMini, "shrink-0 transition-colors tabular-nums",
-                      ratio > 0.9 ? "text-error" : ratio > 0.7 ? "text-warning" : "text-muted-foreground"
-                    )}>
-                      Context {(displayTokens / 1000).toFixed(1)}K / {(maxContext / 1000).toFixed(0)}K
-                    </span>
-                  )
-                })()}
-
-                <div className="flex-1" />
-
-                {/* Send or Cancel button */}
-                {isStreaming ? (
-                  <Button
-                    type="button"
-                    onClick={handleCancelRequest}
-                    variant="outline"
-                    className="h-8 w-8 rounded-full flex-shrink-0 p-0 border-destructive text-destructive hover:bg-destructive-light"
-                    title="Cancel request"
-                  >
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  </Button>
-                ) : (
-                  <Button
-                    type="button"
-                    onClick={handleSend}
-                    disabled={!input.trim() && attachedImages.length === 0}
-                    className={cn(
-                      "h-8 w-8 rounded-full flex-shrink-0 p-0 transition-all",
-                      (!input.trim() && attachedImages.length === 0)
-                        ? "bg-muted text-muted-foreground"
-                        : "bg-primary hover:bg-primary-hover text-primary-foreground"
-                    )}
-                  >
-                    <ArrowUp className="h-4 w-4" />
-                  </Button>
-                )}
+            {/* Tool-loop progress — surfaces the round count while the agent
+                works through multi-round tool calling. On slow local models a
+                legitimate loop can run minutes; without this it reads as a
+                hang (0.9.18 plan item: the eval data showed single cases
+                running 30 rounds). Zero noise when not tool-calling. */}
+            {isStreaming && activeToolRound !== null && (
+              <div className="flex justify-center mb-2">
+                <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+                  {t('chat:toolLoopProgress', { round: activeToolRound })}
+                </span>
               </div>
-            </div>
+            )}
+
+            <ChatComposer
+              value={input}
+              onChange={setInput}
+              onSend={() => handleSend()}
+              onKeyDown={handleKeyDown}
+              textareaRef={inputRef}
+              placeholder={t('chat:input.placeholder')}
+              isStreaming={isStreaming}
+              onCancel={handleCancelRequest}
+              attachments={attachedImages}
+              onAttachmentsChange={setAttachedImages}
+              supportsMultimodal={supportsMultimodal}
+              backends={llmBackends}
+              activeBackendId={activeBackendId}
+              onActivateBackend={activateBackend}
+              contextUsage={contextUsage}
+              maxHeight={isDesktop ? 160 : 100}
+            />
           </div>
         </div>
       </div>
     </div>
 
-    <OnboardingDialog
-      open={onboardingOpen}
-      onOpenChange={setOnboardingOpen}
-      status={onboardingStatus}
-      onDismiss={dismissOnboarding}
-    />
+
     </>
   )
 }

@@ -31,14 +31,9 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        r#"Create or overwrite a file with the given content.
+        r##"Create or overwrite a file (data dir or HERAMIND_ALLOWED_WRITE_DIRS). Relative paths preferred. No binary (.so/.dll) or security (.env) files. Max 1MB; parent dirs auto-created.
 
-Writes files within the data directory or any configured allowed directories (HERAMIND_ALLOWED_WRITE_DIRS).
-Use relative paths (e.g., 'skills/my-skill.md') or absolute paths within allowed directories.
-Cannot write binary files (.so, .dll, .exe) or security files (.env, .env.*).
-Maximum content size: 1 MB. Parent directories are created automatically by default.
-
-Use this for creating skill files, widget bundles, extension source code, config files, or any data files."#
+Use for skill files, widget bundles, extension source, configs. For the agent cross-run memory use `memory`; to edit part of a file use `file_edit`."##
     }
 
     fn parameters(&self) -> Value {

@@ -10,6 +10,16 @@ pub enum SkillOrigin {
     Builtin,
 }
 
+impl SkillOrigin {
+    /// Stable serialized form for API responses / filters.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkillOrigin::User => "user",
+            SkillOrigin::Builtin => "builtin",
+        }
+    }
+}
+
 /// Category of a skill for grouping.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -54,6 +64,11 @@ pub struct SkillAntiTriggers {
 pub struct SkillMetadata {
     pub id: String,
     pub name: String,
+    /// Intent-based description for skill matching (agentskills.io standard).
+    /// Loaded at startup with name; carries the triggering/matching burden.
+    /// Optional for backward compat (empty = fall back to keywords-only).
+    #[serde(default)]
+    pub description: String,
     #[serde(default = "default_category")]
     pub category: SkillCategory,
     #[serde(default = "default_origin")]

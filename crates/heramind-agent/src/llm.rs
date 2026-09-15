@@ -265,6 +265,11 @@ pub struct LlmInterface {
     max_tokens: usize,
     /// Default system prompt (wrapped for dynamic updates).
     system_prompt: Arc<RwLock<String>>,
+    /// Session-scoped suffix appended by the streaming chat prompt builder
+    /// (page-scoped focus). Kept separate from `system_prompt` — the
+    /// streaming builder assembles its own slim-template prompt and only
+    /// injects this suffix, never the full legacy prompt.
+    system_prompt_suffix: Arc<RwLock<Option<String>>>,
     /// Tool definitions for function calling.
     tool_definitions: Arc<RwLock<Vec<heramind_core::llm::backend::ToolDefinition>>>,
     /// System prompt cache to avoid rebuilding on every request.
@@ -297,9 +302,81 @@ pub struct LlmInterface {
     /// Pinned skill IDs selected by the user for this session.
     /// These skills are injected as full guides (not just hints) into the system prompt.
     pinned_skills: Arc<RwLock<Vec<String>>>,
+    /// Frozen memory-snapshot prompt section (user.md/knowledge.md/procedures),
+    /// injected into the chat system prompt so the base prompt's "auto-loaded
+    /// memory" promise is truthful. Set by `Agent::set_memory_snapshot`.
+    memory_context: Arc<RwLock<Option<String>>>,
 }
 
 impl LlmInterface {
+    /// Resolve the thinking control for a request.
+    ///
+    /// Priority: local override (bool) > active instance's `thinking_effort`
+    /// (unified) > instance's legacy `thinking_enabled` (bool) > model default.
+    async fn resolve_thinking_control(
+        &self,
+    ) -> (Option<bool>, Option<heramind_core::ThinkingEffort>) {
+        let local_thinking = *self.thinking_enabled.read().await;
+        if let Some(local) = local_thinking {
+            // A local override pins both: effort derives from the bool.
+            return (
+                Some(local),
+                Some(heramind_core::ThinkingEffort::from_bool(local)),
+            );
+        }
+        if self.uses_instance_manager() {
+            if let Some(manager) = &self.instance_manager {
+                if let Some(inst) = manager.get_active_instance() {
+                    return (Some(inst.thinking_enabled), inst.thinking_effort);
+                }
+            }
+        }
+        (None, None)
+    }
+
+    /// Whether the active backend instance is an integral-thinking model whose
+    /// thinking cannot be turned off (e.g. LFM2.5).
+    ///
+    /// Reads the GLOBAL active instance, not `self.instance_manager`: production
+    /// `LlmInterface`s are built via `LlmInterface::new()` and never carry
+    /// `self.instance_manager`, so the old per-interface read made this guard
+    /// inert (the builtin LFM would get `thinking_enabled=false` forced on
+    /// non-chat calls). Gated on `is_builtin` so a session directly configured
+    /// to a non-builtin backend while the builtin happens to be globally active
+    /// does not inherit the exception.
+    async fn active_thinking_is_integral(&self) -> bool {
+        match crate::get_instance_manager()
+            .ok()
+            .and_then(|m| m.get_active_instance())
+        {
+            Some(inst) => inst.is_builtin && inst.thinking_is_integral,
+            None => false,
+        }
+    }
+
+    /// Resolve the effective thinking control for a call, combining the
+    /// local/instance resolution with the per-call `thinking_override`.
+    ///
+    /// For integral-thinking models (e.g. LFM2.5) the per-call override is
+    /// IGNORED so non-chat calls (summarization, post-tool rounds) don't force
+    /// thinking off — the model cannot disable it, so forcing `false` would
+    /// waste the call. All other models keep the existing behavior: the
+    /// override wins when present, pinning both `thinking_enabled` and the
+    /// derived `thinking_effort`.
+    async fn effective_thinking_control(
+        &self,
+        thinking_override: Option<bool>,
+    ) -> (Option<bool>, Option<heramind_core::ThinkingEffort>) {
+        let resolved = self.resolve_thinking_control().await;
+        if self.active_thinking_is_integral().await {
+            resolved
+        } else if let Some(ov) = thinking_override {
+            (Some(ov), Some(heramind_core::ThinkingEffort::from_bool(ov)))
+        } else {
+            resolved
+        }
+    }
+
     /// Create a new LLM interface.
     pub fn new(config: ChatConfig) -> Self {
         let concurrent_limit = config.concurrent_limit;
@@ -312,18 +389,22 @@ impl LlmInterface {
             top_k: config.top_k,
             max_tokens: config.max_tokens,
             system_prompt: Arc::new(RwLock::new("You are a helpful AI assistant.".to_string())),
+            system_prompt_suffix: Arc::new(RwLock::new(None)),
             tool_definitions: Arc::new(RwLock::new(Vec::new())),
             system_prompt_cache: Arc::new(RwLock::new(None)),
             cached_tools_hash: Arc::new(RwLock::new(None)),
             limiter: ConcurrencyLimiter::new(concurrent_limit),
             use_instance_manager: Arc::new(AtomicUsize::new(0)),
-            thinking_enabled: Arc::new(RwLock::new(None)), // Use backend default (from storage)
+            thinking_enabled: Arc::new(RwLock::new(
+                heramind_storage::AgentDefaults::get().default_thinking_enabled,
+            )), // Use backend default (from storage)
             last_prompt_tokens: Arc::new(tokio::sync::Mutex::new(None)),
             intent_classifier: IntentClassifier::default(),
             global_timezone: Arc::new(RwLock::new(None)), // Will be loaded from settings
             skill_registry: Arc::new(RwLock::new(None)),
             skill_context: Arc::new(RwLock::new(TransientSkillContext::default())),
             pinned_skills: Arc::new(RwLock::new(Vec::new())),
+            memory_context: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -342,18 +423,22 @@ impl LlmInterface {
             top_k: config.top_k,
             max_tokens: config.max_tokens,
             system_prompt: Arc::new(RwLock::new("You are a helpful AI assistant.".to_string())),
+            system_prompt_suffix: Arc::new(RwLock::new(None)),
             tool_definitions: Arc::new(RwLock::new(Vec::new())),
             system_prompt_cache: Arc::new(RwLock::new(None)),
             cached_tools_hash: Arc::new(RwLock::new(None)),
             limiter: ConcurrencyLimiter::new(concurrent_limit),
             use_instance_manager: Arc::new(AtomicUsize::new(1)),
-            thinking_enabled: Arc::new(RwLock::new(None)), // Will use instance manager setting
+            thinking_enabled: Arc::new(RwLock::new(
+                heramind_storage::AgentDefaults::get().default_thinking_enabled,
+            )), // Will use instance manager setting
             last_prompt_tokens: Arc::new(tokio::sync::Mutex::new(None)),
             intent_classifier: IntentClassifier::default(),
             global_timezone: Arc::new(RwLock::new(None)), // Will be loaded from settings
             skill_registry: Arc::new(RwLock::new(None)),
             skill_context: Arc::new(RwLock::new(TransientSkillContext::default())),
             pinned_skills: Arc::new(RwLock::new(Vec::new())),
+            memory_context: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -397,9 +482,7 @@ impl LlmInterface {
     pub async fn load_global_timezone(&self) -> AgentResult<String> {
         use heramind_storage::SettingsStore;
 
-        const SETTINGS_DB_PATH: &str = "data/settings.redb";
-
-        let settings_store = SettingsStore::open(SETTINGS_DB_PATH)
+        let settings_store = SettingsStore::open_default()
             .map_err(|e| HeraMindError::Llm(format!("Failed to open settings store: {}", e)))?;
 
         let timezone = settings_store.get_global_timezone();
@@ -424,7 +507,7 @@ impl LlmInterface {
     /// Get the current LLM runtime.
     /// Priority: Direct runtime (set via configure_llm) > Instance manager active runtime
     /// This ensures that when a specific backend is configured via backendId, it takes precedence.
-    async fn get_runtime(&self) -> AgentResult<Arc<dyn LlmRuntime>> {
+    pub(crate) async fn get_runtime(&self) -> AgentResult<Arc<dyn LlmRuntime>> {
         // First, check if a direct runtime is set (via configure_llm)
         // This takes precedence over instance manager to support backendId selection
         let llm_guard = self.llm.read().await;
@@ -471,11 +554,25 @@ impl LlmInterface {
         // Use more conservative budget for small contexts
         // < 8k: 50% for prompt, 50% for generation + overhead
         // < 16k: 60%, >= 16k: 70%
-        let prompt_ratio = if compact_tools && max_ctx <= 8192 {
-            // The compact 8K path exposes only the shell schema. Reserve enough
-            // prompt space for the latest compact tool result while retaining
-            // at least 2K tokens for the model's next call/final response.
-            75
+        // Thinking/reasoning models burn a large chunk of the GENERATION budget
+        // on CoT tokens (Anthropic: thinking counts toward max_tokens), so trim
+        // the prompt share further for them to avoid the model exhausting its
+        // output budget mid-thinking.
+        let thinking = self
+            .model
+            .read()
+            .await
+            .as_deref()
+            .map(heramind_core::llm::detect_thinking)
+            .unwrap_or(false);
+        let prompt_ratio = if thinking {
+            if max_ctx < 8192 {
+                45
+            } else if max_ctx < 16384 {
+                55
+            } else {
+                65
+            }
         } else if max_ctx < 8192 {
             50
         } else if max_ctx < 16384 {
@@ -485,7 +582,10 @@ impl LlmInterface {
         };
         let prompt_budget = (max_ctx * prompt_ratio) / 100;
 
-        // Estimate tool definition overhead in tokens using estimate_tokens
+        // Estimate tool definition overhead in tokens using estimate_tokens.
+        // Serialize each tool to its actual API JSON shape ({"type":"function",
+        // "function":{"name","description","parameters"}}) so the JSON syntax
+        // tokens are counted — the old per-field estimate undercounted.
         let tool_overhead_tokens = if include_tools {
             let tools = self.tool_definitions.read().await;
             if tools.is_empty() {
@@ -495,10 +595,15 @@ impl LlmInterface {
                     .iter()
                     .filter(|tool| !compact_tools || tool.name == "shell")
                     .map(|t| {
-                        estimate_tokens(&t.name)
-                            + estimate_tokens(&t.description)
-                            + estimate_tokens(&t.parameters.to_string())
-                            + 10 // formatting overhead per tool
+                        let json = serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.parameters,
+                            }
+                        });
+                        estimate_tokens(&json.to_string())
                     })
                     .sum::<usize>()
             }
@@ -603,37 +708,47 @@ impl LlmInterface {
     /// Estimate the token overhead from system prompt + tool definitions.
     /// This is the non-history cost that must be deducted from the context window budget.
     pub async fn estimate_prompt_overhead_tokens(&self) -> usize {
+        let (prompt_tokens, tools_tokens) = self.estimate_prompt_breakdown().await;
+        let overhead = prompt_tokens + tools_tokens;
+        tracing::debug!(
+            "Prompt overhead: system_prompt={} tokens, tools={} tokens, total={} tokens",
+            prompt_tokens,
+            tools_tokens,
+            overhead
+        );
+        overhead
+    }
+
+    /// Per-part prompt overhead: (system prompt tokens, tool-definition tokens).
+    pub async fn estimate_prompt_breakdown(&self) -> (usize, usize) {
         // System prompt: build it and measure
         let system_prompt = self.build_system_prompt_with_tools(None).await;
         let prompt_tokens = crate::agent::tokenizer::estimate_tokens(&system_prompt);
 
-        // Tool definitions: serialize to JSON and measure
+        // Tool definitions: serialize to the actual API JSON shape and measure.
+        // (The old per-field estimate undercounted JSON syntax tokens, notably
+        // for large descriptions like the shell tool's ~3KB.)
         let tools = self.tool_definitions.read().await;
         let tools_tokens = if tools.is_empty() {
             0
         } else {
-            // Each tool definition is roughly: {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
-            // Estimate by serializing key fields
-            let mut total = 0;
-            for tool in tools.iter() {
-                // Base overhead per tool definition: ~15 tokens for JSON structure
-                total += 15;
-                total += crate::agent::tokenizer::estimate_tokens(&tool.name);
-                total += crate::agent::tokenizer::estimate_tokens(&tool.description);
-                total += crate::agent::tokenizer::estimate_tokens(&tool.parameters.to_string());
-            }
-            total
+            tools
+                .iter()
+                .map(|t| {
+                    let json = serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    });
+                    crate::agent::tokenizer::estimate_tokens(&json.to_string())
+                })
+                .sum()
         };
 
-        let overhead = prompt_tokens + tools_tokens;
-        tracing::debug!(
-            "Prompt overhead: system_prompt={} tokens, tools={} tokens ({} tools), total={} tokens",
-            prompt_tokens,
-            tools_tokens,
-            tools.len(),
-            overhead
-        );
-        overhead
+        (prompt_tokens, tools_tokens)
     }
 
     /// Check if the current LLM backend supports multimodal (vision) input.
@@ -718,6 +833,23 @@ impl LlmInterface {
         // Store the prompt in Arc<RwLock<String>>
         self.system_prompt = Arc::new(RwLock::new(prompt.into()));
         self
+    }
+
+    /// Set the streaming-path system prompt suffix (builder pattern).
+    pub fn with_system_prompt_suffix(mut self, suffix: Option<String>) -> Self {
+        self.system_prompt_suffix = Arc::new(RwLock::new(suffix));
+        self
+    }
+
+    /// Set the streaming-path system prompt suffix (for runtime changes).
+    /// Invalidates nothing — the suffix is appended after the cached base.
+    pub async fn set_system_prompt_suffix(&self, suffix: Option<String>) {
+        *self.system_prompt_suffix.write().await = suffix;
+    }
+
+    /// The streaming-path system prompt suffix, if set.
+    pub async fn get_system_prompt_suffix(&self) -> Option<String> {
+        self.system_prompt_suffix.read().await.clone()
     }
 
     /// Set the system prompt (for dynamic updates).
@@ -805,6 +937,14 @@ impl LlmInterface {
         *self.pinned_skills.write().await = skills;
     }
 
+    /// Set the frozen memory-snapshot prompt section for this session (or None
+    /// to clear). Injected into the chat system prompt by
+    /// `build_system_prompt_with_tools` so the base prompt's "auto-loaded
+    /// memory" instruction is truthful.
+    pub async fn set_memory_context(&self, section: Option<String>) {
+        *self.memory_context.write().await = section;
+    }
+
     /// Get pinned skill IDs for this session.
     pub async fn get_pinned_skills(&self) -> Vec<String> {
         self.pinned_skills.read().await.clone()
@@ -852,12 +992,120 @@ impl LlmInterface {
     /// Build the base system prompt with current time injected.
     /// This replaces the time placeholders with actual time values using the configured global timezone.
     pub async fn build_base_system_prompt_with_time(&self, timezone: Option<&str>) -> String {
+        // Get the base prompt (which contains placeholders), then resolve them.
+        let base_prompt = self.build_base_system_prompt().await;
+        self.inject_time_placeholders(base_prompt, timezone).await
+    }
+
+    /// Build system prompt with tool descriptions.
+    /// Uses enhanced prompts from prompts module for better conversation quality.
+    /// Uses cached base prompt with time placeholders replaced and adds user-specific parts.
+    pub(crate) async fn build_system_prompt_with_tools(
+        &self,
+        user_message: Option<&str>,
+    ) -> String {
+        // Start from the RAW base prompt (time placeholders still intact).
+        // Time is injected LAST, after all variable sections are appended —
+        // the template deliberately places the time block near the end for
+        // KV-prefix caching, and appending sections after a resolved time
+        // block used to re-prefill pinned skills / memory / suffix on every
+        // time change.
+        let mut prompt = self.build_base_system_prompt().await;
+
+        // Session-scoped suffix (page-scoped focus). This is the ONLY place
+        // the streaming path honors it — `system_prompt` (the legacy full
+        // prompt) is intentionally not appended here to avoid duplicating
+        // tools/capability sections the slim template already carries.
+        if let Some(suffix) = self.system_prompt_suffix.read().await.clone() {
+            if !suffix.trim().is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(suffix.trim());
+                prompt.push('\n');
+            }
+        }
+
+        // Inject pinned skills (user-selected) as full guides
+        let pinned = self.pinned_skills.read().await.clone();
+        if !pinned.is_empty() {
+            let registry_opt = self.skill_registry.read().await.clone();
+            if let Some(registry) = registry_opt {
+                let registry_guard = registry.read().await;
+                for skill_id in &pinned {
+                    if let Some(skill) = registry_guard.get(skill_id) {
+                        prompt.push_str(&format!(
+                            "\n## Pinned Skill: {}\n{}\n",
+                            skill.metadata.name, skill.body
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Inject frozen memory snapshot (user.md/knowledge.md/procedures) —
+        // stable per session. The base prompt promises this is "auto-loaded";
+        // this injection makes that truthful on the chat path (previously the
+        // chat builder discarded the snapshot that only the dead Path-A
+        // assembler used).
+        let memory_section = self.memory_context.read().await.clone();
+        if let Some(section) = memory_section {
+            if !section.is_empty() {
+                prompt.push('\n');
+                prompt.push_str(&section);
+                prompt.push('\n');
+            }
+        }
+
+        // Auto-load skill guides — DISABLED: the slim prompt (default) dropped the
+        // full CLI reference table, and the shell tool's Command Choice covers only
+        // a subset of domains. Skills are loaded on-demand via the skill tool
+        // (search/load) when the LLM needs domain-specific guidance beyond the
+        // always-present Command Choice (complex workflows, error troubleshooting).
+        // Re-enabling auto-load would re-add ~3000 tokens per turn.
+
+        // Inject transient skill context (from skill tool calls in current turn's multi-round loop)
+        // This content is NOT in session history — only available during the current turn.
+        if let Some(skill_content) = self.get_skill_context().await {
+            prompt.push_str("\n## Skill Reference\n");
+            prompt.push_str("Commands in this skill are canonical — use them exactly; don't guess subcommand names.\n\n");
+            prompt.push_str(&skill_content);
+            prompt.push('\n');
+        }
+
+        // Add intent-specific addon if we can classify the user's message
+        if let Some(msg) = user_message {
+            let intent = self.intent_classifier.classify(msg);
+
+            // Get intent addon using legacy PromptBuilder
+            use crate::prompts::PromptBuilder;
+
+            let task_type = match intent.category {
+                crate::agent::staged::IntentCategory::Device => "device",
+                crate::agent::staged::IntentCategory::Data => "data",
+                crate::agent::staged::IntentCategory::Rule => "rule",
+                _ => "general",
+            };
+
+            // Get intent-specific addon from PromptBuilder
+            let addon = PromptBuilder::new().get_intent_prompt_addon(task_type);
+
+            if !addon.is_empty() {
+                prompt.push_str(&addon);
+            }
+        }
+
+        // Inject time LAST (see the comment at the top of this builder) —
+        // everything above the time block is now prefix-cache stable.
+        self.inject_time_placeholders(prompt, None).await
+    }
+
+    /// Replace the base prompt's time placeholders with current values.
+    /// Extracted so the streaming builder can defer time injection until all
+    /// variable sections are appended (KV-prefix-cache friendly) while the
+    /// other callers keep the up-front behavior.
+    async fn inject_time_placeholders(&self, prompt: String, timezone: Option<&str>) -> String {
         use crate::prompts::{
             CURRENT_TIME_PLACEHOLDER, LOCAL_TIME_PLACEHOLDER, TIMEZONE_PLACEHOLDER,
         };
-
-        // Get the base prompt (which contains placeholders)
-        let base_prompt = self.build_base_system_prompt().await;
 
         // Calculate current times
         let now = chrono::Utc::now();
@@ -871,7 +1119,7 @@ impl LlmInterface {
             .as_ref()
             .cloned()
             .or_else(|| timezone.map(|s| s.to_string()))
-            .unwrap_or_else(|| "Asia/Shanghai".to_string());
+            .unwrap_or_else(|| heramind_storage::DEFAULT_GLOBAL_TIMEZONE.to_string());
 
         // Parse timezone to get local time
         let tz = effective_timezone
@@ -905,74 +1153,10 @@ impl LlmInterface {
         );
 
         // Replace placeholders
-        base_prompt
+        prompt
             .replace(CURRENT_TIME_PLACEHOLDER, &current_time_utc)
             .replace(LOCAL_TIME_PLACEHOLDER, &local_time_with_context)
             .replace(TIMEZONE_PLACEHOLDER, &effective_timezone)
-    }
-
-    /// Build system prompt with tool descriptions.
-    /// Uses enhanced prompts from prompts module for better conversation quality.
-    /// Uses cached base prompt with time placeholders replaced and adds user-specific parts.
-    async fn build_system_prompt_with_tools(&self, user_message: Option<&str>) -> String {
-        // Get base prompt with time placeholders replaced
-        let mut prompt = self.build_base_system_prompt_with_time(None).await;
-
-        // Inject pinned skills (user-selected) as full guides
-        let pinned = self.pinned_skills.read().await.clone();
-        if !pinned.is_empty() {
-            let registry_opt = self.skill_registry.read().await.clone();
-            if let Some(registry) = registry_opt {
-                let registry_guard = registry.read().await;
-                for skill_id in &pinned {
-                    if let Some(skill) = registry_guard.get(skill_id) {
-                        prompt.push_str(&format!(
-                            "\n## Pinned Skill: {}\n{}\n",
-                            skill.metadata.name, skill.body
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Auto-load skill guides — DISABLED: TOOL_STRATEGY already contains complete CLI reference.
-        // Skills are only loaded on-demand via the skill tool (search/load) when the LLM needs
-        // domain-specific guidance beyond what TOOL_STRATEGY provides (complex workflows, error troubleshooting).
-        // This saves ~3000 tokens per turn by avoiding duplication with the always-present TOOL_STRATEGY.
-
-        // Inject transient skill context (from skill tool calls in current turn's multi-round loop)
-        // This content is NOT in session history — only available during the current turn.
-        if let Some(skill_content) = self.get_skill_context().await {
-            prompt.push_str("\n## Skill Reference\n");
-            prompt.push_str(&skill_content);
-            prompt.push('\n');
-        }
-
-        // Add intent-specific addon if we can classify the user's message
-        if let Some(msg) = user_message {
-            let intent = self.intent_classifier.classify(msg);
-
-            // Get intent addon using legacy PromptBuilder
-            use crate::prompts::PromptBuilder;
-
-            let task_type = match intent.category {
-                crate::agent::staged::IntentCategory::Device => "device",
-                crate::agent::staged::IntentCategory::Data => "data",
-                crate::agent::staged::IntentCategory::Rule => "rule",
-                _ => "general",
-            };
-
-            // Get intent-specific addon from PromptBuilder
-            let addon = PromptBuilder::new().get_intent_prompt_addon(task_type);
-
-            if !addon.is_empty() {
-                prompt.push_str(&addon);
-            }
-        }
-
-        // Note: Tools are already included in base_prompt from build_base_system_prompt()
-        // No need to duplicate them here unless we want to do user-specific filtering
-        prompt
     }
 
     /// Update the model name.
@@ -994,7 +1178,24 @@ impl LlmInterface {
 
     /// Send a chat message and get a response.
     pub async fn chat(&self, user_message: impl Into<String>) -> AgentResult<ChatResponse> {
-        self.chat_internal(user_message, None).await
+        self.chat_internal(user_message, None, None).await
+    }
+
+    /// Send a chat message with an explicit per-call thinking override.
+    ///
+    /// [race-free background work] Background summarization used to mutate
+    /// the interface-global thinking flag (set false -> call -> restore): a
+    /// user turn started during the multi-second summary call ran with
+    /// thinking silently off, a user toggle made mid-summary was clobbered
+    /// by the restore, and an abort between set/restore left thinking
+    /// disabled forever. A per-call override touches no shared state.
+    pub async fn chat_with_thinking(
+        &self,
+        user_message: impl Into<String>,
+        thinking_override: Option<bool>,
+    ) -> AgentResult<ChatResponse> {
+        self.chat_internal(user_message, None, thinking_override)
+            .await
     }
 
     /// Send a chat message with conversation history.
@@ -1003,7 +1204,7 @@ impl LlmInterface {
         user_message: impl Into<String>,
         history: &[Message],
     ) -> AgentResult<ChatResponse> {
-        self.chat_internal(user_message, Some(history)).await
+        self.chat_internal(user_message, Some(history), None).await
     }
 
     /// Send a multimodal message (with images) with conversation history.
@@ -1022,6 +1223,7 @@ impl LlmInterface {
         &self,
         user_message: impl Into<String>,
         history: Option<&[Message]>,
+        thinking_override: Option<bool>,
     ) -> AgentResult<ChatResponse> {
         let user_message: String = user_message.into();
 
@@ -1096,29 +1298,13 @@ impl LlmInterface {
                 llm.model_name().to_string()
             } else {
                 // Ultimate fallback
-                "ministral-3:3b".to_string()
+                "qwen3.5:4b".to_string()
             }
         };
 
-        // Get thinking_enabled - priority: local setting > instance setting
-        // This allows per-request override (e.g., disable thinking for multimodal)
-        let local_thinking = *self.thinking_enabled.read().await;
-        let thinking_enabled = if local_thinking.is_some() {
-            // Local override takes precedence
-            local_thinking
-        } else if self.uses_instance_manager() {
-            // Fall back to instance setting
-            if let Some(manager) = &self.instance_manager {
-                manager
-                    .get_active_instance()
-                    .map(|inst| inst.thinking_enabled)
-            } else {
-                None
-            }
-        } else {
-            // Direct mode with no local override
-            None
-        };
+        // Get thinking control - priority: local setting > instance setting.
+        let (thinking_enabled, thinking_effort) =
+            self.effective_thinking_control(thinking_override).await;
 
         tracing::debug!(
             thinking_enabled = ?thinking_enabled,
@@ -1142,6 +1328,7 @@ impl LlmInterface {
             frequency_penalty: None,
             presence_penalty: None,
             thinking_enabled,
+            thinking_effort,
             max_context: None,
         };
 
@@ -1209,7 +1396,8 @@ impl LlmInterface {
             vec![system_msg, user_msg]
         };
 
-        // Get tool definitions
+        // Get tool definitions — no vision filtering here (chat_internal is
+        // text-only; chat_internal_message handles image filtering separately).
         let tools_input = if has_tools {
             let tools = self.tool_definitions.read().await;
             let result = if tools.is_empty() {
@@ -1298,29 +1486,12 @@ impl LlmInterface {
                 llm.model_name().to_string()
             } else {
                 // Ultimate fallback
-                "ministral-3:3b".to_string()
+                "qwen3.5:4b".to_string()
             }
         };
 
-        // Get thinking_enabled - priority: local setting > instance setting
-        // This allows per-request override (e.g., disable thinking for multimodal)
-        let local_thinking = *self.thinking_enabled.read().await;
-        let thinking_enabled = if local_thinking.is_some() {
-            // Local override takes precedence
-            local_thinking
-        } else if self.uses_instance_manager() {
-            // Fall back to instance setting
-            if let Some(manager) = &self.instance_manager {
-                manager
-                    .get_active_instance()
-                    .map(|inst| inst.thinking_enabled)
-            } else {
-                None
-            }
-        } else {
-            // Direct mode with no local override
-            None
-        };
+        // Get thinking control - priority: local setting > instance setting.
+        let (thinking_enabled, thinking_effort) = self.resolve_thinking_control().await;
 
         // Get effective parameters from backend instance or local config
         let (eff_temp, eff_top_p, eff_top_k, _static_max_tokens) =
@@ -1338,6 +1509,7 @@ impl LlmInterface {
             frequency_penalty: None,
             presence_penalty: None,
             thinking_enabled,
+            thinking_effort,
             max_context: None,
         };
 
@@ -1416,11 +1588,31 @@ impl LlmInterface {
             vec![system_msg, user_message]
         };
 
-        // Get tool definitions
+        // Get tool definitions — filter out "vision" when the user message
+        // already contains images.  The model is multimodal and can analyse
+        // them directly; the vision tool is only needed for fetching images
+        // from URLs/files.  Mirrors chat_stream_internal_message.  The session
+        // layer guarantees the model is multimodal whenever images are present.
+        //
+        // `messages.last()` is the current user message (system msg + history
+        // are pushed before it); it is `None` only when the user message is
+        // empty, in which case there are no images anyway.
+        let has_user_images = messages.last().is_some_and(|m| m.has_images());
         let tools_input = if has_tools {
             let tools = self.tool_definitions.read().await;
             let result = if tools.is_empty() {
                 None
+            } else if has_user_images {
+                let filtered: Vec<_> = tools
+                    .iter()
+                    .filter(|t| t.name != "vision")
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(filtered)
+                }
             } else {
                 Some(tools.clone())
             };
@@ -1549,29 +1741,12 @@ impl LlmInterface {
                 llm.model_name().to_string()
             } else {
                 // Ultimate fallback
-                "ministral-3:3b".to_string()
+                "qwen3.5:4b".to_string()
             }
         };
 
-        // Get thinking_enabled - priority: local setting > instance setting
-        // This allows per-request override (e.g., disable thinking for multimodal)
-        let local_thinking = *self.thinking_enabled.read().await;
-        let thinking_enabled = if local_thinking.is_some() {
-            // Local override takes precedence
-            local_thinking
-        } else if self.uses_instance_manager() {
-            // Fall back to instance setting
-            if let Some(manager) = &self.instance_manager {
-                manager
-                    .get_active_instance()
-                    .map(|inst| inst.thinking_enabled)
-            } else {
-                None
-            }
-        } else {
-            // Direct mode with no local override
-            None
-        };
+        // Get thinking control - priority: local setting > instance setting.
+        let (thinking_enabled, thinking_effort) = self.resolve_thinking_control().await;
 
         tracing::debug!(
             thinking_enabled = ?thinking_enabled,
@@ -1595,6 +1770,7 @@ impl LlmInterface {
             frequency_penalty: None,
             presence_penalty: None,
             thinking_enabled,
+            thinking_effort,
             max_context: None,
         };
 
@@ -1806,31 +1982,16 @@ impl LlmInterface {
                 llm.model_name().to_string()
             } else {
                 // Ultimate fallback
-                "ministral-3:3b".to_string()
+                "qwen3.5:4b".to_string()
             }
         };
 
-        // Get thinking_enabled - priority: thinking_override > local setting > instance setting
-        // This allows per-request override (e.g., disable thinking for post-tool rounds)
-        let thinking_enabled = if thinking_override.is_some() {
-            // Explicit per-call override takes highest priority
-            thinking_override
-        } else {
-            let local_thinking = *self.thinking_enabled.read().await;
-            if local_thinking.is_some() {
-                local_thinking
-            } else if self.uses_instance_manager() {
-                if let Some(manager) = &self.instance_manager {
-                    manager
-                        .get_active_instance()
-                        .map(|inst| inst.thinking_enabled)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        // Get thinking control - priority: thinking_override > local setting > instance setting.
+        // (Explicit per-call override takes highest priority; otherwise resolve
+        // local/instance — effort preferred over the legacy bool. Integral-thinking
+        // models, e.g. LFM2.5, ignore the override — their thinking can't be off.)
+        let (thinking_enabled, thinking_effort) =
+            self.effective_thinking_control(thinking_override).await;
 
         tracing::debug!(
             thinking_enabled = ?thinking_enabled,
@@ -1843,21 +2004,15 @@ impl LlmInterface {
         // consume all num_predict tokens on thinking alone, producing no content.
         // Observed: qwen3.5:2b with prompt_eval=32259, eval=32768, content=0.
         let thinking_enabled = if thinking_enabled == Some(true) {
-            let hist_chars: usize = history
-                .map(|h| {
-                    h.iter()
-                        .map(|m| match &m.content {
-                            heramind_core::Content::Text(s) => s.len(),
-                            heramind_core::Content::Parts(parts) => {
-                                parts.iter().map(|p| format!("{:?}", p).len()).sum()
-                            }
-                        })
-                        .sum()
-                })
-                .unwrap_or(0);
-            let total_chars = hist_chars + system_prompt.len() + user_message.len();
-            // Rough estimate: mixed Chinese/English ≈ 0.8 tokens/char
-            let estimated_tokens = (total_chars as f64 * 0.8) as usize;
+            // Size the prompt with the same estimator the budget math uses, so the
+            // guard reflects real token density — not a bytes*0.8 approximation
+            // that over-counted English (~3×) and tripped the guard far too
+            // eagerly on text-heavy prompts.
+            let estimated_tokens = crate::agent::tokenizer::estimate_prompt_tokens(
+                history.unwrap_or(&[]),
+                &system_prompt,
+                &user_message,
+            );
 
             if estimated_tokens > 18000 {
                 tracing::info!(
@@ -1891,6 +2046,7 @@ impl LlmInterface {
             frequency_penalty: None,
             presence_penalty: None,
             thinking_enabled,
+            thinking_effort,
             max_context: None,
         };
 
@@ -1969,10 +2125,21 @@ impl LlmInterface {
                     msgs.push((*msg).clone());
                 }
             } else {
-                // Find the first user message index (original question) — always preserve it
-                let original_user_idx = history_msgs
-                    .iter()
-                    .position(|m| m.role == heramind_core::MessageRole::User);
+                // Preserve-the-first-question is a SINGLE-TASK heuristic: it
+                // serves focused runs where the opening message is the task
+                // charter. In a long multi-task chat the oldest message is
+                // usually unrelated to whatever the user is doing now, and
+                // pinning it steals budget the recent context needs. Apply it
+                // only when the history is short enough to plausibly be one
+                // task (~12 messages ≈ 6 turns).
+                let preserve_original_user = history_msgs.len() <= 12;
+                let original_user_idx = if preserve_original_user {
+                    history_msgs
+                        .iter()
+                        .position(|m| m.role == heramind_core::MessageRole::User)
+                } else {
+                    None
+                };
                 let user_msg_tokens = original_user_idx
                     .map(|idx| estimate_tokens(&history_msgs[idx].content.as_text()))
                     .unwrap_or(0);
@@ -2104,6 +2271,7 @@ impl LlmInterface {
                                     frequency_penalty: None,
                                     presence_penalty: None,
                                     thinking_enabled: None, // Disable thinking on retry
+                                    thinking_effort: None,
                                     max_context: None,
                                 },
                                 model: Some(model.clone()),
@@ -2220,10 +2388,17 @@ pub struct ChatConfig {
 
 impl Default for ChatConfig {
     fn default() -> Self {
+        let ad = heramind_storage::AgentDefaults::get();
         Self {
-            model: "ministral-3:3b".to_string(),
-            temperature: agent_env_vars::temperature(),
-            top_p: agent_env_vars::top_p(),
+            model: "qwen3.5:4b".to_string(),
+            temperature: std::env::var(agent_env_vars::TEMPERATURE)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(ad.default_temperature),
+            top_p: std::env::var(agent_env_vars::TOP_P)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(ad.default_top_p),
             top_k: 40,
             max_tokens: agent_env_vars::max_tokens(),
             concurrent_limit: agent_env_vars::concurrent_limit(),
@@ -2253,7 +2428,7 @@ mod tests {
     #[test]
     fn test_chat_config_default() {
         let config = ChatConfig::default();
-        assert_eq!(config.model, "ministral-3:3b");
+        assert_eq!(config.model, "qwen3.5:4b");
         assert_eq!(config.temperature, 0.3);
         assert_eq!(config.top_p, 0.7);
         assert_eq!(config.max_tokens, 4096);
@@ -2497,5 +2672,98 @@ mod tests {
 
         let err = HeraMindError::Llm("test error".to_string());
         assert!(err.to_string().contains("test error"));
+    }
+
+    /// Open a throwaway store at a unique temp path (mirrors the `test_store`
+    /// pattern in `instance_manager.rs`). The store layer keeps a process-global
+    /// singleton keyed by path, so distinct paths yield isolated databases.
+    fn test_store(tag: &str) -> Arc<heramind_storage::LlmBackendStore> {
+        let path =
+            std::env::temp_dir().join(format!("heramind-test-{}-{}.redb", tag, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        heramind_storage::LlmBackendStore::open(&path).expect("open test store")
+    }
+
+    /// Both integral-thinking tests below install a manager into the
+    /// process-global `INSTANCE_MANAGER` singleton (`active_thinking_is_integral`
+    /// reads the GLOBAL active instance). cargo test runs them on separate
+    /// threads, so serialize them or they'd clobber each other's global.
+    fn test_global_manager_serial() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    // The guard is held across the whole test ON PURPOSE: it serializes tests
+    // that swap the process-global instance manager (test_global_manager_serial).
+    #[allow(clippy::await_holding_lock)]
+    async fn thinking_override_ignored_when_integral() {
+        let _serial = test_global_manager_serial().lock().unwrap();
+        // Active (GLOBAL) instance is an integral-thinking BUILTIN model
+        // (e.g. LFM2.5) whose thinking cannot be disabled. The per-call
+        // thinking_override — used by non-chat calls (summarization, post-tool
+        // rounds) to force thinking off — must be IGNORED so thinking stays
+        // enabled.
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("integral")));
+        let mut inst = heramind_storage::LlmBackendInstance::new(
+            "lfm25".to_string(),
+            "LFM2.5".to_string(),
+            heramind_storage::LlmBackendType::LlamaCpp,
+        );
+        inst.is_builtin = true;
+        inst.thinking_is_integral = true;
+        manager
+            .upsert_instance(inst)
+            .await
+            .expect("upsert integral instance");
+        manager.set_active("lfm25").await.expect("set active");
+        crate::llm_backends::set_instance_manager(manager.clone());
+
+        let interface = LlmInterface::with_instance_manager(ChatConfig::default(), manager);
+        assert!(
+            interface.active_thinking_is_integral().await,
+            "integral builtin instance must be detected"
+        );
+
+        let (enabled, _effort) = interface.effective_thinking_control(Some(false)).await;
+        assert_eq!(
+            enabled,
+            Some(true),
+            "integral model must keep thinking on despite override"
+        );
+    }
+
+    #[tokio::test]
+    // Deliberate serialization guard (see the test above).
+    #[allow(clippy::await_holding_lock)]
+    async fn thinking_override_honored_when_not_integral() {
+        let _serial = test_global_manager_serial().lock().unwrap();
+        // Non-integral models keep existing behavior: the per-call override wins
+        // (gotcha #7 — qwen/deepseek memory-extraction calls disable thinking).
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("non-integral")));
+        let inst = heramind_storage::LlmBackendInstance::new(
+            "qwen35".to_string(),
+            "qwen3.5".to_string(),
+            heramind_storage::LlmBackendType::Ollama,
+        );
+        manager
+            .upsert_instance(inst)
+            .await
+            .expect("upsert non-integral instance");
+        manager.set_active("qwen35").await.expect("set active");
+        crate::llm_backends::set_instance_manager(manager.clone());
+
+        let interface = LlmInterface::with_instance_manager(ChatConfig::default(), manager);
+        assert!(
+            !interface.active_thinking_is_integral().await,
+            "non-integral instance must not be flagged integral"
+        );
+
+        let (enabled, _effort) = interface.effective_thinking_control(Some(false)).await;
+        assert_eq!(
+            enabled,
+            Some(false),
+            "non-integral model must honor the override"
+        );
     }
 }

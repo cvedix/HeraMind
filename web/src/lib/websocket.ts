@@ -17,6 +17,7 @@ export interface ConnectionState {
   nextRetryIn?: number  // seconds
   errorMessage?: string
   wasConnected?: boolean  // true if we ever had a successful connection
+  gaveUp?: boolean  // true once fast-retry exhausts without ever connecting (drives the backend-unavailable overlay; still slow-polls)
 }
 
 // Persistence configuration
@@ -37,12 +38,17 @@ export class ChatWebSocket {
   private countdownTimer: ReturnType<typeof setInterval> | null = null
   private tokenCheckTimer: ReturnType<typeof setInterval> | null = null
   private reconnectAttempts = 0
-  private maxReconnectAttempts = 15  // 快速重连最多15次
+  private maxReconnectAttempts = 30  // More retries before slow mode (IoT edge needs patience for backend startup)
   private baseReconnectDelay = 1000  // 初始重连延迟1秒
-  private maxReconnectDelay = 30000   // 最大重连延迟30秒
-  private slowReconnectDelay = 30000  // 超过上限后每30s轮询一次，无限重试
+  private maxReconnectDelay = 5000   // 最大快速重连延迟5秒（之前30秒→用户体验像卡死）
+  private slowReconnectDelay = 10000  // 超过上限后每10s轮询一次，无限重试（之前30s太慢）
   private isManualDisconnect = false  // 是否用户主动断开
   private wasConnected = false  // 跟踪是否曾经连接过（用于区分初始连接和重连）
+  // True once fast-retry is exhausted WITHOUT ever connecting — drives the
+  // BackendUnavailableOverlay. Cleared on any successful connect or manual
+  // retry. Spread into every state push (like wasConnected) so it persists
+  // across the replace-semantics setState.
+  private gaveUp = false
   private messageHandlers: Set<MessageHandler> = new Set()
   private connectionHandlers: Set<ConnectionHandler> = new Set()
   private stateChangeHandlers: Set<StateChangeHandler> = new Set()
@@ -188,13 +194,27 @@ export class ChatWebSocket {
       // Reconnect on everything else including normal close (server restart)
       // Code 4000 is used for token change - we DO want to reconnect
       if (event.code === 4001) {
-        // Auth error - stop reconnecting
+        // Auth error - stop reconnecting. Dropping queued messages is the
+        // right call (they will never authenticate), but it must be VISIBLE:
+        // the old silent clear left the user's bubble looking delivered
+        // forever. Surface what was lost through the state channel the UI
+        // already renders (same pattern as the pending-limit eviction).
         if (this.pendingMessages.length > 0) {
-          console.warn(`[WebSocket] Auth error, clearing ${this.pendingMessages.length} pending messages`)
+          const droppedCount = this.pendingMessages.length
+          const previews = this.pendingMessages
+            .map(m => (typeof m.message === 'string' ? m.message.slice(0, 50) : '(non-text)'))
+            .join('", "')
+          console.warn(`[WebSocket] Auth error, dropping ${droppedCount} queued message(s)`)
           this.pendingMessages = []
           storage.remove(STORAGE_KEY)
+          this.setState({
+            ...this.currentState,
+            status: 'disconnected',
+            errorMessage: `Authentication failed — ${droppedCount} queued message${droppedCount > 1 ? 's were' : ' was'} not sent: "${previews}"`,
+          })
+        } else {
+          this.setState({ status: 'disconnected' })
         }
-        this.setState({ status: 'disconnected' })
       } else {
         this.scheduleReconnect()
       }
@@ -236,9 +256,9 @@ export class ChatWebSocket {
 
           if (isJwtError || msg.includes('authentication') ||
             msg.includes('unauthorized') || msg.includes('access denied')) {
-            // JWT expired/invalid — reload to redirect to login
+            // JWT expired/invalid — disconnect + let UI handle redirect
+            // (aligned with events.ts: no forced reload that disrupts the user)
             this.disconnect()
-            setTimeout(() => window.location.reload(), 1000)
             return
           }
         }
@@ -310,9 +330,22 @@ export class ChatWebSocket {
     }
 
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      // Switch to slow polling mode - keep retrying every 30s indefinitely
-      // instead of giving up permanently
+      // Fast-retry budget exhausted. Switch to slow polling (every
+      // slowReconnectDelay) INDEFINITELY for both first-connect and reconnect —
+      // we never permanently give up. A slow-booting edge backend (the case
+      // 0d90aea7 explicitly wanted patience for) must auto-recover, not freeze
+      // on a "Backend Unavailable" dead-end after ~140s.
+      //
+      // But if we've NEVER connected (port conflict, crashed at startup, wrong
+      // endpoint), surface it via `gaveUp` so the UI can show a full-screen
+      // overlay — c78d062f's intent of "don't silently spin forever" — while
+      // still retrying in the background so it self-heals the moment the
+      // backend comes up. `gaveUp` is the ONLY thing that shows the overlay;
+      // transient onerror no longer flips it (fixes the per-attempt flash).
       this.reconnectAttempts++ // Keep incrementing to track total attempts
+      // Surface a never-connected state via `gaveUp` (drives the full-screen
+      // overlay in App.tsx) while continuing to slow-poll so it self-heals.
+      this.gaveUp = !this.wasConnected
 
       this.setState({
         status: 'reconnecting',
@@ -353,7 +386,7 @@ export class ChatWebSocket {
     const delay = Math.min(
       this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts),
       this.maxReconnectDelay
-    )
+    ) * (0.5 + Math.random() * 0.5)
     this.reconnectAttempts++
 
     // Set reconnecting state
@@ -412,7 +445,7 @@ export class ChatWebSocket {
   }
 
   private setState(state: ConnectionState) {
-    this.currentState = { ...state, wasConnected: this.wasConnected }
+    this.currentState = { ...state, wasConnected: this.wasConnected, gaveUp: this.gaveUp }
     this.stateChangeHandlers.forEach(handler => handler(this.currentState))
   }
 
@@ -474,6 +507,7 @@ export class ChatWebSocket {
   manualReconnect() {
     this.isManualDisconnect = false
     this.reconnectAttempts = 0
+    this.gaveUp = false // user-initiated retry — dismiss the unavailable overlay
 
     // Clear existing timers
     if (this.reconnectTimer) {
@@ -503,6 +537,7 @@ export class ChatWebSocket {
   private resetReconnectState() {
     this.reconnectAttempts = 0
     this.isManualDisconnect = false
+    this.gaveUp = false
   }
 
   /**

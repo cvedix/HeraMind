@@ -10,6 +10,7 @@ use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 
 use crate::handlers::common::{ok, HandlerResult};
+use crate::models::error::ErrorResponse;
 use crate::server::types::ServerState;
 use heramind_core::datasource::DataSourceId;
 
@@ -38,7 +39,8 @@ pub struct UnifiedDataSourceInfo {
     pub description: Option<String>,
     /// Current value (if available)
     pub current_value: Option<serde_json::Value>,
-    /// Last update timestamp (Unix milliseconds)
+    /// Last update timestamp (Unix SECONDS — same unit as every telemetry
+    /// timestamp; the doc previously claimed milliseconds)
     pub last_update: Option<i64>,
     /// Data quality score (0.0 - 1.0)
     pub quality: Option<f32>,
@@ -55,7 +57,9 @@ pub struct ListDataSourcesQuery {
     pub search: Option<String>,
     /// Pagination offset (0-based)
     pub offset: Option<usize>,
-    /// Page size (default 15, max 100)
+    /// Page size (default 15). Max depends on `skip_telemetry`:
+    /// 100 with telemetry values (avoids overloading the backend), 5000
+    /// when `skip_telemetry=true` (selector listings).
     pub limit: Option<usize>,
     /// Skip populating latest telemetry values (for bulk listing)
     #[serde(default)]
@@ -76,6 +80,22 @@ pub struct ListDataSourcesResponse {
 ///
 /// List all data sources across devices, extensions, and transforms.
 /// Supports server-side filtering, search, and pagination.
+#[utoipa::path(
+    get,
+    path = "/api/data/sources",
+    tag = "telemetry",
+    params(
+        ("source_type" = Option<String>, Query, description = "Filter by source type"),
+        ("source" = Option<String>, Query, description = "Filter by source id"),
+        ("search" = Option<String>, Query, description = "Name substring"),
+        ("offset" = Option<usize>, Query, description = "Skip items"),
+        ("limit" = Option<usize>, Query, description = "Max items"),
+        ("skip_telemetry" = Option<bool>, Query, description = "Omit telemetry availability info"),
+    ),
+    responses(
+        (status = 200, description = "Every data source (devices, transforms, extensions)"),
+    )
+)]
 pub async fn list_all_data_sources_handler(
     State(state): State<ServerState>,
     Query(params): Query<ListDataSourcesQuery>,
@@ -479,19 +499,26 @@ async fn collect_transform_sources(state: &ServerState, sources: &mut Vec<Unifie
 // ============================================================================
 
 /// Query parameters for the generic telemetry endpoint.
+///
+/// `source` and `metric` are REQUIRED. They are typed `Option` only so the
+/// handler can reject them with a self-describing error (serde's default
+/// rejection is a bare "missing field" with no hint) — see DEF-002.
 #[derive(Debug, Deserialize)]
 pub struct TelemetryQueryParams {
     /// Source identifier (e.g. "device:sensor1", "extension:weather", "ai:demo", "transform:proc")
     /// Required.
-    pub source: String,
+    pub source: Option<String>,
     /// Metric name (e.g. "temperature", "score"). Required.
-    pub metric: String,
+    pub metric: Option<String>,
     /// Start timestamp in seconds (default: 24 hours ago)
     pub start: Option<i64>,
     /// End timestamp in seconds (default: now)
     pub end: Option<i64>,
     /// Maximum number of data points to return (default: 100, max: 5000)
     pub limit: Option<usize>,
+    /// Number of newest records to skip before collecting (server-side
+    /// pagination over newest-first order; default: 0)
+    pub offset: Option<usize>,
     /// Aggregation function: "avg", "min", "max", "sum", "count", "last"
     pub aggregate: Option<String>,
     /// When true, use server-side time-bucket downsampling to return evenly-spaced points
@@ -507,38 +534,75 @@ pub struct TelemetryQueryParams {
 /// - `GET /api/telemetry?source=ai:demo&metric=score&start=1713360000&end=1713446400`
 /// - `GET /api/telemetry?source=extension:weather&metric=temp_c&limit=50`
 /// - `GET /api/telemetry?source=transform:converter&metric=output&aggregate=avg`
+#[utoipa::path(
+    get,
+    path = "/api/telemetry",
+    tag = "telemetry",
+    params(
+        ("source" = Option<String>, Query, description = "Device id"),
+        ("metric" = Option<String>, Query, description = "Metric name"),
+        ("start" = Option<i64>, Query, description = "Unix-seconds range start"),
+        ("end" = Option<i64>, Query, description = "Unix-seconds range end"),
+        ("limit" = Option<usize>, Query, description = "Max points"),
+        ("offset" = Option<usize>, Query, description = "Skip points"),
+        ("aggregate" = Option<String>, Query, description = "Aggregation function"),
+        ("bucketed" = Option<bool>, Query, description = "Bucket by interval"),
+    ),
+    responses(
+        (status = 200, description = "Time-series points across devices"),
+    )
+)]
 pub async fn query_telemetry_handler(
     State(state): State<ServerState>,
     Query(params): Query<TelemetryQueryParams>,
 ) -> HandlerResult<serde_json::Value> {
+    // Self-describing required-param validation (DEF-002): both `source`
+    // and `metric` are mandatory; tell the caller exactly what is missing
+    // and the expected format instead of serde's bare field error.
+    let (Some(source), Some(metric)) = (&params.source, &params.metric) else {
+        let missing = [
+            ("source", params.source.is_none()),
+            ("metric", params.metric.is_none()),
+        ]
+        .iter()
+        .filter(|(_, m)| *m)
+        .map(|(n, _)| *n)
+        .collect::<Vec<_>>()
+        .join(", ");
+        return Err(ErrorResponse::bad_request(format!(
+            "Missing required query parameter(s): {}. This endpoint queries ONE              series: pass `source` (e.g. device:sensor1, extension:weather, \
+             transform:proc) and `metric` (e.g. temperature). Optional: start, \
+             end (epoch seconds), limit, offset, aggregate.",
+            missing
+        )));
+    };
     let now = chrono::Utc::now().timestamp();
     let start = params.start.unwrap_or(now - 86400);
     let end = params.end.unwrap_or(now);
     let limit = params.limit.unwrap_or(100).min(5000);
 
     // Parse source into a DataSourceId to extract the storage key
-    let ds_id =
-        DataSourceId::parse(&format!("{}:{}", params.source, params.metric)).or_else(|| {
-            // Try treating source as a raw storage prefix (e.g. "device:sensor1" → device)
-            let parts: Vec<&str> = params.source.splitn(2, ':').collect();
-            if parts.len() == 2 {
-                match parts[0] {
-                    "device" => Some(DataSourceId::device(parts[1], &params.metric)),
-                    "extension" => Some(DataSourceId::extension(parts[1], &params.metric)),
-                    "transform" => Some(DataSourceId::transform(parts[1], &params.metric)),
-                    _ => None,
-                }
-            } else {
-                // Bare device ID
-                Some(DataSourceId::device(&params.source, &params.metric))
+    let ds_id = DataSourceId::parse(&format!("{}:{}", source, metric)).or_else(|| {
+        // Try treating source as a raw storage prefix (e.g. "device:sensor1" → device)
+        let parts: Vec<&str> = source.splitn(2, ':').collect();
+        if parts.len() == 2 {
+            match parts[0] {
+                "device" => Some(DataSourceId::device(parts[1], metric)),
+                "extension" => Some(DataSourceId::extension(parts[1], metric)),
+                "transform" => Some(DataSourceId::transform(parts[1], metric)),
+                _ => None,
             }
-        });
+        } else {
+            // Bare device ID
+            Some(DataSourceId::device(source, metric))
+        }
+    });
 
     let ds_id = match ds_id {
         Some(id) => id,
         None => {
             return Err(crate::models::error::ErrorResponse::bad_request(
-                format!("Invalid source format: '{}'. Use 'type:id' (e.g. 'device:sensor1') or full DataSourceId.", params.source),
+                format!("Invalid source format: '{}'. Use 'type:id' (e.g. 'device:sensor1') or full DataSourceId.", source),
             ));
         }
     };
@@ -555,18 +619,27 @@ pub async fn query_telemetry_handler(
             .await
             .map_err(|e| crate::models::error::ErrorResponse::internal(e.to_string()))?;
 
+        // [contract parity] Same parameter, same validation as the device
+        // telemetry endpoint: unknown aggregate values are a 400 here too
+        // (was a silent avg fallback). `count` remains this endpoint's own
+        // documented extra.
         let value = match agg.as_str() {
             "avg" => aggregated.avg,
             "min" => aggregated.min,
             "max" => aggregated.max,
             "sum" => aggregated.sum,
             "count" => Some(aggregated.count as f64),
-            _ => aggregated.avg,
+            other => {
+                return Err(crate::models::error::ErrorResponse::bad_request(format!(
+                    "Invalid aggregate '{}': expected one of avg/min/max/sum/count",
+                    other
+                )))
+            }
         };
 
         return ok(serde_json::json!({
             "source_id": ds_id.storage_key(),
-            "source": params.source,
+            "source": source,
             "metric": params.metric,
             "start": start,
             "end": end,
@@ -576,7 +649,9 @@ pub async fn query_telemetry_handler(
         }));
     }
 
-    // Regular query — use bucketed downsampling when requested
+    // Regular query — use bucketed downsampling when requested. offset only
+    // applies to the paged path (bucketed downsampling has no record order).
+    let offset = params.offset.unwrap_or(0);
     let (points, total_count) = if params.bucketed.unwrap_or(false) {
         telemetry
             .query_bucketed(&source_part, metric_part, start, end, limit)
@@ -584,7 +659,7 @@ pub async fn query_telemetry_handler(
             .map_err(|e| crate::models::error::ErrorResponse::internal(e.to_string()))?
     } else {
         telemetry
-            .query_with_limit(&source_part, metric_part, start, end, Some(limit))
+            .query_with_limit(&source_part, metric_part, start, end, Some(limit), offset)
             .await
             .map_err(|e| crate::models::error::ErrorResponse::internal(e.to_string()))?
     };
@@ -602,7 +677,7 @@ pub async fn query_telemetry_handler(
 
     ok(serde_json::json!({
         "source_id": ds_id.storage_key(),
-        "source": params.source,
+        "source": source,
         "metric": params.metric,
         "start": start,
         "end": end,

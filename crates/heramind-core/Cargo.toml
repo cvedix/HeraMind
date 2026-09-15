@@ -42,6 +42,13 @@ zip = { version = "2.1", default-features = false, features = ["deflate"] }
 sha2 = { workspace = true }
 scopeguard = "1.2"
 
+# Shared secret encryption (crypto module) — same data/encryption_key as the
+# api crate used standalone; now shared with heramind-storage for LLM keys.
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+pbkdf2 = { workspace = true }
+hex = "0.4"
+
 [lints.clippy]
 # Temporarily suppress clippy warnings for heramind-core
 # These should be fixed properly, but for now we allow them to pass CI
@@ -55,3 +62,8 @@ clone_on_copy = "allow"
 derivable_impls = "allow"
 collapsible_if = "allow"
 map_clone = "allow"
+
+# Schema-only dependency: DTO types referenced by heramind-api's OpenAPI spec.
+[dependencies.utoipa]
+version = "4"
+features = ["chrono", "uuid"]

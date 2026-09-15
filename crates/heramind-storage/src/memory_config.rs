@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Simplified memory system configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
     /// Whether the memory system is enabled
     #[serde(default = "default_enabled")]
@@ -43,7 +43,10 @@ fn default_enabled() -> bool {
     true
 }
 fn default_storage_path() -> String {
-    "data/memory".to_string()
+    heramind_core::paths::data_dir()
+        .join("memory")
+        .to_string_lossy()
+        .to_string()
 }
 fn default_user_limit() -> usize {
     2000
@@ -86,12 +89,14 @@ impl Default for MemoryConfig {
 
 impl MemoryConfig {
     /// Configuration file path
-    pub const CONFIG_FILE: &'static str = "data/memory_config.json";
+    pub fn config_file() -> std::path::PathBuf {
+        heramind_core::paths::store_path("memory_config.json")
+    }
 
     /// Load configuration from file
     pub fn load() -> Self {
-        let path = Self::CONFIG_FILE;
-        if !std::path::Path::new(path).exists() {
+        let path = Self::config_file();
+        if !path.exists() {
             return Self::default();
         }
         std::fs::read_to_string(path)
@@ -103,7 +108,7 @@ impl MemoryConfig {
     /// Save configuration to file
     pub fn save(&self) -> std::io::Result<()> {
         let content = serde_json::to_string_pretty(self)?;
-        crate::atomic_write::write(std::path::Path::new(Self::CONFIG_FILE), content)
+        crate::atomic_write::write(&Self::config_file(), content)
     }
 }
 

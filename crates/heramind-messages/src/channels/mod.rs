@@ -331,13 +331,18 @@ impl ChannelRegistry {
             state.configs.insert(name.clone(), config.clone());
         }
 
-        // Persist to storage
+        // Persist to storage. The filter is NOT this function's to manage —
+        // overwriting it with the default wiped a user-configured
+        // ChannelFilter whenever the channel was re-registered (e.g. via the
+        // update handler), silently routing the channel back to accept-all.
+        // Preserve the stored filter; only a fresh channel starts at default.
+        let existing_filter = self.get_filter(&name).await;
         let stored = StoredChannelConfig {
             name: name.clone(),
             channel_type,
             config,
             enabled,
-            filter: ChannelFilter::default(),
+            filter: existing_filter,
         };
         if let Err(e) = self.save_channel(&stored).await {
             tracing::warn!("Failed to persist channel config: {}", e);
@@ -1177,9 +1182,122 @@ pub fn get_channel_schema(channel_type: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// Detect an error signal in a webhook/channel response body.
+///
+/// Many webhook APIs (Feishu, DingTalk, WeCom, …) return HTTP 200 with an error
+/// code in the JSON body for semantic errors (invalid payload, disabled bot, bad
+/// token). Checking HTTP status alone hides these as false "success" — the
+/// channel-test reports success but no message actually arrives. Returns
+/// `Some(error description)` when the body signals an error, `None` otherwise.
+/// The channel HTTP client: 30s total / 10s connect — one place so a
+/// future policy change (proxy, TLS pins, longer streams budget) can't
+/// drift across the seven senders.
+pub(crate) fn channel_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Shared JSON POST for the webhook-style channels: send → transport-error
+/// map → non-2xx map → 200-with-error-body validation (detect_error_body).
+/// The five senders used to carry byte-identical copies of this ladder with
+/// only the channel name differing.
+pub(crate) async fn post_json(
+    channel: &str,
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> super::Result<()> {
+    let response = client
+        .post(url)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| super::Error::SendFailed(format!("{channel} request failed: {e}")))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(super::Error::SendFailed(format!(
+            "{channel} error {status}: {text}"
+        )));
+    }
+
+    // IM APIs often answer HTTP 200 with an error body (WeCom errcode,
+    // Feishu code, Slack ok:false) — validate the payload, not just 200.
+    let text = response.text().await.unwrap_or_default();
+    if let Some(err) = detect_error_body(&text) {
+        return Err(super::Error::SendFailed(format!(
+            "{channel} reported error: {err}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn detect_error_body(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let obj = v.as_object()?;
+    // Feishu/DingTalk/WeCom style: {"code": N, "msg": "..."} or {"errcode": N,
+    // "errmsg": "..."} — a non-zero code is an error.
+    for key in ["code", "errcode"] {
+        if let Some(code) = obj.get(key).and_then(|c| c.as_i64()) {
+            if code != 0 {
+                let msg = obj
+                    .get("msg")
+                    .and_then(|m| m.as_str())
+                    .or_else(|| obj.get("errmsg").and_then(|m| m.as_str()))
+                    .unwrap_or("");
+                return Some(format!("{key} {code}: {msg}"));
+            }
+        }
+    }
+    // Telegram/Slack style: {"ok": false} / generic {"success": false}
+    if matches!(obj.get("success").and_then(|s| s.as_bool()), Some(false)) {
+        return Some("body reports success=false".to_string());
+    }
+    if matches!(obj.get("ok").and_then(|s| s.as_bool()), Some(false)) {
+        return Some("body reports ok=false".to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_error_body_flags_feishu_code() {
+        assert_eq!(detect_error_body(r#"{"code":0,"msg":"success"}"#), None);
+        let e = detect_error_body(r#"{"code":19001,"msg":"invalid msg_type"}"#).unwrap();
+        assert!(e.contains("19001") && e.contains("invalid msg_type"), "{e}");
+    }
+
+    #[test]
+    fn detect_error_body_flags_errcode_and_ok() {
+        // DingTalk/WeCom: errcode != 0
+        let e = detect_error_body(r#"{"errcode":93000,"errmsg":"invalid webhook"}"#).unwrap();
+        assert!(e.contains("93000") && e.contains("invalid webhook"), "{e}");
+        assert_eq!(detect_error_body(r#"{"errcode":0,"errmsg":"ok"}"#), None);
+        // Telegram/Slack: ok false
+        assert!(detect_error_body(r#"{"ok":false,"description":"chat not found"}"#).is_some());
+        assert_eq!(detect_error_body(r#"{"ok":true}"#), None);
+    }
+
+    #[test]
+    fn detect_error_body_flags_generic_false() {
+        assert!(detect_error_body(r#"{"success":false}"#).is_some());
+        assert!(detect_error_body(r#"{"ok":false}"#).is_some());
+        assert_eq!(detect_error_body(r#"{"success":true}"#), None);
+    }
+
+    #[test]
+    fn detect_error_body_ignores_non_error_bodies() {
+        assert_eq!(detect_error_body(""), None);
+        assert_eq!(detect_error_body("not json"), None);
+        assert_eq!(detect_error_body(r#"{"data":{"x":1}}"#), None);
+    }
 
     /// Mock channel for testing purposes only.
     struct MockChannel {

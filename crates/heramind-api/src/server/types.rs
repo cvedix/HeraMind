@@ -126,6 +126,57 @@ pub const MAX_EXTENSION_UPLOAD_SIZE: usize = 512 * 1024 * 1024;
 /// reported) plus a running byte counter during streaming.
 pub const MAX_EXTENSION_DOWNLOAD_SIZE: u64 = 1024 * 1024 * 1024;
 
+/// Open the extension store, DEGRADING to an isolated temp store on any
+/// failure instead of panicking.
+///
+/// The previous `.expect()` here turned one unreadable `extensions.redb`
+/// (SD-card bit rot, partial write on power loss, read-only/full data disk)
+/// into a boot panic → systemd restart → panic loop: the WHOLE server died,
+/// including every subsystem whose stores were fine. Degrading costs
+/// extension records not persisting (and installed extensions not loading)
+/// until the operator repairs the file — strictly better than a brick, and
+/// the original store file is left untouched for manual inspection.
+fn open_extension_store_resilient(path: std::path::PathBuf) -> std::sync::Arc<ExtensionStore> {
+    match ExtensionStore::open(&path) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::error!(
+                category = "storage",
+                error = %e,
+                path = %path.display(),
+                "Failed to open extension store — falling back to an ISOLATED TEMP store. \
+                 Extension records will not persist and installed extensions will not \
+                 load until the store file above is inspected/repaired"
+            );
+            ExtensionStore::open(":memory:").expect("isolated temp extension store cannot fail")
+        }
+    }
+}
+
+/// Open the frontend component store, degrading to a temp dir on failure —
+/// same boot-resilience rationale as [`open_extension_store_resilient`].
+fn open_frontend_component_store_resilient(dir: std::path::PathBuf) -> FrontendComponentStore {
+    match FrontendComponentStore::open(&dir) {
+        Ok(store) => store,
+        Err(e) => {
+            let fallback = std::env::temp_dir().join(format!(
+                "heramind-frontend-components-fallback-{}",
+                std::process::id()
+            ));
+            tracing::error!(
+                category = "storage",
+                error = %e,
+                path = %dir.display(),
+                fallback = %fallback.display(),
+                "Failed to open frontend component store — falling back to a TEMP dir; \
+                 installed widgets will not persist until the data dir is repaired"
+            );
+            FrontendComponentStore::open(&fallback)
+                .expect("temp-dir frontend component store cannot fail")
+        }
+    }
+}
+
 /// Server state shared across all handlers.
 ///
 /// Organized into logical sub-states for better maintainability.
@@ -185,10 +236,6 @@ pub struct ServerState {
     /// Flag to track if rule engine events have been initialized (prevents duplicate subscribers).
     rule_engine_events_initialized: Arc<std::sync::atomic::AtomicBool>,
 
-    /// Cached rule engine event service instance (prevents duplicate instances).
-    rule_engine_event_service:
-        Arc<tokio::sync::Mutex<Option<crate::event_services::RuleEngineEventService>>>,
-
     /// Flag to track if extension event subscription has been initialized (prevents duplicate subscribers).
     extension_event_subscription_initialized: Arc<std::sync::atomic::AtomicBool>,
 
@@ -215,6 +262,18 @@ pub struct ServerState {
     /// sets BOTH headers when forwarding via loopback reqwest; external
     /// attackers cannot know this per-process random secret.
     pub internal_proxy_secret: Arc<String>,
+
+    /// IM bridge router (lazy-initialized by `start_im_router` at startup).
+    /// Mirrors `agents.agent_manager`'s `Arc<RwLock<Option<…>>>` lazy-init
+    /// pattern, but lives on `ServerState` directly because the IM bridge is
+    /// a cross-cutting concern (events + agents + messages), not agent-only.
+    pub im_router:
+        Arc<tokio::sync::RwLock<Option<Arc<heramind_messages::im_bridge::router::ImRouter>>>>,
+
+    /// Web-triggered self-upgrade coordinator (About page →
+    /// `/api/system/upgrade*`, see `handlers::system`). Holds the
+    /// single-flight lock, task status and the release-check cache.
+    pub upgrade: Arc<crate::upgrade::service::UpgradeState>,
 }
 
 // Backward compatibility: Provide direct field access as before
@@ -412,7 +471,12 @@ impl ServerState {
                             discovery_topic: Some("device/+/+/uplink".to_string()),
                             discovery_prefix: "device".to_string(),
                             auto_discovery: true,
-                            storage_dir: Some("data".to_string()),
+                            device_id_field: old_cfg.device_id_field.clone(),
+                            storage_dir: Some(
+                                heramind_core::paths::data_dir()
+                                    .to_string_lossy()
+                                    .to_string(),
+                            ),
                         };
                         if let Some(event_bus) = self.core.event_bus.as_ref() {
                             if let Ok(val) = serde_json::to_value(&rollback_mqtt_config) {
@@ -490,7 +554,12 @@ impl ServerState {
             discovery_topic: Some("device/+/+/uplink".to_string()),
             discovery_prefix: "device".to_string(),
             auto_discovery: true,
-            storage_dir: Some("data".to_string()),
+            device_id_field: broker_config.device_id_field.clone(),
+            storage_dir: Some(
+                heramind_core::paths::data_dir()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
         };
 
         let Some(event_bus) = self.core.event_bus.as_ref() else {
@@ -599,10 +668,10 @@ impl ServerState {
 
         // ========== Create Unified Value Provider ==========
         // This will be wired up with device and extension storage later
-        let value_provider = Arc::new(UnifiedValueProvider::new().with_ttl(5000));
+        let value_provider = Arc::new(UnifiedValueProvider::new());
 
         // Ensure data directory exists
-        if let Err(e) = std::fs::create_dir_all("data") {
+        if let Err(e) = std::fs::create_dir_all(heramind_core::paths::data_dir()) {
             tracing::warn!(category = "storage", error = %e, "Failed to create data directory");
         }
 
@@ -612,7 +681,7 @@ impl ServerState {
         let t_stores = std::time::Instant::now();
 
         let rule_store_h = tokio::task::spawn_blocking(|| {
-            match RuleStore::open("data/rules.redb") {
+            match RuleStore::open(heramind_core::paths::store_path("rules.redb")) {
                 Ok(store) => {
                     tracing::info!("Rule store initialized at data/rules.redb");
                     Some(store)
@@ -625,7 +694,9 @@ impl ServerState {
         });
 
         let agent_store_h = tokio::task::spawn_blocking(
-            || match heramind_storage::AgentStore::open("data/agents.redb") {
+            || match heramind_storage::AgentStore::open(heramind_core::paths::store_path(
+                "agents.redb",
+            )) {
                 Ok(store) => {
                     tracing::info!("AI Agent store initialized at data/agents.redb");
                     store
@@ -641,7 +712,7 @@ impl ServerState {
         );
 
         let dashboard_store_h = tokio::task::spawn_blocking(|| {
-            match DashboardStore::open("data/dashboards.redb") {
+            match DashboardStore::open(heramind_core::paths::store_path("dashboards.redb")) {
                 Ok(store) => store,
                 Err(_e) => {
                     DashboardStore::memory().unwrap_or_else(|e| {
@@ -653,7 +724,7 @@ impl ServerState {
         });
 
         let instance_store_h = tokio::task::spawn_blocking(|| {
-            match InstanceStore::open("data/instances.redb") {
+            match InstanceStore::open(heramind_core::paths::store_path("instances.redb")) {
                 Ok(store) => store,
                 Err(e) => {
                     tracing::error!(category = "storage", error = %e, "Failed to open instance store");
@@ -673,13 +744,13 @@ impl ServerState {
         });
 
         let data_dir = std::path::PathBuf::from(
-            std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string()),
+            heramind_core::paths::data_dir()
+                .to_string_lossy()
+                .to_string(),
         );
         let frontend_component_store_h = tokio::task::spawn_blocking({
             let dir = data_dir.join("frontend-components");
-            move || {
-                FrontendComponentStore::open(dir).expect("Failed to init frontend component store")
-            }
+            move || open_frontend_component_store_resilient(dir)
         });
 
         // ========== Build CORE STATE ==========
@@ -687,7 +758,7 @@ impl ServerState {
         let event_bus = Some(Arc::new(EventBus::new()));
 
         // Create message manager with persistent storage
-        let message_manager = match MessageManager::with_storage("data") {
+        let message_manager = match MessageManager::with_storage(heramind_core::paths::data_dir()) {
             Ok(manager) => {
                 tracing::info!("Message store initialized at data/messages.redb");
                 Arc::new(manager)
@@ -705,7 +776,11 @@ impl ServerState {
 
         // ========== Build DEVICE STATE ==========
         // Create device registry with persistent storage
-        let device_registry = match DeviceRegistry::with_persistence("data/devices.redb").await {
+        let device_registry = match DeviceRegistry::with_persistence(
+            heramind_core::paths::store_path("devices.redb"),
+        )
+        .await
+        {
             Ok(registry) => {
                 tracing::info!(
                     "Device registry initialized with persistent storage at data/devices.redb"
@@ -724,7 +799,7 @@ impl ServerState {
         let time_series_storage =
             Arc::new(TimeSeriesStorage::memory().expect("in-memory telemetry storage"));
         let telemetry_for_bg = time_series_storage.clone();
-        let telemetry_path = std::path::Path::new("data").join("telemetry.redb");
+        let telemetry_path = heramind_core::paths::store_path("telemetry.redb");
         tokio::spawn(async move {
             let t = tokio::task::spawn_blocking(move || {
                 let start = std::time::Instant::now();
@@ -806,7 +881,7 @@ impl ServerState {
         let extensions_dir = if let Ok(data_dir) = std::env::var("HERAMIND_DATA_DIR") {
             std::path::PathBuf::from(data_dir).join("extensions")
         } else {
-            std::path::PathBuf::from("data/extensions")
+            crate::server::paths::data_dir().join("extensions")
         };
 
         let default_ext_dirs = vec![extensions_dir];
@@ -829,27 +904,9 @@ impl ServerState {
             time_series_storage.clone(),
         ));
 
-        // Open extension store (singleton-cached internally).
-        // If persistent storage is locked by another process, continue with
-        // an isolated in-memory store instead of crashing the server.
-        let extension_store = match ExtensionStore::open("data/extensions.redb") {
-            Ok(store) => store,
-            Err(e) => {
-                tracing::warn!(
-                    category = "storage",
-                    error = %e,
-                    "Failed to open extension store, using in-memory"
-                );
-                ExtensionStore::open(":memory:").unwrap_or_else(|err| {
-                    tracing::error!(
-                        category = "storage",
-                        error = %err,
-                        "Failed to create in-memory extension store"
-                    );
-                    std::process::exit(1);
-                })
-            }
-        };
+        // Open extension store (singleton-cached internally)
+        let extension_store =
+            open_extension_store_resilient(crate::server::paths::extension_store_path());
 
         // Create the extension state with registry, storage, and persistent store
         let extensions = ExtensionState::new(
@@ -889,7 +946,8 @@ impl ServerState {
         }
 
         // ========== Build AUTOMATION STATE ==========
-        let rule_engine = Arc::new(RuleEngine::new(value_provider.clone()));
+        let rule_engine =
+            Arc::new(RuleEngine::new(value_provider.clone()).with_event_bus(event_bus.clone()));
 
         // Set up capability provider for isolated extensions
         // This allows isolated extensions to invoke capabilities on the host process
@@ -1009,7 +1067,11 @@ impl ServerState {
         }
 
         // Create automation store
-        let automation_store = match SharedAutomationStore::open("data/automations.redb").await {
+        let automation_store = match SharedAutomationStore::open(heramind_core::paths::store_path(
+            "automations.redb",
+        ))
+        .await
+        {
             Ok(store) => {
                 tracing::info!("Automation store initialized at data/automations.redb");
                 Some(Arc::new(store))
@@ -1032,6 +1094,9 @@ impl ServerState {
         // Create transform engine with extension registry and automation store support
         let transform_engine = {
             let mut engine = TransformEngine::with_extension_registry(extensions.registry.clone());
+            // Persistent telemetry history — enables TimeSeriesAggregation
+            // over real data (the old in-RAM cache was never populated).
+            engine = engine.with_time_series_storage(time_series_storage.clone());
             if let Some(ref store) = automation_store {
                 engine = engine.with_automation_store(store.clone());
             }
@@ -1067,8 +1132,9 @@ impl ServerState {
         let agent_store = agent_store_h.await.expect("agent_store task panicked");
 
         // Initialize system memory store (Markdown-based persistent memory)
-        let system_memory_store =
-            Arc::new(heramind_storage::MarkdownMemoryStore::new("data/memory"));
+        let system_memory_store = Arc::new(heramind_storage::MarkdownMemoryStore::new(
+            heramind_core::paths::data_dir().join("memory"),
+        ));
         if let Err(e) = system_memory_store.init() {
             tracing::warn!(category = "storage", error = %e, "Failed to initialize system memory store");
         }
@@ -1125,6 +1191,10 @@ impl ServerState {
             tokio::spawn(async move {
                 let mut cleanup_interval =
                     tokio::time::interval(tokio::time::Duration::from_secs(6 * 60 * 60));
+                // Consume the immediate first tick: tokio intervals fire at
+                // once, which used to trigger a full messages scan during
+                // startup (the agent-execution task below does the same).
+                cleanup_interval.tick().await;
                 loop {
                     cleanup_interval.tick().await;
                     if let Ok(cleaned_msgs) = mm.cleanup_old(30).await {
@@ -1194,7 +1264,6 @@ impl ServerState {
             gpu_info,
             agent_events_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rule_engine_events_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rule_engine_event_service: Arc::new(tokio::sync::Mutex::new(None)),
             extension_event_subscription_initialized: Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
@@ -1203,7 +1272,7 @@ impl ServerState {
             data_dir,
             data_push: {
                 let push_manager = match PushManager::new_with_telemetry(
-                    std::path::Path::new("data"),
+                    heramind_core::paths::data_dir().as_path(),
                     event_bus.clone(),
                     data_push_telemetry,
                 ) {
@@ -1223,6 +1292,8 @@ impl ServerState {
             #[cfg(feature = "embedded-broker")]
             credential_cache: Arc::new(std::sync::RwLock::new(CredentialCache::default())),
             internal_proxy_secret: Arc::new(generate_internal_proxy_secret()),
+            im_router: Arc::new(tokio::sync::RwLock::new(None)),
+            upgrade: Arc::new(crate::upgrade::service::UpgradeState::new()),
         }
     }
 
@@ -1244,7 +1315,7 @@ impl ServerState {
         let started_at = chrono::Utc::now().timestamp();
 
         // Create unified value provider
-        let value_provider = Arc::new(UnifiedValueProvider::new().with_ttl(5000));
+        let value_provider = Arc::new(UnifiedValueProvider::new());
 
         // ========== Build CORE STATE ==========
         let event_bus = Some(Arc::new(EventBus::new()));
@@ -1297,7 +1368,8 @@ impl ServerState {
         );
 
         // ========== Build AUTOMATION STATE ==========
-        let rule_engine = Arc::new(RuleEngine::new(value_provider.clone()));
+        let rule_engine =
+            Arc::new(RuleEngine::new(value_provider.clone()).with_event_bus(event_bus.clone()));
         rule_engine
             .set_message_manager(core.message_manager.clone())
             .await;
@@ -1388,13 +1460,12 @@ impl ServerState {
             gpu_info,
             agent_events_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rule_engine_events_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rule_engine_event_service: Arc::new(tokio::sync::Mutex::new(None)),
             extension_event_subscription_initialized: Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
             extension_event_subscription_service: Arc::new(tokio::sync::Mutex::new(None)),
             telemetry_query_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
-            data_dir: std::path::PathBuf::from("data"),
+            data_dir: heramind_core::paths::data_dir(),
             data_push: {
                 let push_manager = PushManager::memory_with_telemetry(data_push_telemetry).ok();
                 Arc::new(tokio::sync::RwLock::new(push_manager))
@@ -1404,6 +1475,8 @@ impl ServerState {
             #[cfg(feature = "embedded-broker")]
             credential_cache: Arc::new(std::sync::RwLock::new(CredentialCache::default())),
             internal_proxy_secret: Arc::new(generate_internal_proxy_secret()),
+            im_router: Arc::new(tokio::sync::RwLock::new(None)),
+            upgrade: Arc::new(crate::upgrade::service::UpgradeState::new()),
         }
     }
 
@@ -1416,25 +1489,36 @@ impl ServerState {
         // Device registry storage is initialized automatically on first use
         tracing::info!(category = "storage", "Data directory created/verified");
 
-        // Seed built-in device type templates (NE101, NE301, etc.)
-        match heramind_storage::DeviceRegistryStore::open("data/devices.redb") {
-            Ok(store) => match store.seed_builtin_templates() {
-                Ok(seeded) => {
-                    if seeded > 0 {
-                        tracing::info!(
-                            category = "storage",
-                            seeded,
-                            "Seeded built-in device type templates"
-                        );
-                    }
+        // Seed built-in device type templates via the registry's OWN storage
+        // handle (same store the cache reads from), so the subsequent reload
+        // is guaranteed to see the seed — no cross-handle visibility race.
+        match self.devices.registry.seed_builtin_templates().await {
+            Ok(seeded) => {
+                if seeded > 0 {
+                    tracing::info!(
+                        category = "storage",
+                        seeded,
+                        "Seeded built-in device type templates"
+                    );
                 }
-                Err(e) => {
-                    tracing::warn!(category = "storage", error = %e, "Failed to seed built-in templates");
-                }
-            },
-            Err(e) => {
-                tracing::warn!(category = "storage", error = %e, "Failed to open device registry for seeding");
             }
+            Err(e) => {
+                tracing::warn!(category = "storage", error = %e, "Failed to seed built-in templates");
+            }
+        }
+
+        // Reload the in-memory registry cache so freshly-seeded builtin
+        // templates (NE101/NE301) become visible. `with_persistence()` loaded
+        // the cache at `ServerState::new` before this seed ran; on a fresh
+        // boot that cache is empty and without a reload, storage has the
+        // templates but the cache stays empty — device registration then
+        // fails with "Device type template '...' not found".
+        if let Err(e) = self.devices.registry.load_from_storage().await {
+            tracing::warn!(
+                category = "storage",
+                error = %e,
+                "Failed to reload device registry cache after builtin seed"
+            );
         }
     }
 
@@ -1484,15 +1568,16 @@ impl ServerState {
         //
         // Path strategy:
         // - install_dir: $HERAMIND_DATA_DIR/extensions/ (where extensions are unpacked)
-        // - nep_cache_dir: $HERAMIND_DATA_DIR/extensions/packages/ (where .nep files are cached)
+        // - nep_cache_dir: $HERAMIND_DATA_DIR/extensions (sync_nep_cache scans both
+        //   this dir and its packages/ subdir, matching the manual trigger)
         //
         // This ensures all extension data is in the app data directory, avoiding
         // path inconsistencies between development and production modes.
-        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+        let data_dir = heramind_core::paths::data_dir()
+            .to_string_lossy()
+            .to_string();
         let install_dir = std::path::PathBuf::from(data_dir.clone()).join("extensions");
-        let nep_cache_dir = std::path::PathBuf::from(data_dir)
-            .join("extensions")
-            .join("packages");
+        let nep_cache_dir = std::path::PathBuf::from(data_dir).join("extensions");
 
         tracing::info!(
             install_dir = %install_dir.display(),
@@ -1500,10 +1585,10 @@ impl ServerState {
             "Extension sync paths configured"
         );
 
+        let state_for_sync = self.clone();
         tokio::spawn(async move {
             use crate::server::ExtensionInstallService;
 
-            // Move paths into the async block instead of borrowing
             let install_service = ExtensionInstallService::new(install_dir, nep_cache_dir);
 
             match install_service.sync_nep_cache().await {
@@ -1515,8 +1600,25 @@ impl ServerState {
                             installed = report.installed,
                             upgraded = report.upgraded,
                             skipped = report.skipped,
-                            "Extension sync completed"
+                            "Extension cache sync completed"
                         );
+                    }
+                    // Register whatever actually landed on disk (the sync used
+                    // to stop here, reporting counts while loading nothing).
+                    for pkg in &report.installed_packages {
+                        if let Err(e) = crate::handlers::extensions::register_installed_package(
+                            &state_for_sync,
+                            pkg,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                category = "extensions",
+                                extension_id = %pkg.extension_id,
+                                error = %e,
+                                "Failed to register synced extension (installed on disk only)"
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -1534,20 +1636,14 @@ impl ServerState {
     /// Falls back to LlmBackendInstanceManager if no config file is found.
     /// Only sets the default backend for NEW sessions.
     pub async fn init_llm(&self) {
-        // First try to load from config file
-        if let Some(backend) = crate::config::load_llm_config() {
-            self.agents
-                .session_manager
-                .set_default_llm_backend(backend)
-                .await;
-            tracing::info!(
-                category = "ai",
-                "Configured default LLM backend successfully from config file"
-            );
-            return;
-        }
-
-        // Fallback: try to load from LlmBackendInstanceManager (database-stored backends)
+        // Priority: DB active instance FIRST, config file as fallback. The
+        // instance manager reflects the user's latest explicit activation
+        // (incl. the builtin model); a config-file entry is a static
+        // deployment default. File-over-DB used to resurrect a stale
+        // config.toml backend after restart on upgraded installs — the user
+        // activates builtin, restarts, and every new session silently routes
+        // back to the dead endpoint the TOML names (observed on a real
+        // 0.9.4→0.9.19 Jetson upgrade).
         match self
             .agents
             .session_manager
@@ -1557,10 +1653,23 @@ impl ServerState {
             Ok(_) => {
                 tracing::info!(
                     category = "ai",
-                    "Configured LLM backend successfully from instance manager"
+                    "Configured LLM backend successfully from instance manager (active instance)"
                 );
             }
             Err(e) => {
+                // No active instance in the DB — fall back to the config file.
+                if let Some(backend) = crate::config::load_llm_config() {
+                    self.agents
+                        .session_manager
+                        .set_default_llm_backend(backend)
+                        .await;
+                    tracing::info!(
+                        category = "ai",
+                        prior_error = %e,
+                        "Configured default LLM backend from config file (no active DB instance)"
+                    );
+                    return;
+                }
                 tracing::warn!(category = "ai", error = %e, "No LLM backend configured. Set up via Web UI or create config.toml");
             }
         }
@@ -1720,7 +1829,12 @@ impl ServerState {
             discovery_topic: Some("device/+/+/uplink".to_string()),
             discovery_prefix: "device".to_string(),
             auto_discovery: true,
-            storage_dir: Some("data".to_string()),
+            device_id_field: broker_config.device_id_field.clone(),
+            storage_dir: Some(
+                heramind_core::paths::data_dir()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
         };
 
         // Create the MQTT adapter
@@ -2210,35 +2324,14 @@ impl ServerState {
             }
         };
 
-        use crate::event_services::RuleEngineEventService;
-
-        // Get or create the service instance (cached in ServerState)
-        {
-            let mut cached_service = self.rule_engine_event_service.lock().await;
-            if cached_service.is_none() {
-                let service =
-                    RuleEngineEventService::new((*event_bus).clone(), rule_engine.clone());
-                *cached_service = Some(service);
-            }
-        }
-
-        // Start the service (duplicate init already prevented by rule_engine_events_initialized guard)
-        let running = {
-            let cached_service = self.rule_engine_event_service.lock().await;
-            cached_service
-                .as_ref()
-                .expect("rule engine event service should be initialized")
-                .start()
-        };
-
-        if running.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!(
-                category = "rule_engine",
-                "Rule engine event service started - rules will auto-evaluate on device metrics"
-            );
-        } else {
-            tracing::warn!("Rule engine event service failed to start");
-        }
+        // The rule engine reacts to device metrics via the value-provider update
+        // task spawned below (plus the extension-output task). There is no
+        // separate "rule engine event service" anymore — it was a dead shell
+        // whose start() only flipped an AtomicBool that nothing ever read.
+        tracing::info!(
+            category = "rule_engine",
+            "Rule engine event listener starting - rules will auto-evaluate on device metrics"
+        );
 
         // Start a task to update the UnifiedValueProvider when device metrics arrive
         // This is needed for rule evaluation to work with current values
@@ -2256,8 +2349,6 @@ impl ServerState {
                     device_id,
                     metric,
                     value,
-                    timestamp: _,
-                    quality: _,
                     ..
                 } = event
                 {
@@ -2835,6 +2926,30 @@ impl ServerState {
                         }
                     }
                 }
+                LlmBackend::LlamaCpp {
+                    endpoint,
+                    model,
+                    capabilities: _,
+                } => {
+                    use heramind_agent::llm_backends::backends::llamacpp::{
+                        LlamaCppConfig, LlamaCppRuntime,
+                    };
+                    let timeout = std::env::var("LLAMACPP_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(180);
+                    match LlamaCppRuntime::new(
+                        LlamaCppConfig::new(&model)
+                            .with_endpoint(&endpoint)
+                            .with_timeout_secs(timeout),
+                    ) {
+                        Ok(runtime) => Some(Arc::new(runtime) as Arc<dyn LlmRuntime + Send + Sync>),
+                        Err(e) => {
+                            tracing::warn!(category = "ai", error = %e, "Failed to create llama.cpp runtime for agents");
+                            None
+                        }
+                    }
+                }
                 LlmBackend::OpenAi {
                     api_key,
                     endpoint,
@@ -2932,7 +3047,9 @@ impl ServerState {
         let has_time_series = time_series_store.is_some();
 
         // Open LLM backend store for per-agent backend lookup
-        let llm_backend_store = match LlmBackendStore::open("data/llm_backends.redb") {
+        let llm_backend_store = match LlmBackendStore::open(heramind_core::paths::store_path(
+            "llm_backends.redb",
+        )) {
             Ok(store) => Some(store),
             Err(e) => {
                 tracing::warn!(category = "storage", error = %e, "Failed to open LlmBackendStore");
@@ -2953,6 +3070,8 @@ impl ServerState {
             memory_store: Some(self.agents.system_memory_store.clone()),
             backend_semaphores: None,
             skill_registry: Some(self.agents.session_manager.skill_registry()),
+            // Populated inside AiAgentManager::new from the scheduler.
+            execution_semaphore: None,
         };
 
         let manager = heramind_agent::ai_agent::AiAgentManager::new(executor_config)
@@ -2985,6 +3104,212 @@ impl ServerState {
             crate::models::ErrorResponse::internal(format!("Failed to start agent manager: {}", e))
         })?;
         tracing::info!("AI Agent manager scheduler started");
+        Ok(())
+    }
+
+    /// Start the IM bridge router.
+    ///
+    /// Subscribes to `ImMessageReceived` on the EventBus and dispatches each
+    /// event to `ImRouter::handle_inbound`. The router owns per-chat
+    /// serialization, msg_id dedup, allowlist gating, and chat↔session reuse.
+    /// Outbound replies are delivered through bridges registered on the
+    /// router's `ImBridgeRegistry` (Task 10+ wires the Telegram bridge).
+    ///
+    /// Mirrors `start_agent_manager` (above): a failure here means all inbound
+    /// IM messages are silently dropped, so callers in server/mod.rs startup
+    /// surface errors via `tracing::error!` — do not swallow with `let _ =`.
+    pub async fn start_im_router(&self) -> Result<(), crate::models::ErrorResponse> {
+        use heramind_messages::im_bridge::{router::InboundMessage, ImPlatform};
+        use std::collections::HashSet;
+
+        // Open the IM session store under data/. A failure here means the
+        // bridge cannot persist chat↔session mappings — surface as 500 rather
+        // than panicking (the plan's `.unwrap()` would crash the server).
+        let store = Arc::new(
+            heramind_messages::im_bridge::session_store::ImSessionStore::open(&self.data_dir)
+                .map_err(|e| {
+                    crate::models::ErrorResponse::internal(format!(
+                        "Failed to open IM session store: {}",
+                        e
+                    ))
+                })?,
+        );
+
+        // SessionManagerAgentRunner forwards to the real SessionManager (Task 8).
+        // Annotate the trait-object type so the unsizing coercion to
+        // `Arc<dyn AgentRunner>` (expected by ImRouter::new) is unambiguous.
+        let runner: Arc<dyn heramind_messages::im_bridge::AgentRunner> =
+            Arc::new(SessionManagerAgentRunner::new(self.session_manager()));
+
+        // Resolve the default IM agent lazily, per inbound message. With no
+        // per-channel override mechanism yet (M1), sessions bind to the
+        // first Active agent at creation time. Resolving lazily (instead of
+        // hard-failing at boot) keeps a fresh system — which by definition
+        // has zero agents — from logging a scary "IM router not started"
+        // error and 503-ing every /im-bridges call before the user has done
+        // anything. An agent created later works without a server restart.
+        let agent_store = self.agent_store();
+        let default_agent_resolver: heramind_messages::im_bridge::router::DefaultAgentResolver =
+            Arc::new(move || {
+                let store = agent_store.clone();
+                Box::pin(async move {
+                    store
+                        .query_agents(heramind_storage::AgentFilter {
+                            status: Some(heramind_storage::AgentStatus::Active),
+                            ..Default::default()
+                        })
+                        .await
+                        .ok()
+                        .and_then(|agents| agents.into_iter().next().map(|a| a.id))
+                })
+            });
+
+        // Clone a handle for the periodic expiry cleanup task (the original
+        // `store` is moved into ImRouter below). Same Arc<ImSessionStore>,
+        // so the cleanup task evicts from the same backing redb the router
+        // reads/writes — no divergence.
+        let store_for_cleanup = store.clone();
+
+        // Load the persisted allowlist BEFORE `store` moves into the router.
+        // Across restarts this repopulates the runtime gate from `/start`
+        // binds the operator already approved — without it the router would
+        // boot in allow-all mode (None) and the invite system would be
+        // cosmetic: any chat could talk to the agent. A fresh deploy with no
+        // approved chats yields an empty set, so Some(empty) rejects all
+        // inbound until an operator mints + a user `/start`-binds an invite.
+        // That is the intended M2a posture (invite-gated from boot).
+        let initial_allowlist: HashSet<String> = store
+            .allow_list()
+            .map_err(|e| {
+                crate::models::ErrorResponse::internal(format!(
+                    "Failed to read IM allowlist: {}",
+                    e
+                ))
+            })?
+            .into_iter()
+            .collect();
+
+        let router = Arc::new(heramind_messages::im_bridge::router::ImRouter::new(
+            store,
+            runner,
+            default_agent_resolver,
+            Some(initial_allowlist),
+        ));
+
+        // Subscribe to ImMessageReceived events and forward each to the router.
+        // The task is intentionally detached: it lives for the process lifetime
+        // (same pattern as init_agent_events at types.rs:2999). Holding the
+        // `FilteredReceiver` in `rx` keeps the broadcast subscription alive;
+        // dropping it on bus close terminates the `while let` cleanly.
+        if let Some(bus) = self.core.event_bus.clone() {
+            let r = router.clone();
+            let mut rx = bus.subscribe_filtered(move |e| {
+                matches!(e, heramind_core::HeraMindEvent::ImMessageReceived { .. })
+            });
+            tokio::spawn(async move {
+                tracing::info!(category = "im", "IM router event listener started");
+                while let Some((ev, _meta)) = rx.recv().await {
+                    if let heramind_core::HeraMindEvent::ImMessageReceived {
+                        platform,
+                        im_chat_id,
+                        sender_id,
+                        text,
+                        msg_id,
+                        timestamp,
+                    } = ev
+                    {
+                        // Unknown platform strings fall back to Telegram so a
+                        // typo in a bridge's published event doesn't blackhole
+                        // the message; this mirrors the bridge's own inbound
+                        // publish path.
+                        let p = ImPlatform::parse(&platform).unwrap_or(ImPlatform::Telegram);
+                        r.handle_inbound(InboundMessage {
+                            platform: p,
+                            chat_id: im_chat_id,
+                            sender_id,
+                            text,
+                            msg_id,
+                            timestamp,
+                        })
+                        .await;
+                    }
+                }
+                tracing::warn!(
+                    category = "im",
+                    "IM router event listener exited (EventBus closed)"
+                );
+            });
+        } else {
+            tracing::warn!(
+                category = "im",
+                "EventBus not available — IM router will not receive inbound messages"
+            );
+        }
+
+        // Reload persisted bridges: each platform's credential set was saved by
+        // `create_bridge_handler` so the bridge auto-starts after a server
+        // restart. Reload happens AFTER the router is built + subscribed (so the
+        // registry exists to receive the rebuilt bridges) and BEFORE the router
+        // is published into `im_router` (so handlers can't observe a half-loaded
+        // registry). Single-bridge failure is warned + skipped inside
+        // reload_persisted_bridges — it does not block server startup. No bus
+        // means no spawn target; the persisted rows remain on disk for next boot.
+        if let Some(bus) = self.core.event_bus.clone() {
+            crate::handlers::im_bridges::reload_persisted_bridges(&router, router.store(), &bus)
+                .await;
+        } else {
+            tracing::warn!(
+                category = "im",
+                "EventBus not available — persisted IM bridges skipped this boot (rows remain on disk)"
+            );
+        }
+
+        *self.im_router.write().await = Some(router);
+        tracing::info!(category = "im", "IM router started");
+
+        // Periodic IM session expiry cleanup — mirrors the agent-execution
+        // cleanup pattern above (line ~1132). TTL = 7 days: a chat inactive
+        // this long is unlikely to recall its prior HeraMind session, and
+        // re-prompting from a clean slate (new session via get_or_create) is
+        // cheaper than carrying stale context indefinitely. First tick is
+        // immediate (`tokio::time::interval` semantics) — consumed so the
+        // server doesn't do a full-table scan during startup, matching the
+        // agent-execution cleanup's rationale.
+        {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                // Skip the immediate first tick to avoid contending with
+                // startup I/O (same rationale as the agent-execution cleanup).
+                interval.tick().await;
+                let ttl_secs: i64 = 7 * 86400;
+                loop {
+                    interval.tick().await;
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let cutoff = now_secs - ttl_secs;
+                    match store_for_cleanup.evict_expired(cutoff) {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(
+                                category = "im",
+                                removed = n,
+                                "IM session expiry cleanup removed stale records"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                category = "im",
+                                error = %e,
+                                "IM session expiry cleanup failed — stale sessions may accumulate"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(())
     }
 
@@ -3092,37 +3417,6 @@ impl ServerState {
             }
         });
     }
-
-    /// Create CapabilityServices for extension capability providers.
-    ///
-    /// This creates a service container that can be used by extension
-    /// capability providers to access real functionality.
-    pub fn create_capability_services(&self) -> heramind_core::extension::CapabilityServices {
-        use heramind_core::extension::{keys, CapabilityServices};
-
-        CapabilityServices::new()
-            .with_service(keys::DEVICE_SERVICE, self.devices.service.clone())
-            .with_service(keys::TELEMETRY_STORAGE, self.devices.telemetry.clone())
-            .with_service(keys::RULE_ENGINE, self.automation.rule_engine.clone())
-            .with_service(keys::EXTENSION_REGISTRY, self.extensions.registry.clone())
-            .with_service(
-                keys::EVENT_BUS,
-                self.core
-                    .event_bus
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(heramind_core::EventBus::new())),
-            )
-    }
-
-    /// Initialize extension capability providers with real services.
-    ///
-    /// This should be called after all services are initialized.
-    pub async fn init_capability_providers(&self) {
-        let _services = self.create_capability_services();
-        // Note: Capability providers are registered via ExtensionContext
-        // when extensions are loaded
-        tracing::info!("Capability services initialized for extension providers");
-    }
 }
 
 /// Rebuild the ToolRegistry disabled set from the persisted ExtensionRecord
@@ -3138,7 +3432,9 @@ async fn apply_persisted_tool_disabled_state(
 ) {
     use std::collections::HashSet;
 
-    let records = match heramind_storage::ExtensionStore::open("data/extensions.redb") {
+    let records = match heramind_storage::ExtensionStore::open(
+        crate::server::paths::extension_store_path(),
+    ) {
         Ok(store) => store.load_all().unwrap_or_default(),
         Err(e) => {
             tracing::warn!(
@@ -3185,3 +3481,169 @@ async fn apply_persisted_tool_disabled_state(
 
 // Note: Default implementation removed because ServerState::new() is now async
 // to support persistent device registry initialization.
+
+/// Production `AgentRunner` adapter that forwards to `SessionManager`.
+///
+/// Used by `start_im_router` (Task 9) to bind the IM bridge to the real agent
+/// backend. The aggregation pattern mirrors the canonical HTTP chat handler in
+/// `handlers/sessions.rs:757-781`: append `AgentEvent::Content` chunks, break
+/// on `AgentEvent::End`, ignore everything else (Thinking/ToolCall*/Warning).
+///
+/// Deliberately no unit test — `SessionManager` cannot have its LLM backend
+/// injected in-process (by design), so the adapter is exercised end-to-end in
+/// Task 11 via an `EchoRunner` mock instead.
+pub struct SessionManagerAgentRunner {
+    sm: Arc<SessionManager>,
+}
+
+impl SessionManagerAgentRunner {
+    pub fn new(sm: Arc<SessionManager>) -> Self {
+        Self { sm }
+    }
+}
+
+#[async_trait::async_trait]
+impl heramind_messages::im_bridge::AgentRunner for SessionManagerAgentRunner {
+    async fn create_session(&self) -> anyhow::Result<String> {
+        // CreateSessionOptions::default() leaves every override as None, so the
+        // new session inherits the manager's default_config (model / system
+        // prompt / tools). The configured "default IM agent" binding happens
+        // in Task 9's start_im_router, not here.
+        let opts = heramind_agent::CreateSessionOptions::default();
+        Ok(self.sm.create_session_with_options(opts).await?)
+    }
+
+    async fn run(&self, session_id: &str, text: &str) -> anyhow::Result<String> {
+        use futures::StreamExt as _;
+        // backend_id=None → use the session's currently-active backend.
+        // selected_skills=&[] → no pinned skills for this turn.
+        let stream = self
+            .sm
+            .process_message_events_with_backend_and_skills(session_id, text, None, None)
+            .await?;
+        let mut s = stream;
+        let mut out = String::new();
+        let mut last_error: Option<String> = None;
+        while let Some(ev) = s.next().await {
+            match ev {
+                heramind_agent::AgentEvent::Content { content } => out.push_str(&content),
+                // gotcha #10: capture the error instead of dropping it — if the
+                // stream errors before any Content chunk, `out` would stay empty,
+                // the router would reply "" → Telegram 400 → reply() silently
+                // swallowed, leaving the user stuck on "思考中…".
+                heramind_agent::AgentEvent::Error { message } => last_error = Some(message),
+                heramind_agent::AgentEvent::End { .. } => break,
+                _ => {}
+            }
+        }
+        // gotcha #10: never return empty silently — surface the error text so
+        // the router replies something instead of empty→400→silent. When content
+        // was produced we keep it as-is (an error mid-stream after partial output
+        // is still useful to the user).
+        if out.is_empty() {
+            if let Some(msg) = last_error {
+                out = format!("（处理失败：{msg}）");
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod boot_resilience_tests {
+    use super::*;
+
+    /// A corrupt extensions.redb (SD-card rot, partial write on power loss)
+    /// must NOT panic the boot — the pre-fix `.expect()` here turned one bad
+    /// file into a systemd restart loop that killed the whole server. The
+    /// resilient open degrades to an isolated temp store that still works.
+    #[test]
+    fn corrupt_extension_store_degrades_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("extensions.redb");
+        // Garbage that exists but is not a redb file: open() must fail.
+        std::fs::write(&corrupt, b"this is definitely not a redb database").unwrap();
+
+        let store = open_extension_store_resilient(corrupt.clone());
+
+        // The fallback store is functional: save + read-back roundtrip.
+        let record = heramind_storage::extensions::ExtensionRecord {
+            id: "ext-1".into(),
+            name: "Test".into(),
+            file_path: "/tmp/x.nep".into(),
+            extension_type: "native".into(),
+            version: "1.0".into(),
+            description: None,
+            author: None,
+            auto_start: false,
+            enabled: true,
+            uninstalled: false,
+            disabled_commands: vec![],
+            config: None,
+            last_error: None,
+            last_error_at: None,
+            health_status: "healthy".into(),
+            updated_at: 0,
+            registered_at: 0,
+        };
+        store.save(&record).unwrap();
+        assert!(
+            store.load("ext-1").unwrap().is_some(),
+            "fallback store must be usable"
+        );
+
+        // The corrupt original must be left untouched for manual repair.
+        let bytes = std::fs::read(&corrupt).unwrap();
+        assert_eq!(bytes, b"this is definitely not a redb database");
+    }
+
+    /// Same contract for the frontend component store: an unusable base dir
+    /// (here: a FILE where the dir should be) degrades to a temp dir.
+    #[test]
+    fn unusable_frontend_dir_degrades_to_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("frontend-components");
+        std::fs::write(&not_a_dir, b"i am a file").unwrap();
+
+        let store = open_frontend_component_store_resilient(not_a_dir.clone());
+        // Functional check: the fallback answers queries (empty, not broken).
+        assert!(store.list_all().unwrap().is_empty());
+    }
+
+    /// Happy path must be unchanged: a healthy store opens at the requested
+    /// path (no silent temp fallback for good disks).
+    #[test]
+    fn healthy_extension_store_opens_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extensions.redb");
+        let store = open_extension_store_resilient(path.clone());
+        // The healthy store persists at the requested path: save, then reopen
+        // through the same resilient helper and read back.
+        let record = heramind_storage::extensions::ExtensionRecord {
+            id: "ext-2".into(),
+            name: "Healthy".into(),
+            file_path: "/tmp/y.nep".into(),
+            extension_type: "native".into(),
+            version: "1.0".into(),
+            description: None,
+            author: None,
+            auto_start: false,
+            enabled: true,
+            uninstalled: false,
+            disabled_commands: vec![],
+            config: None,
+            last_error: None,
+            last_error_at: None,
+            health_status: "healthy".into(),
+            updated_at: 0,
+            registered_at: 0,
+        };
+        store.save(&record).unwrap();
+        drop(store);
+        let reopened = open_extension_store_resilient(path.clone());
+        assert!(
+            reopened.load("ext-2").unwrap().is_some(),
+            "record must persist at the requested path, not in a temp fallback"
+        );
+    }
+}

@@ -4,7 +4,6 @@ import { useStore } from "@/store"
 import { shallow } from "zustand/shallow"
 import { useToast } from "@/hooks/use-toast"
 import { useEvents } from "@/hooks/useEvents"
-import { useAbortController } from "@/hooks/useAbortController"
 import { useVisiblePolling } from "@/hooks/useVisiblePolling"
 import { useIsMobile } from "@/hooks/useMobile"
 import { confirm } from "@/hooks/use-confirm"
@@ -32,7 +31,6 @@ import {
   EditDeviceTypeDialog,
 } from "./devices/index"
 import { CloudImportDialog } from "@/pages/devices/DeviceTypeDialogs"
-import { DeviceTypeGeneratorDialog } from "@/components/devices/DeviceTypeGeneratorDialog"
 import { PendingDevicesList } from "./devices/PendingDevicesList"
 import { AddDeviceGlobalDialog } from "./devices/AddDeviceGlobalDialog"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
@@ -47,6 +45,7 @@ export function DevicesPage() {
   const isMobile = useIsMobile()
 
   // Group device data selectors (change together)
+  const openSettings = useStore((s) => s.openSettings)
   const { devices, devicesLoading } = useStore((s) => ({
     devices: s.devices,
     devicesLoading: s.devicesLoading,
@@ -105,61 +104,6 @@ export function DevicesPage() {
   const [draftPage, setDraftPage] = useState(1)
   const draftsPerPage = 10
   const [draftsCount, setDraftsCount] = useState(0)
-
-  // Auto-onboarding configuration (simplified to 3 fields)
-  interface OnboardConfig {
-    enabled: boolean
-    max_samples: number
-    draft_retention_secs: number
-  }
-  const [onboardConfig, setOnboardConfig] = useState<OnboardConfig>({
-    enabled: true,
-    max_samples: 10,
-    draft_retention_secs: 86400, // 24 hours
-  })
-  const [pendingOnboardConfig, setPendingOnboardConfig] = useState<OnboardConfig>(onboardConfig)
-  const [showOnboardConfigDialog, setShowOnboardConfigDialog] = useState(false)
-  const [savingOnboardConfig, setSavingOnboardConfig] = useState(false)
-
-  // Fetch auto-onboarding configuration
-  const fetchOnboardConfig = async () => {
-    const result = await withErrorHandling(
-      () => api.getOnboardConfig(),
-      { operation: 'Fetch onboard config', showToast: false }
-    )
-    if (result) {
-      setOnboardConfig(result)
-      setPendingOnboardConfig(result)
-    }
-  }
-
-  // Save auto-onboarding configuration
-  const saveOnboardConfig = async () => {
-    setSavingOnboardConfig(true)
-    try {
-      await api.updateOnboardConfig(pendingOnboardConfig)
-      setOnboardConfig(pendingOnboardConfig)
-      toast({
-        title: t('common:success'),
-        description: t('devices:pending.configSaved'),
-      })
-      setShowOnboardConfigDialog(false)
-    } catch (error) {
-      toast({
-        title: t('common:failed'),
-        description: t('devices:pending.configSaveFailed'),
-        variant: 'destructive'
-      })
-    } finally {
-      setSavingOnboardConfig(false)
-    }
-  }
-
-  // Open config dialog and fetch current config
-  const openOnboardConfigDialog = async () => {
-    await fetchOnboardConfig()
-    setShowOnboardConfigDialog(true)
-  }
 
   // Router integration
   const navigate = useNavigate()
@@ -415,6 +359,25 @@ export function DevicesPage() {
 
   // Handlers
   const handleAddDevice = async (request: import('@/types').AddDeviceRequest) => {
+    // [overwrite guard] The backend upserts on POST /devices — an existing
+    // device_id silently replaces the previous device. Confirm before that
+    // happens instead of reporting "added" after the fact.
+    if (request.device_id) {
+      const existing = devices.find((d) => d.device_id === request.device_id)
+      if (existing) {
+        const ok = await confirm({
+          title: t('devices:overwriteTitle', 'Replace existing device?'),
+          description: t(
+            'devices:overwriteConfirm',
+            'A device "{{id}}" ("{{name}}") already exists. Saving replaces its name and configuration.',
+            { id: existing.device_id, name: existing.name }
+          ),
+          confirmText: t('common:confirm'),
+          cancelText: t('common:cancel'),
+        })
+        if (!ok) return false
+      }
+    }
     setAddingDevice(true)
     try {
       return await addDevice(request)
@@ -433,8 +396,18 @@ export function DevicesPage() {
     })
     if (!confirmed) return
 
-    await deleteDevice(id)
-    toast({ title: t('common:success'), description: t('devices:deviceDeleted') })
+    // deleteDevice resolves to false on failure (and can throw on network
+    // errors) — only claim success when the backend actually deleted it.
+    try {
+      const deleted = await deleteDevice(id)
+      if (deleted) {
+        toast({ title: t('common:success'), description: t('devices:deviceDeleted') })
+      } else {
+        toast({ title: t('common:error'), description: t('devices:deleteFailed'), variant: "destructive" })
+      }
+    } catch {
+      toast({ title: t('common:error'), description: t('devices:deleteFailed'), variant: "destructive" })
+    }
   }
 
   const handleOpenDeviceDetails = (device: Device) => {
@@ -545,7 +518,6 @@ export function DevicesPage() {
   const [addDeviceTypeOpen, setAddDeviceTypeOpen] = useState(false)
   const [viewDeviceTypeOpen, setViewDeviceTypeOpen] = useState(false)
   const [editDeviceTypeOpen, setEditDeviceTypeOpen] = useState(false)
-  const [generatorOpen, setGeneratorOpen] = useState(false)
   const [cloudImportOpen, setCloudImportOpen] = useState(false)
   const [importingDeviceType, setImportingDeviceType] = useState(false)
   const deviceTypeImportRef = useRef<HTMLInputElement>(null)
@@ -599,8 +571,16 @@ export function DevicesPage() {
     })
     if (!confirmed) return
 
-    await deleteDeviceType(id)
-    toast({ title: t('common:success'), description: t('devices:deviceTypeDeleted') })
+    try {
+      const deleted = await deleteDeviceType(id)
+      if (deleted) {
+        toast({ title: t('common:success'), description: t('devices:deviceTypeDeleted') })
+      } else {
+        toast({ title: t('common:error'), description: t('devices:deleteFailed'), variant: "destructive" })
+      }
+    } catch {
+      toast({ title: t('common:error'), description: t('devices:deleteFailed'), variant: "destructive" })
+    }
   }
 
   const handleAddDeviceType = async (definition: DeviceType) => {
@@ -749,7 +729,7 @@ export function DevicesPage() {
             label: t('devices:pending.config'),
             icon: <Settings className="h-4 w-4" />,
             variant: 'outline',
-            onClick: openOnboardConfigDialog,
+            onClick: () => openSettings('preferences'),
           },
         ],
         secondary: [],
@@ -975,16 +955,6 @@ export function DevicesPage() {
         onChange={handleDeviceTypeImport}
       />
 
-      {/* Device Type Generator Dialog */}
-      <DeviceTypeGeneratorDialog
-        open={generatorOpen}
-        onOpenChange={setGeneratorOpen}
-        onDeviceTypeCreated={() => {
-          fetchDeviceTypes()
-          setGeneratorOpen(false)
-        }}
-      />
-
       {/* Cloud Import Dialog */}
       <CloudImportDialog
         open={cloudImportOpen}
@@ -999,86 +969,6 @@ export function DevicesPage() {
         }}
       />
 
-      {/* Auto-onboarding Configuration Dialog */}
-      <UnifiedFormDialog
-        open={showOnboardConfigDialog}
-        onOpenChange={setShowOnboardConfigDialog}
-        title={t('devices:pending.configTitle')}
-        width="sm"
-        onSubmit={saveOnboardConfig}
-        isSubmitting={savingOnboardConfig}
-        submitLabel={t('common:save')}
-      >
-        <div className="space-y-6">
-          {/* Enable/Disable auto-onboarding */}
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <Label htmlFor="onboard-enabled">{t('devices:pending.configSettings.enabled')}</Label>
-              <p className="text-xs text-muted-foreground">
-                {t('devices:pending.configSettings.enabledDesc')}
-              </p>
-            </div>
-            <Switch
-              id="onboard-enabled"
-              checked={pendingOnboardConfig.enabled}
-              onCheckedChange={(checked) =>
-                setPendingOnboardConfig({ ...pendingOnboardConfig, enabled: checked })
-              }
-            />
-          </div>
-
-          {/* Max samples */}
-          <div className="space-y-2">
-            <Label htmlFor="maxSamples">{t('devices:pending.configSettings.maxSamples')}</Label>
-            <Input
-              id="maxSamples"
-              type="number"
-              min={1}
-              max={100}
-              value={pendingOnboardConfig.max_samples}
-              onChange={(e) =>
-                setPendingOnboardConfig({
-                  ...pendingOnboardConfig,
-                  max_samples: Math.max(1, parseInt(e.target.value) || 10),
-                })
-              }
-              disabled={!pendingOnboardConfig.enabled}
-            />
-            <p className="text-xs text-muted-foreground">
-              {t('devices:pending.configSettings.maxSamplesDesc')}
-            </p>
-          </div>
-
-          {/* Draft retention time */}
-          <div className="space-y-2">
-            <Label htmlFor="retention">{t('devices:pending.configSettings.retention')}</Label>
-            <div className="flex items-center gap-2">
-              <Input
-                id="retention"
-                type="number"
-                min={3600}
-                max={604800}
-                step={3600}
-                value={pendingOnboardConfig.draft_retention_secs}
-                onChange={(e) =>
-                  setPendingOnboardConfig({
-                    ...pendingOnboardConfig,
-                    draft_retention_secs: Math.max(3600, parseInt(e.target.value) || 86400),
-                  })
-                }
-                disabled={!pendingOnboardConfig.enabled}
-              />
-              <span className="text-sm text-muted-foreground whitespace-nowrap">
-                {Math.round(pendingOnboardConfig.draft_retention_secs / 3600)} {t('devices:pending.hours')}
-              </span>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              {t('devices:pending.configSettings.retentionDesc')}
-            </p>
-          </div>
-
-        </div>
-      </UnifiedFormDialog>
     </>
   )
 }

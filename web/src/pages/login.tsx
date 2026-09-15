@@ -1,3 +1,4 @@
+import { HoneycombBackground } from '@/components/shared/HoneycombBackground'
 import { useState, useEffect } from "react"
 import { useTranslation } from "react-i18next"
 import { useNavigate } from "react-router-dom"
@@ -13,13 +14,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { BrandLogoHorizontal } from "@/components/shared/BrandName"
-import { HoneycombBackground } from "@/components/shared/HoneycombBackground"
 import { LoadingState } from "@/components/shared/LoadingState"
 import { forceViewportReset } from "@/hooks/useVisualViewport"
 import { textNano } from '@/design-system/tokens/typography'
 import { tokenManager, getApiBase, getApiKey, setApiBase, clearApiKey, setApiKey } from "@/lib/api"
+import { handleWindowDragMouseDown } from "@/lib/windowDrag"
 import { INSTANCE_CACHE_KEY, CURRENT_INSTANCE_KEY, PENDING_SWITCH_KEY } from "@/lib/instance-constants"
-import { decryptApiKey } from "@/store/slices/instanceSlice"
+import { getFullApiKey } from "@/store/slices/instanceSlice"
 
 const languages = [
   { code: 'vi', name: 'Tiếng Việt' },
@@ -49,17 +50,22 @@ function getCachedInstances(): CachedInstance[] {
   }
 }
 
-// Error translation helper
+// Error translation helper.
+// Backend messages vary between prose ("Invalid username or password") and
+// camelCase codes ("invalidCredentials"), so matching normalizes separators.
+// Keys MUST carry the `auth:` prefix — defaultNS is `common` and these keys
+// only exist in the auth namespace (bare keys render as raw error codes).
 function translateError(error: string, t: (key: string, params?: Record<string, unknown>) => string): string {
   const lowerError = error.toLowerCase()
-  if (lowerError.includes("invalid username or password") || lowerError.includes("invalid credentials")) {
-    return t("invalidCredentials")
+  const normalized = lowerError.replace(/[\s_-]/g, "")
+  if (normalized.includes("invalidusernameorpassword") || normalized.includes("invalidcredentials")) {
+    return t("auth:invalidCredentials")
   }
   if (lowerError.includes("user not found")) {
-    return t("userNotFound")
+    return t("auth:userNotFound")
   }
   if (lowerError.includes("user disabled") || lowerError.includes("account is disabled")) {
-    return t("accountDisabled")
+    return t("auth:accountDisabled")
   }
   if (lowerError.includes("password must be at least")) {
     return t("minPasswordLength", { ns: 'validation' })
@@ -68,12 +74,12 @@ function translateError(error: string, t: (key: string, params?: Record<string, 
     return t("minUsernameLength", { ns: 'validation' })
   }
   if (lowerError.includes("user already exists")) {
-    return t("userAlreadyExists")
+    return t("auth:userAlreadyExists")
   }
   if (lowerError.includes("unauthorized")) {
-    return t("authFailed")
+    return t("auth:authFailed")
   }
-  return error || t("loginFailed")
+  return error || t("auth:loginFailed")
 }
 
 export function LoginPage() {
@@ -113,9 +119,10 @@ export function LoginPage() {
   const apiBase = getApiBase()
   const isRemote = !!(apiBase && apiBase !== '/api' && !apiBase.includes('localhost') && !apiBase.includes('127.0.0.1'))
 
-  // Handle instance switch — use encrypted_key from backend
+  // Handle instance switch — the full key comes from the per-browser key
+  // store (saved when the user entered it); the backend never returns it.
   const handleInstanceSwitch = async (instance: CachedInstance) => {
-    const fullKey = instance.encrypted_key ? decryptApiKey(instance.encrypted_key) : ''
+    const fullKey = instance.is_local ? '' : (getFullApiKey(instance.id) || '')
     useStore.setState({
       switchingState: 'switching',
       switchingError: null,
@@ -288,9 +295,12 @@ export function LoginPage() {
   // Full-screen instance picker
   if (showInstancePicker) {
     return (
-      <div className="flex flex-col bg-background viewport-full">
+      <div className="flex flex-col bg-popover viewport-full">
         {/* Header */}
-        <header className="flex items-center gap-3 px-4 sm:px-6 h-14 border-b border-border safe-top">
+        <header
+          className="flex items-center gap-3 px-4 sm:px-6 py-3.5 border-b border-border"
+          style={{ paddingTop: "calc(0.875rem + env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px))" }}
+        >
           <Button variant="ghost" size="sm" onClick={() => setShowInstancePicker(false)}>
             <ArrowLeft className="h-4 w-4 mr-1" />
             {t('common:back')}
@@ -303,12 +313,15 @@ export function LoginPage() {
           <div className="max-w-lg mx-auto space-y-3">
             {cachedInstances.map((inst) => {
               const isCurrent = inst.id === localStorage.getItem(CURRENT_INSTANCE_KEY)
-              const hasApiKey = !!(inst.encrypted_key || inst.api_key)
+              // Only a locally-stored FULL key means key auth; the masked
+              // api_key can't authenticate — badging it as key auth sends
+              // the user into a switch that lands on the login page.
+              const hasApiKey = !!getFullApiKey(inst.id)
               return (
                 <button
                   key={inst.id}
                   onClick={() => handleInstanceSwitch(inst)}
-                  className={`w-full flex items-center gap-4 p-4 rounded-xl bg-bg-50 border transition-colors text-left ${
+                  className={`w-full flex items-center gap-4 p-4 rounded-xl border transition-colors text-left ${
                     isCurrent ? 'border-primary' : 'border-border hover:border-primary'
                   }`}
                 >
@@ -370,9 +383,14 @@ export function LoginPage() {
         />
       </div>
 
-      {/* Top Header */}
+      {/* Top Header — doubles as the Tauri window drag region (the shell's
+          TopBar has the same contract; overlay titlebar means nothing native
+          is draggable here). Interactive elements are skipped by the helper. */}
       <header className="absolute top-0 left-0 right-0 z-50 safe-top">
-        <div className="flex items-center justify-between px-4 sm:px-6 h-14 sm:h-16">
+        <div
+          className="flex items-center justify-between px-4 sm:px-6 h-14 sm:h-16"
+          onMouseDown={handleWindowDragMouseDown}
+        >
           <div className="flex items-center gap-2 sm:gap-3">
             <BrandLogoHorizontal className="h-6 sm:h-7" />
           </div>

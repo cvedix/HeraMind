@@ -135,7 +135,7 @@
     "metric": "指标",
     "entityIcon": "实体图标",
     "lucideIcon": "Lucide 图标",
-    "noDashboardFound": "未找到仪表板",
+    "noDashboardFound": "还没有仪表板",
     "createFirstDashboard": "创建您的第一个仪表板以开始使用",
     "share": {
       "title": "分享",
@@ -192,7 +192,7 @@
     "exitFullscreen": "退出全屏",
     "emptyDashboard": "仪表板为空",
     "addComponentsHint": "点击 + 按钮添加组件",
-    "enterEditModeHint": "点击「编辑布局」添加组件",
+    "enterEditModeHint": "进入编辑模式，添加你的第一个组件",
     "save": "保存",
     "settings": "设置",
     "unsavedChanges": "您有未保存的更改",
@@ -262,7 +262,12 @@
     "preview": "预览",
     "systemDataSource": "此组件使用系统数据。",
     "configureDataSourceHint": "请在设置中配置数据源。",
-    "add": "添加"
+    "add": "添加",
+    "emptyGuideDesc": "用可视化组件搭建实时监控视图——图表、仪表、地图，数据来自你的设备。",
+    "emptyAskAi": "让 AI 帮我搭",
+    "emptyStep1": "创建仪表板",
+    "emptyStep2": "添加组件",
+    "emptyStep3": "绑定设备数据"
   },
   "mobileEditBar": {
     "component": "组件",
@@ -641,6 +646,7 @@
     "selectDevice": "选择一个设备",
     "selectedItems": "已选 {{count}} 项",
     "clearAllSelections": "清除所有选择",
+    "deviceRemoved": "绑定的设备已不存在",
     "deviceList": "设备列表",
     "count": "个",
     "metricsCount": "个指标",
@@ -882,7 +888,23 @@
     "imageHistory.failedToLoad": "加载失败",
     "tabComponents": "组件",
     "tabMarketplace": "市场",
+    "tabExtensions": "扩展",
+    "extensionsEmptyTitle": "还没有扩展组件",
+    "extensionsEmptyDesc": "安装提供前端组件的扩展后，其组件会按扩展声明的分类显示在这里",
+    "tabCustom": "自定义",
+    "customEmptyTitle": "还没有自定义组件",
+    "customEmptyDesc": "上传 ZIP 包或从服务器路径导入组件，安装后会显示在这里，可添加到仪表盘",
+    "refreshMarket": "刷新市场",
+    "all": "全部",
     "importComponent": "导入组件",
+    "importTypeUpload": "上传 ZIP",
+    "importTypeServerPath": "服务器路径",
+    "dropOrSelect": "拖拽 .zip 到此处，或点击选择文件",
+    "dropHere": "松开以选择该文件",
+    "replaceFileHint": "点击或拖拽可重新选择",
+    "invalidZipType": "请选择 .zip 文件",
+    "serverPathPlaceholder": "components/my-widget.zip",
+    "serverPathHint": "适用于安装包已位于服务器上的场景（如经 scp / U 盘传入）。路径需在服务器数据目录内，可填相对路径（以上传目录为基准）或绝对路径。",
     "marketplaceEmpty": "暂无可用组件",
     "install": "安装",
     "uninstall": "卸载",
@@ -895,7 +917,6 @@
     "uninstallSuccess": "组件已卸载",
     "installError": "组件安装失败",
     "version": "版本",
-    "title": "组件库",
     "components": "组件",
     "indicators": "指示器",
     "charts": "图表",
@@ -925,8 +946,6 @@
     "imageDisplayDesc": "从 URL 或数据源显示图片",
     "imageHistory": "图片历史",
     "imageHistoryDesc": "带时间导航的历史图片库",
-    "eventList": "事件列表",
-    "eventListDesc": "查看结构化事件、图像和动态属性",
     "webDisplay": "网页显示",
     "webDisplayDesc": "通过 iframe 嵌入网页内容",
     "markdownDisplay": "Markdown 显示",
@@ -954,7 +973,6 @@
     "marketplace": "组件市场",
     "marketplaceTitle": "组件市场",
     "marketplaceError": "无法连接到组件市场",
-    "installed": "已安装",
     "manifestFile": "清单文件 (JSON)",
     "manifestFileDesc": "组件元数据和配置信息",
     "bundleFile": "打包文件 (JavaScript)",
@@ -963,7 +981,9 @@
     "preview": "预览",
     "installConfirm": "确认安装",
     "uninstallConfirm": "确定要卸载此组件吗？",
-    "by": "作者"
+    "by": "作者",
+    "eventList": "事件列表",
+    "eventListDesc": "查看结构化事件、图像和动态属性"
   },
   "common": {
     "cancel": "取消",
@@ -1095,7 +1115,6 @@
     "namePlaceholder": "仪表板名称...",
     "create": "创建",
     "newDashboard": "新建仪表板",
-    "dashboardCount": "{{count}} 个仪表板",
     "switchToTabs": "切换到标签栏",
     "moveUp": "上移",
     "moveDown": "下移",
@@ -1244,6 +1263,17 @@
     "configureSource": "配置数据源",
     "failedToLoad": "加载失败"
   },
+  "installConfirm": "确认安装",
+  "bindingDeviceRemoved": "绑定的设备已删除",
+  "bindingDeviceRemovedHint": "请重新绑定一个存在的设备",
+  "staleData": "最后数值 · 设备离线",
+  "staleDataIdle": "最后数值 · 连接待机，等待数据",
+  "staleDataLastSeen": "最后上报：{{age}}",
+  "staleDataDevices": "设备：{{names}}",
+  "renderer": {
+    "componentUnavailable": "组件暂不可用",
+    "componentUnavailableHint": "提供该组件的扩展未运行或未安装，恢复后将自动显示"
+  },
   "eventList": {
     "title": "事件列表",
     "searchPlaceholder": "搜索事件或属性...",
@@ -1272,6 +1302,5 @@
     "showSearch": "显示搜索",
     "showFilters": "显示筛选",
     "showImage": "显示事件图像"
-  },
-  "installConfirm": "确认安装"
+  }
 }

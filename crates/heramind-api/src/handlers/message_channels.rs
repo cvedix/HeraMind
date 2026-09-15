@@ -52,11 +52,16 @@ use crate::models::ErrorResponse;
 use serde_json::json;
 
 /// Create channel request.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CreateChannelRequest {
     pub name: String,
     pub channel_type: String,
+    /// Channel-specific configuration. NOTE the serde `flatten`: these
+    /// fields are flattened into the request TOP LEVEL — a webhook channel
+    /// is `{"name","channel_type","url"}` with `url` at the root, NOT
+    /// nested under a `config` object.
     #[serde(flatten)]
+    #[schema(value_type = Object)]
     pub config: serde_json::Value,
 }
 
@@ -70,6 +75,14 @@ pub struct ChannelListResponse {
 
 /// List all channels.
 /// GET /api/messages/channels
+#[utoipa::path(
+    get,
+    path = "/api/messages/channels",
+    tag = "channels",
+    responses(
+        (status = 200, description = "Configured notification channels"),
+    )
+)]
 pub async fn list_channels_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -87,6 +100,18 @@ pub async fn list_channels_handler(
 
 /// Get a specific channel.
 /// GET /api/messages/channels/:name
+#[utoipa::path(
+    get,
+    path = "/api/messages/channels/{name}",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Channel name"),
+    ),
+    responses(
+        (status = 200, description = "One channel with config (secrets redacted)"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_channel_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
@@ -103,6 +128,14 @@ pub async fn get_channel_handler(
 
 /// List available channel types.
 /// GET /api/messages/channels/types
+#[utoipa::path(
+    get,
+    path = "/api/messages/channels/types",
+    tag = "channels",
+    responses(
+        (status = 200, description = "Static metadata for every channel type"),
+    )
+)]
 pub async fn list_channel_types_handler() -> HandlerResult<serde_json::Value> {
     let types = heramind_messages::list_channel_types();
 
@@ -114,6 +147,18 @@ pub async fn list_channel_types_handler() -> HandlerResult<serde_json::Value> {
 
 /// Get channel type schema.
 /// GET /api/messages/channels/types/:type/schema
+#[utoipa::path(
+    get,
+    path = "/api/messages/channels/types/{type}/schema",
+    tag = "channels",
+    params(
+        ("type" = String, Path, description = "Channel type key"),
+    ),
+    responses(
+        (status = 200, description = "JSON-schema of the config object for a channel type"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_channel_type_schema_handler(
     Path(channel_type): Path<String>,
 ) -> HandlerResult<serde_json::Value> {
@@ -139,6 +184,15 @@ pub async fn get_channel_type_schema_handler(
 
 /// Create a new channel.
 /// POST /api/messages/channels
+#[utoipa::path(
+    post,
+    path = "/api/messages/channels",
+    tag = "channels",
+    request_body = CreateChannelRequest,
+    responses(
+        (status = 200, description = "Channel created"),
+    )
+)]
 pub async fn create_channel_handler(
     State(state): State<ServerState>,
     Json(req): Json<CreateChannelRequest>,
@@ -237,6 +291,18 @@ pub async fn create_channel_handler(
 
 /// Delete a channel.
 /// DELETE /api/messages/channels/:name
+#[utoipa::path(
+    delete,
+    path = "/api/messages/channels/{name}",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Channel name"),
+    ),
+    responses(
+        (status = 200, description = "Channel deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_channel_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
@@ -259,6 +325,18 @@ pub async fn delete_channel_handler(
 
 /// Test a channel.
 /// POST /api/messages/channels/:name/test
+#[utoipa::path(
+    post,
+    path = "/api/messages/channels/{name}/test",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Channel name"),
+    ),
+    responses(
+        (status = 200, description = "Test notification sent through the channel"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn test_channel_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
@@ -266,22 +344,35 @@ pub async fn test_channel_handler(
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.read().await;
 
-    let result = registry_guard
-        .test(&name)
-        .await
-        .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+    let result = registry_guard.test(&name).await.map_err(|e| match e {
+        heramind_messages::Error::NotFound(msg) => ErrorResponse::not_found(msg),
+        other => ErrorResponse::internal(other.to_string()),
+    })?;
 
     ok(json!(result))
 }
 
 /// Request to update a channel.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct UpdateChannelRequest {
     pub config: serde_json::Value,
 }
 
 /// Update a channel's configuration.
 /// PUT /api/messages/channels/:name
+#[utoipa::path(
+    put,
+    path = "/api/messages/channels/{name}",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Channel name"),
+    ),
+    request_body = UpdateChannelRequest,
+    responses(
+        (status = 200, description = "Channel config updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_channel_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
@@ -406,13 +497,26 @@ pub async fn update_channel_handler(
 }
 
 /// Request to toggle channel enabled state.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct ToggleEnabledRequest {
     pub enabled: bool,
 }
 
 /// Toggle channel enabled state.
 /// PUT /api/messages/channels/:name/enabled
+#[utoipa::path(
+    put,
+    path = "/api/messages/channels/{name}/enabled",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Channel name"),
+    ),
+    request_body = ToggleEnabledRequest,
+    responses(
+        (status = 200, description = "Channel enabled/disabled"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn toggle_enabled_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
@@ -424,7 +528,10 @@ pub async fn toggle_enabled_handler(
     registry_guard
         .set_enabled(&name, req.enabled)
         .await
-        .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+        .map_err(|e| match e {
+            heramind_messages::Error::NotFound(msg) => ErrorResponse::not_found(msg),
+            other => ErrorResponse::internal(other.to_string()),
+        })?;
 
     // Get updated info
     let info = registry_guard
@@ -441,6 +548,14 @@ pub async fn toggle_enabled_handler(
 
 /// Get channel statistics.
 /// GET /api/messages/channels/stats
+#[utoipa::path(
+    get,
+    path = "/api/messages/channels/stats",
+    tag = "channels",
+    responses(
+        (status = 200, description = "Delivery counters per channel"),
+    )
+)]
 pub async fn get_channel_stats_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -454,13 +569,25 @@ pub async fn get_channel_stats_handler(
 // ========== Recipient Management ==========
 
 /// Add recipient request.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct AddRecipientRequest {
     pub email: String,
 }
 
 /// Get recipients for a channel.
 /// GET /api/messages/channels/:name/recipients
+#[utoipa::path(
+    get,
+    path = "/api/messages/channels/{name}/recipients",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Channel name"),
+    ),
+    responses(
+        (status = 200, description = "Recipients of an email-type channel"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn list_recipients_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
@@ -484,6 +611,19 @@ pub async fn list_recipients_handler(
 
 /// Add a recipient to a channel.
 /// POST /api/messages/channels/:name/recipients
+#[utoipa::path(
+    post,
+    path = "/api/messages/channels/{name}/recipients",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Channel name"),
+    ),
+    request_body = AddRecipientRequest,
+    responses(
+        (status = 200, description = "Recipient added"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn add_recipient_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
@@ -509,6 +649,19 @@ pub async fn add_recipient_handler(
 
 /// Remove a recipient from a channel.
 /// DELETE /api/messages/channels/:name/recipients/:email
+#[utoipa::path(
+    delete,
+    path = "/api/messages/channels/{name}/recipients/{email}",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Channel name"),
+        ("email" = String, Path, description = "Recipient email"),
+    ),
+    responses(
+        (status = 200, description = "Recipient removed"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn remove_recipient_handler(
     State(state): State<ServerState>,
     Path((name, email)): Path<(String, String)>,
@@ -543,6 +696,18 @@ pub async fn remove_recipient_handler(
 
 /// Get channel filter configuration.
 /// GET /api/messages/channels/:name/filter
+#[utoipa::path(
+    get,
+    path = "/api/messages/channels/{name}/filter",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Channel name"),
+    ),
+    responses(
+        (status = 200, description = "Severity/category filter of a channel"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_channel_filter_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
@@ -561,7 +726,7 @@ pub async fn get_channel_filter_handler(
 }
 
 /// Request to update channel filter.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct UpdateFilterRequest {
     pub source_types: Vec<String>,
     pub categories: Vec<String>,
@@ -570,6 +735,19 @@ pub struct UpdateFilterRequest {
 
 /// Update channel filter configuration.
 /// PUT /api/messages/channels/:name/filter
+#[utoipa::path(
+    put,
+    path = "/api/messages/channels/{name}/filter",
+    tag = "channels",
+    params(
+        ("name" = String, Path, description = "Channel name"),
+    ),
+    request_body = UpdateFilterRequest,
+    responses(
+        (status = 200, description = "Filter updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_channel_filter_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,

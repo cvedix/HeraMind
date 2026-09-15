@@ -25,7 +25,8 @@
     "skills": "Kỹ năng",
     "selectSkills": "Chọn kỹ năng",
     "noSkills": "Không có kỹ năng khả dụng",
-    "activeSkills": "Kỹ năng đang bật"
+    "activeSkills": "Kỹ năng đang bật",
+    "fallbackHelpPrompt": "Bạn có thể làm gì?"
   },
   "model": {
     "supportsVision": "Hỗ trợ thị giác",
@@ -76,7 +77,9 @@
     "retryAttempt": "Lần thử {{count}}",
     "retryProgress": "Lần thử {{retry}}/{{max}}{{seconds, string}}",
     "retrySeconds": "· {{seconds}}",
-    "reconnect": "Kết nối lại"
+    "reconnect": "Kết nối lại",
+    "authFailed": "Mất kết nối (xác thực thất bại)",
+    "interruptedSaved": "Mất kết nối — câu trả lời vẫn được xử lý nền và lưu vào lịch sử phiên; quay lại phiên này sau để xem kết quả"
   },
   "quickActions": {
     "refreshDevices": "Làm mới thiết bị",
@@ -185,7 +188,8 @@
   "notConfigured": {
     "title": "Chưa cấu hình LLM",
     "description": "Vui lòng cấu hình LLM backend để dùng tính năng chat",
-    "goToSettings": "Đi tới Cài đặt"
+    "goToSettings": "Đi tới Cài đặt",
+    "downloadBuiltin": "Tải mô hình tích hợp (khuyến nghị)"
   },
   "build": {
     "view": "Xem",
@@ -221,5 +225,21 @@
   },
   "footer": {
     "disclaimer": "Miễn trừ trách nhiệm"
+  },
+  "resizePanel": "Kéo để đổi kích thước khung chat",
+  "code": {
+    "copy": "Sao chép",
+    "copied": "Đã sao chép"
+  },
+  "scrollToBottom": "Cuộn xuống cuối",
+  "copyMessage": "Sao chép tin nhắn",
+  "toolLoopProgress": "Đang xử lý · lượt gọi công cụ {{round}}",
+  "context": {
+    "title": "Mức sử dụng ngữ cảnh",
+    "systemPrompt": "Chỉ dẫn hệ thống",
+    "toolDefs": "Định nghĩa công cụ",
+    "history": "Lịch sử hội thoại",
+    "estimatedHint": "Ước tính theo ký tự — cập nhật sau câu trả lời tiếp theo",
+    "msgCount": " · {{count}} tin nhắn"
   }
 }

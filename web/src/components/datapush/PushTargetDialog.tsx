@@ -124,6 +124,7 @@ export function PushTargetDialog() {
   const [targetType, setTargetType] = useState<PushTargetType>('webhook')
   const [webhookUrl, setWebhookUrl] = useState('')
   const [webhookUrlError, setWebhookUrlError] = useState<string | null>(null)
+  const [mqttTopicError, setMqttTopicError] = useState<string | null>(null)
   const [mqttBroker, setMqttBroker] = useState('')
   const [mqttTopic, setMqttTopic] = useState('')
   const [mqttPort, setMqttPort] = useState(1883)
@@ -193,6 +194,7 @@ export function PushTargetDialog() {
         } else {
           setMqttBroker(editingPushTarget.config?.broker || '')
           setMqttTopic(editingPushTarget.config?.topic || '')
+          setMqttTopicError(null)
           setMqttPort(editingPushTarget.config?.port || 1883)
           setMqttUsername(editingPushTarget.config?.username || '')
           setMqttPassword(editingPushTarget.config?.password || '')
@@ -261,6 +263,7 @@ export function PushTargetDialog() {
     setName('')
     setNameError(null)
     setWebhookUrlError(null)
+    setMqttTopicError(null)
     setTargetType('webhook')
     setWebhookUrl('')
     setWebhookAuthType('none')
@@ -361,6 +364,11 @@ export function PushTargetDialog() {
       setWebhookUrlError(t('common:dataPush.urlRequired', 'URL is required'))
       return
     }
+    if (targetType === 'mqtt' && !mqttTopic.trim()) {
+      setMqttTopicError(t('common:dataPush.topicRequired', 'Topic is required'))
+      return
+    }
+    setMqttTopicError(null)
 
     // Resolve MQTT broker from selected external broker or manual input
     const resolvedMqttBroker = mqttMode === 'select' && selectedBrokerId
@@ -381,16 +389,22 @@ export function PushTargetDialog() {
         }
       : {
           broker: resolvedMqttBroker ? resolvedMqttBroker.broker : mqttBroker,
-          port: resolvedMqttBroker ? resolvedMqttBroker.port : mqttPort,
+          // Cleared number input yields NaN/0 — fall back to the MQTT default.
+          port: resolvedMqttBroker
+            ? resolvedMqttBroker.port
+            : Number.isFinite(mqttPort) && mqttPort > 0 ? Math.round(mqttPort) : 1883,
           topic: mqttTopic,
           qos: mqttQos,
           ...(resolvedMqttBroker?.username ? { username: resolvedMqttBroker.username } : mqttUsername.trim() ? { username: mqttUsername } : {}),
           ...(resolvedMqttBroker?.password ? { password: resolvedMqttBroker.password } : mqttPassword ? { password: mqttPassword } : {}),
         }
 
+    // Typed number inputs can hold NaN (cleared field) — fall back to the
+    // defaults instead of serializing null into the request.
+    const safeInterval = Number.isFinite(intervalSecs) && intervalSecs >= 1 ? Math.round(intervalSecs) : 60
     const schedule = scheduleType === 'event_driven'
       ? { type: 'event_driven' as const, event_types: ['device_metric', 'extension_output'] }
-      : { type: 'interval' as const, interval_secs: intervalSecs }
+      : { type: 'interval' as const, interval_secs: safeInterval }
 
     let sourcePatterns: string[]
     if (showAdvanced && manualPatterns.trim()) {
@@ -405,8 +419,8 @@ export function PushTargetDialog() {
     }
 
     const batchConfig = batchEnabled ? {
-      batch_size: batchSize,
-      batch_interval_ms: batchIntervalMs,
+      batch_size: Number.isFinite(batchSize) ? Math.min(1000, Math.max(2, Math.round(batchSize))) : 50,
+      batch_interval_ms: Number.isFinite(batchIntervalMs) ? Math.min(60000, Math.max(100, Math.round(batchIntervalMs))) : 2000,
       format: batchFormat,
     } : undefined
 
@@ -469,7 +483,7 @@ export function PushTargetDialog() {
                         type="button"
                         onClick={() => setTargetType(type)}
                         className={cn(
-                          "relative flex flex-col items-start gap-1.5 rounded-lg border-2 p-3 text-left transition-all",
+                          "relative flex flex-col items-start gap-1.5 rounded-lg border p-3 text-left transition-colors",
                           isActive
                             ? "border-primary bg-muted shadow-sm"
                             : "border-border hover:border-border"
@@ -664,10 +678,12 @@ export function PushTargetDialog() {
                     <div className="sm:col-span-2">
                       <Input
                         value={mqttTopic}
-                        onChange={(e) => setMqttTopic(e.target.value)}
+                        onChange={(e) => { setMqttTopic(e.target.value); if (mqttTopicError) setMqttTopicError(null) }}
                         placeholder="heramind/data"
-                        className={isMobile ? "h-12 text-base" : "h-10"}
+                        aria-invalid={!!mqttTopicError}
+                        className={cn(isMobile ? "h-12 text-base" : "h-10", mqttTopicError && "border-error")}
                       />
+                      {mqttTopicError && <p className="text-sm text-error mt-1">{mqttTopicError}</p>}
                     </div>
                     <Select value={String(mqttQos)} onValueChange={(v) => setMqttQos(Number(v))}>
                       <SelectTrigger className={isMobile ? "h-12 text-base" : "h-10"}>
@@ -888,7 +904,7 @@ export function PushTargetDialog() {
                                         )}
                                       >
                                         <Checkbox checked={allSelected} />
-                                        <span className="text-[13px] font-medium truncate">{displayName}</span>
+                                        <span className="text-body font-medium truncate">{displayName}</span>
                                         {someSelected && (
                                           <Badge variant="secondary" className={cn(textNano, "h-4 px-1 shrink-0")}>
                                             {sourceItems.filter(s => selectedSources.has(s.id)).length}
@@ -897,7 +913,7 @@ export function PushTargetDialog() {
                                       </button>
                                       <button
                                         onClick={() => toggleGroupExpand(sourceKey)}
-                                        className="px-3 py-2 hover:bg-muted-30 transition-colors shrink-0"
+                                        className="inline-flex items-center justify-center h-8 w-8 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0"
                                         aria-label={subExpanded ? 'Collapse' : 'Expand'}
                                       >
                                         {subExpanded
@@ -923,7 +939,7 @@ export function PushTargetDialog() {
                                             <span className="text-xs truncate">{src.field_display_name}</span>
                                             {src.data_type && (
                                               <span className={cn(
-                                                'ml-auto px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0',
+                                                'ml-auto px-1.5 py-0.5 rounded text-nano font-mono shrink-0',
                                                 badgeClass
                                               )}>
                                                 {src.data_type}
@@ -969,10 +985,10 @@ export function PushTargetDialog() {
                           <span className="max-w-[80px] truncate">{src.field_display_name}</span>
                           <button
                             onClick={() => toggleSource(src.id)}
-                            className="ml-0.5 text-muted-foreground hover:text-foreground"
+                            className="ml-0.5 inline-flex items-center justify-center h-5 w-5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
                             aria-label={t('common:dataPush.removeSource')}
                           >
-                            <X className="h-3 w-3" />
+                            <X className="h-3 w-3" aria-hidden="true" />
                           </button>
                         </span>
                       )

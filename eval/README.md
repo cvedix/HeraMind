@@ -76,8 +76,9 @@ python3 eval/run_eval.py validate-all --root eval/cases
 # 3. Run a single case (requires AGENT_LLM_*)
 AGENT_LLM_API_KEY=sk-xxx \
 AGENT_LLM_ENDPOINT=https://api.deepseek.com/v1 \
-AGENT_LLM_MODEL=deepseek-v4-flash \
-AGENT_LLM_BACKEND_TYPE=deepseek \
+AGENT_LLM_MODEL=deepseek-chat \
+AGENT_LLM_BACKEND_TYPE=openai \
+AGENT_LLM_ENDPOINT=https://api.deepseek.com/v1 \
   python3 eval/run_eval.py run-case --case eval/smoke/good-002.json
 
 # 4. Run smoke cases (no judge)
@@ -145,7 +146,7 @@ Weights renormalize over `applies[]` subset.
 | Var | Purpose | Where |
 |-----|---------|-------|
 | `AGENT_LLM_API_KEY` / `AGENT_LLM_ENDPOINT` / `AGENT_LLM_MODEL` | Powers the chat agent (model under test) | Set on runner; propagated to server via API |
-| `AGENT_LLM_BACKEND_TYPE` | `openai` (default) / `deepseek` / `qwen` / `anthropic` / etc. | Same as above |
+| `AGENT_LLM_BACKEND_TYPE` | `ollama` / `llamacpp` / `openai` (default) / `anthropic` — vendors ride `openai` + their endpoint | Same as above |
 | `AGENT_LLM_THINKING` | `true` / `false` (default; commit c6385169) | Same as above |
 | `ANTHROPIC_API_KEY` | Powers the Claude judge | Runner process only |
 | `EVAL_JUDGE_MODEL` | Override judge model (default `claude-opus-4-6`) | Runner process only |
@@ -158,7 +159,7 @@ it to the subprocess.
 ## Known limitations
 
 - **Greeting fast-path false positive**: smoke-good-001 (`你好`) triggers the
-  agent's canned greeting response at `agent/mod.rs:1355` (4ms, no LLM). The
+  agent's canned greeting response at `agent/mod.rs:1434` (`try_fast_path`) (4ms, no LLM). The
   fallback heuristic flags this as `suspected_fallback=true` because
   expectations mention tool words. This is a known false positive — the agent
   behavior is correct for greetings.
@@ -171,3 +172,31 @@ it to the subprocess.
 - Spec: `docs/superpowers/specs/2026-06-29-eval-system-design.md`
 - Plan: `docs/superpowers/plans/2026-06-29-eval-system.md` (historical —
   describes the original Rust crate architecture, now superseded by Python)
+
+## Regression gate (`run_eval.py regression`)
+
+Fast verdict gate over the curated set in `regression_set.txt` (33 cases:
+30 domain-stratified + 3 `surface-micro` single-command cases that isolate
+CLI-surface accuracy from multi-step planning noise). Resolves cases by JSON
+`id` — file location/name is irrelevant, which is what makes the case-library
+layout free to reorganize.
+
+```bash
+# CI / pre-merge gate (exit 1 on robust PASS->FAIL):
+AGENT_LLM_* ... python3 eval/run_eval.py regression --rounds 2
+
+# after merging an approved change, refresh the reference:
+AGENT_LLM_* ... python3 eval/run_eval.py regression --rounds 2 --update-baseline
+```
+
+- **Use `--rounds 2` for verdicts you act on.** Single-round runs have a
+  ~7pp noise floor (observed 2026-09-01: 3/33 flagged regressions on a
+  single round, all three PASS on rerun). A single round is fine as a
+  quick smoke during development.
+- The baseline is per-case robust: multi-round baselines demote
+  round-disagreeing cases to `None` (noisy bucket) instead of flip-flopping.
+- Cases present in the set but absent from the baseline run without
+  affecting the verdict — extend the set first, `--update-baseline` later.
+- Note: `--case-id` selection (also used internally by the gate) matches by
+  id across BOTH langs and takes the first path (en sorts before zh), so
+  the gate exercises the `en` variant of each case.

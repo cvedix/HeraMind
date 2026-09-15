@@ -1,10 +1,10 @@
 /**
- * CompleteStep - Setup completion screen with quick-start guide
+ * CompleteStep - Setup completion screen. Success state with a single CTA —
+ * setup is done, the model/device guidance lives inside the app.
  */
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useNavigate } from 'react-router-dom'
-import { Check, MessageSquare, Settings, ChevronRight, Cpu, Zap, Globe } from 'lucide-react'
+import { Check, ChevronRight, Globe } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { SetupBackground } from './SetupBackground'
@@ -16,12 +16,11 @@ interface CompleteStepProps {
   initialTimezone: string
   token: string
   getApiUrl: (path: string) => string
-  onComplete: () => void
+  onComplete: (dest?: string) => void
 }
 
 export function CompleteStep({ username, initialTimezone, token, getApiUrl, onComplete }: CompleteStepProps) {
   const { t } = useTranslation(['common', 'setup'])
-  const navigate = useNavigate()
   const [timezone, setTimezone] = useState(initialTimezone)
   const timezoneOptions = getLocalizedTimezones(t)
 
@@ -41,27 +40,6 @@ export function CompleteStep({ username, initialTimezone, token, getApiUrl, onCo
       console.warn('Failed to save timezone:', e)
     }
   }
-
-  const quickActions = [
-    {
-      icon: MessageSquare,
-      title: t('setup:quickChat'),
-      description: t('setup:quickChatDesc'),
-      action: () => { onComplete() },
-    },
-    {
-      icon: Cpu,
-      title: t('setup:quickLlm'),
-      description: t('setup:quickLlmDesc'),
-      action: () => { onComplete(); setTimeout(() => navigate('/settings'), 100) },
-    },
-    {
-      icon: Zap,
-      title: t('setup:quickExplore'),
-      description: t('setup:quickExploreDesc'),
-      action: () => { onComplete() },
-    },
-  ]
 
   return (
     <div className="viewport-full flex flex-col bg-background relative overflow-hidden">
@@ -93,7 +71,7 @@ export function CompleteStep({ username, initialTimezone, token, getApiUrl, onCo
               <p className="text-muted-foreground mb-2 text-sm">{t('setup:completeMessage')}</p>
 
               {/* Account meta — username chip + inline timezone selector */}
-              <div className="flex flex-wrap items-center justify-center gap-2 mb-5 sm:mb-6">
+              <div className="flex flex-wrap items-center justify-center gap-2 mb-6 sm:mb-7">
                 <div className="inline-flex items-center gap-2 bg-muted-30 rounded-full px-3 py-1">
                   <span className="text-xs text-muted-foreground">{t('setup:accountCreated')}:</span>
                   <span className="text-sm font-mono font-medium">{username}</span>
@@ -113,37 +91,15 @@ export function CompleteStep({ username, initialTimezone, token, getApiUrl, onCo
                 </div>
               </div>
 
-              {/* Quick Start Guide */}
-              <div className="text-left space-y-2 mb-5 sm:mb-6">
-                <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-3">
-                  {t('setup:nextSteps')}
-                </div>
-                {quickActions.map((action, i) => (
-                  <button
-                    key={i}
-                    onClick={action.action}
-                    className="w-full flex items-center gap-3 p-3 rounded-lg border border-border hover:bg-muted-50 transition-colors text-left group"
-                  >
-                    <div className="flex size-9 items-center justify-center rounded-lg bg-muted text-primary shrink-0">
-                      <action.icon className="size-4" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium">{action.title}</div>
-                      <div className="text-xs text-muted-foreground">{action.description}</div>
-                    </div>
-                    <ChevronRight className="size-4 text-muted-foreground group-hover:text-foreground transition-colors shrink-0" />
-                  </button>
-                ))}
-              </div>
-
-              {/* Main CTA */}
+              {/* Single CTA — setup is done, just go in. Model/device guidance
+                  lives in the app (chat empty state, LLM settings). */}
               <Button
-                onClick={onComplete}
-                className="w-full h-11 sm:h-10"
+                onClick={() => onComplete("/chat")}
+                className="w-full h-11 sm:h-10 gap-2"
                 size="default"
               >
-                {t('setup:goToDashboard')}
-                <ChevronRight className="ml-2 h-4 w-4" />
+                {t('setup:getStarted')}
+                <ChevronRight className="h-4 w-4" />
               </Button>
             </div>
           </div>

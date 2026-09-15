@@ -53,7 +53,17 @@ impl std::error::Error for DispatchError {}
 pub async fn dispatch(argv: &[String]) -> Result<CliResponse, DispatchError> {
     let parsed = match Args::try_parse_from(argv.iter()) {
         Ok(args) => args,
-        Err(e) => return Err(DispatchError::Parse(e.to_string())),
+        Err(e) => {
+            // First-shot flag errors from the agent's shell tool land here.
+            // Counted from logs to rank which commands need surface fixes.
+            tracing::warn!(
+                target: "heramind::cli_dispatch",
+                argv = ?argv,
+                error = %e,
+                "clap parse error"
+            );
+            return Err(DispatchError::Parse(e.to_string()));
+        }
     };
 
     match parsed.command {
@@ -71,6 +81,7 @@ pub async fn dispatch(argv: &[String]) -> Result<CliResponse, DispatchError> {
         // --- Local-only commands (need redb/auth from heramind-api, or print
         //     directly to stdout and rely on subprocess capture) ---
         Command::ApiKey { .. } => Err(DispatchError::NotInProcess),
+        Command::User { .. } => Err(DispatchError::NotInProcess),
         Command::Extension { extension_cmd } => {
             if handlers::is_local_extension_command(&extension_cmd) {
                 Err(DispatchError::NotInProcess)
@@ -143,6 +154,18 @@ pub async fn dispatch(argv: &[String]) -> Result<CliResponse, DispatchError> {
                 .map_err(|e| DispatchError::Api(e.to_string()))?;
             Ok(resp)
         }
+        Command::Config { config_cmd } => {
+            let (resp, _) = handlers::run_config_cmd(config_cmd)
+                .await
+                .map_err(|e| DispatchError::Api(e.to_string()))?;
+            Ok(resp)
+        }
+        Command::Data { data_cmd } => {
+            let (resp, _) = handlers::run_data_cmd(data_cmd)
+                .await
+                .map_err(|e| DispatchError::Api(e.to_string()))?;
+            Ok(resp)
+        }
         Command::Settings { settings_cmd } => {
             let (resp, _) = handlers::run_settings_cmd(settings_cmd)
                 .await
@@ -172,6 +195,101 @@ pub async fn dispatch(argv: &[String]) -> Result<CliResponse, DispatchError> {
                 .await
                 .map_err(|e| DispatchError::Api(e.to_string()))?;
             Ok(resp)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        std::iter::once("heramind")
+            .chain(parts.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Side-effecting / interactive commands must return NotInProcess so the
+    /// agent's shell tool falls back to a real subprocess — running `serve`
+    /// in-process would wedge the host server forever.
+    #[tokio::test]
+    async fn side_effecting_commands_are_not_in_process() {
+        for args in [
+            vec!["serve"],
+            vec!["serve", "--port", "0"],
+            vec!["chat"],
+            vec!["logs", "--follow"],
+            vec!["upgrade"],
+            vec!["health"],
+        ] {
+            let err = dispatch(&argv(&args)).await.unwrap_err();
+            assert!(
+                matches!(err, DispatchError::NotInProcess),
+                "`heramind {:?}` must be NotInProcess, got {err:?}",
+                args
+            );
+        }
+    }
+
+    /// Local-only commands (redb-backed or stdout-printing) also stay out of
+    /// process.
+    #[tokio::test]
+    async fn local_only_commands_are_not_in_process() {
+        for args in [vec!["api-key", "list"], vec!["user", "list"]] {
+            let err = dispatch(&argv(&args)).await.unwrap_err();
+            assert!(
+                matches!(err, DispatchError::NotInProcess),
+                "`heramind {:?}` must be NotInProcess, got {err:?}",
+                args
+            );
+        }
+    }
+
+    /// Malformed input must yield Parse (so the caller can surface clap's
+    /// message to the model for a corrected retry), never panic and never
+    /// exit() the host process.
+    #[tokio::test]
+    async fn malformed_input_yields_parse_error() {
+        for args in [
+            vec!["device"],               // subcommand required
+            vec!["device", "frobnicate"], // unknown subcommand
+            vec!["--definitely-not-a-flag"],
+            vec!["dashboard", "get"], // missing required ID positional
+        ] {
+            let err = dispatch(&argv(&args)).await.unwrap_err();
+            assert!(
+                matches!(err, DispatchError::Parse(_)),
+                "`heramind {:?}` must be Parse, got {err:?}",
+                args
+            );
+        }
+    }
+
+    /// A well-formed DATA command routes into the handler layer, which
+    /// reports unreachability as a normal error CliResponse (not a dispatch
+    /// error) — exactly what the agent's shell tool renders. With no server
+    /// on the default base URL this is the "server down" path the incident
+    /// agent would have hit; it must degrade to a message, never a panic.
+    #[tokio::test]
+    async fn data_command_degrades_to_error_response_without_server() {
+        // Pin a port nothing listens on so the test never depends on (or
+        // races with) a locally running dev server.
+        std::env::set_var("HERAMIND_API_BASE", "http://127.0.0.1:9/test-api");
+        let result = dispatch(&argv(&["device", "list"])).await;
+        std::env::remove_var("HERAMIND_API_BASE");
+
+        match result {
+            Ok(resp) => {
+                assert!(
+                    !resp.success,
+                    "no-server call must not report success: {resp:?}"
+                );
+            }
+            Err(DispatchError::Api(msg)) => {
+                assert!(!msg.is_empty(), "api error must carry a message");
+            }
+            Err(other) => panic!("expected Ok(error-response) or Api, got {other:?}"),
         }
     }
 }

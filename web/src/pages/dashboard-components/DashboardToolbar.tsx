@@ -9,6 +9,7 @@
 
 import { Check, Settings2, Plus, Share2, Maximize } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import {
   Tooltip,
@@ -20,13 +21,12 @@ import { DashboardTabBar } from '@/components/dashboard/DashboardTabBar'
 import { ComponentLibrarySidebar } from './ComponentLibrarySidebar'
 import type { Dashboard } from '@/types/dashboard'
 import type { ComponentCategory } from './componentLibraryUtils'
-import type { MarketComponentEntry } from '@/types/frontend-component'
+import type { MarketComponentEntry, FrontendComponentMeta } from '@/types/frontend-component'
 
 export interface DashboardToolbarProps {
   // Dashboard data
   sortedDashboards: Dashboard[]
   currentDashboardId: string | null
-  currentDashboard: Dashboard
   layoutMode: 'sidebar' | 'tabs'
 
   // Dashboard handlers
@@ -57,8 +57,8 @@ export interface DashboardToolbarProps {
   // Component library sidebar
   componentLibraryOpen: boolean
   setComponentLibraryOpen: (open: boolean) => void
-  libraryTab: 'components' | 'marketplace'
-  onLibraryTabChange: (tab: 'components' | 'marketplace') => void
+  libraryTab: 'components' | 'extensions' | 'marketplace' | 'custom'
+  onLibraryTabChange: (tab: 'components' | 'extensions' | 'marketplace' | 'custom') => void
   librarySearch: string
   onLibrarySearchChange: (q: string) => void
   filteredLibrary: ComponentCategory[]
@@ -67,7 +67,8 @@ export interface DashboardToolbarProps {
   // Marketplace
   marketComponents: MarketComponentEntry[]
   marketLoading: boolean
-  installedComponents: { id: string; source?: 'local' | 'marketplace' }[]
+  installedComponents: FrontendComponentMeta[]
+  onRefreshMarket: () => Promise<void>
   installingId: string | null
   onInstall: (id: string) => Promise<void>
   onUninstall: (id: string) => Promise<void>
@@ -82,7 +83,6 @@ export function DashboardToolbar(props: DashboardToolbarProps) {
   const {
     sortedDashboards,
     currentDashboardId,
-    currentDashboard,
     layoutMode,
     onDashboardSwitch,
     onDashboardCreate,
@@ -109,6 +109,7 @@ export function DashboardToolbar(props: DashboardToolbarProps) {
     marketComponents,
     marketLoading,
     installedComponents,
+    onRefreshMarket,
     installingId,
     onInstall,
     onUninstall,
@@ -121,8 +122,18 @@ export function DashboardToolbar(props: DashboardToolbarProps) {
 
   const { t } = useTranslation('dashboardComponents')
 
+  // Sidebar mode on desktop: the action buttons sit directly under the
+  // page title (left-aligned) so title + actions read as one header
+  // block. Tabs/mobile keep them at the right edge opposite the tab bar.
+  const actionsAlignLeft = layoutMode === 'sidebar' && !isMobile
+
   return (
-    <header className="shrink-0 flex items-center justify-between px-4 h-11 border-b border-border bg-[var(--chrome)] z-10">
+    <header
+      className={cn(
+        'shrink-0 flex items-center px-4 sm:px-6 md:px-8 py-2 bg-background z-10',
+        actionsAlignLeft ? 'justify-start' : 'justify-between',
+      )}
+    >
       {/* Mobile: always show the dropdown switcher regardless of layoutMode.
           Sidebar-mode's "open the list drawer" pattern has no trigger on
           touch devices, so we route through DashboardTabBar's mobile UI. */}
@@ -139,11 +150,10 @@ export function DashboardToolbar(props: DashboardToolbarProps) {
           onSwitchToSidebar={onSwitchToSidebar}
         />
       ) : (
-        <div className="flex items-center gap-2 min-w-0">
-          <h1 className="text-sm font-semibold truncate">
-            {currentDashboard.name}
-          </h1>
-        </div>
+        /* Sidebar mode on desktop: the page title above already shows the
+           current dashboard's name, so the left slot stays empty and only
+           the action buttons remain, left-aligned under the title. */
+        <span aria-hidden="true" />
       )}
 
       <TooltipProvider delayDuration={300}>
@@ -216,6 +226,7 @@ export function DashboardToolbar(props: DashboardToolbarProps) {
             marketComponents={marketComponents}
             marketLoading={marketLoading}
             installedComponents={installedComponents}
+            onRefreshMarket={onRefreshMarket}
             installingId={installingId}
             onInstall={onInstall}
             onUninstall={onUninstall}
@@ -232,7 +243,7 @@ export function DashboardToolbar(props: DashboardToolbarProps) {
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-6 w-6"
+                className="h-8 w-8 rounded-lg"
                 onClick={onToggleFullscreen}
               >
                 <Maximize className="h-4 w-4" />
@@ -241,6 +252,7 @@ export function DashboardToolbar(props: DashboardToolbarProps) {
             <TooltipContent side="bottom">{t('visualDashboard.fullscreen')}</TooltipContent>
           </Tooltip>
         </div>
+
       </TooltipProvider>
     </header>
   )

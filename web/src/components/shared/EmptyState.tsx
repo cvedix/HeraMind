@@ -73,9 +73,9 @@ export function EmptyState({ icon, title, description, action, className }: Empt
   const iconContent = typeof icon === 'string' ? iconMap[icon as keyof typeof iconMap] : icon
 
   return (
-    <div className={cn('flex flex-col items-center justify-center py-12 px-4 text-center animate-fade-in-up', className)}>
+    <div className={cn('flex flex-col flex-1 w-full items-center justify-center py-12 px-4 text-center animate-fade-in-up', className)}>
       {iconContent && (
-        <div className="mb-4 flex h-20 w-20 items-center justify-center rounded-2xl bg-primary-light text-primary border border-primary-light">
+        <div className="mb-4 flex h-20 w-20 items-center justify-center rounded-xl bg-primary-light text-primary border border-primary-light">
           {iconContent}
         </div>
       )}
@@ -110,13 +110,14 @@ export function EmptyStateCompact({
   icon?: React.ReactNode
 }) {
   return (
-    <div className="flex flex-col items-center justify-center py-6 text-center">
+    <div className="flex flex-col flex-1 w-full items-center justify-center py-6 text-center">
       {icon && (
-        <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-2xl bg-primary-light text-primary border border-primary-light">
+        <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-xl bg-primary-light text-primary border border-primary-light">
           {icon}
         </div>
       )}
-      <p className="font-medium text-muted-foreground">{title}</p>
+      {/* explicit size: compact used to silently inherit whatever the parent set */}
+      <p className="text-base font-medium text-muted-foreground">{title}</p>
       {description && (
         <p className="mt-1 text-sm text-muted-foreground">{description}</p>
       )}

@@ -341,7 +341,11 @@ impl DeviceCapabilityProvider {
                 ExtensionCapability::DeviceRegister,
             ))?;
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        // [unit fix] DeviceConfig.last_seen is SECONDS (every other write
+        // path uses timestamp(); the API decodes it with from_timestamp(secs)).
+        // This wrote millis — extension-registered devices showed last_seen
+        // ≈ year 58000 until their first real telemetry overwrote it.
+        let now_secs = chrono::Utc::now().timestamp();
 
         // Extract extension_id injected by the IPC layer for routing commands back
         let adapter_id = params
@@ -356,7 +360,7 @@ impl DeviceCapabilityProvider {
             adapter_type: "extension".to_string(),
             connection_config,
             adapter_id,
-            last_seen: now_ms,
+            last_seen: now_secs,
             offline_timeout_secs: None,
         };
 
@@ -1443,6 +1447,19 @@ impl ChatStreamCapabilityProvider {
                 CapabilityError::InvalidParameters("Missing 'message' string field".to_string())
             })?;
 
+        // Multimodal turns: optional `images` array of data-URLs. Routes
+        // through the same multimodal stream the chat UI uses; backends
+        // without vision degrade to text-only. Absent/empty ⇒ legacy path.
+        let images: Vec<String> = params
+            .get("images")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|i| i.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let existing_session_id = params.get("session_id").and_then(|v| v.as_str());
 
         // Resolve SessionManager via late-binding holder.
@@ -1476,9 +1493,16 @@ impl ChatStreamCapabilityProvider {
         let bus = self.event_bus.clone();
         let sid = session_id.clone();
         let msg = message.to_string();
+        let imgs = images;
         tokio::spawn(async move {
             let result = async {
-                let stream = match mgr.process_message_events(&sid, &msg).await {
+                let stream_result = if imgs.is_empty() {
+                    mgr.process_message_events(&sid, &msg).await
+                } else {
+                    mgr.process_message_multimodal_with_backend_stream(&sid, &msg, imgs, None)
+                        .await
+                };
+                let stream = match stream_result {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!(
@@ -1915,7 +1939,7 @@ fn agent_event_to_json(event: &AgentEvent) -> Value {
         }),
         AgentEvent::Plan { step, stage } => json!({ "type": "Plan", "step": step, "stage": stage }),
         AgentEvent::IntermediateEnd => json!({ "type": "intermediate_end" }),
-        AgentEvent::End { prompt_tokens } => {
+        AgentEvent::End { prompt_tokens, .. } => {
             let mut v = json!({ "type": "end" });
             if let Some(pt) = prompt_tokens {
                 v["tokenUsage"] = json!({ "promptTokens": pt });

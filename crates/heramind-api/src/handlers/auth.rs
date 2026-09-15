@@ -26,11 +26,12 @@ fn extract_api_key(headers: &HeaderMap) -> Result<String, AuthError> {
 }
 
 /// Request to create a new API key.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CreateKeyRequest {
     /// Human-readable name for the key
     pub name: String,
-    /// Permissions (empty means full access)
+    /// Permissions (informational only — never enforced; every key has full
+    /// admin access regardless of this field. Empty defaults to ["*"].)
     #[serde(default)]
     pub permissions: Vec<String>,
 }
@@ -94,6 +95,15 @@ impl IntoResponse for ApiResponse {
 }
 
 /// List all API keys (requires authentication).
+#[utoipa::path(
+    get,
+    path = "/api/auth/keys",
+    tag = "auth",
+    responses(
+        (status = 200, description = "List of the caller's API keys (masked previews)"),
+        (status = 401, description = "Not authenticated (unified envelope)"),
+    )
+)]
 pub async fn list_keys_handler(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -111,6 +121,19 @@ pub async fn list_keys_handler(
 }
 
 /// Create a new API key (requires authentication).
+///
+/// NOTE: the `permissions` field is informational only and never enforced —
+/// every API key grants full administrator access. Create keys only for
+/// parties you would trust with the admin account.
+#[utoipa::path(
+    post,
+    path = "/api/auth/keys",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Key created (full value shown once)"),
+        (status = 401, description = "Not authenticated"),
+    )
+)]
 pub async fn create_key_handler(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -138,6 +161,18 @@ pub async fn create_key_handler(
 }
 
 /// Delete an API key by ID (requires authentication).
+#[utoipa::path(
+    delete,
+    path = "/api/auth/keys/{id}",
+    tag = "auth",
+    params(
+        ("id" = String, Path, description = "API key id"),
+    ),
+    responses(
+        (status = 200, description = "Key revoked; it can no longer authenticate requests"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_key_handler(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -176,6 +211,14 @@ pub async fn delete_key_handler(
 }
 
 /// Get authentication status (public endpoint - no auth required).
+#[utoipa::path(
+    get,
+    path = "/api/auth/status",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Whether API-key auth is enabled (no credentials required)"),
+    )
+)]
 pub async fn auth_status_handler(State(state): State<ServerState>) -> Json<AuthStatusResponse> {
     let keys = state.auth.api_key_state.list_keys().await;
     let key_count = keys.len();

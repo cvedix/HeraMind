@@ -1,23 +1,13 @@
 //! Device type management.
 
-use crate::automation::device_type_generator::{DeviceTypeGenerator, GenerationConfig};
-use crate::automation::discovery::DeviceSample;
-
 use axum::{
     extract::{Path, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
 
-use heramind_agent::llm_backends::backends::openai::{CloudConfig, CloudProvider, CloudRuntime};
-use heramind_agent::llm_backends::{
-    instance_manager::get_instance_manager, OllamaConfig, OllamaRuntime,
-};
-use heramind_core::llm::backend::LlmRuntime;
 use heramind_devices::registry::DeviceTypeTemplate;
-use heramind_storage::{LlmBackendInstance, LlmBackendType};
 
 use super::models::{
     CommandDefinitionDto, DeviceTypeDto, MetricDefinitionDto, ParameterDefinitionDto,
@@ -30,6 +20,14 @@ use crate::models::ErrorResponse;
 
 /// List device types.
 /// Uses new DeviceService - now includes metrics and commands
+#[utoipa::path(
+    get,
+    path = "/api/device-types",
+    tag = "device-types",
+    responses(
+        (status = 200, description = "Registered device-type templates"),
+    )
+)]
 pub async fn list_device_types_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -101,6 +99,18 @@ pub async fn list_device_types_handler(
 
 /// Get device type details.
 /// Uses new DeviceService - returns simplified format (direct metrics/commands)
+#[utoipa::path(
+    get,
+    path = "/api/device-types/{id}",
+    tag = "device-types",
+    params(
+        ("id" = String, Path, description = "Device type id"),
+    ),
+    responses(
+        (status = 200, description = "One device-type template"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_device_type_handler(
     State(state): State<ServerState>,
     Path(device_type): Path<String>,
@@ -137,6 +147,15 @@ pub async fn get_device_type_handler(
 
 /// Register a new device type.
 /// Uses new DeviceService - accepts simplified format (direct metrics/commands)
+#[utoipa::path(
+    post,
+    path = "/api/device-types",
+    tag = "device-types",
+    request_body = DeviceTypeTemplate,
+    responses(
+        (status = 200, description = "Template registered"),
+    )
+)]
 pub async fn register_device_type_handler(
     State(state): State<ServerState>,
     Json(template): Json<DeviceTypeTemplate>,
@@ -165,6 +184,18 @@ pub async fn register_device_type_handler(
 
 /// Delete a device type.
 /// Uses new DeviceService
+#[utoipa::path(
+    delete,
+    path = "/api/device-types/{id}",
+    tag = "device-types",
+    params(
+        ("id" = String, Path, description = "Device type id"),
+    ),
+    responses(
+        (status = 200, description = "Template deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_device_type_handler(
     State(state): State<ServerState>,
     Path(device_type): Path<String>,
@@ -185,6 +216,15 @@ pub async fn delete_device_type_handler(
 
 /// Validate a device type definition without registering it.
 /// Accepts simplified format (direct metrics/commands)
+#[utoipa::path(
+    put,
+    path = "/api/device-types",
+    tag = "device-types",
+    request_body = DeviceTypeTemplate,
+    responses(
+        (status = 200, description = "Validation report for a template (nothing saved)"),
+    )
+)]
 pub async fn validate_device_type_handler(
     Json(template): Json<DeviceTypeTemplate>,
 ) -> HandlerResult<serde_json::Value> {
@@ -299,350 +339,6 @@ pub async fn validate_device_type_handler(
     }
 }
 
-/// Request for generating device type from samples
-#[derive(Debug, Deserialize)]
-pub struct GenerateDeviceTypeRequest {
-    /// Optional device ID
-    #[serde(rename = "device_id")]
-    pub device_id: Option<String>,
-    /// Optional manufacturer
-    #[serde(rename = "manufacturer")]
-    pub manufacturer: Option<String>,
-    /// Data samples from the device
-    pub samples: Vec<DeviceSampleData>,
-    /// Minimum coverage threshold (0.0-1.0) for including fields
-    /// Fields appearing in less than this ratio of samples will be excluded
-    #[serde(rename = "min_coverage", default = "default_min_coverage")]
-    pub min_coverage: f32,
-    /// Minimum confidence threshold (0.0-1.0) for including metrics
-    /// Metrics with AI confidence below this will be excluded
-    #[serde(rename = "min_confidence", default = "default_min_confidence")]
-    pub min_confidence: f32,
-}
-
-fn default_min_coverage() -> f32 {
-    0.0
-}
-fn default_min_confidence() -> f32 {
-    0.0
-}
-
-/// A single data sample with timestamp
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeviceSampleData {
-    /// Timestamp of the sample
-    pub timestamp: i64,
-    /// Data payload
-    pub data: serde_json::Value,
-}
-
-/// Response from device type generation
-#[derive(Debug, Serialize)]
-pub struct GenerateDeviceTypeResponse {
-    /// Generated device type ID
-    #[serde(rename = "id")]
-    pub id: String,
-    /// Generated device type name
-    pub name: String,
-    /// Description
-    pub description: String,
-    /// Device category
-    pub category: String,
-    /// Manufacturer
-    pub manufacturer: String,
-    /// Discovered metrics
-    pub metrics: Vec<GeneratedMetricDto>,
-    /// Discovered commands
-    pub commands: Vec<GeneratedCommandDto>,
-    /// Confidence score (0-1)
-    pub confidence: f32,
-}
-
-/// A generated metric
-#[derive(Debug, Serialize)]
-pub struct GeneratedMetricDto {
-    /// Field name (internal)
-    pub name: String,
-    /// Path to the data
-    pub path: String,
-    /// Display name
-    #[serde(rename = "display_name")]
-    pub display_name: String,
-    /// Description
-    pub description: String,
-    /// Data type
-    #[serde(rename = "data_type")]
-    pub data_type: String,
-    /// Semantic type
-    #[serde(rename = "semantic_type")]
-    pub semantic_type: String,
-    /// Unit (if applicable)
-    pub unit: Option<String>,
-    /// Whether metric is readable
-    pub readable: bool,
-    /// Whether metric is writable
-    pub writable: bool,
-    /// Confidence score
-    pub confidence: f32,
-}
-
-/// A generated command
-#[derive(Debug, Serialize)]
-pub struct GeneratedCommandDto {
-    /// Command name
-    pub name: String,
-    /// Display name
-    #[serde(rename = "display_name")]
-    pub display_name: String,
-    /// Description
-    pub description: String,
-    /// Command parameters
-    pub parameters: Vec<GeneratedParameterDto>,
-    /// Confidence score
-    pub confidence: f32,
-}
-
-/// A command parameter
-#[derive(Debug, Serialize)]
-pub struct GeneratedParameterDto {
-    /// Parameter name
-    pub name: String,
-    /// Parameter type
-    #[serde(rename = "type")]
-    pub type_: String,
-    /// Whether parameter is required
-    pub required: bool,
-}
-
-/// Convert LlmBackendInstance to LlmRuntime
-fn instance_to_runtime(instance: &LlmBackendInstance) -> Result<Arc<dyn LlmRuntime>, String> {
-    match instance.backend_type {
-        LlmBackendType::Ollama => {
-            let config = OllamaConfig {
-                endpoint: instance
-                    .endpoint
-                    .clone()
-                    .unwrap_or_else(|| "http://localhost:11434".to_string()),
-                model: instance.model.clone(),
-                timeout_secs: 120,
-            };
-            OllamaRuntime::new(config)
-                .map(|runtime| Arc::new(runtime) as Arc<dyn LlmRuntime>)
-                .map_err(|e| format!("Failed to create Ollama runtime: {}", e))
-        }
-        LlmBackendType::OpenAi => {
-            let provider = CloudProvider::OpenAI;
-            let config = CloudConfig {
-                api_key: instance.api_key.clone().unwrap_or_default(),
-                provider,
-                model: Some(instance.model.clone()),
-                base_url: instance.endpoint.clone(),
-                timeout_secs: 120,
-            };
-            CloudRuntime::new(config)
-                .map(|runtime| Arc::new(runtime) as Arc<dyn LlmRuntime>)
-                .map_err(|e| format!("Failed to create OpenAI runtime: {}", e))
-        }
-        LlmBackendType::Anthropic => {
-            let provider = CloudProvider::Anthropic;
-            let config = CloudConfig {
-                api_key: instance.api_key.clone().unwrap_or_default(),
-                provider,
-                model: Some(instance.model.clone()),
-                base_url: instance.endpoint.clone(),
-                timeout_secs: 120,
-            };
-            CloudRuntime::new(config)
-                .map(|runtime| Arc::new(runtime) as Arc<dyn LlmRuntime>)
-                .map_err(|e| format!("Failed to create Anthropic runtime: {}", e))
-        }
-        LlmBackendType::Google => {
-            let provider = CloudProvider::Google;
-            let config = CloudConfig {
-                api_key: instance.api_key.clone().unwrap_or_default(),
-                provider,
-                model: Some(instance.model.clone()),
-                base_url: instance.endpoint.clone(),
-                timeout_secs: 120,
-            };
-            CloudRuntime::new(config)
-                .map(|runtime| Arc::new(runtime) as Arc<dyn LlmRuntime>)
-                .map_err(|e| format!("Failed to create Google runtime: {}", e))
-        }
-        LlmBackendType::XAi => {
-            let provider = CloudProvider::Grok;
-            let config = CloudConfig {
-                api_key: instance.api_key.clone().unwrap_or_default(),
-                provider,
-                model: Some(instance.model.clone()),
-                base_url: instance.endpoint.clone(),
-                timeout_secs: 120,
-            };
-            CloudRuntime::new(config)
-                .map(|runtime| Arc::new(runtime) as Arc<dyn LlmRuntime>)
-                .map_err(|e| format!("Failed to create xAI runtime: {}", e))
-        }
-        LlmBackendType::Qwen => {
-            // Qwen uses OpenAI-compatible API
-            let provider = CloudProvider::OpenAI;
-            let config = CloudConfig {
-                api_key: instance.api_key.clone().unwrap_or_default(),
-                provider,
-                model: Some(instance.model.clone()),
-                base_url: instance.endpoint.clone(),
-                timeout_secs: 120,
-            };
-            CloudRuntime::new(config)
-                .map(|runtime| Arc::new(runtime) as Arc<dyn LlmRuntime>)
-                .map_err(|e| format!("Failed to create Qwen runtime: {}", e))
-        }
-        LlmBackendType::DeepSeek => {
-            let provider = CloudProvider::DeepSeek;
-            let config = CloudConfig {
-                api_key: instance.api_key.clone().unwrap_or_default(),
-                provider,
-                model: Some(instance.model.clone()),
-                base_url: instance.endpoint.clone(),
-                timeout_secs: 120,
-            };
-            CloudRuntime::new(config)
-                .map(|runtime| Arc::new(runtime) as Arc<dyn LlmRuntime>)
-                .map_err(|e| format!("Failed to create DeepSeek runtime: {}", e))
-        }
-        LlmBackendType::GLM => {
-            let provider = CloudProvider::GLM;
-            let config = CloudConfig {
-                api_key: instance.api_key.clone().unwrap_or_default(),
-                provider,
-                model: Some(instance.model.clone()),
-                base_url: instance.endpoint.clone(),
-                timeout_secs: 120,
-            };
-            CloudRuntime::new(config)
-                .map(|runtime| Arc::new(runtime) as Arc<dyn LlmRuntime>)
-                .map_err(|e| format!("Failed to create GLM runtime: {}", e))
-        }
-        LlmBackendType::MiniMax => {
-            let provider = CloudProvider::MiniMax;
-            let config = CloudConfig {
-                api_key: instance.api_key.clone().unwrap_or_default(),
-                provider,
-                model: Some(instance.model.clone()),
-                base_url: instance.endpoint.clone(),
-                timeout_secs: 120,
-            };
-            CloudRuntime::new(config)
-                .map(|runtime| Arc::new(runtime) as Arc<dyn LlmRuntime>)
-                .map_err(|e| format!("Failed to create MiniMax runtime: {}", e))
-        }
-        LlmBackendType::LlamaCpp => {
-            heramind_agent::llm_backends::create_backend(
-                "llamacpp",
-                &serde_json::json!({
-                    "endpoint": instance.endpoint.clone().unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
-                    "model": instance.model.clone(),
-                    "timeout_secs": 180,
-                }),
-            )
-            .map_err(|e| format!("Failed to create llama.cpp runtime: {}", e))
-        }
-    }
-}
-
-/// Generate a device type from data samples
-pub async fn generate_device_type_from_samples_handler(
-    State(_state): State<ServerState>,
-    Json(request): Json<GenerateDeviceTypeRequest>,
-) -> HandlerResult<GenerateDeviceTypeResponse> {
-    // Get LLM instance
-    let instance_manager = get_instance_manager()
-        .map_err(|e| ErrorResponse::internal(format!("Failed to get LLM manager: {}", e)))?;
-
-    let instance = instance_manager.get_active_instance().ok_or_else(|| {
-        ErrorResponse::internal("No active LLM backend. Please configure an LLM backend first.")
-    })?;
-
-    // Convert to LlmRuntime
-    let llm = instance_to_runtime(&instance)
-        .map_err(|e| ErrorResponse::internal(format!("Failed to create LLM runtime: {}", e)))?;
-
-    // Create generator
-    let generator = DeviceTypeGenerator::new(llm);
-
-    // Convert request samples to DeviceSample format
-    let device_id = request.device_id.as_deref().unwrap_or("unknown-device");
-    let manufacturer = request.manufacturer.as_deref();
-
-    let samples: Vec<DeviceSample> = request
-        .samples
-        .into_iter()
-        .map(|s| DeviceSample::from_json(s.data, format!("sample-{}", s.timestamp)))
-        .collect();
-
-    if samples.is_empty() {
-        return Err(ErrorResponse::bad_request("No valid samples provided"));
-    }
-
-    // Create generation config from request
-    let config = GenerationConfig {
-        min_coverage: request.min_coverage,
-        min_confidence: request.min_confidence,
-    };
-
-    // Generate device type with config
-    let generated = generator
-        .generate_device_type_with_config(device_id, manufacturer, &samples, config)
-        .await
-        .map_err(|e| ErrorResponse::internal(format!("Failed to generate device type: {}", e)))?;
-
-    // Convert to response format
-    let response = GenerateDeviceTypeResponse {
-        id: generated.id,
-        name: generated.name,
-        description: generated.description,
-        category: format!("{:?}", generated.category),
-        manufacturer: generated.manufacturer,
-        metrics: generated
-            .metrics
-            .into_iter()
-            .map(|m| GeneratedMetricDto {
-                name: m.name,
-                path: m.path,
-                display_name: m.display_name,
-                description: m.description,
-                data_type: format!("{:?}", m.data_type),
-                semantic_type: format!("{:?}", m.semantic_type),
-                unit: m.unit,
-                readable: m.is_readable,
-                writable: m.is_writable,
-                confidence: 1.0, // Default confidence
-            })
-            .collect(),
-        commands: generated
-            .commands
-            .into_iter()
-            .map(|c| GeneratedCommandDto {
-                name: c.name,
-                display_name: c.display_name,
-                description: c.description,
-                parameters: c
-                    .parameters
-                    .into_iter()
-                    .map(|p| GeneratedParameterDto {
-                        name: p.name,
-                        type_: format!("{:?}", p.param_type),
-                        required: p.required,
-                    })
-                    .collect(),
-                confidence: 1.0, // Default confidence
-            })
-            .collect(),
-        confidence: 1.0, // Default confidence
-    };
-
-    ok(response)
-}
-
 // ============================================================================
 // CLOUD DEVICE TYPE IMPORT
 // ============================================================================
@@ -687,7 +383,7 @@ pub struct CloudDeviceTypesResponse {
 }
 
 /// Request for importing selected device types
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CloudImportRequest {
     pub device_types: Vec<String>,
     #[serde(default)]
@@ -715,6 +411,14 @@ pub struct CloudImportResponse {
 /// Uses raw.githubusercontent.com to read index.json (avoids GitHub API rate limits)
 ///
 /// GET /api/device-types/cloud/list
+#[utoipa::path(
+    get,
+    path = "/api/device-types/cloud/list",
+    tag = "device-types",
+    responses(
+        (status = 200, description = "Cloud device-type repository listing"),
+    )
+)]
 pub async fn list_cloud_device_types_handler(
     State(_state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -848,6 +552,15 @@ async fn fetch_device_type(
 /// Import selected device types from cloud
 ///
 /// POST /api/device-types/cloud/import
+#[utoipa::path(
+    post,
+    path = "/api/device-types/cloud/import",
+    tag = "device-types",
+    request_body = CloudImportRequest,
+    responses(
+        (status = 200, description = "Templates imported from the cloud repository"),
+    )
+)]
 pub async fn import_cloud_device_types_handler(
     State(state): State<ServerState>,
     Json(request): Json<CloudImportRequest>,

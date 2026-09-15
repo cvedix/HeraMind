@@ -75,11 +75,100 @@ pub fn estimate_message_tokens(message: &crate::agent::AgentMessage) -> usize {
     // Add tokens for images (rough estimate)
     if let Some(images) = &message.images {
         if !images.is_empty() {
-            tokens += 85 * images.len();
+            tokens += IMAGE_TOKEN_ESTIMATE * images.len();
         }
     }
 
     tokens
+}
+
+/// Per-image token cost used by every prompt-size estimate, so the chat
+/// thinking-guard and the per-message tally always agree.
+const IMAGE_TOKEN_ESTIMATE: usize = 85;
+
+/// Estimate total prompt tokens for an outbound chat request.
+///
+/// Uses [`estimate_tokens`] — the same per-language heuristic the rest of the
+/// codebase uses — for all text: system prompt, user message, and every history
+/// message. Image parts contribute a fixed [`IMAGE_TOKEN_ESTIMATE`] each rather
+/// than their raw byte length, so a large base64 image can't dominate the
+/// estimate.
+///
+/// This replaces an earlier `len() * 0.8` approximation that counted **bytes**
+/// (not chars, not tokens): it over-counted English roughly 3× (ASCII is 1
+/// byte/char but ~0.25 tokens/char) and over-counted Chinese via the 3-byte
+/// UTF-8 factor, which made the "auto-disable thinking" guard trip far too
+/// eagerly on text-heavy prompts.
+pub fn estimate_prompt_tokens(
+    history: &[heramind_core::message::Message],
+    system_prompt: &str,
+    user_message: &str,
+) -> usize {
+    let mut tokens = estimate_tokens(system_prompt) + estimate_tokens(user_message);
+    let mut images = 0usize;
+
+    for msg in history {
+        match &msg.content {
+            heramind_core::Content::Text(s) => tokens += estimate_tokens(s),
+            heramind_core::Content::Parts(parts) => {
+                for part in parts {
+                    if part.is_image() {
+                        images += 1;
+                    } else {
+                        tokens += estimate_tokens(&part.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    tokens + images * IMAGE_TOKEN_ESTIMATE
+}
+
+/// Truncate to the longest prefix whose `estimate_tokens` is ≤ `max_tokens`.
+///
+/// `estimate_tokens` is monotonically non-decreasing in prefix length (every
+/// char contributes a positive weight), so a binary search over the char split
+/// point bounds it in ~log(n) measurements. The canonical token-based truncation
+/// primitive — used wherever content must be capped by token budget rather than
+/// char count (memory snapshot, knowledge files).
+pub fn truncate_to_tokens(s: &str, max_tokens: usize) -> String {
+    if estimate_tokens(s) <= max_tokens {
+        return s.to_string();
+    }
+    let total_chars = s.chars().count();
+    // Fast path: if the content is far over budget, trim to a conservative
+    // char ceiling first (≈3.5 chars/token is an upper bound — CJK is ~1.8,
+    // ASCII ~4 — so the prefix can't drop below the token budget). This keeps
+    // the binary search below operating on a small string instead of scanning
+    // a 20K-char CJK file ~15 times per call.
+    let start = if total_chars > max_tokens * 4 {
+        max_tokens * 4
+    } else {
+        total_chars
+    };
+    let mut lo: usize = 0;
+    let mut hi: usize = start;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if estimate_tokens(split_at_char(s, mid)) <= max_tokens {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    split_at_char(s, lo).to_string()
+}
+
+/// Prefix of `s` containing the first `n` Unicode scalar values (UTF-8 safe).
+fn split_at_char(s: &str, n: usize) -> &str {
+    if n == 0 {
+        return "";
+    }
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
 }
 
 /// === P1.2: Relevance-Based Context Selection ===
@@ -264,5 +353,74 @@ mod tests {
         "#;
         let tokens = estimate_tokens(code);
         assert!(tokens > 0);
+    }
+
+    /// The "auto-disable thinking" guard compares a prompt-size estimate against
+    /// 18_000. The previous estimator multiplied `str::len()` — which is BYTES —
+    /// by 0.8. For ASCII English that's ~0.8 tokens/byte, but real BPE density is
+    /// ~0.25 tokens/char, so a ~23 KB English prompt was rated >18_000 "tokens"
+    /// and tripped the guard even though the real count is tiny — thinking got
+    /// disabled unnecessarily. `estimate_prompt_tokens` must reuse the same
+    /// per-language heuristic as the rest of the codebase and stay under threshold.
+    #[test]
+    fn estimate_prompt_tokens_does_not_overcount_english_bytes() {
+        let big_english = "word ".repeat(4600); // 23_000 bytes of ASCII
+        assert_eq!(big_english.len(), 23_000);
+
+        let tokens = estimate_prompt_tokens(&[], &big_english, "");
+
+        assert!(
+            tokens < 18_000,
+            "English prompt over-counted: got {tokens} tokens \
+             (the old bytes*0.8 formula would yield {})",
+            (big_english.len() as f64 * 0.8) as usize,
+        );
+    }
+
+    /// A base64 image's raw string is huge. The old path ran
+    /// `format!("{:?}", part).len()` over each content part, so a 100 KB base64
+    /// blob dumped ~100_000 into the byte total and (×0.8) dominated the whole
+    /// estimate. Image parts must contribute only a fixed per-image cost.
+    #[test]
+    fn estimate_prompt_tokens_counts_images_at_fixed_cost() {
+        use heramind_core::message::{Content, ContentPart, Message, MessageRole};
+
+        let huge_b64 = "A".repeat(100_000);
+        let msg = Message::new(
+            MessageRole::User,
+            Content::Parts(vec![
+                ContentPart::text("describe this"),
+                ContentPart::image_base64(&huge_b64, "image/png"),
+            ]),
+        );
+
+        let tokens = estimate_prompt_tokens(&[msg], "", "");
+
+        // 100 KB of base64 treated as text would be thousands of tokens; a fixed
+        // image cost plus a few tokens of text must stay small.
+        assert!(
+            tokens < 500,
+            "image base64 bytes leaked into the estimate: got {tokens}",
+        );
+    }
+
+    #[test]
+    fn truncate_to_tokens_caps_cjk_under_budget() {
+        // 5000 Chinese chars ≈ 9900 tokens — over an 8000-token budget. The
+        // char-based truncate_to would leave all 5000 chars (5000 < 8000),
+        // injecting ~9900 tokens; token-based truncation must cap under budget.
+        let big = "知".repeat(5000);
+        let capped = truncate_to_tokens(&big, 8000);
+        assert!(
+            estimate_tokens(&capped) <= 8000,
+            "exceeded token budget: {}",
+            estimate_tokens(&capped),
+        );
+        assert!(capped.chars().count() < 5000, "should have truncated");
+    }
+
+    #[test]
+    fn truncate_to_tokens_preserves_under_budget_content() {
+        assert_eq!(truncate_to_tokens("hello world", 100), "hello world");
     }
 }

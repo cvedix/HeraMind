@@ -18,6 +18,7 @@ import {
   Trash2,
   Settings,
   Filter,
+  Loader2,
   Search,
   Cloud,
   Share2,
@@ -87,7 +88,6 @@ export interface PageTabsBarProps {
   secondaryActions?: TabAction[]
   actionsExtra?: ReactNode
   tabsClassName?: string
-  maxWidth?: 'md' | 'lg' | 'xl' | '2xl' | 'full'
 }
 
 export function PageTabsBar({
@@ -98,17 +98,9 @@ export function PageTabsBar({
   secondaryActions = [],
   actionsExtra,
   tabsClassName,
-  maxWidth = 'full',
 }: PageTabsBarProps) {
   const isMobile = useIsMobile()
 
-  const maxWidthClass = {
-    md: 'max-w-4xl',
-    lg: 'max-w-6xl',
-    xl: 'max-w-7xl',
-    '2xl': 'max-w-7xl',
-    full: 'max-w-full',
-  }
 
   // On mobile, lift all actions into the MobilePageHeader via context.
   // secondaryActions are appended so MobileTabActionsCompact naturally
@@ -123,17 +115,22 @@ export function PageTabsBar({
     )
   }
 
-  // Desktop: Show full tabs bar
+  // Desktop: page toolbar — the SAME shape as the dashboard toolbar
+  // (h-11 chrome row with bottom border): tabs capsule left, page actions
+  // center-right, global entry points at the far right. The tab strip is a
+  // SINGLE scrollable row (no wrapping): overflowing tabs scroll
+  // horizontally at natural size instead of squeezing labels together.
   return (
-    <div className="px-4 sm:px-6 md:px-8 py-2">
-      <div className={cn('mx-auto', maxWidthClass[maxWidth])}>
-        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <div
-            className={cn(
-              'inline-flex w-auto flex-wrap overflow-visible rounded-lg border border-border bg-card p-1',
-              tabsClassName
-            )}
-          >
+    // py-2 + border-b: the row keeps its bottom divider (tab capsule's edge
+    // line) AND breathing room above the content area. px matches the title
+    // row (md:px-8) so tabs left-align with the title above them.
+    <div className="flex shrink-0 items-center gap-3 bg-background px-4 py-2 sm:px-6 md:px-8">
+      <div
+        className={cn(
+          'flex min-w-0 max-w-full items-center overflow-x-auto scrollbar-none rounded-lg border border-border bg-card p-1 gap-1',
+          tabsClassName
+        )}
+      >
             {tabs.map((tab) => {
               const isActive = activeTab === tab.value
               return (
@@ -142,7 +139,7 @@ export function PageTabsBar({
                   disabled={tab.disabled}
                   onClick={() => onTabChange(tab.value)}
                   className={cn(
-                    'inline-flex items-center justify-center gap-2 rounded-sm px-4 py-1.5 h-9 text-sm font-medium whitespace-nowrap transition-all',
+                    'inline-flex shrink-0 items-center justify-start gap-2 rounded-sm px-3 py-1.5 h-9 text-sm font-medium whitespace-nowrap transition-all',
                     isActive
                       ? 'bg-foreground text-background shadow-sm'
                       : 'text-muted-foreground hover:text-foreground'
@@ -156,7 +153,7 @@ export function PageTabsBar({
           </div>
 
           {(actions.length > 0 || secondaryActions.length > 0 || actionsExtra) && (
-            <div className="flex shrink-0 flex-wrap gap-2">
+            <div className="ml-auto flex shrink-0 flex-wrap items-center gap-2">
               {actions.map((action) => (
                 <Button
                   key={action.label}
@@ -179,8 +176,7 @@ export function PageTabsBar({
               {actionsExtra}
             </div>
           )}
-        </div>
-      </div>
+
     </div>
   )
 }
@@ -277,7 +273,7 @@ export function PageTabs({
                       disabled={tab.disabled}
                       onClick={() => onTabChange(tab.value)}
                       className={cn(
-                        'inline-flex items-center justify-center gap-2 rounded-sm px-4 py-1.5 h-9 text-sm font-medium whitespace-nowrap transition-all',
+                        'inline-flex items-center justify-start gap-2 rounded-sm px-3 py-1.5 h-9 text-sm font-medium whitespace-nowrap transition-all',
                         isActive
                           ? 'bg-foreground text-background shadow-sm'
                           : 'text-muted-foreground hover:text-foreground'
@@ -302,7 +298,7 @@ export function PageTabs({
                       className=""
                     >
                       {action.loading ? (
-                        <span className="mr-2 h-4 w-4 animate-spin">⟳</span>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       ) : (
                         action.icon && <span className="mr-2 shrink-0 h-4 w-4">{action.icon}</span>
                       )}
@@ -328,7 +324,7 @@ export function PageTabs({
                 disabled={action.disabled || action.loading}
               >
                 {action.loading ? (
-                  <span className="mr-1 h-3.5 w-3.5 animate-spin">⟳</span>
+                  <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
                 ) : action.icon ? (
                   <span className="mr-1 shrink-0 h-3.5 w-3.5">{action.icon}</span>
                 ) : null}
@@ -363,7 +359,7 @@ export function PageTabs({
           <div
             className={cn(
               /* mobile: full-width segmented control, horizontal scroll */
-              'flex w-full flex-nowrap overflow-x-auto rounded-lg border border-border bg-muted-30 p-1',
+              'flex w-full flex-nowrap overflow-x-auto rounded-lg border border-border bg-card p-1',
               '[-webkit-overflow-scrolling:touch]',
               /* desktop: inline tabs with full text */
               'md:inline-flex md:w-auto md:flex-wrap md:overflow-visible md:rounded-md md:border-0 md:bg-card md:p-0.5',
@@ -463,11 +459,11 @@ export function PageTabsGrid({
 }: PageTabsGridProps) {
   // Map gridCols to Tailwind classes - md: for desktop layout
   const gridColsClass: Record<2 | 3 | 4 | 5 | 6, string> = {
-    2: 'md:grid-cols-2',
-    3: 'md:grid-cols-3',
-    4: 'md:grid-cols-4',
-    5: 'md:grid-cols-5',
-    6: 'md:grid-cols-6',
+    2: '@md:grid-cols-2',
+    3: '@md:grid-cols-3',
+    4: '@md:grid-cols-4',
+    5: '@md:grid-cols-5',
+    6: '@md:grid-cols-6',
   }
 
   // Adjust max-width based on number of columns (desktop only)
@@ -481,7 +477,7 @@ export function PageTabsGrid({
           <div
             className={cn(
               /* mobile: 2-col grid, segmented style */
-              'grid w-full shrink-0 grid-cols-2 overflow-x-auto rounded-lg border border-border bg-muted-30 p-1',
+              'grid w-full shrink-0 grid-cols-2 overflow-x-auto rounded-lg border border-border bg-card p-1',
               '[-webkit-overflow-scrolling:touch]',
               /* desktop: compact inline grid */
               'md:w-auto md:overflow-visible md:rounded-md md:border-0 md:bg-card',
@@ -526,7 +522,7 @@ export function PageTabsGrid({
                   className="min-h-11 shrink-0 px-4 md:min-h-9"
                 >
                   {action.loading ? (
-                    <span className="mr-2 h-4 w-4 animate-spin">⟳</span>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                   ) : (
                     action.icon && <span className="mr-2 shrink-0">{action.icon}</span>
                   )}
@@ -670,7 +666,7 @@ function TabActionsOverflow({
           </Button>
         )}
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-[12rem] z-[200]">
+      <DropdownMenuContent align="end" className="min-w-[12rem]">
         {actions.map((action) => {
           const icon = resolveActionIcon(action)
           const isDestructive = action.variant === 'destructive'

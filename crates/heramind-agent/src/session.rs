@@ -36,12 +36,19 @@ use heramind_storage::LlmBackendInstance;
 pub struct CreateSessionOptions {
     /// Override the agent's system prompt.
     pub system_prompt: Option<String>,
+    /// Append to the agent's system prompt (keeps the platform default as
+    /// the base). Ignored when `system_prompt` is also set — an explicit
+    /// full override wins.
+    pub system_prompt_suffix: Option<String>,
     /// Override the LLM sampling temperature.
     pub temperature: Option<f32>,
     /// Override the model identifier (e.g. "qwen3:1.7b").
     pub model: Option<String>,
     /// Enable or disable tool calling.
     pub enable_tools: Option<bool>,
+    /// Restrict the session to these tools (empty/absent = all tools).
+    /// The user-interaction tools are always kept regardless.
+    pub allowed_tools: Vec<String>,
 }
 
 /// Convert an LlmBackendInstance to LlmBackend enum for agent configuration.
@@ -58,7 +65,7 @@ fn convert_capabilities(
         multiple_models: false,
         modalities: Vec::new(),
         supports_images: storage_caps.supports_multimodal,
-        supports_audio: storage_caps.supports_audio,
+        reasoning: heramind_core::ReasoningCapabilities::default(),
     }
 }
 
@@ -251,7 +258,7 @@ pub struct SessionManager {
     skill_registry: crate::skills::SharedSkillRegistry,
     /// Cancel signal senders for active streaming sessions (session_id → watch::Sender)
     cancel_senders: Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
-    /// Per-session direct event subscribers. ChatSessionCapabilityProvider
+    /// Per-session event subscribers. ChatSessionCapabilityProvider
     /// registers one mpsc::Sender per session-stream subscription. Each
     /// AgentEvent yielded by `process_message_events` is teed (best-effort,
     /// `try_send`) to all subscribers of the session. Voice-assistant and
@@ -262,25 +269,33 @@ pub struct SessionManager {
     /// extension. A slow subscriber that fills its channel just drops events
     /// (deliberate: voice workloads should never accumulate backlog).
     event_subscribers: Arc<RwLock<HashMap<String, Vec<tokio::sync::mpsc::Sender<AgentEvent>>>>>,
+    /// Per-session frozen memory snapshot (loaded once, cached for the session).
+    /// `MemorySnapshot::load` reads 3 files synchronously + token-truncates on
+    /// every call; the "frozen snapshot" design (snapshot.rs) loads once per
+    /// session, so re-reading on each message was redundant work on the hot
+    /// path. Memory-tool writes intentionally do NOT invalidate this — the
+    /// snapshot stays frozen for the session and is re-read on the next one.
+    memory_snapshots: Arc<RwLock<HashMap<String, crate::memory::MemorySnapshot>>>,
 }
 
 impl SessionManager {
     /// Create a new session manager with persistent storage.
     pub fn new() -> Result<Self> {
-        Self::with_path("data/sessions.redb")
+        Self::with_path(heramind_core::paths::store_path("sessions.redb"))
     }
 
     /// Create a new session manager with in-memory storage.
     /// This does not open any database files, avoiding lock conflicts.
     pub fn memory() -> Self {
         tracing::debug!(message = "Creating memory SessionManager (fallback mode)");
-        let store = SessionStore::open(":memory:").unwrap_or_else(|e| {
+        let store = SessionStore::open_isolated(":memory:").unwrap_or_else(|e| {
             // Fallback to temp file if :memory: fails
             tracing::error!(error = %e, ":memory: failed, using temp file");
             let temp_path = std::env::temp_dir()
                 .join(format!("sessions_fallback_{}.redb", uuid::Uuid::new_v4()));
             tracing::debug!(path = ?temp_path, "Using fallback path for session store");
-            SessionStore::open(&temp_path).expect("Failed to create fallback session store")
+            SessionStore::open_isolated(&temp_path)
+                .expect("Failed to create fallback session store")
         });
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -292,6 +307,7 @@ impl SessionManager {
             skill_registry: crate::skills::create_shared_registry(None),
             cancel_senders: Arc::new(RwLock::new(HashMap::new())),
             event_subscribers: Arc::new(RwLock::new(HashMap::new())),
+            memory_snapshots: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -301,7 +317,7 @@ impl SessionManager {
         let store = SessionStore::open(path)
             .map_err(|e| HeraMindError::Storage(format!("Failed to open session store: {}", e)))?;
 
-        let data_dir = std::path::Path::new("data");
+        let data_dir = &heramind_core::paths::data_dir();
         let manager = Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             session_messages: Arc::new(RwLock::new(HashMap::new())),
@@ -312,6 +328,7 @@ impl SessionManager {
             skill_registry: crate::skills::create_shared_registry(Some(data_dir)),
             cancel_senders: Arc::new(RwLock::new(HashMap::new())),
             event_subscribers: Arc::new(RwLock::new(HashMap::new())),
+            memory_snapshots: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Restore sessions from database on startup
@@ -615,15 +632,24 @@ impl SessionManager {
 
     /// Register a cancel signal sender for an active streaming session.
     /// The sender is stored so that `cancel_session` can interrupt the stream.
+    ///
+    /// [single-stream mutex] Returns `false` WITHOUT registering when a
+    /// stream is already active for the session — the registration doubles
+    /// as the per-session mutual exclusion. Previously a second concurrent
+    /// stream silently OVERWROTE the first's sender (making it
+    /// uncancellable) and interleaved history writes into the same
+    /// AgentInternalState.
     pub async fn register_cancel_sender(
         &self,
         session_id: &str,
         sender: tokio::sync::watch::Sender<bool>,
-    ) {
-        self.cancel_senders
-            .write()
-            .await
-            .insert(session_id.to_string(), sender);
+    ) -> bool {
+        let mut map = self.cancel_senders.write().await;
+        if map.contains_key(session_id) {
+            return false;
+        }
+        map.insert(session_id.to_string(), sender);
+        true
     }
 
     /// Remove a cancel sender (called when streaming ends naturally).
@@ -663,11 +689,17 @@ impl SessionManager {
     /// ChatSessionCapabilityProvider). The dropped `Sender` closes the
     /// channel; the holder's `Receiver::recv` will return `None`.
     pub async fn remove_subscriber(&self, session_id: &str) {
-        if let Some(v) = self.event_subscribers.write().await.get_mut(session_id) {
+        // [deadlock fix] The old body held the write guard from the
+        // `if let` scrutinee and then acquired `.write()` AGAIN on the same
+        // non-reentrant tokio RwLock whenever the popped vec became empty —
+        // a permanent deadlock wedging `event_subscribers` globally the
+        // moment a subscriber ever registered and disconnected. Remove
+        // through the same guard instead.
+        let mut subs = self.event_subscribers.write().await;
+        if let Some(v) = subs.get_mut(session_id) {
             v.pop();
             if v.is_empty() {
-                // Free the empty Vec slot to keep the map tidy.
-                self.event_subscribers.write().await.remove(session_id);
+                subs.remove(session_id);
             }
         }
     }
@@ -777,6 +809,18 @@ impl SessionManager {
         let mut cfg = self.default_config.clone();
         if let Some(sp) = opts.system_prompt {
             cfg.system_prompt = sp;
+        } else if let Some(suffix) = opts.system_prompt_suffix {
+            if !suffix.trim().is_empty() {
+                // Append on top of the platform default — page-scoped focus
+                // without losing the base agent instructions. Both slots get
+                // it: `system_prompt` feeds the non-streaming paths, the new
+                // dedicated suffix field feeds the streaming chat builder
+                // (which builds its own slim-template prompt and never read
+                // `system_prompt` — the suffix used to die there silently).
+                let trimmed = suffix.trim().to_string();
+                cfg.system_prompt = format!("{}\n\n{}", cfg.system_prompt.trim_end(), trimmed);
+                cfg.system_prompt_suffix = Some(trimmed);
+            }
         }
         if let Some(t) = opts.temperature {
             cfg.temperature = t;
@@ -786,6 +830,9 @@ impl SessionManager {
         }
         if let Some(et) = opts.enable_tools {
             cfg.enable_tools = et;
+        }
+        if !opts.allowed_tools.is_empty() {
+            cfg.allowed_tools = opts.allowed_tools;
         }
         cfg
     }
@@ -1030,11 +1077,297 @@ impl SessionManager {
     }
 
     /// Get whether memory is enabled for a session.
+    /// Lightweight background memory extraction after a chat turn.
+    ///
+    /// Chat had NO automatic memory write — only what the model chose to
+    /// write via the memory tool, which small models almost never do — so
+    /// USER.md/KNOWLEDGE.md stayed empty and cross-session memory was dead
+    /// in practice. This runs a small thinking-disabled LLM call over the
+    /// last exchange, merges durable facts into the snapshot files
+    /// (deduped, budget-capped), and invalidates the frozen-snapshot cache
+    /// so the next turn sees them. Fire-and-forget; never blocks the reply.
+    pub async fn maybe_extract_memory(
+        &self,
+        session_id: &str,
+        user_message: &str,
+        assistant_reply: &str,
+    ) {
+        if !self.is_memory_enabled(session_id).await {
+            tracing::info!(session_id, "memory extraction: memory disabled, skip");
+            return;
+        }
+        let um = user_message.trim().to_string();
+        let ar = assistant_reply.trim().to_string();
+        // A substantive exchange only — greetings/pings shouldn't mint memory.
+        if um.is_empty() || ar.chars().count() < 40 {
+            tracing::info!(
+                session_id,
+                ar_len = ar.chars().count(),
+                "memory extraction: reply too short, skip"
+            );
+            return;
+        }
+        let agent = match self.get_session(session_id).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(session_id, error = %e, "memory extraction: no session");
+                return;
+            }
+        };
+        let runtime = match agent.llm_interface().get_runtime().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(session_id, error = %e, "memory extraction: no runtime");
+                return;
+            }
+        };
+        let model = runtime.model_name().to_string();
+
+        // The snapshot cache is invalidated after a write so the next turn
+        // re-loads the updated files. Rebuild from the store fresh each time.
+        // Path AND merge limits come from the configured MemorySystemConfig —
+        // hardcoding 2000/3000 here would truncate files the user had raised
+        // the limits for (Settings → Preferences), silently destroying memory.
+        let mem_cfg = heramind_storage::MemoryConfig::load();
+        let store = heramind_storage::MarkdownMemoryStore::new(&mem_cfg.storage_path);
+        // new() does NOT create the directory tree — only the server's
+        // init() does. Core-path consumers (CLI/eval/embedded) run before or
+        // without that init, and every write into the missing dir failed
+        // silently (write_file error swallowed by the merge below), so
+        // extracted facts vanished. Initialize best-effort; idempotent.
+        let _ = store.init();
+        let (user_limit, knowledge_limit) = (mem_cfg.user_char_limit, mem_cfg.knowledge_char_limit);
+        let snapshots = self.memory_snapshots.clone();
+        let session_id = session_id.to_string();
+
+        tokio::spawn(async move {
+            use heramind_core::llm::backend::{GenerationParams, LlmInput};
+            use heramind_core::message::{Content, Message, MessageRole};
+
+            let prompt = format!(
+                "You are the memory extractor for an IoT edge platform assistant. \
+From this user turn and the assistant's reply, extract AT MOST 3 durable, reusable \
+facts that would help FUTURE conversations. Two kinds, tagged exactly:\n\
+[user] fact        — durable facts about the user (preferences, identity, context)\n\
+[knowledge] fact   — durable facts about the system/domain (device names, locations, conventions)\n\
+Output ONLY bullet lines starting with \"- \", one per fact, each tagged. \
+Skip transient or session-specific chatter. Empty output if nothing durable.\n\n\
+User: {um}\n\
+Assistant: {ar}\n"
+            );
+
+            let input = LlmInput {
+                messages: vec![Message::new(MessageRole::User, Content::text(prompt))],
+                params: GenerationParams {
+                    temperature: Some(0.2),
+                    // LFM's integral thinking eats a big budget before content
+                    // (measured ~5700 chars of reasoning); 800 still ended
+                    // empty. 2000 leaves room for the tagged facts. Background
+                    // call, so the latency is invisible to the user.
+                    max_tokens: Some(2000),
+                    thinking_enabled: Some(false), // gotcha #7 — no wasted thinking tokens
+                    ..Default::default()
+                },
+                model: Some(model),
+                stream: false,
+                tools: None,
+            };
+            let out = match runtime.generate(input).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(session_id, error = %e, "memory extraction: LLM generate failed");
+                    return;
+                }
+            };
+            tracing::info!(
+                session_id,
+                out_chars = out.text.chars().count(),
+                "memory extraction: LLM responded"
+            );
+
+            // Parse tagged bullets: `- [user] ...` / `- [knowledge] ...`
+            let mut new_user: Vec<String> = Vec::new();
+            let mut new_knowledge: Vec<String> = Vec::new();
+            for line in out.text.lines() {
+                let line = line.trim();
+                let rest = line.strip_prefix("- ").or_else(|| line.strip_prefix("• "));
+                let Some(rest) = rest else { continue };
+                let strip_tag = |tag: &str| -> Option<String> {
+                    // Accept both "- [user] fact …" and "- [user]: fact …" —
+                    // the model varies the tag separator between runs.
+                    let mut f = rest.strip_prefix(tag)?.trim().to_string();
+                    for sep in [":", "fact", "-"] {
+                        if let Some(stripped) = f.strip_prefix(sep) {
+                            f = stripped.trim_start().to_string();
+                        }
+                    }
+                    if f.is_empty() {
+                        None
+                    } else {
+                        Some(f)
+                    }
+                };
+                if let Some(f) = strip_tag("[user]") {
+                    new_user.push(f);
+                } else if let Some(f) = strip_tag("[knowledge]") {
+                    new_knowledge.push(f);
+                }
+            }
+            if new_user.is_empty() && new_knowledge.is_empty() {
+                tracing::info!(session_id, "memory extraction: no tagged facts in output");
+                return;
+            }
+            tracing::info!(
+                session_id,
+                user_facts = new_user.len(),
+                knowledge_facts = new_knowledge.len(),
+                "memory extraction: parsed facts"
+            );
+
+            // Merge: exact-normalized dedup against existing bullets; cap to
+            // the file budget keeping the OLDEST facts (durable base facts
+            // outrank recent chatter).
+            let norm =
+                |s: &str| -> String { s.to_lowercase().split_whitespace().collect::<String>() };
+            let merged = |target: &str, additions: &[String]| -> Option<String> {
+                let existing = store.read_file_sync(target);
+                let existing_norms: std::collections::HashSet<String> = existing
+                    .lines()
+                    .filter_map(|l| {
+                        let l = l.trim().trim_start_matches("- ").trim_start_matches("• ");
+                        if l.is_empty() {
+                            None
+                        } else {
+                            Some(norm(l))
+                        }
+                    })
+                    .collect();
+                let fresh: Vec<&String> = additions
+                    .iter()
+                    .filter(|f| !existing_norms.contains(&norm(f)))
+                    .collect();
+                if fresh.is_empty() {
+                    return None;
+                }
+                let mut merged = existing.trim_end().to_string();
+                for f in &fresh {
+                    if !merged.is_empty() {
+                        merged.push('\n');
+                    }
+                    merged.push_str("- ");
+                    merged.push_str(f);
+                }
+                merged.push('\n');
+                let limit = match target {
+                    "user" => user_limit,
+                    _ => knowledge_limit,
+                };
+                if merged.chars().count() > limit {
+                    let mut kept = String::new();
+                    for line in merged.lines() {
+                        if kept.chars().count() + line.chars().count() + 1 > limit {
+                            break;
+                        }
+                        if !kept.is_empty() {
+                            kept.push('\n');
+                        }
+                        kept.push_str(line);
+                    }
+                    merged = kept;
+                    merged.push('\n');
+                }
+                Some(merged)
+            };
+
+            // Serialize the read-modify-write: two concurrent extractions
+            // reading the same base then writing would lose one's facts (the
+            // store's write lock only serializes the write, not the merge).
+            static MEMORY_EXTRACT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let _guard = MEMORY_EXTRACT_LOCK.lock().await;
+
+            let mut wrote_any = false;
+            if let Some(content) = merged("user", &new_user) {
+                match store.write_file("user", &content).await {
+                    Ok(()) => wrote_any = true,
+                    Err(e) => tracing::warn!(
+                        category = "memory",
+                        error = %e,
+                        "Failed to persist extracted user facts — this extraction's \
+                         facts are lost and the snapshot cache stays stale"
+                    ),
+                }
+            }
+            if let Some(content) = merged("knowledge", &new_knowledge) {
+                match store.write_file("knowledge", &content).await {
+                    Ok(()) => wrote_any = true,
+                    Err(e) => tracing::warn!(
+                        category = "memory",
+                        error = %e,
+                        "Failed to persist extracted knowledge facts — this \
+                         extraction's facts are lost and the snapshot cache stays stale"
+                    ),
+                }
+            }
+
+            if wrote_any {
+                // Invalidate the frozen snapshot so the next turn re-loads.
+                snapshots.write().await.remove(&session_id);
+                tracing::info!(
+                    session_id,
+                    user_facts = new_user.len(),
+                    knowledge_facts = new_knowledge.len(),
+                    "chat memory extraction: merged durable facts"
+                );
+            }
+        });
+    }
+
     pub async fn is_memory_enabled(&self, session_id: &str) -> bool {
         self.store
             .get_session_metadata(session_id)
             .map(|m| m.memory_enabled)
-            .unwrap_or(false)
+            // Bare sessions (no metadata row — core-path consumers like the
+            // CLI/eval create exactly these) default ON: extraction is
+            // budget-capped and background, and a default-off gate was one
+            // half of why cross-session memory stayed empty in practice.
+            .unwrap_or(true)
+    }
+
+    /// Ensure the session's frozen memory snapshot is loaded and set on the
+    /// agent. Loads once per session and caches the result — `MemorySnapshot`
+    /// is a "frozen snapshot" (see `memory/snapshot.rs`) that reads 3 files
+    /// synchronously per load, so reloading on every message was redundant
+    /// work on the hot path. Memory-tool writes deliberately do NOT invalidate
+    /// this cache: the snapshot stays frozen for the session and is re-read on
+    /// the next session, matching the original frozen-snapshot semantics.
+    async fn ensure_memory_snapshot(&self, session_id: &str, agent: &Arc<Agent>) {
+        if !self.is_memory_enabled(session_id).await {
+            return;
+        }
+        {
+            let cache = self.memory_snapshots.read().await;
+            if let Some(snapshot) = cache.get(session_id) {
+                if !snapshot.is_empty() {
+                    agent.set_memory_snapshot(snapshot.clone()).await;
+                }
+                return;
+            }
+        }
+        let memory_store = heramind_storage::MarkdownMemoryStore::new(
+            heramind_core::paths::data_dir().join("memory"),
+        );
+        let snapshot = crate::memory::MemorySnapshot::load(&memory_store);
+        if !snapshot.is_empty() {
+            tracing::info!(
+                session_id = %session_id,
+                "Loaded memory snapshot for session"
+            );
+            self.memory_snapshots
+                .write()
+                .await
+                .insert(session_id.to_string(), snapshot.clone());
+            agent.set_memory_snapshot(snapshot).await;
+        }
     }
 
     /// List all active sessions with their metadata.
@@ -1106,7 +1439,7 @@ impl SessionManager {
         }
 
         // Sort by created_at descending (newest first)
-        infos.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        infos.sort_by_key(|i| std::cmp::Reverse(i.created_at));
 
         infos
     }
@@ -1159,7 +1492,7 @@ impl SessionManager {
         }
 
         // Sort by created_at descending (newest first)
-        infos.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        infos.sort_by_key(|i| std::cmp::Reverse(i.created_at));
 
         infos
     }
@@ -1193,17 +1526,7 @@ impl SessionManager {
         let agent = self.get_session(session_id).await?;
 
         // Load memory snapshot if enabled and not yet loaded (parity with process_message_events)
-        if self.is_memory_enabled(session_id).await && !agent.has_memory_snapshot() {
-            let memory_store = heramind_storage::MarkdownMemoryStore::new("data/memory");
-            let snapshot = crate::memory::MemorySnapshot::load(&memory_store);
-            if !snapshot.is_empty() {
-                tracing::info!(
-                    session_id = %session_id,
-                    "Loaded memory snapshot for session (REST path)"
-                );
-                agent.set_memory_snapshot(snapshot);
-            }
-        }
+        self.ensure_memory_snapshot(session_id, &agent).await;
 
         let response = agent.process(message).await?;
 
@@ -1218,6 +1541,15 @@ impl SessionManager {
         if let Err(e) = self.save_history(session_id, &messages) {
             tracing::error!(session_id = %session_id, error = %e, message = "Failed to save history");
         }
+
+        // Background chat memory extraction — the REST chat path runs this
+        // after every turn (handlers/sessions.rs); the core path must too,
+        // or every non-REST consumer (CLI, embedded, eval) leaves USER.md
+        // empty forever and the memory tool answers from nothing. Awaiting
+        // (not spawning) matches the non-streaming REST semantics and keeps
+        // the next turn's snapshot deterministic.
+        self.maybe_extract_memory(session_id, message, &response.message.content)
+            .await;
 
         Ok(response)
     }
@@ -1239,11 +1571,21 @@ impl SessionManager {
         message: &str,
         backend_id: Option<&str>,
     ) -> Result<super::agent::AgentResponse> {
-        // If a specific backend is requested, configure the agent with it
+        // If a specific backend is requested, configure the agent with it.
+        // Propagate the error (mirrors process_message_multimodal_with_backend):
+        // if the user explicitly chose a backend and it can't be applied, fail
+        // loud rather than silently running on the previously-configured one.
         if let Some(backend) = backend_id {
-            let _ = self
-                .configure_agent_by_backend_id(session_id, backend)
-                .await;
+            self.configure_agent_by_backend_id(session_id, backend)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        backend_id = %backend,
+                        error = ?e,
+                        "Failed to configure agent with backend"
+                    );
+                    e
+                })?;
         }
         self.process_message(session_id, message).await
     }
@@ -1257,17 +1599,7 @@ impl SessionManager {
         let agent = self.get_session(session_id).await?;
 
         // Load memory snapshot if enabled and not yet loaded
-        if self.is_memory_enabled(session_id).await && !agent.has_memory_snapshot() {
-            let memory_store = heramind_storage::MarkdownMemoryStore::new("data/memory");
-            let snapshot = crate::memory::MemorySnapshot::load(&memory_store);
-            if !snapshot.is_empty() {
-                tracing::info!(
-                    session_id = %session_id,
-                    "Loaded memory snapshot for session"
-                );
-                agent.set_memory_snapshot(snapshot);
-            }
-        }
+        self.ensure_memory_snapshot(session_id, &agent).await;
 
         // Read conversation summary from session metadata for context compression
         let (conversation_summary, summary_up_to_index) = self
@@ -1278,7 +1610,11 @@ impl SessionManager {
 
         // Create a cancel signal channel so the stream can be interrupted
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        self.register_cancel_sender(session_id, cancel_tx).await;
+        if !self.register_cancel_sender(session_id, cancel_tx).await {
+            return Err(HeraMindError::validation(
+                "A response is already being generated for this session — wait for it to finish or cancel it first",
+            ));
+        }
 
         let safeguards = super::agent::StreamSafeguards::default().with_interrupt_signal(cancel_rx);
 
@@ -1319,17 +1655,20 @@ impl SessionManager {
         message: &str,
         backend_id: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentEvent> + Send>>> {
-        self.process_message_events_with_backend_and_skills(session_id, message, backend_id, &[])
+        self.process_message_events_with_backend_and_skills(session_id, message, backend_id, None)
             .await
     }
 
     /// Process a message in a session with event streaming, optional backend override, and pinned skills.
+    ///
+    /// `selected_skills`: `None` = leave the session's pins untouched;
+    /// `Some(list)` = replace the pins (an empty list clears them).
     pub async fn process_message_events_with_backend_and_skills(
         &self,
         session_id: &str,
         message: &str,
         backend_id: Option<&str>,
-        selected_skills: &[String],
+        selected_skills: Option<&[String]>,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentEvent> + Send>>> {
         // If a specific backend is requested, configure the agent with it
         if let Some(backend) = backend_id {
@@ -1347,9 +1686,9 @@ impl SessionManager {
         }
 
         // Update pinned skills on the agent if provided
-        if !selected_skills.is_empty() {
+        if let Some(skills) = selected_skills {
             if let Ok(agent) = self.get_session(session_id).await {
-                agent.set_pinned_skills(selected_skills.to_vec()).await;
+                agent.set_pinned_skills(skills.to_vec()).await;
             }
         }
 
@@ -1473,7 +1812,11 @@ impl SessionManager {
 
         // Create a cancel signal channel
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        self.register_cancel_sender(session_id, cancel_tx).await;
+        if !self.register_cancel_sender(session_id, cancel_tx).await {
+            return Err(HeraMindError::validation(
+                "A response is already being generated for this session — wait for it to finish or cancel it first",
+            ));
+        }
 
         let safeguards = super::agent::StreamSafeguards::default().with_interrupt_signal(cancel_rx);
 
@@ -1547,6 +1890,33 @@ impl SessionManager {
         // Clear persisted history using the dedicated clear method
         if let Err(e) = self.store.clear_history(session_id) {
             tracing::error!(session_id = %session_id, error = %e, message = "Failed to clear history");
+        }
+
+        // [ghost-summary fix] The conversation summary survives a history
+        // clear unless reset — the next turn then injected a summary of the
+        // DELETED conversation as a system message. Reset both fields so a
+        // cleared session starts truly fresh.
+        match self.store.get_session_metadata(session_id) {
+            Ok(mut meta) => {
+                if meta.conversation_summary.is_some() || meta.summary_up_to_index.is_some() {
+                    meta.conversation_summary = None;
+                    meta.summary_up_to_index = None;
+                    if let Err(e) = self.store.save_session_metadata(session_id, &meta) {
+                        tracing::error!(
+                            session_id = %session_id,
+                            error = %e,
+                            message = "Failed to reset conversation summary on clear"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    error = %e,
+                    "No session metadata to reset on clear"
+                );
+            }
         }
 
         Ok(())
@@ -1689,6 +2059,7 @@ impl Default for SessionManager {
                 skill_registry: crate::skills::create_shared_registry(None),
                 cancel_senders: Arc::new(RwLock::new(HashMap::new())),
                 event_subscribers: Arc::new(RwLock::new(HashMap::new())),
+                memory_snapshots: Arc::new(RwLock::new(HashMap::new())),
             }
         })
     }
@@ -1746,6 +2117,7 @@ mod tests {
             temperature: Some(0.1),
             model: None,        // inherit default
             enable_tools: None, // inherit default
+            ..Default::default()
         };
 
         let session_id = manager.create_session_with_options(opts).await.unwrap();
@@ -1758,6 +2130,71 @@ mod tests {
         // without poking at backend internals; the override is exercised
         // end-to-end in the API integration tests. The system_prompt check
         // above is the load-bearing assertion for the patch mechanism.
+    }
+
+    #[tokio::test]
+    async fn test_create_session_with_options_suffix_appends_to_default() {
+        // system_prompt_suffix appends to the platform default instead of
+        // replacing it — page-scoped focus without losing the base prompt.
+        let manager = create_temp_manager();
+        let default_prompt = manager.default_config.system_prompt.clone();
+
+        let opts = CreateSessionOptions {
+            system_prompt_suffix: Some("## Current page focus: devices".to_string()),
+            ..Default::default()
+        };
+        let session_id = manager.create_session_with_options(opts).await.unwrap();
+        let agent = manager.get_session(&session_id).await.unwrap();
+        let sp = agent.llm_interface().get_system_prompt().await;
+
+        assert!(
+            sp.starts_with(&default_prompt),
+            "suffix must keep the platform default as the base"
+        );
+        assert!(sp.ends_with("## Current page focus: devices"));
+        // And the merge must not mutate the manager default
+        assert_eq!(manager.default_config.system_prompt, default_prompt);
+    }
+
+    #[tokio::test]
+    async fn test_suffix_survives_into_streaming_chat_prompt() {
+        // Regression (0.9.20): the streaming chat path builds its own
+        // slim-template prompt and never read `system_prompt` — the
+        // page-scoped suffix silently died in tool-enabled sessions. The
+        // dedicated suffix slot must be appended by the streaming builder.
+        let manager = create_temp_manager();
+        let opts = CreateSessionOptions {
+            system_prompt_suffix: Some("## Current page focus: dashboards".to_string()),
+            ..Default::default()
+        };
+        let session_id = manager.create_session_with_options(opts).await.unwrap();
+        let agent = manager.get_session(&session_id).await.unwrap();
+
+        let streaming_prompt = agent
+            .llm_interface()
+            .build_system_prompt_with_tools(Some("list my boards"))
+            .await;
+        assert!(
+            streaming_prompt.contains("## Current page focus: dashboards"),
+            "streaming chat prompt must carry the session suffix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_session_with_options_full_override_wins_over_suffix() {
+        // An explicit system_prompt replaces wholesale; the suffix is ignored.
+        let manager = create_temp_manager();
+        let opts = CreateSessionOptions {
+            system_prompt: Some("full override".to_string()),
+            system_prompt_suffix: Some("appended?".to_string()),
+            ..Default::default()
+        };
+        let session_id = manager.create_session_with_options(opts).await.unwrap();
+        let agent = manager.get_session(&session_id).await.unwrap();
+        assert_eq!(
+            agent.llm_interface().get_system_prompt().await,
+            "full override"
+        );
     }
 
     #[tokio::test]

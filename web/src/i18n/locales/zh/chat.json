@@ -1,6 +1,7 @@
 {
   "openPanel": "打开 AI 对话",
   "closePanel": "关闭",
+  "resizePanel": "拖动调整对话面板宽度",
   "panelTitle": "AI 对话",
   "streamInProgress": "正在响应中，完成后自动关闭...",
   "title": "智能物联网助手",
@@ -22,6 +23,7 @@
     "moreOptions": "更多选项",
     "newChat": "新对话",
     "startNewConversation": "开始输入消息，与 AI 助手对话",
+    "fallbackHelpPrompt": "你能做什么",
     "skills": "技能",
     "selectSkills": "选择技能",
     "noSkills": "暂无可用技能",
@@ -76,7 +78,9 @@
     "retryAttempt": "第 {{count}} 次尝试",
     "retryProgress": "尝试 {{retry}}/{{max}}{{seconds, string}}",
     "retrySeconds": " · {{seconds}}s",
-    "reconnect": "重新连接"
+    "reconnect": "重新连接",
+    "authFailed": "连接中断（认证失败）",
+    "interruptedSaved": "连接中断 — 本轮回复仍会在后台完成并保存到会话历史，稍后返回本会话即可看到"
   },
   "quickActions": {
     "refreshDevices": "刷新设备状态",
@@ -184,8 +188,9 @@
   },
   "notConfigured": {
     "title": "LLM 未配置",
-    "description": "请先配置 LLM 后端以使用聊天功能",
-    "goToSettings": "前往设置"
+    "description": "下载内置模型（约 1.5GB，离线可用、无需 API key），或配置你自己的 LLM 后端",
+    "goToSettings": "前往设置",
+    "downloadBuiltin": "下载内置 AI 模型（推荐）"
   },
   "build": {
     "view": "查看",
@@ -219,7 +224,22 @@
     "typing": "输入中",
     "wait": "等待中"
   },
+  "code": {
+    "copy": "复制",
+    "copied": "已复制"
+  },
+  "scrollToBottom": "回到底部",
+  "copyMessage": "复制消息",
   "footer": {
     "disclaimer": "免责声明"
+  },
+  "toolLoopProgress": "工具调用中 · 第 {{round}} 轮",
+  "context": {
+    "title": "上下文占用",
+    "systemPrompt": "系统提示词",
+    "toolDefs": "工具定义",
+    "history": "对话历史",
+    "estimatedHint": "基于字符估算——下次回复后更新为精确值",
+    "msgCount": " · {{count}} 条"
   }
 }

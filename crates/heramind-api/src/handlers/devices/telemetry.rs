@@ -37,9 +37,31 @@ fn get_transform_namespaces() -> &'static [&'static str; 5] {
 /// - metric: optional metric name (if not specified, returns all metrics)
 /// - start: optional start timestamp (default: 24 hours ago)
 /// - end: optional end timestamp (default: now)
-/// - limit: optional limit on number of data points (default: 100, max: 1000)
+/// - limit: optional limit on number of data points (default: 100, max: 5000)
 /// - offset: optional offset for pagination (default: 0)
-/// - aggregate: optional aggregation type (avg, min, max, sum, last)
+/// - aggregate: optional aggregation type (avg, min, max, sum, last, count)
+#[utoipa::path(
+    get,
+    path = "/api/devices/{id}/telemetry",
+    tag = "telemetry",
+    params(
+        ("id" = String, Path, description = "Device id"),
+        ("metric" = Option<String>, Query, description = "Single metric; omit for all"),
+        ("start" = Option<i64>, Query, description = "Unix seconds"),
+        ("end" = Option<i64>, Query, description = "Unix seconds"),
+        ("hours" = Option<i64>, Query, description = "Window (1-720) when start absent"),
+        ("aggregate" = Option<String>, Query, description = "avg|min|max|sum|last|count — drives the value field; unknown = 400"),
+        ("limit" = Option<usize>, Query, description = "Points per page (1-5000, default 100)"),
+        ("offset" = Option<usize>, Query, description = "Skip newest N"),
+        ("cursor" = Option<i64>, Query, description = "Previous page's oldest ts; next page is strictly older; next_cursor null = last page"),
+        ("history" = Option<bool>, Query, description = "true = read a deleted device's archive"),
+        ("bucketed" = Option<bool>, Query, description = "Server-side downsampling for charts"),
+    ),
+    responses(
+        (status = 200, description = "Telemetry series with pagination {offset,limit,total,next_cursor}"),
+        (status = 404, description = "Unknown device (use history=true for deleted-device archives)"),
+    )
+)]
 pub async fn get_device_telemetry_handler(
     State(state): State<ServerState>,
     Path(device_id): Path<String>,
@@ -62,9 +84,18 @@ pub async fn get_device_telemetry_handler(
         validate_string_length(m, "metric", 1, 100)?;
     }
 
+    // `hours` window support: when the caller asks for ?hours=N and does NOT
+    // pin an explicit start, derive the window from now. The parameter was
+    // previously accepted and silently ignored here (a known bug class —
+    // explicit start/end callers are unaffected).
+    let hours = params
+        .get("hours")
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|h| h.clamp(1, 30 * 24));
     let start = params
         .get("start")
         .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| hours.map(|h| chrono::Utc::now().timestamp() - h * 3600))
         .unwrap_or_else(|| chrono::Utc::now().timestamp() - 86400); // 24 hours ago in seconds
     let end = params
         .get("end")
@@ -101,6 +132,21 @@ pub async fn get_device_telemetry_handler(
     let offset = offset as usize;
 
     let aggregate = params.get("aggregate").cloned();
+    // [aggregate contract] The requested function must drive `value` — it
+    // was hardcoded to avg, so ?aggregate=max returned the AVERAGE as the
+    // primary value (charts and agents silently got wrong data; min/max/sum
+    // only survived as side fields). Validate up front so an unknown value
+    // is a 400, not a silent avg.
+    const AGGREGATE_FNS: [&str; 6] = ["avg", "min", "max", "sum", "last", "count"];
+    if let Some(ref requested) = aggregate {
+        if !AGGREGATE_FNS.contains(&requested.as_str()) {
+            return Err(ErrorResponse::bad_request(format!(
+                "Invalid aggregate '{}': expected one of {}",
+                requested,
+                AGGREGATE_FNS.join("/")
+            )));
+        }
+    }
 
     // Bucketed downsampling: when true, use server-side time-bucket aggregation
     // to return at most `limit` evenly-spaced points covering the full time range.
@@ -136,6 +182,27 @@ pub async fn get_device_telemetry_handler(
         .service
         .get_device_with_template(&device_id)
         .await;
+
+    // [existence contract] Unknown device → 404, SAME as GET /devices/:id —
+    // the old fallthrough answered 200 with _raw queries for nonexistent
+    // ids, so clients could not write one existence/retry rule. Telemetry
+    // for a DELETED device stays reachable with ?history=true (the storage
+    // keys outlive the registry entry; dashboards archive old charts).
+    let allow_deleted_history = params
+        .get("history")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if !allow_deleted_history {
+        if let Err(ref e) = device_with_template {
+            if matches!(
+                e,
+                heramind_devices::DeviceError::NotFoundStr(_)
+                    | heramind_devices::DeviceError::NotFound(_)
+            ) {
+                return Err(ErrorResponse::not_found("Device"));
+            }
+        }
+    }
 
     // Get device template to find available metrics
     // Also include virtual metrics (metrics in storage but not in template)
@@ -262,6 +329,7 @@ pub async fn get_device_telemetry_handler(
                 let device_source_id = device_source_id.clone();
                 let metric_name = metric_name.clone();
                 let semaphore = state.telemetry_query_semaphore.clone();
+                let aggregate = aggregate.clone();
                 async move {
                     let _permit = match semaphore.acquire().await {
                         Ok(p) => p,
@@ -279,9 +347,11 @@ pub async fn get_device_telemetry_handler(
                         .await
                     {
                         Ok(agg) => {
+                            // `value` reflects the REQUESTED aggregate (avg default);
+                            // all raw fields stay available alongside.
                             vec![json!({
                                 "timestamp": agg.start_timestamp,
-                                "value": agg.avg,
+                                "value": aggregate_value(&agg, aggregate.as_deref()),
                                 "count": agg.count,
                                 "min": agg.min,
                                 "max": agg.max,
@@ -304,11 +374,13 @@ pub async fn get_device_telemetry_handler(
             .collect();
 
         let results = futures::future::join_all(aggregate_futures).await;
-        let data: HashMap<String, serde_json::Value> = results
-            .iter()
-            .map(|(k, v, _)| (k.clone(), v.clone()))
-            .collect();
-        let counts: HashMap<String, usize> = results.into_iter().map(|(k, _, c)| (k, c)).collect();
+        // [alloc] counts derived by reference FIRST, then the JSON values
+        // are MOVED into the data map — the old shape deep-cloned every
+        // points array (whole series in compress mode) per request.
+        let counts: HashMap<String, usize> =
+            results.iter().map(|(k, _, c)| (k.clone(), *c)).collect();
+        let data: HashMap<String, serde_json::Value> =
+            results.into_iter().map(|(k, v, _)| (k, v)).collect();
         (data, counts, None)
     } else if compress {
         // AI compression mode: lossless adaptive series (kept/fluctuated)
@@ -364,11 +436,13 @@ pub async fn get_device_telemetry_handler(
             .collect();
 
         let results = futures::future::join_all(compress_futures).await;
-        let data: HashMap<String, serde_json::Value> = results
-            .iter()
-            .map(|(k, v, _)| (k.clone(), v.clone()))
-            .collect();
-        let counts: HashMap<String, usize> = results.into_iter().map(|(k, _, c)| (k, c)).collect();
+        // [alloc] counts derived by reference FIRST, then the JSON values
+        // are MOVED into the data map — the old shape deep-cloned every
+        // points array (whole series in compress mode) per request.
+        let counts: HashMap<String, usize> =
+            results.iter().map(|(k, _, c)| (k.clone(), *c)).collect();
+        let data: HashMap<String, serde_json::Value> =
+            results.into_iter().map(|(k, v, _)| (k, v)).collect();
         (data, counts, None)
     } else {
         // Raw queries - run concurrently with pagination support
@@ -395,18 +469,34 @@ pub async fn get_device_telemetry_handler(
                         }
                     };
 
-                    // Cursor-based pagination: use cursor as the scan start for O(1) seek
-                    let (effective_start, effective_offset) = if let Some(ct) = cursor_ts {
-                        (ct, 0) // Start from cursor, no offset skip needed
-                    } else if offset > 100 {
-                        // PERFORMANCE: For deep pagination (offset > 100), estimate start time
-                        // to avoid loading huge amounts of data. Assume 1 point per second as fallback.
-                        let estimated_skip_seconds = offset as i64;
-                        let estimated_start = end.saturating_sub(estimated_skip_seconds);
-                        (estimated_start, 0)
-                    } else {
-                        (start, offset) // Traditional offset pagination for small offsets
-                    };
+                    // Cursor-based pagination: use cursor as the scan start for O(1) seek.
+                    // [boundary fix] The cursor is the OLDEST point of the previous page;
+                    // the storage range is INCLUSIVE, so scanning from `ct` re-fetches
+                    // that exact point — every page boundary was returned twice (chart
+                    // duplicates, inflated counts). Start the scan at ct but filter to
+                    // strictly-older points afterwards (the filter also keeps this correct
+                    // if fetch_limit ever truncates the start).
+                    // [cursor bound] The cursor is the UPPER bound of the next
+                    // page, not its start: storage scans newest-first within
+                    // [start, end], so passing ct as `start` while `end` stayed
+                    // at now returned only points >= ct — every one of which the
+                    // strictly-older filter then dropped, yielding an EMPTY page
+                    // and a premature "end of data". (The pre-fix code had the
+                    // mirror-image bug: an inclusive boundary that looped.) With
+                    // the cursor as `end`, the reverse scan hands back the newest
+                    // points older than ct; the < ct filter trims the boundary row.
+                    let (effective_start, effective_end, effective_offset) =
+                        if let Some(ct) = cursor_ts {
+                            (start, ct, 0)
+                        } else if offset > 100 {
+                            // PERFORMANCE: For deep pagination (offset > 100), estimate start time
+                            // to avoid loading huge amounts of data. Assume 1 point per second as fallback.
+                            let estimated_skip_seconds = offset as i64;
+                            let estimated_start = end.saturating_sub(estimated_skip_seconds);
+                            (estimated_start, end, 0)
+                        } else {
+                            (start, end, offset) // Traditional offset pagination for small offsets
+                        };
 
                     // Fast path: server-side bucketed downsampling for chart rendering.
                     // When no pagination (cursor/offset) and bucketed=true, use a single
@@ -458,7 +548,7 @@ pub async fn get_device_telemetry_handler(
                             &device_id_for_service,
                             &metric_name,
                             Some(effective_start),
-                            Some(end),
+                            Some(effective_end),
                             Some(fetch_limit),
                         )
                         .await
@@ -466,9 +556,12 @@ pub async fn get_device_telemetry_handler(
                         Ok(all_points) => {
                             // DB returns points in timestamp-asc order.
                             // For "newest first" pagination, take from the end and reverse.
+                            // Cursor mode: drop points at-or-after the cursor (the boundary
+                            // point was already returned as the previous page's oldest).
                             let total = all_points.len();
                             let paginated: Vec<_> = all_points
                                 .into_iter()
+                                .filter(|(ts, _)| cursor_ts.is_none_or(|ct| *ts < ct))
                                 .rev() // newest first without sorting
                                 .skip(effective_offset)
                                 .take(limit)
@@ -497,8 +590,9 @@ pub async fn get_device_telemetry_handler(
                                     &device_source_id,
                                     &metric_name,
                                     effective_start,
-                                    end,
+                                    effective_end,
                                     Some(fetch_limit),
+                                    0,
                                 )
                                 .await
                             {
@@ -506,8 +600,10 @@ pub async fn get_device_telemetry_handler(
                                     let total = total_from_db.unwrap_or(all_points.len());
                                     // DB returns points in timestamp-asc order.
                                     // Reverse for "newest first" without O(n log n) sort.
+                                    // Same cursor boundary filter as the primary path.
                                     let paginated: Vec<_> = all_points
                                         .into_iter()
+                                        .filter(|p| cursor_ts.is_none_or(|ct| p.timestamp < ct))
                                         .rev()
                                         .skip(effective_offset)
                                         .take(limit)
@@ -533,25 +629,33 @@ pub async fn get_device_telemetry_handler(
                         }
                     };
 
-                    // Extract next_cursor from the oldest point in the page (smallest timestamp)
-                    let next_cursor = points
-                        .last()
-                        .as_ref()
-                        .and_then(|p| p.get("timestamp").and_then(|t| t.as_i64()));
+                    // Extract next_cursor from the oldest point in the page
+                    // (smallest timestamp). [termination signal] A page
+                    // SHORTER than the limit is the last page — emit None so
+                    // clients can stop without probing for an empty page
+                    // (previously next_cursor was always Some, and the only
+                    // termination signal was receiving an empty page).
+                    let has_more = points.len() >= limit;
+                    let next_cursor = if has_more {
+                        points
+                            .last()
+                            .as_ref()
+                            .and_then(|p| p.get("timestamp").and_then(|t| t.as_i64()))
+                    } else {
+                        None
+                    };
                     (metric_name, json!(points), total, next_cursor)
                 }
             })
             .collect();
 
         let results = futures::future::join_all(query_futures).await;
-        let data: HashMap<String, serde_json::Value> = results
-            .iter()
-            .map(|(k, v, _, _)| (k.clone(), v.clone()))
-            .collect();
+        // [alloc] same move-not-clone discipline; cursor derived by ref first.
         let counts: HashMap<String, usize> =
             results.iter().map(|(k, _, c, _)| (k.clone(), *c)).collect();
-        // next_cursor from the first metric's oldest point
         let next_cursor: Option<i64> = results.first().and_then(|(_, _, _, nc)| *nc);
+        let data: HashMap<String, serde_json::Value> =
+            results.into_iter().map(|(k, v, _, _)| (k, v)).collect();
         (data, counts, next_cursor)
     };
 
@@ -585,6 +689,19 @@ pub async fn get_device_telemetry_handler(
 /// GET /api/devices/:id/telemetry/summary
 ///
 /// Returns summary statistics for all device metrics over a time range.
+#[utoipa::path(
+    get,
+    path = "/api/devices/{id}/telemetry/summary",
+    tag = "telemetry",
+    params(
+        ("id" = String, Path, description = "Device id"),
+        ("hours" = Option<i64>, Query, description = "Summary window in hours (default 24)"),
+    ),
+    responses(
+        (status = 200, description = "Per-metric summary {current, avg, min, max, count}"),
+        (status = 404, description = "Unknown device"),
+    )
+)]
 pub async fn get_device_telemetry_summary_handler(
     State(state): State<ServerState>,
     Path(device_id): Path<String>,
@@ -600,6 +717,29 @@ pub async fn get_device_telemetry_summary_handler(
 
     // Unified source_id for storage queries
     let device_source_id = format!("device:{}", device_id);
+
+    // [existence contract] Same 404 rule as the telemetry + detail
+    // endpoints (see the main handler's gate).
+    let allow_deleted_history = params
+        .get("history")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if !allow_deleted_history {
+        let probe = state
+            .devices
+            .service
+            .get_device_with_template(&device_id)
+            .await;
+        if let Err(ref e) = probe {
+            if matches!(
+                e,
+                heramind_devices::DeviceError::NotFoundStr(_)
+                    | heramind_devices::DeviceError::NotFound(_)
+            ) {
+                return Err(ErrorResponse::not_found("Device"));
+            }
+        }
+    }
 
     // Get device template to find available metrics
     // Also include virtual metrics from transforms
@@ -664,13 +804,15 @@ pub async fn get_device_telemetry_summary_handler(
             .cloned()
             .collect();
 
-        // Debug: log all storage metrics
-        tracing::info!(
+        // [log spam] These dump full metric lists on EVERY summary request
+        // — info-level turned routine polling into log noise; the comment
+        // always said "Debug".
+        tracing::debug!(
             "Device {} storage metrics: {:?}",
             device_id,
             all_storage_metrics
         );
-        tracing::info!(
+        tracing::debug!(
             "Device {} template metrics: {:?}",
             device_id,
             template_metric_names
@@ -778,64 +920,41 @@ pub async fn get_device_telemetry_summary_handler(
     let metric_info: Vec<(String, (String, String, String, bool))> =
         metric_info_map.into_iter().collect();
 
-    let mut summary_data: HashMap<String, serde_json::Value> = HashMap::new();
+    let _summary_data: HashMap<String, serde_json::Value> = HashMap::new();
 
-    for (metric_name, (display_name, unit, data_type, is_virtual)) in metric_info.iter() {
-        // Get aggregated statistics - aggregate() returns AggregatedData directly
-        if let Ok(agg) = state
-            .devices
-            .telemetry
-            .aggregate(&device_source_id, metric_name, start, end)
-            .await
-        {
-            // Get latest value
-            let latest = state
-                .devices
-                .telemetry
-                .latest(&device_source_id, metric_name)
-                .await
-                .ok()
-                .flatten();
-
-            summary_data.insert(
-                metric_name.to_string(),
-                json!({
-                    "display_name": display_name,
-                    "unit": unit,
-                    "data_type": data_type,
-                    "is_virtual": is_virtual,
-                    "current": latest.as_ref().map(|p| metric_value_to_json(&p.value)),
-                    "current_timestamp": latest.map(|p| p.timestamp),
-                    "avg": agg.avg,
-                    "min": agg.min,
-                    "max": agg.max,
-                    "count": agg.count,
-                }),
-            );
-        } else {
-            // Try to get current value from DeviceService
-            if let Ok(current_values) = state.devices.service.get_current_metrics(&device_id).await
-            {
-                if let Some(val) = current_values.get(metric_name) {
-                    summary_data.insert(
-                        metric_name.to_string(),
-                        json!({
-                            "display_name": display_name,
-                            "unit": unit,
-                            "data_type": data_type,
-                            "is_virtual": is_virtual,
-                            "current": metric_value_to_json(val),
-                            "current_timestamp": chrono::Utc::now().timestamp(),
-                            "avg": null,
-                            "min": null,
-                            "max": null,
-                            "count": 0,
-                        }),
-                    );
-                }
+    // [fan-out] Per-metric work runs CONCURRENTLY: the sequential loop did
+    // 2N redb round-trips (aggregate + latest) — N×2×latency on every
+    // summary request. latest() stays per metric (it piggybacks the
+    // aggregate result branch below).
+    let metric_futures: Vec<_> = metric_info
+        .iter()
+        .map(|(metric_name, info)| {
+            let state = state.clone();
+            let device_source_id = device_source_id.clone();
+            let metric_name = metric_name.clone();
+            let info = info.clone();
+            let device_id = device_id.clone();
+            async move {
+                let entry = build_summary_entry(
+                    &state,
+                    &device_source_id,
+                    &device_id,
+                    &metric_name,
+                    &info,
+                    start,
+                    end,
+                )
+                .await;
+                (metric_name, entry)
             }
-        }
-    }
+        })
+        .collect();
+    let summary_data: HashMap<String, serde_json::Value> =
+        futures::future::join_all(metric_futures)
+            .await
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect();
 
     ok(json!({
         "device_id": device_id,
@@ -843,6 +962,28 @@ pub async fn get_device_telemetry_summary_handler(
         "start": start,
         "end": end,
     }))
+}
+
+/// Select the aggregate the caller asked for as the primary `value`.
+/// `requested` is validated upstream (one of avg/min/max/sum/last/count, default avg).
+/// Non-numeric windows (e.g. all-string metrics) yield null for the numeric
+/// fns — the caller still has `count` and the other fields to tell "no data"
+/// from "not numeric".
+fn aggregate_value(
+    agg: &heramind_devices::telemetry::AggregatedData,
+    requested: Option<&str>,
+) -> serde_json::Value {
+    match requested {
+        Some("min") => json!(agg.min),
+        Some("max") => json!(agg.max),
+        Some("sum") => json!(agg.sum),
+        Some("count") => json!(agg.count),
+        Some("last") => match &agg.last {
+            Some(v) => metric_value_to_json(v),
+            None => json!(null),
+        },
+        _ => json!(agg.avg),
+    }
 }
 
 /// Convert MetricValue to JSON.
@@ -886,6 +1027,18 @@ fn metric_value_to_json(value: &heramind_devices::MetricValue) -> serde_json::Va
 ///
 /// Query parameters:
 /// - limit: maximum number of commands to return (default: 50)
+#[utoipa::path(
+    get,
+    path = "/api/devices/{id}/commands",
+    tag = "telemetry",
+    params(
+        ("id" = String, Path, description = "Device id"),
+    ),
+    responses(
+        (status = 200, description = "Command history for a device"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_device_command_history_handler(
     State(state): State<ServerState>,
     Path(device_id): Path<String>,
@@ -1116,4 +1269,106 @@ pub async fn analyze_metric_timestamps_handler(
             })).collect::<Vec<_>>(),
         },
     }))
+}
+
+/// One summary entry: telemetry aggregate+latest, else DeviceService cache.
+/// Returns None when neither source has data for the metric.
+#[allow(clippy::too_many_arguments)]
+async fn build_summary_entry(
+    state: &ServerState,
+    device_source_id: &str,
+    device_id: &str,
+    metric_name: &str,
+    (display_name, unit, data_type, is_virtual): &(String, String, String, bool),
+    start: i64,
+    end: i64,
+) -> Option<serde_json::Value> {
+    if let Ok(agg) = state
+        .devices
+        .telemetry
+        .aggregate(device_source_id, metric_name, start, end)
+        .await
+    {
+        let latest = state
+            .devices
+            .telemetry
+            .latest(device_source_id, metric_name)
+            .await
+            .ok()
+            .flatten();
+        Some(json!({
+            "display_name": display_name,
+            "unit": unit,
+            "data_type": data_type,
+            "is_virtual": is_virtual,
+            "current": latest.as_ref().map(|p| metric_value_to_json(&p.value)),
+            "current_timestamp": latest.map(|p| p.timestamp),
+            "avg": agg.avg,
+            "min": agg.min,
+            "max": agg.max,
+            "count": agg.count,
+        }))
+    } else if let Ok(current_values) = state.devices.service.get_current_metrics(device_id).await {
+        current_values.get(metric_name).map(|val| {
+            json!({
+                "display_name": display_name,
+                "unit": unit,
+                "data_type": data_type,
+                "is_virtual": is_virtual,
+                "current": metric_value_to_json(val),
+                "current_timestamp": chrono::Utc::now().timestamp(),
+                "avg": null,
+                "min": null,
+                "max": null,
+                "count": 0,
+            })
+        })
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod aggregate_contract_tests {
+    use super::*;
+
+    fn sample_agg() -> heramind_devices::telemetry::AggregatedData {
+        heramind_devices::telemetry::AggregatedData {
+            start_timestamp: 1,
+            end_timestamp: 2,
+            count: 4,
+            avg: Some(25.0),
+            min: Some(10.0),
+            max: Some(40.0),
+            sum: Some(100.0),
+            first: None,
+            last: Some(heramind_devices::MetricValue::Float(31.5)),
+        }
+    }
+
+    /// The P0: `value` must reflect the REQUESTED aggregate — it was
+    /// hardcoded to avg, so ?aggregate=max returned the average.
+    #[test]
+    fn aggregate_value_reflects_requested_function() {
+        let agg = sample_agg();
+        assert_eq!(aggregate_value(&agg, None), json!(25.0), "default is avg");
+        assert_eq!(aggregate_value(&agg, Some("avg")), json!(25.0));
+        assert_eq!(aggregate_value(&agg, Some("min")), json!(10.0));
+        assert_eq!(aggregate_value(&agg, Some("max")), json!(40.0));
+        assert_eq!(aggregate_value(&agg, Some("sum")), json!(100.0));
+        assert_eq!(aggregate_value(&agg, Some("last")), json!(31.5));
+        assert_eq!(aggregate_value(&agg, Some("count")), json!(4));
+    }
+
+    #[test]
+    fn aggregate_value_null_on_non_numeric_window() {
+        let mut agg = sample_agg();
+        agg.avg = None;
+        agg.min = None;
+        agg.max = None;
+        agg.sum = None;
+        agg.last = None;
+        assert_eq!(aggregate_value(&agg, Some("avg")), json!(null));
+        assert_eq!(aggregate_value(&agg, Some("last")), json!(null));
+    }
 }

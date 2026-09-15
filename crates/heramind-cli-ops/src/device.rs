@@ -1,6 +1,7 @@
 use crate::types::{BuildMeta, CliResponse};
 use crate::ApiClient;
 use anyhow::Result;
+use base64::Engine;
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -245,20 +246,111 @@ fn looks_like_base64_blob(s: &str) -> bool {
 }
 
 /// Sanitize the full /devices/{id}/current response to truncate binary metric values.
-fn sanitize_device_current(data: &serde_json::Value) -> serde_json::Value {
+/// Converts inline `data:image/...;base64,...` data URLs to `/api/images/` file URLs
+/// so the agent can pass them directly to `vision(image="/api/images/...")` without
+/// needing $cached or python extraction.
+fn sanitize_device_current(data: &serde_json::Value, device_id: &str) -> serde_json::Value {
     let mut result = data.clone();
     // Navigate to data.metrics and sanitize each metric's value
     let metrics = result.pointer_mut("/data/metrics");
     if let Some(m) = metrics.and_then(|v| v.as_object_mut()) {
-        for (_name, info) in m.iter_mut() {
+        for (name, info) in m.iter_mut() {
             if let Some(obj) = info.as_object_mut() {
                 if let Some(val) = obj.get_mut("value") {
                     *val = sanitize_metric_value(val);
+                    // If the value is a data URL, try to materialize it as a file
+                    // so the agent gets a clean /api/images/ URL instead of 60KB
+                    // of base64 it can't pass between tools.
+                    if let Some(s) = val.as_str() {
+                        if let Some(url) = materialize_data_url(s, device_id, name) {
+                            *val = json!(url);
+                        }
+                    }
                 }
             }
         }
     }
     result
+}
+
+/// If `s` is a `data:image/...;base64,...` data URL, save the decoded bytes
+/// to `data/images/{device_id}/{metric_name}/{timestamp}.{ext}` and return the
+/// `/api/images/...` URL. Returns `None` for non-data-URL values or if the
+/// file write fails (caller falls back to the original value).
+///
+/// This completes the v0.9.6 base64→URL migration at the CLI layer: the agent
+/// gets a short URL it can pass directly to `vision(image="/api/images/...")`,
+/// eliminating the $cached / python-extraction loops that broke on every model.
+fn materialize_data_url(s: &str, device_id: &str, metric_name: &str) -> Option<String> {
+    // Only handle data URLs
+    if !s.starts_with("data:") {
+        return None;
+    }
+    // Parse "data:image/jpeg;base64,/9j/..."
+    let comma_pos = s.find(',')?;
+    let mime_part = &s[5..comma_pos]; // "image/jpeg;base64"
+    let (mime, is_base64) = {
+        let parts: Vec<&str> = mime_part.split(';').collect();
+        let mime = parts.first()?; // "image/jpeg"
+        let is_base64 = parts.contains(&"base64");
+        (mime.to_string(), is_base64)
+    };
+    if !is_base64 {
+        return None;
+    }
+    let b64_data = &s[comma_pos + 1..];
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64_data)
+        .ok()?;
+
+    // Determine extension from mime
+    let ext = match mime.as_str() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => "bin",
+    };
+
+    // Compute content hash for dedup (same image → same file)
+    let hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    };
+
+    // Resolve data_dir from env (set by the server/dispatch context)
+    let data_dir = crate::auto_auth::data_dir_for_paths();
+    let images_dir = std::path::Path::new(&data_dir).join("images");
+    // Create device/metric subdirectory to match the URL structure:
+    // /api/images/{device_id}/{metric_name}/{filename}
+    let metric_dir = images_dir.join(device_id).join(metric_name);
+    if std::fs::create_dir_all(&metric_dir).is_err() {
+        return None;
+    }
+
+    let filename = format!("{}.{}", hash, ext);
+    let filepath = metric_dir.join(&filename);
+
+    // Dedup: skip write if file already exists with same content hash
+    if !filepath.exists() && std::fs::write(&filepath, &bytes).is_err() {
+        return None;
+    }
+
+    let url = format!("/api/images/{}/{}/{}", device_id, metric_name, filename);
+
+    tracing::debug!(
+        device_id = device_id,
+        metric = metric_name,
+        bytes = bytes.len(),
+        url = %url,
+        "Materialized data URL to image file"
+    );
+
+    Some(url)
 }
 
 /// Extract device array from API response (handles multiple response shapes).
@@ -294,7 +386,7 @@ fn build_example(current_data: &serde_json::Value) -> (serde_json::Value, serde_
     let mut field_names: Vec<serde_json::Value> = Vec::new();
     if let Some(metrics_obj) = metrics.and_then(|m| m.as_object()) {
         for (name, info) in metrics_obj {
-            if info.get("value").map_or(false, |v| !v.is_null()) {
+            if info.get("value").is_some_and(|v| !v.is_null()) {
                 field_names.push(json!(name));
             }
         }
@@ -345,7 +437,7 @@ fn build_device_list(devs: &[serde_json::Value]) -> serde_json::Value {
 /// Get device details (metadata + metrics + commands) via /current endpoint.
 pub async fn get_device(client: &ApiClient, id: &str, metric: Option<&str>) -> Result<CliResponse> {
     let data = client.get(&format!("/devices/{}/current", id)).await?;
-    let mut sanitized = sanitize_device_current(&data);
+    let mut sanitized = sanitize_device_current(&data, id);
     if let Some(field) = metric {
         filter_single_metric(&mut sanitized, field);
     }
@@ -451,11 +543,13 @@ pub async fn delete_device(client: &ApiClient, id: &str) -> Result<CliResponse> 
 /// Get latest metrics for a device
 pub async fn get_latest_metrics(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client.get(&format!("/devices/{}/current", id)).await?;
-    let sanitized = sanitize_device_current(&data);
+    let sanitized = sanitize_device_current(&data, id);
     Ok(CliResponse::success(sanitized, "Latest metrics retrieved"))
 }
 
 /// Get historical telemetry data for a device
+// Keep dispatch arguments explicit, including HeraMind's time offset and aggregate.
+#[allow(clippy::too_many_arguments)]
 pub async fn get_telemetry_history(
     client: &ApiClient,
     id: &str,

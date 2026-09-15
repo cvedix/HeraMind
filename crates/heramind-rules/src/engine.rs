@@ -103,11 +103,19 @@ const MAX_HISTORY_SIZE: usize = 1000;
 /// Rules are evaluated only when [`on_data_update`] is called — no polling.
 pub struct RuleEngine {
     /// All registered rules.
-    rules: Arc<RwLock<HashMap<RuleId, CompiledRule>>>,
+    // parking_lot (sync): consumed from both sync and async contexts; the
+    // tokio lock forced try_read in the sync rebuild path, which silently
+    // SKIPPED the rebuild under trigger-path contention — a rule added in
+    // that window never entered subscription_index until the next CRUD.
+    rules: Arc<StdRwLock<HashMap<RuleId, CompiledRule>>>,
     /// Subscription index: DataSourceId → Vec<RuleId>
-    subscription_index: Arc<StdRwLock<HashMap<String, Vec<RuleId>>>>,
+    subscription_index: Arc<StdRwLock<HashMap<String, Arc<Vec<RuleId>>>>>,
     /// Cooldown tracking: RuleId → last trigger Instant
     cooldowns: Arc<StdRwLock<HashMap<RuleId, Instant>>>,
+    /// Consecutive all-actions-failed count per rule. Gates the cooldown
+    /// refund so a persistently-failing rule paces itself instead of re-firing
+    /// on every matching data point.
+    consecutive_action_failures: Arc<StdRwLock<HashMap<RuleId, u32>>>,
     /// Value provider for condition evaluation.
     value_provider: Arc<dyn ValueProvider>,
     /// In-memory execution history.
@@ -119,15 +127,21 @@ pub struct RuleEngine {
     agent_trigger: OptionAgentTriggerCallback,
     /// Persistent rule store.
     rule_store: Arc<StdRwLock<Option<Arc<RuleStore>>>>,
+    /// Optional EventBus — publishes RuleEvaluated/RuleTriggered/RuleExecuted
+    /// so the frontend / extension subscriptions / agents can react in real
+    /// time instead of polling the history API. Wired at construction; the
+    /// engine degrades gracefully to no-publish when absent.
+    event_bus: Arc<tokio::sync::RwLock<Option<Arc<heramind_core::EventBus>>>>,
 }
 
 impl RuleEngine {
     /// Create a new engine.
     pub fn new(value_provider: Arc<dyn ValueProvider>) -> Self {
         Self {
-            rules: Arc::new(RwLock::new(HashMap::new())),
+            rules: Arc::new(StdRwLock::new(HashMap::new())),
             subscription_index: Arc::new(StdRwLock::new(HashMap::new())),
             cooldowns: Arc::new(StdRwLock::new(HashMap::new())),
+            consecutive_action_failures: Arc::new(StdRwLock::new(HashMap::new())),
             value_provider,
             history: Arc::new(RwLock::new(VecDeque::new())),
             message_manager: Arc::new(tokio::sync::RwLock::new(None)),
@@ -135,6 +149,22 @@ impl RuleEngine {
             extension_action_executor: Arc::new(tokio::sync::RwLock::new(None)),
             agent_trigger: Arc::new(tokio::sync::RwLock::new(None)),
             rule_store: Arc::new(StdRwLock::new(None)),
+            event_bus: Arc::new(tokio::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Attach the EventBus so rule lifecycle becomes observable in real time.
+    pub fn with_event_bus(mut self, bus: Option<Arc<heramind_core::EventBus>>) -> Self {
+        self.event_bus = Arc::new(tokio::sync::RwLock::new(bus));
+        self
+    }
+
+    /// Fire-and-forget publish. The engine never depends on a subscriber
+    /// being present; a publish that finds no bus (or a busy one) is dropped.
+    async fn publish(&self, event: heramind_core::event::HeraMindEvent) {
+        let bus = self.event_bus.read().await.clone();
+        if let Some(bus) = bus {
+            let _ = bus.publish(event).await;
         }
     }
 
@@ -165,7 +195,7 @@ impl RuleEngine {
     /// Add a compiled rule. Rebuilds subscription index for the rule.
     pub async fn add_rule(&self, rule: CompiledRule) -> Result<(), RuleError> {
         let id = rule.id.clone();
-        let mut rules = self.rules.write().await;
+        let mut rules = self.rules.write();
         rules.insert(id, rule);
         drop(rules);
         // Rebuild after insert so the index reflects the new state
@@ -175,7 +205,7 @@ impl RuleEngine {
 
     /// Remove a rule and its subscription entries.
     pub async fn remove_rule(&self, id: &RuleId) -> Result<bool, RuleError> {
-        let mut rules = self.rules.write().await;
+        let mut rules = self.rules.write();
         let removed = rules.remove(id).is_some();
         drop(rules);
         if removed {
@@ -189,7 +219,7 @@ impl RuleEngine {
     /// Update an existing rule (or insert if new).
     pub async fn update_rule(&self, rule: CompiledRule) -> Result<(), RuleError> {
         let id = rule.id.clone();
-        let mut rules = self.rules.write().await;
+        let mut rules = self.rules.write();
         rules.insert(id, rule);
         drop(rules);
         // Rebuild after insert so the index reflects the new state
@@ -199,17 +229,17 @@ impl RuleEngine {
 
     /// Get a rule by ID.
     pub async fn get_rule(&self, id: &RuleId) -> Option<CompiledRule> {
-        self.rules.read().await.get(id).cloned()
+        self.rules.read().get(id).cloned()
     }
 
     /// List all rules.
     pub async fn list_rules(&self) -> Vec<CompiledRule> {
-        self.rules.read().await.values().cloned().collect()
+        self.rules.read().values().cloned().collect()
     }
 
     /// Enable / disable a rule.
     pub async fn set_enabled(&self, id: &RuleId, enabled: bool) -> Result<(), RuleError> {
-        let mut rules = self.rules.write().await;
+        let mut rules = self.rules.write();
         match rules.get_mut(id) {
             Some(rule) => {
                 rule.enabled = enabled;
@@ -223,33 +253,28 @@ impl RuleEngine {
     // -- Subscription index --
 
     fn rebuild_all_subscriptions(&self) {
-        // Use blocking read via try_read on the async RwLock.
-        // Since this is called after write lock is dropped (in update_rule/remove_rule),
-        // the lock should be uncontended.
-        let guard = self.rules.try_read();
-        match guard {
-            Ok(rules) => {
-                let mut idx = HashMap::new();
-                for rule in rules.values() {
-                    if let RuleTrigger::DataChange { sources } = &rule.trigger {
-                        for source in sources {
-                            let key = source.storage_key();
-                            idx.entry(key)
-                                .or_insert_with(Vec::new)
-                                .push(rule.id.clone());
-                        }
-                    }
+        // [contention-safe] parking_lot read — the old tokio try_read silently
+        // kept the STALE index whenever the trigger path held the write lock
+        // (update_condition_since / update_rule_state_after_trigger take it on
+        // every firing), so a rule added during active triggering could exist
+        // in `rules` but never in subscription_index — silently unevaluated
+        // until some later rule CRUD happened to succeed. A blocking read of
+        // a short critical section cannot skip.
+        let rules = self.rules.read();
+        let mut idx = HashMap::new();
+        for rule in rules.values() {
+            if let RuleTrigger::DataChange { sources } = &rule.trigger {
+                for source in sources {
+                    let key = source.storage_key();
+                    idx.entry(key)
+                        .or_insert_with(Vec::new)
+                        .push(rule.id.clone());
                 }
-                *self.subscription_index.write() = idx;
-            }
-            Err(_) => {
-                // Lock is contended (rare) — keep the existing index rather than wiping it.
-                // The next successful rebuild will bring it up to date.
-                tracing::debug!(
-                    "rebuild_all_subscriptions: rules lock contended, keeping existing index"
-                );
             }
         }
+        let idx: HashMap<String, Arc<Vec<RuleId>>> =
+            idx.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        *self.subscription_index.write() = idx;
     }
 
     /// Return device_ids referenced by any rule whose subscription index entry
@@ -287,7 +312,7 @@ impl RuleEngine {
         let source_key = source.storage_key();
 
         // 1. Find affected rules
-        let affected: Vec<RuleId> = {
+        let affected: Arc<Vec<RuleId>> = {
             let idx = self.subscription_index.read();
             idx.get(&source_key).cloned().unwrap_or_default()
         };
@@ -296,7 +321,7 @@ impl RuleEngine {
             return;
         }
 
-        for rule_id in &affected {
+        for rule_id in &*affected {
             if let Err(e) = self.evaluate_and_fire(rule_id).await {
                 tracing::warn!(rule_id = %rule_id, error = %e, "Rule evaluation failed");
             }
@@ -309,7 +334,7 @@ impl RuleEngine {
         let now = Utc::now();
 
         let rule = {
-            let rules = self.rules.read().await;
+            let rules = self.rules.read();
             rules.get(id).cloned()
         };
 
@@ -425,11 +450,11 @@ impl RuleEngine {
         }
 
         // Extract trigger value for message placeholder substitution
-        let (trigger_value, trigger_source) = rule
+        let (_, trigger_value, trigger_source) = rule
             .condition
             .as_ref()
             .map(|c| Self::extract_trigger_value(c, self.value_provider.as_ref()))
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, None));
 
         // Execute actions
         let mut actions_executed = Vec::new();
@@ -437,7 +462,7 @@ impl RuleEngine {
 
         for action in &rule.actions {
             match self
-                .execute_action(action, trigger_value, trigger_source.as_deref())
+                .execute_action(action, trigger_value.as_deref(), trigger_source.as_deref())
                 .await
             {
                 Ok(name) => actions_executed.push(name),
@@ -453,6 +478,42 @@ impl RuleEngine {
                     }
                 }
             }
+        }
+
+        // If ALL actions failed, retry quickly so critical-sensor rules don't
+        // silently miss alerts due to a transient failure (device offline,
+        // extension down). But pace the retries: refund the cooldown ONLY on the
+        // first consecutive failure (immediate retry on next match); on repeat
+        // failures leave the cooldown claimed so the rule fires at most once
+        // per cooldown window. Without this cap, a rule bound to a high-rate
+        // stream whose only actions persistently fail (e.g. a lone Execute
+        // against an offline device — Notify essentially always succeeds, so it
+        // only applies to action sets with no Notify) would re-fire on every
+        // data point and flood rule_history (0.9.11 implicitly rate-limited via
+        // the held cooldown; 8d3d0349's full refund removed that cap).
+        if actions_executed.is_empty() && error.is_some() {
+            let first_consecutive = {
+                let mut failures = self.consecutive_action_failures.write();
+                let count = failures.entry(id.clone()).or_insert(0);
+                let was_zero = *count == 0;
+                *count += 1;
+                was_zero
+            };
+            if first_consecutive {
+                self.cooldowns.write().remove(id);
+                tracing::warn!(
+                    rule_id = %id,
+                    "All actions failed — refunded cooldown for one immediate retry"
+                );
+            } else {
+                tracing::warn!(
+                    rule_id = %id,
+                    "All actions failed again — cooldown held to pace retries (avoids rule_history flood)"
+                );
+            }
+        } else if !actions_executed.is_empty() {
+            // At least one action succeeded → clear the consecutive-failure counter.
+            self.consecutive_action_failures.write().remove(id);
         }
 
         // Update state (cooldown already claimed before action execution)
@@ -475,7 +536,7 @@ impl RuleEngine {
     /// Evaluate a single rule and fire actions if conditions are met.
     async fn evaluate_and_fire(&self, rule_id: &RuleId) -> Result<(), RuleError> {
         let rule = {
-            let rules = self.rules.read().await;
+            let rules = self.rules.read();
             rules.get(rule_id).cloned()
         };
         let Some(rule) = rule else {
@@ -504,6 +565,14 @@ impl RuleEngine {
             cond.evaluate(self.value_provider.as_ref())
         }))
         .unwrap_or(false);
+
+        self.publish(heramind_core::event::HeraMindEvent::RuleEvaluated {
+            rule_id: rule_id.to_string(),
+            rule_name: rule.name.clone(),
+            condition_met,
+            timestamp: Utc::now().timestamp(),
+        })
+        .await;
 
         if !condition_met {
             // Reset condition_since
@@ -535,8 +604,21 @@ impl RuleEngine {
         }
 
         // Extract trigger value for message placeholder substitution
-        let (trigger_value, trigger_source) =
+        let (trigger_value, trigger_value_display, trigger_source) =
             Self::extract_trigger_value(cond, self.value_provider.as_ref());
+
+        self.publish(heramind_core::event::HeraMindEvent::RuleTriggered {
+            rule_id: rule_id.to_string(),
+            rule_name: rule.name.clone(),
+            trigger_value: trigger_value.unwrap_or(0.0),
+            actions: rule
+                .actions
+                .iter()
+                .map(|a| a.action_type().to_string())
+                .collect(),
+            timestamp: Utc::now().timestamp(),
+        })
+        .await;
 
         // Fire actions
         let start = Instant::now();
@@ -544,7 +626,11 @@ impl RuleEngine {
         let mut first_error = None;
         for action in &rule.actions {
             match self
-                .execute_action(action, trigger_value, trigger_source.as_deref())
+                .execute_action(
+                    action,
+                    trigger_value_display.as_deref(),
+                    trigger_source.as_deref(),
+                )
                 .await
             {
                 Ok(name) => actions_executed.push(name),
@@ -583,10 +669,17 @@ impl RuleEngine {
     // -- Action execution --
 
     /// Substitute `{value}` and `{source_id}` placeholders in a message template.
-    fn substitute_placeholders(message: &str, value: Option<f64>, source: Option<&str>) -> String {
+    fn substitute_placeholders(
+        message: &str,
+        value_display: Option<&str>,
+        source: Option<&str>,
+    ) -> String {
         let mut result = message.to_string();
-        if let Some(v) = value {
-            result = result.replace("{value}", &format!("{}", v));
+        // `{value}` renders the trigger value's DISPLAY form — a string rule
+        // (contains/regex on Text) used to leave the literal `{value}` in the
+        // alert because only numbers were ever substituted.
+        if let Some(v) = value_display {
+            result = result.replace("{value}", v);
         }
         if let Some(s) = source {
             result = result.replace("{source_id}", s);
@@ -599,27 +692,38 @@ impl RuleEngine {
     fn extract_trigger_value(
         condition: &RuleCondition,
         provider: &dyn ValueProvider,
-    ) -> (Option<f64>, Option<String>) {
+    ) -> (Option<f64>, Option<String>, Option<String>) {
+        // Returns (numeric_value, display_value, source_key). The numeric
+        // value feeds events/telemetry; the DISPLAY value feeds `{value}`
+        // placeholder substitution — which used to only ever be Some for
+        // numbers, so string rules rendered a literal `{value}` in alerts.
+        fn display(v: &RuleValue) -> String {
+            match v {
+                RuleValue::Number(n) => format!("{}", n),
+                RuleValue::Text(s) => s.clone(),
+            }
+        }
         fn find_first(
             cond: &RuleCondition,
             provider: &dyn ValueProvider,
-        ) -> (Option<f64>, Option<String>) {
+        ) -> (Option<f64>, Option<String>, Option<String>) {
             match cond {
                 RuleCondition::Comparison { source, .. } | RuleCondition::Range { source, .. } => {
                     let value = provider.get_by_source(source);
                     (
                         value.as_ref().and_then(|rv| rv.as_number()),
+                        value.as_ref().map(display),
                         Some(source.storage_key()),
                     )
                 }
                 RuleCondition::Logical { conditions, .. } => {
                     for c in conditions {
-                        let (v, s) = find_first(c, provider);
-                        if v.is_some() || s.is_some() {
-                            return (v, s);
+                        let (v, d, s) = find_first(c, provider);
+                        if v.is_some() || d.is_some() || s.is_some() {
+                            return (v, d, s);
                         }
                     }
-                    (None, None)
+                    (None, None, None)
                 }
             }
         }
@@ -629,13 +733,13 @@ impl RuleEngine {
     async fn execute_action(
         &self,
         action: &RuleAction,
-        trigger_value: Option<f64>,
+        trigger_value_display: Option<&str>,
         trigger_source: Option<&str>,
     ) -> Result<String, String> {
         match action {
             RuleAction::Notify { message, severity } => {
                 let formatted =
-                    Self::substitute_placeholders(message, trigger_value, trigger_source);
+                    Self::substitute_placeholders(message, trigger_value_display, trigger_source);
 
                 let msg_sev = match severity {
                     NotifySeverity::Info => heramind_messages::MessageSeverity::Info,
@@ -721,10 +825,31 @@ impl RuleEngine {
             } => {
                 let trigger = self.agent_trigger.read().await;
                 if let Some(cb) = trigger.as_ref() {
-                    match cb(agent_id.clone(), input.clone(), data.clone()).await {
-                        Ok(()) => Ok(format!("TRIGGER_AGENT: {}", agent_id)),
-                        Err(e) => Err(format!("TRIGGER_AGENT failed: {}", e)),
-                    }
+                    // [decoupled] The full agent run used to be awaited INLINE
+                    // here — one rule with a TriggerAgent action stalled every
+                    // other rule's evaluation platform-wide for the entire
+                    // agent execution (bounded only by the global 5-min cap),
+                    // because on_data_update awaits evaluate_and_fire
+                    // sequentially per affected rule. Spawn it: rule
+                    // processing continues, and the agent's own executor
+                    // (semaphores, timeout, journaling) governs the run.
+                    let cb = cb.clone();
+                    let (spawn_id, spawn_input, spawn_data, log_id) = (
+                        agent_id.clone(),
+                        input.clone(),
+                        data.clone(),
+                        agent_id.clone(),
+                    );
+                    tokio::spawn(async move {
+                        if let Err(e) = cb(spawn_id, spawn_input, spawn_data).await {
+                            tracing::warn!(
+                                agent_id = %log_id,
+                                error = %e,
+                                "TRIGGER_AGENT execution failed"
+                            );
+                        }
+                    });
+                    Ok(format!("TRIGGER_AGENT: {} (spawned)", agent_id))
                 } else {
                     tracing::warn!("TRIGGER_AGENT: {} (no callback wired)", agent_id);
                     Err("TRIGGER_AGENT failed: agent trigger callback not initialized".to_string())
@@ -766,25 +891,38 @@ impl RuleEngine {
         rule_id: &RuleId,
         condition_met: bool,
     ) -> Option<chrono::DateTime<Utc>> {
-        let mut rules = self.rules.write().await;
-        if let Some(rule) = rules.get_mut(rule_id) {
+        let (result, rule_snapshot) = {
+            let mut rules = self.rules.write();
+            let rule = rules.get_mut(rule_id)?;
             if condition_met {
                 if rule.state.condition_since.is_none() {
                     rule.state.condition_since = Some(Utc::now());
+                    (rule.state.condition_since, Some(rule.clone()))
+                } else {
+                    (rule.state.condition_since, None) // no state change
                 }
-                rule.state.condition_since
-            } else {
+            } else if rule.state.condition_since.is_some() {
                 rule.state.condition_since = None;
-                None
+                (None, Some(rule.clone()))
+            } else {
+                (None, None) // no state change
             }
-        } else {
-            None
+        };
+        // Persist only when condition_since changed (was missing — for_duration
+        // elapsed accumulation was lost on restart, causing premature triggering).
+        if let Some(rule) = rule_snapshot {
+            if let Some(store) = self.rule_store.read().as_ref() {
+                if let Err(e) = store.save(&rule) {
+                    tracing::warn!(rule_id = %rule_id, error = %e, "Failed to persist condition_since");
+                }
+            }
         }
+        result
     }
 
     async fn update_rule_state_after_trigger(&self, rule_id: &RuleId) {
         let rule_snapshot = {
-            let mut rules = self.rules.write().await;
+            let mut rules = self.rules.write();
             if let Some(rule) = rules.get_mut(rule_id) {
                 rule.state.trigger_count += 1;
                 rule.state.last_triggered = Some(Utc::now());
@@ -806,6 +944,18 @@ impl RuleEngine {
     }
 
     async fn record_history(&self, result: RuleExecutionResult) {
+        // Publish the completion — the frontend's DataChanged refresh and
+        // extension event subscriptions both consume this instead of polling
+        // the history API.
+        self.publish(heramind_core::event::HeraMindEvent::RuleExecuted {
+            rule_id: result.rule_id.to_string(),
+            rule_name: result.rule_name.clone(),
+            success: result.success,
+            duration_ms: result.duration_ms,
+            timestamp: Utc::now().timestamp(),
+        })
+        .await;
+
         // Persist to store if available
         if let Some(store) = self.rule_store.read().as_ref() {
             if let Err(e) = store.save_history(&result) {
@@ -834,7 +984,7 @@ impl RuleEngine {
 
     /// List only Schedule-type rules with their cron expressions.
     pub async fn list_schedule_rules(&self) -> Vec<(RuleId, String)> {
-        let rules = self.rules.read().await;
+        let rules = self.rules.read();
         rules
             .iter()
             .filter_map(|(id, rule)| {
@@ -884,6 +1034,96 @@ mod tests {
 
         engine.add_rule(rule).await.unwrap();
         assert_eq!(engine.list_rules().await.len(), 1);
+    }
+
+    /// Regression (0.9.20): the engine used to record history but never
+    /// published — RuleTriggered/RuleEvaluated/RuleExecuted existed in the
+    /// event enum with zero producers, so the frontend and extension
+    /// subscriptions had to poll the history API. Wired bus must deliver.
+    /// Regression (0.9.20): `{value}` in a Notify template used to render as
+    /// the literal placeholder for string rules — extract_trigger_value only
+    /// ever returned numbers, so Text values never substituted.
+    #[test]
+    fn placeholder_substitutes_text_values() {
+        assert_eq!(
+            RuleEngine::substitute_placeholders(
+                "State: {value} @ {source_id}",
+                Some("error"),
+                Some("device:s1:state")
+            ),
+            "State: error @ device:s1:state"
+        );
+        assert_eq!(
+            RuleEngine::substitute_placeholders("Temp: {value}", Some("23.5"), None),
+            "Temp: 23.5"
+        );
+        // No value → placeholder stays literal (caller decides what that means).
+        assert_eq!(
+            RuleEngine::substitute_placeholders("v={value}", None, None),
+            "v={value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rule_events_published_to_bus() {
+        let bus = Arc::new(heramind_core::EventBus::new());
+        let mut rx = bus.subscribe();
+
+        let provider = Arc::new(InMemoryValueProvider::new());
+        let engine = RuleEngine::new(provider.clone()).with_event_bus(Some(bus.clone()));
+
+        let mut rule = CompiledRule::new("High Temp");
+        rule.condition = Some(RuleCondition::Comparison {
+            source: DataSourceId::device("sensor1", "temperature"),
+            operator: ComparisonOperator::GreaterThan,
+            threshold: 50.0,
+            threshold_value: None,
+        });
+        rule.trigger = RuleTrigger::from_condition(&rule.condition);
+        rule.actions = vec![RuleAction::Notify {
+            message: "Too hot".into(),
+            severity: NotifySeverity::Warning,
+        }];
+        rule.finalize();
+        engine.add_rule(rule).await.unwrap();
+
+        provider.set_value("device:sensor1:temperature", 75.0);
+        engine
+            .on_data_update(
+                &DataSourceId::device("sensor1", "temperature"),
+                RuleValue::Number(75.0),
+            )
+            .await;
+
+        use std::time::Duration;
+        use tokio::time::timeout;
+        let mut saw_evaluated = false;
+        let mut saw_triggered = false;
+        let mut saw_executed = false;
+        for _ in 0..6 {
+            match timeout(Duration::from_secs(2), rx.recv()).await {
+                Ok(Some((
+                    heramind_core::event::HeraMindEvent::RuleEvaluated { condition_met, .. },
+                    _,
+                ))) => {
+                    saw_evaluated = condition_met;
+                }
+                Ok(Some((heramind_core::event::HeraMindEvent::RuleTriggered { .. }, _))) => {
+                    saw_triggered = true;
+                }
+                Ok(Some((
+                    heramind_core::event::HeraMindEvent::RuleExecuted { success, .. },
+                    _,
+                ))) => {
+                    saw_executed = success;
+                }
+                Ok(Some((_, _))) | Ok(None) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(saw_evaluated, "expected RuleEvaluated(condition_met=true)");
+        assert!(saw_triggered, "expected RuleTriggered");
+        assert!(saw_executed, "expected RuleExecuted(success=true)");
     }
 
     #[tokio::test]

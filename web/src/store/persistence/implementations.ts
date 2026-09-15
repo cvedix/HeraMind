@@ -13,12 +13,50 @@ import type {
 } from './types'
 import type { Dashboard } from '@/types/dashboard'
 import { generateId } from '@/lib/id'
+import i18n from '@/i18n/config'
+import { notifyError } from '@/lib/notify'
 import {
   toDashboardDTO,
   fromDashboardDTO,
   toCreateDashboardDTO,
   toUpdateDashboardDTO,
 } from './types'
+
+// ============================================================================
+// Server-sync failure tracking (Hybrid storage)
+// ============================================================================
+// The Hybrid layer syncs local-first and swallows API failures by design, so
+// callers cannot otherwise tell that the server is now stale. The store layer
+// uses this timestamp to avoid letting a server-backed refetch clobber local
+// state that never reached the backend. Module-level is intentional: it resets
+// on page reload, where reading the server (merged with the local cache) is
+// the correct ground truth again.
+
+let lastServerSyncFailureAt = 0
+let lastSyncFailureNotifiedAt = 0
+
+/** Background retries for a failed server sync before giving up (local state stays authoritative). */
+const SERVER_SYNC_RETRIES = 3
+/** Base backoff for sync retries; each attempt waits base × (attempt + 1). */
+const SERVER_SYNC_RETRY_BASE_MS = 3000
+
+/** Has a server sync failed within the given window (default 30s)? */
+export function hasRecentServerSyncFailure(windowMs: number = 30_000): boolean {
+  return lastServerSyncFailureAt !== 0 && Date.now() - lastServerSyncFailureAt < windowMs
+}
+
+function noteServerSyncFailure(): void {
+  lastServerSyncFailureAt = Date.now()
+  // Syncs fire on every drag/config change — throttle the user-facing toast to
+  // once a minute so an offline backend doesn't spam.
+  const now = Date.now()
+  if (now - lastSyncFailureNotifiedAt > 60_000) {
+    lastSyncFailureNotifiedAt = now
+    notifyError(
+      i18n.t('dashboard:syncFailureNotify', 'Changes are saved locally but could not reach the server.'),
+    )
+  }
+}
 
 // ============================================================================
 // LocalStorage Storage
@@ -71,18 +109,26 @@ export class LocalStorageDashboardStorage implements DashboardStorage {
   }
 
   async save(dashboards: Dashboard[]): Promise<StorageResult<void>> {
+    const serialized = JSON.stringify(dashboards)
     try {
-      localStorage.setItem(this.storageKey, JSON.stringify(dashboards))
+      localStorage.setItem(this.storageKey, serialized)
       return { data: undefined, error: null }
     } catch (error) {
-      // Attempt quota recovery: clear old data and retry once
+      // Attempt quota recovery: clear old data and retry once.
+      // Keep the previous payload first — if the retry also fails (a single
+      // oversized dashboard can exceed quota on its own), restoring it leaves
+      // the last known-good state on disk instead of nothing.
       if (error instanceof DOMException && error.name === 'QuotaExceededError') {
+        const previous = localStorage.getItem(this.storageKey)
         console.warn('[LocalStorage] Quota exceeded, clearing old dashboard data and retrying...')
         try {
           localStorage.removeItem(this.storageKey)
-          localStorage.setItem(this.storageKey, JSON.stringify(dashboards))
+          localStorage.setItem(this.storageKey, serialized)
           return { data: undefined, error: null }
         } catch (retryError) {
+          if (previous !== null) {
+            try { localStorage.setItem(this.storageKey, previous) } catch { /* nothing more we can do */ }
+          }
           return {
             data: null,
             error: retryError instanceof Error
@@ -394,8 +440,14 @@ export class HybridDashboardStorage implements DashboardStorage {
   // Track in-flight sync operations for local dashboards to prevent duplicate creation.
   // Key: local UUID, Value: the Promise resolving to the server dashboard (or null).
   private pendingSync: Map<string, Promise<StorageResult<Dashboard>>> = new Map()
+  /// Bumped by clear() (logout). In-flight syncs capture it before their
+  /// awaits; a post-clear localStorage write would resurrect the previous
+  /// account's dashboard into the next account's local-only merge.
+  private epoch = 0
   // Map local UUID -> server ID so subsequent syncs use the server ID.
   private localToServerId: Map<string, string> = new Map()
+  // Cross-tab watchers: fired when another tab writes the shared cache.
+  private remoteCacheListeners: Set<() => void> = new Set()
 
   constructor(options: { cacheEnabled?: boolean } = {}) {
     this.apiStorage = new ApiDashboardStorage()
@@ -403,6 +455,36 @@ export class HybridDashboardStorage implements DashboardStorage {
     this.cacheEnabled = options.cacheEnabled ?? true
     // Restore persisted ID mapping from localStorage
     this.loadIdMapping()
+
+    // [cross-tab] localStorage 'storage' events fire in OTHER tabs on
+    // every write. Without this, each tab holds an independent id mapping
+    // and dashboard array — the second tab to save overwrote the first's
+    // dashboards wholesale, and the same local UUID synced from both tabs
+    // created the dashboard twice on the server. On a remote write:
+    // refresh this tab's id mapping (kills the duplicate-create path) and
+    // notify the store layer to refetch (kills the stale-overwrite path).
+    if (typeof window !== 'undefined') {
+      window.addEventListener('storage', (e: StorageEvent) => {
+        if (e.key !== LOCAL_STORAGE_KEY && e.key !== LOCAL_TO_SERVER_ID_KEY) return
+        if (e.key === LOCAL_TO_SERVER_ID_KEY) {
+          this.localToServerId.clear()
+          this.loadIdMapping()
+        }
+        this.remoteCacheListeners.forEach(cb => {
+          try { cb() } catch { /* listener errors are not ours to propagate */ }
+        })
+      })
+    }
+  }
+
+  /**
+   * Subscribe to remote (other-tab) writes of the shared cache. Returns an
+   * unsubscribe function. Store layers use this to refetch instead of
+   * clobbering with their stale in-memory copy.
+   */
+  onRemoteCacheChange(cb: () => void): () => void {
+    this.remoteCacheListeners.add(cb)
+    return () => this.remoteCacheListeners.delete(cb)
   }
 
   /** Persist localToServerId mapping to localStorage */
@@ -455,13 +537,107 @@ export class HybridDashboardStorage implements DashboardStorage {
       return this.localStorage.load()
     }
 
-    // Cache to localStorage if enabled and update timestamp
-    if (this.cacheEnabled && apiResult.data) {
-      this.localStorage.save(apiResult.data).catch(() => {})
-      this.updateCacheTimestamp()
+    // Merge instead of overwrite, and RETURN the merged list (the old code
+    // cached the merge but returned the raw server list — local-only and
+    // offline-edited dashboards were invisible until a cold start, and the
+    // next in-memory save then overwrote the cache with the server's stale
+    // versions). Dashboards that only exist locally must survive a
+    // successful API load; offline edits must not be handed back to the
+    // server as ground truth.
+    if (apiResult.data) {
+      const merged = this.mergeServerWithLocalOnly(apiResult.data)
+      if (this.cacheEnabled) {
+        this.localStorage.save(merged).catch(() => {})
+        this.updateCacheTimestamp()
+      }
+      return { data: merged, error: null }
     }
 
     return apiResult
+  }
+
+  /**
+   * Merge the server list with the local cache, newest-write-wins:
+   *
+   * 1. [offline-edit recovery] For dashboards present on BOTH sides, a
+   *    STRICTLY NEWER local copy (by `updatedAt`) wins — it holds edits made
+   *    while the backend was unreachable. The old merge let the stale server
+   *    version overwrite the newer cache unconditionally, permanently losing
+   *    those edits on reload ("local-first" was only "local-until-reload").
+   *    Trade-off: an offline edit made after another client deleted the
+   *    dashboard resurrects it — losing the edit is worse than resurrecting.
+   *    Recovered winners are re-synced in the background so the server heals.
+   * 2. Local-only dashboards (no server id, no mapping) survive as before.
+   * 3. Dashboards whose mapped server ID is absent from the server list were
+   *    deleted from another client (and not edited locally since) — dropped.
+   */
+  /**
+   * Normalize a timestamp to milliseconds for comparisons ONLY.
+   *
+   * The server persists `updated_at` as Unix SECONDS (chrono timestamp())
+   * while the frontend writes `updatedAt` as Date.now() MILLISECONDS, and
+   * fromDashboardDTO passes the value through unchanged. Comparing raw
+   * values made every local copy "newer" than every server copy (~1.7e12 vs
+   * ~1.7e9) — the merge then "recovered" everything on every load, healing
+   * forever and silently reverting other clients' edits. Threshold 1e12
+   * (Sep 2001 in ms) cleanly separates the two regimes.
+   */
+  private static normalizeToMs(ts: number | undefined): number {
+    if (typeof ts !== 'number' || !Number.isFinite(ts)) return 0
+    return ts < 1e12 ? ts * 1000 : ts
+  }
+
+  private mergeServerWithLocalOnly(serverDashboards: Dashboard[]): Dashboard[] {
+    try {
+      const stored = localStorage.getItem(LOCAL_STORAGE_KEY)
+      if (!stored) return serverDashboards
+      const local = JSON.parse(stored) as Dashboard[]
+      if (!Array.isArray(local)) return serverDashboards
+      const serverIds = new Set(serverDashboards.map(d => d.id))
+
+      // Newest local copy per server id (direct match or via the mapping).
+      const localByServerId = new Map<string, Dashboard>()
+      for (const d of local) {
+        if (!d || typeof d !== 'object' || typeof d.id !== 'string') continue
+        const serverId = serverIds.has(d.id) ? d.id : this.localToServerId.get(d.id)
+        if (!serverId || !serverIds.has(serverId)) continue
+        const prev = localByServerId.get(serverId)
+        if (
+          !prev ||
+          HybridDashboardStorage.normalizeToMs(d.updatedAt) > HybridDashboardStorage.normalizeToMs(prev.updatedAt)
+        ) {
+          localByServerId.set(serverId, d)
+        }
+      }
+
+      const recovered: Dashboard[] = []
+      const merged = serverDashboards.map(sd => {
+        const ld = localByServerId.get(sd.id)
+        if (
+          ld &&
+          HybridDashboardStorage.normalizeToMs(ld.updatedAt) >
+            HybridDashboardStorage.normalizeToMs(sd.updatedAt)
+        ) {
+          const winner = { ...ld, id: sd.id }
+          recovered.push(winner)
+          return winner
+        }
+        return sd
+      })
+
+      // Heal the server with the recovered versions (fire-and-forget).
+      for (const winner of recovered) {
+        void this.sync(winner).catch(() => { /* retried on the next edit */ })
+      }
+
+      const localOnly = local.filter(d =>
+        d && typeof d === 'object' && typeof d.id === 'string' &&
+        !serverIds.has(d.id) && !this.localToServerId.has(d.id),
+      )
+      return localOnly.length > 0 ? [...merged, ...localOnly] : merged
+    } catch {
+      return serverDashboards
+    }
   }
 
   async save(dashboards: Dashboard[]): Promise<StorageResult<void>> {
@@ -515,8 +691,15 @@ export class HybridDashboardStorage implements DashboardStorage {
       const syncPromise = this.apiStorage.sync(dashboard)
       this.pendingSync.set(dashboard.id, syncPromise)
 
+      const entryEpoch = this.epoch
       try {
         const apiResult = await syncPromise
+        if (this.epoch !== entryEpoch) {
+          // A clear() (logout) raced this sync: persisting now would write
+          // the previous account's dashboard back into local storage after
+          // it was wiped.
+          return apiResult
+        }
         if (apiResult.data && apiResult.data.id !== dashboard.id) {
           // Server assigned a new ID - map it
           this.localToServerId.set(dashboard.id, apiResult.data.id)
@@ -541,18 +724,32 @@ export class HybridDashboardStorage implements DashboardStorage {
 
   /**
    * Sync a dashboard that already has a server ID to both localStorage and API.
+   *
+   * API failures are recorded via noteServerSyncFailure() (timestamp + throttled
+   * user toast) and retried a few times with backoff — a successful retry
+   * closes the window in which a server-backed refetch could clobber the newer
+   * local state. The local result is always returned: the UI keeps its
+   * optimistic state regardless of server outcome.
    */
   private async doServerSync(dashboard: Dashboard): Promise<StorageResult<Dashboard>> {
     const localResult = await this.localStorage.sync(dashboard)
+    const payload = localResult.data || dashboard
 
-    // Sync to API — track failure so callers can detect stale server state
-    try {
-      const apiResult = await this.apiStorage.sync(localResult.data || dashboard)
-      if (apiResult.error) {
+    for (let attempt = 0; attempt <= SERVER_SYNC_RETRIES; attempt++) {
+      try {
+        const apiResult = await this.apiStorage.sync(payload)
+        if (!apiResult.error) {
+          lastServerSyncFailureAt = 0
+          return localResult
+        }
         console.warn('[HybridStorage] API sync error for dashboard:', dashboard.id, apiResult.error)
+      } catch (err) {
+        console.warn('[HybridStorage] API sync failed for dashboard:', dashboard.id, err)
       }
-    } catch (err) {
-      console.warn('[HybridStorage] API sync failed for dashboard:', dashboard.id, err)
+      noteServerSyncFailure()
+      if (attempt < SERVER_SYNC_RETRIES) {
+        await new Promise(resolve => setTimeout(resolve, SERVER_SYNC_RETRY_BASE_MS * (attempt + 1)))
+      }
     }
 
     return localResult
@@ -595,7 +792,7 @@ export class HybridDashboardStorage implements DashboardStorage {
   // Local-only dashboards are synced through the dedicated sync() method
   // which handles ID mapping to prevent duplicate creation.
   private async syncToApi(dashboards: Dashboard[]): Promise<void> {
-    await Promise.allSettled(
+    const results = await Promise.allSettled(
       dashboards
         .filter(d => {
           // Only sync if the dashboard has a server ID (not local-only)
@@ -604,6 +801,15 @@ export class HybridDashboardStorage implements DashboardStorage {
         })
         .map(d => this.apiStorage.sync(d))
     )
+    // Surface bulk-sync failures through the same channel as doServerSync so
+    // the store can guard refetches while the server is behind local state.
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        noteServerSyncFailure()
+      } else if (result.value?.error) {
+        noteServerSyncFailure()
+      }
+    }
   }
 
   // Expose current dashboard helpers from localStorage
@@ -616,11 +822,12 @@ export class HybridDashboardStorage implements DashboardStorage {
   }
 
   clear(): void {
+    this.epoch++
     this.localStorage.clear()
     this.localToServerId.clear()
     this.pendingSync.clear()
-    try { localStorage.removeItem(LOCAL_STORAGE_CACHE_TIMESTAMP_KEY) } catch {}
-    try { localStorage.removeItem(LOCAL_TO_SERVER_ID_KEY) } catch {}
+    try { localStorage.removeItem(LOCAL_STORAGE_CACHE_TIMESTAMP_KEY) } catch { /* cache keys may not exist */ }
+    try { localStorage.removeItem(LOCAL_TO_SERVER_ID_KEY) } catch { /* cache keys may not exist */ }
   }
 
   /** Get cache age in milliseconds, or null if no timestamp */
@@ -638,7 +845,7 @@ export class HybridDashboardStorage implements DashboardStorage {
   private updateCacheTimestamp(): void {
     try {
       localStorage.setItem(LOCAL_STORAGE_CACHE_TIMESTAMP_KEY, String(Date.now()))
-    } catch {}
+    } catch { /* timestamp is best-effort */ }
   }
 }
 

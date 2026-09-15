@@ -150,7 +150,7 @@
     "exitFullscreen": "Exit Fullscreen",
     "emptyDashboard": "Dashboard is empty",
     "addComponentsHint": "Click the + button to add components",
-    "enterEditModeHint": "Click Edit Layout to add components",
+    "enterEditModeHint": "Enter edit mode to add your first component",
     "deviceNotFound": "Device Not Found",
     "deviceNotFoundDesc": "The requested device could not be found",
     "metricInfo": "Metric Information",
@@ -160,7 +160,7 @@
     "metric": "Metric",
     "entityIcon": "Entity Icon",
     "lucideIcon": "Lucide Icon",
-    "noDashboardFound": "No Dashboard Found",
+    "noDashboardFound": "No dashboards yet",
     "createFirstDashboard": "Create your first dashboard to get started",
     "share": {
       "title": "Share",
@@ -262,7 +262,12 @@
     "add": "Add",
     "loadingDashboard": "Loading Dashboard...",
     "device": "Device",
-    "command": "Command"
+    "command": "Command",
+    "emptyGuideDesc": "Build live monitoring views from widgets — charts, gauges, maps — fed by your devices.",
+    "emptyAskAi": "Ask AI to build one",
+    "emptyStep1": "Create a dashboard",
+    "emptyStep2": "Add widgets",
+    "emptyStep3": "Bind device data"
   },
   "mobileEditBar": {
     "component": "Component",
@@ -641,6 +646,7 @@
     "selectDevice": "Select a device",
     "selectedItems": "{{count}} selected",
     "clearAllSelections": "Clear all selections",
+    "deviceRemoved": "Bound device no longer exists",
     "deviceList": "Device List",
     "count": "items",
     "metricsCount": "metrics",
@@ -882,7 +888,23 @@
     "imageHistory.failedToLoad": "Failed to load",
     "tabComponents": "Components",
     "tabMarketplace": "Marketplace",
+    "tabExtensions": "Extensions",
+    "extensionsEmptyTitle": "No extension components",
+    "extensionsEmptyDesc": "Install an extension that provides frontend components; they appear here grouped by their declared categories",
+    "tabCustom": "Custom",
+    "customEmptyTitle": "No custom components yet",
+    "customEmptyDesc": "Import a .zip package (upload or server path); installed components appear here and can be added to dashboards",
+    "refreshMarket": "Refresh market",
+    "all": "All",
     "importComponent": "Import Component",
+    "importTypeUpload": "Upload ZIP",
+    "importTypeServerPath": "Server path",
+    "dropOrSelect": "Drag a .zip here, or click to browse",
+    "dropHere": "Drop to use this file",
+    "replaceFileHint": "Click or drop to replace",
+    "invalidZipType": "Please choose a .zip file",
+    "serverPathPlaceholder": "components/my-widget.zip",
+    "serverPathHint": "For packages already on the server (e.g. transferred via scp/USB). The path must live inside the server data directory — relative (to the data dir) or absolute.",
     "marketplaceEmpty": "No components available",
     "install": "Install",
     "uninstall": "Uninstall",
@@ -895,7 +917,6 @@
     "uninstallSuccess": "Component uninstalled",
     "installError": "Failed to install component",
     "version": "Version",
-    "title": "Component Library",
     "components": "Components",
     "indicators": "Indicators & Metrics",
     "charts": "Charts",
@@ -927,8 +948,6 @@
     "imageDisplayDesc": "Display images from URL or data source",
     "imageHistory": "Image History",
     "imageHistoryDesc": "Historical image gallery with time navigation",
-    "eventList": "Event List",
-    "eventListDesc": "Review structured events, images, and dynamic attributes",
     "webDisplay": "Web Display",
     "webDisplayDesc": "Embed web content via iframe",
     "markdownDisplay": "Markdown Display",
@@ -954,7 +973,6 @@
     "marketplace": "Component Marketplace",
     "marketplaceTitle": "Component Marketplace",
     "marketplaceError": "Unable to connect to component marketplace",
-    "installed": "Installed",
     "manifestFile": "Manifest File (JSON)",
     "manifestFileDesc": "Component metadata and configuration",
     "bundleFile": "Bundle File (JavaScript)",
@@ -963,7 +981,9 @@
     "preview": "Preview",
     "installConfirm": "Confirm Install",
     "uninstallConfirm": "Are you sure you want to uninstall this component?",
-    "by": "by"
+    "by": "by",
+    "eventList": "Event List",
+    "eventListDesc": "Review structured events, images, and dynamic attributes"
   },
   "common": {
     "cancel": "Cancel",
@@ -1095,7 +1115,6 @@
     "namePlaceholder": "Dashboard name...",
     "create": "Create",
     "newDashboard": "New Dashboard",
-    "dashboardCount": "{{count}} dashboards",
     "switchToTabs": "Switch to tab bar",
     "moveUp": "Move up",
     "moveDown": "Move down",
@@ -1244,6 +1263,17 @@
     "configureSource": "Configure Source",
     "failedToLoad": "Failed To Load"
   },
+  "installConfirm": "Install Confirm",
+  "bindingDeviceRemoved": "Bound device was removed",
+  "bindingDeviceRemovedHint": "Rebind this component to an existing device",
+  "staleData": "Last value — device offline",
+  "staleDataIdle": "Last value — awaiting data",
+  "staleDataLastSeen": "Last reported {{age}}",
+  "staleDataDevices": "Devices: {{names}}",
+  "renderer": {
+    "componentUnavailable": "Component unavailable",
+    "componentUnavailableHint": "The extension providing this component is not running; it will reappear once the extension returns"
+  },
   "eventList": {
     "title": "Event list",
     "searchPlaceholder": "Search events or attributes...",
@@ -1272,6 +1302,5 @@
     "showSearch": "Show search",
     "showFilters": "Show filters",
     "showImage": "Show event image"
-  },
-  "installConfirm": "Install Confirm"
+  }
 }

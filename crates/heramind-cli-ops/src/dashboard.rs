@@ -3,6 +3,74 @@ use crate::ApiClient;
 use anyhow::Result;
 use serde_json::{json, Value};
 
+/// Compact grid-occupancy summary computed from a dashboard's components —
+/// lets the agent place new widgets without a follow-up get or blind guessing.
+/// Returns (occupied_rows_desc, next_free_y). Grid is 12 columns.
+fn grid_summary(components: &[serde_json::Value]) -> (String, u64) {
+    let mut occupied: Vec<bool> = Vec::new();
+    for c in components {
+        let pos = c.get("position");
+        let y = pos
+            .and_then(|p| p.get("y"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let h = pos
+            .and_then(|p| p.get("h"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1);
+        let bottom = y + h;
+        if occupied.len() < bottom as usize {
+            occupied.resize(bottom as usize, false);
+        }
+        for row in occupied.iter_mut().take(bottom as usize).skip(y as usize) {
+            *row = true;
+        }
+    }
+    let rows: Vec<String> = {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < occupied.len() {
+            if occupied[i] {
+                let start = i;
+                while i < occupied.len() && occupied[i] {
+                    i += 1;
+                }
+                out.push(if start == i - 1 {
+                    format!("{}", start)
+                } else {
+                    format!("{}-{}", start, i - 1)
+                });
+            } else {
+                i += 1;
+            }
+        }
+        out
+    };
+    (
+        if rows.is_empty() {
+            "none".to_string()
+        } else {
+            rows.join(",")
+        },
+        occupied.len() as u64,
+    )
+}
+
+/// Extract the components array from a GET / add-components API response
+/// (handles the double-nested `data.data` the API wraps).
+fn response_components(data: &serde_json::Value) -> Vec<serde_json::Value> {
+    data.get("data")
+        .and_then(|d| {
+            d.get("components")
+                .or_else(|| d.get("data").and_then(|dd| dd.get("components")))
+        })
+        .or_else(|| data.get("components"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// List all dashboards with compact summary.
 ///
 /// Returns only id, name, and component count per dashboard — NOT the full
@@ -74,10 +142,21 @@ pub async fn list_dashboards(client: &ApiClient) -> Result<CliResponse> {
     ))
 }
 
-/// Get dashboard by ID
+/// Get dashboard by ID (or name — server resolves both).
 pub async fn get_dashboard(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client.get(&format!("/dashboards/{}", id)).await?;
-    Ok(CliResponse::success(data, "Dashboard retrieved"))
+    let comps = response_components(&data);
+    let (occupied, next_free_y) = grid_summary(&comps);
+    Ok(CliResponse::success(
+        data,
+        format!(
+            "Dashboard retrieved — {} components, 12-col grid, occupied rows: {}, next free row: y={} (place new widgets at y={} to avoid overlap)",
+            comps.len(),
+            occupied,
+            next_free_y,
+            next_free_y
+        ),
+    ))
 }
 
 /// Inspect dashboard bindings with a compact response suitable for an LLM.
@@ -148,6 +227,7 @@ pub async fn create_dashboard(
     name: &str,
     description: Option<&str>,
     layout: Option<serde_json::Value>,
+    components: Option<serde_json::Value>,
 ) -> Result<CliResponse> {
     let mut body = json!({
         "name": name,
@@ -157,6 +237,9 @@ pub async fn create_dashboard(
     }
     if let Some(layout_value) = layout {
         body["layout"] = layout_value;
+    }
+    if let Some(components_value) = components {
+        body["components"] = components_value;
     }
 
     let data = client.post("/dashboards", &body).await?;
@@ -218,6 +301,32 @@ pub async fn delete_dashboard(client: &ApiClient, id: &str) -> Result<CliRespons
     ))
 }
 
+/// Update ONE component of a dashboard (deep-merge patch)
+pub async fn update_component(
+    client: &ApiClient,
+    id: &str,
+    component_id: &str,
+    set: serde_json::Value,
+) -> Result<CliResponse> {
+    let body = json!({ "set": set });
+    let data = client
+        .patch(
+            &format!("/dashboards/{}/components/{}", id, component_id),
+            &body,
+        )
+        .await?;
+    let updated_id = data
+        .get("data")
+        .and_then(|d| d.get("component_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(component_id)
+        .to_string();
+    Ok(CliResponse::success(
+        data,
+        format!("Component '{}' updated", updated_id),
+    ))
+}
+
 /// Add components to a dashboard (append mode)
 pub async fn add_components(
     client: &ApiClient,
@@ -230,11 +339,20 @@ pub async fn add_components(
     let data = client
         .post(&format!("/dashboards/{}/components", id), &body)
         .await?;
-    let inner = data.get("data").unwrap_or(&data);
-    let count = inner["components"].as_array().map(|a| a.len()).unwrap_or(0);
+    let comps = response_components(&data);
+    let ids: Vec<String> = comps
+        .iter()
+        .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+    let (_occupied, next_free_y) = grid_summary(&comps);
     Ok(CliResponse::success(
         data,
-        format!("Components added (total: {})", count),
+        format!(
+            "Components added (total: {}): {} — types verified, next free row: y={} (no re-fetch needed)",
+            comps.len(),
+            if ids.is_empty() { "?".to_string() } else { ids.join(", ") },
+            next_free_y
+        ),
     ))
 }
 

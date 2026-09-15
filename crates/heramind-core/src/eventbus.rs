@@ -24,6 +24,12 @@ pub struct EventBus {
     tx: broadcast::Sender<(HeraMindEvent, EventMetadata)>,
     /// Event bus name for identification
     name: String,
+    /// Process-wide sum of every event dropped by any lagging subscriber of
+    /// this bus. Shared with each receiver so drops are counted even though
+    /// receivers don't hold a bus reference. Surfaced via /api/metrics —
+    /// non-zero means some subscriber (rules/telemetry/automation) missed
+    /// events silently.
+    total_dropped: Arc<AtomicU64>,
 }
 
 impl EventBus {
@@ -40,6 +46,7 @@ impl EventBus {
         Self {
             tx,
             name: "default".to_string(),
+            total_dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -48,7 +55,15 @@ impl EventBus {
         Self {
             tx: broadcast::channel(DEFAULT_CHANNEL_CAPACITY).0,
             name: name.into(),
+            total_dropped: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Total events dropped across ALL subscribers of this bus because a
+    /// receiver lagged behind the broadcast buffer. Non-zero ⇒ silent event
+    /// loss somewhere downstream (rules/telemetry/automation).
+    pub fn total_dropped_count(&self) -> u64 {
+        self.total_dropped.load(Ordering::Relaxed)
     }
 
     /// Get the name of this event bus.
@@ -127,6 +142,7 @@ impl EventBus {
         EventBusReceiver {
             rx: self.tx.subscribe(),
             dropped: AtomicU64::new(0),
+            total_dropped: self.total_dropped.clone(),
         }
     }
 
@@ -139,13 +155,14 @@ impl EventBus {
         F: Fn(&HeraMindEvent) -> bool + Send + 'static,
     {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, filter)
+        FilteredReceiver::new(rx, filter, self.total_dropped.clone())
     }
 
     /// Create a filtered subscription helper for common patterns.
     pub fn filter(&self) -> FilterBuilder {
         FilterBuilder {
             tx: Arc::new(self.tx.clone()),
+            total_dropped: self.total_dropped.clone(),
         }
     }
 }
@@ -162,6 +179,8 @@ pub struct EventBusReceiver {
     /// Events silently dropped because this receiver lagged behind the buffer.
     /// Non-zero ⇒ silent event loss (telemetry/rules/agents missed).
     dropped: AtomicU64,
+    /// Bus-wide drop counter shared with the EventBus (see its field docs).
+    total_dropped: Arc<AtomicU64>,
 }
 
 impl EventBusReceiver {
@@ -173,7 +192,8 @@ impl EventBusReceiver {
             match self.rx.recv().await {
                 Ok(event) => return Some(event),
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    let total = self.dropped.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                    let total = self.dropped.fetch_add(n, Ordering::Relaxed) + n;
+                    self.total_dropped.fetch_add(n, Ordering::Relaxed);
                     tracing::warn!(
                         dropped_total = total,
                         this_batch = n,
@@ -221,17 +241,24 @@ where
     filter: F,
     /// Events silently dropped because this receiver lagged behind the buffer.
     dropped: AtomicU64,
+    /// Bus-wide drop counter shared with the EventBus (see its field docs).
+    total_dropped: Arc<AtomicU64>,
 }
 
 impl<F> FilteredReceiver<F>
 where
     F: Fn(&HeraMindEvent) -> bool + Send,
 {
-    fn new(rx: broadcast::Receiver<(HeraMindEvent, EventMetadata)>, filter: F) -> Self {
+    fn new(
+        rx: broadcast::Receiver<(HeraMindEvent, EventMetadata)>,
+        filter: F,
+        total_dropped: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             rx,
             filter,
             dropped: AtomicU64::new(0),
+            total_dropped,
         }
     }
 
@@ -248,7 +275,8 @@ where
                     // Event didn't match filter, continue waiting
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    let total = self.dropped.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                    let total = self.dropped.fetch_add(n, Ordering::Relaxed) + n;
+                    self.total_dropped.fetch_add(n, Ordering::Relaxed);
                     tracing::warn!(
                         dropped_total = total,
                         this_batch = n,
@@ -284,49 +312,67 @@ where
 /// Builder for creating filtered subscriptions.
 pub struct FilterBuilder {
     tx: Arc<broadcast::Sender<(HeraMindEvent, EventMetadata)>>,
+    /// Bus-wide drop counter shared with the EventBus (see its field docs).
+    total_dropped: Arc<AtomicU64>,
 }
 
 impl FilterBuilder {
     /// Subscribe to device events only.
     pub fn device_events(&self) -> FilteredReceiver<fn(&HeraMindEvent) -> bool> {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, HeraMindEvent::is_device_event)
+        FilteredReceiver::new(
+            rx,
+            HeraMindEvent::is_device_event,
+            self.total_dropped.clone(),
+        )
     }
 
     /// Subscribe to rule events only.
     pub fn rule_events(&self) -> FilteredReceiver<fn(&HeraMindEvent) -> bool> {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, HeraMindEvent::is_rule_event)
+        FilteredReceiver::new(rx, HeraMindEvent::is_rule_event, self.total_dropped.clone())
     }
 
     /// Subscribe to agent events only.
     pub fn agent_events(&self) -> FilteredReceiver<fn(&HeraMindEvent) -> bool> {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, HeraMindEvent::is_agent_event)
+        FilteredReceiver::new(
+            rx,
+            HeraMindEvent::is_agent_event,
+            self.total_dropped.clone(),
+        )
     }
 
     /// Subscribe to LLM events only.
     pub fn llm_events(&self) -> FilteredReceiver<fn(&HeraMindEvent) -> bool> {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, HeraMindEvent::is_llm_event)
+        FilteredReceiver::new(rx, HeraMindEvent::is_llm_event, self.total_dropped.clone())
     }
 
     /// Subscribe to alert events only.
     pub fn alert_events(&self) -> FilteredReceiver<fn(&HeraMindEvent) -> bool> {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, HeraMindEvent::is_alert_event)
+        FilteredReceiver::new(
+            rx,
+            HeraMindEvent::is_alert_event,
+            self.total_dropped.clone(),
+        )
     }
 
     /// Subscribe to message events only.
     pub fn message_events(&self) -> FilteredReceiver<fn(&HeraMindEvent) -> bool> {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, HeraMindEvent::is_message_event)
+        FilteredReceiver::new(
+            rx,
+            HeraMindEvent::is_message_event,
+            self.total_dropped.clone(),
+        )
     }
 
     /// Subscribe to tool execution events only.
     pub fn tool_events(&self) -> FilteredReceiver<fn(&HeraMindEvent) -> bool> {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, HeraMindEvent::is_tool_event)
+        FilteredReceiver::new(rx, HeraMindEvent::is_tool_event, self.total_dropped.clone())
     }
 
     /// Phase 2.2: Subscribe to extension events only.
@@ -334,7 +380,11 @@ impl FilterBuilder {
     /// This includes both ExtensionOutput and ExtensionLifecycle events.
     pub fn extension_events(&self) -> FilteredReceiver<fn(&HeraMindEvent) -> bool> {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, HeraMindEvent::is_extension_event)
+        FilteredReceiver::new(
+            rx,
+            HeraMindEvent::is_extension_event,
+            self.total_dropped.clone(),
+        )
     }
 
     /// Phase 2.2: Subscribe to extension output events only.
@@ -342,9 +392,11 @@ impl FilterBuilder {
     /// Filters for ExtensionOutput events (data from providers).
     pub fn extension_output(&self) -> FilteredReceiver<fn(&HeraMindEvent) -> bool> {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, |event| {
-            matches!(event, HeraMindEvent::ExtensionOutput { .. })
-        })
+        FilteredReceiver::new(
+            rx,
+            |event| matches!(event, HeraMindEvent::ExtensionOutput { .. }),
+            self.total_dropped.clone(),
+        )
     }
 
     /// Phase 2.2: Subscribe to extension lifecycle events only.
@@ -352,9 +404,11 @@ impl FilterBuilder {
     /// Filters for ExtensionLifecycle events (state changes).
     pub fn extension_lifecycle(&self) -> FilteredReceiver<fn(&HeraMindEvent) -> bool> {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, |event| {
-            matches!(event, HeraMindEvent::ExtensionLifecycle { .. })
-        })
+        FilteredReceiver::new(
+            rx,
+            |event| matches!(event, HeraMindEvent::ExtensionLifecycle { .. }),
+            self.total_dropped.clone(),
+        )
     }
 
     /// Phase 2.2: Subscribe to events from a specific extension.
@@ -369,6 +423,7 @@ impl FilterBuilder {
         FilteredReceiver::new(
             rx,
             move |event| matches!(event, HeraMindEvent::ExtensionOutput { extension_id, .. } | HeraMindEvent::ExtensionLifecycle { extension_id, .. } if extension_id == &target_id),
+            self.total_dropped.clone(),
         )
     }
 
@@ -378,7 +433,7 @@ impl FilterBuilder {
         F: Fn(&HeraMindEvent) -> bool + Send + 'static,
     {
         let rx = self.tx.subscribe();
-        FilteredReceiver::new(rx, filter)
+        FilteredReceiver::new(rx, filter, self.total_dropped.clone())
     }
 }
 
@@ -521,6 +576,51 @@ mod tests {
             rx.dropped_count() >= 3,
             "expected >=3 silent drops counted, got {}",
             rx.dropped_count()
+        );
+        // The bus-wide counter aggregates the same drops (this is what
+        // /api/metrics reports — no receiver handles needed).
+        assert!(bus.total_dropped_count() >= 3);
+    }
+
+    #[tokio::test]
+    async fn test_total_dropped_aggregates_across_subscribers() {
+        let bus = EventBus::with_capacity(2);
+        let mut slow1 = bus.subscribe();
+        let mut slow2 = bus.filter().device_events();
+
+        for i in 0..5u32 {
+            bus.publish(HeraMindEvent::DeviceOnline {
+                device_id: format!("dev{i}"),
+                device_type: "sensor".to_string(),
+                timestamp: i as i64,
+            })
+            .await;
+        }
+
+        // Both subscribers lag; draining surfaces the Lagged accounting on
+        // both the per-receiver and the shared bus-wide counters. Each recv
+        // is timeout-bounded: once the backlog is drained, recv() would
+        // block forever (the bus and its sender are still alive), so without
+        // the timeout this test would hang.
+        for _ in 0..10 {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), slow1.recv()).await {
+                Ok(Some(_)) if slow1.dropped_count() == 0 => continue,
+                _ => break,
+            }
+        }
+        for _ in 0..10 {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), slow2.recv()).await {
+                Ok(Some(_)) if slow2.dropped_count() == 0 => continue,
+                _ => break,
+            }
+        }
+
+        let per_bus = bus.total_dropped_count();
+        assert!(
+            per_bus >= slow1.dropped_count() && per_bus >= slow2.dropped_count(),
+            "bus total ({per_bus}) must cover each receiver's drops ({}, {})",
+            slow1.dropped_count(),
+            slow2.dropped_count()
         );
     }
 

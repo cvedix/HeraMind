@@ -21,7 +21,7 @@ type SetupStep = 'account' | 'complete'
 
 export function SetupPage() {
   const navigate = useNavigate()
-  const { login } = useStore()
+  const login = useStore((s) => s.login)
   const { withErrorHandling } = useErrorHandler()
   const { t } = useTranslation(['setup'])
 
@@ -87,10 +87,10 @@ export function SetupPage() {
     setStep('complete')
   }
 
-  const handleComplete = () => {
+  const handleComplete = (dest = '/') => {
     if (accountInfo) {
       login(accountInfo.username, accountInfo.password, true).then(() => {
-        window.location.href = '/'
+        window.location.href = dest
       }).catch(() => {
         navigate('/login')
       })
@@ -121,7 +121,7 @@ export function SetupPage() {
     return (
       <CompleteStep
         username={accountInfo?.username || ''}
-        initialTimezone={accountInfo?.timezone || 'Asia/Shanghai'}
+        initialTimezone={accountInfo?.timezone || 'Asia/Ho_Chi_Minh'}
         token={accountInfo?.token || ''}
         getApiUrl={getApiUrl}
         onComplete={handleComplete}

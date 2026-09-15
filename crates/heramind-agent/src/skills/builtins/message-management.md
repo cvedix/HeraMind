@@ -1,6 +1,7 @@
 ---
 id: message-management
 name: Message Management & Channel Configuration
+description: Use when the user wants to manage messages and notification channels — sending messages, configuring channels (webhook/email/Telegram/DingTalk/Feishu/Slack), alerts, acknowledge, severity. Covers message send/channel-create/channel-get/channel-update/channel-test/channel-delete/channel-type-schema even without saying 'message' (e.g. '发个通知到飞书', '告警发我邮箱'). Includes 消息/通知/通道/告警. NOT external MQTT brokers — use connector-management for those.
 category: message
 origin: builtin
 priority: 80
@@ -17,6 +18,25 @@ anti_triggers:
 # Message Management & Channel Configuration
 
 Messages are platform notifications delivered through configurable channels. 7 channel types are supported: webhook, email, telegram, wecom, dingtalk, slack, feishu.
+
+## Command Cheat-Sheet (run these via `shell`)
+
+Always RUN the command yourself and report the real output.
+
+| Command | Purpose |
+|---|---|
+| `heramind message list` | List messages |
+| `heramind message get <id>` | Message details |
+| `heramind message send` | Send a new message |
+| `heramind message read <id>` | Acknowledge/read a message (alias: `ack`) |
+| `heramind message channel-list` | List message channels |
+| `heramind message channel-get <id>` | Channel details |
+| `heramind message channel-types` | List available channel types |
+| `heramind message channel-type-schema <TYPE>` | Config schema + examples for a channel type |
+| `heramind message channel-create` | Create a message channel |
+| `heramind message channel-update <id>` | Update channel configuration |
+| `heramind message channel-delete <id>` | Delete a channel |
+| `heramind message channel-test <id>` | Test a message channel |
 
 ## CRITICAL Rules
 
@@ -57,7 +77,8 @@ heramind message channel-types                     # List available channel type
 heramind message channel-type-schema <TYPE>        # Get config schema for a type
 heramind message channel-list                      # List all channels
 heramind message channel-get <NAME>                # Get channel details
-heramind message channel-create --name <N> --type <T> --config '<JSON>'  # Create channel
+heramind message channel-create --name <N> --type <T> --param <k>=<v>...  # Create channel (flags, preferred)
+heramind message channel-create --name <N> --type <T> --config '<JSON>'  # Create channel (full JSON form)
 heramind message channel-update <NAME> --config '<JSON>'                 # Update channel config
 heramind message channel-delete <NAME>             # Delete channel
 heramind message channel-test <NAME>               # Test channel delivery
@@ -74,8 +95,9 @@ heramind message channel-types
 # Step 2: Get config schema for the desired type
 heramind message channel-type-schema telegram
 
-# Step 3: Create the channel with proper config
-heramind message channel-create --name my-telegram --type telegram --config '{"token":"...","chat_id":"..."}'
+# Step 3: Create the channel with proper config — prefer flag form, one --param per field
+heramind message channel-create --name my-telegram --type telegram --param token=123:ABC --param chat_id=99887
+# (equivalent JSON form: --config '{"token":"123:ABC","chat_id":"99887"}')
 
 # Step 4: Test the channel
 heramind message channel-test my-telegram

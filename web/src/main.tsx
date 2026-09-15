@@ -92,7 +92,7 @@ import { initVisualViewport } from "@/hooks/useVisualViewport"
     })
 
     // Return shape expected by components: { id, name, scope, extension_id, rule, status, created_at }
-    const automation = (result as any).automation
+    const automation = result.automation
     return {
       id: automation.id,
       name: automation.name,
@@ -130,21 +130,17 @@ import { initVisualViewport } from "@/hooks/useVisualViewport"
     if (config.js_code) definition.js_code = config.js_code
     if (config.output_prefix) definition.output_prefix = config.output_prefix
 
-    try {
-      const result = await api.updateAutomation(id, {
-        name: config.name,
-        description: config.description,
-        definition: Object.keys(definition).length > 0 ? definition : undefined,
-      })
-      const automation = (result as any).automation
-      return {
-        id: automation.id,
-        name: automation.name,
-        status: automation.enabled ? 'active' : 'paused',
-      }
-    } catch (error) {
-      // Throw error so caller can handle fallback (e.g., recreate Transform)
-      throw error
+    // Errors propagate so the caller can handle fallback (e.g., recreate Transform)
+    const result = await api.updateAutomation(id, {
+      name: config.name,
+      description: config.description,
+      definition: Object.keys(definition).length > 0 ? definition : undefined,
+    })
+    const automation = result.automation
+    return {
+      id: automation.id,
+      name: automation.name,
+      status: automation.enabled ? 'active' : 'paused',
     }
   },
 
@@ -198,10 +194,10 @@ import { initVisualViewport } from "@/hooks/useVisualViewport"
       const result = await api.getDeviceCurrent(deviceId)
       // The API returns { device, metrics: { name: { value, is_virtual, ... } }, commands }
       // Extract raw values from the metrics map, handling both current and legacy formats.
-      const metrics = (result as any)?.metrics
+      const metrics = result.metrics
       const cv: Record<string, unknown> = {}
       if (metrics && typeof metrics === 'object') {
-        for (const [key, entry] of Object.entries(metrics as Record<string, any>)) {
+        for (const [key, entry] of Object.entries(metrics)) {
           // Each metric is { name, value, is_virtual, ... } — extract the raw value.
           // Skip metrics with null value (no data) to avoid returning the wrapper object.
           const val = entry && typeof entry === 'object' ? entry.value : entry
@@ -209,7 +205,8 @@ import { initVisualViewport } from "@/hooks/useVisualViewport"
         }
       }
       // Also check legacy flat formats
-      const legacy = (result as any)?.current_values || (result as any)?.values
+      const legacy = (result as Partial<Record<'current_values' | 'values', Record<string, unknown>>>).current_values
+        ?? (result as Partial<Record<'current_values' | 'values', Record<string, unknown>>>).values
       if (legacy && typeof legacy === 'object') {
         Object.assign(cv, legacy)
       }
@@ -279,9 +276,14 @@ import { initVisualViewport } from "@/hooks/useVisualViewport"
 // Initialize global VisualViewport tracking for mobile keyboard handling
 initVisualViewport()
 
+// Compatibility for official marketplace bundles using the upstream host API.
+;(window as any).neomind = (window as any).heramind
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BrowserRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+    {/* react-router v7: v7_relativeSplatPath / v7_startTransition are now the
+        only behaviours — the old `future` prop no longer exists. */}
+    <BrowserRouter>
       <ThemeProvider>
         <App />
       </ThemeProvider>

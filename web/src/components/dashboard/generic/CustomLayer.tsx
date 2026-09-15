@@ -504,7 +504,7 @@ function LayerItemComponent({
         return (
         <div
           className={cn(
-            'absolute z-50 rounded-lg shadow-xl animate-in fade-in zoom-in-95 duration-150',
+            'absolute z-50 rounded-lg shadow-xl animate-in fade-in zoom-in-95 duration-fast',
             _isImg
               ? 'min-w-[160px] max-w-[280px] overflow-hidden'
               : 'min-w-[200px] max-w-[280px] border bg-bg-95 backdrop-blur p-3',
@@ -579,7 +579,7 @@ function LayerItemComponent({
                       }}
                     />
                     {(item.deviceName || item.deviceId) && (
-                      <span className="absolute bottom-0 inset-x-0 px-1.5 py-0.5 text-[10px] text-white bg-overlay-medium truncate">
+                      <span className="absolute bottom-0 inset-x-0 px-1.5 py-0.5 text-nano text-white bg-overlay-medium truncate">
                         {item.deviceName || item.deviceId}
                       </span>
                     )}
@@ -1463,7 +1463,7 @@ export function CustomLayer({
       {fullscreenOverlay}
       {fullscreenImage && createPortal(
         <div
-          className="fixed inset-0 z-[200] bg-overlay-heavy backdrop-blur-sm flex items-center justify-center"
+          className="fixed inset-0 z-[110] bg-overlay-heavy backdrop-blur-sm flex items-center justify-center"
           onClick={() => setFullscreenImage(null)}
         >
           <div className="absolute top-4 left-4 right-4 flex items-center justify-between">

@@ -8,7 +8,7 @@ use serde_json::json;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
-use super::compat::{config_to_device_instance, format_status_to_str};
+use super::compat::config_to_device_instance;
 use super::models::{
     AddDeviceRequest, BatchCurrentValuesRequest, DeviceDto, PaginationMeta, PaginationQuery,
     UpdateDeviceRequest,
@@ -68,11 +68,88 @@ fn get_plugin_info(adapter_id: &Option<String>) -> (Option<String>, Option<Strin
     }
 }
 
+/// Three-state wire status shared by EVERY device surface (list filter,
+/// list rows, detail, current). The detail endpoints used to collapse to
+/// online|disconnected, so a previously-seen timed-out device read as
+/// "Never Connected" (从未上线) on its detail page while the list said
+/// "Offline" — wrong data for the same device from two endpoints.
+fn three_state_status(online: bool, config_last_seen: i64) -> &'static str {
+    if online {
+        "online"
+    } else if config_last_seen > 0 {
+        "offline"
+    } else {
+        "disconnected"
+    }
+}
+
+/// Allowed range for a device's offline_timeout_secs override.
+pub(crate) const MIN_OFFLINE_TIMEOUT: u64 = 30; // below this causes status flicker
+pub(crate) const MAX_OFFLINE_TIMEOUT: u64 = 86400; // 24h — beyond this is unreasonable
+
+/// Validate an offline_timeout_secs override. Extracted so the range rule is
+/// testable (it was inline in the handler).
+fn validate_offline_timeout(secs: u64) -> Result<(), ErrorResponse> {
+    if !(MIN_OFFLINE_TIMEOUT..=MAX_OFFLINE_TIMEOUT).contains(&secs) {
+        return Err(ErrorResponse::bad_request(format!(
+            "offline_timeout_secs must be between {} and {} (got {})",
+            MIN_OFFLINE_TIMEOUT, MAX_OFFLINE_TIMEOUT, secs
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a device's effective offline timeout.
+/// Priority: device override > template default > global. Extracted from a
+/// closure duplicated across three handlers so the precedence is pinned by
+/// tests (a regression here flips devices offline too early/late).
+fn effective_offline_timeout(
+    device_override: Option<u64>,
+    template_default: Option<u64>,
+    global: u64,
+) -> u64 {
+    device_override.or(template_default).unwrap_or(global)
+}
+
+/// Map a DeviceService error to the right HTTP class. The register/update
+/// paths used to funnel EVERYTHING through ErrorResponse::internal — a
+/// device_type that isn't a registered template (a plain client mistake)
+/// answered 500 INTERNAL_ERROR, so integrators could not tell "I sent
+/// something wrong" from "the server broke".
+fn device_error_to_response(context: &str, e: heramind_devices::DeviceError) -> ErrorResponse {
+    use heramind_devices::DeviceError as DE;
+    let msg = format!("{context}: {e}");
+    match e {
+        DE::NotFoundStr(_) | DE::NotFound(_) => ErrorResponse::not_found(msg),
+        DE::AlreadyExists(_) => ErrorResponse::conflict(msg),
+        DE::InvalidParameter(_)
+        | DE::InvalidMetric(_)
+        | DE::InvalidCommand(_)
+        | DE::Serialization(_) => ErrorResponse::bad_request(msg),
+        _ => ErrorResponse::internal(msg),
+    }
+}
+
 /// List devices with pagination and filtering support.
 /// Uses new DeviceService with real device status from event tracking
 ///
 /// Performance optimization: Queries device status once per device and reuses it
 /// for both filtering and DTO conversion, eliminating duplicate status queries.
+#[utoipa::path(
+    get,
+    path = "/api/devices",
+    tag = "devices",
+    params(
+        ("page" = Option<usize>, Query, description = "1-indexed page"),
+        ("limit" = Option<usize>, Query, description = "Per page (capped 1000)"),
+        ("device_type" = Option<String>, Query, description = "Filter by type"),
+        ("status" = Option<String>, Query, description = "online | offline | disconnected (legacy 'connected' = online)"),
+    ),
+    responses(
+        (status = 200, description = "Device list with pagination"),
+        (status = 401, description = "Not authenticated"),
+    )
+)]
 pub async fn list_devices_handler(
     State(state): State<ServerState>,
     Query(pagination): Query<PaginationQuery>,
@@ -97,15 +174,14 @@ pub async fn list_devices_handler(
     // Resolve per-device effective offline timeout.
     // Priority: device override > template default > global.
     let effective_timeout = |config: &heramind_devices::DeviceConfig| -> u64 {
-        if let Some(secs) = config.offline_timeout_secs {
-            return secs;
-        }
-        if let Some(tpl) = template_map.get(config.device_type.as_str()) {
-            if let Some(secs) = tpl.default_offline_timeout_secs {
-                return secs;
-            }
-        }
-        global_offline_timeout
+        let template_default = template_map
+            .get(config.device_type.as_str())
+            .and_then(|tpl| tpl.default_offline_timeout_secs);
+        effective_offline_timeout(
+            config.offline_timeout_secs,
+            template_default,
+            global_offline_timeout,
+        )
     };
 
     struct DeviceWithStatus {
@@ -133,13 +209,7 @@ pub async fn list_devices_handler(
         // Support legacy filters: "connected" → "online", "disconnected" → "disconnected"
         if let Some(ref filter_status) = pagination.status {
             let is_connected = device_status.is_connected_within(effective_timeout(&config));
-            let device_status_str = if is_connected {
-                "online"
-            } else if config.last_seen > 0 {
-                "offline"
-            } else {
-                "disconnected"
-            };
+            let device_status_str = three_state_status(is_connected, config.last_seen);
             let matches = device_status_str == filter_status.as_str()
                 || (filter_status == "connected" && device_status_str == "online");
             if !matches {
@@ -178,13 +248,7 @@ pub async fn list_devices_handler(
         //   - online: currently connected and active (is_connected() && last_seen < 5min)
         //   - offline: was online before but timed out (config.last_seen > 0)
         //   - disconnected: never connected / never reported data (config.last_seen == 0)
-        let status_str = if online {
-            "online"
-        } else if config.last_seen > 0 {
-            "offline"
-        } else {
-            "disconnected"
-        };
+        let status_str = three_state_status(online, config.last_seen);
 
         // Use persisted last_seen (config.last_seen) for display — survives server restarts.
         // Fall back to in-memory last_seen_ts if config.last_seen is 0/1 but device is currently online.
@@ -255,6 +319,16 @@ pub async fn list_devices_handler(
 
 /// Get device details.
 /// Uses new DeviceService with real device status from event tracking
+#[utoipa::path(
+    get,
+    path = "/api/devices/{id}",
+    tag = "devices",
+    params(("id" = String, Path, description = "Device id")),
+    responses(
+        (status = 200, description = "Device detail; status three-state online/offline/disconnected"),
+        (status = 404, description = "Unknown device"),
+    )
+)]
 pub async fn get_device_handler(
     State(state): State<ServerState>,
     Path(device_id): Path<String>,
@@ -287,10 +361,11 @@ pub async fn get_device_handler(
 
     // Resolve per-device effective offline timeout
     // (device override > template default > global)
-    let effective_timeout = config
-        .offline_timeout_secs
-        .or(template.default_offline_timeout_secs)
-        .unwrap_or(state.devices.service.heartbeat_config().offline_timeout);
+    let effective_timeout = effective_offline_timeout(
+        config.offline_timeout_secs,
+        template.default_offline_timeout_secs,
+        state.devices.service.heartbeat_config().offline_timeout,
+    );
     let online = device_status.is_connected_within(effective_timeout);
 
     // Determine status string based on actual connectivity
@@ -300,6 +375,9 @@ pub async fn get_device_handler(
         MdlConnectionStatus::Disconnected
     };
     let status = convert_status(status);
+    // Wire status matches the list endpoint exactly (three states) — see
+    // three_state_status. The enum above feeds the instance object only.
+    let status_str = three_state_status(online, config.last_seen);
 
     // Use persisted last_seen (survives server restart) with in-memory fallback.
     // This MUST match the list handler's logic — otherwise the detail page shows
@@ -331,7 +409,7 @@ pub async fn get_device_handler(
         "device_type": config.device_type,
         "adapter_type": config.adapter_type,
         "connection_config": config.connection_config,
-        "status": format_status_to_str(&instance.status),
+        "status": status_str,
         "last_seen": last_seen,
         "online": online,
         "transport_connected": device_status.transport_connected,
@@ -358,6 +436,16 @@ pub async fn get_device_handler(
 ///
 /// Returns device info + all metrics with current values in one call.
 /// This is the recommended endpoint for UI components that need device state.
+#[utoipa::path(
+    get,
+    path = "/api/devices/{id}/current",
+    tag = "devices",
+    params(("id" = String, Path, description = "Device id")),
+    responses(
+        (status = 200, description = "Current values of every metric"),
+        (status = 404, description = "Unknown device"),
+    )
+)]
 pub async fn get_device_current_handler(
     State(state): State<ServerState>,
     Path(device_id): Path<String>,
@@ -372,10 +460,11 @@ pub async fn get_device_current_handler(
 
     // Get device status
     let device_status = state.devices.service.get_device_status(&device_id).await;
-    let effective_timeout = config
-        .offline_timeout_secs
-        .or(template.default_offline_timeout_secs)
-        .unwrap_or(state.devices.service.heartbeat_config().offline_timeout);
+    let effective_timeout = effective_offline_timeout(
+        config.offline_timeout_secs,
+        template.default_offline_timeout_secs,
+        state.devices.service.heartbeat_config().offline_timeout,
+    );
     let online = device_status.is_connected_within(effective_timeout);
     let status = if online {
         MdlConnectionStatus::Connected
@@ -383,6 +472,9 @@ pub async fn get_device_current_handler(
         MdlConnectionStatus::Disconnected
     };
     let status = convert_status(status);
+    // Wire status matches the list endpoint exactly (three states) — see
+    // three_state_status. The enum above feeds the instance object only.
+    let status_str = three_state_status(online, config.last_seen);
 
     // Use persisted last_seen (survives server restart) with in-memory fallback.
     // This MUST match the list handler's logic — otherwise the detail page shows
@@ -402,7 +494,7 @@ pub async fn get_device_current_handler(
     };
     let last_seen_dt =
         chrono::DateTime::from_timestamp(effective_last_seen, 0).unwrap_or_else(chrono::Utc::now);
-    let instance = config_to_device_instance(&config, status, last_seen_dt);
+    let _instance = config_to_device_instance(&config, status, last_seen_dt);
 
     // Get plugin info
     let (plugin_id, plugin_name) = get_plugin_info(&config.adapter_id);
@@ -539,7 +631,7 @@ pub async fn get_device_current_handler(
             "name": config.name,
             "device_type": config.device_type,
             "adapter_type": config.adapter_type,
-            "status": format_status_to_str(&instance.status),
+            "status": status_str,
             "last_seen": last_seen,
             "online": online,
             "transport_connected": device_status.transport_connected,
@@ -569,13 +661,53 @@ pub async fn get_device_current_handler(
 ///
 /// Efficiently fetches current metric values for multiple devices in one request.
 /// This is optimized for dashboard components that need data from multiple devices.
+#[utoipa::path(
+    post,
+    path = "/api/devices/current-batch",
+    tag = "devices",
+    request_body = BatchCurrentValuesRequest,
+    responses(
+        (status = 200, description = "Current values for many devices in one call"),
+    )
+)]
 pub async fn get_devices_current_batch_handler(
     State(state): State<ServerState>,
     Json(req): Json<BatchCurrentValuesRequest>,
 ) -> HandlerResult<serde_json::Value> {
-    let mut devices = std::collections::HashMap::new();
+    // [fan-out] Devices polled CONCURRENTLY — dashboards hit this for every
+    // widget's device set; the sequential loop summed per-device latencies
+    // (the inner per-metric fallback was already join_all'd).
+    let per_device: Vec<_> = req
+        .device_ids
+        .into_iter()
+        .map(|device_id| {
+            let state = state.clone();
+            async move {
+                (
+                    device_id.clone(),
+                    one_device_current(&state, &device_id).await,
+                )
+            }
+        })
+        .collect();
+    let devices: std::collections::HashMap<String, serde_json::Value> =
+        futures::future::join_all(per_device)
+            .await
+            .into_iter()
+            .collect();
 
-    for device_id in req.device_ids {
+    let count = devices.len();
+
+    ok(json!({
+        "devices": devices,
+        "count": count,
+    }))
+}
+
+/// Current values for ONE device: in-memory cache first, telemetry-storage
+/// fallback (all template metrics concurrently) when the cache is cold.
+async fn one_device_current(state: &ServerState, device_id: &str) -> serde_json::Value {
+    {
         // Unified source_id for telemetry storage queries
         let device_source_id = format!("device:{}", device_id);
 
@@ -583,7 +715,7 @@ pub async fn get_devices_current_batch_handler(
         let current_values = state
             .devices
             .service
-            .get_current_metrics(&device_id)
+            .get_current_metrics(device_id)
             .await
             .unwrap_or_default();
 
@@ -597,7 +729,7 @@ pub async fn get_devices_current_batch_handler(
         // If cache is empty, try time_series_storage for recent data
         let current_values_json = if current_values_json.is_empty() {
             // Try to get the device template to know which metrics to fetch
-            let template = state.devices.service.get_template(&device_id);
+            let template = state.devices.service.get_template(device_id);
 
             if let Some(template) = template {
                 // PERFORMANCE FIX: Use batch query instead of sequential N+1 queries
@@ -632,25 +764,25 @@ pub async fn get_devices_current_batch_handler(
             current_values_json
         };
 
-        devices.insert(
-            device_id.clone(),
-            json!({
-                "device_id": device_id,
-                "current_values": current_values_json
-            }),
-        );
+        json!({
+            "device_id": device_id,
+            "current_values": current_values_json
+        })
     }
-
-    let count = devices.len();
-
-    ok(json!({
-        "devices": devices,
-        "count": count,
-    }))
 }
 
 /// Delete a device.
 /// Uses new DeviceService
+#[utoipa::path(
+    delete,
+    path = "/api/devices/{id}",
+    tag = "devices",
+    params(("id" = String, Path, description = "Device id")),
+    responses(
+        (status = 200, description = "Deleted"),
+        (status = 404, description = "Unknown device"),
+    )
+)]
 pub async fn delete_device_handler(
     State(state): State<ServerState>,
     Path(device_id): Path<String>,
@@ -660,7 +792,7 @@ pub async fn delete_device_handler(
         .service
         .unregister_device(&device_id)
         .await
-        .map_err(|e| ErrorResponse::internal(format!("Failed to delete device: {}", e)))?;
+        .map_err(|e| device_error_to_response("Failed to delete device", e))?;
     ok(json!({
         "device_id": device_id,
         "deleted": true,
@@ -669,6 +801,17 @@ pub async fn delete_device_handler(
 
 /// Add a new device manually.
 /// Uses new DeviceService
+#[utoipa::path(
+    post,
+    path = "/api/devices",
+    tag = "devices",
+    request_body = AddDeviceRequest,
+    responses(
+        (status = 200, description = "Created — or REPLACED an existing device with the same id (upsert; check updated_existing)"),
+        (status = 400, description = "Unknown device_type / invalid params"),
+        (status = 409, description = "Already exists"),
+    )
+)]
 pub async fn add_device_handler(
     State(state): State<ServerState>,
     Json(req): Json<AddDeviceRequest>,
@@ -692,6 +835,11 @@ pub async fn add_device_handler(
         serde_json::from_value(req.connection_config)
             .map_err(|e| ErrorResponse::bad_request(format!("Invalid connection_config: {}", e)))?;
 
+    // Same range rules as the update path for a provided create override.
+    if let Some(secs) = req.offline_timeout_secs {
+        validate_offline_timeout(secs)?;
+    }
+
     // Create DeviceConfig
     let config = heramind_devices::DeviceConfig {
         device_id: device_id.clone(),
@@ -701,8 +849,16 @@ pub async fn add_device_handler(
         connection_config,
         adapter_id: None, // Will be set by adapter when registered
         last_seen: 0,
-        offline_timeout_secs: None,
+        offline_timeout_secs: req.offline_timeout_secs,
     };
+
+    // [upsert visibility] The service's register_device upserts by design
+    // (internal adapter/auto-onboard paths re-register idempotently), so a
+    // public POST with an EXISTING id silently REPLACED the previous
+    // device's name/config and still answered `added: true`. The upsert
+    // stays (internal callers depend on it), but the response now says
+    // which happened so a client can tell "created" from "overwrote".
+    let existed = state.devices.service.get_device(&device_id).is_some();
 
     // Register device using new DeviceService
     state
@@ -710,16 +866,31 @@ pub async fn add_device_handler(
         .service
         .register_device(config)
         .await
-        .map_err(|e| ErrorResponse::internal(format!("Failed to add device: {}", e)))?;
+        .map_err(|e| device_error_to_response("Failed to add device", e))?;
 
     ok(json!({
         "device_id": device_id,
         "added": true,
+        // Additive field: true when an existing device with this id was
+        // replaced instead of created.
+        "updated_existing": existed,
     }))
 }
 
 /// Update a device.
 /// Only updates the fields provided in the request.
+#[utoipa::path(
+    put,
+    path = "/api/devices/{id}",
+    tag = "devices",
+    params(("id" = String, Path, description = "Device id")),
+    request_body = UpdateDeviceRequest,
+    responses(
+        (status = 200, description = "Updated. offline_timeout_secs tri-state: absent=keep, null=clear, number=set (30-86400)"),
+        (status = 400, description = "Invalid offline_timeout_secs or params"),
+        (status = 404, description = "Unknown device"),
+    )
+)]
 pub async fn update_device_handler(
     State(state): State<ServerState>,
     Path(device_id): Path<String>,
@@ -732,16 +903,10 @@ pub async fn update_device_handler(
         .get_device(&device_id)
         .ok_or_else(|| ErrorResponse::not_found("Device"))?;
 
-    // Validate offline_timeout_secs if provided
-    if let Some(secs) = req.offline_timeout_secs {
-        const MIN_OFFLINE_TIMEOUT: u64 = 30; // 30s — below this causes status flicker
-        const MAX_OFFLINE_TIMEOUT: u64 = 86400; // 24h — beyond this is unreasonable
-        if !(MIN_OFFLINE_TIMEOUT..=MAX_OFFLINE_TIMEOUT).contains(&secs) {
-            return Err(ErrorResponse::bad_request(format!(
-                "offline_timeout_secs must be between {} and {} (got {})",
-                MIN_OFFLINE_TIMEOUT, MAX_OFFLINE_TIMEOUT, secs
-            )));
-        }
+    // Validate offline_timeout_secs if provided as a SET (absent keeps the
+    // existing value and is not validated; explicit null clears it).
+    if let Some(Some(secs)) = req.offline_timeout_secs {
+        validate_offline_timeout(secs)?;
     }
 
     // Parse connection_config if provided
@@ -761,9 +926,11 @@ pub async fn update_device_handler(
         connection_config,
         adapter_id: req.adapter_id.or(existing.adapter_id),
         last_seen: existing.last_seen,
-        // Direct assignment: frontend always sends this field explicitly.
-        // null/None = clear override (fall back to template/global), Some(n) = set.
-        offline_timeout_secs: req.offline_timeout_secs,
+        // absent (None) = keep the existing override; null (Some(None)) =
+        // clear it (fall back to template/global); value = set.
+        offline_timeout_secs: req
+            .offline_timeout_secs
+            .unwrap_or(existing.offline_timeout_secs),
     };
 
     // Update device using new DeviceService
@@ -772,7 +939,7 @@ pub async fn update_device_handler(
         .service
         .update_device(&device_id, config)
         .await
-        .map_err(|e| ErrorResponse::internal(format!("Failed to update device: {}", e)))?;
+        .map_err(|e| device_error_to_response("Failed to update device", e))?;
 
     ok(json!({
         "device_id": device_id,
@@ -908,5 +1075,181 @@ pub async fn refresh_device_handler(
             "refreshed": false,
             "error": "Adapter not available",
         }))
+    }
+}
+
+#[cfg(test)]
+mod crud_logic_tests {
+    use super::*;
+
+    /// Offline-timeout override range: the bounds exist because <30s makes
+    /// status flap with normal MQTT jitter and >24h hides real outages.
+    #[test]
+    fn offline_timeout_bounds() {
+        assert!(validate_offline_timeout(30).is_ok());
+        assert!(validate_offline_timeout(300).is_ok());
+        assert!(validate_offline_timeout(86400).is_ok());
+        for bad in [0, 1, 29, 86401, u64::MAX] {
+            let err = validate_offline_timeout(bad).unwrap_err();
+            assert!(
+                err.message.contains("between 30 and 86400"),
+                "got {} for {bad}: {}",
+                err.message,
+                bad
+            );
+        }
+    }
+
+    /// Precedence: device override beats template beats global. A device
+    /// override of exactly the global value still counts as an override
+    /// (indistinguishable here, but None vs Some matters upstream).
+    #[test]
+    fn effective_offline_timeout_precedence() {
+        let g = 300;
+        // override wins over both
+        assert_eq!(effective_offline_timeout(Some(60), Some(120), g), 60);
+        // template wins over global
+        assert_eq!(effective_offline_timeout(None, Some(120), g), 120);
+        // global when nothing else set
+        assert_eq!(effective_offline_timeout(None, None, g), 300);
+        // override wins even when SMALLER than template and global
+        assert_eq!(effective_offline_timeout(Some(31), Some(86400), g), 31);
+    }
+
+    /// Plugin display mapping: None = internal MQTT, external-mqtt* gets a
+    /// descriptive label, everything else passes through verbatim.
+    #[test]
+    fn plugin_info_mapping() {
+        let (id, name) = get_plugin_info(&None);
+        assert_eq!(
+            (id.as_deref(), name.as_deref()),
+            (Some("internal-mqtt"), Some("Internal MQTT"))
+        );
+
+        let (id, name) = get_plugin_info(&Some("external-mqtt-42".into()));
+        assert_eq!(id.as_deref(), Some("external-mqtt-42"));
+        assert_eq!(name.as_deref(), Some("External MQTT: external-mqtt-42"));
+
+        // A non-external custom adapter id passes through unchanged.
+        let (id, name) = get_plugin_info(&Some("modbus-gw1".into()));
+        assert_eq!(id.as_deref(), Some("modbus-gw1"));
+        assert_eq!(name.as_deref(), Some("modbus-gw1"));
+    }
+
+    /// Adapter→API status mapping is total (no variant silently dropped).
+    #[test]
+    fn status_mapping_is_total() {
+        use AdapterConnectionStatus as A;
+        let roundtrip = |a: A, expects: &str| {
+            let s = format!("{:?}", convert_status(a)).to_lowercase();
+            assert!(s.contains(expects), "{a:?} → {s}, expected {expects}");
+        };
+        roundtrip(A::Connected, "connected");
+        roundtrip(A::Connecting, "connecting");
+        roundtrip(A::Disconnected, "disconnected");
+        roundtrip(A::Reconnecting, "reconnecting");
+        roundtrip(A::Error, "error");
+    }
+}
+
+#[cfg(test)]
+mod contract_fix_tests {
+    use super::*;
+
+    /// Three-state mapping must be identical everywhere a device status is
+    /// emitted — the detail endpoints used to collapse to two states.
+    #[test]
+    fn three_state_status_matches_list_semantics() {
+        assert_eq!(three_state_status(true, 0), "online");
+        assert_eq!(three_state_status(true, 999), "online");
+        // Previously-seen but timed out → offline (NOT "disconnected").
+        assert_eq!(three_state_status(false, 1), "offline");
+        assert_eq!(three_state_status(false, 1_700_000_000), "offline");
+        // Never reported → disconnected.
+        assert_eq!(three_state_status(false, 0), "disconnected");
+    }
+
+    /// The absent-vs-null contract of PUT /devices/:id: a partial update
+    /// omitting the field must KEEP the override; explicit null clears it;
+    /// a value sets it. The old single-Option mapping read absent and null
+    /// identically — any omission wiped the override.
+    #[test]
+    fn update_request_distinguishes_absent_null_and_value() {
+        let absent: super::super::models::UpdateDeviceRequest =
+            serde_json::from_str(r#"{"name": "renamed"}"#).unwrap();
+        assert_eq!(
+            absent.offline_timeout_secs, None,
+            "absent key must mean KEEP"
+        );
+
+        let nullified: super::super::models::UpdateDeviceRequest =
+            serde_json::from_str(r#"{"name": "renamed", "offline_timeout_secs": null}"#).unwrap();
+        assert_eq!(
+            nullified.offline_timeout_secs,
+            Some(None),
+            "explicit null must mean CLEAR"
+        );
+
+        let valued: super::super::models::UpdateDeviceRequest =
+            serde_json::from_str(r#"{"offline_timeout_secs": 300}"#).unwrap();
+        assert_eq!(valued.offline_timeout_secs, Some(Some(300)));
+    }
+
+    /// Create requests accept the override the TS type declares (it used to
+    /// be silently dropped by serde).
+    #[test]
+    fn add_request_accepts_offline_timeout() {
+        let req: super::super::models::AddDeviceRequest = serde_json::from_str(
+            r#"{"device_type":"t","name":"n","adapter_type":"mqtt","connection_config":{},"offline_timeout_secs":120}"#,
+        )
+        .unwrap();
+        assert_eq!(req.offline_timeout_secs, Some(120));
+    }
+}
+
+#[cfg(test)]
+mod device_error_mapping_tests {
+    use super::*;
+    use heramind_devices::DeviceError;
+
+    /// [live-caught] An unregistered device_type reached the client as 500
+    /// INTERNAL_ERROR — a plain client mistake reported as a server fault.
+    /// Client-input variants must map to 4xx. NotFound* is 404: REST-wise
+    /// (and per the utoipa annotations, which document "Unknown device" as
+    /// 404) a missing resource is not-found, not a malformed request.
+    #[test]
+    fn client_input_errors_map_to_4xx() {
+        let resp = device_error_to_response(
+            "Failed to add device",
+            DeviceError::NotFoundStr("Device type template 'nope' not found".into()),
+        );
+        assert_eq!(
+            resp.status,
+            axum::http::StatusCode::NOT_FOUND,
+            "unknown template must be 404"
+        );
+
+        let resp = device_error_to_response(
+            "Failed to add device",
+            DeviceError::AlreadyExists("dev-1".into()),
+        );
+        assert_eq!(resp.status, axum::http::StatusCode::CONFLICT);
+
+        let resp = device_error_to_response(
+            "Failed to add device",
+            DeviceError::InvalidParameter("empty id".into()),
+        );
+        assert_eq!(resp.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Infrastructure failures still surface as 500 — the mapper must not
+    /// swallow real server-side faults into 4xx.
+    #[test]
+    fn infrastructure_errors_stay_5xx() {
+        let resp = device_error_to_response(
+            "Failed to add device",
+            DeviceError::Storage("redb: disk full".into()),
+        );
+        assert_eq!(resp.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

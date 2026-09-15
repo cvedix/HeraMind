@@ -6,6 +6,76 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+/// Serializes the serve tests that actually start a server. `heramind serve`
+/// binds the embedded MQTT broker on port 1883 (read from config.toml, no
+/// override flag), so running them in parallel makes the instances contend
+/// for 1883 and some panic after the "port still in use, waiting" wait.
+static SERVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the serve serialization lock.
+fn serve_lock() -> MutexGuard<'static, ()> {
+    SERVE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Spawn `heramind serve` and assert a FULL startup: the server must stay up
+/// long enough to get past binding, store init and services, then exit
+/// gracefully with code 0 via the test-only `HERAMIND_EXIT_AFTER_READY_MS`
+/// deadline. This replaced "spawn, hope it's still alive after 500ms, kill"
+/// — which couldn't tell a healthy server from one still wedged in init,
+/// and left junk data dirs behind.
+///
+/// Each run gets its own HERAMIND_DATA_DIR so tests never touch the repo's
+/// data/ (the ":memory:" file litter in the repo root came from exactly
+/// that). Still serialized: the embedded MQTT broker's port comes from
+/// config.toml with no CLI override.
+fn assert_serve_starts(args: &[&str]) {
+    let _lock = serve_lock();
+    let bin = assert_cmd::cargo::cargo_bin("heramind");
+    let data_dir = std::env::temp_dir().join(format!("heramind-serve-test-{}", std::process::id()));
+    std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+
+    let mut child = std::process::Command::new(bin)
+        .args(["serve"])
+        .args(args)
+        .env("HERAMIND_DATA_DIR", &data_dir)
+        .env("HERAMIND_EXIT_AFTER_READY_MS", "4000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn heramind serve");
+
+    // 4s deadline to exit + generous startup allowance on slow runners.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "`heramind serve {:?}` did not exit within 90s (test deadline not honored)",
+                    args
+                );
+            }
+            Err(e) => {
+                let _ = child.kill();
+                panic!("failed to check serve child: {e}");
+            }
+        }
+    };
+    let _ = std::fs::remove_dir_all(&data_dir);
+    assert!(
+        status.success(),
+        "`heramind serve {:?}` exited with {status} — startup failed",
+        args
+    );
+}
 
 /// Test that serve command accepts default values.
 #[test]
@@ -20,31 +90,17 @@ fn test_serve_default_values() {
         .stdout(predicate::str::contains("9375")); // Default port
 }
 
-/// Test that custom port is accepted.
+/// Test that a custom port is accepted and the server binds it.
 #[test]
 fn test_serve_custom_port() {
-    let mut cmd = Command::cargo_bin("heramind").unwrap();
-    cmd.arg("serve")
-        .arg("--port")
-        .arg("8080")
-        .arg("--host")
-        .arg("127.0.0.1");
-
-    // This will likely fail due to no LLM backend
-    cmd.assert().failure();
+    // Port 0 → OS-assigned ephemeral port, never conflicts with anything.
+    assert_serve_starts(&["--port", "0", "--host", "127.0.0.1"]);
 }
 
-/// Test that custom host is accepted.
+/// Test that a custom host is accepted.
 #[test]
 fn test_serve_custom_host() {
-    let mut cmd = Command::cargo_bin("heramind").unwrap();
-    cmd.arg("serve")
-        .arg("--host")
-        .arg("0.0.0.0")
-        .arg("--port")
-        .arg("9375");
-
-    cmd.assert().failure();
+    assert_serve_starts(&["--host", "0.0.0.0", "--port", "0"]);
 }
 
 /// Test that invalid port is rejected.
@@ -77,12 +133,24 @@ fn test_address_parsing() {
     }
 }
 
-/// Test that missing required arguments shows appropriate error.
-#[test]
-fn test_serve_shows_help_with_missing_args() {
-    let mut cmd = Command::cargo_bin("heramind").unwrap();
-    cmd.arg("serve");
+/// `heramind serve` with NO args binds the default port 9375. On a dev
+/// machine the real instance is often already running on it (exactly that
+/// failed a full workspace run while the machine served a live 9375
+/// listener) — skip loudly instead of reporting a startup failure. CI
+/// holds nothing on 9375, so there the test still runs its full course.
+/// Probe by CONNECTING, not binding: std TcpListener::bind sets
+/// SO_REUSEADDR, which on macOS lets a 127.0.0.1 bind succeed next to a
+/// foreign wildcard listener — the bind-based probe missed the conflict.
+fn default_port_occupied() -> bool {
+    std::net::TcpStream::connect("127.0.0.1:9375").is_ok()
+}
 
-    // Should work with defaults
-    cmd.assert().failure();
+/// Test that missing required arguments starts a server with defaults.
+#[test]
+fn test_serve_with_defaults() {
+    if default_port_occupied() {
+        eprintln!("SKIP: port 9375 already bound — a heramind instance is running");
+        return;
+    }
+    assert_serve_starts(&[]);
 }

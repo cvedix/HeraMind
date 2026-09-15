@@ -182,7 +182,8 @@
     "active": "Đang hoạt động",
     "paused": "Đã tạm dừng",
     "error": "Lỗi",
-    "executing": "Đang chạy"
+    "executing": "Đang chạy",
+    "completed": "Hoàn thành"
   },
   "executionStatus": {
     "running": "Đang chạy",
@@ -697,5 +698,6 @@
     "save": "Lưu",
     "saving": "Đang lưu"
   },
-  "executionNotFound": "Không tìm thấy việc thực thi"
+  "executionNotFound": "Không tìm thấy việc thực thi",
+  "noAgentsNoBackendDesc": "Agent cần mô hình AI để hoạt động. Tải mô hình tích hợp (chạy ngoại tuyến, không cần API key) hoặc cấu hình backend của bạn trước."
 }

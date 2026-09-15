@@ -41,6 +41,21 @@ use tracing::warn;
 /// Loader for native extension metadata and discovery.
 pub struct NativeExtensionMetadataLoader;
 
+// Prefer HeraMind's ABI namespace; official marketplace binaries retain NeoMind's
+// symbol names. The caller still validates ABI_VERSION before calling exports.
+unsafe fn compatible_symbol<'lib, T>(
+    library: &'lib libloading::Library,
+    name: &[u8],
+) -> std::result::Result<libloading::Symbol<'lib, T>, libloading::Error> {
+    library.get(name).or_else(|error| {
+        let Some(suffix) = name.strip_prefix(b"heramind_") else {
+            return Err(error);
+        };
+        let alias = [b"neomind_".as_slice(), suffix].concat();
+        library.get(&alias)
+    })
+}
+
 impl NativeExtensionMetadataLoader {
     /// Create a new native extension metadata loader.
     pub fn new() -> Self {
@@ -102,8 +117,7 @@ impl NativeExtensionMetadataLoader {
 
         let version = Self::safe_call_ffi("abi_version", || {
             let abi_version: libloading::Symbol<unsafe extern "C" fn() -> u32> = unsafe {
-                library
-                    .get(b"heramind_extension_abi_version\0")
+                compatible_symbol(&library, b"heramind_extension_abi_version\0")
                     .map_err(|e| ExtensionError::SymbolNotFound(format!("abi_version: {}", e)))?
             };
             Ok(unsafe { abi_version() })
@@ -126,8 +140,9 @@ impl NativeExtensionMetadataLoader {
         ];
 
         for symbol_name in &required_symbols {
-            let symbol_result =
-                unsafe { library.get::<unsafe extern "C" fn()>(symbol_name.as_bytes()) };
+            let symbol_result = unsafe {
+                compatible_symbol::<unsafe extern "C" fn()>(&library, symbol_name.as_bytes())
+            };
             if symbol_result.is_err() {
                 return Err(ExtensionError::LoadFailed(format!(
                     "Extension uses incompatible FFI interface (missing symbol: {}). \
@@ -139,8 +154,7 @@ impl NativeExtensionMetadataLoader {
 
         let c_meta = Self::safe_call_ffi("metadata", || {
             let get_metadata: libloading::Symbol<unsafe extern "C" fn() -> CExtensionMetadata> = unsafe {
-                library
-                    .get(b"heramind_extension_metadata\0")
+                compatible_symbol(&library, b"heramind_extension_metadata\0")
                     .map_err(|e| ExtensionError::SymbolNotFound(format!("metadata: {}", e)))?
             };
             Ok(unsafe { get_metadata() })

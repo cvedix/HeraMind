@@ -32,7 +32,7 @@ pub struct ListBackendsQuery {
 }
 
 /// Request to create/update an LLM backend instance
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CreateBackendRequest {
     /// Display name
     pub name: String,
@@ -65,9 +65,20 @@ pub struct CreateBackendRequest {
     #[serde(default = "default_thinking_enabled")]
     pub thinking_enabled: bool,
 
+    /// Unified thinking/reasoning effort (preferred over `thinking_enabled`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<ThinkingEffortMirror>)]
+    pub thinking_effort: Option<heramind_core::ThinkingEffort>,
+
     /// Model capabilities (optional, from Ollama model detection)
     #[serde(default)]
     pub capabilities: Option<BackendCapabilities>,
+
+    /// Explicit context window override (custom backends like RKLLM3 run a
+    /// real -c that the default 128000 overstates — an over-sized prompt hangs
+    /// the runtime). Merged into capabilities.max_context when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context: Option<usize>,
 }
 
 fn default_temperature() -> f32 {
@@ -87,7 +98,7 @@ fn default_thinking_enabled() -> bool {
 }
 
 /// Request to update an LLM backend instance
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct UpdateBackendRequest {
     /// Display name
     pub name: Option<String>,
@@ -101,6 +112,11 @@ pub struct UpdateBackendRequest {
     /// API key
     pub api_key: Option<String>,
 
+    /// Backend type / protocol (e.g. openai ↔ anthropic). Changing it
+    /// re-bases capabilities on the new type's defaults (model-adjusted);
+    /// endpoint/model/api_key are kept as-is.
+    pub backend_type: Option<String>,
+
     /// Temperature
     pub temperature: Option<f32>,
 
@@ -113,13 +129,21 @@ pub struct UpdateBackendRequest {
     /// Enable thinking/reasoning mode for models that support it
     pub thinking_enabled: Option<bool>,
 
+    /// Unified thinking/reasoning effort (preferred over `thinking_enabled`).
+    #[schema(value_type = Option<ThinkingEffortMirror>)]
+    pub thinking_effort: Option<heramind_core::ThinkingEffort>,
+
     /// Model capabilities (optional, from Ollama model detection)
     #[serde(default)]
     pub capabilities: Option<BackendCapabilities>,
+
+    /// Explicit context window override (see create request).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context: Option<usize>,
 }
 
 /// Backend instance DTO for API responses
-#[derive(Debug, Serialize)]
+#[derive(utoipa::ToSchema, Debug, Serialize)]
 pub struct BackendInstanceDto {
     pub id: String,
     pub name: String,
@@ -128,11 +152,15 @@ pub struct BackendInstanceDto {
     pub model: String,
     pub api_key_configured: bool,
     pub is_active: bool,
+    pub is_builtin: bool,
+    pub thinking_is_integral: bool,
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: usize,
     pub max_tokens: usize,
     pub thinking_enabled: bool,
+    #[schema(value_type = Option<ThinkingEffortMirror>)]
+    pub thinking_effort: Option<heramind_core::ThinkingEffort>,
     pub capabilities: BackendCapabilities,
     pub updated_at: i64,
     pub healthy: Option<bool>,
@@ -150,11 +178,14 @@ impl From<LlmBackendInstance> for BackendInstanceDto {
             api_key_configured: instance.api_key.is_some()
                 && !instance.api_key.as_ref().is_some_and(|k| k.is_empty()),
             is_active: instance.is_active,
+            is_builtin: instance.is_builtin,
+            thinking_is_integral: instance.thinking_is_integral,
             temperature: instance.temperature,
             top_p: instance.top_p,
             top_k: instance.top_k,
             max_tokens: instance.max_tokens,
             thinking_enabled: instance.thinking_enabled,
+            thinking_effort: instance.thinking_effort,
             capabilities: instance.capabilities,
             updated_at: instance.updated_at,
             healthy: None, // Populated separately
@@ -239,6 +270,18 @@ async fn get_backend_stats() -> Result<serde_json::Value, ErrorResponse> {
 /// Query parameters:
 /// - type: Filter by backend type (e.g., "ollama", "openai")
 /// - active_only: Show only the active backend
+#[utoipa::path(
+    get,
+    path = "/api/llm-backends",
+    tag = "llm-backends",
+    params(
+        ("type" = Option<String>, Query, description = "Filter by backend type"),
+        ("active_only" = Option<bool>, Query, description = "Only the active backend"),
+    ),
+    responses(
+        (status = 200, description = "Configured LLM backends"),
+    )
+)]
 pub async fn list_backends_handler(
     State(_state): State<ServerState>,
     Query(query): Query<ListBackendsQuery>,
@@ -285,6 +328,18 @@ pub async fn list_backends_handler(
 /// Get a specific LLM backend instance
 ///
 /// GET /api/llm-backends/:id
+#[utoipa::path(
+    get,
+    path = "/api/llm-backends/{id}",
+    tag = "llm-backends",
+    params(
+        ("id" = String, Path, description = "Backend id"),
+    ),
+    responses(
+        (status = 200, description = "One configured backend"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_backend_handler(
     State(_state): State<ServerState>,
     Path(id): Path<String>,
@@ -310,6 +365,33 @@ pub async fn get_backend_handler(
 /// Create a new LLM backend instance
 ///
 /// POST /api/llm-backends
+/// Parse an API-facing backend type string (used by create + protocol
+/// switch on update).
+fn parse_backend_type(s: &str) -> Option<LlmBackendType> {
+    match s {
+        "ollama" => Some(LlmBackendType::Ollama),
+        "llamacpp" => Some(LlmBackendType::LlamaCpp),
+        "openai" => Some(LlmBackendType::OpenAi),
+        "anthropic" => Some(LlmBackendType::Anthropic),
+        "google" => Some(LlmBackendType::Google),
+        "xai" => Some(LlmBackendType::XAi),
+        "qwen" => Some(LlmBackendType::Qwen),
+        "deepseek" => Some(LlmBackendType::DeepSeek),
+        "glm" => Some(LlmBackendType::GLM),
+        "minimax" => Some(LlmBackendType::MiniMax),
+        _ => None,
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/llm-backends",
+    tag = "llm-backends",
+    request_body = CreateBackendRequest,
+    responses(
+        (status = 200, description = "Backend created"),
+    )
+)]
 pub async fn create_backend_handler(
     State(_state): State<ServerState>,
     Json(req): Json<CreateBackendRequest>,
@@ -317,30 +399,15 @@ pub async fn create_backend_handler(
     let manager = get_manager()?;
 
     // Parse backend type
-    let backend_type = match req.backend_type.as_str() {
-        "ollama" => LlmBackendType::Ollama,
-        "llamacpp" => LlmBackendType::LlamaCpp,
-        "openai" => LlmBackendType::OpenAi,
-        "anthropic" => LlmBackendType::Anthropic,
-        "google" => LlmBackendType::Google,
-        "xai" => LlmBackendType::XAi,
-        "qwen" => LlmBackendType::Qwen,
-        "deepseek" => LlmBackendType::DeepSeek,
-        "glm" => LlmBackendType::GLM,
-        "minimax" => LlmBackendType::MiniMax,
-        _ => {
-            return Err(ErrorResponse::bad_request(format!(
-                "Unknown backend type: {}",
-                req.backend_type
-            )));
-        }
-    };
+    let backend_type = parse_backend_type(&req.backend_type).ok_or_else(|| {
+        ErrorResponse::bad_request(format!("Unknown backend type: {}", req.backend_type))
+    })?;
 
     // Generate unique ID
     let id = LlmBackendStore::generate_id(&req.backend_type);
 
     // Get capabilities: prefer API detection for Ollama, fallback to name-based
-    let capabilities = if matches!(backend_type, LlmBackendType::Ollama) {
+    let mut capabilities = if matches!(backend_type, LlmBackendType::Ollama) {
         // For Ollama, try to get capabilities from /api/show endpoint
         let endpoint = req.endpoint.as_deref().unwrap_or("http://localhost:11434");
         let show_url = format!("{}/api/show", endpoint);
@@ -378,6 +445,11 @@ pub async fn create_backend_handler(
         adjust_capabilities_for_model(&req.model, &mut caps);
         caps
     };
+    // Explicit context override wins in both branches — the review caught that
+    // create dropped it (only the update handler merged it).
+    if let Some(ctx) = req.max_context {
+        capabilities.max_context = ctx;
+    }
 
     let instance = LlmBackendInstance {
         id: id.clone(),
@@ -387,11 +459,14 @@ pub async fn create_backend_handler(
         model: req.model,
         api_key: req.api_key,
         is_active: false,
+        is_builtin: false,
+        thinking_is_integral: false,
         temperature: req.temperature,
         top_p: req.top_p,
         max_tokens: default_max_tokens(),
         top_k: req.top_k.unwrap_or(20), // Default to 20 for faster responses
         thinking_enabled: req.thinking_enabled,
+        thinking_effort: req.thinking_effort,
         capabilities,
         updated_at: chrono::Utc::now().timestamp(),
     };
@@ -414,10 +489,23 @@ pub async fn create_backend_handler(
 /// Update an LLM backend instance
 ///
 /// PUT /api/llm-backends/:id
+#[utoipa::path(
+    put,
+    path = "/api/llm-backends/{id}",
+    tag = "llm-backends",
+    params(
+        ("id" = String, Path, description = "Backend id"),
+    ),
+    request_body = UpdateBackendRequest,
+    responses(
+        (status = 200, description = "Backend updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_backend_handler(
     State(_state): State<ServerState>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateBackendRequest>,
+    Json(mut req): Json<UpdateBackendRequest>,
 ) -> HandlerResult<serde_json::Value> {
     let manager = get_manager()?;
 
@@ -425,6 +513,34 @@ pub async fn update_backend_handler(
     let mut instance = manager
         .get_instance(&id)
         .ok_or_else(|| ErrorResponse::not_found(format!("Backend instance {}", id)))?;
+
+    // Protocol switch (openai ↔ anthropic ↔ vendor types). Capabilities are
+    // type-specific, so re-base them on the new type's defaults (model-
+    // adjusted). Endpoint/model/key are kept; the runtime cache is cleared
+    // by upsert so the next request builds a runtime for the new type.
+    // Note: the instance ID keeps its historical type prefix (e.g.
+    // `anthropic_…` after switching to openai) — IDs are opaque and
+    // referenced by active_id / sessions, so they never change.
+    if let Some(new_type_str) = req.backend_type.as_deref() {
+        let new_type = parse_backend_type(new_type_str).ok_or_else(|| {
+            ErrorResponse::bad_request(format!("Unknown backend type: {new_type_str}"))
+        })?;
+        if new_type != instance.backend_type {
+            tracing::info!(
+                backend_id = %id,
+                from = ?instance.backend_type,
+                to = ?new_type,
+                "Backend type (protocol) changed"
+            );
+            let mut caps = get_default_capabilities(&new_type);
+            adjust_capabilities_for_model(&instance.model, &mut caps);
+            instance.backend_type = new_type;
+            instance.capabilities = caps;
+            // A type change supersedes the client-sent capabilities below —
+            // drop them so the re-based ones aren't overwritten.
+            req.capabilities = None;
+        }
+    }
 
     // Update fields
     if let Some(name) = req.name {
@@ -494,6 +610,17 @@ pub async fn update_backend_handler(
             "User thinking_enabled setting updated"
         );
     }
+    if let Some(thinking_effort) = req.thinking_effort {
+        let prev = instance.thinking_effort;
+        instance.thinking_effort = Some(thinking_effort);
+        tracing::info!(
+            backend_id = %id,
+            model = %instance.model,
+            prev_thinking_effort = ?prev,
+            new_thinking_effort = ?thinking_effort,
+            "User thinking_effort setting updated"
+        );
+    }
     if let Some(mut capabilities) = req.capabilities {
         // Preserve fields that the frontend doesn't render.
         // The capabilities object sent by the frontend typically doesn't include
@@ -504,14 +631,6 @@ pub async fn update_backend_handler(
         let saved_user_override = instance.capabilities.multimodal_user_override;
         let saved_source = instance.capabilities.multimodal_source.clone();
         let saved_multimodal = instance.capabilities.supports_multimodal;
-        // supports_audio is also not rendered by the frontend, so save it
-        // before the request body overwrites the whole capabilities struct.
-        // The frontend sends a partial capabilities object (typically omitting
-        // audio); without this, every unrelated PUT (e.g. temperature change)
-        // would silently reset audio capability to its serde default (false)
-        // and a backend that the runtime had detected as audio-capable would
-        // appear to lose it until the next capability refresh cycle.
-        let saved_supports_audio = instance.capabilities.supports_audio;
 
         // Adjust capabilities based on model name
         adjust_capabilities_for_model(&instance.model, &mut capabilities);
@@ -549,19 +668,11 @@ pub async fn update_backend_handler(
         }
 
         instance.capabilities = capabilities;
-        // Restore supports_audio — the frontend doesn't render an audio toggle
-        // and the request body (deserialized as a whole capabilities struct)
-        // would otherwise leave this at the serde default (false). The
-        // centralized capability detector / runtime refresh loop is the only
-        // path that should re-author this field.
-        //
-        // TODO(audio-override): once a PATCH `/capabilities` audio field is
-        // added (symmetric with `multimodal`), this restore must switch to
-        // the same conditional pattern used for `multimodal_user_override`
-        // above — otherwise the restore would silently drop an audio user
-        // override that the frontend finally learned how to send. Audio has
-        // no override surface today (plumbing-only); see review Minor 1.
-        instance.capabilities.supports_audio = saved_supports_audio;
+    }
+    // Explicit context override (custom backends): the user knows their real
+    // ctx (e.g. RKLLM3 -c 16384); a user-set value wins over name-detection.
+    if let Some(ctx) = req.max_context {
+        instance.capabilities.max_context = ctx;
     }
     instance.updated_at = chrono::Utc::now().timestamp();
 
@@ -586,6 +697,18 @@ pub async fn update_backend_handler(
 /// Delete an LLM backend instance
 ///
 /// DELETE /api/llm-backends/:id
+#[utoipa::path(
+    delete,
+    path = "/api/llm-backends/{id}",
+    tag = "llm-backends",
+    params(
+        ("id" = String, Path, description = "Backend id"),
+    ),
+    responses(
+        (status = 200, description = "Backend deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_backend_handler(
     State(_state): State<ServerState>,
     Path(id): Path<String>,
@@ -606,7 +729,7 @@ pub async fn delete_backend_handler(
 ///
 /// All fields are optional. `multimodal: null` clears the override (returns
 /// to auto-detection); `multimodal: true/false` pins the value.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct UpdateCapabilitiesOverrideRequest {
     /// Override the multimodal/vision capability.
     ///
@@ -626,6 +749,19 @@ pub struct UpdateCapabilitiesOverrideRequest {
 /// Currently only the `multimodal` (vision) capability is overridable — this
 /// is the main source of false positives in auto-detection, and is the field
 /// users most commonly need to correct manually.
+#[utoipa::path(
+    patch,
+    path = "/api/llm-backends/{id}/capabilities",
+    tag = "llm-backends",
+    params(
+        ("id" = String, Path, description = "Backend id"),
+    ),
+    request_body = UpdateCapabilitiesOverrideRequest,
+    responses(
+        (status = 200, description = "Per-backend capability overrides (vision, tools, ...) saved"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_capabilities_override_handler(
     State(_state): State<ServerState>,
     Path(id): Path<String>,
@@ -694,6 +830,18 @@ pub async fn update_capabilities_override_handler(
 /// Set a backend as active
 ///
 /// POST /api/llm-backends/:id/activate
+#[utoipa::path(
+    post,
+    path = "/api/llm-backends/{id}/activate",
+    tag = "llm-backends",
+    params(
+        ("id" = String, Path, description = "Backend id"),
+    ),
+    responses(
+        (status = 200, description = "Backend marked active for the agent runtime"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn activate_backend_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -726,7 +874,7 @@ pub async fn activate_backend_handler(
             multiple_models: false,
             modalities: Vec::new(),
             supports_images: storage_caps.supports_multimodal,
-            supports_audio: storage_caps.supports_audio,
+            reasoning: heramind_core::ReasoningCapabilities::default(),
         }
     }
 
@@ -965,16 +1113,35 @@ pub async fn activate_backend_handler(
 /// Test connection to a backend
 ///
 /// POST /api/llm-backends/:id/test
+#[utoipa::path(
+    post,
+    path = "/api/llm-backends/{id}/test",
+    tag = "llm-backends",
+    params(
+        ("id" = String, Path, description = "Backend id"),
+    ),
+    responses(
+        (status = 200, description = "Round-trip chat completion against the backend"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn test_backend_handler(
     State(_state): State<ServerState>,
     Path(id): Path<String>,
 ) -> HandlerResult<serde_json::Value> {
     let manager = get_manager()?;
 
-    let result = manager
-        .test_connection(&id)
-        .await
-        .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+    let result = manager.test_connection(&id).await.map_err(|e| match &e {
+        // A missing instance surfaces as BackendUnavailable("Backend
+        // instance X") — a 404, not a 500. Other unavailability
+        // (runtime creation failing for an EXISTING backend) stays 500.
+        heramind_core::llm::backend::LlmError::BackendUnavailable(msg)
+            if msg.starts_with("Backend instance") =>
+        {
+            ErrorResponse::not_found(e.to_string())
+        }
+        _ => ErrorResponse::internal(e.to_string()),
+    })?;
 
     ok(json!({
         "backend_id": id,
@@ -985,6 +1152,14 @@ pub async fn test_backend_handler(
 /// Get available backend types
 ///
 /// GET /api/llm-backends/types
+#[utoipa::path(
+    get,
+    path = "/api/llm-backends/types",
+    tag = "llm-backends",
+    responses(
+        (status = 200, description = "Static metadata for every supported backend type"),
+    )
+)]
 pub async fn list_backend_types_handler(
     State(_state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -1007,6 +1182,18 @@ pub async fn list_backend_types_handler(
 /// Get configuration schema for a backend type
 ///
 /// GET /api/llm-backends/types/:type/schema
+#[utoipa::path(
+    get,
+    path = "/api/llm-backends/types/{type}/schema",
+    tag = "llm-backends",
+    params(
+        ("type" = String, Path, description = "Backend type key"),
+    ),
+    responses(
+        (status = 200, description = "JSON-schema of the config object for a backend type"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_backend_schema_handler(
     State(_state): State<ServerState>,
     Path(backend_type): Path<String>,
@@ -1023,6 +1210,14 @@ pub async fn get_backend_schema_handler(
 /// Get backend statistics
 ///
 /// GET /api/llm-backends/stats
+#[utoipa::path(
+    get,
+    path = "/api/llm-backends/stats",
+    tag = "llm-backends",
+    responses(
+        (status = 200, description = "Usage counters per backend"),
+    )
+)]
 pub async fn get_backend_stats_handler(
     State(_state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -1042,6 +1237,17 @@ pub async fn get_backend_stats_handler(
 ///
 /// Uses /api/show endpoint to get accurate capabilities from Ollama's response.
 /// The capabilities field contains "vision" for multimodal models.
+#[utoipa::path(
+    get,
+    path = "/api/llm-backends/ollama/models",
+    tag = "llm-backends",
+    params(
+        ("endpoint" = Option<String>, Query, description = "Ollama base URL (defaults to the active backend)"),
+    ),
+    responses(
+        (status = 200, description = "Models exposed by a live Ollama server"),
+    )
+)]
 pub async fn list_ollama_models_handler(
     Query(params): Query<OllamaModelsQuery>,
 ) -> HandlerResult<serde_json::Value> {
@@ -1096,7 +1302,7 @@ pub async fn list_ollama_models_handler(
         };
 
         models_with_caps.push(OllamaModelWithCapabilities {
-            name: model.name,
+            name: model.name.clone(),
             size: model.size,
             modified_at: model.modified_at,
             digest: model.digest,
@@ -1105,6 +1311,7 @@ pub async fn list_ollama_models_handler(
             supports_thinking: caps.supports_thinking,
             supports_tools: caps.supports_tools,
             max_context: caps.max_context,
+            reasoning: reasoning_for_ollama_model(&model.name, caps.supports_thinking),
         });
     }
 
@@ -1154,13 +1361,9 @@ async fn get_model_capabilities_from_show(
     // Thinking capability is NOT provided by Ollama's API, need to infer from model name
     let supports_thinking = detect_thinking_from_name(model_name);
 
-    // Tools support - most models support tools except very small ones
-    let name_lower = model_name.to_lowercase();
-    let supports_tools = !name_lower.contains("270m")
-        && !name_lower.contains("1b")
-        && !name_lower.contains("tiny")
-        && !name_lower.contains("micro")
-        && !name_lower.contains("nano");
+    // Tool calling — registry (supports_function_calling) with a conservative
+    // name fallback for models absent from the registry.
+    let supports_tools = heramind_core::llm::detect_tools_capability(model_name);
 
     // Detect max context from model info or details
     let max_context = if let Some(model_info) = show_response["model_info"].as_object() {
@@ -1195,40 +1398,24 @@ async fn get_model_capabilities_from_show(
 
 /// Detect thinking capability from model name only
 ///
-/// Ollama's API doesn't provide thinking capability, so we infer it from model naming patterns.
+/// Ollama's API doesn't provide thinking capability, so we infer it from model
+/// naming patterns. Delegates to heramind-core's single `detect_thinking` to
+/// stay consistent with the Ollama/llama.cpp runtimes (historically this
+/// duplicated the rule and disagreed with them — e.g. it excluded `-vl` while
+/// the runtime allowed modern multimodal+thinking models).
 fn detect_thinking_from_name(model_name: &str) -> bool {
-    let name_lower = model_name.to_lowercase();
-
-    // Vision models typically don't support extended thinking
-    if name_lower.contains("-vl") || name_lower.ends_with("vl") {
-        return false;
-    }
-
-    name_lower.starts_with("qwen3")
-        || name_lower.contains("qwen3-")
-        || name_lower.contains("gpt-oss")
-        || name_lower.contains("deepseek-r1")
-        || name_lower.contains("deepseek-r")
-        || name_lower.contains("deepseek v3.1")
-        || name_lower.contains("deepseek-v3.1")
-        || name_lower.contains("thinking")
+    heramind_core::llm::detect_thinking(model_name)
 }
 
 /// Fallback: Detect capabilities from model name when /api/show is not available.
 /// Uses heramind-core's unified detect_vision_capability for consistency.
 fn detect_ollama_model_capabilities_from_name(model_name: &str) -> BackendCapabilities {
-    let name_lower = model_name.to_lowercase();
-
     // Use unified vision detection from heramind-core
     let supports_multimodal = detect_vision_capability(model_name);
 
     let supports_thinking = detect_thinking_from_name(model_name);
 
-    let supports_tools = !name_lower.contains("270m")
-        && !name_lower.contains("1b")
-        && !name_lower.contains("tiny")
-        && !name_lower.contains("micro")
-        && !name_lower.contains("nano");
+    let supports_tools = heramind_core::llm::detect_tools_capability(model_name);
 
     let max_context = detect_ollama_model_context(model_name);
 
@@ -1308,6 +1495,45 @@ struct OllamaModelWithCapabilities {
     supports_thinking: bool,
     supports_tools: bool,
     max_context: usize,
+    /// Declared reasoning control for this model — drives the frontend's
+    /// thinking-effort widget (readonly / boolean / level / effort).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningCapabilitiesDto>,
+}
+
+/// Reasoning capabilities surfaced per-model in the Ollama list (and the
+/// llama.cpp server-info probe). Mirrors the fields the frontend reads.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReasoningCapabilitiesDto {
+    supported_efforts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_effort: Option<String>,
+    mandatory: bool,
+    control: String,
+}
+
+/// Reasoning capabilities for an Ollama model in the list API.
+/// Ollama controls thinking via `think: true/false/low/medium/high`, so a
+/// thinking-capable model gets a Level control with the full effort set.
+fn reasoning_for_ollama_model(
+    model_name: &str,
+    supports_thinking: bool,
+) -> Option<ReasoningCapabilitiesDto> {
+    // Use the unified thinking detector as an additional check — /api/show
+    // reports `supports_thinking` from attention heads, but the name check
+    // covers models the API probe might miss (e.g. qwq-* naming).
+    if !supports_thinking && !heramind_core::llm::detect_thinking(model_name) {
+        return None;
+    }
+    Some(ReasoningCapabilitiesDto {
+        supported_efforts: ["none", "low", "medium", "high"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        default_effort: Some("high".to_string()),
+        mandatory: false,
+        control: "level".to_string(),
+    })
 }
 
 /// Detect maximum context window size for a model (works across all backends)
@@ -1538,18 +1764,15 @@ fn adjust_capabilities_for_model(model_name: &str, capabilities: &mut BackendCap
     // support both vision and thinking. The old "vision blocks thinking" rule
     // was correct for 2024-era llava-class models but is now stale; users can
     // always override via PATCH /capabilities.
-    capabilities.supports_thinking = name_lower.starts_with("qwen3")
-        || name_lower.starts_with("qwen2.5")
-        || name_lower.contains("deepseek-r1")
-        || name_lower.contains("thinking")
-        || name_lower.contains("o1")
-        || name_lower.contains("o3");
+    capabilities.supports_thinking = heramind_core::llm::detect_thinking(&name_lower);
 
     // === Tool support ===
-    // Very small models (< 1B params) typically don't support tool calling
-    if name_lower.contains(":0.5") || name_lower.contains(":0.5b") {
-        capabilities.supports_tools = false;
-    }
+    // registry (supports_function_calling) with name fallback, plus an
+    // explicit guard for sub-1B models whose names don't contain the
+    // fallback's "1b"/"tiny" keywords (e.g. `:0.5`).
+    capabilities.supports_tools = heramind_core::llm::detect_tools_capability(model_name)
+        && !name_lower.contains(":0.5")
+        && !name_lower.contains(":0.5b");
 
     // Detect max context from model name
     capabilities.max_context = detect_model_context(model_name);
@@ -1594,8 +1817,6 @@ struct LlamaCppPropsParams {
 struct LlamaCppModalities {
     #[serde(default)]
     vision: Option<bool>,
-    #[serde(default)]
-    audio: Option<bool>,
 }
 
 impl LlamaCppPropsLight {
@@ -1648,6 +1869,18 @@ struct LlamaCppServerInfoResponse {
 ///
 /// Fetches health check and server properties from a llama.cpp server,
 /// returns combined info with auto-detected capabilities.
+#[utoipa::path(
+    get,
+    path = "/api/llm-backends/llamacpp/server-info",
+    tag = "llm-backends",
+    params(
+        ("endpoint" = Option<String>, Query, description = "llama.cpp server base URL"),
+        ("api_key" = Option<String>, Query, description = "Bearer token for the server"),
+    ),
+    responses(
+        (status = 200, description = "Runtime info from a llama.cpp server (/health + /props)"),
+    )
+)]
 pub async fn list_llamacpp_server_info_handler(
     Query(params): Query<LlamaCppServerInfoQuery>,
 ) -> HandlerResult<serde_json::Value> {
@@ -1798,12 +2031,6 @@ pub async fn list_llamacpp_server_info_handler(
                         // Multimodal from modalities field
                         if let Some(vision) = props.modalities.as_ref().and_then(|m| m.vision) {
                             capabilities.supports_multimodal = vision;
-                        }
-                        // Audio from modalities field (llama.cpp server reports
-                        // `modalities.audio` when the loaded model has an audio
-                        // projector, e.g. Qwen2-Audio / Ultravox).
-                        if let Some(audio) = props.modalities.as_ref().and_then(|m| m.audio) {
-                            capabilities.supports_audio = audio;
                         }
 
                         // Version from build_info

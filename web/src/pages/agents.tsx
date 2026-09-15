@@ -8,9 +8,12 @@
  */
 
 import { useState, useCallback, useEffect, useRef, useMemo } from "react"
+import { useStore } from "@/store"
+import { useDataVersion } from "@/hooks/useDataVersion"
 import { useLocation, useNavigate } from "react-router-dom"
 import { useTranslation } from "react-i18next"
 import { PageLayout } from "@/components/layout/PageLayout"
+import { BuiltinModelWizard } from "@/components/llm/BuiltinModelWizard"
 import { PageTabsBar, PageTabsContent, PageTabsBottomNav, Pagination } from "@/components/shared"
 import { LoadingState } from "@/components/shared/LoadingState"
 import { api } from "@/lib/api"
@@ -20,7 +23,7 @@ import { useEvents } from "@/hooks/useEvents"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
 import { showErrorToast } from "@/lib/error-messages"
 import { useIsMobile } from "@/hooks/useMobile"
-import { Loader2, Bot, Plus, Brain, Cpu, Settings, Zap, BookOpen, Edit, Play, FileText, Wrench, Search } from "lucide-react"
+import { Bot, Plus, Brain, Cpu, Settings, BookOpen, Edit, Play, FileText, Wrench, Search, Download, Server } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import {
@@ -58,6 +61,15 @@ export function AgentsPage() {
   const { handleError } = useErrorHandler()
   const location = useLocation()
   const navigate = useNavigate()
+
+  // LLM backend presence — drives the no-backend setup banner (agents are
+  // inert without a model).
+  const llmBackends = useStore((s) => s.llmBackends)
+  const llmBackendLoading = useStore((s) => s.llmBackendLoading)
+  const loadBackends = useStore((s) => s.loadBackends)
+  const openSettings = useStore((s) => s.openSettings)
+  useEffect(() => { loadBackends() }, [loadBackends])
+  const [agentWizardOpen, setAgentWizardOpen] = useState(false)
 
   // Determine active tab from URL path
   const getTabFromPath = () => {
@@ -203,9 +215,10 @@ export function AgentsPage() {
   }, [editorResourcesLoaded, handleError])
 
   // Load items on mount
+  const dataVersion = useDataVersion('agents', 'skills')
   useEffect(() => {
     loadItems()
-  }, [loadItems])
+  }, [loadItems, dataVersion])
 
   // Listen to WebSocket events for real-time agent status updates
   useEvents({
@@ -537,7 +550,7 @@ export function AgentsPage() {
     : activeTab === 'memory'
     ? [
         { label: tAgent('systemMemory.custom.create', 'Add File'), icon: <FileText className="h-4 w-4" />, onClick: () => memoryPanelRef.current?.openCreateFile() },
-        { label: tAgent('systemMemory.config.title', 'Config'), icon: <Settings className="h-4 w-4" />, onClick: () => memoryPanelRef.current?.openConfig() },
+        { label: tAgent('systemMemory.config.title', 'Config'), icon: <Settings className="h-4 w-4" />, onClick: () => openSettings('preferences') },
       ]
     : activeTab === 'skills'
     ? [
@@ -618,18 +631,48 @@ export function AgentsPage() {
           <LoadingState variant="page" />
         ) : agents.length === 0 ? (
           <div className="flex min-h-[500px] items-center justify-center">
-            <EmptyState
-              icon={<Bot className="h-12 w-12" />}
-              title={tAgent('noAgents')}
-              description={tAgent('noAgentsDesc')}
-              action={{
-                label: tAgent('createAgent'),
-                onClick: handleCreate,
-              }}
-            />
+            {llmBackends.length === 0 && !llmBackendLoading ? (
+              /* No backend — same empty-state visual, but the guidance swaps:
+                 agents are inert without a model, so the CTAs lead with model
+                 setup; creating an agent first stays reachable via text link. */
+              <div className="text-center max-w-md px-6">
+                <div className="mx-auto mb-5 flex size-14 items-center justify-center rounded-xl bg-primary-light text-primary">
+                  <Bot className="size-7" />
+                </div>
+                <h2 className="mb-2 text-lg font-semibold tracking-tight">{tAgent('noAgents')}</h2>
+                <p className="text-sm text-muted-foreground mb-6 leading-relaxed">
+                  {tAgent('noAgentsNoBackendDesc')}
+                </p>
+                <div className="flex items-center justify-center gap-3">
+                  <Button className="h-11 sm:h-10 gap-2" onClick={() => setAgentWizardOpen(true)}>
+                    <Download className="h-4 w-4" />
+                    {tCommon('llmGuide.builtinShort')}
+                  </Button>
+                  <Button variant="secondary" className="h-11 sm:h-10 gap-2" onClick={() => openSettings('llm')}>
+                    <Server className="h-4 w-4" />
+                    {tCommon('llmGuide.ownShort')}
+                  </Button>
+                </div>
+                <BuiltinModelWizard
+                  open={agentWizardOpen}
+                  onOpenChange={setAgentWizardOpen}
+                  onActivated={() => { setAgentWizardOpen(false); loadBackends() }}
+                />
+              </div>
+            ) : (
+              <EmptyState
+                icon={<Bot className="h-12 w-12" />}
+                title={tAgent('noAgents')}
+                description={tAgent('noAgentsDesc')}
+                action={{
+                  label: tAgent('createAgent'),
+                  onClick: handleCreate,
+                }}
+              />
+            )}
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 @md:grid-cols-2 @lg:grid-cols-3 @xl:grid-cols-4 gap-4">
             {paginatedAgents.map((agent, index) => (
               <div
                 key={agent.id}

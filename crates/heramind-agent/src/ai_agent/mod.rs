@@ -133,6 +133,10 @@ impl AiAgentManager {
         // Share backend semaphores between scheduler and executor
         let mut executor_config = config;
         executor_config.backend_semaphores = Some(scheduler.backend_semaphores().clone());
+        // Share the GLOBAL execution semaphore too, so event-triggered
+        // executions (spawned from the executor, not the scheduler) are
+        // accounted against the same global concurrency bound.
+        executor_config.execution_semaphore = Some(scheduler.execution_semaphore().clone());
 
         let executor = Arc::new(AgentExecutor::new(executor_config).await?);
 
@@ -274,7 +278,14 @@ impl AiAgentManager {
 
         // Update agent status based on result
         let new_status = if result.is_ok() {
-            AgentStatus::Active
+            // A manual task idles as Completed (not Active): it has no
+            // standing duty and the scheduler must not pick it up. Manual
+            // invoke always works — Completed is a ready-state, not terminal.
+            if agent.schedule.schedule_type == ScheduleType::Manual {
+                AgentStatus::Completed
+            } else {
+                AgentStatus::Active
+            }
         } else {
             AgentStatus::Error
         };

@@ -59,6 +59,13 @@ pub enum AgentEvent {
         /// Prompt tokens used in this request (from LLM backend)
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt_tokens: Option<u32>,
+        /// System-prompt portion of the prompt (estimated) — context-usage
+        /// breakdown for the UI.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system_prompt_tokens: Option<u32>,
+        /// Tool-definition portion of the prompt (estimated)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_tokens: Option<u32>,
     },
     /// Intermediate end (for multi-round tool calling)
     /// Indicates the current round is complete but more processing is coming
@@ -181,13 +188,22 @@ impl AgentEvent {
     pub fn end() -> Self {
         Self::End {
             prompt_tokens: None,
+            system_prompt_tokens: None,
+            tool_tokens: None,
         }
     }
 
-    /// Create an end event with token usage data.
-    pub fn end_with_tokens(prompt_tokens: u32) -> Self {
+    /// Create an end event with token usage data plus the prompt breakdown
+    /// (system prompt / tool definitions) for context-usage display.
+    pub fn end_with_usage(
+        prompt_tokens: u32,
+        system_prompt_tokens: usize,
+        tool_tokens: usize,
+    ) -> Self {
         Self::End {
             prompt_tokens: Some(prompt_tokens),
+            system_prompt_tokens: Some(system_prompt_tokens as u32),
+            tool_tokens: Some(tool_tokens as u32),
         }
     }
 
@@ -247,12 +263,17 @@ impl AgentEvent {
 }
 
 /// Agent configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// Agent name
     pub name: String,
     /// System prompt
     pub system_prompt: String,
+    /// Session-scoped suffix appended to the STREAMING chat system prompt
+    /// (page-scoped focus). Kept separate from `system_prompt` so the
+    /// streaming builder can inject it without dragging in the legacy full
+    /// prompt that `system_prompt` carries for the non-streaming paths.
+    pub system_prompt_suffix: Option<String>,
     /// Maximum tokens in context
     pub max_context_tokens: usize,
     /// Temperature for LLM
@@ -273,6 +294,12 @@ pub struct AgentConfig {
     /// Number of recent tool results to keep intact (default: 2)
     #[serde(default = "default_keep_tool_results")]
     pub keep_recent_tool_results: usize,
+    /// Per-session tool allowlist (empty = all available tools). Applied to
+    /// both the function-calling schema and the text quick-reference prompt.
+    /// The user-interaction tools (ask_user / confirm_action / clarify_intent)
+    /// are always kept — they are UX, not domain capability.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
 }
 
 /// Default value for max tool calls per request.
@@ -299,6 +326,7 @@ impl Default for AgentConfig {
         Self {
             name: "HeraMind Agent".to_string(),
             system_prompt: default_system_prompt(),
+            system_prompt_suffix: None,
             // Load from environment variables with fallback to defaults
             max_context_tokens: agent_env_vars::max_context_tokens(),
             temperature: agent_env_vars::temperature(),
@@ -312,6 +340,7 @@ impl Default for AgentConfig {
             api_key: std::env::var("OPENAI_API_KEY").ok(),
             max_tool_calls: default_max_tool_calls(),
             keep_recent_tool_results: default_keep_tool_results(),
+            allowed_tools: Vec::new(),
         }
     }
 }
@@ -924,6 +953,72 @@ impl LargeDataCache {
             }
         }
         best.map(|(key, entry)| (Self::extract_image_data(&entry.data, data_dir), key.clone()))
+    }
+
+    /// Seed the cache with the agent's bound device image so the existing
+    /// `$cached:` reference resolution + auto-inject machinery
+    /// (`resolve_cached_arguments`) can hand the FULL image to image-aware
+    /// tool calls — including extension tools (e.g. YOLO / grounding) whose
+    /// `image`/`image_base64` arg the LLM cannot fill with real bytes.
+    ///
+    /// Why this exists: scheduled/event agents inject their bound image
+    /// directly into the multimodal user message (`build_tool_messages`)
+    /// rather than via `store()`. Without seeding, `get_latest_image()`
+    /// returns `None`, the auto-inject never fires, and tools receive the
+    /// LLM's truncated base64 fragment (a recognizable JPEG header + junk
+    /// body) → the extension decodes garbage and returns `null`.
+    ///
+    /// `data_url` must be a `data:image/<mime>;base64,<...>` string. Unlike
+    /// `store()`, this bypasses the 32KB size threshold — even a small bound
+    /// image must be injectable. Keyed as `agent_image` so it is distinct from
+    /// chat's `user_image` and surfaced by `get_latest_image()`'s image scan.
+    pub fn seed_bound_image(&mut self, data_url: &str) {
+        if !data_url.starts_with("data:image/") {
+            tracing::warn!(
+                len = data_url.len(),
+                "seed_bound_image: ignoring non-image data URL"
+            );
+            return;
+        }
+        let cached = CachedLargeResult {
+            content_type: Self::detect_content_type(data_url),
+            data: data_url.to_string(),
+            size_bytes: data_url.len(),
+            cached_at: chrono::Utc::now().timestamp(),
+        };
+        self.entries.insert("agent_image".to_string(), cached);
+        self.evict_if_needed();
+    }
+
+    /// Store a user-uploaded chat image UNCONDITIONALLY — no size threshold.
+    ///
+    /// `store()` passes anything under `CACHE_THRESHOLD_BYTES` (32KB) through
+    /// without caching, so a compressed user image (frontend uploads are
+    /// routinely ≤24KB binary ≈ 32KB base64) never entered the cache:
+    /// `$cached:user_image` then failed to resolve AND `get_latest_image()`
+    /// returned None, so image-shaped tool args received the LLM's literal
+    /// placeholder string and the tool errored ("Invalid base64 data").
+    /// Found via 2026-08-18 vision-pipeline debugging: the model SAW the
+    /// image in the prompt, but every image tool call failed — mirroring the
+    /// agent-path lesson already encoded in `seed_bound_image` ("must work
+    /// even for a small bound image").
+    pub fn store_user_image(&mut self, key: &str, data_url: &str) {
+        if !data_url.starts_with("data:image/") {
+            tracing::warn!(
+                len = data_url.len(),
+                key = %key,
+                "store_user_image: ignoring non-image data URL"
+            );
+            return;
+        }
+        let cached = CachedLargeResult {
+            content_type: Self::detect_content_type(data_url),
+            data: data_url.to_string(),
+            size_bytes: data_url.len(),
+            cached_at: chrono::Utc::now().timestamp(),
+        };
+        self.entries.insert(key.to_string(), cached);
+        self.evict_if_needed();
     }
 
     /// Detect content type from content heuristics.
@@ -1774,6 +1869,30 @@ mod tests {
 
     /// Single image value gets replaced with a one-line summary that
     /// mentions kind, mime, size, $cached ref, and the vision tool.
+    #[test]
+    fn test_store_user_image_bypasses_threshold() {
+        // Regression (2026-08-18): a compressed user image below the 32KB
+        // CACHE_THRESHOLD used to be silently dropped by store(), leaving
+        // $cached:user_image unresolvable and image tool calls failing with
+        // "Invalid base64 data" while the model HAD seen the image.
+        let small_png = concat!(
+            "data:image/png;base64,",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ",
+            "AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        );
+        let mut cache = LargeDataCache::new();
+        cache.store_user_image("user_image", small_png);
+        // Resolvable as a $cached: reference (what the LLM emits)…
+        let resolved = cache
+            .resolve_reference("$cached:user_image")
+            .expect("small user image must resolve");
+        assert!(resolved.starts_with("data:image/png;base64,"));
+        // …and surfaced to the auto-inject path.
+        let (latest, source) = cache.get_latest_image().expect("latest image must exist");
+        assert_eq!(source, "user_image");
+        assert_eq!(latest, resolved);
+    }
+
     #[test]
     fn test_slim_single_image_value_replaced() {
         let mut cache = LargeDataCache::new();

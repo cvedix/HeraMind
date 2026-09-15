@@ -10,60 +10,19 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { PasswordInput } from '@/components/ui/password-input'
 import { Label } from '@/components/ui/label'
-import { Checkbox } from '@/components/ui/checkbox'
 import { SetupBackground } from './SetupBackground'
 import { SetupHeader } from './SetupHeader'
 import { getBrowserTimezone, COMMON_TIMEZONE_IDS } from '@/lib/time/format'
 
-// Mailchimp subscription function
-function mcSubscribe(email: string, username?: string): Promise<{ result: string; msg: string }> {
-  const base = "https://camthink.us2.list-manage.com/subscribe/post-json"
-  const cb = "mc_cb_" + Date.now() + "_" + Math.random().toString(16).slice(2)
-
-  const params = new URLSearchParams({
-    u: "4ecc400d85930178fb49aa9de",
-    id: "466fcc3b55",
-    f_id: "00e60ae1f0",
-    EMAIL: email,
-    b_4ecc400d85930178fb49aa9de_466fcc3b55: "",
-    c: cb,
-    _: Date.now().toString(),
-  })
-
-  if (username) params.append("FNAME", username)
-
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      cleanup()
-      reject(new Error("Mailchimp JSONP timeout"))
-    }, 8000)
-
-    function cleanup() {
-      clearTimeout(timeout)
-      try { delete (window as any)[cb] } catch (_) { /* ignore */ }
-      if (script && script.parentNode) script.parentNode.removeChild(script)
-    }
-
-    ;(window as any)[cb] = function (data: { result: string; msg: string }) {
-      cleanup()
-      resolve(data)
-    }
-
-    const script = document.createElement("script")
-    script.src = base + "?" + params.toString()
-    script.onerror = () => { cleanup(); reject(new Error("Mailchimp JSONP network error")) }
-    document.head.appendChild(script)
-  })
-}
-
-// Error translation helper
+// Error translation helper. setup.* keys need the explicit `setup:` prefix —
+// defaultNS is `common`, so bare keys render as raw error codes.
 function translateError(error: string, t: (key: string, params?: Record<string, unknown>) => string): string {
   const lowerError = error.toLowerCase()
   if (lowerError.includes("password must be at least")) return t('minPasswordLength', { ns: 'validation' })
   if (lowerError.includes("username must be at least")) return t('minUsernameLength', { ns: 'validation' })
-  if (lowerError.includes("password must contain")) return t('passwordComplexity')
-  if (lowerError.includes("setup already completed")) return t('setupAlreadyCompleted')
-  return error || t("setupFailed")
+  if (lowerError.includes("password must contain")) return t('setup:passwordComplexity')
+  if (lowerError.includes("setup already completed")) return t('setup:setupAlreadyCompleted')
+  return error || t("setup:setupFailed")
 }
 
 interface AccountStepProps {
@@ -82,12 +41,11 @@ export function AccountStep({ getApiUrl, onAccountCreated }: AccountStepProps) {
   const [password, setPassword] = useState("")
   const [confirmPassword, setConfirmPassword] = useState("")
   const [email, setEmail] = useState("")
-  const [subscribeToNewsletter, setSubscribeToNewsletter] = useState(false)
 
   // Timezone (auto-detected from browser, saved silently on submit; the user
   // can adjust it on the next step — no need to clutter the registration form.)
   const browserTz = getBrowserTimezone()
-  const selectedTimezone = COMMON_TIMEZONE_IDS.includes(browserTz as any) ? browserTz : "Asia/Shanghai"
+  const selectedTimezone = COMMON_TIMEZONE_IDS.includes(browserTz as any) ? browserTz : "Asia/Ho_Chi_Minh"
 
   // Password validation
   const getPasswordErrors = (pwd: string): string[] => {
@@ -142,11 +100,6 @@ export function AccountStep({ getApiUrl, onAccountCreated }: AccountStepProps) {
         })
       } catch (tzError) {
         console.warn('Failed to save timezone, continuing:', tzError)
-      }
-
-      // Newsletter subscription (non-blocking)
-      if (subscribeToNewsletter && email?.trim()) {
-        mcSubscribe(email, username).catch(() => {})
       }
 
       onAccountCreated(username, password, data.token, selectedTimezone)
@@ -216,18 +169,6 @@ export function AccountStep({ getApiUrl, onAccountCreated }: AccountStepProps) {
                     autoComplete="email"
                     className="h-10 bg-bg-70 border-border mt-1.5 scroll-mb-32"
                   />
-                  {email?.trim() && (
-                    <div className="flex items-center gap-2 mt-2">
-                      <Checkbox
-                        id="subscribe"
-                        checked={subscribeToNewsletter}
-                        onCheckedChange={(checked) => setSubscribeToNewsletter(!!checked)}
-                      />
-                      <label htmlFor="subscribe" className="text-xs text-muted-foreground cursor-pointer leading-tight">
-                        {t('setup:subscribeNewsletter')}
-                      </label>
-                    </div>
-                  )}
                 </div>
 
                 {/* Password */}
@@ -263,6 +204,10 @@ export function AccountStep({ getApiUrl, onAccountCreated }: AccountStepProps) {
                       className="pl-9 h-10 bg-bg-70 border-border scroll-mb-32"
                     />
                   </div>
+                  {/* Immediate mismatch feedback — don't wait for submit */}
+                  {confirmPassword.length > 0 && password !== confirmPassword && (
+                    <p className="text-xs text-error mt-1.5">{t('passwordsDoNotMatch', { ns: 'validation' })}</p>
+                  )}
                 </div>
 
                 {/* Password Strength */}
@@ -309,7 +254,7 @@ export function AccountStep({ getApiUrl, onAccountCreated }: AccountStepProps) {
                 {/* Submit — 44px touch target on mobile, 40px on desktop */}
                 <Button
                   type="submit"
-                  disabled={isLoading || !username || !password || !confirmPassword || passwordErrors.length > 0}
+                  disabled={isLoading || !username || !password || !confirmPassword || passwordErrors.length > 0 || (confirmPassword.length > 0 && password !== confirmPassword)}
                   className="h-11 sm:h-10 w-full mt-1"
                   size="default"
                 >

@@ -251,7 +251,7 @@ export function ComponentConfigDialog({
     return createPortal(
       <>
         {open && (
-          <div className="fixed inset-0 z-50 bg-background animate-in fade-in duration-200">
+          <div className="fixed inset-0 z-[100] bg-background animate-in fade-in duration-normal">
             <div className="flex h-full w-full flex-col">
               {/* Header */}
               <div
@@ -281,7 +281,7 @@ export function ComponentConfigDialog({
                     isExpanded={expandedSections.has('preview')}
                     onToggle={() => toggleSection('preview')}
                   >
-                    <div className="rounded-lg border bg-muted-20 p-4">
+                    <div className="rounded-lg border p-4">
                       <ComponentPreview
                         key={previewKey}
                         componentType={componentType}
@@ -306,7 +306,7 @@ export function ComponentConfigDialog({
                         shouldShowDataTransform ? (
                           <div className="space-y-3">
                             {/* Inner tabs */}
-                            <div className="flex gap-2 p-1 bg-muted-50 rounded-lg">
+                            <div className="flex gap-2 p-1 bg-muted rounded-lg">
                               <button
                                 onClick={() => setMobileDataSourceTab('datasource')}
                                 className={`flex-1 py-2 px-3 text-sm font-medium rounded-lg transition-all ${
@@ -452,7 +452,7 @@ export function ComponentConfigDialog({
       {/* Header */}
       <FullScreenDialogHeader
         icon={<Settings className="h-5 w-5" />}
-        iconBg="bg-muted dark:bg-muted"
+        iconBg="bg-muted"
         iconColor="text-primary"
         title={t('componentConfig.editComponent')}
         subtitle={componentType.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}
@@ -463,7 +463,7 @@ export function ComponentConfigDialog({
       <FullScreenDialogContent className="!p-0">
         <div className="h-full w-full flex">
           {/* Left: Preview */}
-          <div className="flex-1 flex flex-col bg-muted-20 overflow-hidden border-r min-w-0">
+          <div className="flex-1 flex flex-col overflow-hidden min-w-0 border-r border-border">
             <div className="flex-1 flex items-center justify-center p-4 min-h-0">
               <div
                 className="rounded-lg overflow-hidden border bg-background shadow-sm max-w-lg max-h-full"
@@ -478,32 +478,32 @@ export function ComponentConfigDialog({
           </div>
 
           {/* Right: Config tabs */}
-          <div className="flex-1 flex flex-col overflow-hidden bg-background min-w-0">
+          <div className="flex-1 flex flex-col overflow-hidden min-w-0">
             {(hasStyleConfig || hasDisplayConfig || hasDataSource) ? (
               <Tabs value={configTabValue} onValueChange={(v) => setConfigTabValue(v as typeof configTabValue)} className="flex-1 flex flex-col min-h-0">
-                <TabsList className="w-full justify-start bg-muted-50 px-4 h-12 shrink-0 border-b rounded-none">
+                <TabsList className="w-full justify-start px-4 h-12 shrink-0 border-b rounded-none bg-transparent">
                   {hasStyleConfig && (
-                    <TabsTrigger value="style" className="data-[state=active]:bg-background data-[state=active]:shadow-sm rounded-lg">
+                    <TabsTrigger value="style" className="data-[state=active]:bg-card data-[state=active]:shadow-sm rounded-lg">
                       {t('componentConfig.style')}
                     </TabsTrigger>
                   )}
                   {hasDisplayConfig && (
-                    <TabsTrigger value="display" className="data-[state=active]:bg-background data-[state=active]:shadow-sm rounded-lg">
+                    <TabsTrigger value="display" className="data-[state=active]:bg-card data-[state=active]:shadow-sm rounded-lg">
                       {t('componentConfig.display')}
                     </TabsTrigger>
                   )}
                   {hasDataSource && (
-                    <TabsTrigger value="datasource" className="data-[state=active]:bg-background data-[state=active]:shadow-sm rounded-lg">
+                    <TabsTrigger value="datasource" className="data-[state=active]:bg-card data-[state=active]:shadow-sm rounded-lg">
                       {t('componentConfig.dataSource')}
                     </TabsTrigger>
                   )}
                   {hasAdvancedConfig && (
-                    <TabsTrigger value="advanced" className="data-[state=active]:bg-background data-[state=active]:shadow-sm rounded-lg">
+                    <TabsTrigger value="advanced" className="data-[state=active]:bg-card data-[state=active]:shadow-sm rounded-lg">
                       {t('componentConfig.advanced', 'Advanced')}
                     </TabsTrigger>
                   )}
                   {shouldShowDataTransform && (
-                    <TabsTrigger value="transform" className="data-[state=active]:bg-background data-[state=active]:shadow-sm rounded-lg">
+                    <TabsTrigger value="transform" className="data-[state=active]:bg-card data-[state=active]:shadow-sm rounded-lg">
                       {t('componentConfig.transform')}
                     </TabsTrigger>
                   )}
@@ -637,7 +637,7 @@ function MobileConfigCard({
         </div>
       </button>
       {isExpanded && (
-        <div className="p-4 bg-background animate-in slide-in-from-top-2 duration-200 border-t border-border">
+        <div className="p-4 bg-background animate-in slide-in-from-top-2 duration-normal border-t border-border">
           {children}
         </div>
       )}

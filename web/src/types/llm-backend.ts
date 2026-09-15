@@ -12,6 +12,19 @@ export interface BackendCapabilities {
   supports_thinking: boolean
   supports_tools: boolean
   max_context: number
+  /** Declared reasoning/thinking capabilities (drives the effort UI). */
+  reasoning?: ReasoningCapabilities
+}
+
+export interface ReasoningCapabilities {
+  /** Effort levels this backend can honor. Empty = unknown. */
+  supported_efforts?: ThinkingEffort[]
+  /** The model's default effort when nothing is set. */
+  default_effort?: ThinkingEffort
+  /** Whether thinking is mandatory (cannot be turned off). */
+  mandatory?: boolean
+  /** How the backend controls thinking. */
+  control?: 'readonly' | 'boolean' | 'level' | 'effort'
 }
 
 export interface LlmBackendInstance {
@@ -22,15 +35,28 @@ export interface LlmBackendInstance {
   model: string
   api_key_configured: boolean
   is_active: boolean
+  /** Whether this instance is a built-in (bundled llama-server) — not user-configured. */
+  is_builtin?: boolean
+  /** Whether the model's thinking cannot be turned off (e.g. LFM2.5); non-chat calls don't force thinking_enabled=false. */
+  thinking_is_integral?: boolean
   temperature: number
   top_p: number
   top_k: number
   max_tokens: number
   thinking_enabled: boolean  // Enable thinking/reasoning mode for models that support it
+  thinking_effort?: ThinkingEffort  // Unified reasoning effort (preferred over thinking_enabled)
   capabilities: BackendCapabilities
   updated_at: number
   healthy?: boolean  // Health check result (from API)
 }
+
+export type ThinkingEffort =
+  | 'none'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
 
 export interface CreateLlmBackendRequest {
   name: string
@@ -42,7 +68,9 @@ export interface CreateLlmBackendRequest {
   top_p?: number
   top_k?: number
   thinking_enabled?: boolean  // Enable thinking/reasoning mode for models that support it
+  thinking_effort?: ThinkingEffort  // Unified reasoning effort (preferred over thinking_enabled)
   capabilities?: BackendCapabilities  // Model capabilities (from Ollama model detection)
+  max_context?: number  // Explicit context window for custom backends (e.g. RKLLM3 -c 16384)
 }
 
 export interface UpdateLlmBackendRequest {
@@ -50,10 +78,14 @@ export interface UpdateLlmBackendRequest {
   endpoint?: string
   model?: string
   api_key?: string
+  /** Protocol switch (openai ↔ anthropic ↔ vendor types). Server re-bases
+   *  capabilities on the new type's defaults; same value = no-op. */
+  backend_type?: LlmBackendType
   temperature?: number
   top_p?: number
   top_k?: number
   thinking_enabled?: boolean  // Enable thinking/reasoning mode for models that support it
+  thinking_effort?: ThinkingEffort  // Unified reasoning effort (preferred over thinking_enabled)
   capabilities?: BackendCapabilities  // Model capabilities (from Ollama model detection)
 }
 
@@ -61,6 +93,60 @@ export interface LlmBackendListResponse {
   backends: LlmBackendInstance[]
   count: number
   active_id: string | null
+}
+
+/**
+ * Status of the built-in bundled LLM (LFM2.5-2.6B).
+ * GET /api/builtin-llm/status
+ */
+/** One installable builtin model (from GET /api/builtin-llm/models). */
+export interface BuiltinModelDef {
+  id: string
+  name: string
+  file_name: string
+  quant: string
+  size_bytes: number
+  default_ctx: number
+  /** Native context ceiling — what the UI shows ("supports up to").
+   * Absent (older catalogs) → fall back to default_ctx. */
+  max_ctx?: number
+  /** Recommended minimum AVAILABLE RAM (MB) — install discouraged below. */
+  min_ram_mb: number
+  /** Whether the host currently has enough available RAM. */
+  memory_ok: boolean
+  notes: string
+  recommended: boolean
+  installed: boolean
+  /** Locally imported GGUF (open catalog local channel). */
+  custom?: boolean
+}
+
+export interface BuiltinLlmStatus {
+  /** Whether the model GGUF is present on disk. */
+  installed: boolean
+  model_id: string | null
+  /**
+   * Derived server state:
+   * - `not_configured` — model not downloaded
+   * - `downloading`    — background download in progress
+   * - `running`        — bundled llama-server healthy on its port
+   * - `stopped`        — model present but server not running
+   * - `error`          — manifest unreadable
+   */
+  server_state: 'not_configured' | 'downloading' | 'running' | 'stopped' | 'error'
+  /** Effective context size (override if set, else per-model default). */
+  ctx?: number
+  /** Explicit override from env / restart API (null = per-model default). */
+  ctx_override?: number | null
+  /** The installed model's own default context. */
+  default_ctx?: number
+  /** Feasibility: available RAM ≥ the installed model's minimum. */
+  memory_ok?: boolean
+  min_ram_mb?: number
+  available_ram_mb?: number
+  total_ram_mb?: number
+  downloaded_bytes: number | null
+  total_bytes: number | null
 }
 
 export interface BackendTypeDefinition {

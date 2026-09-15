@@ -6,15 +6,235 @@
 //!   3. Context System — conversation continuity, long-context handling
 //!   4. Task Completion — single-turn / multi-turn / complex resource creation
 //!
-//! Run:
+//! The test self-hosts a sandbox HeraMind API server (fresh data dir, private
+//! port, seeded devices) so the model operates against a REAL platform —
+//! every `heramind` CLI call (in-process dispatch AND subprocess) targets it
+//! via HERAMIND_API_BASE/HERAMIND_API_KEY. Without this, commands hit whatever
+//! server happens to run on :9375 (or nothing) and the model's entire world
+//! is error messages.
+//!
+//! Run (self-contained — no external env needed beyond the LLM backend):
 //!   cargo test -p heramind-agent --test comprehensive_agent_eval -- --ignored --nocapture
+//! Requires target/release/heramind (cargo build -p heramind-cli --release).
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use heramind_agent::llm_backends::{CloudConfig, CloudRuntime, OllamaConfig, OllamaRuntime};
 use heramind_agent::session::SessionManager;
+use heramind_agent::toolkit::{
+    FileEditTool, FileWriteTool, ImageEditTool, MemoryTool, ShellConfig, ToolRegistryBuilder,
+    WebFetchTool,
+};
 use heramind_core::llm::backend::LlmRuntime;
+
+#[cfg(feature = "llamacpp")]
+use heramind_agent::llm_backends::backends::llamacpp::{LlamaCppConfig, LlamaCppRuntime};
+
+// ── sandbox platform ─────────────────────────────────────────────────
+
+/// Self-hosted sandbox: `heramind serve` subprocess on a private port with a
+/// fresh data dir, plus seeded devices so read turns have a real world.
+mod sandbox {
+    use std::io::Read;
+    use std::sync::Mutex;
+
+    static SERVER: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+    fn serve_binary() -> std::path::PathBuf {
+        let bin =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/heramind");
+        if !bin.exists() {
+            panic!(
+                "sandbox needs {}; build it with: cargo build -p heramind-cli --release",
+                bin.display()
+            );
+        }
+        bin
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind :0 for a free port")
+            .local_addr()
+            .expect("local addr")
+            .port()
+    }
+
+    /// Start the sandbox server, point the whole test process at it, and
+    /// seed the platform. Idempotent — the second call is a no-op.
+    pub async fn start() {
+        {
+            let guard = SERVER.lock().unwrap();
+            if guard.is_some() {
+                return;
+            }
+        }
+
+        let port = free_port();
+        let data_dir =
+            std::env::temp_dir().join(format!("heramind-eval-sbx-{}", std::process::id()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let log_path = data_dir.join("serve.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        // The default-API-key banner is written on stderr — route it into
+        // the same log or the key can never be harvested.
+        let log_err = log.try_clone().unwrap();
+
+        let mut child = std::process::Command::new(serve_binary())
+            .arg("serve")
+            .arg("--port")
+            .arg(port.to_string())
+            // Run from the sandbox dir: the storage layer falls back to a
+            // CWD-relative legacy `data/` store when it finds one, which
+            // would silently bind the sandbox to the repo's dev data.
+            .current_dir(&data_dir)
+            .env("HERAMIND_DATA_DIR", &data_dir)
+            .stdout(log)
+            .stderr(log_err)
+            .spawn()
+            .expect("spawn sandbox heramind serve");
+
+        // Wait for HTTP readiness, then harvest the auto-generated default
+        // API key from the first-boot banner in the log.
+        let base = format!("http://127.0.0.1:{port}/api");
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..60 {
+            if client
+                .get(format!("{base}/docs"))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().as_u16() == 200)
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        if !ready {
+            let _ = child.kill();
+            panic!("sandbox server failed to become ready; log: {log_path:?}");
+        }
+
+        let mut log_text = String::new();
+        if let Ok(mut f) = std::fs::File::open(&log_path) {
+            let _ = f.read_to_string(&mut log_text);
+        }
+        let api_key = log_text
+            .lines()
+            .find_map(|l| {
+                let idx = l.find("Key:")?;
+                l[idx + 4..]
+                    .split_whitespace()
+                    .next()
+                    .filter(|k| k.starts_with("nmk_"))
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| {
+                let _ = child.kill();
+                panic!("no default API key in sandbox log: {log_path:?}")
+            });
+
+        // Route EVERYTHING (in-process CLI dispatch + subprocess commands)
+        // at the sandbox, and isolate all storage under its data dir.
+        std::env::set_var("HERAMIND_DATA_DIR", &data_dir);
+        std::env::set_var("HERAMIND_API_BASE", &base);
+        std::env::set_var("HERAMIND_API_KEY", &api_key);
+        // Scenarios use this to point web_fetch probes at a live local target.
+        std::env::set_var("HERAMIND_EVAL_SANDBOX_PORT", port.to_string());
+
+        *SERVER.lock().unwrap() = Some(child);
+        eprintln!("sandbox platform ready on :{port} (data: {data_dir:?})");
+
+        seed(&client, &base, &api_key).await;
+    }
+
+    /// Seed the world the eval's read turns assume: sensor_01 / sensor_02 /
+    /// an office sensor, plus one threshold rule. All best-effort — a seed
+    /// failure degrades realism, it must not kill the run.
+    async fn seed(client: &reqwest::Client, base: &str, key: &str) {
+        let auth = |r: reqwest::RequestBuilder| r.bearer_auth(key);
+        let json_post = |url: String, body: serde_json::Value| auth(client.post(url).json(&body));
+
+        // Register a generic sensor type (fresh data dirs ship only cameras).
+        let _ = json_post(
+            format!("{base}/device-types"),
+            serde_json::json!({
+                "device_type": "generic_sensor",
+                "name": "Generic Sensor",
+                "categories": ["sensor"],
+            }),
+        )
+        .send()
+        .await;
+
+        // NOTE: telemetry seeding was attempted via webhook ingest but the
+        // metrics land in the auto-onboard draft pipeline, not the
+        // time-series store (verified 2026-09-09) — trend/history turns are
+        // scored on command emission only. Known boundary.
+        for (id, name) in [
+            ("sensor_01", "办公室温湿度传感器"),
+            ("sensor_02", "仓库温湿度传感器"),
+            ("light_living", "客厅智能灯"),
+        ] {
+            let resp = json_post(
+                format!("{base}/devices"),
+                serde_json::json!({
+                    "device_type": "generic_sensor",
+                    "device_id": id,
+                    "name": name,
+                    "adapter_type": "mqtt",
+                    "connection_config": {"topic": format!("heramind/devices/{id}")},
+                }),
+            )
+            .send()
+            .await;
+            if !resp.as_ref().is_ok_and(|r| r.status().is_success()) {
+                eprintln!("sandbox seed: device {id} failed: {resp:?}");
+            }
+        }
+
+        let _ = json_post(
+            format!("{base}/rules"),
+            serde_json::json!({
+                "name": "温度告警规则",
+                "condition": {
+                    "condition_type": "comparison",
+                    "source": "device:sensor_01:temperature",
+                    "operator": "greater_than",
+                    "threshold": 35,
+                },
+                "actions": [{"type": "notify", "message": "温度超过35度"}],
+            }),
+        )
+        .send()
+        .await;
+
+        // A tiny valid PNG for image_edit probes in the tools-breadth round.
+        // 1x1 red pixel — enough for the tool's format sniffing.
+        let png: [u8; 69] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 0x90, 0x77, 0x53, 0xDE, 0, 0, 0, 0x0C, 0x49,
+            0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01,
+            0x00, 0x18, 0xDD, 0x8D, 0xB0, 0, 0, 0, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60,
+            0x82,
+        ];
+        let img_dir =
+            std::env::temp_dir().join(format!("heramind-eval-sbx-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&img_dir);
+        let _ = std::fs::write(img_dir.join("probe.png"), png);
+    }
+
+    /// Kill the sandbox server (call at test end; best-effort).
+    pub fn stop() {
+        if let Some(mut child) = SERVER.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 // ── helpers ───────────────────────────────────────────────────────────
 
@@ -23,23 +243,130 @@ fn ollama_up() -> bool {
     std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok()
 }
 
+/// llama.cpp standalone server (llama-server) mode, selected by setting
+/// LLAMACPP_ENDPOINT (e.g. http://127.0.0.1:8080). The server has the model
+/// loaded at startup; MODEL is forwarded in the request body, so give
+/// llama-server a matching `--alias`.
+///
+/// Probes /props for the real context window and applies it as the
+/// capabilities override — without it `max_context_length()` hardcodes 4096
+/// and the session truncates history against a phantom budget, starving
+/// cross-turn context and memory recall.
+#[cfg(feature = "llamacpp")]
+async fn llamacpp_llm() -> Arc<dyn LlmRuntime> {
+    let endpoint = std::env::var("LLAMACPP_ENDPOINT").unwrap();
+    let model = std::env::var("MODEL").unwrap_or_default();
+    let runtime = LlamaCppRuntime::new(LlamaCppConfig {
+        endpoint,
+        model,
+        timeout_secs: 240,
+        api_key: None,
+        cache_prompt: true,
+    })
+    .unwrap();
+    let runtime = match runtime.detect_capabilities().await {
+        Some(caps) => {
+            eprintln!(
+                "llama.cpp capabilities: n_ctx={}, tools={}, thinking={}, multimodal={}",
+                caps.max_context,
+                caps.supports_tools,
+                caps.supports_thinking,
+                caps.supports_multimodal
+            );
+            runtime.with_capabilities_override(
+                caps.supports_multimodal,
+                caps.supports_thinking,
+                caps.supports_tools,
+                caps.max_context,
+            )
+        }
+        None => {
+            eprintln!("warning: /props probe failed — assuming 4096 context");
+            runtime
+        }
+    };
+    Arc::new(runtime)
+}
+
+#[cfg(not(feature = "llamacpp"))]
+async fn llamacpp_llm() -> Arc<dyn LlmRuntime> {
+    panic!("LLAMACPP_ENDPOINT is set but the llamacpp feature is off — rebuild with --features llamacpp");
+}
+
 async fn new_session() -> (SessionManager, String) {
     let sm = SessionManager::memory();
+
+    // Production-parity tool set. The real server's chat path registers the
+    // full toolkit (shell first-class + standalone tools); without this the
+    // session only carries the interaction tools from `Agent::new`
+    // (ask_user / confirm_action / clarify_intent). A native-tools model
+    // then can only ever ask questions — earlier scores came from models
+    // emitting out-of-schema `shell` calls through the TEXT protocol, which
+    // `parse_tool_calls` accepts but native OpenAI-tools backends never
+    // produce. VisionTool is VLM-gated and extensions need installed
+    // packages, so both stay out (matches a text-only production backend).
+    let data_dir =
+        std::path::PathBuf::from(std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| {
+            std::env::temp_dir()
+                .join("heramind-eval-data")
+                .display()
+                .to_string()
+        }));
+    let mut registry = ToolRegistryBuilder::new()
+        .with_shell_tool(Some(ShellConfig {
+            enabled: true,
+            timeout_secs: 30,
+            max_output_chars: 10_000,
+        }))
+        .build();
+    registry.register(Arc::new(
+        heramind_agent::toolkit::skill_tool::SkillTool::with_data_dir(
+            sm.skill_registry(),
+            data_dir.clone(),
+        ),
+    ));
+    registry.register(Arc::new(WebFetchTool::new()));
+    registry.register(Arc::new(FileWriteTool::new(data_dir.clone())));
+    registry.register(Arc::new(FileEditTool::new(data_dir.clone())));
+    registry.register(Arc::new(ImageEditTool::new(data_dir.clone())));
+    let memory_store = heramind_storage::MarkdownMemoryStore::new(
+        &heramind_storage::MemoryConfig::load().storage_path,
+    );
+    registry.register(Arc::new(MemoryTool::new(Arc::new(
+        tokio::sync::RwLock::new(memory_store),
+    ))));
+    sm.set_tool_registry(Arc::new(registry)).await;
+
     let sid = sm.create_session().await.unwrap();
 
-    let llm: Arc<dyn LlmRuntime> = if let Ok(api_key) = std::env::var("LLM_API_KEY") {
-        // Cloud LLM mode (GLM-5, OpenAI, etc.)
-        let endpoint = std::env::var("LLM_ENDPOINT")
-            .unwrap_or("https://open.bigmodel.cn/api/coding/paas/v4".into());
+    // Memory recall is one of the measured dimensions — the R5/R10/R15
+    // rounds plant facts and query them back. Enable the session memory
+    // system so extraction ↔ recall is exercised end-to-end.
+    let _ = sm.toggle_memory(&sid, true).await;
+
+    let llm: Arc<dyn LlmRuntime> = if std::env::var("LLAMACPP_ENDPOINT").is_ok() {
+        // llama.cpp standalone server mode (native tools path — run llama-server
+        // with --jinja so the model's own chat template handles tool calls)
+        llamacpp_llm().await
+    } else if let Ok(api_key) = std::env::var("LLM_API_KEY") {
+        // Cloud LLM mode. MODEL names containing "deepseek" use the built-in
+        // DeepSeek provider (official endpoint, 128k context, native function
+        // calling) — mirrors how production users configure DeepSeek. Other
+        // models take the custom-endpoint path (LLM_ENDPOINT), which is the
+        // proxy/vLLM scenario.
         let model = std::env::var("MODEL").unwrap_or("glm-5".into());
-        Arc::new(
-            CloudRuntime::new(
-                CloudConfig::custom(api_key, endpoint)
-                    .with_model(model)
-                    .with_timeout_secs(180),
-            )
-            .unwrap(),
-        )
+        let cfg = if model.to_lowercase().contains("deepseek") {
+            CloudConfig::deepseek(api_key)
+                .with_model(model)
+                .with_timeout_secs(600)
+        } else {
+            let endpoint = std::env::var("LLM_ENDPOINT")
+                .unwrap_or("https://open.bigmodel.cn/api/coding/paas/v4".into());
+            CloudConfig::custom(api_key, endpoint)
+                .with_model(model)
+                .with_timeout_secs(600)
+        };
+        Arc::new(CloudRuntime::new(cfg).unwrap())
     } else {
         // Local Ollama mode
         let model = std::env::var("MODEL").unwrap_or("qwen3.5:2b".into());
@@ -58,13 +385,117 @@ async fn new_session() -> (SessionManager, String) {
         .unwrap()
         .set_custom_llm(llm)
         .await;
+    // No manual format-teaching suffix needed anymore: every backend now
+    // injects the text tool-calling protocol itself when the model reports
+    // no native function calling (`llm_backends::text_tool_calls`), so this
+    // eval measures the model, not the integration gap.
     (sm, sid)
+}
+
+// Process-wide turn telemetry — send() sees every turn but not the Metrics
+// struct the scenarios own, so wall-clock latency and tool-turn counts
+// accumulate here for the final report.
+static TOTAL_ELAPSED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TURNS_WITH_TOOLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// ── fairness view ─────────────────────────────────────────────────────
+//
+// The classic scoring rewards EMITTING the right domain command and gives
+// zero for anything else — structurally penalizing models that investigate
+// first (`--help` probes) or answer directly from context without a call.
+// The transcript + fair rescore below re-judges every domain turn:
+//   full command      → 1.0
+//   exploration probe → 0.5  (help/list in the right domain)
+//   direct answer     → 0.75 (no command, substantive reply)
+//   nothing           → 0
+// It is printed alongside the classic report, never replaces it.
+
+#[derive(Clone)]
+struct TurnRecord {
+    query: String,
+    commands: Vec<String>,
+    content: String,
+}
+
+static TRANSCRIPT: std::sync::Mutex<Vec<TurnRecord>> = std::sync::Mutex::new(Vec::new());
+
+fn expected_domain(query: &str) -> Option<&'static str> {
+    let q = query.to_lowercase();
+    let device =
+        q.contains("设备") || q.contains("device") || q.contains("传感器") || q.contains("sensor");
+    let rule = q.contains("规则") || q.contains("rule");
+    let agent = q.contains("agent");
+    if agent {
+        Some("agent")
+    } else if rule {
+        Some("rule")
+    } else if device {
+        Some("device")
+    } else {
+        None
+    }
+}
+
+fn fair_rescore() -> (f64, usize, usize) {
+    let transcript = TRANSCRIPT.lock().unwrap();
+    let (mut points, mut n, mut classic_hits) = (0.0f64, 0usize, 0usize);
+    for t in transcript.iter() {
+        let Some(domain) = expected_domain(&t.query) else {
+            continue;
+        };
+        // Recall/summary/context turns are not command tasks.
+        if t.query.contains("总结")
+            || t.query.contains("summarize")
+            || t.query.contains("我叫什么")
+            || t.query.contains("my name")
+            || t.query.contains("多少个传感器")
+            || t.query.contains("how many sensors")
+            || t.query.contains("摄像头")
+            || t.query.contains("cameras?")
+            || t.query.contains("阈值")
+            || t.query.contains("threshold")
+            || t.query.contains("通知方式")
+            || t.query.contains("notification method")
+            || t.query.contains("门禁")
+            || t.query.contains("联系")
+            || t.query.contains("contact")
+        {
+            continue;
+        }
+        n += 1;
+        let prefix = format!("heramind {}", domain);
+        let mut full = false;
+        let mut expl = false;
+        for c in &t.commands {
+            let cl = c.to_lowercase();
+            if cl.starts_with(&prefix) || cl.starts_with(&format!("heramind {} ", domain)) {
+                if cl.contains("--help") {
+                    expl = true;
+                } else {
+                    full = true;
+                }
+            }
+        }
+        if full {
+            points += 1.0;
+            classic_hits += 1;
+        } else if expl {
+            points += 0.5;
+        } else if t.commands.is_empty() && t.content.chars().count() > 30 {
+            points += 0.75;
+        }
+    }
+    (points, n, classic_hits)
 }
 
 async fn send(sm: &SessionManager, sid: &str, msg: &str) -> MsgResult {
     let start = Instant::now();
     let resp = sm.process_message(sid, msg).await.unwrap();
     let elapsed = start.elapsed();
+    TOTAL_ELAPSED_MS.fetch_add(
+        elapsed.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // Extract CLI commands from shell tool calls
     let shell_commands: Vec<String> = resp
         .tool_calls
@@ -73,6 +504,15 @@ async fn send(sm: &SessionManager, sid: &str, msg: &str) -> MsgResult {
         .filter_map(|t| t.arguments.get("command").and_then(|v| v.as_str()))
         .map(|s| s.to_string())
         .collect();
+    if !shell_commands.is_empty() {
+        TURNS_WITH_TOOLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    TRANSCRIPT.lock().unwrap().push(TurnRecord {
+        query: msg.to_string(),
+        commands: shell_commands.clone(),
+        content: resp.message.content.to_string(),
+    });
 
     MsgResult {
         content: resp.message.content.to_string(),
@@ -124,6 +564,12 @@ impl MsgResult {
             .filter(|c| c.starts_with(&prefix) || **c == exact)
             .count()
     }
+
+    /// Did the model invoke the named tool at least once this turn?
+    /// (For the non-shell breadth round: file_write/web_fetch/skill/memory/…)
+    fn called_tool(&self, name: &str) -> bool {
+        self.tool_calls.iter().any(|t| t == name)
+    }
 }
 
 // ── metrics ───────────────────────────────────────────────────────────
@@ -134,7 +580,6 @@ struct Metrics {
     total_rounds: usize,
 
     // Tool system
-    turns_with_tools: usize,
     tools_correct: usize,
     tools_total_expected: usize,
     multi_tool_attempts: usize,
@@ -156,9 +601,7 @@ struct Metrics {
     multi_turn_success: usize,
     resource_creation_tasks: usize,
     resource_creation_success: usize,
-
     // Performance
-    total_elapsed_ms: u64,
 }
 
 impl Metrics {
@@ -204,13 +647,6 @@ impl Metrics {
             self.memory_recall_success as f64 / self.memory_recall_queries as f64 * 100.0
         }
     }
-    fn avg_latency(&self) -> u64 {
-        if self.total_turns == 0 {
-            0
-        } else {
-            self.total_elapsed_ms / (self.total_turns as u64)
-        }
-    }
 }
 
 // ── Test scenarios ────────────────────────────────────────────────────
@@ -229,7 +665,6 @@ async fn r1_device_management(sm: &SessionManager, sid: &str, m: &mut Metrics) -
         m.tools_correct += 1;
     }
     m.tools_total_expected += 1;
-    m.turns_with_tools += if r.shell_commands.is_empty() { 0 } else { 1 };
     m.single_turn_tasks += 1;
     if r.has_domain("device") {
         m.single_turn_success += 1;
@@ -985,8 +1420,741 @@ async fn r5_memory_context_stress(sm: &SessionManager, sid: &str, m: &mut Metric
     notes
 }
 
-// R6-20: Reuse R1-R5 patterns with variations
-// Use a simple match dispatch in the main test
+// R6-R10: English mirrors of R1-R5 — the platform is bilingual; agent
+// quality must hold in English too. Same structure and scoring, translated
+// queries and English keyword checks.
+
+async fn r6_device_management_en(sm: &SessionManager, sid: &str, m: &mut Metrics) -> Vec<String> {
+    let mut notes = Vec::new();
+    let checks: Vec<(&str, &str, Option<&str>)> = vec![
+        ("List all devices", "device", Some("single")),
+        (
+            "Show the latest data for device sensor_01",
+            "device",
+            Some("single"),
+        ),
+        (
+            "Show the temperature trend of sensor_01 over the last 24 hours",
+            "device",
+            None,
+        ),
+        ("What is the battery level of that device?", "", None), // context follow-up
+        ("Turn on device light_living", "device", Some("single")),
+        (
+            "Check sensor_01 and sensor_02 at the same time",
+            "device",
+            Some("multi"),
+        ),
+        (
+            "Analyze the online/offline status of all devices",
+            "device",
+            None,
+        ),
+        ("Which device did I just turn on?", "", None), // recall turn 5
+        ("Show data for device nonexist999", "", None), // error recovery
+        ("What is the temperature in my office?", "device", None),
+        ("List all offline devices", "device", None),
+        ("Turn off device light_living", "device", Some("single")),
+        ("How is the signal strength of sensor_01?", "device", None),
+        (
+            "Compare the temperature of sensor_01 and sensor_02",
+            "device",
+            Some("multi"),
+        ),
+        ("Any device anomalies today?", "device", None),
+    ];
+    for (i, (q, domain, kind)) in checks.iter().enumerate() {
+        let r = send(sm, sid, q).await;
+        m.total_turns += 1;
+        match (*domain, *kind) {
+            ("device", Some("multi")) => {
+                m.tools_total_expected += 2;
+                m.multi_tool_attempts += 1;
+                if r.domain_count("device") >= 2 {
+                    m.tools_correct += 2;
+                    m.multi_tool_success += 1;
+                    notes.push(format!("T{}: ✅ multi-device", i + 1));
+                } else if r.has_domain("device") {
+                    m.tools_correct += 1;
+                    notes.push(format!("T{}: ⚠️ partial multi-device", i + 1));
+                } else {
+                    notes.push(format!("T{}: ❌ multi-device", i + 1));
+                }
+            }
+            ("device", _) => {
+                m.tools_total_expected += 1;
+                if r.has_domain("device") {
+                    m.tools_correct += 1;
+                    notes.push(format!("T{}: ✅ {}", i + 1, q));
+                } else {
+                    notes.push(format!("T{}: ❌ {}", i + 1, q));
+                }
+                if *kind == Some("single") {
+                    m.single_turn_tasks += 1;
+                    if r.has_domain("device") {
+                        m.single_turn_success += 1;
+                    }
+                }
+            }
+            _ => {
+                // context / recall / recovery turns
+                if i == 3 {
+                    m.context_followup_total += 1;
+                    let ok = r.content.contains("sensor_01") || r.content.contains("battery");
+                    if ok {
+                        m.context_followup_success += 1;
+                    }
+                    notes.push(format!(
+                        "T{}: {} context follow-up",
+                        i + 1,
+                        if ok { "✅" } else { "❌" }
+                    ));
+                } else if i == 7 {
+                    m.context_followup_total += 1;
+                    let ok = r.content.contains("light_living")
+                        || r.content.contains("light")
+                        || r.content.contains("living");
+                    if ok {
+                        m.context_followup_success += 1;
+                    }
+                    notes.push(format!(
+                        "T{}: {} context recall",
+                        i + 1,
+                        if ok { "✅" } else { "❌" }
+                    ));
+                } else {
+                    notes.push(format!(
+                        "T{}: {} misc",
+                        i + 1,
+                        if r.content.is_empty() { "❌" } else { "✅" }
+                    ));
+                }
+            }
+        }
+    }
+    notes
+}
+
+async fn r7_rule_management_en(sm: &SessionManager, sid: &str, m: &mut Metrics) -> Vec<String> {
+    let mut notes = Vec::new();
+    let r = send(sm, sid, "List all automation rules").await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    m.single_turn_tasks += 1;
+    if r.has_domain("rule") {
+        m.tools_correct += 1;
+        m.single_turn_success += 1;
+        notes.push("T1: ✅ list rules".into());
+    } else {
+        notes.push("T1: ❌ list rules".into());
+    }
+
+    let r = send(
+        sm,
+        sid,
+        "Create a rule: send an alert when the temperature exceeds 35 degrees",
+    )
+    .await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    m.resource_creation_tasks += 1;
+    if r.has_domain("rule") {
+        m.tools_correct += 1;
+        if r.content.contains("35") || r.content.contains("temperature") {
+            m.resource_creation_success += 1;
+            notes.push("T2: ✅ create temp rule".into());
+        } else {
+            notes.push("T2: ⚠️ rule created, content uncertain".into());
+        }
+    } else {
+        notes.push("T2: ❌ create temp rule".into());
+    }
+
+    let r = send(
+        sm,
+        sid,
+        "Create a rule: notify me when battery drops below 20%",
+    )
+    .await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    m.resource_creation_tasks += 1;
+    if r.has_domain("rule") {
+        m.tools_correct += 1;
+        m.resource_creation_success += 1;
+        notes.push("T3: ✅ create battery rule".into());
+    } else {
+        notes.push("T3: ❌ create battery rule".into());
+    }
+
+    let r = send(sm, sid, "Which rules did I just create?").await;
+    m.total_turns += 1;
+    m.context_followup_total += 1;
+    let ok = r.content.contains("35")
+        || r.content.contains("20")
+        || r.content.contains("temperature")
+        || r.content.contains("battery");
+    if ok {
+        m.context_followup_success += 1;
+    }
+    notes.push(format!(
+        "T4: {} context recall rules",
+        if ok { "✅" } else { "❌" }
+    ));
+
+    let r = send(
+        sm,
+        sid,
+        "Create a rule: when temperature exceeds 30 and humidity drops below 40%, turn on the sprinkler system and notify me",
+    )
+    .await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    m.resource_creation_tasks += 1;
+    if r.has_domain("rule") {
+        m.tools_correct += 1;
+        let complex = r.content.contains("30")
+            && (r.content.contains("40") || r.content.contains("sprinkler"));
+        if complex {
+            m.resource_creation_success += 1;
+            notes.push("T5: ✅ complex rule".into());
+        } else {
+            notes.push("T5: ⚠️ complex rule (partial)".into());
+        }
+    } else {
+        notes.push("T5: ❌ complex rule".into());
+    }
+
+    let more: Vec<&str> = vec![
+        "How many rules are there now?",
+        "Delete the temperature alert rule",
+        "Create a rule (without any condition)",
+        "Disable the battery alert rule",
+        "How many rules have I created in total?",
+        "Create a rule: urgent notification when a device is offline for over 10 minutes",
+        "List all disabled rules",
+        "Create a rule: check all devices every day at 8am",
+        "Change the temperature alert threshold to 38 degrees",
+        "Delete all rules",
+    ];
+    for (i, q) in more.iter().enumerate() {
+        let r = send(sm, sid, q).await;
+        m.total_turns += 1;
+        let needs_tool = !(q.contains("in total?") || q.starts_with("Create a rule ("));
+        if needs_tool {
+            m.tools_total_expected += 1;
+        }
+        if r.has_domain("rule") {
+            if needs_tool {
+                m.tools_correct += 1;
+            }
+            notes.push(format!("T{}: ✅ {}", 6 + i, q));
+        } else {
+            notes.push(format!("T{}: ❌ {}", 6 + i, q));
+        }
+    }
+    notes
+}
+
+async fn r8_agent_management_en(sm: &SessionManager, sid: &str, m: &mut Metrics) -> Vec<String> {
+    let mut notes = Vec::new();
+    let r = send(sm, sid, "List all AI agents").await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    if r.has_domain("agent") {
+        m.tools_correct += 1;
+        notes.push("T1: ✅ list agents".into());
+    } else {
+        notes.push("T1: ❌ list agents".into());
+    }
+
+    let r = send(
+        sm,
+        sid,
+        "Create an agent called Temperature Patrol that runs every 5 minutes and checks all temperature sensors",
+    )
+    .await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    m.resource_creation_tasks += 1;
+    if r.has_domain("agent") {
+        m.tools_correct += 1;
+        if r.content.contains("Temperature") || r.content.contains("Patrol") {
+            m.resource_creation_success += 1;
+            notes.push("T2: ✅ create temp agent".into());
+        } else {
+            notes.push("T2: ⚠️ agent create (uncertain)".into());
+        }
+    } else {
+        notes.push("T2: ❌ create temp agent".into());
+    }
+
+    let r = send(
+        sm,
+        sid,
+        "Create an agent: Battery Monitor, runs daily at 8am, checks battery levels and notifies",
+    )
+    .await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    m.resource_creation_tasks += 1;
+    if r.has_domain("agent") {
+        m.tools_correct += 1;
+        m.resource_creation_success += 1;
+        notes.push("T3: ✅ create battery agent".into());
+    } else {
+        notes.push("T3: ❌ create battery agent".into());
+    }
+
+    let r = send(sm, sid, "Show the details of the Temperature Patrol agent").await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    if r.has_domain("agent") {
+        m.tools_correct += 1;
+        notes.push("T4: ✅ agent detail".into());
+    } else {
+        notes.push("T4: ❌ agent detail".into());
+    }
+
+    let r = send(sm, sid, "What is the second agent I created?").await;
+    m.total_turns += 1;
+    m.context_followup_total += 1;
+    let ok = r.content.contains("Battery") || r.content.contains("battery");
+    if ok {
+        m.context_followup_success += 1;
+    }
+    notes.push(format!(
+        "T5: {} context agent recall",
+        if ok { "✅" } else { "❌" }
+    ));
+
+    let rest: Vec<(&str, bool)> = vec![
+        ("Pause the Temperature Patrol agent", true),
+        ("Show the execution history of the Temperature Patrol agent", true),
+        ("Resume the Temperature Patrol agent", true),
+        ("Create a smart ops agent that runs every 10 minutes, checks device status and creates alert rules on anomalies", true),
+        ("List all agents and their status", true),
+        ("Delete the Battery Monitor agent", true),
+        ("How many agents are currently running?", false),
+        ("Change the Temperature Patrol interval to 3 minutes", true),
+        ("Delete all agents", true),
+    ];
+    for (i, (q, needs_tool)) in rest.iter().enumerate() {
+        let r = send(sm, sid, q).await;
+        m.total_turns += 1;
+        if *needs_tool {
+            m.tools_total_expected += 1;
+        }
+        if r.has_domain("agent") {
+            if *needs_tool {
+                m.tools_correct += 1;
+            }
+            notes.push(format!("T{}: ✅ {}", 6 + i, q));
+        } else {
+            notes.push(format!("T{}: ❌ {}", 6 + i, q));
+        }
+    }
+    notes
+}
+
+async fn r9_cross_domain_en(sm: &SessionManager, sid: &str, m: &mut Metrics) -> Vec<String> {
+    let mut notes = Vec::new();
+    let r = send(sm, sid, "Check the status of all devices").await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    if r.has_domain("device") {
+        m.tools_correct += 1;
+        notes.push("T1: ✅ check devices".into());
+    } else {
+        notes.push("T1: ❌ check devices".into());
+    }
+
+    let r = send(
+        sm,
+        sid,
+        "Create an alert rule for devices with temperature above 30 degrees",
+    )
+    .await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    m.resource_creation_tasks += 1;
+    if r.has_domain("rule") {
+        m.tools_correct += 1;
+        m.resource_creation_success += 1;
+        notes.push("T2: ✅ cross-domain device→rule".into());
+    } else {
+        notes.push("T2: ❌ cross-domain device→rule".into());
+    }
+
+    let r = send(sm, sid, "Now create an agent to run that rule periodically").await;
+    m.total_turns += 1;
+    m.tools_total_expected += 1;
+    m.resource_creation_tasks += 1;
+    if r.has_domain("agent") {
+        m.tools_correct += 1;
+        m.resource_creation_success += 1;
+        notes.push("T3: ✅ cross-domain rule→agent".into());
+    } else {
+        notes.push("T3: ❌ cross-domain rule→agent".into());
+    }
+
+    let r = send(sm, sid, "Summarize what I have just done").await;
+    m.total_turns += 1;
+    m.context_followup_total += 1;
+    let ok = (r.content.contains("device") || r.content.contains("传感器"))
+        && (r.content.contains("rule") || r.content.contains("规则"))
+        && (r.content.contains("agent") || r.content.contains("Agent"));
+    if ok {
+        m.context_followup_success += 1;
+    }
+    notes.push(format!(
+        "T4: {} cross-domain summary",
+        if ok { "✅" } else { "❌" }
+    ));
+
+    let mixed: Vec<(&str, Option<&str>)> = vec![
+        ("Show the battery status of all devices", Some("device")),
+        (
+            "Create a rule: notify when battery is below 15%",
+            Some("rule"),
+        ),
+        ("List all current rules", Some("rule")),
+        ("Was that battery rule created successfully?", None),
+        (
+            "Create an agent to check the battery once a day",
+            Some("agent"),
+        ),
+        (
+            "List all devices and all rules at the same time",
+            Some("multi"),
+        ),
+        (
+            "Pause the battery check agent we just created",
+            Some("agent"),
+        ),
+        (
+            "Inventory check: how many devices, rules and agents do I have?",
+            None,
+        ),
+    ];
+    for (i, (q, expected)) in mixed.iter().enumerate() {
+        let r = send(sm, sid, q).await;
+        m.total_turns += 1;
+        match expected {
+            Some("multi") => {
+                m.tools_total_expected += 2;
+                m.multi_tool_attempts += 1;
+                let d = r.has_domain("device");
+                let ru = r.has_domain("rule");
+                if d {
+                    m.tools_correct += 1;
+                }
+                if ru {
+                    m.tools_correct += 1;
+                }
+                if d && ru {
+                    m.multi_tool_success += 1;
+                }
+                notes.push(format!(
+                    "T{}: {} multi-tool",
+                    5 + i,
+                    if d && ru { "✅" } else { "⚠️" }
+                ));
+            }
+            Some(tool) => {
+                m.tools_total_expected += 1;
+                if r.has_domain(tool) {
+                    m.tools_correct += 1;
+                    notes.push(format!("T{}: ✅ {}", 5 + i, q));
+                } else {
+                    notes.push(format!("T{}: ❌ {}", 5 + i, q));
+                }
+            }
+            None => {
+                m.context_followup_total += 1;
+                if r.content.len() > 20 {
+                    m.context_followup_success += 1;
+                }
+                notes.push(format!("T{}: ✅ context", 5 + i));
+            }
+        }
+    }
+    notes
+}
+
+async fn r10_memory_context_stress_en(
+    sm: &SessionManager,
+    sid: &str,
+    m: &mut Metrics,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let r = send(
+        sm,
+        sid,
+        "Hi, my name is John Smith and I work at the Shanghai warehouse",
+    )
+    .await;
+    m.total_turns += 1;
+    notes.push(format!(
+        "T1: {} intro",
+        if r.content.contains("John") || r.content.contains("Hi") {
+            "✅"
+        } else {
+            "⚠️"
+        }
+    ));
+
+    let _r = send(
+        sm,
+        sid,
+        "Our warehouse has 50 temperature sensors and 10 cameras",
+    )
+    .await;
+    m.total_turns += 1;
+    let _r = send(
+        sm,
+        sid,
+        "Alert thresholds: temperature above 32 degrees, humidity above 80%",
+    )
+    .await;
+    m.total_turns += 1;
+    let _r = send(
+        sm,
+        sid,
+        "Use SMS for notifications; call me by phone in emergencies",
+    )
+    .await;
+    m.total_turns += 1;
+
+    let recall_queries: Vec<(&str, Vec<&str>)> = vec![
+        ("What is my name?", vec!["John", "Smith"]),
+        ("Where do I work?", vec!["Shanghai", "warehouse"]),
+        ("How many sensors do we have?", vec!["50"]),
+        ("What is the temperature alert threshold?", vec!["32"]),
+        (
+            "How do you contact me in an emergency?",
+            vec!["phone", "call"],
+        ),
+        ("What notification method did I say I prefer?", vec!["SMS"]),
+        ("Do we have cameras? How many?", vec!["10", "cameras"]),
+        (
+            "Summarize everything I have told you",
+            vec!["John", "Shanghai"],
+        ),
+        (
+            "Create a temperature alert rule based on my requirements",
+            vec!["32"],
+        ),
+        ("Create a humidity monitoring agent", vec!["80"]),
+    ];
+    for (i, (q, keywords)) in recall_queries.iter().enumerate() {
+        let r = send(sm, sid, q).await;
+        m.total_turns += 1;
+        m.memory_recall_queries += 1;
+        let hit = keywords.iter().any(|kw| r.content.contains(kw));
+        if hit {
+            m.memory_recall_success += 1;
+            notes.push(format!("T{}: ✅ recall: {}", 5 + i, q));
+        } else {
+            notes.push(format!(
+                "T{}: ❌ recall: {} (got: {:?})",
+                5 + i,
+                q,
+                r.content.chars().take(60).collect::<String>()
+            ));
+        }
+        if i >= 8 {
+            m.resource_creation_tasks += 1;
+            if !r.shell_commands.is_empty() {
+                m.resource_creation_success += 1;
+            }
+        }
+    }
+
+    let r = send(
+        sm,
+        sid,
+        "Based on the thresholds I set earlier, create another humidity alert rule",
+    )
+    .await;
+    m.total_turns += 1;
+    m.resource_creation_tasks += 1;
+    if r.has_domain("rule") {
+        m.resource_creation_success += 1;
+        notes.push("T15: ✅ rule from memory".into());
+    } else {
+        notes.push("T15: ❌ rule from memory".into());
+    }
+    notes
+}
+
+// R11: long-horizon round — 40 turns. Facts planted early, a wall of real
+// tool traffic in the middle (filling the context with verbose results),
+// recall probes at the end. Measures long-horizon memory + context rot.
+async fn r11_long_horizon(sm: &SessionManager, sid: &str, m: &mut Metrics) -> Vec<String> {
+    let mut notes = Vec::new();
+
+    // T1-T5: plant durable facts interleaved with light queries.
+    let _r = send(sm, sid, "记住几个信息:我叫李雷,负责北京3号仓库").await;
+    m.total_turns += 1;
+    let _r = send(sm, sid, "列出所有设备").await;
+    m.total_turns += 1;
+    let _r = send(sm, sid, "仓库有42个温湿度传感器、8个摄像头,门禁密码是8848").await;
+    m.total_turns += 1;
+    let _r = send(sm, sid, "查看设备 sensor_01 的最新数据").await;
+    m.total_turns += 1;
+    let _r = send(sm, sid, "告警策略:温度超过28度先发邮件,超过33度打电话").await;
+    m.total_turns += 1;
+
+    // T6-T28: the noise wall — varied tool traffic to fill the window with
+    // real (verbose) results.
+    let noise: Vec<&str> = vec![
+        "列出所有设备",
+        "查看规则列表",
+        "创建规则:湿度超过75%时通知",
+        "查看设备 sensor_02 的数据",
+        "列出所有 Agent",
+        "设备在线状态分析",
+        "创建规则:每天早上7点检查传感器",
+        "查看设备 light_living",
+        "sensor_01 过去24小时温度趋势",
+        "删除湿度告警规则",
+        "创建Agent:每日巡检,每天9点执行",
+        "列出所有规则",
+        "查看 sensor_01 的电池电量",
+        "关闭设备 light_living",
+        "对比 sensor_01 和 sensor_02 的温度",
+        "创建规则:设备离线10分钟告警",
+        "查看所有Agent状态",
+        "修改每日巡检Agent为8点执行",
+        "列出离线设备",
+        "查看传感器信号强度",
+        "创建规则:rssi低于-80时通知",
+        "列出所有设备类型",
+        "设备异常检查",
+        "查看告警历史",
+    ];
+    for q in &noise {
+        let _r = send(sm, sid, q).await;
+        m.total_turns += 1;
+    }
+
+    // T29-T40: long-horizon recall probes — the planted facts are now 25+
+    // turns and a full context behind.
+    let probes: Vec<(&str, Vec<&str>)> = vec![
+        ("我叫什么名字?负责哪个仓库?", vec!["李雷", "北京", "3号"]),
+        ("仓库有多少个温湿度传感器?", vec!["42"]),
+        ("门禁密码是多少?", vec!["8848"]),
+        ("温度超过多少度需要打电话?", vec!["33"]),
+        ("温度28度以上应该做什么?", vec!["邮件"]),
+        ("仓库有几个摄像头?", vec!["8"]),
+        ("总结一下我最开始告诉你的所有信息", vec!["李雷", "8848"]),
+        ("根据我最初的告警策略,创建一条33度打电话的规则", vec!["33"]),
+        ("根据我的要求创建邮件提醒规则", vec!["28"]),
+        ("我今天一共创建了多少条规则?", vec!["条", "规则"]),
+    ];
+    for (i, (q, keywords)) in probes.iter().enumerate() {
+        let r = send(sm, sid, q).await;
+        m.total_turns += 1;
+        m.memory_recall_queries += 1;
+        let hit = keywords.iter().any(|kw| r.content.contains(kw));
+        if hit {
+            m.memory_recall_success += 1;
+            notes.push(format!("T{}: ✅ long-recall: {}", 29 + i, q));
+        } else {
+            notes.push(format!("T{}: ❌ long-recall: {}", 29 + i, q));
+        }
+        if i == 7 || i == 8 {
+            m.resource_creation_tasks += 1;
+            if r.has_domain("rule") {
+                m.resource_creation_success += 1;
+            }
+        }
+    }
+    notes
+}
+
+// R12: tools-breadth round — direct probes for the non-shell tools the
+// production registry carries (file_write / file_edit / web_fetch / skill /
+// memory). The other rounds only ever exercise the shell CLI path.
+async fn r12_tools_breadth(sm: &SessionManager, sid: &str, m: &mut Metrics) -> Vec<String> {
+    let mut notes = Vec::new();
+    let port = std::env::var("HERAMIND_EVAL_SANDBOX_PORT").unwrap_or_else(|_| "9375".into());
+
+    let fetch_q = format!("获取 {port} 端口上本平台 API 文档页面的内容并简要总结");
+    let probes: Vec<(&str, &str)> = vec![
+        ("把当前设备清单保存到文件 device_report.md 里", "file_write"),
+        (
+            "把 device_report.md 文件里所有的 sensor_01 改成 sensor_99",
+            "file_edit",
+        ),
+        (fetch_q.as_str(), "web_fetch"),
+        (
+            "记住一条重要信息:我们的紧急联系人是王工,电话13900000000",
+            "memory",
+        ),
+        ("搜索并加载关于规则管理的技能指南", "skill"),
+        ("把 probe.png 这张图片裁剪成正方形", "image_edit"),
+    ];
+    for (i, (q, tool)) in probes.iter().enumerate() {
+        let r = send(sm, sid, q).await;
+        m.total_turns += 1;
+        m.tools_total_expected += 1;
+        if r.called_tool(tool) {
+            m.tools_correct += 1;
+            notes.push(format!("T{}: ✅ {}", i + 1, tool));
+        } else {
+            notes.push(format!(
+                "T{}: ❌ {} (called: {:?})",
+                i + 1,
+                tool,
+                r.tool_calls
+            ));
+        }
+    }
+
+    // Contrast turns: same session, shell-domain asks — the model must
+    // switch back and forth instead of latching onto the last tool.
+    let shell_turns: Vec<(&str, &str)> = vec![
+        ("列出所有设备", "device"),
+        ("创建规则:温度超过30度时通知", "rule"),
+        ("列出所有规则", "rule"),
+        ("查看设备 sensor_01 最新数据", "device"),
+        (
+            "再把这些设备的清单追加到 device_report.md 文件末尾",
+            "file_write",
+        ),
+        ("我们仓库的温度现在大概是多少?", "device"),
+        ("总结一下这个文件里都有什么", "file_write"),
+        ("把刚才创建的规则导出保存到 rules_export.md", "file_write"),
+        ("对照技能指南,我刚才创建规则的姿势标准吗?", "skill"),
+    ];
+    for (i, (q, expect)) in shell_turns.iter().enumerate() {
+        let r = send(sm, sid, q).await;
+        m.total_turns += 1;
+        m.tools_total_expected += 1;
+        let ok = if ["device", "rule"].contains(expect) {
+            r.has_domain(expect)
+        } else {
+            r.called_tool(expect)
+        };
+        if ok {
+            m.tools_correct += 1;
+            notes.push(format!("T{}: ✅ {}", 6 + i, expect));
+        } else {
+            notes.push(format!(
+                "T{}: ❌ {} (called: {:?})",
+                6 + i,
+                expect,
+                r.tool_calls
+            ));
+        }
+    }
+    notes
+}
+
+// Scenario dispatch: 12 distinct scenarios, cycling. ROUNDS=12 covers every
+// scenario once; ROUNDS=24 (default) runs two full cycles.
 
 async fn run_scenario(
     round: usize,
@@ -994,12 +2162,19 @@ async fn run_scenario(
     sid: &str,
     m: &mut Metrics,
 ) -> Vec<String> {
-    match round {
-        0 | 5 | 10 | 15 => r1_device_management(sm, sid, m).await,
-        1 | 6 | 11 | 16 => r2_rule_management(sm, sid, m).await,
-        2 | 7 | 12 | 17 => r3_agent_management(sm, sid, m).await,
-        3 | 8 | 13 | 18 => r4_cross_domain(sm, sid, m).await,
-        4 | 9 | 14 | 19 => r5_memory_context_stress(sm, sid, m).await,
+    match round % 12 {
+        0 => r1_device_management(sm, sid, m).await,
+        1 => r2_rule_management(sm, sid, m).await,
+        2 => r3_agent_management(sm, sid, m).await,
+        3 => r4_cross_domain(sm, sid, m).await,
+        4 => r5_memory_context_stress(sm, sid, m).await,
+        5 => r6_device_management_en(sm, sid, m).await,
+        6 => r7_rule_management_en(sm, sid, m).await,
+        7 => r8_agent_management_en(sm, sid, m).await,
+        8 => r9_cross_domain_en(sm, sid, m).await,
+        9 => r10_memory_context_stress_en(sm, sid, m).await,
+        10 => r11_long_horizon(sm, sid, m).await,
+        11 => r12_tools_breadth(sm, sid, m).await,
         _ => unreachable!(),
     }
 }
@@ -1010,21 +2185,25 @@ static SCENARIO_NAMES: &[&str] = &[
     "R03-Agent管理",
     "R04-跨域综合",
     "R05-记忆上下文",
-    "R06-设备管理v2",
-    "R07-规则管理v2",
-    "R08-Agent管理v2",
-    "R09-跨域综合v2",
-    "R10-记忆上下文v2",
-    "R11-设备管理v3",
-    "R12-规则管理v3",
-    "R13-Agent管理v3",
-    "R14-跨域综合v3",
-    "R15-记忆上下文v3",
-    "R16-设备管理v4",
-    "R17-规则管理v4",
-    "R18-Agent管理v4",
-    "R19-跨域综合v4",
-    "R20-记忆上下文v4",
+    "R06-DeviceEN",
+    "R07-RuleEN",
+    "R08-AgentEN",
+    "R09-CrossEN",
+    "R10-MemoryEN",
+    "R11-长程记忆40轮",
+    "R12-工具广度",
+    "R13-设备管理v2",
+    "R14-规则管理v2",
+    "R15-Agent管理v2",
+    "R16-跨域综合v2",
+    "R17-记忆上下文v2",
+    "R18-DeviceEN-v2",
+    "R19-RuleEN-v2",
+    "R20-AgentEN-v2",
+    "R21-CrossEN-v2",
+    "R22-MemoryEN-v2",
+    "R23-长程记忆v2",
+    "R24-工具广度v2",
 ];
 
 // ── Main test ─────────────────────────────────────────────────────────
@@ -1032,10 +2211,31 @@ static SCENARIO_NAMES: &[&str] = &[
 #[tokio::test]
 #[ignore = "Requires Ollama. cargo test -p heramind-agent --test comprehensive_agent_eval -- --ignored --nocapture"]
 async fn comprehensive_20round_evaluation() -> anyhow::Result<()> {
-    if !ollama_up() && std::env::var("LLM_API_KEY").is_err() {
-        eprintln!("Neither Ollama nor LLM_API_KEY available, skipping");
+    if !ollama_up()
+        && std::env::var("LLM_API_KEY").is_err()
+        && std::env::var("LLAMACPP_ENDPOINT").is_err()
+    {
+        eprintln!("Neither Ollama, llama.cpp, nor LLM_API_KEY available, skipping");
         return Ok(());
     }
+
+    // Diagnostics: set EVAL_TRACE=1 to surface the crate's tracing output
+    // (filter via RUST_LOG, default heramind_agent=debug) — shows the raw LLM
+    // responses and parsed tool-call counts per turn.
+    if std::env::var("EVAL_TRACE").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "heramind_agent=debug".into()),
+            )
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+
+    // Self-hosted sandbox platform: fresh data dir, private port, seeded
+    // devices — the model's CLI calls operate on a real world instead of
+    // 401s against whatever server happens to run on :9375.
+    sandbox::start().await;
 
     let model = std::env::var("MODEL").unwrap_or("qwen3.5:2b".into());
     println!("\n{}", "═".repeat(70));
@@ -1046,14 +2246,22 @@ async fn comprehensive_20round_evaluation() -> anyhow::Result<()> {
     let mut total_metrics = Metrics::default();
     let total_start = Instant::now();
 
-    for (idx, &name) in SCENARIO_NAMES.iter().enumerate() {
+    // ROUNDS env var limits the evaluation to the first N scenarios (quick mode).
+    let max_rounds: usize = std::env::var("ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SCENARIO_NAMES.len());
+
+    for (idx, &name) in SCENARIO_NAMES.iter().enumerate().take(max_rounds) {
         println!("\n{}", "─".repeat(60));
         println!("Round {}/20: {}", idx + 1, name);
         println!("{}", "─".repeat(60));
 
         let (sm, sid) = new_session().await;
-        let mut round_metrics = Metrics::default();
-        round_metrics.total_rounds = 1;
+        let mut round_metrics = Metrics {
+            total_rounds: 1,
+            ..Default::default()
+        };
 
         let notes = run_scenario(idx, &sm, &sid, &mut round_metrics).await;
 
@@ -1073,7 +2281,6 @@ async fn comprehensive_20round_evaluation() -> anyhow::Result<()> {
         // Accumulate
         total_metrics.total_rounds += 1;
         total_metrics.total_turns += round_metrics.total_turns;
-        total_metrics.turns_with_tools += round_metrics.turns_with_tools;
         total_metrics.tools_correct += round_metrics.tools_correct;
         total_metrics.tools_total_expected += round_metrics.tools_total_expected;
         total_metrics.multi_tool_attempts += round_metrics.multi_tool_attempts;
@@ -1089,7 +2296,6 @@ async fn comprehensive_20round_evaluation() -> anyhow::Result<()> {
         total_metrics.multi_turn_success += round_metrics.multi_turn_success;
         total_metrics.resource_creation_tasks += round_metrics.resource_creation_tasks;
         total_metrics.resource_creation_success += round_metrics.resource_creation_success;
-        total_metrics.total_elapsed_ms += round_metrics.total_elapsed_ms;
     }
 
     let total_elapsed = total_start.elapsed();
@@ -1103,7 +2309,9 @@ async fn comprehensive_20round_evaluation() -> anyhow::Result<()> {
     println!("  Rounds:          {}", total_metrics.total_rounds);
     println!("  Total Turns:     {}", total_metrics.total_turns);
     println!("  Total Time:      {:.1}s", total_elapsed.as_secs_f64());
-    println!("  Avg Latency:     {}ms/turn", total_metrics.avg_latency());
+    let avg_ms = TOTAL_ELAPSED_MS.load(std::sync::atomic::Ordering::Relaxed)
+        / total_metrics.total_turns.max(1) as u64;
+    println!("  Avg Latency:     {avg_ms}ms/turn");
 
     println!("\n[Tool System]");
     println!(
@@ -1112,11 +2320,12 @@ async fn comprehensive_20round_evaluation() -> anyhow::Result<()> {
         total_metrics.tools_correct,
         total_metrics.tools_total_expected
     );
+    let turns_tools = TURNS_WITH_TOOLS.load(std::sync::atomic::Ordering::Relaxed);
     println!(
         "  Turns with Tools:    {}/{} ({:.0}%)",
-        total_metrics.turns_with_tools,
+        turns_tools,
         total_metrics.total_turns,
-        total_metrics.turns_with_tools as f64 / total_metrics.total_turns as f64 * 100.0
+        turns_tools as f64 / total_metrics.total_turns as f64 * 100.0
     );
     println!(
         "  Multi-Tool Rate:     {}/{} ({:.0}%)",
@@ -1124,6 +2333,7 @@ async fn comprehensive_20round_evaluation() -> anyhow::Result<()> {
         total_metrics.multi_tool_attempts,
         if total_metrics.multi_tool_attempts > 0 {
             total_metrics.multi_tool_success as f64 / total_metrics.multi_tool_attempts as f64
+                * 100.0
                 * 100.0
         } else {
             0.0
@@ -1189,14 +2399,44 @@ async fn comprehensive_20round_evaluation() -> anyhow::Result<()> {
     };
     println!("   Grade: {}", grade);
 
+    // Fairness view — re-judged domain turns (full command 1.0 / exploration
+    // 0.5 / substantive direct answer 0.75). Printed alongside the classic
+    // score: a large gap between the two views means the classic score was
+    // penalizing investigation-first or answer-from-context behavior.
+    let (fair_points, fair_n, classic_hits) = fair_rescore();
+    if fair_n > 0 {
+        println!("\n[Fairness View]");
+        println!(
+            "  Classic domain accuracy:  {:.1}% ({}/{})",
+            classic_hits as f64 / fair_n as f64 * 100.0,
+            classic_hits,
+            fair_n
+        );
+        println!(
+            "  Fair domain score:       {:.1}% ({:.1}/{})",
+            fair_points / fair_n as f64 * 100.0,
+            fair_points,
+            fair_n
+        );
+        println!(
+            "  Bias delta:              {:+.1}pp (negative = classic score penalized this model)",
+            fair_points / fair_n as f64 * 100.0 - classic_hits as f64 / fair_n as f64 * 100.0
+        );
+    }
+
     println!("\n{}", "═".repeat(70));
 
-    // Sanity checks
+    // Sanity checks — scale with ROUNDS (every scenario runs exactly 15
+    // turns). ROUNDS=5 quick mode must not fail the 20-round expectation.
+    let min_expected_turns = max_rounds * 15;
     assert!(
-        total_metrics.total_turns >= 300,
-        "Should have 300+ turns across 20 rounds, got {}",
+        total_metrics.total_turns >= min_expected_turns,
+        "Should have {}+ turns across {} rounds, got {}",
+        min_expected_turns,
+        max_rounds,
         total_metrics.total_turns
     );
 
+    sandbox::stop();
     Ok(())
 }

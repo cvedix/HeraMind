@@ -1,12 +1,13 @@
 ---
 id: device-onboarding
 name: Device Onboarding & Connection Guide
+description: Use when the user wants to onboard, connect, or configure an IoT device, OR send a control command to a device (stop, start, set speed, alarm, reboot). Covers device provisioning, MQTT/Webhook/BLE connection, getting broker addresses, and controlling devices — even if they don't explicitly say "device" or "control" (e.g. "shut down the pump", "把泵停掉", "set the fan speed", "停下来"). Includes 设备接入/连接/配置/控制/停机/调速/命令下发.
 category: device
 origin: builtin
 priority: 90
 token_budget: 12000
 triggers:
-  keywords: [设备接入, 接入, onboarding, 连接设备, connect device, MQTT, mqtt, broker, webhook, 传感器, sensor, 如何连接, how to connect, 怎么接入, 设备配置, device setup, device connect, 设备上线, provision, 配置设备, device provisioning, 网关, gateway, 接入方式, connection method, 接入协议, protocol, broker地址, broker address, 服务器地址, server address, topic, 主题, 订阅, subscribe, 发布, publish, draft, 草稿, 待审批, pending device, auto-discovery, 自动发现]
+  keywords: [设备接入, 接入, onboarding, 连接设备, connect device, MQTT, mqtt, broker, webhook, 传感器, sensor, 设备配置, device setup, device connect, provision, 配置设备, device provisioning, 网关, gateway, 接入方式, 订阅, subscribe, auto-discovery, 自动发现, 控制, 命令, 停机, 停止, control, command, stop, shutdown, reboot, set speed, device control]
   tool_target:
     - tool: system
       actions: [info]
@@ -17,6 +18,46 @@ anti_triggers:
 ---
 
 # Device Onboarding & Connection Guide
+
+## Command Cheat-Sheet (run these via `shell`)
+
+Always RUN the command yourself and report the real output — don't narrate.
+
+| Command | Purpose |
+|---|---|
+| `heramind device list` | List all devices (grouped by type) |
+| `heramind device get <id>` | Details: metadata + metrics + commands |
+| `heramind device create --name <N> --device-type <TYPE> [--id <id>] [--adapter-type <a>]` | Create a device |
+
+**When the user gives a device ID in their request (e.g. "create cam-office"), you MUST pass `--id <that-id>`** — never silently swap it for an auto-generated one. If you omit `--id`, the CLI auto-generates a random ID and the user's requested identifier is lost.
+| `heramind device update <id>` | Update a device |
+| `heramind device delete <id>` | Delete a device |
+| `heramind device history <id>` | Telemetry history |
+| `heramind device control <id> <COMMAND>` | Send a control command to a device |
+| `heramind device types list` | List device-type templates |
+| `heramind device write-metric <id> <METRIC> <VALUE>` | Write a metric data point |
+| `heramind device webhook-url <id>` | Get the webhook URL for a device |
+| `heramind device drafts` | Manage auto-discovery drafts |
+
+## Sending Control Commands
+
+To send a command to a device (stop, set speed, alarm, reboot, ...):
+
+1. **Always inspect first**: `heramind device get <id>` — its output lists the device's supported commands. Do NOT guess a command name.
+2. **Send with the correct argument order**: `heramind device control <id> <COMMAND>` — the device ID comes FIRST, the command name SECOND. (Common mistake: writing the command before the ID, or `device <command> <id>`. The subcommand is `control`, not the command name.)
+3. Optional params — prefer the repeatable flag form (no JSON quoting):
+   `heramind device control <id> <COMMAND> --param key=value --param key2=value2`.
+   Numbers/booleans are auto-detected (`--param state=true --param speed=2`).
+   The JSON form also works: `--params '{"key":"value"}'`.
+
+Example:
+```bash
+heramind device get pump-A            # → shows stop / set_speed / calibrate
+heramind device control pump-A stop   # → sends stop (ID first, command second)
+heramind device control pump-A set_speed --param speed=2
+```
+
+If `device get` shows the command is NOT defined for the device's template, tell the user it isn't available — do not fabricate a success.
 
 ## Overview
 
@@ -337,7 +378,7 @@ Yes! Any topic works. HeraMind auto-discovers data from any topic.
 
 ### "How do I send commands to a device?"
 ```bash
-heramind device control <ID> <command> --params '<json>'
+heramind device control <ID> <command> --param key=value
 ```
 Commands are sent via MQTT to `{device_topic}/command` or `{device_topic}/downlink`.
 
@@ -370,7 +411,7 @@ These typically require a **gateway** that translates the protocol to MQTT or HT
 | `heramind device delete <ID>` | Delete device |
 | `heramind device get <ID>` | Get device details (metrics + commands) |
 | `heramind device history <ID> [--metric <M>] [--time-range <R>]` | Telemetry history |
-| `heramind device control <ID> <CMD> [--params '<JSON>']` | Send command |
+| `heramind device control <ID> <CMD> [--param k=v]... [--params '<JSON>']` | Send command |
 | `heramind device types list` | List device types |
 | `heramind device types create --name <N> --metrics '<JSON>'` | Create device type |
 | `heramind device types get <ID>` | Get device type details |

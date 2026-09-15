@@ -54,6 +54,7 @@ fn split_frontmatter(content: &str) -> Result<(String, String), ParseError> {
 fn parse_frontmatter(yaml: &str) -> Result<SkillMetadata, ParseError> {
     let mut id = None;
     let mut name = None;
+    let mut description = String::new();
     let mut category = SkillCategory::General;
     let mut origin = SkillOrigin::User;
     let mut priority = 50u32;
@@ -124,6 +125,12 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillMetadata, ParseError> {
                     name = Some(value.to_string());
                     current_section = "";
                 }
+                "description" => {
+                    // agentskills.io: descriptions carry the matching burden;
+                    // cap at 1024 chars to keep the matcher fast.
+                    description = value.chars().take(1024).collect();
+                    current_section = "";
+                }
                 "category" => {
                     category = match value {
                         "device" => SkillCategory::Device,
@@ -176,11 +183,9 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillMetadata, ParseError> {
                         });
                     }
                 }
-                "actions" => {
-                    if current_section == "tool_target" {
-                        if let Some(last) = tool_targets.last_mut() {
-                            last.actions = parse_list_value(value);
-                        }
+                "actions" if current_section == "tool_target" => {
+                    if let Some(last) = tool_targets.last_mut() {
+                        last.actions = parse_list_value(value);
                     }
                 }
                 _ => {}
@@ -194,6 +199,7 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillMetadata, ParseError> {
     Ok(SkillMetadata {
         id,
         name,
+        description,
         category,
         origin,
         priority,
@@ -323,6 +329,7 @@ Step-by-step guide here.
             metadata: SkillMetadata {
                 id: "test".into(),
                 name: "Test".into(),
+                description: String::new(),
                 category: SkillCategory::General,
                 origin: SkillOrigin::User,
                 priority: 50,

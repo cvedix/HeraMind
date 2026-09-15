@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from "react"
+import { useState, useEffect, useCallback, useRef, useMemo, type ReactNode } from "react"
 import { useTranslation } from "react-i18next"
-import { RefreshCw, Eye, Brain, Wrench, Loader2, Server, RotateCcw, Info } from "lucide-react"
+import { RefreshCw, Eye, Brain, Wrench, Loader2, Server, RotateCcw, Info, Text } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -17,6 +17,7 @@ import { extractErrorMessage } from "@/lib/notify"
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import type { PluginConfigSchema } from "@/types"
+import type { ReasoningCapabilities, ThinkingEffort } from "@/types/llm-backend"
 
 /**
  * Ollama model with capabilities
@@ -57,6 +58,13 @@ export interface PluginInstance {
   }
   [key: string]: unknown
 }
+
+/**
+ * Sentinel shown in the api_key field when a key is stored server-side
+ * (the real key is never returned). Submit paths treat it exactly like an
+ * empty value — "keep the existing key" — so it can never be persisted.
+ */
+export const API_KEY_MASK = "••••••••••••"
 
 /**
  * Unified plugin type definition
@@ -143,7 +151,13 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
   const [loadingLlamacppInfo, setLoadingLlamacppInfo] = useState(false)
 
   // Auto-detected capabilities state
-  const [detectedCapabilities, setDetectedCapabilities] = useState({
+  const [detectedCapabilities, setDetectedCapabilities] = useState<{
+    supports_multimodal: boolean
+    supports_thinking: boolean
+    supports_tools: boolean
+    max_context: number
+    reasoning?: ReasoningCapabilities
+  }>({
     supports_multimodal: false,
     supports_thinking: false,
     supports_tools: true,
@@ -162,11 +176,11 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
     pending: boolean
   }>({ override: null, effective: false, source: null, pending: false })
 
-  // Thinking toggle state. Unlike multimodal, thinking is a plain backend
+  // Thinking effort state. Unlike multimodal, thinking is a plain backend
   // config field (not an override) — the user choice IS the effective value.
-  // Default true (matches backend storage default_thinking_enabled()).
-  const [thinkingState, setThinkingState] = useState<{ enabled: boolean; pending: boolean }>({
-    enabled: true,
+  // `effort: "high"` = thinking on (default), `"none"` = off.
+  const [thinkingState, setThinkingState] = useState<{ effort: ThinkingEffort; pending: boolean }>({
+    effort: "high",
     pending: false,
   })
 
@@ -193,6 +207,7 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
             supports_thinking: modelWithCaps.supports_thinking,
             supports_tools: modelWithCaps.supports_tools,
             max_context: modelWithCaps.max_context,
+            reasoning: modelWithCaps.reasoning,
           })
         }
       }
@@ -244,7 +259,7 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
       // will re-initialise it from the editing instance's saved capabilities.
       setOverrideState({ override: null, effective: false, source: null, pending: false })
       // Reset thinking state too; re-initialised below from instance config.
-      setThinkingState({ enabled: true, pending: false })
+      setThinkingState({ effort: "high", pending: false })
 
       if (editingInstance && (editingInstance as any).capabilities) {
         const existingCaps = (editingInstance as any).capabilities
@@ -253,6 +268,7 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
           supports_thinking: existingCaps.supports_thinking ?? false,
           supports_tools: existingCaps.supports_tools ?? true,
           max_context: existingCaps.max_context ?? 8192,
+          reasoning: existingCaps.reasoning ?? undefined,
         })
         // Initialise multimodal override state from saved instance capabilities.
         // In create mode this branch is skipped — overrideState stays at its default
@@ -263,11 +279,16 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
           source: existingCaps.multimodal_source ?? null,
           pending: false,
         })
-        // Initialise thinking state from saved backend config (defaults to true
-        // if the field is absent — matches backend storage default).
-        const savedThinking = (editingInstance.config as any)?.thinking_enabled
+        // Initialise thinking effort from saved backend config. Prefer the
+        // unified `thinking_effort`; fall back to the legacy `thinking_enabled`
+        // bool (true → "high", false → "none"). Defaults to "high" if absent.
+        const savedEffort = (editingInstance.config as any)?.thinking_effort as
+          | ThinkingEffort
+          | undefined
+        const savedEnabled = (editingInstance.config as any)?.thinking_enabled
+        const initEffort: ThinkingEffort = savedEffort ?? (savedEnabled === false ? "none" : "high")
         setThinkingState({
-          enabled: typeof savedThinking === "boolean" ? savedThinking : true,
+          effort: initEffort,
           pending: false,
         })
         if (pluginType.id === "ollama") {
@@ -336,6 +357,20 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
         supports_tools: model.supports_tools,
         max_context: model.max_context,
       })
+      // Editing + switching models: re-sync the multimodal override's
+      // `effective` value to the newly selected model. Without this,
+      // `detectedCapabilities` (drives whether the Vision row shows) updates
+      // to the new model while `overrideState.effective` (drives the switch)
+      // stays stuck on the previous model — so a newly-selected vision model
+      // shows the row with the toggle off. A user-pinned override is
+      // preserved (stays authoritative); only the Auto value follows.
+      if (isEditing) {
+        setOverrideState((prev) => ({
+          ...prev,
+          effective:
+            prev.override != null ? prev.override : model.supports_multimodal,
+        }))
+      }
     }
   }
 
@@ -472,6 +507,28 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
       }
     }
 
+    // api_key is write-only (never returned by the API), so the edit form
+    // would always start empty — which reads as "my key is gone". Prefill
+    // with a mask when a key is stored. The mask is a SENTINEL: the update
+    // path strips it (same as empty) so it can never be saved as a real key.
+    if (editingInstance && schema.properties?.api_key) {
+      const configured = (editingInstance as any).api_key_configured
+      if (configured) {
+        schema.properties.api_key = {
+          ...schema.properties.api_key as any,
+          default: API_KEY_MASK,
+        }
+        // Placeholder still applies if the user clears the field.
+        schema.ui_hints = {
+          ...schema.ui_hints,
+          placeholders: {
+            ...schema.ui_hints?.placeholders,
+            api_key: t("plugins:llm.apiKeyKeepHint", { defaultValue: "Configured — leave blank to keep" }),
+          },
+        }
+      }
+    }
+
     return schema
   }
 
@@ -519,32 +576,28 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
     patchMultimodalOverride(!overrideState.effective)
   const handleResetMultimodalOverride = () => patchMultimodalOverride(null)
 
-  // PATCH thinking_enabled directly on the backend (not via capabilities
+  // PATCH thinking_effort directly on the backend (not via capabilities
   // override endpoint — thinking is a plain config field, not an override).
   // Optimistic update with rollback on error, mirroring patchMultimodalOverride.
   //
-  // After success, refresh the parent list so the next dialog open sees the
-  // persisted value. The dialog is rendered via portal as a sibling of the
-  // list, so refreshing the list does not unmount this dialog mid-interaction.
-  const patchThinking = async (value: boolean) => {
+  // We deliberately do NOT call `onRefresh()` here: the parent's loadData
+  // flips setLoading(true) which replaces the whole tab with a page-level
+  // loading skeleton — that unmounts this dialog mid-interaction and wipes
+  // any in-progress form edits. The PATCH response is authoritative, so local
+  // state stays correct; the card list reconciles on the next natural refresh.
+  const patchEffort = async (effort: ThinkingEffort) => {
     if (!editingInstance || thinkingState.pending) return
     const prev = thinkingState
-    setThinkingState({ enabled: value, pending: true })
+    setThinkingState({ effort, pending: true })
     try {
-      await api.updateLlmBackend(editingInstance.id, { thinking_enabled: value })
-      setThinkingState({ enabled: value, pending: false })
+      await api.updateLlmBackend(editingInstance.id, { thinking_effort: effort })
+      setThinkingState({ effort, pending: false })
       showSuccess(t("plugins:llm.thinkingSavedToast"))
-      // Refresh parent so reopen-without-Save shows the persisted value.
-      // Patched into thinking (and intentionally NOT into patchMultimodalOverride
-      // to limit scope); if multimodal needs the same fix later, mirror this.
-      if (onRefresh) {
-        try { await onRefresh() } catch { /* parent refresh is best-effort */ }
-      }
     } catch (error) {
       setThinkingState(prev)
       const isNotFound = (error as { status?: number })?.status === 404
       handleError(error as Error, {
-        operation: "Update thinking mode",
+        operation: "Update thinking effort",
         userMessage: isNotFound
           ? t("plugins:llm.backendNotFound")
           : t("plugins:llm.thinkingSaveFailed", { message: extractErrorMessage(error) }),
@@ -552,115 +605,168 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
     }
   }
 
-  const renderCapabilityBadges = () => (
-    <div className="flex flex-wrap gap-2 mt-2 items-center">
-      {/* Multimodal / Vision — interactive override in edit mode, read-only badge in create mode */}
-      {(() => {
-        // Create mode: no backend id → no PATCH possible → original read-only badge.
-        if (!isEditing) {
-          return detectedCapabilities.supports_multimodal ? (
-            <Badge variant="outline" className="text-xs">
-              <Eye className="h-4 w-4 mr-1" />
-              {t("plugins:llm.capabilityVision")}
-            </Badge>
-          ) : null
-        }
+  const renderCapabilityBadges = () => {
+    // Spec-row layout: each capability is one row — [icon] name on the left,
+    // value/control right-aligned. Deliberately NOT FormField: this is a
+    // capability summary panel, and wrapping mixed read-only/interactive items
+    // in form-field chrome reads as "weird half-form". A bordered tinted panel
+    // with iconified rows reads as a spec sheet instead.
+    const renderRow = (
+      key: string,
+      icon: ReactNode,
+      label: string,
+      children: ReactNode
+    ) => (
+      <div key={key} className="flex items-center justify-between gap-3 min-h-8">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="shrink-0">{icon}</span>
+          <span className="text-sm truncate">{label}</span>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">{children}</div>
+      </div>
+    )
 
-        // Edit mode: Switch + optional Reset button. Switch reflects the
-        // *effective* value (override when set, else auto-detected). Toggling
-        // pins the new value via PATCH. Label stays short — on/off is conveyed
-        // by the Switch position; source provenance and the "click to override"
-        // hint go into the Switch's `title` tooltip to keep the row compact
-        // alongside Thinking/Tools/ctx badges.
-        const effective = overrideState.effective
-        const override = overrideState.override
-        const source = overrideState.source
+    const rows: ReactNode[] = []
 
-        return (
-          <div className="flex items-center gap-2">
-            <Switch
-              checked={effective}
-              onCheckedChange={handleToggleMultimodalOverride}
-              disabled={overrideState.pending}
-              aria-label={t("plugins:llm.capabilityVision")}
-              title={
-                override == null
-                  ? source
-                    ? `${t("plugins:llm.overrideHint")} (${source})`
-                    : t("plugins:llm.overrideHint")
-                  : undefined
-              }
-            />
-            <span className="text-xs">
-              {override != null
-                ? t("plugins:llm.capabilityVisionOverrideLabelText")
-                : t("plugins:llm.capabilityVisionAutoLabel")}
-            </span>
-            {override != null && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-6 w-6 p-0"
-                onClick={handleResetMultimodalOverride}
-                disabled={overrideState.pending}
-                aria-label={t("plugins:llm.resetToAuto")}
-                title={t("plugins:llm.resetToAuto")}
-              >
-                <RotateCcw className="h-3 w-3" />
-              </Button>
-            )}
-            {overrideState.pending && (
-              <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-            )}
-          </div>
-        )
-      })()}
-      {(() => {
-        // Same pattern as multimodal above: read-only badge in create mode,
-        // interactive Switch in edit mode. Hidden entirely when the model
-        // doesn't support thinking — no point showing a disabled control.
-        if (!detectedCapabilities.supports_thinking) return null
-        if (!isEditing) {
-          return (
-            <Badge variant="outline" className="text-xs">
-              <Brain className="h-4 w-4 mr-1" />
-              {t("plugins:llm.capabilityThinking")}
+    // Vision / multimodal — interactive override in edit mode, read-only in create
+    if (detectedCapabilities.supports_multimodal) {
+      if (!isEditing) {
+        rows.push(
+          renderRow(
+            "vision",
+            <Eye className="h-4 w-4 text-info" />,
+            t("plugins:llm.capabilityVision"),
+            <Badge variant="outline" className="text-xs h-6">
+              {t("plugins:llm.capabilityVisionSupported", { defaultValue: "Supported" })}
             </Badge>
           )
-        }
-        return (
-          <div className="flex items-center gap-2">
-            <Switch
-              checked={thinkingState.enabled}
-              onCheckedChange={patchThinking}
-              disabled={thinkingState.pending}
-              aria-label={t("plugins:llm.capabilityThinking")}
-              title={t("plugins:llm.thinkingToggleHint")}
-            />
-            <span className="text-xs">
-              {thinkingState.enabled
-                ? t("plugins:llm.thinkingOnLabel")
-                : t("plugins:llm.thinkingOffLabel")}
-            </span>
-            {thinkingState.pending && (
-              <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-            )}
-          </div>
         )
-      })()}
-      {detectedCapabilities.supports_tools && (
-        <Badge variant="outline" className="text-xs">
-          <Wrench className="h-4 w-4 mr-1" />
-          Tools
-        </Badge>
-      )}
-      <Badge variant="secondary" className="text-xs">
-        {detectedCapabilities.max_context >= 100000
-          ? `${Math.round(detectedCapabilities.max_context / 1000)}k ctx`
-          : `${detectedCapabilities.max_context} ctx`}
-      </Badge>
-    </div>
-  )
+      } else {
+        const effective = overrideState.effective
+        const override = overrideState.override
+        rows.push(
+          renderRow(
+            "vision",
+            <Eye className="h-4 w-4 text-info" />,
+            t("plugins:llm.capabilityVision"),
+            <>
+              <Switch
+                checked={effective}
+                onCheckedChange={handleToggleMultimodalOverride}
+                disabled={overrideState.pending}
+                aria-label={t("plugins:llm.capabilityVision")}
+              />
+              <span className="text-xs text-muted-foreground">
+                {override != null
+                  ? t("plugins:llm.capabilityVisionOverrideLabelText")
+                  : t("plugins:llm.capabilityVisionAutoLabel")}
+              </span>
+              {override != null && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 w-6 p-0"
+                  onClick={handleResetMultimodalOverride}
+                  disabled={overrideState.pending}
+                  aria-label={t("plugins:llm.resetToAuto")}
+                  title={t("plugins:llm.resetToAuto")}
+                >
+                  <RotateCcw className="h-3 w-3" />
+                </Button>
+              )}
+            </>
+          )
+        )
+      }
+    }
+
+    // Thinking effort — read-only badge when model-controlled or non-edit, else dropdown
+    if (detectedCapabilities.supports_thinking) {
+      const control = detectedCapabilities.reasoning?.control
+      const isReadOnly = control === "readonly" || control === undefined
+      if (!isEditing || isReadOnly) {
+        rows.push(
+          renderRow(
+            "thinking",
+            <Brain className="h-4 w-4 text-accent-purple" />,
+            t("plugins:llm.capabilityThinking"),
+            <Badge variant="outline" className="text-xs h-6">
+              {t("plugins:llm.capabilityThinkingReadOnly", { defaultValue: "Thinking (model default)" })}
+            </Badge>
+          )
+        )
+      } else {
+        const showLevels = control !== "boolean"
+        rows.push(
+          renderRow(
+            "thinking",
+            <Brain className="h-4 w-4 text-accent-purple" />,
+            t("plugins:llm.capabilityThinking"),
+            <>
+              <Select
+                value={thinkingState.effort}
+                onValueChange={(v) => patchEffort(v as ThinkingEffort)}
+                disabled={thinkingState.pending}
+              >
+                <SelectTrigger className="w-[140px] h-8" aria-label={t("plugins:llm.capabilityThinking")}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">{t("plugins:llm.effortNone")}</SelectItem>
+                  {showLevels && (
+                    <>
+                      <SelectItem value="low">{t("plugins:llm.effortLow")}</SelectItem>
+                      <SelectItem value="medium">{t("plugins:llm.effortMedium")}</SelectItem>
+                    </>
+                  )}
+                  <SelectItem value="high">{t("plugins:llm.effortHigh")}</SelectItem>
+                </SelectContent>
+              </Select>
+              {thinkingState.pending && (
+                <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+              )}
+            </>
+          )
+        )
+      }
+    }
+
+    // Tools — read-only
+    if (detectedCapabilities.supports_tools) {
+      rows.push(
+        renderRow(
+          "tools",
+          <Wrench className="h-4 w-4 text-accent-orange" />,
+          t("plugins:llm.capabilityTools"),
+          <Badge variant="outline" className="text-xs h-6">
+            {t("plugins:llm.capabilityToolsSupported", { defaultValue: "Supported" })}
+          </Badge>
+        )
+      )
+    }
+
+    // Context window — read-only
+    rows.push(
+      renderRow(
+        "context",
+        <Text className="h-4 w-4 text-accent-cyan" />,
+        t("plugins:llm.capabilityContext", { defaultValue: "Context Window" }),
+        <span className="text-sm text-muted-foreground tabular-nums">
+          {detectedCapabilities.max_context >= 100000
+            ? `${Math.round(detectedCapabilities.max_context / 1000)}k tokens`
+            : `${detectedCapabilities.max_context} tokens`}
+        </span>
+      )
+    )
+
+    if (rows.length === 0) return null
+
+    return (
+      <div className="rounded-lg border border-border bg-muted-30 p-3 space-y-2">
+        {rows}
+      </div>
+    )
+  }
 
   const getModelIcon = (model: OllamaModel) => {
     const icons = []
@@ -701,6 +807,7 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
       }
       icon={<span className={pluginType.color}>{pluginType.icon}</span>}
       width="xl"
+      className="z-[110]"
       isSubmitting={saving}
       preventCloseOnSubmit={false}
       footer={
@@ -927,9 +1034,14 @@ export function UniversalPluginConfigDialog(props: UniversalPluginConfigDialogPr
                       )}
                     </div>
                   )}
-                  {renderCapabilityBadges()}
                 </div>
               )}
+
+              {/* Capabilities — always visible for llama.cpp, independent of
+                  server connectivity. (llama.cpp is ReadOnly for thinking —
+                  thinking follows the model default — but the control must not
+                  silently disappear.) */}
+              {renderCapabilityBadges()}
 
               {/* Error state */}
               {llamacppServerInfo && llamacppServerInfo.status !== "ok" && (

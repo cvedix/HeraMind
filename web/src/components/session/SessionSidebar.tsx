@@ -5,6 +5,7 @@
  */
 
 import { getPortalRoot } from '@/lib/portal'
+import { handleWindowDragMouseDown } from "@/lib/windowDrag"
 import { useState, useEffect, useRef, useMemo } from "react"
 import { useTranslation } from "react-i18next"
 import { useNavigate, useParams } from "react-router-dom"
@@ -21,8 +22,6 @@ import {
   MessageSquare,
   Trash2,
   Clock,
-  PanelLeftClose,
-  PanelLeftOpen,
   Pencil,
   Check,
 } from "lucide-react"
@@ -47,10 +46,6 @@ interface SessionSidebarProps {
   open: boolean
   /** Mobile drawer mode: close handler */
   onClose: () => void
-  /** Desktop mode: collapsed state */
-  collapsed?: boolean
-  /** Desktop mode: toggle collapse */
-  onToggleCollapse?: () => void
   /** Is desktop mode (fixed sidebar) */
   isDesktop?: boolean
 }
@@ -58,8 +53,6 @@ interface SessionSidebarProps {
 export function SessionSidebar({
   open,
   onClose,
-  collapsed = false,
-  onToggleCollapse,
   isDesktop = false
 }: SessionSidebarProps) {
   const { t } = useTranslation('common')
@@ -308,22 +301,9 @@ export function SessionSidebar({
     <>
       {/* Header */}
       {showHeader && (
-        <div className="flex items-center justify-between p-3 border-b border-border">
-          {!collapsed && <h2 className="text-sm font-semibold">{t('session.sessions')}</h2>}
-          {isDesktop ? (
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={onToggleCollapse}
-              className={cn("h-6 w-6 rounded-lg", collapsed && "mx-auto")}
-            >
-              {collapsed ? (
-                <PanelLeftOpen className="h-4 w-4" />
-              ) : (
-                <PanelLeftClose className="h-4 w-4" />
-              )}
-            </Button>
-          ) : (
+        <div className="relative z-[1] flex items-center justify-between px-3 py-2" onMouseDown={handleWindowDragMouseDown}>
+          <h2 className="text-base font-semibold">{t('session.sessions')}</h2>
+          {!isDesktop && (
             <Button
               variant="ghost"
               size="icon"
@@ -336,64 +316,14 @@ export function SessionSidebar({
         </div>
       )}
 
-      {/* Collapsed mode - only show icons */}
-      {collapsed ? (
-        <div className="flex-1 min-h-0 flex flex-col items-center py-2 gap-1 overflow-hidden">
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={handleNewSession}
-            disabled={isCreating}
-            className="h-9 w-9 rounded-lg"
-            title={t('session.newChat')}
-          >
-            <Plus className="h-4 w-4" />
-          </Button>
-          <div className="w-6 h-px bg-glass-border my-1" />
-          <ScrollArea className="flex-1 w-full min-h-0">
-            <div className="flex flex-col items-center gap-1 py-1">
-              {sortedSessions.map((session) => {
-                const isActive = session.sessionId === currentSessionId
-                return (
-                  <Button
-                    key={session.sessionId}
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => handleSwitchSession(session.sessionId)}
-                    className={cn(
-                      "h-9 w-9 rounded-lg",
-                      isActive && "bg-muted"
-                    )}
-                    title={getSessionTitle(session)}
-                  >
-                    <MessageSquare className={cn(
-                      "h-4 w-4",
-                      isActive ? "text-foreground" : "text-muted-foreground"
-                    )} />
-                  </Button>
-                )
-              })}
-              {/* Load more trigger */}
-              <div ref={loadMoreTriggerRef} className="h-1" />
-              {/* Loading indicator */}
-              {sessionsLoading && (
-                <div className="flex items-center justify-center py-2">
-                  <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                </div>
-              )}
-            </div>
-          </ScrollArea>
-        </div>
-      ) : (
-        <>
-          {/* Search */}
-          <div className="px-3 py-2">
-            <div className="relative">
-              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-              <Input
-                ref={searchInputRef}
-                type="text"
-                placeholder={t('session.search')}
+      {/* Search */}
+      <div className="px-3 py-2">
+        <div className="relative">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+          <Input
+            ref={searchInputRef}
+            type="text"
+            placeholder={t('session.search')}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="pl-8 h-8 text-sm rounded-lg bg-muted-50 border-0"
@@ -436,7 +366,9 @@ export function SessionSidebar({
                         key={session.sessionId}
                         onClick={() => !isEditing && handleSwitchSession(session.sessionId)}
                         className={cn(
-                          "group relative flex items-start gap-2 p-2 rounded-lg cursor-pointer transition-all",
+                          // Flat list: selected = plain muted block (no
+                          // raised card / shadow — the 3D look was overkill)
+                          "group relative flex items-start gap-2 p-2 rounded-lg cursor-pointer transition-colors",
                           isActive
                             ? "bg-muted"
                             : "hover:bg-muted-50",
@@ -456,6 +388,7 @@ export function SessionSidebar({
                               disabled={isUpdating}
                             />
                             <button
+                              aria-label={t('common:confirm')}
                               className="h-6 w-6 shrink-0 flex items-center justify-center rounded-md text-success hover:bg-success-light transition-colors"
                               onClick={() => handleEditSave(session.sessionId)}
                               disabled={isUpdating || !editingTitle.trim()}
@@ -463,6 +396,7 @@ export function SessionSidebar({
                               <Check className="h-3.5 w-3.5" />
                             </button>
                             <button
+                              aria-label={t('common:cancel')}
                               className="h-6 w-6 shrink-0 flex items-center justify-center rounded-md hover:bg-muted transition-colors"
                               onClick={handleEditCancel}
                               disabled={isUpdating}
@@ -473,9 +407,9 @@ export function SessionSidebar({
                         ) : (
                           // Normal mode
                           <>
-                            <div className="flex items-start gap-2 min-w-0 flex-1">
+                            <div className="flex items-center gap-2 min-w-0 flex-1">
                               <MessageSquare className={cn(
-                                "h-4 w-4 mt-0.5 shrink-0",
+                                "h-4 w-4 shrink-0",
                                 isActive ? "text-foreground" : "text-muted-foreground"
                               )} />
                               <div className="min-w-0 flex-1">
@@ -499,9 +433,10 @@ export function SessionSidebar({
                             </div>
 
                             {/* Action buttons */}
-                            <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 translate-x-1 transition-all duration-fast group-hover:translate-x-0 group-hover:opacity-100">
                               <button
                                 onClick={(e) => handleEditClick(e, session)}
+                                aria-label={t('common:edit')}
                                 className="h-6 w-6 flex items-center justify-center rounded hover:bg-muted transition-colors"
                                 title={t('session.rename')}
                               >
@@ -509,6 +444,7 @@ export function SessionSidebar({
                               </button>
                               <button
                                 onClick={(e) => handleDeleteClick(e, session.sessionId)}
+                                aria-label={t('common:delete')}
                                 disabled={isDeleting}
                                 className={cn(
                                   "h-6 w-6 flex items-center justify-center rounded hover:bg-error-light text-muted-foreground hover:text-error transition-colors",
@@ -536,15 +472,6 @@ export function SessionSidebar({
               )}
             </div>
           </ScrollArea>
-
-          {/* Footer */}
-          <div className="p-2 border-t border-border">
-            <p className={cn(textNano, "text-muted-foreground text-center")}>
-              {t('session.totalSessions', { count: sessions.length })}
-            </p>
-          </div>
-        </>
-      )}
     </>
   )
 
@@ -552,18 +479,28 @@ export function SessionSidebar({
   if (isDesktop) {
     return (
       <>
-        <div
-          className={cn(
-            // bg-popover (opaque, semantic "floating layer" token) unifies
-            // the persistent chat list with all other side drawers / popups.
-            // Previously bg-bg-50 (50% white) was a frosted layer that let
-            // the aurora gradient bleed through; it created a visible color
-            // gap against the opaque chat content area and the bg-popover
-            // dialogs opened on top of it.
-            "h-full bg-popover border-r border-border flex flex-col transition-[width] duration-200 overflow-hidden",
-            collapsed ? "w-12" : "w-64"
-          )}
-        >
+      <div
+        className={cn(
+          // Chrome panel — one step brighter than the rail in BOTH themes
+          // (light: white vs #F8F9FA rail; dark: 0.20 vs 0.115 rail), so
+          // the page sidebar reads as a separate surface. Right border
+          // separates it from the white content area. Fixed width.
+          "relative h-full w-64 bg-background border-r border-border flex flex-col overflow-hidden"
+        )}
+        style={{
+          // Safe top clearance: the drawer starts below the window chrome /
+          // traffic-light strip instead of touching the window edge
+          paddingTop: "calc(env(safe-area-inset-top, 0px) + 1rem)",
+        }}
+      >
+          {/* Window drag strip — covers the top clearance zone + header row
+              behind it; the header content sits above (z-[1]) so its
+              buttons stay clickable */}
+          <div
+            className="absolute inset-x-0 top-0 z-0"
+            style={{ height: "calc(env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px) + 2.75rem)" }}
+            onMouseDown={handleWindowDragMouseDown}
+          />
           {SidebarContent({})}
         </div>
 
@@ -582,7 +519,7 @@ export function SessionSidebar({
               </AlertDialogCancel>
               <AlertDialogAction
                 onClick={handleConfirmDelete}
-                className="bg-destructive text-error-foreground hover:bg-destructive-hover"
+                className="bg-destructive text-destructive-foreground hover:bg-destructive-hover"
               >
                 {t('delete')}
               </AlertDialogAction>
@@ -599,7 +536,7 @@ export function SessionSidebar({
       {/* Backdrop */}
       {open && (
         <div
-          className="fixed inset-0 bg-overlay-light backdrop-blur-sm z-[60] transition-opacity lg:hidden"
+          className="fixed inset-0 bg-overlay-light backdrop-blur-sm z-50 transition-opacity lg:hidden"
           onClick={onClose}
         />
       )}
@@ -607,14 +544,14 @@ export function SessionSidebar({
       {/* Sidebar */}
       <div
         className={cn(
-          "fixed top-0 left-0 h-full w-72 z-[70] lg:hidden safe-top",
+          "fixed top-0 left-0 h-full w-72 z-50 lg:hidden safe-top",
           // bg-popover matches the desktop persistent sidebar and every
           // other drawer / popup in the app. Previously bg-background,
           // which is /97% alpha in dark mode and let the page + backdrop
           // bleed through, making the drawer read darker than the chrome
           // layer it slides out from.
           "bg-popover shadow-xl flex flex-col",
-          "transform transition-transform duration-300 ease-out",
+          "transform transition-transform duration-slow ease-out",
           open ? "translate-x-0" : "-translate-x-full"
         )}
       >
@@ -636,7 +573,7 @@ export function SessionSidebar({
             </AlertDialogCancel>
             <AlertDialogAction
               onClick={handleConfirmDelete}
-              className="bg-destructive text-error-foreground hover:bg-destructive-hover"
+              className="bg-destructive text-destructive-foreground hover:bg-destructive-hover"
             >
               {t('delete')}
             </AlertDialogAction>

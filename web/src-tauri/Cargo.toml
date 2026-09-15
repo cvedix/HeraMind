@@ -1,6 +1,6 @@
 [package]
 name = "heramind-tauri"
-version = "0.9.11"
+version = "0.9.24"
 description = "HeraMind Edge AI Platform"
 authors = ["HeraMind Team"]
 license = "MIT"

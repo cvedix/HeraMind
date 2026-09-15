@@ -7,6 +7,7 @@ import { ResponsiveTable, StatusBadge, EmptyState } from "@/components/shared"
 import { DeviceStatusBadge } from "@/components/shared/DeviceStatusBadge"
 import { Eye, MoreVertical, Trash2, Cpu, Database, Waves, Pencil } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { interactiveCardHover } from "@/design-system/tokens/size"
 import { textMini } from "@/design-system/tokens/typography"
 import { formatTimestamp } from "@/lib/utils/format"
 import type { Device } from "@/types"
@@ -92,7 +93,10 @@ export function DeviceList({
             return (
               <Card
                 key={device.id}
-                className="overflow-hidden border-border shadow-sm cursor-pointer active:scale-[0.99] hover:shadow-md hover:-translate-y-0.5 transition-all duration-200"
+                className={cn(
+                  "overflow-hidden border-border shadow-sm cursor-pointer active:scale-[0.99]",
+                  interactiveCardHover,
+                )}
                 onClick={() => onViewDetails(device)}
               >
                 <div className="px-3 py-2.5">
@@ -158,7 +162,7 @@ export function DeviceList({
       ) : (
         <ResponsiveTable
         onRowClick={(rowData) => {
-          onViewDetails(rowData as unknown as Device)
+          onViewDetails(rowData)
         }}
         columns={[
           {
@@ -190,11 +194,11 @@ export function DeviceList({
             align: 'center',
           },
         ]}
-        data={paginatedDevices as unknown as Record<string, unknown>[]}
-        rowKey={(device) => (device as unknown as Device).id}
+        data={paginatedDevices}
+        rowKey={(device: Device) => device.id}
         loading={loading}
         renderCell={(columnKey, rowData) => {
-          const device = rowData as unknown as Device
+          const device = rowData
           const AdapterIcon = getAdapterIcon(device.adapter_type)
 
           switch (columnKey) {
@@ -255,7 +259,7 @@ export function DeviceList({
             label: t('devices:actions.viewDetails'),
             icon: <Eye className="h-4 w-4" />,
             onClick: (rowData) => {
-              const device = rowData as unknown as Device
+              const device = rowData
               onViewDetails(device)
             },
           },
@@ -263,7 +267,7 @@ export function DeviceList({
             label: t('common:edit'),
             icon: <Pencil className="h-4 w-4" />,
             onClick: (rowData) => {
-              const device = rowData as unknown as Device
+              const device = rowData
               onEdit(device)
             },
           },
@@ -272,7 +276,7 @@ export function DeviceList({
             icon: <Trash2 className="h-4 w-4" />,
             variant: 'destructive',
             onClick: (rowData) => {
-              const device = rowData as unknown as Device
+              const device = rowData
               onDelete(device.id)
             },
           },

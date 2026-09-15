@@ -66,7 +66,21 @@ pub async fn trigger_summarization(
         return Ok(());
     }
 
-    // Determine which messages to summarize: first 50% not already summarized
+    // Determine which messages to summarize: first 50% not already summarized,
+    // bounded by a character budget derived from the model's context window.
+    //
+    // [self-overflow fix] The old code took `unsummarized.len() / 2` MESSAGES
+    // with full text — message count is not token count, so on small-context
+    // models (8K) the summary prompt itself could exceed the window exactly
+    // when compression was most needed; the call then failed (warn) forever
+    // and the context kept growing. Bound the input instead: each message is
+    // capped, and the cumulative budget keeps the summary prompt comfortably
+    // inside the window (mixed CJK ≈ 1.8 tokens/char, so ~0.3 chars/token;
+    // 25% of the window for input + the fixed prompt + response headroom).
+    const PER_MESSAGE_CHAR_CAP: usize = 300;
+    let char_budget: usize = ((max_ctx as f64) * 0.15) as usize;
+    let char_budget = char_budget.clamp(2_000, 24_000);
+
     let summary_up_to = metadata.summary_up_to_index.unwrap_or(0) as usize;
     let unsummarized: Vec<&AgentMessage> = history
         .iter()
@@ -80,34 +94,50 @@ pub async fn trigger_summarization(
         return Ok(());
     }
 
-    let summarize_count = unsummarized.len() / 2;
-    let messages_to_summarize = &unsummarized[..summarize_count];
+    let summarize_count_target = unsummarized.len() / 2;
 
-    // Build conversation text for summarization
+    // Build conversation text for summarization under the char budget
     let mut conv_text = String::new();
-    for msg in messages_to_summarize {
-        match msg.role.as_str() {
-            "user" => conv_text.push_str(&format!("User: {}\n", msg.content)),
+    let mut summarized_count = 0usize;
+    for msg in unsummarized.iter().take(summarize_count_target) {
+        let line = match msg.role.as_str() {
+            "user" => format!(
+                "User: {}\n",
+                truncate_str(&msg.content, PER_MESSAGE_CHAR_CAP)
+            ),
             "assistant" => {
                 // Skip thinking content, only include actual response
-                conv_text.push_str(&format!("Assistant: {}\n", msg.content));
+                format!(
+                    "Assistant: {}\n",
+                    truncate_str(&msg.content, PER_MESSAGE_CHAR_CAP)
+                )
             }
             "tool" => {
                 if let Some(ref tool_name) = msg.tool_call_name {
-                    conv_text.push_str(&format!(
+                    format!(
                         "[Tool {}: {}]\n",
                         tool_name,
                         truncate_str(&msg.content, 200)
-                    ));
+                    )
+                } else {
+                    continue;
                 }
             }
-            _ => {}
+            _ => continue,
+        };
+        if conv_text.len() + line.len() > char_budget && summarized_count >= 4 {
+            // Budget exhausted (keep at least 4 messages so the summary is
+            // meaningful at all); summarize what we have.
+            break;
         }
+        conv_text.push_str(&line);
+        summarized_count += 1;
     }
 
-    if conv_text.is_empty() {
+    if summarized_count == 0 || conv_text.is_empty() {
         return Ok(());
     }
+    let summarize_count = summarized_count;
 
     // Call LLM to generate summary (non-streaming, thinking disabled)
     let summary_prompt = format!(
@@ -115,11 +145,15 @@ pub async fn trigger_summarization(
         conv_text
     );
 
-    // Disable thinking for this call to save tokens, then restore the prior setting
-    let prev_thinking = llm_interface.get_thinking_enabled().await;
-    llm_interface.set_thinking_enabled(false).await;
-    let summary_result = llm_interface.chat(&summary_prompt).await;
-    llm_interface.restore_thinking_enabled(prev_thinking).await;
+    // Thinking disabled via a PER-CALL override. The old pattern mutated the
+    // interface-global flag around the call (set false -> chat -> restore):
+    // a user turn starting during the multi-second summary ran with thinking
+    // silently off, a user toggle made mid-summary was clobbered by the
+    // restore, and an abort between set/restore left thinking disabled for
+    // the rest of the session.
+    let summary_result = llm_interface
+        .chat_with_thinking(&summary_prompt, Some(false))
+        .await;
     let summary = match summary_result {
         Ok(response) => response.text,
         Err(e) => {
@@ -128,9 +162,26 @@ pub async fn trigger_summarization(
         }
     };
 
-    // Append to existing summary or create new one
+    // Append to existing summary or create new one.
+    // [bounded chains] Summaries used to append forever ("--- 后续对话摘要 ---"
+    // per threshold crossing) — an unbounded system message that the context
+    // window keeps with NO budget check. Cap the chain at 4 segments; beyond
+    // that, fold: the new summary REPLACES the old ones (the summarizer was
+    // given the prior summary text in its input, so nothing is lost).
+    const MAX_SUMMARY_SEGMENTS: usize = 4;
     let new_summary = match &metadata.conversation_summary {
-        Some(existing) => format!("{}\n\n--- 后续对话摘要 ---\n{}", existing, summary),
+        Some(existing) => {
+            let segments = existing.matches("--- 后续对话摘要 ---").count();
+            if segments + 1 < MAX_SUMMARY_SEGMENTS {
+                format!("{}\n\n--- 后续对话摘要 ---\n{}", existing, summary)
+            } else {
+                tracing::debug!(
+                    segments,
+                    "Summary chain at cap — folding old segments into the new summary"
+                );
+                summary
+            }
+        }
         None => summary,
     };
 

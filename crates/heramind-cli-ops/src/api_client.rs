@@ -83,11 +83,24 @@ impl ApiClient {
             }
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             if !status.is_success() {
-                anyhow::bail!("API error ({}): {}", status, extract_error_message(&body));
+                anyhow::bail!(
+                    "API error ({}): {}{}",
+                    status,
+                    extract_error_message(&body),
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        unauthorized_hint()
+                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                        "\nHint: is the server running? Try: heramind health"
+                    } else {
+                        ""
+                    }
+                );
             }
             return Ok(body);
         }
-        anyhow::bail!("API request failed after retry")
+        anyhow::bail!(
+            "API request failed after retry — is the server running? Try: heramind health"
+        )
     }
 
     pub async fn post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
@@ -105,14 +118,23 @@ impl ApiClient {
             let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
             if !status.is_success() {
                 anyhow::bail!(
-                    "API error ({}): {}",
+                    "API error ({}): {}{}",
                     status,
-                    extract_error_message(&resp_body)
+                    extract_error_message(&resp_body),
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        unauthorized_hint()
+                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                        "\nHint: is the server running? Try: heramind health"
+                    } else {
+                        ""
+                    }
                 );
             }
             return Ok(resp_body);
         }
-        anyhow::bail!("API request failed after retry")
+        anyhow::bail!(
+            "API request failed after retry — is the server running? Try: heramind health"
+        )
     }
 
     pub async fn post_raw(&self, path: &str) -> Result<serde_json::Value> {
@@ -127,14 +149,23 @@ impl ApiClient {
             let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
             if !status.is_success() {
                 anyhow::bail!(
-                    "API error ({}): {}",
+                    "API error ({}): {}{}",
                     status,
-                    extract_error_message(&resp_body)
+                    extract_error_message(&resp_body),
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        unauthorized_hint()
+                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                        "\nHint: is the server running? Try: heramind health"
+                    } else {
+                        ""
+                    }
                 );
             }
             return Ok(resp_body);
         }
-        anyhow::bail!("API request failed after retry")
+        anyhow::bail!(
+            "API request failed after retry — is the server running? Try: heramind health"
+        )
     }
 
     pub async fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
@@ -152,14 +183,57 @@ impl ApiClient {
             let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
             if !status.is_success() {
                 anyhow::bail!(
-                    "API error ({}): {}",
+                    "API error ({}): {}{}",
                     status,
-                    extract_error_message(&resp_body)
+                    extract_error_message(&resp_body),
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        unauthorized_hint()
+                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                        "\nHint: is the server running? Try: heramind health"
+                    } else {
+                        ""
+                    }
                 );
             }
             return Ok(resp_body);
         }
-        anyhow::bail!("API request failed after retry")
+        anyhow::bail!(
+            "API request failed after retry — is the server running? Try: heramind health"
+        )
+    }
+
+    pub async fn patch(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        for attempt in 0..=MAX_RETRIES {
+            let url = format!("{}{}", self.base_url, path);
+            let resp = self
+                .add_auth(self.client.patch(&url).json(body))
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.as_u16() == 401 && attempt < MAX_RETRIES {
+                self.refresh_api_key();
+                continue;
+            }
+            let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!(
+                    "API error ({}): {}{}",
+                    status,
+                    extract_error_message(&resp_body),
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        unauthorized_hint()
+                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                        "\nHint: is the server running? Try: heramind health"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            return Ok(resp_body);
+        }
+        anyhow::bail!(
+            "API request failed after retry — is the server running? Try: heramind health"
+        )
     }
 
     pub async fn delete(&self, path: &str) -> Result<serde_json::Value> {
@@ -174,14 +248,23 @@ impl ApiClient {
             let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
             if !status.is_success() {
                 anyhow::bail!(
-                    "API error ({}): {}",
+                    "API error ({}): {}{}",
                     status,
-                    extract_error_message(&resp_body)
+                    extract_error_message(&resp_body),
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        unauthorized_hint()
+                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                        "\nHint: is the server running? Try: heramind health"
+                    } else {
+                        ""
+                    }
                 );
             }
             return Ok(resp_body);
         }
-        anyhow::bail!("API request failed after retry")
+        anyhow::bail!(
+            "API request failed after retry — is the server running? Try: heramind health"
+        )
     }
 
     pub async fn delete_with_body(
@@ -203,14 +286,23 @@ impl ApiClient {
             let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
             if !status.is_success() {
                 anyhow::bail!(
-                    "API error ({}): {}",
+                    "API error ({}): {}{}",
                     status,
-                    extract_error_message(&resp_body)
+                    extract_error_message(&resp_body),
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        unauthorized_hint()
+                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                        "\nHint: is the server running? Try: heramind health"
+                    } else {
+                        ""
+                    }
                 );
             }
             return Ok(resp_body);
         }
-        anyhow::bail!("API request failed after retry")
+        anyhow::bail!(
+            "API request failed after retry — is the server running? Try: heramind health"
+        )
     }
 
     /// Upload a single file as multipart with the specified field name.
@@ -252,14 +344,23 @@ impl ApiClient {
             let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
             if !status.is_success() {
                 anyhow::bail!(
-                    "API error ({}): {}",
+                    "API error ({}): {}{}",
                     status,
-                    extract_error_message(&resp_body)
+                    extract_error_message(&resp_body),
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        unauthorized_hint()
+                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                        "\nHint: is the server running? Try: heramind health"
+                    } else {
+                        ""
+                    }
                 );
             }
             return Ok(resp_body);
         }
-        anyhow::bail!("API request failed after retry")
+        anyhow::bail!(
+            "API request failed after retry — is the server running? Try: heramind health"
+        )
     }
 
     /// Upload multiple named parts as multipart/form-data.
@@ -295,14 +396,23 @@ impl ApiClient {
             let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
             if !status.is_success() {
                 anyhow::bail!(
-                    "API error ({}): {}",
+                    "API error ({}): {}{}",
                     status,
-                    extract_error_message(&resp_body)
+                    extract_error_message(&resp_body),
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        unauthorized_hint()
+                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                        "\nHint: is the server running? Try: heramind health"
+                    } else {
+                        ""
+                    }
                 );
             }
             return Ok(resp_body);
         }
-        anyhow::bail!("API request failed after retry")
+        anyhow::bail!(
+            "API request failed after retry — is the server running? Try: heramind health"
+        )
     }
 }
 
@@ -327,6 +437,28 @@ fn extract_error_message(body: &serde_json::Value) -> String {
         .or_else(|| body.get("error").and_then(|v| v.as_str()))
         .unwrap_or("Unknown error")
         .to_string()
+}
+
+/// Context-aware next-command hint for 401 responses.
+///
+/// The bare "Run: heramind login" advice dead-ends when a credential already
+/// exists — `heramind login` then short-circuits with "already logged in"
+/// (it checks file existence, not validity), so an agent or user following
+/// the hint loops forever. Route each starting state to a command that can
+/// actually make progress:
+/// - credential file present but rejected → diagnose with `whoami`,
+///   refresh with `login --force`
+/// - HERAMIND_API_KEY env set but rejected → the env var shadows every other
+///   source; unset it or fix its value
+/// - nothing stored → bootstrap with `login`
+fn unauthorized_hint() -> &'static str {
+    if std::env::var_os("HERAMIND_API_KEY").is_some() {
+        "\nHint: HERAMIND_API_KEY was rejected by the server — unset the env var or correct its value"
+    } else if crate::auto_auth::read_logged_in_key().is_some() {
+        "\nHint: stored credential was rejected. Diagnose with: heramind whoami — refresh with: heramind login --force"
+    } else {
+        "\nHint: not logged in? Run: heramind login"
+    }
 }
 
 #[cfg(test)]
@@ -377,5 +509,80 @@ mod tests {
         let client = ApiClient::with_base_url("http://localhost:9375/api");
         client.refresh_api_key();
         // Should not panic
+    }
+
+    /// Guards the two process-global env vars the hint branches read.
+    static HINT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores both env vars on drop, even on panic.
+    struct HintEnvGuard {
+        api_key_value: Option<std::ffi::OsString>,
+        config_dir_value: Option<std::ffi::OsString>,
+    }
+    impl HintEnvGuard {
+        fn take() -> Self {
+            Self {
+                api_key_value: std::env::var_os("HERAMIND_API_KEY"),
+                config_dir_value: std::env::var_os("HERAMIND_CONFIG_DIR"),
+            }
+        }
+    }
+    impl Drop for HintEnvGuard {
+        fn drop(&mut self) {
+            match &self.api_key_value {
+                Some(v) => std::env::set_var("HERAMIND_API_KEY", v),
+                None => std::env::remove_var("HERAMIND_API_KEY"),
+            }
+            match &self.config_dir_value {
+                Some(v) => std::env::set_var("HERAMIND_CONFIG_DIR", v),
+                None => std::env::remove_var("HERAMIND_CONFIG_DIR"),
+            }
+        }
+    }
+
+    /// The 401 hint must route each starting state to a command that makes
+    /// progress. Regression for the incident where a stored-but-stale
+    /// credential got "Run: heramind login" → "already logged in" → dead end.
+    #[test]
+    fn test_unauthorized_hint_routes_by_state() {
+        let _lock = HINT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = HintEnvGuard::take();
+
+        // 1. Rejected HERAMIND_API_KEY env var — the strongest shadowing source.
+        //    Advice must name the env var, not send the user to login (whose
+        //    result the env var would override anyway).
+        std::env::set_var("HERAMIND_API_KEY", "nmk_rejected");
+        std::env::remove_var("HERAMIND_CONFIG_DIR");
+        let hint = unauthorized_hint();
+        assert!(
+            hint.contains("HERAMIND_API_KEY"),
+            "env-key 401 must name the env var, got: {hint}"
+        );
+
+        // 2. Stored credential file exists (env unset) — must NOT suggest bare
+        //    `login` (dead-ends with "already logged in"); point at whoami /
+        //    login --force.
+        std::env::remove_var("HERAMIND_API_KEY");
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("HERAMIND_CONFIG_DIR", cfg.path());
+        crate::auto_auth::write_credential("nmk_stale").unwrap();
+        let hint = unauthorized_hint();
+        assert!(
+            hint.contains("whoami") && hint.contains("--force"),
+            "stored-credential 401 must route to whoami/login --force, got: {hint}"
+        );
+        assert!(!hint.contains("Run: heramind login\n"));
+
+        // 3. Nothing stored — bootstrap advice is correct here. Point the
+        //    config dir at an EMPTY tempdir rather than unsetting the env:
+        //    unsetting would fall through to the real platform config dir,
+        //    which may legitimately hold a credential on a dev machine.
+        let empty = tempfile::tempdir().unwrap();
+        std::env::set_var("HERAMIND_CONFIG_DIR", empty.path());
+        let hint = unauthorized_hint();
+        assert!(
+            hint.contains("Run: heramind login"),
+            "bare 401 must suggest login, got: {hint}"
+        );
     }
 }

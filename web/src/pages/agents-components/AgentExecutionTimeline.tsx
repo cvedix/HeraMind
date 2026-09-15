@@ -64,7 +64,7 @@ function normalizeToDataUrl(str: string): string {
   if (str.startsWith('data:image/')) {
     const ci = str.indexOf(',')
     if (ci === -1) return str
-    let b64 = str.slice(ci + 1).replace(/[\s\r\n]+/g, '')
+    const b64 = str.slice(ci + 1).replace(/[\s\r\n]+/g, '')
     if (b64.startsWith('data:image/') || b64.startsWith('data:')) return normalizeToDataUrl(b64)
     const detected = detectImageMime(b64)
     if (detected) return `data:${detected};base64,${b64}`
@@ -238,8 +238,11 @@ export function AgentExecutionTimeline({
             </div>
           ) : (
             <div className="relative">
-              {/* Timeline Line - aligned to center of dots (left-[16px] = 8px position + 8px half of 16px dot) */}
-              <div className="absolute left-[16px] top-2 bottom-2 w-0.5 bg-border" />
+              {/* Timeline Line - center-aligned to dots: the line is 2px wide
+                  (w-0.5), so left-[15px] puts its CENTER at 16px — matching the
+                  16px dot's center (left-2 = 8px + 8px half). left-[16px] would
+                  center the line at 17px (1px off, visible at this scale). */}
+              <div className="absolute left-[15px] top-2 bottom-2 w-0.5 bg-border" />
 
               {/* Timeline Items */}
               <div className="space-y-4">
@@ -330,7 +333,7 @@ export function AgentExecutionTimeline({
                                   if (imgs.length === 0 && mTags.length === 0) return null
                                   return (
                                     <TimelineSection
-                                      icon={<Database className="h-4 w-4 text-info" />}
+                                      icon={<Database className="h-4 w-4 text-muted-foreground" />}
                                       title={t('agents:memory.inputData', 'Input Data')}
                                     >
                                       {imgs.length > 0 && (
@@ -356,7 +359,7 @@ export function AgentExecutionTimeline({
                                 {/* ① Situation Analysis */}
                                 {detail.decision_process?.situation_analysis && (
                                   <TimelineSection
-                                    icon={<Brain className="h-4 w-4 text-accent-purple" />}
+                                    icon={<Brain className="h-4 w-4 text-muted-foreground" />}
                                     title={t('agents:memory.situationAnalysis')}
                                   >
                                     <CollapsibleText content={detail.decision_process.situation_analysis} maxLines={3} />
@@ -366,7 +369,7 @@ export function AgentExecutionTimeline({
                                 {/* ② Execution Process — reasoning_steps with tool_call cards */}
                                 {detail.decision_process?.reasoning_steps && detail.decision_process.reasoning_steps.length > 0 && (
                                   <TimelineSection
-                                    icon={<ChevronRight className="h-4 w-4 text-accent-orange" />}
+                                    icon={<ChevronRight className="h-4 w-4 text-muted-foreground" />}
                                     title={t('agents:memory.executionProcess')}
                                   >
                                     <div className="space-y-2">
@@ -429,7 +432,7 @@ export function AgentExecutionTimeline({
                                           </Card>
                                         )}
                                         {hasConfidence && (
-                                          <div className="flex items-center justify-between text-sm p-2 bg-muted-50 rounded-lg">
+                                          <div className="flex items-center justify-between text-sm p-2 bg-muted rounded-lg">
                                             <span className="text-muted-foreground">{t('agents:memory.confidence')}</span>
                                             <Badge variant={dp!.confidence! > 0.7 ? "default" : "secondary"}>
                                               {(dp!.confidence! * 100).toFixed(0)}%
@@ -455,7 +458,7 @@ export function AgentExecutionTimeline({
                                   if (!summary || isGeneric || isDuplicate) return null
                                   return (
                                     <TimelineSection
-                                      icon={<Sparkles className="h-4 w-4 text-accent-indigo" />}
+                                      icon={<Sparkles className="h-4 w-4 text-muted-foreground" />}
                                       title={t('agents:memory.llmResponse', 'LLM Response')}
                                     >
                                       <CollapsibleText content={summary} maxLines={6} />
@@ -520,7 +523,7 @@ export function AgentExecutionTimeline({
                                 {/* ④ Notifications */}
                                 {detail.result?.notifications_sent && detail.result.notifications_sent.length > 0 && (
                                   <TimelineSection
-                                    icon={<Bell className="h-4 w-4 text-info" />}
+                                    icon={<Bell className="h-4 w-4 text-muted-foreground" />}
                                     title={t('agents:memory.notificationsSent')}
                                   >
                                     <div className="space-y-2">
@@ -667,7 +670,7 @@ function CollapsibleText({ content, maxLines = 6 }: { content: string; maxLines?
     <div>
       <div
         className={cn(
-          "text-sm bg-muted-50 p-3 rounded-lg border whitespace-pre-wrap break-words leading-relaxed",
+          "text-sm bg-muted p-3 rounded-lg border whitespace-pre-wrap break-words leading-relaxed",
           !expanded && isLong && "max-h-40 overflow-hidden relative",
         )}
       >
@@ -739,11 +742,11 @@ function ReasoningStepItem({ step, showRoundSeparator, roundNumber }: { step: Re
       <div>
         {showRoundSeparator && roundNumber !== undefined && (
           <div className="flex items-center gap-2 mb-3 -mt-1">
-            <div className="h-px flex-1 bg-gradient-to-r from-transparent via-border to-transparent" />
+            <div className="h-px flex-1 bg-border" />
             <span className="text-xs text-muted-foreground font-medium shrink-0 px-2">
               {t('agents:memory.round', 'Round {{round}}', { round: roundNumber })}
             </span>
-            <div className="h-px flex-1 bg-gradient-to-l from-transparent via-border to-transparent" />
+            <div className="h-px flex-1 bg-border" />
           </div>
         )}
         <div className="text-xs text-muted-foreground italic py-1 px-2 rounded bg-muted-30 mb-1">
@@ -771,11 +774,11 @@ function ReasoningStepItem({ step, showRoundSeparator, roundNumber }: { step: Re
     <div>
       {showRoundSeparator && roundNumber !== undefined && (
         <div className="flex items-center gap-2 mb-3 -mt-1">
-          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-border to-transparent" />
+          <div className="h-px flex-1 bg-border" />
           <span className="text-xs text-muted-foreground font-medium shrink-0 px-2">
             {t('agents:memory.round', 'Round {{round}}', { round: roundNumber })}
           </span>
-          <div className="h-px flex-1 bg-gradient-to-l from-transparent via-border to-transparent" />
+          <div className="h-px flex-1 bg-border" />
         </div>
       )}
       <div className="flex gap-3 min-w-0">
@@ -990,7 +993,7 @@ function InputDataImage({ source, image }: { source: string; image: string }) {
       </div>
       {fullscreen && (
         <div
-          className="fixed inset-0 z-[200] bg-overlay-heavy flex items-center justify-center"
+          className="fixed inset-0 z-[110] bg-overlay-heavy flex items-center justify-center"
           onClick={() => setFullscreen(false)}
         >
           <img src={image} alt={source} className="max-w-[90vw] max-h-[90vh] object-contain rounded-lg" />

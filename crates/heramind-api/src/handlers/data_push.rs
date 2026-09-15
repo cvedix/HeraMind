@@ -26,6 +26,20 @@ use super::{
 };
 use crate::models::ErrorResponse;
 
+/// The manager reports a missing target as anyhow "Target not found: X" —
+/// map it to 404 so consumers don't see 500s for plain not-found ids.
+fn push_error_to_response(e: anyhow::Error) -> ErrorResponse {
+    let msg = e.to_string();
+    if msg.starts_with("Target not found") {
+        ErrorResponse::not_found(msg)
+    } else if msg.starts_with("Unknown target type") {
+        // an unrecognized `type` discriminator is a client mistake
+        ErrorResponse::bad_request(msg)
+    } else {
+        ErrorResponse::internal(msg)
+    }
+}
+
 /// Query parameters for listing push targets.
 #[derive(Debug, Deserialize)]
 pub struct ListTargetsQuery {
@@ -76,6 +90,15 @@ fn webhook_self_loop_error(config: &serde_json::Value) -> Option<String> {
 
 /// Create a new push target.
 /// POST /api/data-push
+#[utoipa::path(
+    post,
+    path = "/api/data-push",
+    tag = "data-push",
+    request_body = CreateTargetRequest,
+    responses(
+        (status = 200, description = "Push target created"),
+    )
+)]
 pub async fn create_push_target_handler(
     State(state): State<ServerState>,
     Json(request): Json<CreateTargetRequest>,
@@ -91,7 +114,7 @@ pub async fn create_push_target_handler(
     let target = manager
         .create_target(request)
         .await
-        .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+        .map_err(push_error_to_response)?;
 
     ok(json!({
         "id": target.id,
@@ -103,6 +126,17 @@ pub async fn create_push_target_handler(
 
 /// List all push targets.
 /// GET /api/data-push
+#[utoipa::path(
+    get,
+    path = "/api/data-push",
+    tag = "data-push",
+    params(
+        ("enabled" = Option<bool>, Query, description = "Filter by enabled"),
+    ),
+    responses(
+        (status = 200, description = "Configured push targets"),
+    )
+)]
 pub async fn list_push_targets_handler(
     State(state): State<ServerState>,
     Query(_params): Query<ListTargetsQuery>,
@@ -124,6 +158,18 @@ pub async fn list_push_targets_handler(
 
 /// Get a push target by ID.
 /// GET /api/data-push/:id
+#[utoipa::path(
+    get,
+    path = "/api/data-push/{id}",
+    tag = "data-push",
+    params(
+        ("id" = String, Path, description = "Push target id"),
+    ),
+    responses(
+        (status = 200, description = "One push target"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_push_target_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -143,6 +189,19 @@ pub async fn get_push_target_handler(
 
 /// Update a push target.
 /// PUT /api/data-push/:id
+#[utoipa::path(
+    put,
+    path = "/api/data-push/{id}",
+    tag = "data-push",
+    params(
+        ("id" = String, Path, description = "Push target id"),
+    ),
+    request_body = UpdateTargetRequest,
+    responses(
+        (status = 200, description = "Push target updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_push_target_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -161,7 +220,7 @@ pub async fn update_push_target_handler(
     let target = manager
         .update_target(&id, request)
         .await
-        .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+        .map_err(push_error_to_response)?;
 
     ok(json!({
         "id": target.id,
@@ -172,6 +231,18 @@ pub async fn update_push_target_handler(
 
 /// Delete a push target.
 /// DELETE /api/data-push/:id
+#[utoipa::path(
+    delete,
+    path = "/api/data-push/{id}",
+    tag = "data-push",
+    params(
+        ("id" = String, Path, description = "Push target id"),
+    ),
+    responses(
+        (status = 200, description = "Push target deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_push_target_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -184,7 +255,7 @@ pub async fn delete_push_target_handler(
     let deleted = manager
         .delete_target(&id)
         .await
-        .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+        .map_err(push_error_to_response)?;
 
     if !deleted {
         return Err(ErrorResponse::not_found(format!(
@@ -198,6 +269,18 @@ pub async fn delete_push_target_handler(
 
 /// Test a push target by sending sample data.
 /// POST /api/data-push/:id/test
+#[utoipa::path(
+    post,
+    path = "/api/data-push/{id}/test",
+    tag = "data-push",
+    params(
+        ("id" = String, Path, description = "Push target id"),
+    ),
+    responses(
+        (status = 200, description = "Test payload delivered; delivery result returned"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn test_push_target_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -210,13 +293,25 @@ pub async fn test_push_target_handler(
     let log = manager
         .test_target(&id)
         .await
-        .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+        .map_err(push_error_to_response)?;
 
     ok(json!(log))
 }
 
 /// Start a push target.
 /// POST /api/data-push/:id/start
+#[utoipa::path(
+    post,
+    path = "/api/data-push/{id}/start",
+    tag = "data-push",
+    params(
+        ("id" = String, Path, description = "Push target id"),
+    ),
+    responses(
+        (status = 200, description = "Push target started"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn start_push_target_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -229,13 +324,25 @@ pub async fn start_push_target_handler(
     manager
         .start_target(&id)
         .await
-        .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+        .map_err(push_error_to_response)?;
 
     ok(json!({"message": "Push target started"}))
 }
 
 /// Stop a push target.
 /// POST /api/data-push/:id/stop
+#[utoipa::path(
+    post,
+    path = "/api/data-push/{id}/stop",
+    tag = "data-push",
+    params(
+        ("id" = String, Path, description = "Push target id"),
+    ),
+    responses(
+        (status = 200, description = "Push target stopped"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn stop_push_target_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -248,13 +355,27 @@ pub async fn stop_push_target_handler(
     manager
         .stop_target(&id)
         .await
-        .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+        .map_err(push_error_to_response)?;
 
     ok(json!({"message": "Push target stopped"}))
 }
 
 /// List delivery logs for a push target.
 /// GET /api/data-push/:id/logs
+#[utoipa::path(
+    get,
+    path = "/api/data-push/{id}/logs",
+    tag = "data-push",
+    params(
+        ("id" = String, Path, description = "Push target id"),
+        ("limit" = Option<usize>, Query, description = "Max entries"),
+        ("offset" = Option<usize>, Query, description = "Skip entries"),
+    ),
+    responses(
+        (status = 200, description = "Delivery attempt log"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn list_delivery_logs_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -279,6 +400,14 @@ pub async fn list_delivery_logs_handler(
 
 /// Get push statistics.
 /// GET /api/data-push/stats
+#[utoipa::path(
+    get,
+    path = "/api/data-push/stats",
+    tag = "data-push",
+    responses(
+        (status = 200, description = "Delivery counters across targets"),
+    )
+)]
 pub async fn get_push_stats_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {

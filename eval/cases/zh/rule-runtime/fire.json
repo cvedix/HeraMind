@@ -1,0 +1,28 @@
+{
+  "id": "rule-fire-runtime",
+  "lang": "zh",
+  "category": "rule",
+  "workflow": "rule-runtime",
+  "scenario_type": "single_turn",
+  "description": "运行时验证·规则触发执行(HeraMind 自动化核心链)。规则预置在 fixture(battery_level<20→notify),eval 通过 webhook 摄取路径注入触发性遥测(battery_level=10<20),验证规则真 fire 产生了告警消息。隔离测 fire 链(webhook→DeviceMetric→rule→notify→message),不受 agent 建规则能力波动影响。新维度:runtime rule firing。",
+  "setup": { "fixture": "scenario-rule-runtime" },
+  "turns": [
+    { "user": "查一下 webhook-sensor 的 battery_level 当前是多少?" }
+  ],
+  "applies": ["tool_accuracy", "task_completion", "language_adherence"],
+  "expectations": {
+    "per_turn": ["Turn 1: `heramind device get webhook-sensor` 查 battery_level"],
+    "overall": "(runtime 注入 battery_level=10 后)预置规则 fire 产生告警消息"
+  },
+  "expect": { "tools": ["shell"], "commands": ["heramind device get"] },
+  "runtime": {
+    "pre_wait_ms": 12000,
+    "trigger": [
+      { "type": "webhook", "device_id": "webhook-sensor", "metric": "battery_level", "value": 10 }
+    ],
+    "wait_ms": 3000,
+    "expect": [
+      { "type": "message_count", "expected_min": 1 }
+    ]
+  }
+}

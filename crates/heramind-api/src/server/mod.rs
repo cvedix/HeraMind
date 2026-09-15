@@ -8,6 +8,7 @@ pub mod extension_metrics;
 pub mod image_cleanup;
 pub mod install_service;
 pub mod middleware;
+pub mod paths;
 pub mod router;
 pub mod state;
 pub mod system_context;
@@ -39,7 +40,33 @@ use tower_http::timeout::{RequestBodyTimeoutLayer, TimeoutLayer};
 
 /// Start the web server on a specific address.
 /// This is the main entry point for running the server.
+/// Recorded at startup so URL resolution can tell whether the server is
+/// reachable on the LAN (0.0.0.0) or only locally (127.0.0.1/localhost).
+static HTTP_BIND_LOOPBACK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static HTTP_BIND_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Whether the HTTP server is bound to loopback only.
+pub fn http_bind_is_loopback() -> bool {
+    HTTP_BIND_LOOPBACK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The bound HTTP port (0 if not yet bound).
+pub fn http_bind_port() -> u16 {
+    HTTP_BIND_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
+    // rustls 0.23 has no auto-selected process CryptoProvider; install ring
+    // up front (idempotent) — the CLI `serve` path reaches run() directly and
+    // would otherwise panic on first TLS use (e.g. the TLS proxy below).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    HTTP_BIND_LOOPBACK.store(
+        bind.ip().is_loopback(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    HTTP_BIND_PORT.store(bind.port(), std::sync::atomic::Ordering::Relaxed);
     use crate::startup::{ServiceStatus, StartupLogger};
 
     // Note: V2 extension system doesn't require panic hook installation
@@ -132,7 +159,24 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
             Duration::from_secs(120),
         ));
 
-    let listener = tokio::net::TcpListener::bind(bind).await?;
+    // TCP_NODELAY on the LISTENING socket: accepted connections inherit it on
+    // Linux/macOS. Without it, per-message WebSocket writes on the video push
+    // path interlock with the receiver's delayed ACKs (~40-200ms stall per
+    // message) — a fast link delivers only ~6fps of 20fps pushed frames.
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(bind),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nodelay(true)?;
+    socket.bind(&bind.into())?;
+    socket.listen(1024)?;
+    // std/socket2 sockets are blocking by default; tokio requires a
+    // non-blocking fd or registration panics ("Registering a blocking socket
+    // with the tokio runtime is unsupported" — seen on macOS 15+).
+    socket.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(socket.into())?;
 
     // Ready phase — HTTP listener is bound
     startup.phase_ready();
@@ -142,6 +186,29 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
         elapsed_ms = t_start.elapsed().as_millis() as u64,
         "HTTP listener ready (time to serve)"
     );
+
+    // ── Optional TLS front (secure-context enablement) ─────────────────────
+    // Browsers gate getUserMedia (device camera) and the clipboard API on
+    // secure contexts. Edge deployments are usually reached over plain HTTP
+    // on a LAN IP, so we offer an in-process TLS reverse proxy: TLS on
+    // HERAMIND_TLS_PORT (default 9376) → loopback to the plaintext listener.
+    // Enable by setting HERAMIND_TLS_CERT + HERAMIND_TLS_KEY (PEM paths).
+    if let (Ok(cert), Ok(key)) = (
+        std::env::var("HERAMIND_TLS_CERT"),
+        std::env::var("HERAMIND_TLS_KEY"),
+    ) {
+        let tls_port: u16 = std::env::var("HERAMIND_TLS_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(9376);
+        let target = format!("127.0.0.1:{}", bind.port());
+        tokio::spawn(async move {
+            match run_tls_proxy(&cert, &key, tls_port, &target).await {
+                Ok(()) => unreachable!("tls proxy loop never returns Ok"),
+                Err(e) => tracing::error!(error = %e, port = tls_port, "TLS proxy terminated"),
+            }
+        });
+    }
 
     // ── Phase B: Deferred background services (after listener starts serving) ──
     // These run in the background and do not block HTTP serving.
@@ -172,20 +239,43 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
             // Wait for server to initialize
             tokio::time::sleep(Duration::from_secs(10)).await;
 
-            const SETTINGS_DB_PATH: &str = "data/settings.redb";
-            const TELEMETRY_DB_PATH: &str = "data/telemetry.redb";
-
             loop {
-                // Load config on each cycle so runtime changes take effect
-                let config = SettingsStore::open(SETTINGS_DB_PATH)
+                // Load config on each cycle so runtime changes take effect.
+                // [observability] Both reopen failures used to be silent —
+                // retention could no-op forever with no trace of why.
+                let config = SettingsStore::open_default()
                     .map(|s| s.get_retention_config())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            category = "storage",
+                            error = %e,
+                            "Retention: settings store unavailable — retention disabled this cycle"
+                        );
+                        Default::default()
+                    });
 
                 let interval_secs = config.interval_hours * 3600;
 
                 if config.enabled {
                     let policy = config.to_retention_policy();
-                    if let Ok(ts_store) = TimeSeriesStore::open(TELEMETRY_DB_PATH) {
+                    let ts_store = match TimeSeriesStore::open(heramind_core::paths::store_path(
+                        "telemetry.redb",
+                    )) {
+                        Ok(store) => store,
+                        Err(e) => {
+                            tracing::warn!(
+                                category = "storage",
+                                error = %e,
+                                "Retention: telemetry store unavailable — skipping this cycle"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                interval_secs.max(3600),
+                            ))
+                            .await;
+                            continue;
+                        }
+                    };
+                    {
                         ts_store.set_retention_policy(policy).await;
                         match ts_store.apply_retention().await {
                             Ok(result) => {
@@ -316,6 +406,42 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
         });
     }
 
+    // Automation execution retention — this table was the one unbounded-growth
+    // store the 0.9.12 sweep missed (messages/agent-executions/data-push/
+    // rule-history all got tasks; automations were forgotten). 30 days,
+    // daily, mirroring the rule-history task above.
+    {
+        let automation_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+
+            const AUTOMATION_EXEC_RETENTION_DAYS: u64 = 30;
+            const RUN_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+            loop {
+                if let Some(store) = automation_state.automation.automation_store.clone() {
+                    match store
+                        .cleanup_executions(AUTOMATION_EXEC_RETENTION_DAYS)
+                        .await
+                    {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(
+                            removed = n,
+                            days = AUTOMATION_EXEC_RETENTION_DAYS,
+                            "Automation execution cleanup removed old records"
+                        ),
+                        Err(e) => tracing::warn!(
+                            category = "automation",
+                            error = %e,
+                            "Automation execution cleanup failed (will retry next cycle)"
+                        ),
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(RUN_INTERVAL_SECS)).await;
+            }
+        });
+    }
+
     // Heavy background services — extension loading, agent manager, MQTT
     {
         let bg_state = state.clone();
@@ -353,7 +479,20 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
                         let ext_id = extension_id.to_string();
                         let rt = runtime.clone();
                         tokio::spawn(async move {
-                            if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
+                            // The manager's crash-restart rebuilt its own map;
+                            // swap the proxy registry to the fresh instance
+                            // FIRST — otherwise session/init calls keep
+                            // hitting the dead proxy ("Extension not
+                            // running") and even send_config_update below
+                            // goes through the stale handle.
+                            if let Err(e) = rt.refresh_proxy(&ext_id).await {
+                                tracing::warn!(
+                                    extension_id = %ext_id,
+                                    error = %e,
+                                    "Failed to refresh proxy after crash recovery"
+                                );
+                            }
+                            if let Ok(store) = ExtensionStore::open(crate::server::paths::extension_store_path()) {
                                 // Clear error status after successful crash recovery
                                 if let Ok(Some(mut record)) = store.load(&ext_id) {
                                     record.health_status = "ok".to_string();
@@ -387,41 +526,125 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
                 ));
             }
 
-            // Record error in storage when crash recovery restart fails
+            // Record error in storage when crash recovery restart fails, and
+            // surface it through the notification channels — without the
+            // message, a circuit-broken extension just quietly stops working
+            // ("feature silently gone" from the extension-system review).
+            let crash_notify_state = bg_state.clone();
             bg_state
                 .extensions
                 .runtime
-                .set_on_crash_recovery_failed(Arc::new(move |extension_id: &str, error: &str| {
-                    let ext_id = extension_id.to_string();
-                    let err_msg = error.to_string();
-                    tokio::spawn(async move {
-                        if let Ok(store) = ExtensionStore::open("data/extensions.redb") {
-                            let _ = store.update_error_status(&ext_id, &err_msg);
-                        }
-                    });
-                }));
+                .set_on_crash_recovery_failed(Arc::new(
+                    move |extension_id: &str, error: &str| {
+                        let ext_id = extension_id.to_string();
+                        let err_msg = error.to_string();
+                        let notify = crash_notify_state.clone();
+                        tokio::spawn(async move {
+                            if let Ok(store) = ExtensionStore::open(crate::server::paths::extension_store_path()) {
+                                let _ = store.update_error_status(&ext_id, &err_msg);
+                            }
+                            let title = format!("Extension '{ext_id}' stopped auto-restarting");
+                            let body = format!(
+                                "Extension '{ext_id}' crashed repeatedly and auto-restart has been \
+                                 disabled ({err_msg}). It will not recover on its own — check \
+                                 Settings → Extensions to view the crash reason or restart it manually."
+                            );
+                            if let Err(e) = notify
+                                .core
+                                .message_manager
+                                .system_message(title, body)
+                                .await
+                            {
+                                tracing::warn!(
+                                    extension_id = %ext_id,
+                                    error = %e,
+                                    "Failed to send crash-recovery notification"
+                                );
+                            }
+                        });
+                    },
+                ));
 
             bg_state.extensions.runtime.clone().start_death_monitoring();
 
             // Initialize extension event subscription
             bg_state.init_extension_event_subscription().await;
 
-            // Initialize AI Agent manager
-            let _ = bg_state.start_agent_manager().await;
+            // Initialize AI Agent manager.
+            // A failure here means the scheduler never starts: all scheduled and
+            // event-triggered agents silently stop running (HTTP/health stay green).
+            // Log at error! so it is visible — do not swallow with `let _ =`.
+            if let Err(e) = bg_state.start_agent_manager().await {
+                tracing::error!(
+                    category = "agent",
+                    error = %e,
+                    "Failed to start agent manager — scheduled and event-triggered agents will not run"
+                );
+            }
+
+            // Start the IM bridge router.
+            // A failure here means all inbound IM messages (Telegram/Feishu/...)
+            // are silently dropped — the EventBus subscription never starts, so
+            // inbound events go nowhere. Surface at error! so it is visible;
+            // do NOT swallow with `let _ =` (P0 pattern).
+            if let Err(e) = bg_state.start_im_router().await {
+                tracing::error!(
+                    category = "im",
+                    error = %e,
+                    "Failed to start IM router — inbound IM messages will not be processed"
+                );
+            }
 
             // Initialize AI Agent event listener
             bg_state.init_agent_events().await;
 
-            // Detect llama.cpp backend capabilities from /props endpoint
+            // Auto-register a reachable llama.cpp server (if none exists yet),
+            // then refresh capabilities from /props for all llama.cpp backends.
             {
                 let mut retry_interval = tokio::time::interval(Duration::from_secs(5));
                 for _ in 0..12 {
                     retry_interval.tick().await;
                     if let Ok(instance_manager) = heramind_agent::get_instance_manager() {
+                        instance_manager.auto_register_llamacpp().await;
                         instance_manager.detect_llamacpp_capabilities().await;
                         break;
                     }
                 }
+            }
+
+            // Builtin LLM(内置 LFM2.5-2.6B):定位已下载模型 → spawn → 注册实例。
+            // 独立 task 运行:不阻塞后续启动(wait_healthy 最多等 60s)。
+            {
+                let bg_state_for_builtin = bg_state.clone();
+                tokio::spawn(async move {
+                    let cfg = crate::builtin_llm::config::BuiltinConfig::from_env();
+                    let data_dir = bg_state_for_builtin.data_dir.clone();
+                    // 镜像 auto_register 守卫:get_instance_manager 启动初期可能暂不可用,
+                    // 重试到可用(与上面 llama.cpp 块相同的 12×5s 节奏)。
+                    let mut retry_interval = tokio::time::interval(Duration::from_secs(5));
+                    for _ in 0..12 {
+                        retry_interval.tick().await;
+                        if let Ok(manager) = heramind_agent::get_instance_manager() {
+                            match crate::builtin_llm::state::bootstrap(&data_dir, &cfg, &manager)
+                                .await
+                            {
+                                crate::builtin_llm::state::BootstrapOutcome::ServerReady {
+                                    endpoint,
+                                } => {
+                                    tracing::info!(endpoint = %endpoint, "Builtin LLM ready");
+                                }
+                                crate::builtin_llm::state::BootstrapOutcome::ModelMissing => {
+                                    tracing::info!("Builtin LLM model not downloaded yet; UI will guide download");
+                                }
+                                crate::builtin_llm::state::BootstrapOutcome::Failed(e) => {
+                                    tracing::warn!(error = %e, "Builtin LLM bootstrap failed");
+                                }
+                                _ => {}
+                            }
+                            break;
+                        }
+                    }
+                });
             }
 
             // Start memory scheduler (temp file cleanup)
@@ -524,6 +747,10 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
     // Services phase
     startup.phase_services();
 
+    // Periodic data-dir backup (see heramind_storage::backup). Runs the same
+    // create_backup path as POST /api/settings/backup.
+    spawn_backup_scheduler(state.data_dir.clone());
+
     // Run with graceful shutdown.
     // `into_make_service_with_connect_info` populates `ConnectInfo<SocketAddr>` for
     // all handlers — required by webhook IP allow/block lists, rate-limit client_id
@@ -534,7 +761,7 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(crate::shutdown::shutdown_signal())
+    .with_graceful_shutdown(crate::shutdown::shutdown_signal_or_test_deadline())
     .await?;
 
     // Clean up resources after server shuts down
@@ -542,6 +769,99 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
 
     tracing::info!("Server shutdown complete");
     Ok(())
+}
+
+/// Periodic data-directory backup. The schedule lives in settings.redb
+/// (`/api/settings/backup-config`, editable in Settings → Preferences) and
+/// is re-read every tick so changes apply within a minute — env vars only
+/// seed the default before anything is saved. The first full interval after
+/// boot is skipped so a fresh start does not copy databases while services
+/// are still warming up.
+fn spawn_backup_scheduler(data_dir: std::path::PathBuf) {
+    tracing::info!(category = "backup", "Periodic backup scheduler started");
+
+    tokio::spawn(async move {
+        // Read the schedule off the (blocking) settings store. The settings
+        // path derives from the SAME data_dir being backed up — the store
+        // path used to be hardcoded "data/settings.redb", so a deployment
+        // with HERAMIND_DATA_DIR pointing elsewhere read one directory's
+        // config while backing up another (found by the pre-release audit).
+        let settings_dir = data_dir.clone();
+        let read_config = move || {
+            let settings_path = settings_dir.join("settings.redb");
+            tokio::task::spawn_blocking(move || {
+                use heramind_storage::settings::BackupConfig;
+                heramind_storage::SettingsStore::open(settings_path)
+                    .ok()
+                    .and_then(|s| s.load_backup_config().ok().flatten())
+                    .unwrap_or_else(BackupConfig::from_env_or_default)
+            })
+        };
+
+        let initial = read_config().await.unwrap_or_default();
+        // Grace: first backup one full interval after boot, not immediately.
+        let mut next_run =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(initial.interval_secs);
+        let mut last_config = initial;
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+            let config = read_config().await.unwrap_or(last_config.clone());
+            if config != last_config {
+                // Schedule edit: re-arm the timer off the NEW interval so a
+                // shortened interval doesn't wait out the old one.
+                next_run = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(config.interval_secs);
+                tracing::info!(
+                    category = "backup",
+                    enabled = config.enabled,
+                    interval_secs = config.interval_secs,
+                    keep = config.keep,
+                    "Backup schedule changed; timer re-armed"
+                );
+                last_config = config.clone();
+            }
+            if !config.enabled || tokio::time::Instant::now() < next_run {
+                continue;
+            }
+            next_run =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(config.interval_secs);
+
+            let dir = data_dir.clone();
+            let keep = config.keep;
+            let result =
+                tokio::task::spawn_blocking(move || match heramind_storage::backup::create_backup(
+                    &dir,
+                    env!("CARGO_PKG_VERSION"),
+                ) {
+                    Ok(manifest) => {
+                        let pruned = heramind_storage::backup::prune_backups(&dir, keep);
+                        Ok((manifest, pruned))
+                    }
+                    Err(e) => Err(e),
+                })
+                .await;
+            match result {
+                Ok(Ok((manifest, pruned))) => tracing::info!(
+                    category = "backup",
+                    id = %manifest.id,
+                    pruned,
+                    "Scheduled backup complete"
+                ),
+                Ok(Err(e)) => tracing::warn!(
+                    category = "backup",
+                    error = %e,
+                    "Scheduled backup failed"
+                ),
+                Err(e) => tracing::warn!(
+                    category = "backup",
+                    error = %e,
+                    "Scheduled backup task join error"
+                ),
+            }
+        }
+    });
 }
 
 /// Start the server with default configuration.
@@ -560,4 +880,74 @@ pub async fn start_server() -> anyhow::Result<()> {
     let (host, port) = crate::config::get_server_config();
     let bind: SocketAddr = format!("{}:{}", host, port).parse()?;
     run(bind).await
+}
+
+// ============================================================================
+// TLS reverse proxy (secure-context enablement for LAN deployments)
+// ============================================================================
+
+/// In-process TLS front: accepts rustls connections on `port`, forwards them
+/// byte-for-byte to the plaintext listener at `target` (loopback). Same
+/// TCP_NODELAY-on-listener trick as the main listener — WS push latency
+/// depends on it.
+async fn run_tls_proxy(
+    cert_pem: &str,
+    key_pem: &str,
+    port: u16,
+    target: &str,
+) -> anyhow::Result<()> {
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = {
+        let f = std::fs::File::open(cert_pem)?;
+        let mut r = std::io::BufReader::new(f);
+        rustls_pemfile::certs(&mut r).collect::<Result<_, _>>()?
+    };
+    let key = {
+        let f = std::fs::File::open(key_pem)?;
+        let mut r = std::io::BufReader::new(f);
+        rustls_pemfile::private_key(&mut r)?
+            .ok_or_else(|| anyhow::anyhow!("no private key in {key_pem}"))?
+    };
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+
+    let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nodelay(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    // std/socket2 sockets are blocking by default; tokio requires a
+    // non-blocking fd or registration panics INSIDE the spawned task —
+    // the server keeps running, the proxy dies silently with no log. Same
+    // bug as the main listener (fixed there in a474ef03); this second
+    // call site was missed and left the whole TLS front non-functional.
+    socket.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(socket.into())?;
+
+    tracing::info!(port, %target, "TLS proxy listening (secure-context front)");
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
+        let acceptor = acceptor.clone();
+        let target = target.to_string();
+        tokio::spawn(async move {
+            let tls = match acceptor.accept(stream).await {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let mut upstream = match tokio::net::TcpStream::connect(&target).await {
+                Ok(u) => u,
+                Err(_) => return,
+            };
+            let _ = upstream.set_nodelay(true);
+            let mut tls = tls;
+            let _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream).await;
+        });
+    }
 }

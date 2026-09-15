@@ -1,13 +1,17 @@
 import { lazy, Suspense, useEffect, useState, useRef } from "react"
 import { Routes, Route, Navigate, useLocation } from "react-router-dom"
+import { useTranslation } from "react-i18next"
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary"
 import { BrandGradientDef } from "@/components/shared/BrandGradientDef"
 import { useStore } from "@/store"
 import { shallow } from "zustand/shallow"
-import { TopNav } from "@/components/layout/TopNav"
+import { AppSidebar } from "@/components/layout/AppSidebar"
+import { GlobalControlsFloating } from "@/components/layout/GlobalControls"
 import { MobileNav } from "@/components/layout/MobileNav"
+import { SwipeNavigation } from "@/components/layout/SwipeNavigation"
 import { NavigationProgress } from "@/components/layout/NavigationProgress"
 import { useIsMobile } from "@/hooks/useMobile"
+import { useDataChangeEvents } from "@/hooks/useDataChangeEvents"
 import { Toaster } from "@/components/ui/toaster"
 import { Confirmer } from "@/components/ui/confirmer"
 import { tokenManager, getApiBase, isTauriEnv, setApiBase, getApiKey } from "@/lib/api"
@@ -16,10 +20,14 @@ import { StartupLoading } from "@/components/StartupLoading"
 import { LoadingState } from "@/components/shared/LoadingState"
 import { forceViewportReset } from "@/hooks/useVisualViewport"
 import { useExtensionComponents } from "@/hooks/useExtensionComponents"
-import { UpdateDialog } from '@/components/update'
+import { UpdateDialog, ServerUpgradeDialog } from '@/components/update'
 import { InstanceSwitchOverlay } from '@/components/layout/InstanceSwitchOverlay'
 import { GlobalChatFab } from '@/components/chat/GlobalChatFab'
+import { SettingsDialog } from "@/components/settings/SettingsDialog"
 import { useUpdateCheck } from '@/hooks/useUpdateCheck'
+import { listen } from "@tauri-apps/api/event"
+import type { ConnectionState } from "@/lib/websocket"
+import { BackendUnavailableOverlay } from "@/components/BackendUnavailableOverlay"
 
 // Performance optimization: Lazy load route components to reduce initial bundle size
 // Each page is loaded on-demand, reducing Time to Interactive by ~70%
@@ -34,7 +42,6 @@ const DataExplorerPage = lazy(() => import('@/pages/data-explorer').then(m => ({
 const DevicesPage = lazy(() => import('@/pages/devices').then(m => ({ default: m.DevicesPage })))
 const AutomationPage = lazy(() => import('@/pages/automation').then(m => ({ default: m.AutomationPage })))
 const AgentsPage = lazy(() => import('@/pages/agents').then(m => ({ default: m.AgentsPage })))
-const SettingsPage = lazy(() => import('@/pages/settings').then(m => ({ default: m.SettingsPage })))
 const MessagesPage = lazy(() => import('@/pages/messages').then(m => ({ default: m.default })))
 const ExtensionsPage = lazy(() => import('@/pages/extensions').then(m => ({ default: m.ExtensionsPage })))
 const SystemPage = lazy(() => import('@/pages/SystemPage'))
@@ -78,8 +85,25 @@ window.addEventListener('unhandledrejection', (event) => {
   }
 })
 
+// Set the macOS Tauri title-bar inset globally (login/setup pages have no sidebar rail).
+const _isMacTauri = typeof window !== 'undefined' && '__TAURI__' in window && /Mac/i.test(navigator.platform || navigator.userAgent)
+if (_isMacTauri) {
+  document.documentElement.style.setProperty('--titlebar-inset', '24px')
+}
+
 // Protected Route component
 // Checks authentication first, then setup status in background
+/** Legacy /settings deep links: settings now lives in the SettingsDialog
+ * (mounted once at the app root). Open the dialog, then redirect home so
+ * closing it never leaves a blank page behind. */
+function SettingsRoute() {
+  const openSettings = useStore((state) => state.openSettings)
+  useEffect(() => {
+    openSettings()
+  }, [openSettings])
+  return <Navigate to="/" replace />
+}
+
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const [setupRequired, setSetupRequired] = useState<boolean | false>(false)
 
@@ -211,8 +235,22 @@ function PageLoading() {
   )
 }
 
+// Tauri window drag — same contract as the rail's handler: startDragging on
+// mousedown over non-interactive areas (data-tauri-drag-region is unreliable
+// in Tauri 2 overlay mode).
+import { getCurrentWindow } from "@tauri-apps/api/window"
+const handleWindowDragMouseDown = (e: React.MouseEvent) => {
+  if (!isTauriEnv()) return
+  const target = e.target as HTMLElement
+  if (target.closest("button, a, input, select, textarea, [role='button'], [role='tab']")) return
+  getCurrentWindow().startDragging()
+}
+
 function App() {
   const isMobile = useIsMobile()
+  const { t } = useTranslation("common")
+  // AI/other-client data changes → auto-refresh domain caches & pages
+  useDataChangeEvents()
   const extensionComponents = useExtensionComponents({ autoSync: true, syncInterval: 60000 })
   const extensionSyncRef = useRef(extensionComponents.sync)
   
@@ -241,15 +279,18 @@ function App() {
       }
     }
     ;(window as any).HeraMindStream = { urlFor: buildStreamUrl }
+    ;(window as any).NeoMindStream = (window as any).HeraMindStream
     return () => {
       delete (window as any).HeraMindStream
+      delete (window as any).NeoMindStream
     }
   }, [])
-  const { isAuthenticated, checkAuthStatus, setWsConnected, updateDialogOpen } = useStore((s) => ({
+  const { isAuthenticated, checkAuthStatus, setWsConnected, updateDialogOpen, serverUpgradeDialogOpen } = useStore((s) => ({
     isAuthenticated: s.isAuthenticated,
     checkAuthStatus: s.checkAuthStatus,
     setWsConnected: s.setWsConnected,
     updateDialogOpen: s.updateDialogOpen,
+    serverUpgradeDialogOpen: s.serverUpgradeDialogOpen,
   }), shallow)
   
   // Global auto-update check with system notification
@@ -263,6 +304,41 @@ function App() {
   const [isTauri, setIsTauri] = useState(false)
   const [initialCheckDone, setInitialCheckDone] = useState(false)
   const [setupRequired, setSetupRequired] = useState<boolean | null>(null)
+  // Backend startup failure surfaced from Rust (Tauri "backend-start-failed"
+  // event, e.g. port 9375 already in use). null while healthy.
+  const [backendError, setBackendError] = useState<{ error: string; port_conflict: boolean } | null>(null)
+  // WebSocket connection state, used for the fallback error overlay (web build
+  // or a missed Tauri event).
+  const [wsConnectionState, setWsConnectionState] = useState<ConnectionState>({ status: 'disconnected' })
+
+  // Surface a backend startup failure (port conflict, crash at startup) as a
+  // clear error page instead of letting the user stare at endless
+  // "Reconnecting". Tauri-only — the web build relies on the WS fallback below.
+  useEffect(() => {
+    if (!isTauriEnv()) return
+    let unlisten: (() => void) | undefined
+    listen<{ error: string; port_conflict: boolean }>("backend-start-failed", (e) => {
+      setBackendError(e.payload)
+    }).then((fn) => {
+      unlisten = fn
+    })
+    return () => {
+      unlisten?.()
+    }
+  }, [])
+
+  // Subscribe to WS state for the fallback path: if the socket never connected
+  // and gave up retrying, show the same error overlay (covers web/non-Tauri
+  // and the case where the Tauri event was missed).
+  useEffect(() => {
+    let unsub: (() => void) | undefined
+    import("@/lib/websocket").then(({ ws }) => {
+      unsub = ws.onStateChange(setWsConnectionState)
+    })
+    return () => {
+      unsub?.()
+    }
+  }, [])
 
   // Reset viewport and scroll when route changes (fix mobile keyboard dismissal issues)
   useEffect(() => {
@@ -429,6 +505,28 @@ function App() {
   }, [isAuthenticated, setWsConnected, currentPath])
 
 
+  // Backend never came up — show a clear error page above everything else
+  // (overrides startup loading / login) so the user knows the backend is
+  // unreachable. `gaveUp` is set only after the fast-retry budget is exhausted
+  // WITHOUT ever connecting (port conflict, crashed/misconfigured backend, or a
+  // slow-booting edge box) — NOT on every transient connect error, which avoids
+  // a full-screen flash per failed attempt. The WS keeps slow-polling in the
+  // background, so this clears automatically once the backend actually answers.
+  if (backendError || wsConnectionState.gaveUp) {
+    return (
+      <BackendUnavailableOverlay
+        portConflict={backendError?.port_conflict}
+        error={backendError?.error}
+        onRetry={() => {
+          setBackendError(null)
+          import("@/lib/websocket").then(({ ws }) => {
+            ws.manualReconnect()
+          })
+        }}
+      />
+    )
+  }
+
   // Show loading screen in Tauri until backend is ready
   if (isTauri && !backendReady) {
     return <StartupLoading onReady={() => setBackendReady(true)} />
@@ -473,11 +571,40 @@ function App() {
             path="/*"
             element={
               <ProtectedRoute>
-                <div className="flex flex-col" style={{height: 'var(--app-height, 100vh)'}}>
-                  <div className="aurora-bg" />
-                  {!isMobile && <TopNav />}
-                  <MobileNav />
-                  <main className="relative z-10 flex flex-1 min-h-0 overflow-hidden" style={{paddingTop: 'var(--topnav-height, calc(4rem + env(safe-area-inset-top, 0px)))'}}>
+                <div className="flex" style={{height: 'var(--app-height, 100vh)'}}>
+                  {!isMobile && <AppSidebar />}
+                  {/* Full-height slot for page-owned sidebars (chat sessions,
+                      dashboard list) — they portal in here to sit level with
+                      the AppSidebar, so the TopBar spans only the content
+                      area. Empty (0 width) on pages that don't use it. */}
+                  {!isMobile && <div id="page-sidebar-slot" className="flex shrink-0" />}
+                  <div className="flex flex-col flex-1 min-w-0">
+                    <MobileNav />
+                    {/* Skip link — keyboard users tab past the nav straight to content.
+                        Visually hidden until focused. */}
+                    <a
+                      href="#main-content"
+                      className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-[400] focus:rounded-md focus:bg-background focus:px-3 focus:py-2 focus:text-sm focus:shadow-lg focus:border focus:border-border"
+                    >
+                      {t("skipToContent")}
+                    </a>
+                    <main
+                      id="main-content"
+                      tabIndex={-1}
+                      className="relative flex flex-1 min-w-0 min-h-0 overflow-hidden transition-[margin-right] duration-normal ease-out focus:outline-none"
+                      style={{ marginRight: "var(--dock-chat-width, 0px)" }}
+                    >
+                    {!isMobile && <GlobalControlsFloating />}
+                    {/* Window drag strip — the whole top of the content area
+                        moves the Tauri window, not just the rail. Sits under
+                        the floating controls (z-20) and above page content. */}
+                    {!isMobile && (
+                      <div
+                        className="absolute right-0 top-0 z-10 h-14"
+                        style={{ left: 'var(--page-sidebar-width, 0px)' }}
+                        onMouseDown={handleWindowDragMouseDown}
+                      />
+                    )}
                     <div className="w-full h-full overflow-hidden" id="main-scroll-container">
                     <ErrorBoundary>
                     <div key={location.pathname.split('/')[1] || 'root'} className="animate-page-enter w-full h-full overflow-hidden">
@@ -503,10 +630,11 @@ function App() {
                       <Route path="/agents/memory" element={<AgentsPage />} />
                       <Route path="/agents/skills" element={<AgentsPage />} />
                       <Route path="/agents/tools" element={<AgentsPage />} />
-                      <Route path="/settings" element={<SettingsPage />} />
+                      <Route path="/settings" element={<SettingsRoute />} />
                       {/* Messages with tab routes */}
                       <Route path="/messages" element={<MessagesPage />} />
                       <Route path="/messages/channels" element={<MessagesPage />} />
+                      <Route path="/messages/im" element={<MessagesPage />} />
                       {/* Extensions */}
                       <Route path="/extensions" element={<ExtensionsPage />} />
                       <Route path="/plugins" element={<Navigate to="/extensions" replace />} />
@@ -519,9 +647,12 @@ function App() {
                     </ErrorBoundary>
                     </div>
                   </main>
-                  <Toaster />
-                  <Confirmer />
+                  <SettingsDialog />
+                  <SwipeNavigation />
+                  {/* Wide screens: the chat FAB docks as an in-flow right
+                      column beside main (squeezing the page content) */}
                   {!isMobile && <GlobalChatFab />}
+                  </div>
                 </div>
               </ProtectedRoute>
             }
@@ -535,6 +666,13 @@ function App() {
       <UpdateDialog
         open={updateDialogOpen}
         onClose={() => useStore.setState({ updateDialogOpen: false })}
+      />
+      {/* Global Server Upgrade Dialog (browser/server deployments) — driven
+          by the shared flag so the top-right indicator and the About page
+          open the same instance. */}
+      <ServerUpgradeDialog
+        open={serverUpgradeDialogOpen}
+        onClose={() => useStore.setState({ serverUpgradeDialogOpen: false })}
       />
       {/* Global Instance Switch Overlay */}
       <InstanceSwitchOverlay />

@@ -25,7 +25,7 @@ mod self_update;
 // climbed to 4-6 GB over days). jemalloc packs allocations tightly and
 // releases freed pages promptly. macOS/Windows use their own allocators
 // (not glibc) so they don't have this problem.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -63,17 +63,22 @@ async fn main() -> Result<()> {
     let file_logging = matches!(args.command, Command::Serve { .. });
 
     if file_logging {
-        let log_dir = Path::new("data/logs");
+        let log_dir = heramind_core::paths::data_dir().join("logs");
         let file_appender = tracing_appender::rolling::daily(log_dir, "heramind.log");
 
+        // [stdout hygiene] Console tracing goes to STDERR: the layer used to
+        // default to stdout, interleaving log lines into the HERAMIND_JSON=1
+        // stream (breaking serde parsing for the agent's machine reads).
         let stdout_layer = if json_logging {
             tracing_subscriber::fmt::layer()
                 .json()
+                .with_writer(std::io::stderr)
                 .with_target(true)
                 .with_filter(env_filter.clone())
                 .boxed()
         } else {
             tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
                 .with_target(false)
                 .with_thread_ids(false)
                 .with_file(false)
@@ -84,9 +89,14 @@ async fn main() -> Result<()> {
                 .boxed()
         };
 
+        // Never write ANSI color codes into the on-disk log: `fmt::layer()`
+        // defaults `with_ansi` to true (no TTY detection, unlike `fmt()`), so
+        // without this every line would be wrapped in `\x1b[...m` escapes and
+        // the /api/logs/download archive would ship them verbatim.
         let file_layer = tracing_subscriber::fmt::layer()
             .with_target(true)
             .with_writer(file_appender)
+            .with_ansi(false)
             .with_filter(env_filter);
 
         tracing_subscriber::registry()
@@ -96,11 +106,13 @@ async fn main() -> Result<()> {
     } else if json_logging {
         tracing_subscriber::fmt()
             .json()
+            .with_writer(std::io::stderr)
             .with_env_filter(env_filter)
             .with_target(true)
             .init();
     } else {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_env_filter(env_filter)
             .with_target(false)
             .with_thread_ids(false)
@@ -130,7 +142,17 @@ async fn main() -> Result<()> {
         } => run_logs(tail, follow, level, since).await,
         Command::Extension { extension_cmd } => run_extension_cmd(extension_cmd).await,
         Command::CheckUpdate => run_check_update().await,
-        Command::Upgrade { version, yes } => self_update::run_upgrade(version, yes).await,
+        Command::Upgrade {
+            version,
+            yes,
+            apply_staged,
+        } => {
+            if apply_staged {
+                self_update::run_apply_staged()
+            } else {
+                self_update::run_upgrade(version, yes).await
+            }
+        }
         Command::Uninstall { purge, yes } => self_update::run_uninstall(purge, yes).await,
         Command::ApiKey { key_cmd } => run_api_key_cmd(key_cmd).await,
         Command::Llm { llm_cmd } => {
@@ -163,6 +185,12 @@ async fn main() -> Result<()> {
         Command::System { system_cmd } => {
             print_result(heramind_cli_ops::dispatch::handlers::run_system_cmd(system_cmd).await)
         }
+        Command::Config { config_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_config_cmd(config_cmd).await)
+        }
+        Command::Data { data_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_data_cmd(data_cmd).await)
+        }
         Command::Connector { connector_cmd } => print_result(
             heramind_cli_ops::dispatch::handlers::run_connector_cmd(connector_cmd).await,
         ),
@@ -178,6 +206,9 @@ async fn main() -> Result<()> {
         Command::Whoami => {
             print_result(heramind_cli_ops::dispatch::handlers::run_whoami_cmd().await)
         }
+        Command::User { user_cmd } => {
+            print_result(heramind_cli_ops::dispatch::handlers::run_user_cmd(user_cmd).await)
+        }
     }
 }
 
@@ -190,6 +221,14 @@ fn print_result(
 ) -> Result<()> {
     let (resp, fmt) = result?;
     heramind_cli_ops::output::format_output(&resp, fmt);
+    // [exit-code contract] A CliResponse that reports failure IS a failure:
+    // scripts and the agent's shell tool key on the process exit status, and
+    // every error path used to print "❌ …" and exit 0 — indistinguishable
+    // from success. Exit 3 = the command ran but the operation failed
+    // (distinct from anyhow's exit 1 = transport/usage-level failure).
+    if !resp.success {
+        std::process::exit(3);
+    }
     Ok(())
 }
 
@@ -611,7 +650,7 @@ async fn run_server(host: String, port: u16) -> Result<()> {
 fn cleanup_old_logs() {
     use std::fs;
 
-    let log_dir = Path::new("data/logs");
+    let log_dir = heramind_core::paths::data_dir().join("logs");
     if !log_dir.exists() {
         return;
     }
@@ -710,9 +749,13 @@ async fn run_health() -> Result<()> {
 
     println!();
 
-    // Check database files
+    // Check database files — resolved, not CWD-relative: running `heramind
+    // health` from any other directory used to report "Data directory not
+    // found" for a perfectly healthy install.
     println!("🔍 Checking databases...");
-    let data_dir = std::path::PathBuf::from("./data");
+    let data_dir = heramind_cli_ops::data_dir::resolve(None)
+        .unwrap_or_else(|_| std::path::PathBuf::from("./data"));
+    println!("  (data dir: {})", data_dir.display());
     if data_dir.exists() {
         let db_files = [
             "telemetry.redb",
@@ -962,8 +1005,8 @@ async fn run_extension_cmd(cmd: ExtensionCommand) -> Result<()> {
             unreachable!()
         }
         ExtensionCommand::Uninstall { .. } => {
-            if let ExtensionCommand::Uninstall { id } = cmd {
-                return uninstall_extension(&id).await;
+            if let ExtensionCommand::Uninstall { id, yes, .. } = cmd {
+                return uninstall_extension(&id, yes).await;
             }
             unreachable!()
         }
@@ -1131,16 +1174,26 @@ async fn show_extension_info(id_or_path: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Try API first (shows runtime info: status, commands, metrics)
+    // Try API first (shows runtime info: status, commands, metrics). A 2xx
+    // whose body isn't JSON (the web SPA fallback for an unrouted path)
+    // parses to Null in the client — treat anything but a non-empty JSON
+    // object as "no answer" and fall through, never as success.
     let client = heramind_cli_ops::ApiClient::new();
     if let Ok(response) = heramind_cli_ops::extension::get_extension(&client, id_or_path).await {
-        let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-            OutputFormat::Json
-        } else {
-            OutputFormat::Human
-        };
-        format_output(&response, output_format);
-        return Ok(());
+        let looks_like_extension = response
+            .data
+            .as_ref()
+            .and_then(|d| d.as_object())
+            .is_some_and(|o| !o.is_empty());
+        if looks_like_extension {
+            let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Human
+            };
+            format_output(&response, output_format);
+            return Ok(());
+        }
     }
 
     // Fallback: search local filesystem for .nep files
@@ -1209,7 +1262,35 @@ async fn install_extension(package: &str) -> Result<()> {
 }
 
 /// Uninstall an extension.
-async fn uninstall_extension(id: &str) -> Result<()> {
+/// Confirmation prompt that is SAFE for non-interactive callers (the AI
+/// agent's shell tool, scripts, CI): with `--yes` it proceeds; on a
+/// non-terminal stdin it refuses with an actionable message instead of
+/// blocking forever on a pipe that will never answer (the old prompt hung
+/// the agent's subprocess until its tool timeout killed it).
+fn confirm_or_abort(prompt: &str, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "{} — refusing to proceed non-interactively. Re-run with --yes to skip the prompt.",
+            prompt
+        );
+    }
+    print!("{} [y/N] ", prompt);
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if !input.trim().to_lowercase().starts_with('y') {
+        println!("Cancelled.");
+        return Err(anyhow::anyhow!("Cancelled by user"));
+    }
+    Ok(())
+}
+
+async fn uninstall_extension(id: &str, yes: bool) -> Result<()> {
     use std::fs;
 
     let search_dirs = [
@@ -1250,17 +1331,7 @@ async fn uninstall_extension(id: &str) -> Result<()> {
 
     println!("Uninstalling extension: {}", path.display());
     println!("This will delete the extension package.");
-    print!("Confirm? [y/N] ");
-    use std::io::Write;
-    std::io::stdout().flush()?;
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-
-    if !input.trim().to_lowercase().starts_with('y') {
-        println!("Cancelled.");
-        return Ok(());
-    }
+    confirm_or_abort("Confirm uninstall?", yes)?;
 
     fs::remove_file(path)?;
 
@@ -1668,14 +1739,28 @@ fn walk_dir(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(out)
 }
 
+/// Resolve the data directory for local (non-server) key management.
+///
+/// `--data-dir` still wins; otherwise this auto-detects the install's
+/// store (env → desktop app dir → ./data → platform default). The old
+/// `default_value = "data"` meant running the command from any other
+/// directory created a SECOND, unused key store there — and printed
+/// success for a key the server would never accept.
+fn api_key_data_dir(explicit: Option<String>) -> Result<String> {
+    Ok(heramind_cli_ops::data_dir::resolve_or_message(explicit)?
+        .to_string_lossy()
+        .into_owned())
+}
+
 /// Run API key management commands.
-/// Run LLM backend management commands.
 async fn run_api_key_cmd(cmd: ApiKeyCommand) -> Result<()> {
     match cmd {
         ApiKeyCommand::Create { name, data_dir } => {
-            std::fs::create_dir_all(&data_dir)?;
+            let dir = api_key_data_dir(data_dir)?;
+            println!("Using data directory: {}", dir);
+            std::fs::create_dir_all(&dir)?;
 
-            let auth = heramind_api::auth::AuthState::new_with_data_dir(&data_dir);
+            let auth = heramind_api::auth::AuthState::new_with_data_dir(&dir);
             let (key, info) = auth.create_key(name.clone(), vec!["*".to_string()]).await;
 
             println!("API Key created successfully!");
@@ -1687,7 +1772,9 @@ async fn run_api_key_cmd(cmd: ApiKeyCommand) -> Result<()> {
             println!("IMPORTANT: Save this key now. It will not be shown again.");
         }
         ApiKeyCommand::List { data_dir } => {
-            let auth = heramind_api::auth::AuthState::new_with_data_dir(&data_dir);
+            let dir = api_key_data_dir(data_dir)?;
+            println!("Using data directory: {}", dir);
+            let auth = heramind_api::auth::AuthState::new_with_data_dir(&dir);
             let keys = auth.list_keys().await;
 
             if keys.is_empty() {
@@ -1718,6 +1805,7 @@ async fn run_api_key_cmd(cmd: ApiKeyCommand) -> Result<()> {
             }
         }
         ApiKeyCommand::Delete { name, data_dir } => {
+            let data_dir = api_key_data_dir(data_dir)?;
             let auth = heramind_api::auth::AuthState::new_with_data_dir(&data_dir);
             let keys = auth.list_keys().await;
             let target = keys.iter().find(|(_, info)| info.name == name);

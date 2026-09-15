@@ -37,7 +37,7 @@ pub struct SetupStatusResponse {
 }
 
 /// Initialize admin request.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct InitializeAdminRequest {
     /// Admin username
     pub username: String,
@@ -69,7 +69,7 @@ pub struct AdminUserInfo {
 }
 
 /// LLM configuration for setup.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct LlmConfigRequest {
     /// LLM provider (ollama, openai, anthropic, etc.)
     pub provider: String,
@@ -88,6 +88,14 @@ pub struct LlmConfigRequest {
 /// Returns whether the system needs initial setup (no users exist).
 /// This endpoint is public and used by the frontend to decide whether
 /// to show the login page or setup wizard.
+#[utoipa::path(
+    get,
+    path = "/api/setup/status",
+    tag = "setup",
+    responses(
+        (status = 200, description = "Whether first-run setup is required"),
+    )
+)]
 pub async fn setup_status_handler(
     State(state): State<ServerState>,
 ) -> Result<Json<SetupStatusResponse>, ErrorResponse> {
@@ -105,10 +113,45 @@ pub async fn setup_status_handler(
 ///
 /// Creates the first admin user. Only available when no users exist.
 /// After successful creation, returns a JWT token for immediate login.
+///
+/// Per-IP throttled (every attempt counts): an unconfigured device exposes
+/// this endpoint to the network, and racing to claim the admin account is
+/// the highest-value brute-force target on the box.
+#[utoipa::path(
+    post,
+    path = "/api/setup/initialize",
+    tag = "setup",
+    request_body = InitializeAdminRequest,
+    responses(
+        (status = 200, description = "Admin account created and setup marked started"),
+    )
+)]
 pub async fn initialize_admin_handler(
     State(state): State<ServerState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<InitializeAdminRequest>,
 ) -> Result<Json<InitializeAdminResponse>, ErrorResponse> {
+    // Throttle first (pure in-memory check, before any DB reads).
+    let ip = crate::auth_users::client_ip_for_throttle(&headers, &addr);
+    if let Err(crate::auth_users::AuthError::TooManyAttempts(secs)) = state
+        .auth
+        .user_state
+        .check_signup_throttle("setup", Some(&ip))
+    {
+        return Err(ErrorResponse {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "TOO_MANY_ATTEMPTS".to_string(),
+            message: format!("Too many setup attempts — try again in {secs} seconds"),
+            request_id: None,
+            hint: None,
+        });
+    }
+    state
+        .auth
+        .user_state
+        .record_signup_attempt("setup", Some(&ip));
+
     // Validate that this is truly first-time setup
     let users = state.auth.user_state.list_users().await;
     if !users.is_empty() {
@@ -206,6 +249,14 @@ pub async fn initialize_admin_handler(
 /// Complete setup.
 ///
 /// Marks setup as complete. Called after all setup steps are done.
+#[utoipa::path(
+    post,
+    path = "/api/setup/complete",
+    tag = "setup",
+    responses(
+        (status = 200, description = "Setup wizard finished"),
+    )
+)]
 pub async fn complete_setup_handler(
     State(state): State<ServerState>,
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
@@ -232,6 +283,15 @@ pub async fn complete_setup_handler(
 /// Save LLM configuration during setup.
 ///
 /// Allows configuring the LLM backend during the setup wizard.
+#[utoipa::path(
+    post,
+    path = "/api/setup/llm-config",
+    tag = "setup",
+    request_body = LlmConfigRequest,
+    responses(
+        (status = 200, description = "Wizard LLM choice saved and activated"),
+    )
+)]
 pub async fn save_llm_config_handler(
     State(state): State<ServerState>,
     Json(req): Json<LlmConfigRequest>,

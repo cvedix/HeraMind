@@ -90,9 +90,14 @@ export function ExtensionGrid({
 
     // In V2 system, extensions are always active once registered
     // Error/Warning/Stopped indicate problems
-    const activeCount = exts.filter((ext) => ext.state !== "Error" && ext.state !== "Warning" && ext.state !== "Stopped" && ext.state !== "Failed").length
-    const errorCount = exts.filter((ext) => ext.state === "Error" || ext.state === "Warning").length
-    const stoppedCount = exts.filter((ext) => ext.state === "Stopped" || ext.state === "Failed").length
+    // Crashed = stopped by crash-loop — error-class: it must NOT count as
+    // active, and must be findable in the error filter (it was missing from
+    // both sides, making crashed extensions invisible except in "all").
+    const isErrorState = (s: string) => s === "Error" || s === "Warning" || s === "Crashed"
+    const isStoppedState = (s: string) => s === "Stopped" || s === "Failed"
+    const activeCount = exts.filter((ext) => !isErrorState(ext.state) && !isStoppedState(ext.state)).length
+    const errorCount = exts.filter((ext) => isErrorState(ext.state)).length
+    const stoppedCount = exts.filter((ext) => isStoppedState(ext.state)).length
 
     // Build status options (only show categories that have items)
     const options: StatusOption[] = [
@@ -124,9 +129,9 @@ export function ExtensionGrid({
       filtered = filtered.filter((ext) => {
         switch (statusFilter) {
           case "active":
-            return ext.state !== "Error" && ext.state !== "Warning" && ext.state !== "Stopped" && ext.state !== "Failed"
+            return !isErrorState(ext.state) && !isStoppedState(ext.state)
           case "error":
-            return ext.state === "Error" || ext.state === "Warning"
+            return isErrorState(ext.state)
           case "stopped":
             return ext.state === "Stopped" || ext.state === "Failed"
           default:
@@ -147,7 +152,7 @@ export function ExtensionGrid({
 
   if (loading) {
     return (
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(max(25%_-_1rem,280px),1fr))] gap-5">
         {Array.from({ length: 6 }).map((_, i) => (
           <div
             key={i}
@@ -185,7 +190,7 @@ export function ExtensionGrid({
     return (
       <div className="flex flex-col items-center py-12 px-4">
         {/* Hero */}
-        <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-muted ring-1 ring-border mb-5">
+        <div className="flex h-16 w-16 items-center justify-center rounded-xl bg-muted ring-1 ring-border mb-5">
           <Plug className="h-8 w-8 text-muted-foreground" />
         </div>
         <h3 className="text-xl font-semibold">{t("empty.title")}</h3>
@@ -203,21 +208,21 @@ export function ExtensionGrid({
             {marqueeItems.map((ext, i) => (
               <div
                 key={`${ext.name}-${i}`}
-                className="flex-shrink-0 w-56 mx-2 rounded-xl border bg-card backdrop-blur-sm p-3.5 hover:border-brand hover:bg-background transition-colors"
+                className="flex-shrink-0 w-56 mx-2 rounded-xl border bg-card backdrop-blur-sm p-3.5 hover:border-foreground/30 hover:bg-background transition-colors"
               >
                 <div className="flex items-start gap-3">
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-brand-bg text-brand">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground">
                     {ext.icon}
                   </div>
                   <div className="min-w-0">
                     <p className="text-sm font-medium truncate">{ext.name}</p>
-                    <p className="text-[11px] text-muted-foreground mt-0.5 line-clamp-2 leading-tight">
+                    <p className="text-mini text-muted-foreground mt-0.5 line-clamp-2 leading-tight">
                       {ext.desc}
                     </p>
                   </div>
                 </div>
                 <div className="mt-2">
-                  <span className="inline-flex items-center rounded-full bg-muted-50 px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+                  <span className="inline-flex items-center rounded-full bg-muted-50 px-2 py-0.5 text-nano font-medium text-muted-foreground">
                     {ext.category}
                   </span>
                 </div>
@@ -273,6 +278,7 @@ export function ExtensionGrid({
         {searchQuery && (
           <button
             onClick={() => setSearchQuery("")}
+            aria-label={t('common:clear')}
             className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
           >
             <X className="h-4 w-4" />
@@ -319,7 +325,7 @@ export function ExtensionGrid({
                 {option.icon}
                 <span>{option.label}</span>
                 <span className={cn(
-                  "inline-flex items-center justify-center min-w-[18px] h-[16px] px-1 rounded text-[10px] font-semibold tabular-nums",
+                  "inline-flex items-center justify-center min-w-[18px] h-[16px] px-1 rounded text-nano font-semibold tabular-nums",
                   isSelected
                     ? "bg-white/20 text-primary-foreground"
                     : "bg-muted text-muted-foreground"
@@ -339,7 +345,7 @@ export function ExtensionGrid({
       </div>
 
       {/* Extension Cards Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(max(25%_-_1rem,280px),1fr))] gap-5">
         {filteredExtensions.map((extension, index) => (
           <div
             key={extension.id}

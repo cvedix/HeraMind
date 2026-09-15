@@ -198,8 +198,26 @@ pub struct IsolatedExtensionConfig {
     pub startup_timeout_secs: u64,
     /// Command execution timeout in seconds
     pub command_timeout_secs: u64,
-    /// Maximum memory usage in MB (0 = unlimited)
+    /// Maximum memory usage in MB (0 = unlimited) — enforced by the RSS
+    /// polling check (accurate for resident memory, incl. GPU-adjacent libs).
     pub max_memory_mb: usize,
+    /// HARD address-space rlimit for the runner process, in MB (None =
+    /// unlimited). OFF by default on purpose: RLIMIT_AS caps *virtual*
+    /// address space, and CUDA/ONNX runtimes reserve multi-GB VA regions at
+    /// init, so a naive cap kills exactly the heavy extensions it looks like
+    /// it should protect. Set this only for extensions with known-bounded
+    /// allocators (pure-Rust CLI-style extensions).
+    pub rlimit_memory_mb: Option<u64>,
+    /// Periodic liveness probe interval in seconds (0 = disabled). A hung
+    /// extension (deadlock without exit) never closes stdout, so the death
+    /// monitor can't see it; the probe Pings the runner and kills it after
+    /// repeated failures, converting hangs into crashes the existing
+    /// restart machinery already handles.
+    pub health_check_interval_secs: u64,
+    /// Per-probe timeout in seconds.
+    pub health_check_timeout_secs: u64,
+    /// Consecutive probe failures before the process is killed.
+    pub health_check_max_failures: u32,
     /// Restart on crash
     pub restart_on_crash: bool,
     /// Maximum restart attempts
@@ -231,6 +249,10 @@ impl Default for IsolatedExtensionConfig {
             // - System overhead: ~100MB
             // - Headroom: ~918MB
             max_memory_mb: 2048, // Increased from 1024MB for YOLO stability
+            rlimit_memory_mb: None,
+            health_check_interval_secs: 30,
+            health_check_timeout_secs: 5,
+            health_check_max_failures: 2,
             restart_on_crash: true,
             max_restart_attempts: 3,
             restart_cooldown_secs: 5,
@@ -369,6 +391,9 @@ pub struct IsolatedExtension {
         Arc<std::sync::RwLock<Option<Arc<dyn super::super::context::ExtensionCapabilityProvider>>>>,
     /// Crash loop detection: consecutive crash count
     consecutive_crashes: AtomicU32,
+    /// Human-readable reason for the most recent crash (exited/signal/IPC
+    /// failure) — surfaced through the API so "Stopped" can become "Crashed".
+    last_crash_reason: tokio::sync::Mutex<Option<String>>,
     /// Crash loop detection: timestamp of last crash
     last_crash_time: Mutex<Option<Instant>>,
     /// Ring buffer capturing stderr output as structured log entries
@@ -408,6 +433,7 @@ impl IsolatedExtension {
             start_time: Mutex::new(None),
             // Crash loop detection
             consecutive_crashes: AtomicU32::new(0),
+            last_crash_reason: tokio::sync::Mutex::new(None),
             last_crash_time: Mutex::new(None),
             log_buffer: Arc::new(LogBuffer::new()),
         }
@@ -532,7 +558,7 @@ impl IsolatedExtension {
                 dir
             } else {
                 // Legacy format: parent directory IS the extension root
-                // e.g., /path/to/extensions/yolo-video-v2/extension.dylib -> /path/to/extensions/yolo-video-v2/
+                // e.g., /path/to/extensions/yolo-video/extension.dylib -> /path/to/extensions/yolo-video/
                 let dir = self.extension_path.parent().ok_or_else(|| {
                     IsolatedExtensionError::SpawnFailed(
                         "Invalid extension path - expected extension root directory".to_string(),
@@ -581,10 +607,29 @@ impl IsolatedExtension {
                 .unwrap_or_else(|_| extension_dir.to_path_buf())
         };
         let mut cmd = Command::new(&runner_path);
+        // Hard rlimit only when explicitly configured — see the field docs on
+        // IsolatedExtensionConfig::rlimit_memory_mb for why this is not fed
+        // from max_memory_mb (the runner's flags existed but were never wired,
+        // which made "resource limits" a no-op on the spawn path).
+        if let Some(mb) = self.config.rlimit_memory_mb {
+            cmd.arg("--memory-limit").arg(mb.to_string());
+        }
+        // Extension-private data dir: platform-guaranteed to survive
+        // upgrades AND uninstall. Created here so extensions can rely on
+        // it existing without any bootstrap of their own.
+        let extension_data_dir = extension_dir_absolute.join("data");
+        if let Err(e) = std::fs::create_dir_all(&extension_data_dir) {
+            tracing::warn!(
+                extension_id = %self.extension_id,
+                error = %e,
+                "Could not create extension data dir"
+            );
+        }
         cmd.arg("--extension-path")
             .arg(&extension_path_absolute)
             .env("HERAMIND_EXTENSION_DIR", &extension_dir_absolute)
-            .current_dir(extension_dir_absolute) // Set working directory to extension root
+            .env("HERAMIND_EXTENSION_DATA_DIR", &extension_data_dir)
+            .current_dir(&extension_dir_absolute) // Set working directory to extension root
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -626,6 +671,22 @@ impl IsolatedExtension {
                 );
             }
 
+            // Manifest-declared env hints (generic, opt-in). Extensions that
+            // need runtime-specific env vars (ORT_DYLIB_PATH for
+            // load-dynamic ONNX Runtime, RKNN/TensorRT lib paths, …)
+            // declare them in their .nep manifest instead of the platform
+            // special-casing each runtime:
+            //
+            //   "env_hints": { "ORT_DYLIB_PATH": "{binaries}/libonnxruntime.dylib" }
+            //
+            // Mutating DYLD_* at runtime inside the child is unreliable on
+            // macOS (SIP), which is why exact-file env vars belong here at
+            // spawn. A hint only applies when the variable is not already
+            // set and the resolved file exists — no-ops otherwise, so
+            // extensions with other (or no) acceleration runtimes are
+            // untouched.
+            apply_manifest_env_hints(&mut cmd, &extension_dir_absolute, binary_dir);
+
             tracing::debug!(
                 extension_id = %self.extension_id,
                 binary_dir = %bin_dir,
@@ -664,32 +725,13 @@ impl IsolatedExtension {
         let rt_handle = tokio::runtime::Handle::current();
         self.spawn_receiver_thread(stdout, shutdown_rx, rt_handle, pid);
 
-        // Spawn stderr reader to prevent pipe buffer from filling up and capture logs
+        // Spawn stderr reader to prevent pipe buffer from filling up and capture logs.
+        // Body lives in `capture_stderr_loop` so it can be unit-tested with a
+        // synthetic stream (see `stderr_capture_survives_non_utf8_byte`).
         let extension_id = self.extension_id.clone();
         let log_buffer = self.log_buffer.clone();
         std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                let level = infer_log_level(&line);
-                match level {
-                    "ERROR" | "error" => {
-                        tracing::error!(extension_id = %extension_id, "{}", line);
-                    }
-                    "WARN" | "warning" => {
-                        tracing::warn!(extension_id = %extension_id, "{}", line);
-                    }
-                    _ => {
-                        tracing::info!(extension_id = %extension_id, "{}", line);
-                    }
-                }
-                let timestamp = chrono::Utc::now().timestamp_millis();
-                log_buffer.push(ExtensionLogEntry {
-                    timestamp,
-                    level: level.to_string(),
-                    message: line,
-                });
-            }
+            capture_stderr_loop(BufReader::new(stderr), extension_id, log_buffer);
         });
 
         // Spawn event push task to send events to extension process
@@ -950,8 +992,12 @@ impl IsolatedExtension {
                     break;
                 }
 
-                // Parse response
-                let response = match IpcResponse::from_bytes(payload.as_ref()) {
+                // Parse response — segmented binary payloads (push hot
+                // path) are handled by the SDK parser; legacy whole-JSON
+                // payloads parse exactly as before.
+                let response = match heramind_extension_sdk::parse_response_payload(
+                    payload.as_ref(),
+                ) {
                     Ok(r) => {
                         // Debug: log StreamSessionInit responses specifically
                         if let IpcResponse::StreamSessionInit {
@@ -1859,15 +1905,16 @@ impl IsolatedExtension {
             .map_err(|_| IsolatedExtensionError::ChannelClosed)?;
 
         match response {
-            IpcResponse::StreamSessionClosed {
-                total_frames,
-                duration_ms,
-                ..
-            } => Ok(super::super::stream::SessionStats {
-                output_chunks: total_frames,
-                last_activity: duration_ms as i64,
-                ..Default::default()
-            }),
+            IpcResponse::StreamSessionClosed { total_frames, .. } => {
+                Ok(super::super::stream::SessionStats {
+                    output_chunks: total_frames,
+                    // [unit fix] this wrote a DURATION into a timestamp field —
+                    // the API computes now_millis - last_activity for duration_ms,
+                    // so stats.last_activity must be a MILLIS timestamp.
+                    last_activity: chrono::Utc::now().timestamp_millis(),
+                    ..Default::default()
+                })
+            }
             IpcResponse::Error { error, .. } => Err(IsolatedExtensionError::ExecutionFailed(error)),
             _ => Err(IsolatedExtensionError::IpcError(
                 "Unexpected response to CloseStreamSession".to_string(),
@@ -2453,7 +2500,8 @@ impl IsolatedExtension {
                         self.kill_internal(&mut process_guard).await;
                         drop(process_guard);
                         // Record crash for crash loop detection
-                        self.record_crash().await;
+                        self.record_crash(format!("process exited with status: {:?}", status))
+                            .await;
                         return Err(IsolatedExtensionError::Crashed(format!(
                             "Process exited with status: {:?}",
                             status
@@ -2480,10 +2528,11 @@ impl IsolatedExtension {
                             exit_code = status.code(),
                             "Extension process exited unexpectedly"
                         );
-                        self.kill_internal(&mut *process_guard).await;
+                        self.kill_internal(&mut process_guard).await;
                         drop(process_guard);
                         // Record crash for crash loop detection
-                        self.record_crash().await;
+                        self.record_crash(format!("process exited with code: {:?}", status.code()))
+                            .await;
                         return Err(IsolatedExtensionError::Crashed(format!(
                             "Process exited with code: {:?}",
                             status.code()
@@ -2514,11 +2563,12 @@ impl IsolatedExtension {
                     );
 
                     let mut process_guard = self.process.lock().await;
-                    self.kill_internal(&mut *process_guard).await;
+                    self.kill_internal(&mut process_guard).await;
                     drop(process_guard);
 
                     // Record crash for crash loop detection
-                    self.record_crash().await;
+                    self.record_crash("IPC failure while starting extension")
+                        .await;
 
                     // Attempt restart with crash loop detection
                     if self.config.restart_on_crash {
@@ -2566,7 +2616,7 @@ impl IsolatedExtension {
                     drop(process_guard);
 
                     // Record crash for crash loop detection
-                    self.record_crash().await;
+                    self.record_crash("IPC failure during health check").await;
 
                     // Attempt restart with crash loop detection
                     if self.config.restart_on_crash {
@@ -2727,15 +2777,142 @@ impl IsolatedExtension {
     }
 
     /// Record a crash for crash loop detection
-    pub async fn record_crash(&self) {
+    pub async fn record_crash(&self, reason: impl Into<String>) {
         let consecutive = self.consecutive_crashes.fetch_add(1, Ordering::SeqCst);
+        let reason = reason.into();
+        *self.last_crash_reason.lock().await = Some(reason.clone());
         let mut last_crash = self.last_crash_time.lock().await;
         *last_crash = Some(Instant::now());
         warn!(
             extension_id = %self.extension_id,
             consecutive_crashes = consecutive + 1,
+            reason = %reason,
             "Extension crash recorded for crash loop detection"
         );
+    }
+
+    /// Current crash-loop status: (consecutive crashes, last crash reason).
+    pub async fn crash_info(&self) -> (u32, Option<String>) {
+        (
+            self.consecutive_crashes.load(Ordering::SeqCst),
+            self.last_crash_reason.lock().await.clone(),
+        )
+    }
+
+    /// Round-trip liveness probe. The runner answers `Ping` with `Pong`
+    /// without touching the extension; a timeout means the runner itself is
+    /// wedged (deadlock, unbounded loop in the message pump) — see
+    /// `spawn_health_monitor`.
+    pub async fn ping(&self) -> IsolatedResult<()> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(IsolatedExtensionError::NotRunning);
+        }
+        let (request_id, rx) = self.in_flight.register();
+        if let Err(e) = self
+            .send_message_with_retry(&IpcMessage::Ping {
+                request_id,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+        {
+            // Cancel our own entry on send failure: a leaked pending entry
+            // pins pending_count() ≥ 1 forever, which makes the health
+            // monitor skip every future probe (hang detection silently dead).
+            self.in_flight.cancel(request_id);
+            return Err(e);
+        }
+        match self
+            .in_flight
+            .wait_with_timeout(
+                request_id,
+                rx,
+                Duration::from_secs(self.config.health_check_timeout_secs.max(1)),
+            )
+            .await
+        {
+            Ok(IpcResponse::Pong { .. }) => Ok(()),
+            Ok(other) => Err(IsolatedExtensionError::InvalidResponse(format!(
+                "expected Pong, got {other:?}"
+            ))),
+            Err(super::in_flight::InFlightError::Timeout(ms)) => {
+                Err(IsolatedExtensionError::Timeout(ms))
+            }
+            Err(super::in_flight::InFlightError::ChannelClosed) => Err(
+                IsolatedExtensionError::IpcError("response channel closed".to_string()),
+            ),
+        }
+    }
+
+    /// Spawn the periodic liveness probe (see `health_check_interval_secs`).
+    /// Exits when the process stops running — the death monitor owns restarts;
+    /// this task's only job is to convert "hung but alive" into "dead" by
+    /// killing the process after repeated Ping failures.
+    pub fn spawn_health_monitor(self: &std::sync::Arc<Self>) {
+        let interval = self.config.health_check_interval_secs;
+        if interval == 0 {
+            return;
+        }
+        let max_failures = self.config.health_check_max_failures.max(1);
+        let this = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            let mut consecutive_failures: u32 = 0;
+            loop {
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                if !this.running.load(Ordering::SeqCst) {
+                    debug!(
+                        extension_id = %this.extension_id,
+                        "Health monitor exiting: process no longer running"
+                    );
+                    return;
+                }
+                // Busy runner ≠ hung runner. The runner's message pump handles
+                // one message at a time and native commands run as a single
+                // sync FFI call, so a legitimate long command (model load,
+                // batch inference — command_timeout_secs is 300s by default)
+                // blocks Ping for its whole duration. Probing during a command
+                // would kill healthy extensions mid-command; the command's own
+                // timeout already owns the hang path while one is executing.
+                if this.in_flight.pending_count() > 0 {
+                    debug!(
+                        extension_id = %this.extension_id,
+                        "Health probe skipped: command(s) in flight"
+                    );
+                    consecutive_failures = 0;
+                    continue;
+                }
+                match this.ping().await {
+                    Ok(()) => consecutive_failures = 0,
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        warn!(
+                            extension_id = %this.extension_id,
+                            error = %e,
+                            consecutive_failures,
+                            max_failures,
+                            "Extension liveness probe failed"
+                        );
+                        if consecutive_failures >= max_failures {
+                            // Same kill path a command timeout takes: EOF on
+                            // stdout fires the death notification and the
+                            // manager's crash machinery restarts or
+                            // circuit-breaks the extension.
+                            warn!(
+                                extension_id = %this.extension_id,
+                                consecutive_failures,
+                                "Extension unresponsive to liveness probes — killing hung process"
+                            );
+                            this.record_crash("unresponsive to liveness probes (hang)")
+                                .await;
+                            let mut process_guard = this.process.lock().await;
+                            if process_guard.is_some() {
+                                this.kill_internal(&mut process_guard).await;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Record successful start - reset crash counter after stable period
@@ -2790,6 +2967,69 @@ fn infer_log_level(line: &str) -> &'static str {
         "trace"
     } else {
         "info"
+    }
+}
+
+/// Continuously read stderr lines from `reader` into `log_buffer`.
+///
+/// Extracted from the stderr-capture spawn site so the logic can be exercised
+/// with a synthetic `BufRead` in unit tests.
+fn capture_stderr_loop<R: std::io::BufRead>(
+    reader: R,
+    extension_id: String,
+    log_buffer: Arc<LogBuffer>,
+) {
+    // Byte-level splitting instead of `BufRead::lines()`. `lines()` yields
+    // Err(InvalidData) on any non-UTF-8 byte; combined with a `map_while(Result::ok)`
+    // exit that permanently killed the capture thread — freezing the log buffer
+    // at startup output. Native deps (OpenCV/ONNX/ffmpeg/...) write directly to
+    // fd 2 and routinely emit non-UTF-8 bytes during model load, so we read raw
+    // bytes and lossy-convert, and never abort on a single bad line.
+    let mut reader = reader;
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break, // EOF — child closed stderr
+            Ok(_) => {
+                // Strip trailing CR/LF produced by the splitter.
+                while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+                    buf.pop();
+                }
+                if buf.is_empty() {
+                    continue;
+                }
+                let line = String::from_utf8_lossy(&buf).into_owned();
+                let level = infer_log_level(&line);
+                match level {
+                    "ERROR" | "error" => {
+                        tracing::error!(extension_id = %extension_id, "{}", line);
+                    }
+                    "WARN" | "warning" => {
+                        tracing::warn!(extension_id = %extension_id, "{}", line);
+                    }
+                    _ => {
+                        tracing::info!(extension_id = %extension_id, "{}", line);
+                    }
+                }
+                let timestamp = chrono::Utc::now().timestamp_millis();
+                log_buffer.push(ExtensionLogEntry {
+                    timestamp,
+                    level: level.to_string(),
+                    message: line,
+                });
+            }
+            Err(e) => {
+                // Transient read error — keep draining. A single blip must not
+                // freeze the whole log buffer (the old failure mode).
+                tracing::warn!(
+                    extension_id = %extension_id,
+                    error = %e,
+                    "stderr read error, continuing capture"
+                );
+                continue;
+            }
+        }
     }
 }
 
@@ -2865,9 +3105,189 @@ impl Drop for IsolatedExtension {
     }
 }
 
+/// Apply manifest-declared env hints to a runner command.
+///
+/// Reads `<extension_dir>/manifest.json` → optional `"env_hints"` map of
+/// `{VAR: path_template}`. Templates may contain `{binaries}` (the
+/// platform binaries dir of this spawn) and `{extension_dir}`. A hint is
+/// applied only when the env var is not already set AND the resolved file
+/// exists; anything else is silently skipped (declared-but-absent files are
+/// a normal state, e.g. runtime libs only bundled in jetson/cuda variants).
+fn apply_manifest_env_hints(
+    cmd: &mut Command,
+    extension_dir: &std::path::Path,
+    binaries_dir: &std::path::Path,
+) {
+    let manifest_path = extension_dir.join("manifest.json");
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return;
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        tracing::debug!(
+            manifest = %manifest_path.display(),
+            "env_hints: manifest.json unreadable, skipping"
+        );
+        return;
+    };
+    let Some(hints) = manifest.get("env_hints").and_then(|h| h.as_object()) else {
+        return;
+    };
+    for (var, template) in hints {
+        let Some(template) = template.as_str() else {
+            continue;
+        };
+        if std::env::var_os(var).is_some() {
+            continue;
+        }
+        let resolved = template
+            .replace("{binaries}", &binaries_dir.to_string_lossy())
+            .replace("{extension_dir}", &extension_dir.to_string_lossy());
+        let path = std::path::Path::new(&resolved);
+        if path.is_file() {
+            tracing::debug!(
+                var,
+                value = %resolved,
+                "Applying manifest env hint"
+            );
+            cmd.env(var, &resolved);
+        } else {
+            tracing::debug!(
+                var,
+                value = %resolved,
+                "Manifest env hint target missing, skipping"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "heramind-env-hints-test-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn env_hints_resolve_placeholders_and_apply() {
+        let tmp = scratch_dir("apply");
+        let bin_dir = tmp.join("binaries/darwin_aarch64");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("libonnxruntime.dylib"), b"fake").unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"id":"t","env_hints":{"ORT_DYLIB_PATH":"{binaries}/libonnxruntime.dylib"}}"#,
+        )
+        .unwrap();
+
+        let mut cmd = Command::new("true");
+        apply_manifest_env_hints(&mut cmd, &tmp, &bin_dir);
+        assert_eq!(
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new("ORT_DYLIB_PATH"))
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().to_string()),
+            Some(
+                bin_dir
+                    .join("libonnxruntime.dylib")
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn env_hints_skipped_when_target_missing() {
+        let tmp = scratch_dir("missing");
+        std::fs::create_dir_all(tmp.join("binaries/darwin_aarch64")).unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"id":"t","env_hints":{"ORT_DYLIB_PATH":"{binaries}/libonnxruntime.dylib"}}"#,
+        )
+        .unwrap();
+
+        let mut cmd = Command::new("true");
+        apply_manifest_env_hints(&mut cmd, &tmp, &tmp.join("binaries/darwin_aarch64"));
+        assert!(!cmd.get_envs().any(|(k, _)| k == "ORT_DYLIB_PATH"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn env_hints_noop_without_manifest_or_field() {
+        let tmp = scratch_dir("noop");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut cmd = Command::new("true");
+        // no manifest.json at all
+        apply_manifest_env_hints(&mut cmd, &tmp, &tmp);
+        // manifest without env_hints
+        std::fs::write(tmp.join("manifest.json"), r#"{"id":"t"}"#).unwrap();
+        apply_manifest_env_hints(&mut cmd, &tmp, &tmp);
+        assert!(cmd.get_envs().next().is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn env_hints_extension_dir_placeholder() {
+        let tmp = scratch_dir("extdir");
+        std::fs::create_dir_all(tmp.join("rknn")).unwrap();
+        std::fs::write(tmp.join("rknn/librknnrt.so"), b"fake").unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"id":"t","env_hints":{"RKNN_LIB_PATH":"{extension_dir}/rknn/librknnrt.so"}}"#,
+        )
+        .unwrap();
+
+        let mut cmd = Command::new("true");
+        apply_manifest_env_hints(&mut cmd, &tmp, &tmp);
+        assert!(cmd
+            .get_envs()
+            .any(|(k, _)| k == std::ffi::OsStr::new("RKNN_LIB_PATH")));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stderr_capture_survives_non_utf8_byte() {
+        // Regression: the stderr capture loop used `reader.lines().map_while(Result::ok)`.
+        // `BufRead::lines()` yields Err(InvalidData) on any non-UTF-8 byte, and
+        // `map_while(Result::ok)` terminates the whole iteration at the first Err —
+        // silently killing the capture thread. The log buffer then froze at whatever
+        // was collected before the bad byte (i.e. startup output), and no later logs
+        // ever appeared. Native deps (OpenCV/ONNX/ffmpeg/...) write directly to fd 2
+        // and routinely emit non-UTF-8 bytes during model load — right after startup.
+        use std::io::Cursor;
+
+        let mut stream: Vec<u8> = Vec::new();
+        stream.extend_from_slice(b"2026-07-31T00:00:00.000000Z  INFO extension starting\n");
+        stream.extend_from_slice(b"model load warning: [");
+        stream.push(0xFF); // invalid UTF-8 byte — killed the old loop
+        stream.extend_from_slice(b"] check locale\n");
+        stream.extend_from_slice(b"2026-07-31T00:00:01.000000Z  INFO inference ready\n");
+
+        let buffer = Arc::new(LogBuffer::new());
+        capture_stderr_loop(Cursor::new(stream), "test-ext".to_string(), buffer.clone());
+
+        let snapshot = buffer.snapshot();
+        let messages: Vec<&str> = snapshot.iter().map(|e| e.message.as_str()).collect();
+
+        // Pre-bad-byte line must be present.
+        assert!(
+            messages.iter().any(|m| m.contains("extension starting")),
+            "startup line missing: {messages:?}"
+        );
+        // The bug: the line AFTER the non-UTF-8 byte was never captured because the
+        // loop had already died. A passing fix must reach this line.
+        assert!(
+            messages.iter().any(|m| m.contains("inference ready")),
+            "post-non-utf8 line missing — capture thread died at 0xFF: {messages:?}"
+        );
+    }
 
     #[test]
     fn test_config_default() {

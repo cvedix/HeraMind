@@ -141,11 +141,11 @@ export function PageLayout({
         />
       )}
       {/* Desktop: PageHeader with title + description + actions.
-          bg-background so the title strip visually connects with the
-          scroll container below (which also has bg-background). */}
+          mx-auto + maxWidth mirror the scroll container so the title and
+          content share the same left edge. */}
       {title && !isMobile && (
         <div className="shrink-0 bg-background">
-          <div className={cn('w-full px-4 pt-4 pb-2 sm:px-6 sm:pt-5 sm:pb-3 md:px-8 md:pt-6 md:pb-3', maxWidthClass[maxWidth], className)}>
+          <div className={cn('mx-auto w-full px-4 pt-4 pb-2 sm:px-6 sm:pt-5 sm:pb-3 md:px-8 md:pt-6 md:pb-3', maxWidthClass[maxWidth], className)}>
             <PageHeader
               title={title}
               description={subtitle}
@@ -170,7 +170,7 @@ export function PageLayout({
             container so it stays visible while content scrolls. Desktop is
             unaffected (those actions render in the desktop tab bar instead). */}
         {isMobile && collectedMobileContentActions.length > 0 && (
-          <div className="shrink-0 border-b border-border bg-background px-3 py-2">
+          <div className="shrink-0  bg-background px-3 py-2">
             <div className="flex items-center gap-2 overflow-x-auto scrollbar-none">
               {collectedMobileContentActions.map((node, i) => (
                 <Fragment key={i}>{node}</Fragment>
@@ -183,7 +183,7 @@ export function PageLayout({
             transparent strip above the first (often sticky) child. */}
         <div
           className={cn(
-            'flex-1 flex flex-col overflow-auto bg-background overscroll-none',
+            '@container flex-1 flex flex-col overflow-auto bg-background overscroll-none',
             !noPadding && 'px-4 sm:px-6 md:px-8',
             !noPadding && isMobile && 'pt-2',
           )}
@@ -198,9 +198,13 @@ export function PageLayout({
           </div>
         </div>
       </div>
-      {/* Fixed footer with glass morphism effect */}
+      {/* Fixed footer with glass morphism effect. left offsets past the
+          desktop AppSidebar (0 on mobile — sidebar unmounted, var is 0px). */}
       {showFooter ? (
-        <div className="fixed bottom-[var(--keyboard-offset,0px)] left-0 right-0 bg-surface-glass backdrop-blur-xl border-t border-glass-border safe-bottom z-10">
+        <div
+          className="fixed bottom-[var(--keyboard-offset,0px)] bg-surface-glass backdrop-blur-xl border-t border-glass-border safe-bottom z-10 transition-[margin-right] duration-normal ease-out"
+          style={{ left: 'var(--app-sidebar-width, 0px)', right: 0, marginRight: 'var(--dock-chat-width, 0px)' }}
+        >
           <div className={cn('w-full px-4 py-4 sm:px-6 sm:py-5 md:px-8', maxWidthClass[maxWidth], className)}>
             {footer}
           </div>

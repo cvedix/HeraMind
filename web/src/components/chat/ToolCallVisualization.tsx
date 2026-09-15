@@ -16,7 +16,7 @@ import { useState, useEffect } from "react"
 import { useTranslation } from "react-i18next"
 import { Wrench, ChevronDown, CheckCircle2, Loader2, Code, FileText } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { textBody, textMini } from "@/design-system/tokens/typography"
+import { textMini, textCode } from "@/design-system/tokens/typography"
 import type { ToolCall } from "@/types"
 import { BuildCard, parseBuildResponse } from "@/components/chat/BuildCard"
 
@@ -115,14 +115,15 @@ export function ToolProcessBlock({
   isStreaming = false,
 }: ToolProcessBlockProps) {
   const { t } = useTranslation("chat")
-  const [isExpanded, setIsExpanded] = useState(true)
-
-  // Auto-collapse when many tool calls are present and all completed
-  useEffect(() => {
-    if (toolCalls.length > 4 && !isStreaming) {
-      setIsExpanded(false)
-    }
-  }, [toolCalls.length, isStreaming])
+  // Expansion is decided ONCE at mount: long completed batches start
+  // collapsed, streaming/short ones start expanded. The previous auto-collapse
+  // effect fired exactly when isStreaming flipped false — a message that
+  // streamed expanded would visually SNAP shut at completion (bubble
+  // re-layout mid-view). A streamed message keeps its expansion until the
+  // user toggles it.
+  const [isExpanded, setIsExpanded] = useState(
+    !(toolCalls.length > 4 && !isStreaming)
+  )
 
   if (!toolCalls || toolCalls.length === 0) return null
 
@@ -133,11 +134,11 @@ export function ToolProcessBlock({
   const manyCalls = toolCalls.length > 4
 
   return (
-    <div className="mb-4">
+    <div className="mb-4 overflow-hidden rounded-lg bg-muted/40">
       {/* Summary header */}
       <button
         onClick={() => setIsExpanded(!isExpanded)}
-        className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-muted-30 transition-colors"
+        className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-muted-50 transition-colors"
       >
         <div className={cn(
           "h-4 w-4 rounded flex items-center justify-center shrink-0",
@@ -153,7 +154,7 @@ export function ToolProcessBlock({
             <Wrench className="h-2.5 w-2.5" />
           )}
         </div>
-        <span className={cn(textBody, "font-medium text-foreground")}>
+        <span className={cn("text-body sm:text-sm", "font-medium text-foreground")}>
           {isStreaming
             ? `${completedCount}/${toolCalls.length} ${t("toolCall.status.running")}`
             : `${toolCalls.length} ${t("toolCall.title")} · ${steps.length} ${t("toolCall.rounds")}`
@@ -161,7 +162,7 @@ export function ToolProcessBlock({
         </span>
         <div className="flex-1" />
         <ChevronDown className={cn(
-          "h-4 w-4 text-muted-foreground transition-transform duration-200",
+          "h-4 w-4 text-muted-foreground transition-transform duration-normal",
           isExpanded && "rotate-180"
         )} />
       </button>
@@ -174,11 +175,8 @@ export function ToolProcessBlock({
             const isLastStep = idx === steps.length - 1
             const stepStreaming = isStreaming && isLastStep
             const roundContent = roundContents[step]
-            // Alternate subtle background per round
-            const roundBg = idx % 2 === 1 ? "bg-muted-30" : ""
-
             return (
-              <div key={step} className={cn("rounded-lg mb-1", roundBg)}>
+              <div key={step} className="mb-1">
                 {/* Round content (intermediate results) */}
                 {roundContent && (
                   <RoundContent content={roundContent} />
@@ -229,7 +227,7 @@ function RoundContent({ content }: { content: string }) {
       </button>
       {isExpanded && (
         <div className="px-3 pb-2">
-          <div className={cn(textBody, "font-mono text-muted-foreground whitespace-pre-wrap break-words leading-relaxed")}>
+          <div className={cn("text-body sm:text-sm", "font-mono text-muted-foreground whitespace-pre-wrap break-words leading-relaxed")}>
             {content}
           </div>
         </div>
@@ -270,7 +268,14 @@ function ToolCallItem({
 
   return (
     <div className="px-3 py-1">
-      <div className="flex items-center gap-2">
+      <button
+        onClick={() => { if (hasDetails) setIsExpanded(!isExpanded) }}
+        className={cn(
+          "w-full flex items-center gap-2 rounded text-left transition-colors",
+          hasDetails && "hover:bg-muted-30"
+        )}
+        aria-label={hasDetails ? t("toolCall.toggleDetails") : undefined}
+      >
         <div className={cn(
           "h-3.5 w-3.5 rounded-full flex items-center justify-center shrink-0",
           status === "completed" && "text-accent-emerald",
@@ -285,7 +290,7 @@ function ToolCallItem({
             <div className="h-1.5 w-1.5 rounded-full bg-muted-foreground" />
           )}
         </div>
-        <span className={cn(textBody, "truncate text-muted-foreground")}>{getToolDisplayName(toolCall.name, toolCall.arguments)}</span>
+        <span className={cn("text-sm", "truncate text-muted-foreground")}>{getToolDisplayName(toolCall.name, toolCall.arguments)}</span>
         {status === "running" && (
           <span className={cn(textMini, "px-1.5 py-0.5 rounded bg-warning-light text-warning shrink-0")}>
             {statusLabels[status]}
@@ -293,19 +298,12 @@ function ToolCallItem({
         )}
         <div className="flex-1" />
         {hasDetails && (
-          <button
-            onClick={() => setIsExpanded(!isExpanded)}
-            // -mr-1 + p-1: pull the button's right edge out by 4px so the
-            // 16px chevron inside (centered with 4px right padding) lands
-            // at exactly parent_right - 12, matching ThinkingBlock /
-            // ToolProcessBlock / RoundContent chevrons.
-            className="-mr-1 p-1 rounded text-muted-foreground hover:bg-muted-30 hover:text-muted-foreground shrink-0 transition-colors"
-            aria-label={t("toolCall.toggleDetails")}
-          >
-            <ChevronDown className={cn("h-4 w-4 transition-transform duration-200", isExpanded && "rotate-180")} />
-          </button>
+          <ChevronDown className={cn(
+            "h-4 w-4 text-muted-foreground transition-transform duration-normal shrink-0",
+            isExpanded && "rotate-180"
+          )} />
         )}
-      </div>
+      </button>
       {isExpanded && hasDetails && (
         <div className="ml-5.5 mt-0.5 mb-1 space-y-1">
           {hasArguments && (
@@ -313,7 +311,7 @@ function ToolCallItem({
               <div className={cn(textMini, "text-muted-foreground mb-0.5 flex items-center gap-1")}>
                 <Code className="h-3 w-3" />{t("toolCall.arguments")}
               </div>
-              <pre className={cn(textMini, "font-mono text-muted-foreground whitespace-pre-wrap break-words leading-relaxed")}>
+              <pre className={cn(textCode, "font-mono text-muted-foreground whitespace-pre-wrap break-words leading-relaxed")}>
                 {formatJson(toolCall.arguments)}
               </pre>
             </div>
@@ -325,7 +323,7 @@ function ToolCallItem({
               <div className={cn(textMini, "text-muted-foreground mb-0.5 flex items-center gap-1")}>
                 <CheckCircle2 className="h-3 w-3" />{t("toolCall.result")}
               </div>
-              <pre className={cn(textMini, "font-mono text-muted-foreground whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed")}>
+              <pre className={cn(textCode, "font-mono text-muted-foreground whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed")}>
                 {formatJson(toolCall.result)}
               </pre>
             </div>

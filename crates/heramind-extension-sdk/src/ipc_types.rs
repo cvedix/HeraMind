@@ -713,6 +713,15 @@ pub struct ExtensionRuntimeState {
     pub error_count: u64,
     /// Last error message
     pub last_error: Option<String>,
+    /// Consecutive crashes as counted by crash-loop detection (reset on a
+    /// stable start). Non-zero while the extension is stopped means it did
+    /// not stop on purpose — it crashed.
+    #[serde(default)]
+    pub consecutive_crashes: u32,
+    /// Why the last crash happened (exit status / signal / IPC failure /
+    /// hang). Surfaced so the UI can say "Crashed: <reason>".
+    #[serde(default)]
+    pub last_crash_reason: Option<String>,
 }
 
 impl ExtensionRuntimeState {
@@ -1006,6 +1015,10 @@ pub struct StreamClientInfo {
 pub struct StreamDataChunk {
     pub sequence: u64,
     pub data_type: String,
+    /// Base64 on the wire: a raw Vec<u8> serializes as a decimal number
+    /// array (~4x size, an order of magnitude slower to parse) — this chunk
+    /// type carries video frames.
+    #[serde(with = "base64_vec")]
     pub data: Vec<u8>,
     pub timestamp: i64,
     pub is_last: bool,
@@ -1135,8 +1148,13 @@ pub enum IpcMessage {
     /// Graceful shutdown
     Shutdown,
 
-    /// Ping (keep-alive)
+    /// Ping (keep-alive / liveness probe)
     Ping {
+        /// Request ID for routing the Pong back to the probing caller.
+        /// `#[serde(default)]`: the host is the only Ping sender and always
+        /// sets it; the default keeps deserialization tolerant.
+        #[serde(default)]
+        request_id: u64,
         /// Timestamp
         timestamp: i64,
     },
@@ -1381,6 +1399,10 @@ pub enum IpcResponse {
 
     /// Pong response
     Pong {
+        /// Request ID of the Ping this answers (routes through the host's
+        /// in-flight tracker like every other response).
+        #[serde(default)]
+        request_id: u64,
         /// Original timestamp
         timestamp: i64,
     },
@@ -1422,7 +1444,8 @@ pub enum IpcResponse {
         input_sequence: u64,
         /// Output sequence
         output_sequence: u64,
-        /// Result data
+        /// Result data (base64 on the wire — see base64_vec)
+        #[serde(with = "base64_vec")]
         data: Vec<u8>,
         /// Data type MIME
         data_type: String,
@@ -1449,7 +1472,8 @@ pub enum IpcResponse {
         input_sequence: u64,
         /// Output sequence
         output_sequence: u64,
-        /// Result data
+        /// Result data (base64 on the wire — see base64_vec)
+        #[serde(with = "base64_vec")]
         data: Vec<u8>,
         /// Data type MIME
         data_type: String,
@@ -1493,7 +1517,8 @@ pub enum IpcResponse {
         session_id: String,
         /// Output sequence
         sequence: u64,
-        /// Data
+        /// Data (base64 on the wire — see base64_vec)
+        #[serde(with = "base64_vec")]
         data: Vec<u8>,
         /// Data type MIME
         data_type: String,
@@ -1626,7 +1651,7 @@ impl IpcResponse {
             Self::Health { request_id, .. } => Some(*request_id),
             Self::Metadata { request_id, .. } => Some(*request_id),
             Self::EventSubscriptions { request_id, .. } => Some(*request_id),
-            Self::Pong { .. } => None,
+            Self::Pong { request_id, .. } => Some(*request_id),
             Self::StreamSessionInit { request_id, .. } => Some(*request_id),
             Self::StreamSessionClosed { request_id, .. } => Some(*request_id),
             Self::StreamChunkResult { request_id, .. } => Some(*request_id),
@@ -1656,7 +1681,8 @@ pub struct PushOutputData {
     pub session_id: String,
     /// Output sequence
     pub sequence: u64,
-    /// Data
+    /// Data (base64 on the wire — see base64_vec)
+    #[serde(with = "base64_vec")]
     pub data: Vec<u8>,
     /// Data type MIME
     pub data_type: String,
@@ -1698,6 +1724,72 @@ impl From<IpcResponse> for Option<PushOutputData> {
 pub struct IpcFrame {
     /// Payload bytes
     pub payload: Vec<u8>,
+}
+
+/// Encode a SEGMENTED runner→core payload: binary payloads ride as raw
+/// bytes instead of a base64 string inside JSON:
+/// `[header_len: u32 LE][header JSON][segment bytes]`.
+///
+/// The header carries every PushOutput field except `data`, plus
+/// `data_len` describing the segment. Frame layout itself is unchanged —
+/// this is a payload-level convention on the push hot path only.
+pub fn encode_segmented_payload(header: &[u8], segment: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + header.len() + segment.len());
+    out.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    out.extend_from_slice(header);
+    out.extend_from_slice(segment);
+    out
+}
+
+/// True when `payload` looks segmented: the first 4 bytes as LE u32 must
+/// be a plausible header length AND byte 4 must open a JSON object. A
+/// legacy whole-JSON payload starts with `{` (0x7B), which reads as a
+/// huge LE u32 and fails the length check — the two conditions together
+/// make a false positive effectively impossible.
+fn payload_is_segmented(payload: &[u8]) -> bool {
+    if payload.len() < 6 {
+        return false;
+    }
+    let hlen = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    hlen >= 2 && 4 + hlen <= payload.len() && payload[4] == b'{'
+}
+
+/// Parse a runner→core response payload, segmented (binary push) or
+/// legacy (whole JSON). Segmented PushOutput headers are reconstructed
+/// with `data = segment` — zero base64 anywhere on this path.
+pub fn parse_response_payload(
+    payload: &[u8],
+) -> std::result::Result<IpcResponse, serde_json::Error> {
+    if !payload_is_segmented(payload) {
+        return IpcResponse::from_bytes(payload);
+    }
+    let hlen = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let header: serde_json::Value = serde_json::from_slice(&payload[4..4 + hlen])?;
+    let Some(v) = header.get("PushOutput") else {
+        // segmented non-PushOutput: not produced today — parse as error
+        return IpcResponse::from_bytes(payload);
+    };
+    Ok(IpcResponse::PushOutput {
+        session_id: v
+            .get("session_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        sequence: v.get("sequence").and_then(|x| x.as_u64()).unwrap_or(0),
+        data: payload[4 + hlen..].to_vec(),
+        data_type: v
+            .get("data_type")
+            .and_then(|x| x.as_str())
+            .unwrap_or("application/octet-stream")
+            .to_string(),
+        timestamp: v
+            .get("timestamp")
+            .and_then(|x| x.as_i64())
+            .unwrap_or_default(),
+        metadata: v
+            .get("metadata")
+            .and_then(|m| if m.is_null() { None } else { Some(m.clone()) }),
+    })
 }
 
 /// Maximum IPC frame payload size (16 MB)
@@ -1749,6 +1841,60 @@ impl IpcFrame {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod segmented_tests {
+    use super::*;
+
+    #[test]
+    fn segmented_roundtrip() {
+        let header = br#"{"PushOutput":{"session_id":"s1","sequence":7,"data_len":5,"data_type":"video/avc","timestamp":123,"metadata":null}}"#;
+        let segment: &[u8] = &[0, 0, 0, 1, 0x67];
+        let payload = encode_segmented_payload(header, segment);
+        let r = parse_response_payload(&payload).expect("segmented must parse");
+        match r {
+            IpcResponse::PushOutput {
+                session_id,
+                sequence,
+                data,
+                data_type,
+                timestamp,
+                metadata,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(sequence, 7);
+                assert_eq!(data, segment);
+                assert_eq!(data_type, "video/avc");
+                assert_eq!(timestamp, 123);
+                assert!(metadata.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_json_payload_passthrough() {
+        // A legacy whole-JSON payload (data as base64) must parse unchanged
+        let json = br#"{"PushOutput":{"session_id":"s2","sequence":1,"data":"AAECAwQ=","data_type":"image/jpeg","timestamp":9,"metadata":null}}"#;
+        let r = parse_response_payload(json).expect("legacy must parse");
+        match r {
+            IpcResponse::PushOutput { data, .. } => assert_eq!(data, vec![0, 1, 2, 3, 4]),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discriminator_rejects_large_json() {
+        // An 8 KB+ legacy JSON (descriptor-sized) must NOT be mistaken for
+        // segmented: first bytes `{"Re` read as a huge LE u32.
+        let mut big = br#"{"Ready":{"descriptor":"x"#.to_vec();
+        big.extend(std::iter::repeat(b'a').take(9000));
+        big.push(b'}');
+        // It fails to parse as IpcResponse (not a real message) — but it
+        // must fail as LEGACY (serde), not crash the discriminator.
+        assert!(parse_response_payload(&big).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1876,5 +2022,76 @@ mod tests {
         let err = ExtensionError::Timeout("timeout".to_string());
         let kind: ErrorKind = err.into();
         assert_eq!(kind, ErrorKind::Timeout);
+    }
+
+    /// Binary payloads must serialize as base64 (not decimal number arrays)
+    /// and must still DESERIALIZE the legacy number-array form.
+    #[test]
+    fn test_binary_payloads_use_base64_and_accept_legacy_arrays() {
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+
+        let resp = IpcResponse::PushOutput {
+            metadata: None,
+            session_id: "s".into(),
+            sequence: 1,
+            data: payload.clone(),
+            data_type: "image/jpeg".into(),
+            timestamp: 0,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let data = json
+            .get("PushOutput")
+            .and_then(|v| v.get("data"))
+            .expect("externally-tagged variant payload");
+        assert!(
+            data.is_string(),
+            "PushOutput.data must serialize as base64 string, got: {data}"
+        );
+        // ~5.5 KB base64 vs ~19 KB number array for a 4 KB frame.
+        let encoded_len = data.as_str().unwrap().len();
+        assert!(
+            encoded_len < payload.len() * 2,
+            "base64 should be ~4/3x, got {encoded_len} for {} bytes",
+            payload.len()
+        );
+
+        // Legacy number-array form (written by pre-base64 builds) must load.
+        let legacy = serde_json::json!({ "PushOutput": {
+            "session_id": "s",
+            "sequence": 1,
+            "data": [1, 2, 3, 250],
+            "data_type": "image/jpeg",
+            "timestamp": 0,
+        }});
+        let parsed: IpcResponse = serde_json::from_value(legacy)
+            .expect("legacy number-array data must still deserialize");
+        match parsed {
+            IpcResponse::PushOutput { data, .. } => assert_eq!(data, vec![1, 2, 3, 250]),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stream_chunk_base64_roundtrip() {
+        let chunk = IpcMessage::ProcessStreamChunk {
+            request_id: 7,
+            session_id: "s".into(),
+            chunk: StreamDataChunk {
+                sequence: 2,
+                data: vec![200, 201, 202],
+                data_type: "video/frame".into(),
+                timestamp: 42,
+                is_last: false,
+            },
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("yMnK"), "expected base64 payload in: {json}");
+        let back: IpcMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            IpcMessage::ProcessStreamChunk { chunk, .. } => {
+                assert_eq!(chunk.data, vec![200, 201, 202])
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }

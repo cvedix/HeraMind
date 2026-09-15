@@ -46,6 +46,7 @@
 
 pub mod agents;
 pub mod atomic_write;
+pub mod backup;
 pub mod business;
 pub mod dashboards;
 pub mod device_registry;
@@ -56,6 +57,8 @@ pub mod instances;
 pub mod llm_backends;
 pub mod memory_config;
 pub mod messages;
+pub mod schema;
+pub mod secret;
 pub mod session;
 pub mod settings;
 pub mod system_memory;
@@ -76,12 +79,13 @@ pub use session::{
 pub use messages::{MessageStore, StoredMessage};
 
 pub use settings::{
-    ExternalBroker, LlmBackendType, LlmSettings, MqttSettings, SecurityLevel, SettingsStore,
-    DEFAULT_GLOBAL_TIMEZONE,
+    AgentDefaults, DeviceDefaults, ExternalBroker, LlmBackendType, LlmSettings, MqttSettings,
+    SecurityLevel, SettingsStore, DEFAULT_GLOBAL_TIMEZONE,
 };
 
 pub use llm_backends::{
     BackendCapabilities, ConnectionTestResult, LlmBackendInstance, LlmBackendStore,
+    ReasoningCapabilities,
 };
 
 pub use instances::InstanceRecord;

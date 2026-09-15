@@ -112,6 +112,14 @@ impl JsTransformExecutor {
 
         // Create Boa context
         let mut context = Context::default();
+        // [watchdog] User JS runs inline on the executor thread; an infinite
+        // loop (while(true)) used to hang it forever — Boa has no wall-clock
+        // interrupt, but the loop-iteration limit aborts hostile/nonterminating
+        // scripts with a runtime-limit error. 10M iterations is far above any
+        // legitimate transform and costs only seconds of CPU at worst.
+        context
+            .runtime_limits_mut()
+            .set_loop_iteration_limit(10_000_000);
 
         // Inject input data as JSON
         let input_json =
@@ -463,7 +471,17 @@ impl JsTransformExecutor {
                 results_json.insert(key.clone(), value.clone());
 
                 let value_json = serde_json::to_string(value).unwrap_or_default();
-                let var_name = format!("ext_result_{}", key.replace("::", "_").replace('-', "_"));
+                // Sanitize to a valid JS identifier. The old replace chain
+                // left dots intact: an extension id like `weather.ext`
+                // (this module's own doc example) produced
+                // `const ext_result_weather.ext_get_current = ...` — a JS
+                // SyntaxError that failed the whole transform even when the
+                // user only used the __extension_results__ lookup.
+                let suffix: String = key
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                let var_name = format!("ext_result_{}", suffix);
 
                 let inject_code = format!("const {} = {};", var_name, value_json);
 
@@ -819,8 +837,14 @@ impl TransformedMetric {
 
 /// Transform engine - executes data transformations
 pub struct TransformEngine {
-    /// Time-series data cache for window-based aggregations
-    time_series_cache: Arc<tokio::sync::RwLock<TimeSeriesCache>>,
+    /// Persistent telemetry storage for window-based aggregations.
+    /// [2026-08 fix] TimeSeriesAggregation used to read an in-RAM cache that
+    /// NOTHING ever populated (the feeding API had zero callers) — every
+    /// aggregation failed with "No data points found" while recording
+    /// Completed. It now queries the real telemetry store: full history,
+    /// restart-safe, unit-aligned (seconds — device metrics storage writes
+    /// `Utc::now().timestamp()`).
+    time_series_storage: Option<Arc<heramind_devices::TimeSeriesStorage>>,
     /// JavaScript executor for AI-generated code
     js_executor: JsTransformExecutor,
     /// Phase 4.1: Extension registry for preprocessing
@@ -843,13 +867,31 @@ impl TransformEngine {
     /// Create a new transform engine
     pub fn new() -> Self {
         Self {
-            time_series_cache: Arc::new(tokio::sync::RwLock::new(TimeSeriesCache::new())),
+            time_series_storage: None,
             js_executor: JsTransformExecutor::new(),
             extension_registry: None,
             output_registry: Arc::new(TransformOutputRegistry::new()),
             automation_store: None,
-            http_client: reqwest::Client::new(),
+            // [bounded fetch] reqwest's default client has NO total timeout;
+            // url_to_base64 fetches device-controlled URLs — a hanging or
+            // huge response stalled the transform task (and could OOM the
+            // process). 30s total, 10MB body cap enforced at the read site.
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
+    }
+
+    /// Attach the persistent telemetry store (enables window-based
+    /// TimeSeriesAggregation over real history).
+    pub fn with_time_series_storage(
+        mut self,
+        storage: Arc<heramind_devices::TimeSeriesStorage>,
+    ) -> Self {
+        self.time_series_storage = Some(storage);
+        self
     }
 
     /// Phase 4.1: Create a transform engine with extension registry
@@ -857,12 +899,20 @@ impl TransformEngine {
         extension_registry: Arc<heramind_core::extension::registry::ExtensionRegistry>,
     ) -> Self {
         Self {
-            time_series_cache: Arc::new(tokio::sync::RwLock::new(TimeSeriesCache::new())),
+            time_series_storage: None,
             js_executor: JsTransformExecutor::new(),
             extension_registry: Some(extension_registry),
             output_registry: Arc::new(TransformOutputRegistry::new()),
             automation_store: None,
-            http_client: reqwest::Client::new(),
+            // [bounded fetch] reqwest's default client has NO total timeout;
+            // url_to_base64 fetches device-controlled URLs — a hanging or
+            // huge response stalled the transform task (and could OOM the
+            // process). 30s total, 10MB body cap enforced at the read site.
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -872,12 +922,20 @@ impl TransformEngine {
     /// and query Transform outputs as data sources.
     pub fn with_output_registry(output_registry: Arc<TransformOutputRegistry>) -> Self {
         Self {
-            time_series_cache: Arc::new(tokio::sync::RwLock::new(TimeSeriesCache::new())),
+            time_series_storage: None,
             js_executor: JsTransformExecutor::new(),
             extension_registry: None,
             output_registry,
             automation_store: None,
-            http_client: reqwest::Client::new(),
+            // [bounded fetch] reqwest's default client has NO total timeout;
+            // url_to_base64 fetches device-controlled URLs — a hanging or
+            // huge response stalled the transform task (and could OOM the
+            // process). 30s total, 10MB body cap enforced at the read site.
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -887,12 +945,20 @@ impl TransformEngine {
         output_registry: Arc<TransformOutputRegistry>,
     ) -> Self {
         Self {
-            time_series_cache: Arc::new(tokio::sync::RwLock::new(TimeSeriesCache::new())),
+            time_series_storage: None,
             js_executor: JsTransformExecutor::new(),
             extension_registry,
             output_registry,
             automation_store: None,
-            http_client: reqwest::Client::new(),
+            // [bounded fetch] reqwest's default client has NO total timeout;
+            // url_to_base64 fetches device-controlled URLs — a hanging or
+            // huge response stalled the transform task (and could OOM the
+            // process). 30s total, 10MB body cap enforced at the read site.
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -1693,19 +1759,19 @@ impl TransformEngine {
             let rendered = self.render_template(template, raw_data, Some(item), index);
             let rendered_output = self.render_template(output_pattern, raw_data, Some(item), index);
 
-            // Try to parse as number, otherwise use as string (convert to f64 via hash for now)
-            let value = if let Ok(num) = rendered.trim().parse::<f64>() {
-                num
+            // Try to parse as number; if not numeric, store as a Text metric
+            // (previously hashed to a bogus float — silent data corruption).
+            let value: MetricValue = if let Ok(num) = rendered.trim().parse::<f64>() {
+                num.into()
             } else {
-                // Use a simple hash for non-numeric values
-                rendered.chars().map(|c| c as u32 as f64).sum::<f64>() % 10000.0
+                rendered.clone().into()
             };
 
             metrics.push(TransformedMetric {
                 device_id: device_id.to_string(),
                 transform_id: None,
                 metric: rendered_output,
-                value: value.into(),
+                value,
                 timestamp,
                 quality: Some(1.0),
             });
@@ -1755,19 +1821,18 @@ impl TransformEngine {
 
         let rendered = self.render_template(template, &data, None, 0);
 
-        // Try to parse as number, otherwise use hash
-        let value = if let Ok(num) = rendered.trim().parse::<f64>() {
-            num
+        // Try to parse as number; if not numeric, store as Text (not a bogus hash).
+        let value: MetricValue = if let Ok(num) = rendered.trim().parse::<f64>() {
+            num.into()
         } else {
-            // Use hash for string values
-            rendered.chars().map(|c| c as u32 as f64).sum::<f64>() % 10000.0
+            rendered.clone().into()
         };
 
         Ok(TransformedMetric {
             device_id: device_id.to_string(),
             transform_id: None,
             metric: output.to_string(),
-            value: value.into(),
+            value,
             timestamp,
             quality: Some(1.0),
         })
@@ -1804,21 +1869,15 @@ impl TransformEngine {
     async fn execute_pipeline(
         &self,
         _steps: &[TransformOperation],
-        final_output: &str,
-        device_id: &str,
-        timestamp: i64,
+        _final_output: &str,
+        _device_id: &str,
+        _timestamp: i64,
         _raw_data: &Value,
     ) -> Result<Vec<TransformedMetric>> {
-        // Simplified: Pipeline is not fully implemented yet
-        // Just return a placeholder metric
-        Ok(vec![TransformedMetric {
-            device_id: device_id.to_string(),
-            transform_id: None,
-            metric: final_output.to_string(),
-            value: 0.0.into(),
-            timestamp,
-            quality: Some(1.0),
-        }])
+        Err(AutomationError::TransformError {
+            operation: "Pipeline".to_string(),
+            message: "Pipeline operation is not yet implemented".to_string(),
+        })
     }
 
     /// Execute Fork operation - parallel branches
@@ -1829,8 +1888,10 @@ impl TransformEngine {
         _timestamp: i64,
         _raw_data: &Value,
     ) -> Result<Vec<TransformedMetric>> {
-        // Simplified: Fork is not fully implemented yet
-        Ok(vec![])
+        Err(AutomationError::TransformError {
+            operation: "Fork".to_string(),
+            message: "Fork operation is not yet implemented".to_string(),
+        })
     }
 
     /// Execute If operation - conditional execution
@@ -1839,20 +1900,15 @@ impl TransformEngine {
         _condition: &str,
         _then_op: &TransformOperation,
         _else_op: Option<&TransformOperation>,
-        output: &str,
-        device_id: &str,
-        timestamp: i64,
+        _output: &str,
+        _device_id: &str,
+        _timestamp: i64,
         _raw_data: &Value,
     ) -> Result<Vec<TransformedMetric>> {
-        // Simplified: If is not fully implemented yet
-        Ok(vec![TransformedMetric {
-            device_id: device_id.to_string(),
-            transform_id: None,
-            metric: output.to_string(),
-            value: 0.0.into(),
-            timestamp,
-            quality: Some(1.0),
-        }])
+        Err(AutomationError::TransformError {
+            operation: "If".to_string(),
+            message: "If operation is not yet implemented".to_string(),
+        })
     }
 
     /// Render a template string with variable substitution
@@ -1865,8 +1921,22 @@ impl TransformEngine {
     ) -> String {
         let mut result = template.to_string();
 
-        // Replace {{variable}} patterns
-        while let Some(start) = result.find("{{") {
+        // Replace {{variable}} patterns. [loop-guard] The scan used to
+        // restart from 0 after every replacement — a replacement drawn
+        // from device data that itself contains `{{...}}` (e.g.
+        // `{"a": "{{a}}"}`) re-expanded forever, hanging the async
+        // executor worker. The cursor now advances past each replacement
+        // so substituted content is never re-expanded; a hard iteration
+        // cap bounds pathological input as belt-and-braces.
+        let mut scan_from = 0usize;
+        let mut iterations = 0usize;
+        while let Some(rel) = result[scan_from..].find("{{") {
+            let start = scan_from + rel;
+            iterations += 1;
+            if iterations > 1000 {
+                tracing::warn!("render_template: iteration cap hit, leaving rest as-is");
+                break;
+            }
             let end = match result[start..].find("}}") {
                 Some(pos) => start + pos + 2,
                 None => break,
@@ -1901,6 +1971,9 @@ impl TransformEngine {
             };
 
             result.replace_range(start..end, &replacement);
+            // Advance past the replacement — never re-expand substituted
+            // content (the infinite-loop guard).
+            scan_from = (start + replacement.len()).min(result.len());
         }
 
         result
@@ -2028,22 +2101,50 @@ impl TransformEngine {
         output_metric: &str,
         device_id: &str,
     ) -> Result<TransformedMetric> {
-        // Get historical data points from cache
-        let cache = self.time_series_cache.read().await;
-        let data_points = cache.get_window(device_id, source_metric, window.duration_secs);
+        // Query the persistent telemetry store over the window. Timestamps
+        // are SECONDS (device metrics storage writes Utc::now().timestamp();
+        // the old code's millis comment was backwards).
+        let storage =
+            self.time_series_storage
+                .as_ref()
+                .ok_or_else(|| AutomationError::TransformError {
+                    operation: "TimeSeriesAggregation".to_string(),
+                    message: "Time-series storage is not available for aggregation".to_string(),
+                })?;
+        let now = Utc::now().timestamp();
+        let start = now - window.duration_secs as i64;
+        let source_id = format!("device:{}", device_id);
+        let points: Vec<heramind_devices::telemetry::DataPoint> = storage
+            .query(&source_id, source_metric, start, now)
+            .await
+            .map_err(|e| AutomationError::TransformError {
+                operation: "TimeSeriesAggregation".to_string(),
+                message: format!(
+                    "Failed to query history for '{}.{}': {}",
+                    device_id, source_metric, e
+                ),
+            })?;
 
-        if data_points.is_empty() {
+        let values: Vec<f64> = points
+            .iter()
+            .filter_map(|p| match &p.value {
+                heramind_devices::MetricValue::Float(f) => Some(*f),
+                heramind_devices::MetricValue::Integer(i) => Some(*i as f64),
+                _ => None,
+            })
+            .collect();
+
+        if values.is_empty() {
             return Err(AutomationError::TransformError {
                 operation: "TimeSeriesAggregation".to_string(),
                 message: format!("No data points found for '{}.{}'", device_id, source_metric),
             });
         }
 
-        let values: Vec<f64> = data_points.iter().map(|p| p.value).collect();
         let result = self.compute_aggregation(&values, aggregation)?;
 
-        // Use milliseconds for consistency with device metrics storage
-        let timestamp = Utc::now().timestamp_millis();
+        // Seconds, aligned with device metrics storage and sibling outputs.
+        let timestamp = Utc::now().timestamp();
 
         Ok(TransformedMetric {
             device_id: device_id.to_string(),
@@ -2298,18 +2399,6 @@ impl TransformEngine {
         }
     }
 
-    /// Add a data point to the time-series cache (for TimeSeriesAggregation)
-    pub async fn add_time_series_point(
-        &self,
-        device_id: &str,
-        metric: &str,
-        value: f64,
-        timestamp: i64,
-    ) {
-        let mut cache = self.time_series_cache.write().await;
-        cache.add_point(device_id, metric, value, timestamp);
-    }
-
     /// Execute GroupBy operation - group array elements by key and aggregate
     async fn execute_group_by(
         &self,
@@ -2464,15 +2553,17 @@ impl TransformEngine {
             Value::String(decoded.clone())
         };
 
-        // Convert to f64 (use hash for non-numeric)
-        let value = value_as_f64(&json_value)
-            .unwrap_or_else(|| decoded.chars().map(|c| c as u32 as f64).sum::<f64>() % 10000.0);
+        // Try numeric first; if not numeric, store the decoded string as Text
+        // (previously hashed to a bogus float — silent data corruption).
+        let value: MetricValue = value_as_f64(&json_value)
+            .map(MetricValue::from)
+            .unwrap_or_else(|| decoded.clone().into());
 
         Ok(vec![TransformedMetric {
             device_id: device_id.to_string(),
             transform_id: None,
             metric: output.to_string(),
-            value: value.into(),
+            value,
             timestamp,
             quality: Some(1.0),
         }])
@@ -2508,14 +2599,18 @@ impl TransformEngine {
             crate::automation::types::DecodeFormat::Csv => to_encode,
         };
 
-        // Use hash for encoded string value
-        let value = encoded.chars().map(|c| c as u32 as f64).sum::<f64>() % 10000.0;
+        // Store the encoded string as Text (previously hashed to a bogus float).
+        let value: MetricValue = encoded
+            .trim()
+            .parse::<f64>()
+            .map(MetricValue::from)
+            .unwrap_or_else(|_| encoded.clone().into());
 
         Ok(vec![TransformedMetric {
             device_id: device_id.to_string(),
             transform_id: None,
             metric: output.to_string(),
-            value: value.into(),
+            value,
             timestamp,
             quality: Some(1.0),
         }])
@@ -2755,35 +2850,86 @@ async fn resolve_input_mapping(
                                     }
                                     resolved.insert(key.clone(), Value::String(s.to_string()));
                                 } else {
-                                    // It's a URL — fetch and convert to base64
+                                    // It's a URL — fetch and convert to base64.
+                                    // [SSRF guard] the URL comes from DEVICE DATA —
+                                    // without this check a compromised device could
+                                    // make the server fetch internal endpoints
+                                    // (cloud metadata at 169.254.169.254, admin
+                                    // panels, etc.) and exfiltrate the base64 into
+                                    // transform outputs. Same shared rules as the
+                                    // agent's web_fetch tool.
+                                    let url_allowed = reqwest::Url::parse(s)
+                                        .ok()
+                                        .and_then(|u| match u.scheme() {
+                                            "http" | "https" => u
+                                                .host_str()
+                                                .map(|h| !heramind_core::net::is_private_host(h)),
+                                            _ => Some(false),
+                                        })
+                                        .unwrap_or(false);
+                                    if !url_allowed {
+                                        tracing::warn!(
+                                            url = %s,
+                                            key = %key,
+                                            "url_to_base64: blocked non-HTTP(s) or private-network URL (SSRF guard)"
+                                        );
+                                        resolved.insert(key.clone(), extracted);
+                                        continue;
+                                    }
                                     match http_client.get(s).send().await {
-                                        Ok(resp) => match resp.bytes().await {
-                                            Ok(bytes) => {
-                                                use base64::Engine;
-                                                let b64 = base64::engine::general_purpose::STANDARD
+                                        Ok(resp) => {
+                                            // [size cap] reject declared-oversized bodies up
+                                            // front (a device-controlled URL could otherwise
+                                            // feed an arbitrarily large payload into base64
+                                            // + redb). The 30s client timeout bounds the
+                                            // transfer duration for lying/chunked bodies.
+                                            const MAX_FETCH_BYTES: u64 = 10 * 1024 * 1024;
+                                            if resp
+                                                .content_length()
+                                                .map(|l| l > MAX_FETCH_BYTES)
+                                                .unwrap_or(false)
+                                            {
+                                                tracing::warn!(
+                                                    "url_to_base64: body too large for {}, skipping",
+                                                    key
+                                                );
+                                                resolved.insert(key.clone(), extracted);
+                                            } else {
+                                                match resp.bytes().await {
+                                                    Ok(bytes) => {
+                                                        use base64::Engine;
+                                                        let b64 = base64::engine::general_purpose::STANDARD
                                                     .encode(&bytes);
-                                                resolved.insert(key.clone(), Value::String(b64));
+                                                        resolved.insert(
+                                                            key.clone(),
+                                                            Value::String(b64),
+                                                        );
 
-                                                // Try to get image dimensions for normalization
-                                                if let Ok(reader) = image::ImageReader::new(
-                                                    std::io::Cursor::new(&bytes),
-                                                )
-                                                .with_guessed_format()
-                                                {
-                                                    if let Ok(dims) = reader.into_dimensions() {
-                                                        image_dimensions.insert(key.clone(), dims);
+                                                        // Try to get image dimensions for normalization
+                                                        if let Ok(reader) = image::ImageReader::new(
+                                                            std::io::Cursor::new(&bytes),
+                                                        )
+                                                        .with_guessed_format()
+                                                        {
+                                                            if let Ok(dims) =
+                                                                reader.into_dimensions()
+                                                            {
+                                                                image_dimensions
+                                                                    .insert(key.clone(), dims);
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "Failed to read response bytes for {}: {}",
+                                                            key,
+                                                            e
+                                                        );
+                                                        resolved.insert(key.clone(), extracted);
                                                     }
                                                 }
                                             }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "Failed to read response bytes for {}: {}",
-                                                    key,
-                                                    e
-                                                );
-                                                resolved.insert(key.clone(), extracted);
-                                            }
-                                        },
+                                        }
                                         Err(e) => {
                                             tracing::warn!(
                                                 "Failed to fetch URL for {}: {}",
@@ -3140,63 +3286,6 @@ fn extract_ref_texts(value: &Value) -> Vec<String> {
     texts
 }
 
-/// Time-series data cache for window-based aggregations
-#[derive(Debug)]
-struct TimeSeriesCache {
-    /// Store data points as (device_id, metric) -> Vec<(timestamp, value)>
-    data: HashMap<(String, String), Vec<(i64, f64)>>,
-    /// Maximum number of points per metric
-    max_points_per_metric: usize,
-}
-
-impl TimeSeriesCache {
-    fn new() -> Self {
-        Self {
-            data: HashMap::new(),
-            max_points_per_metric: 1000,
-        }
-    }
-
-    /// Add a data point to the cache
-    fn add_point(&mut self, device_id: &str, metric: &str, value: f64, timestamp: i64) {
-        let key = (device_id.to_string(), metric.to_string());
-        let points = self.data.entry(key).or_default();
-        points.push((timestamp, value));
-
-        // Sort by timestamp and keep only recent points
-        points.sort_by_key(|(ts, _)| *ts);
-        if points.len() > self.max_points_per_metric {
-            *points = points.split_off(points.len() - self.max_points_per_metric);
-        }
-    }
-
-    /// Get data points within a time window
-    fn get_window(&self, device_id: &str, metric: &str, window_secs: u64) -> Vec<DataPoint> {
-        let key = (device_id.to_string(), metric.to_string());
-        // Use milliseconds for consistency with stored timestamps
-        let cutoff = Utc::now().timestamp_millis() - (window_secs as i64 * 1000);
-
-        self.data
-            .get(&key)
-            .map(|points| {
-                points
-                    .iter()
-                    .filter(|(ts, _)| *ts >= cutoff)
-                    .map(|(ts, v)| DataPoint {
-                        _timestamp: *ts,
-                        value: *v,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-}
-
-struct DataPoint {
-    _timestamp: i64,
-    value: f64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::types::TransformScope;
@@ -3442,8 +3531,9 @@ mod tests {
         let base64_data = json!({ "image": large_base64 });
         let result = resolve_image_data(&base64_data);
 
-        // Should return the base64 string (or empty if it doesn't pass validation)
-        assert!(result.len() > 0 || result.is_empty()); // Either way, no panic
+        // Either a non-empty extraction or a clean empty return is acceptable
+        // — the contract under test is "no panic" on malformed input.
+        let _ = result;
     }
 
     #[test]

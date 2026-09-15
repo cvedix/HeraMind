@@ -40,10 +40,7 @@ export function InstanceSwitchOverlay() {
       {/* Animated background — matches StartupLoading */}
       <div className="fixed inset-0">
         <div className="absolute inset-0 bg-gradient-to-br from-background via-background to-muted" />
-        <div className="absolute inset-0" style={{
-          backgroundImage: 'radial-gradient(circle, #80808015 1px, transparent 1px)',
-          backgroundSize: '32px 32px',
-        }} />
+        <div className="absolute inset-0 dot-grid" />
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-muted rounded-full blur-3xl animate-pulse" style={{ animationDuration: '8s' }} />
       </div>
 
@@ -65,7 +62,7 @@ export function InstanceSwitchOverlay() {
         )}
 
         {switchingState === 'error' && (
-          <div className="bg-surface border border-glass-border rounded-2xl shadow-2xl p-8 max-w-sm w-full mx-4 text-center">
+          <div className="bg-surface border border-glass-border rounded-xl shadow-xl p-8 max-w-sm w-full mx-4 text-center">
             <AlertTriangle className="h-10 w-10 mx-auto mb-4 text-warning" />
             <p className="text-sm font-medium mb-2">{t('switch.error')}</p>
             {switchingError && (

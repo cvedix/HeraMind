@@ -11,7 +11,7 @@ use super::{
 use crate::models::ErrorResponse;
 
 /// Request body for LLM generation.
-#[derive(serde::Deserialize)]
+#[derive(utoipa::ToSchema, serde::Deserialize)]
 pub struct LlmGenerateRequest {
     pub prompt: String,
 }
@@ -19,6 +19,15 @@ pub struct LlmGenerateRequest {
 /// Generate LLM response (one-shot, no session required).
 /// This bypasses the agent's tool calling pipeline and calls LLM directly.
 /// Useful for features like AI-assisted MDL generation.
+#[utoipa::path(
+    post,
+    path = "/api/llm/generate",
+    tag = "llm-backends",
+    request_body = LlmGenerateRequest,
+    responses(
+        (status = 200, description = "One-shot LLM completion (no session)"),
+    )
+)]
 pub async fn llm_generate_handler(
     State(_state): State<ServerState>,
     Json(req): Json<LlmGenerateRequest>,
@@ -138,6 +147,7 @@ pub async fn llm_generate_handler(
             frequency_penalty: None,
             presence_penalty: None,
             thinking_enabled: None,
+            thinking_effort: None,
             max_context: None,
         },
         model: Some(model_name),
@@ -168,7 +178,7 @@ pub async fn llm_generate_handler(
 // ============================================================================
 
 /// Request body for updating timezone.
-#[derive(serde::Deserialize)]
+#[derive(utoipa::ToSchema, serde::Deserialize)]
 pub struct TimezoneRequest {
     pub timezone: String,
 }
@@ -181,12 +191,18 @@ pub struct TimezoneResponse {
 }
 
 /// Get the current global timezone setting.
+#[utoipa::path(
+    get,
+    path = "/api/settings/timezone",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Configured timezone (IANA name)"),
+    )
+)]
 pub async fn get_timezone(State(_state): State<ServerState>) -> HandlerResult<TimezoneResponse> {
     use heramind_storage::SettingsStore;
 
-    const SETTINGS_DB_PATH: &str = "data/settings.redb";
-
-    let settings_store = SettingsStore::open(SETTINGS_DB_PATH)
+    let settings_store = SettingsStore::open_default()
         .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
 
     let timezone = settings_store.get_global_timezone();
@@ -199,13 +215,20 @@ pub async fn get_timezone(State(_state): State<ServerState>) -> HandlerResult<Ti
 }
 
 /// Update the global timezone setting.
+#[utoipa::path(
+    put,
+    path = "/api/settings/timezone",
+    tag = "settings",
+    request_body = TimezoneRequest,
+    responses(
+        (status = 200, description = "Timezone saved"),
+    )
+)]
 pub async fn update_timezone(
     State(_state): State<ServerState>,
     Json(req): Json<TimezoneRequest>,
 ) -> HandlerResult<serde_json::Value> {
     use heramind_storage::SettingsStore;
-
-    const SETTINGS_DB_PATH: &str = "data/settings.redb";
 
     // Validate timezone using chrono-tz
     if req.timezone.parse::<chrono_tz::Tz>().is_err() {
@@ -215,7 +238,7 @@ pub async fn update_timezone(
         )));
     }
 
-    let settings_store = SettingsStore::open(SETTINGS_DB_PATH)
+    let settings_store = SettingsStore::open_default()
         .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
 
     settings_store
@@ -231,6 +254,14 @@ pub async fn update_timezone(
 }
 
 /// Get available timezone options.
+#[utoipa::path(
+    get,
+    path = "/api/settings/timezones",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Valid IANA timezone names"),
+    )
+)]
 pub async fn list_timezones() -> HandlerResult<serde_json::Value> {
     // Common IANA timezones with display names
     let timezones = vec![
@@ -269,14 +300,20 @@ pub async fn list_timezones() -> HandlerResult<serde_json::Value> {
 // ============================================================================
 
 /// Get the current retention configuration.
+#[utoipa::path(
+    get,
+    path = "/api/settings/retention",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Data-retention windows"),
+    )
+)]
 pub async fn get_retention_config(
     State(_state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
     use heramind_storage::SettingsStore;
 
-    const SETTINGS_DB_PATH: &str = "data/settings.redb";
-
-    let settings_store = SettingsStore::open(SETTINGS_DB_PATH)
+    let settings_store = SettingsStore::open_default()
         .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
 
     let config = settings_store.get_retention_config();
@@ -290,13 +327,20 @@ pub async fn get_retention_config(
 }
 
 /// Update the retention configuration.
+#[utoipa::path(
+    put,
+    path = "/api/settings/retention",
+    tag = "settings",
+    request_body = RetentionConfigRequest,
+    responses(
+        (status = 200, description = "Retention windows saved"),
+    )
+)]
 pub async fn update_retention_config(
     State(_state): State<ServerState>,
     Json(req): Json<RetentionConfigRequest>,
 ) -> HandlerResult<serde_json::Value> {
     use heramind_storage::SettingsStore;
-
-    const SETTINGS_DB_PATH: &str = "data/settings.redb";
 
     // Validate interval
     if req.interval_hours == 0 {
@@ -305,7 +349,7 @@ pub async fn update_retention_config(
         ));
     }
 
-    let settings_store = SettingsStore::open(SETTINGS_DB_PATH)
+    let settings_store = SettingsStore::open_default()
         .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
 
     let config = heramind_storage::settings::RetentionConfig {
@@ -336,22 +380,216 @@ pub async fn update_retention_config(
     }))
 }
 
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
+pub struct AgentDefaultsRequest {
+    #[serde(default)]
+    pub max_rounds: u32,
+    #[serde(default)]
+    pub execution_timeout_secs: u64,
+    #[serde(default)]
+    pub tool_concurrency: usize,
+    #[serde(default)]
+    pub default_temperature: f32,
+    #[serde(default)]
+    pub default_top_p: f32,
+    #[serde(default)]
+    pub default_thinking_enabled: Option<bool>,
+    /// Chat history depth in turns (5-200)
+    pub chat_history_depth: Option<usize>,
+    /// Wall-clock budget for one interactive chat turn, seconds (60-7200)
+    pub chat_turn_timeout_secs: Option<u64>,
+}
+
+/// Get agent execution defaults (max_rounds, timeout, concurrency, sampling).
+#[utoipa::path(
+    get,
+    path = "/api/settings/agent",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Default agent runtime settings"),
+    )
+)]
+pub async fn get_agent_defaults(
+    State(_state): State<ServerState>,
+) -> HandlerResult<serde_json::Value> {
+    use heramind_storage::SettingsStore;
+
+    let settings_store = SettingsStore::open_default()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
+    let config = settings_store.get_agent_defaults();
+
+    ok(json!({
+        "max_rounds": config.max_rounds,
+        "execution_timeout_secs": config.execution_timeout_secs,
+        "tool_concurrency": config.tool_concurrency,
+        "default_temperature": config.default_temperature,
+        "default_top_p": config.default_top_p,
+        "default_thinking_enabled": config.default_thinking_enabled,
+        "chat_history_depth": config.chat_history_depth,
+        "chat_turn_timeout_secs": config.chat_turn_timeout_secs,
+    }))
+}
+
+/// Update agent execution defaults. Values are clamped to sane ranges.
+/// Applies to the NEXT agent execution (not mid-flight).
+#[utoipa::path(
+    put,
+    path = "/api/settings/agent",
+    tag = "settings",
+    request_body = AgentDefaultsRequest,
+    responses(
+        (status = 200, description = "Agent defaults saved"),
+    )
+)]
+pub async fn update_agent_defaults(
+    State(_state): State<ServerState>,
+    Json(req): Json<AgentDefaultsRequest>,
+) -> HandlerResult<serde_json::Value> {
+    use heramind_storage::SettingsStore;
+
+    // Missing optional fields keep their current value (not a silent reset).
+    let existing = SettingsStore::open_default()
+        .map(|s| s.get_agent_defaults())
+        .unwrap_or_default();
+    let config = heramind_storage::AgentDefaults {
+        max_rounds: req.max_rounds.clamp(1, 50),
+        execution_timeout_secs: req.execution_timeout_secs.clamp(30, 1800),
+        tool_concurrency: req.tool_concurrency.clamp(1, 16),
+        default_temperature: req.default_temperature.clamp(0.0, 2.0),
+        default_top_p: req.default_top_p.clamp(0.0, 1.0),
+        default_thinking_enabled: req.default_thinking_enabled,
+        chat_history_depth: req
+            .chat_history_depth
+            .map(|d| d.clamp(5, 200))
+            .unwrap_or(existing.chat_history_depth),
+        chat_turn_timeout_secs: req
+            .chat_turn_timeout_secs
+            .map(|s| s.clamp(60, 7200))
+            .unwrap_or(existing.chat_turn_timeout_secs),
+    };
+
+    let settings_store = SettingsStore::open_default()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
+    settings_store
+        .save_agent_defaults(&config)
+        .map_err(|e| ErrorResponse::internal(format!("Failed to save agent defaults: {}", e)))?;
+
+    tracing::info!(
+        max_rounds = config.max_rounds,
+        timeout_secs = config.execution_timeout_secs,
+        tool_conc = config.tool_concurrency,
+        temp = config.default_temperature,
+        top_p = config.default_top_p,
+        thinking = ?config.default_thinking_enabled,
+        "Agent defaults updated"
+    );
+
+    ok(json!({
+        "success": true,
+        "max_rounds": config.max_rounds,
+        "execution_timeout_secs": config.execution_timeout_secs,
+        "tool_concurrency": config.tool_concurrency,
+        "default_temperature": config.default_temperature,
+        "default_top_p": config.default_top_p,
+        "default_thinking_enabled": config.default_thinking_enabled,
+        "chat_history_depth": config.chat_history_depth,
+        "chat_turn_timeout_secs": config.chat_turn_timeout_secs,
+    }))
+}
+
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
+pub struct DeviceDefaultsRequest {
+    #[serde(default)]
+    pub default_offline_timeout_secs: u64,
+    #[serde(default)]
+    pub auto_onboard_enabled: bool,
+}
+
+/// Get device defaults (offline timeout, auto-onboarding).
+#[utoipa::path(
+    get,
+    path = "/api/settings/device",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Default device settings (heartbeat, offline timeout)"),
+    )
+)]
+pub async fn get_device_defaults(
+    State(_state): State<ServerState>,
+) -> HandlerResult<serde_json::Value> {
+    use heramind_storage::SettingsStore;
+
+    let settings_store = SettingsStore::open_default()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
+    let config = settings_store.get_device_defaults();
+
+    ok(json!({
+        "default_offline_timeout_secs": config.default_offline_timeout_secs,
+        "auto_onboard_enabled": config.auto_onboard_enabled,
+    }))
+}
+
+/// Update device defaults. offline_timeout is live; auto_onboard applies on next restart.
+#[utoipa::path(
+    put,
+    path = "/api/settings/device",
+    tag = "settings",
+    request_body = DeviceDefaultsRequest,
+    responses(
+        (status = 200, description = "Device defaults saved"),
+    )
+)]
+pub async fn update_device_defaults(
+    State(_state): State<ServerState>,
+    Json(req): Json<DeviceDefaultsRequest>,
+) -> HandlerResult<serde_json::Value> {
+    use heramind_storage::SettingsStore;
+
+    let config = heramind_storage::DeviceDefaults {
+        default_offline_timeout_secs: req.default_offline_timeout_secs.max(10),
+        auto_onboard_enabled: req.auto_onboard_enabled,
+    };
+
+    let settings_store = SettingsStore::open_default()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
+    settings_store
+        .save_device_defaults(&config)
+        .map_err(|e| ErrorResponse::internal(format!("Failed to save device defaults: {}", e)))?;
+
+    tracing::info!(
+        offline_timeout = config.default_offline_timeout_secs,
+        auto_onboard = config.auto_onboard_enabled,
+        "Device defaults updated"
+    );
+
+    ok(json!({
+        "success": true,
+        "default_offline_timeout_secs": config.default_offline_timeout_secs,
+        "auto_onboard_enabled": config.auto_onboard_enabled,
+    }))
+}
+
 /// Manually trigger a retention cleanup.
+#[utoipa::path(
+    post,
+    path = "/api/settings/retention/cleanup",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Retention purge executed now"),
+    )
+)]
 pub async fn trigger_retention_cleanup(
     State(_state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
     use heramind_storage::{SettingsStore, TimeSeriesStore};
 
-    const SETTINGS_DB_PATH: &str = "data/settings.redb";
-    const TELEMETRY_DB_PATH: &str = "data/telemetry.redb";
-
-    let settings_store = SettingsStore::open(SETTINGS_DB_PATH)
+    let settings_store = SettingsStore::open_default()
         .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
 
     let config = settings_store.get_retention_config();
     let policy = config.to_retention_policy();
 
-    let ts_store = TimeSeriesStore::open(TELEMETRY_DB_PATH)
+    let ts_store = TimeSeriesStore::open(heramind_core::paths::store_path("telemetry.redb"))
         .map_err(|e| ErrorResponse::internal(format!("Failed to open telemetry store: {}", e)))?;
 
     // Apply the policy synchronously (cheap) so the config is live before
@@ -388,10 +626,275 @@ pub async fn trigger_retention_cleanup(
 }
 
 /// Request body for updating retention configuration.
-#[derive(serde::Deserialize)]
+#[derive(utoipa::ToSchema, serde::Deserialize)]
 pub struct RetentionConfigRequest {
     pub enabled: bool,
     pub interval_hours: u64,
     pub default_retention: Option<u64>,
     pub image_retention: Option<u64>,
+}
+
+/// Trigger an immediate data-directory backup (admin only).
+///
+/// Copies every `*.redb` + secret file into `data/backups/backup-<ts>/`,
+/// verifies each copied database opens (redb crash-recovery check), and
+/// prunes old backups down to the retention limit. The periodic scheduler
+/// (`HERAMIND_BACKUP_INTERVAL_SECS`, default 24h) calls the same path.
+#[utoipa::path(
+    post,
+    path = "/api/settings/backup",
+    tag = "backups",
+    responses(
+        (status = 200, description = "Backup archive created (admin only)"),
+    )
+)]
+pub async fn create_backup_handler(
+    State(state): State<ServerState>,
+    axum::extract::Extension(admin): axum::extract::Extension<crate::auth_users::SessionInfo>,
+) -> HandlerResult<serde_json::Value> {
+    if admin.role != crate::auth_users::UserRole::Admin {
+        return Err(ErrorResponse::bad_request("Admin access required"));
+    }
+
+    let data_dir = state.data_dir.clone();
+    // Retention from the saved schedule config (UI); env seeds the default.
+    // Settings path follows the SAME data dir being backed up (the
+    // hardcoded "data/settings.redb" split config-read from backup-target
+    // when HERAMIND_DATA_DIR points elsewhere — pre-release audit finding).
+    let keep: usize = heramind_storage::SettingsStore::open(state.data_dir.join("settings.redb"))
+        .ok()
+        .and_then(|s| s.load_backup_config().ok().flatten())
+        .unwrap_or_else(heramind_storage::settings::BackupConfig::from_env_or_default)
+        .keep;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let manifest =
+            heramind_storage::backup::create_backup(&data_dir, env!("CARGO_PKG_VERSION"))?;
+        let pruned = heramind_storage::backup::prune_backups(&data_dir, keep);
+        Ok::<_, heramind_storage::backup::BackupError>((manifest, pruned))
+    })
+    .await
+    .map_err(|e| ErrorResponse::internal(format!("Backup task failed: {}", e)))?
+    .map_err(|e| ErrorResponse::internal(format!("Backup failed: {}", e)))?;
+
+    let (manifest, pruned) = result;
+    tracing::info!(
+        admin = %admin.username,
+        id = %manifest.id,
+        pruned,
+        "Manual backup triggered"
+    );
+
+    ok(json!({
+        "id": manifest.id,
+        "created_at": manifest.created_at,
+        "total_bytes": manifest.total_bytes,
+        "files": manifest.files,
+        "pruned_old_backups": pruned,
+    }))
+}
+
+/// List existing backups (admin only), newest first.
+///
+/// Restoring is deliberately manual: stop the server, copy the files from
+/// `data/backups/<id>/` back into the data dir, start the server.
+#[utoipa::path(
+    get,
+    path = "/api/settings/backups",
+    tag = "backups",
+    responses(
+        (status = 200, description = "Backup archive listing"),
+    )
+)]
+pub async fn list_backups_handler(
+    State(state): State<ServerState>,
+    axum::extract::Extension(admin): axum::extract::Extension<crate::auth_users::SessionInfo>,
+) -> HandlerResult<serde_json::Value> {
+    if admin.role != crate::auth_users::UserRole::Admin {
+        return Err(ErrorResponse::bad_request("Admin access required"));
+    }
+
+    let backups = heramind_storage::backup::list_backups(&state.data_dir);
+    ok(json!({ "backups": backups }))
+}
+
+/// Backup schedule configuration (Settings → Preferences in the web UI).
+/// The scheduler and the manual admin trigger both read this; env vars only
+/// seed the default until something is saved here.
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
+pub struct BackupConfigRequest {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub keep: usize,
+}
+
+/// Get the effective backup schedule configuration.
+#[utoipa::path(
+    get,
+    path = "/api/settings/backup-config",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Scheduled-backup configuration"),
+    )
+)]
+pub async fn get_backup_config(
+    State(_state): State<ServerState>,
+) -> HandlerResult<serde_json::Value> {
+    use heramind_storage::SettingsStore;
+
+    let settings_store = SettingsStore::open_default()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
+    let config = settings_store
+        .load_backup_config()
+        .ok()
+        .flatten()
+        .unwrap_or_else(heramind_storage::settings::BackupConfig::from_env_or_default);
+
+    ok(json!({
+        "enabled": config.enabled,
+        "interval_secs": config.interval_secs,
+        "keep": config.keep,
+    }))
+}
+
+/// Update the backup schedule configuration (takes effect within a minute —
+/// the scheduler re-reads this every tick).
+#[utoipa::path(
+    put,
+    path = "/api/settings/backup-config",
+    tag = "settings",
+    request_body = BackupConfigRequest,
+    responses(
+        (status = 200, description = "Backup schedule saved"),
+    )
+)]
+pub async fn update_backup_config(
+    State(_state): State<ServerState>,
+    Json(req): Json<BackupConfigRequest>,
+) -> HandlerResult<serde_json::Value> {
+    use heramind_storage::SettingsStore;
+
+    if req.interval_secs < 300 {
+        return Err(ErrorResponse::bad_request(
+            "interval_secs must be at least 300 (5 minutes)",
+        ));
+    }
+    if !(1..=50).contains(&req.keep) {
+        return Err(ErrorResponse::bad_request("keep must be between 1 and 50"));
+    }
+
+    let settings_store = SettingsStore::open_default()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
+    let config = heramind_storage::settings::BackupConfig {
+        enabled: req.enabled,
+        interval_secs: req.interval_secs,
+        keep: req.keep,
+    };
+    settings_store
+        .save_backup_config(&config)
+        .map_err(|e| ErrorResponse::internal(format!("Failed to save backup config: {}", e)))?;
+
+    tracing::info!(
+        enabled = config.enabled,
+        interval_secs = config.interval_secs,
+        keep = config.keep,
+        "Backup schedule updated"
+    );
+
+    ok(json!({
+        "enabled": config.enabled,
+        "interval_secs": config.interval_secs,
+        "keep": config.keep,
+    }))
+}
+
+/// GET /api/settings/market (admin): effective extension-marketplace source.
+#[utoipa::path(
+    get,
+    path = "/api/settings/market",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Extension marketplace source URL"),
+    )
+)]
+pub async fn get_market_source_handler(
+    State(_state): State<ServerState>,
+    axum::extract::Extension(admin): axum::extract::Extension<crate::auth_users::SessionInfo>,
+) -> HandlerResult<serde_json::Value> {
+    if admin.role != crate::auth_users::UserRole::Admin {
+        return Err(ErrorResponse::bad_request("Admin access required"));
+    }
+
+    use heramind_storage::SettingsStore;
+    let saved = SettingsStore::open_default()
+        .ok()
+        .and_then(|s| s.load("extension_market_url").ok().flatten());
+
+    ok(json!({
+        "market_url": crate::handlers::extensions::extension_market_base_url(),
+        "saved_url": saved,
+        "default_url": "https://raw.githubusercontent.com/camthink-ai/NeoMind-Extensions",
+    }))
+}
+
+/// PUT /api/settings/market (admin): set or reset the marketplace source.
+///
+/// An empty body value resets to the default chain (env > built-in). Mirror
+/// URLs follow the component-market shape, e.g.
+/// `https://ghfast.top/https://raw.githubusercontent.com/camthink-ai/...`.
+/// NOTE the trust boundary: after switching, sha256 verification checks the
+/// MIRROR's artifacts, not the upstream ones.
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
+pub struct MarketSourceRequest {
+    /// Empty string = reset to default.
+    pub market_url: String,
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/settings/market",
+    tag = "settings",
+    request_body = MarketSourceRequest,
+    responses(
+        (status = 200, description = "Marketplace source saved"),
+    )
+)]
+pub async fn update_market_source_handler(
+    State(_state): State<ServerState>,
+    axum::extract::Extension(admin): axum::extract::Extension<crate::auth_users::SessionInfo>,
+    Json(req): Json<MarketSourceRequest>,
+) -> HandlerResult<serde_json::Value> {
+    if admin.role != crate::auth_users::UserRole::Admin {
+        return Err(ErrorResponse::bad_request("Admin access required"));
+    }
+
+    use heramind_storage::SettingsStore;
+    let store = SettingsStore::open_default()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
+
+    let trimmed = req.market_url.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        // Reset: drop the saved override entirely.
+        let _ = store.save("extension_market_url", "");
+        tracing::info!(admin = %admin.username, "Extension marketplace source reset to default");
+        return ok(json!({
+            "market_url": crate::handlers::extensions::extension_market_base_url(),
+            "saved_url": serde_json::Value::Null,
+        }));
+    }
+    if !trimmed.starts_with("https://") && !trimmed.starts_with("http://") {
+        return Err(ErrorResponse::bad_request(
+            "market_url must be an http(s) URL",
+        ));
+    }
+
+    store
+        .save("extension_market_url", &trimmed)
+        .map_err(|e| ErrorResponse::internal(format!("Failed to save market source: {}", e)))?;
+    tracing::info!(admin = %admin.username, url = %trimmed, "Extension marketplace source updated");
+
+    ok(json!({
+        "market_url": trimmed,
+        "saved_url": trimmed,
+    }))
 }

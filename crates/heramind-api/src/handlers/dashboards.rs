@@ -10,7 +10,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 
 use super::{
     common::{ok, HandlerResult},
@@ -24,6 +23,67 @@ use heramind_storage::dashboards::{
     DashboardLayout as StoredLayout, DashboardTemplate as StoredTemplate,
     SharePermissions as StoredSharePermissions, ShareToken as StoredShareToken,
 };
+
+/// All widget type ids the frontend can render: builtin ∪ community ∪
+/// extension-bundled. Shared by the add-components and update (full-replace)
+/// paths so both reject unknown types at the door.
+fn collect_known_widget_types(state: &ServerState) -> std::collections::HashSet<String> {
+    let mut known: std::collections::HashSet<String> =
+        heramind_core::dashboard::BUILTIN_WIDGET_TYPES
+            .iter()
+            .map(|t| t.type_id.to_string())
+            .collect();
+    if let Ok(installed) = state.frontend_component_store.list_all() {
+        for m in installed {
+            known.insert(m.id.clone());
+        }
+    }
+    // Extension-bundled components (from installed extensions). The
+    // async runtime list is not awaitable here (sync validation block),
+    // so read the store's file paths and scan frontend/ manifests.
+    for rec in state.extensions.store.load_all().unwrap_or_default() {
+        let dir = std::path::Path::new(&rec.file_path)
+            .parent()
+            .map(|p| p.to_path_buf());
+        if let Some(dir) = dir {
+            for c in super::extensions::load_extension_components(&rec.id, Some(&dir))
+                .unwrap_or_default()
+            {
+                known.insert(c.component_type.clone());
+            }
+        }
+    }
+    known
+}
+
+/// Resolve a dashboard by id first, then by exact NAME. Every handler that
+/// takes :id must resolve identically — LLM callers naturally address boards
+/// by name (or reuse the name after a `dashboard get` that itself accepts
+/// names); a get-by-name that succeeds followed by a mutation-by-name that
+/// 404s traps small models into hallucinating success (observed 2026-08-23).
+fn resolve_dashboard(
+    state: &ServerState,
+    id_or_name: &str,
+) -> Result<StoredDashboard, ErrorResponse> {
+    match state.dashboard_store.load(id_or_name) {
+        Ok(Some(d)) => Ok(d),
+        Ok(None) => {
+            let all = state.dashboard_store.list_all().map_err(|e| {
+                ErrorResponse::internal(format!("Failed to list dashboards: {}", e))
+            })?;
+            all.into_iter().find(|d| d.name == id_or_name).ok_or_else(|| {
+                ErrorResponse::not_found(format!(
+                    "Dashboard '{}' not found (by id or name) — run `heramind dashboard list` for valid ids",
+                    id_or_name
+                ))
+            })
+        }
+        Err(e) => Err(ErrorResponse::internal(format!(
+            "Failed to load dashboard: {}",
+            e
+        ))),
+    }
+}
 
 /// Emit a DashboardUpdated event to notify frontend of changes.
 fn emit_dashboard_event(state: &ServerState, dashboard_id: &str, action: &str) {
@@ -44,7 +104,7 @@ fn emit_dashboard_event(state: &ServerState, dashboard_id: &str, action: &str) {
 // ============================================================================
 
 /// Dashboard layout configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardLayout {
     pub columns: u32,
     #[serde(alias = "rows", rename = "rows")]
@@ -63,14 +123,14 @@ impl Default for DashboardLayout {
 }
 
 /// Rows value - can be "auto" string or a number
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RowsValue {
     String(String),
     Number(u32),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutBreakpoints {
     pub lg: u32,
     pub md: u32,
@@ -90,7 +150,7 @@ impl Default for LayoutBreakpoints {
 }
 
 /// Component position on the grid
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentPosition {
     pub x: u32,
     pub y: u32,
@@ -110,6 +170,7 @@ pub struct ComponentPosition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardComponent {
     pub id: String,
+    /// Widget type: `value-card` | `line-chart` | `bar-chart` | `gauge` | `markdown-display`
     #[serde(alias = "type", rename = "type")]
     pub component_type: String,
     pub position: ComponentPosition,
@@ -124,25 +185,25 @@ pub struct DashboardComponent {
         alias = "data_source",
         rename = "data_source"
     )]
-    pub data_source: Option<JsonValue>,
+    pub data_source: Option<serde_json::Value>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         alias = "display",
         rename = "display"
     )]
-    pub display: Option<JsonValue>,
+    pub display: Option<serde_json::Value>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         alias = "config",
         rename = "config"
     )]
-    pub config: Option<JsonValue>,
+    pub config: Option<serde_json::Value>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         alias = "actions",
         rename = "actions"
     )]
-    pub actions: Option<JsonValue>,
+    pub actions: Option<serde_json::Value>,
 }
 
 /// Dashboard
@@ -150,6 +211,8 @@ pub struct DashboardComponent {
 pub struct Dashboard {
     pub id: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub layout: DashboardLayout,
     pub components: Vec<DashboardComponent>,
     #[serde(alias = "created_at", rename = "created_at")]
@@ -172,20 +235,23 @@ pub struct Dashboard {
 }
 
 /// Request to create a dashboard
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CreateDashboardRequest {
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub layout: DashboardLayout,
     #[serde(default)]
     pub components: Vec<CreateDashboardComponent>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct CreateDashboardComponent {
     /// Optional client-provided ID; if absent, server generates one
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Widget type: `value-card` | `line-chart` | `bar-chart` | `gauge` | `markdown-display`
     #[serde(alias = "type", rename = "type")]
     pub component_type: String,
     pub position: ComponentPosition,
@@ -200,36 +266,38 @@ pub struct CreateDashboardComponent {
         alias = "data_source",
         rename = "data_source"
     )]
-    pub data_source: Option<JsonValue>,
+    pub data_source: Option<serde_json::Value>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         alias = "display",
         rename = "display"
     )]
-    pub display: Option<JsonValue>,
+    pub display: Option<serde_json::Value>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         alias = "config",
         rename = "config"
     )]
-    pub config: Option<JsonValue>,
+    pub config: Option<serde_json::Value>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         alias = "actions",
         rename = "actions"
     )]
-    pub actions: Option<JsonValue>,
+    pub actions: Option<serde_json::Value>,
 }
 
-/// Request to update a dashboard - use JsonValue to accept flexible formats
-#[derive(Debug, Deserialize)]
+/// Request to update a dashboard - use serde_json::Value to accept flexible formats
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct UpdateDashboardRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub layout: Option<DashboardLayout>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub components: Option<Vec<JsonValue>>,
+    pub components: Option<Vec<serde_json::Value>>,
 }
 
 /// Dashboard template
@@ -242,7 +310,7 @@ pub struct DashboardTemplate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     pub layout: DashboardLayout,
-    pub components: Vec<JsonValue>,
+    pub components: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required_resources: Option<RequiredResources>,
 }
@@ -288,6 +356,7 @@ fn stored_to_api(dashboard: &StoredDashboard) -> Dashboard {
     Dashboard {
         id: dashboard.id.clone(),
         name: dashboard.name.clone(),
+        description: dashboard.description.clone(),
         layout: convert_layout(&dashboard.layout),
         components: dashboard.components.iter().map(convert_component).collect(),
         created_at: dashboard.created_at,
@@ -407,6 +476,18 @@ fn stored_template_to_api(template: &StoredTemplate) -> DashboardTemplate {
 ///
 /// Performance optimization: Supports pagination via limit/offset query parameters.
 /// Example: GET /api/dashboards?limit=10&offset=20
+#[utoipa::path(
+    get,
+    path = "/api/dashboards",
+    tag = "dashboards",
+    params(
+        ("limit" = Option<usize>, Query, description = "Max items"),
+        ("offset" = Option<usize>, Query, description = "Skip items"),
+    ),
+    responses(
+        (status = 200, description = "Dashboards in display order"),
+    )
+)]
 pub async fn list_dashboards_handler(
     State(state): State<ServerState>,
     Query(params): Query<PaginationParams>,
@@ -446,6 +527,18 @@ pub async fn list_dashboards_handler(
 }
 
 /// Get a dashboard by ID
+#[utoipa::path(
+    get,
+    path = "/api/dashboards/{id}",
+    tag = "dashboards",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+    ),
+    responses(
+        (status = 200, description = "One dashboard with components"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_dashboard_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -462,6 +555,7 @@ pub async fn get_dashboard_handler(
         return ok(Dashboard {
             id: template.id.clone(),
             name: template.name.clone(),
+            description: Some(template.description.clone()),
             layout: convert_layout(&template.layout),
             components: vec![],
             created_at: now,
@@ -471,16 +565,21 @@ pub async fn get_dashboard_handler(
         });
     }
 
-    let dashboard = state
-        .dashboard_store
-        .load(&id)
-        .map_err(|e| ErrorResponse::internal(format!("Failed to load dashboard: {}", e)))?
-        .ok_or_else(|| ErrorResponse::not_found(format!("Dashboard '{}' not found", id)))?;
+    let dashboard = resolve_dashboard(&state, &id)?;
 
     ok(stored_to_api(&dashboard))
 }
 
 /// Create a new dashboard
+#[utoipa::path(
+    post,
+    path = "/api/dashboards",
+    tag = "dashboards",
+    request_body = CreateDashboardRequest,
+    responses(
+        (status = 200, description = "Dashboard created"),
+    )
+)]
 pub async fn create_dashboard_handler(
     State(state): State<ServerState>,
     Json(req): Json<CreateDashboardRequest>,
@@ -496,7 +595,8 @@ pub async fn create_dashboard_handler(
 
     let stored_dashboard = StoredDashboard {
         id: id.clone(),
-        name: req.name,
+        name: req.name.clone(),
+        description: req.description,
         layout: api_to_stored_layout(&req.layout),
         components: req
             .components
@@ -527,20 +627,32 @@ pub async fn create_dashboard_handler(
 }
 
 /// Update a dashboard
+#[utoipa::path(
+    put,
+    path = "/api/dashboards/{id}",
+    tag = "dashboards",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+    ),
+    request_body = UpdateDashboardRequest,
+    responses(
+        (status = 200, description = "Dashboard updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_dashboard_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDashboardRequest>,
 ) -> HandlerResult<Dashboard> {
-    let mut dashboard = state
-        .dashboard_store
-        .load(&id)
-        .map_err(|e| ErrorResponse::internal(format!("Failed to load dashboard: {}", e)))?
-        .ok_or_else(|| ErrorResponse::not_found(format!("Dashboard '{}' not found", id)))?;
+    let mut dashboard = resolve_dashboard(&state, &id)?;
 
     // Update fields if provided
     if let Some(name) = req.name {
         dashboard.name = name;
+    }
+    if let Some(description) = req.description {
+        dashboard.description = Some(description);
     }
     if let Some(layout) = req.layout {
         dashboard.layout = api_to_stored_layout(&layout);
@@ -556,7 +668,26 @@ pub async fn update_dashboard_handler(
             })
             .collect();
         match parsed {
-            Ok(parsed_components) => dashboard.components = parsed_components,
+            Ok(parsed_components) => {
+                // Same type gate as add-components — the full-replace path is
+                // the one place a typo'd type could still sneak in silently.
+                let known = collect_known_widget_types(&state);
+                // The update path must NOT hard-fail on orphaned/legacy types:
+                // a dashboard with a widget whose type was later uninstalled (or
+                // shared from another instance) would become un-editable. Warn
+                // and persist — the renderer shows an UnknownComponent placeholder.
+                // The ADD path keeps the strict gate (typos on new widgets).
+                for c in &parsed_components {
+                    if !known.contains(&c.component_type) {
+                        tracing::warn!(
+                            dashboard_id = %id,
+                            component_type = %c.component_type,
+                            "update-dashboard: persisting a component with an unknown type (orphaned/legacy)"
+                        );
+                    }
+                }
+                dashboard.components = parsed_components;
+            }
             Err(e) => {
                 return Err(
                     ErrorResponse::bad_request(format!("Invalid component data: {}", e)).with_hint(
@@ -580,16 +711,25 @@ pub async fn update_dashboard_handler(
 }
 
 /// Add components to a dashboard (append mode)
+#[utoipa::path(
+    post,
+    path = "/api/dashboards/{id}/components",
+    tag = "dashboards",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+    ),
+    request_body = AddComponentsRequest,
+    responses(
+        (status = 200, description = "Components appended"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn add_components_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
     Json(req): Json<AddComponentsRequest>,
 ) -> HandlerResult<Dashboard> {
-    let mut dashboard = state
-        .dashboard_store
-        .load(&id)
-        .map_err(|e| ErrorResponse::internal(format!("Failed to load dashboard: {}", e)))?
-        .ok_or_else(|| ErrorResponse::not_found(format!("Dashboard '{}' not found", id)))?;
+    let mut dashboard = resolve_dashboard(&state, &id)?;
 
     // Parse and append new components
     let new_components: Vec<StoredComponent> = req
@@ -611,6 +751,49 @@ pub async fn add_components_handler(
             )
         })?;
 
+    // Reject unknown component TYPES up front: a typo'd type ("value_card")
+    // used to persist silently and render as an UnknownComponent placeholder
+    // while the agent claimed success. Known = builtin ∪ community ∪
+    // extension-bundled.
+    let known = collect_known_widget_types(&state);
+    if let Some(bad) = new_components
+        .iter()
+        .find(|c| !known.contains(&c.component_type))
+    {
+        return Err(ErrorResponse::bad_request(format!(
+            "Unknown component type '{}' — run `heramind widget list` for valid types",
+            bad.component_type
+        ))
+        .with_hint(
+            "Use the exact type id (kebab-case, e.g. value-card / line-chart / sparkline).",
+        ));
+    }
+
+    // Reject component-id collisions: duplicates make `update-component`
+    // (find-first) ambiguous and break the frontend's React keys.
+    if let Some(dup) = new_components.iter().find(|c| {
+        dashboard
+            .components
+            .iter()
+            .any(|existing| existing.id == c.id)
+    }) {
+        return Err(ErrorResponse::bad_request(format!(
+            "Component id '{}' already exists on dashboard '{}' — component ids must be unique. \
+             Use `dashboard get {}` to list existing ids, or `update-component` to modify one.",
+            dup.id, id, id
+        )));
+    }
+    // Also reject duplicates WITHIN the same batch.
+    {
+        let mut seen = std::collections::HashSet::new();
+        if let Some(dup) = new_components.iter().find(|c| !seen.insert(&c.id)) {
+            return Err(ErrorResponse::bad_request(format!(
+                "Duplicate component id '{}' within the same --components batch",
+                dup.id
+            )));
+        }
+    }
+
     dashboard.components.extend(new_components);
     dashboard.updated_at = chrono::Utc::now().timestamp();
 
@@ -625,16 +808,25 @@ pub async fn add_components_handler(
 }
 
 /// Remove components from a dashboard by ID
+#[utoipa::path(
+    delete,
+    path = "/api/dashboards/{id}/components",
+    tag = "dashboards",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+    ),
+    request_body = RemoveComponentsRequest,
+    responses(
+        (status = 200, description = "Components removed"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn remove_components_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
     Json(req): Json<RemoveComponentsRequest>,
 ) -> HandlerResult<serde_json::Value> {
-    let mut dashboard = state
-        .dashboard_store
-        .load(&id)
-        .map_err(|e| ErrorResponse::internal(format!("Failed to load dashboard: {}", e)))?
-        .ok_or_else(|| ErrorResponse::not_found(format!("Dashboard '{}' not found", id)))?;
+    let mut dashboard = resolve_dashboard(&state, &id)?;
 
     let before = dashboard.components.len();
     dashboard.components.retain(|c| !req.ids.contains(&c.id));
@@ -656,33 +848,141 @@ pub async fn remove_components_handler(
 }
 
 /// Request to add components
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct AddComponentsRequest {
-    pub components: Vec<JsonValue>,
+    pub components: Vec<serde_json::Value>,
 }
 
 /// Request to remove components by ID
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct RemoveComponentsRequest {
     pub ids: Vec<String>,
 }
 
+/// Request to patch a single component (deep merge)
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
+pub struct UpdateComponentRequest {
+    /// Partial component JSON, DEEP-MERGED into the stored component:
+    /// objects merge recursively, everything else (scalars, arrays) replaces.
+    /// `id` and `type` are immutable and ignored.
+    pub set: Option<serde_json::Value>,
+}
+
+/// Recursive JSON merge: objects merge key-by-key, everything else replaces.
+fn deep_merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    if let (serde_json::Value::Object(t), serde_json::Value::Object(p)) = (target, patch) {
+        for (k, v) in p {
+            match t.get_mut(k) {
+                Some(serde_json::Value::Object(_)) if v.is_object() => {
+                    if let Some(child) = t.get_mut(k) {
+                        deep_merge_json(child, v);
+                    }
+                }
+                _ => {
+                    t.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Patch ONE component of a dashboard (deep merge) — the cheap way to tweak a
+/// single field (e.g. a data_source timeWindow) without round-tripping the
+/// whole component array through `dashboard update --components`.
+#[utoipa::path(
+    patch,
+    path = "/api/dashboards/{id}/components/{component_id}",
+    tag = "dashboards",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+        ("component_id" = String, Path, description = "Component id"),
+    ),
+    request_body = UpdateComponentRequest,
+    responses(
+        (status = 200, description = "Component updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
+pub async fn update_component_handler(
+    State(state): State<ServerState>,
+    Path((id, component_id)): Path<(String, String)>,
+    Json(req): Json<UpdateComponentRequest>,
+) -> HandlerResult<serde_json::Value> {
+    let set = req.set.unwrap_or(serde_json::Value::Null);
+    if !set.is_object() {
+        return Err(ErrorResponse::bad_request(
+            "`set` must be a JSON object of partial component fields",
+        ));
+    }
+
+    let mut dashboard = resolve_dashboard(&state, &id)?;
+
+    let component = dashboard
+        .components
+        .iter_mut()
+        .find(|c| c.id == component_id)
+        .ok_or_else(|| {
+            ErrorResponse::not_found(format!(
+                "Component '{}' not found on dashboard '{}' (use `dashboard get {}` to list component ids)",
+                component_id, id, id
+            ))
+        })?;
+
+    // Round-trip through JSON so the patch can touch any field generically.
+    let mut value = serde_json::to_value(&*component)
+        .map_err(|e| ErrorResponse::internal(format!("Failed to serialize component: {}", e)))?;
+    // id and type identify the component — never let a patch move/retype it.
+    if let serde_json::Value::Object(patch) = &set {
+        let mut sanitized = patch.clone();
+        sanitized.remove("id");
+        sanitized.remove("type");
+        deep_merge_json(&mut value, &serde_json::Value::Object(sanitized));
+    }
+    let patched: StoredComponent = serde_json::from_value(value)
+        .map_err(|e| ErrorResponse::bad_request(format!("Patched component is invalid: {}", e)))?;
+    let patched_id = patched.id.clone();
+    *component = patched;
+
+    dashboard.updated_at = chrono::Utc::now().timestamp();
+    state
+        .dashboard_store
+        .save(&dashboard)
+        .map_err(|e| ErrorResponse::internal(format!("Failed to save dashboard: {}", e)))?;
+
+    emit_dashboard_event(&state, &id, "update_component");
+
+    ok(serde_json::json!({
+        "ok": true,
+        "dashboard_id": id,
+        "component_id": patched_id,
+        "component": serde_json::to_value(
+            dashboard.components.iter().find(|c| c.id == patched_id)
+        ).unwrap_or(serde_json::Value::Null),
+    }))
+}
+
 /// Delete a dashboard
+#[utoipa::path(
+    delete,
+    path = "/api/dashboards/{id}",
+    tag = "dashboards",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+    ),
+    responses(
+        (status = 200, description = "Dashboard deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_dashboard_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
 ) -> HandlerResult<serde_json::Value> {
-    // Check if dashboard exists
-    if !state
-        .dashboard_store
-        .exists(&id)
-        .map_err(|e| ErrorResponse::internal(format!("Failed to check dashboard: {}", e)))?
-    {
-        return Err(ErrorResponse::not_found(format!(
-            "Dashboard '{}' not found",
-            id
-        )));
-    }
+    // Resolve by id OR name — every :id handler must accept names, or a
+    // get-by-name that succeeds followed by delete-by-name that 404s traps
+    // LLM callers into hallucinated success (the resolve_dashboard contract).
+    let resolved = resolve_dashboard(&state, &id)?;
+    let id = resolved.id;
 
     state
         .dashboard_store
@@ -698,21 +998,25 @@ pub async fn delete_dashboard_handler(
 }
 
 /// Set default dashboard
+#[utoipa::path(
+    post,
+    path = "/api/dashboards/{id}/default",
+    tag = "dashboards",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+    ),
+    responses(
+        (status = 200, description = "Dashboard set as default"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn set_default_dashboard_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
 ) -> HandlerResult<serde_json::Value> {
-    // Check if dashboard exists
-    if !state
-        .dashboard_store
-        .exists(&id)
-        .map_err(|e| ErrorResponse::internal(format!("Failed to check dashboard: {}", e)))?
-    {
-        return Err(ErrorResponse::not_found(format!(
-            "Dashboard '{}' not found",
-            id
-        )));
-    }
+    // Same id-or-name contract as every other :id handler.
+    let resolved = resolve_dashboard(&state, &id)?;
+    let id = resolved.id;
 
     state
         .dashboard_store
@@ -727,7 +1031,7 @@ pub async fn set_default_dashboard_handler(
 
 /// Request body for `PUT /api/dashboards/reorder`.
 /// `dashboard_ids` is the desired full ordering (index 0 = top).
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct ReorderDashboardsRequest {
     pub dashboard_ids: Vec<String>,
 }
@@ -745,6 +1049,15 @@ pub struct ReorderDashboardsResponse {
 /// assign each its index as the new `sort_order` and persist them in a single
 /// transaction. Emits a single `DashboardUpdated` event with action `"reorder"`
 /// so other clients refetch.
+#[utoipa::path(
+    put,
+    path = "/api/dashboards/reorder",
+    tag = "dashboards",
+    request_body = ReorderDashboardsRequest,
+    responses(
+        (status = 200, description = "Display order saved"),
+    )
+)]
 pub async fn reorder_dashboards_handler(
     State(state): State<ServerState>,
     Json(req): Json<ReorderDashboardsRequest>,
@@ -766,7 +1079,12 @@ pub async fn reorder_dashboards_handler(
     state
         .dashboard_store
         .set_sort_orders(&items)
-        .map_err(|e| ErrorResponse::internal(format!("Failed to reorder dashboards: {}", e)))?;
+        .map_err(|e| match e {
+            heramind_storage::Error::NotFound(msg) => {
+                ErrorResponse::not_found(format!("Failed to reorder dashboards: {msg}"))
+            }
+            other => ErrorResponse::internal(format!("Failed to reorder dashboards: {other}")),
+        })?;
 
     // Notify other clients. Use the first id as the event target — the SSE
     // consumer refetches the full list on receipt regardless of which id.
@@ -778,6 +1096,14 @@ pub async fn reorder_dashboards_handler(
 }
 
 /// List dashboard templates
+#[utoipa::path(
+    get,
+    path = "/api/dashboards/templates",
+    tag = "dashboards",
+    responses(
+        (status = 200, description = "Built-in dashboard templates"),
+    )
+)]
 pub async fn list_templates_handler(
     State(_state): State<ServerState>,
 ) -> HandlerResult<Vec<DashboardTemplate>> {
@@ -786,6 +1112,18 @@ pub async fn list_templates_handler(
 }
 
 /// Get a template by ID
+#[utoipa::path(
+    get,
+    path = "/api/dashboards/templates/{id}",
+    tag = "dashboards",
+    params(
+        ("id" = String, Path, description = "Template id"),
+    ),
+    responses(
+        (status = 200, description = "One dashboard template"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_template_handler(
     State(_state): State<ServerState>,
     Path(id): Path<String>,
@@ -804,13 +1142,13 @@ pub async fn get_template_handler(
 // ============================================================================
 
 /// Share permissions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct SharePermissions {
     pub allow_interactive: bool,
 }
 
 /// Request to create a share link
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CreateShareRequest {
     pub permissions: SharePermissions,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -841,17 +1179,27 @@ pub struct SharedDashboardResponse {
 // ============================================================================
 
 /// Create a share link for a dashboard
+#[utoipa::path(
+    post,
+    path = "/api/dashboards/{id}/share",
+    tag = "shares",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+    ),
+    request_body = CreateShareRequest,
+    responses(
+        (status = 200, description = "Share link created"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn create_share_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
     Json(req): Json<CreateShareRequest>,
 ) -> HandlerResult<ShareTokenResponse> {
-    // Verify dashboard exists
-    state
-        .dashboard_store
-        .load(&id)
-        .map_err(|e| ErrorResponse::internal(format!("Failed to load dashboard: {}", e)))?
-        .ok_or_else(|| ErrorResponse::not_found(format!("Dashboard '{}' not found", id)))?;
+    // Same id-or-name contract as every other :id handler.
+    let resolved = resolve_dashboard(&state, &id)?;
+    let id = resolved.id;
 
     // Generate token: ds_ prefix + 22 random hex chars
     let random_bytes: [u8; 16] = rand::random();
@@ -892,6 +1240,18 @@ pub async fn create_share_handler(
 }
 
 /// List all share links for a dashboard
+#[utoipa::path(
+    get,
+    path = "/api/dashboards/{id}/share",
+    tag = "shares",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+    ),
+    responses(
+        (status = 200, description = "Active share links of a dashboard"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn list_shares_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -921,6 +1281,19 @@ pub async fn list_shares_handler(
 }
 
 /// Revoke a share link
+#[utoipa::path(
+    delete,
+    path = "/api/dashboards/{id}/share/{token}",
+    tag = "shares",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+        ("token" = String, Path, description = "Share token"),
+    ),
+    responses(
+        (status = 200, description = "Share link revoked"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn revoke_share_handler(
     State(state): State<ServerState>,
     Path((id, token)): Path<(String, String)>,
@@ -960,6 +1333,18 @@ fn validate_share_token(
 }
 
 /// Get shared dashboard data (public, no auth)
+#[utoipa::path(
+    get,
+    path = "/api/share/{token}",
+    tag = "shares",
+    params(
+        ("token" = String, Path, description = "Share token"),
+    ),
+    responses(
+        (status = 200, description = "Shared dashboard snapshot (no auth; token grant)"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_shared_dashboard_handler(
     State(state): State<ServerState>,
     Path(token): Path<String>,
@@ -1026,8 +1411,8 @@ pub async fn share_proxy_handler(
         }
     }
 
-    let is_read_only = !share.permissions.allow_interactive;
-    let path_str = path.as_ref();
+    let allow_interactive = share.permissions.allow_interactive;
+    let path_str: &str = path.as_ref();
 
     // 3. Enforce an ALLOWLIST of paths reachable through the share proxy.
     //    Previously this was a blocklist, which silently allowed anonymous
@@ -1035,6 +1420,19 @@ pub async fn share_proxy_handler(
     //    extension data — far beyond what the shared dashboard needs. The
     //    semantics of a share link are "read the data this dashboard needs",
     //    not "read the entire platform".
+    // 3a. Reject traversal outright: a wildcard path like
+    // `devices/../../auth/keys` passes a first-segment allowlist check, and
+    // the loopback URL builder normalizes the dot-segments away — turning
+    // the allowlist into a full authenticated-API bypass via the internal-
+    // proxy secret. No legitimate share-proxy path contains them.
+    if path_str.split('/').any(|seg| seg == ".." || seg == ".") {
+        return ErrorResponse::new(
+            "FORBIDDEN",
+            "This path is not accessible via share proxy",
+            StatusCode::FORBIDDEN,
+        )
+        .into_response();
+    }
     if !is_share_proxy_path_allowed(path_str) {
         return ErrorResponse::new(
             "FORBIDDEN",
@@ -1044,14 +1442,22 @@ pub async fn share_proxy_handler(
         .into_response();
     }
 
-    // 4. Block write methods in read-only mode
-    if is_read_only && !is_allowed_readonly_method(path_str, &method) {
-        return ErrorResponse::new(
-            "FORBIDDEN",
-            "This share link is read-only",
-            StatusCode::FORBIDDEN,
-        )
-        .into_response();
+    // 4. Method gate. Interactive links get the same POST whitelist as
+    //    read-only ones, PLUS device control commands — previously an
+    //    interactive link skipped the gate entirely, letting an anonymous
+    //    share-token holder run ANY write method on any allowlisted path
+    //    (install extensions, delete agents, rewrite channels): "allow this
+    //    viewer to press the dashboard's buttons" must not mean "full admin
+    //    write inside the allowlist prefixes". PUT/DELETE stay blocked for
+    //    both modes — interactive means actuating devices, never editing
+    //    configuration.
+    if !is_allowed_share_method(path_str, &method, allow_interactive) {
+        let reason = if allow_interactive {
+            "This action is not available through a shared link"
+        } else {
+            "This share link is read-only"
+        };
+        return ErrorResponse::new("FORBIDDEN", reason, StatusCode::FORBIDDEN).into_response();
     }
 
     // 5. Build query string
@@ -1060,10 +1466,20 @@ pub async fn share_proxy_handler(
     } else {
         format!("?{}", query)
     };
-    let target_url = format!("http://127.0.0.1:9375/api/{}{}", path_str, qs);
+    // Bind port is configurable (HERAMIND_PORT / config) — a hardcoded 9375
+    // broke every shared-dashboard data proxy on non-default-port installs.
+    let target_url = format!(
+        "http://127.0.0.1:{}/api/{}{}",
+        crate::server::http_bind_port(),
+        path_str,
+        qs
+    );
 
-    // 6. Forward via reqwest (internal loopback, skips auth middleware)
-    let client = reqwest::Client::new();
+    // 6. Forward via reqwest (internal loopback, skips auth middleware).
+    // One shared client — shared boards poll through here continuously and a
+    // per-request Client pays pool/TLS setup every call.
+    static PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = PROXY_CLIENT.get_or_init(reqwest::Client::new);
     let mut req_builder = match method {
         Method::GET => client.get(&target_url),
         Method::POST => client.post(&target_url),
@@ -1183,7 +1599,7 @@ fn new_output_prefix(source_prefix: &str) -> String {
 ///   - dataSource.sourceId             → "transform:{new_id}"
 ///   - dataSource.id                   → new_id
 ///   - dataSource.metricId / .field    → replace old_prefix with new_prefix if the
-///                                       string starts with "{old_prefix}."
+///     string starts with "{old_prefix}."
 fn rewrite_component_transform_refs(
     component: &mut StoredComponent,
     old_id: &str,
@@ -1207,7 +1623,7 @@ fn rewrite_component_transform_refs(
     if let Some(cfg) = component.config.as_mut().and_then(|c| c.as_object_mut()) {
         cfg.insert(
             "_transformId".to_string(),
-            JsonValue::String(new_id.to_string()),
+            serde_json::Value::String(new_id.to_string()),
         );
     }
 
@@ -1219,23 +1635,26 @@ fn rewrite_component_transform_refs(
     {
         ds.insert(
             "transformId".to_string(),
-            JsonValue::String(new_id.to_string()),
+            serde_json::Value::String(new_id.to_string()),
         );
         ds.insert(
             "sourceId".to_string(),
-            JsonValue::String(format!("transform:{}", new_id)),
+            serde_json::Value::String(format!("transform:{}", new_id)),
         );
-        ds.insert("id".to_string(), JsonValue::String(new_id.to_string()));
+        ds.insert(
+            "id".to_string(),
+            serde_json::Value::String(new_id.to_string()),
+        );
 
         let prefix_replacements = ["metricId", "field"];
         let old_prefix_dot = format!("{}.", old_prefix);
         for key in prefix_replacements {
-            if let Some(JsonValue::String(s)) = ds.get(key).cloned() {
+            if let Some(serde_json::Value::String(s)) = ds.get(key).cloned() {
                 if s.starts_with(&old_prefix_dot) {
                     let suffix = &s[old_prefix_dot.len()..];
                     ds.insert(
                         key.to_string(),
-                        JsonValue::String(format!("{}.{}", new_prefix, suffix)),
+                        serde_json::Value::String(format!("{}.{}", new_prefix, suffix)),
                     );
                 }
             }
@@ -1265,7 +1684,7 @@ fn build_duplicate_dashboard(
         .components
         .iter()
         .map(|c| {
-            serde_json::from_value(serde_json::to_value(c).unwrap_or(JsonValue::Null))
+            serde_json::from_value(serde_json::to_value(c).unwrap_or(serde_json::Value::Null))
                 .unwrap_or_else(|_| c.clone())
         })
         .collect();
@@ -1329,6 +1748,7 @@ fn build_duplicate_dashboard(
     let new_dashboard = StoredDashboard {
         id: new_dashboard_id,
         name: format!("{} (copy)", source.name),
+        description: source.description.clone(),
         layout: source.layout.clone(),
         components: new_components,
         created_at: now,
@@ -1348,6 +1768,18 @@ fn build_duplicate_dashboard(
 /// are deep-cloned with fresh IDs and output_prefix; their references in the
 /// cloned components are rewritten. Device/agent/extension references stay
 /// shared (they are global resources).
+#[utoipa::path(
+    post,
+    path = "/api/dashboards/{id}/duplicate",
+    tag = "dashboards",
+    params(
+        ("id" = String, Path, description = "Dashboard id"),
+    ),
+    responses(
+        (status = 200, description = "Dashboard copied"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn duplicate_dashboard_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1465,46 +1897,148 @@ fn path_matches_pattern(path: &str, pattern: &str) -> bool {
         .all(|(p, pat)| pat.starts_with(':') || *p == *pat)
 }
 
-/// In read-only mode, only allow GET and specific safe POST endpoints.
-/// Uses exact endpoint matching to prevent unauthorized access to side-effect
-/// operations that share a prefix with read-like endpoints.
+/// Method gate for the share proxy — both share modes. Uses exact endpoint
+/// matching to prevent unauthorized access to side-effect operations that
+/// share a prefix with read-like endpoints.
+///
+/// "Interactive" means the viewer may actuate what the dashboard shows
+/// (send a device control command) — it does NOT open configuration writes.
 ///
 /// Share mode permission matrix:
-/// ┌──────────────────────────────────────────┬────────┬─────────┐
-/// │ Path pattern                             │ Method │ Allowed │
-/// ├──────────────────────────────────────────┼────────┼─────────┤
-/// │ * (unless blocked)                       │ GET    │ YES     │
-/// │ extensions/:id/command                   │ POST   │ YES     │
-/// │ devices/current-batch                    │ POST   │ YES     │
-/// │ agents/:id/executions/details            │ POST   │ YES     │
-/// │ * (all other)                            │ POST   │ NO      │
-/// │ *                                        │ PUT    │ NO      │
-/// │ *                                        │ DELETE │ NO      │
-/// └──────────────────────────────────────────┴────────┴─────────┘
-fn is_allowed_readonly_method(path: &str, method: &Method) -> bool {
+/// ┌──────────────────────────────────────────┬────────┬─────────┬──────────────┐
+/// │ Path pattern                             │ Method │ Allowed │ Mode         │
+/// ├──────────────────────────────────────────┼────────┼─────────┼──────────────┤
+/// │ * (unless path-blocked)                  │ GET    │ YES     │ both         │
+/// │ extensions/:id/command                   │ POST   │ YES     │ both         │
+/// │ devices/current-batch                    │ POST   │ YES     │ both         │
+/// │ agents/:id/executions/details            │ POST   │ YES     │ both         │
+/// │ devices/:id/command/:command             │ POST   │ YES     │ interactive  │
+/// │ agents/:id/invoke (AI-analyst ask)       │ POST   │ YES     │ interactive  │
+/// │ * (all other)                            │ POST   │ NO      │ both         │
+/// │ *                                        │ PUT    │ NO      │ both         │
+/// │ *                                        │ DELETE │ NO      │ both         │
+/// └──────────────────────────────────────────┴────────┴─────────┴──────────────┘
+fn is_allowed_share_method(path: &str, method: &Method, allow_interactive: bool) -> bool {
     if method == Method::GET {
         return true;
     }
-    if method == Method::POST {
-        let allowed_post_patterns = [
-            "extensions/:id/command",        // Extension read-only commands
-            "devices/current-batch",         // Batch device current values
-            "agents/:id/executions/details", // Batch get execution details
-        ];
-        return allowed_post_patterns
-            .iter()
-            .any(|p| path_matches_pattern(path, p));
+    if method != Method::POST {
+        return false;
     }
-    false
+    // Read-like POSTs both modes allow…
+    let read_like = [
+        "extensions/:id/command", // Extension commands (incl. read-only queries)
+        "devices/current-batch",  // Batch device current values
+        "agents/:id/executions/details", // Batch get execution details
+    ];
+    if read_like.iter().any(|p| path_matches_pattern(path, p)) {
+        return true;
+    }
+    // …plus interactive-mode writes: device control buttons, and running an
+    // agent via the AI-analyst widget's ask box (invoke) — same authorization
+    // tier as actuating devices; pre-hardening interactive shares allowed
+    // these and the analyst on shared boards regressed when the gate landed.
+    if !allow_interactive {
+        return false;
+    }
+    path_matches_pattern(path, "devices/:id/command/:command")
+        || path_matches_pattern(path, "agents/:id/invoke")
+        // CommandButton widgets wired to extension commands — same tier.
+        || path_matches_pattern(path, "extensions/:id/invoke")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_duplicate_dashboard, new_output_prefix, rewrite_component_transform_refs};
+    use super::{
+        build_duplicate_dashboard, deep_merge_json, is_allowed_share_method, new_output_prefix,
+        rewrite_component_transform_refs,
+    };
+    use axum::http::Method;
     use heramind_storage::dashboards::{
         Dashboard as StoredDashboard, DashboardComponent as StoredComponent,
         DashboardLayout as StoredLayout,
     };
+
+    /// Interactive links must NOT be "full admin write inside the allowlist
+    /// prefixes" — the method gate whitelists POSTs for both modes, with
+    /// interactive adding exactly one endpoint (device control).
+    #[test]
+    fn share_method_gate_interactive_is_not_blanket_write() {
+        // Read-like POSTs: both modes.
+        for path in [
+            "devices/current-batch",
+            "extensions/weather/command",
+            "agents/a1/executions/details",
+        ] {
+            assert!(
+                is_allowed_share_method(path, &Method::POST, false),
+                "read-like POST `{path}` must pass in read-only mode"
+            );
+            assert!(
+                is_allowed_share_method(path, &Method::POST, true),
+                "read-like POST `{path}` must pass in interactive mode"
+            );
+        }
+
+        // Device control: interactive only.
+        assert!(!is_allowed_share_method(
+            "devices/ne101-01/command/reboot",
+            &Method::POST,
+            false
+        ));
+        assert!(is_allowed_share_method(
+            "devices/ne101-01/command/reboot",
+            &Method::POST,
+            true
+        ));
+
+        // AI-analyst ask box on shared boards: interactive only.
+        assert!(!is_allowed_share_method(
+            "agents/a1/invoke",
+            &Method::POST,
+            false
+        ));
+        assert!(is_allowed_share_method(
+            "agents/a1/invoke",
+            &Method::POST,
+            true
+        ));
+
+        // Configuration writes: NEVER — this is the fix. An interactive
+        // share-token holder previously reached any write method on any
+        // allowlisted path (install extensions, delete agents, rewrite
+        // channels).
+        for (path, method) in [
+            ("extensions/install", Method::POST),
+            ("agents/a1", Method::DELETE),
+            ("agents/a1", Method::PUT),
+            ("messages/ch-1", Method::PUT),
+            ("messages/ch-1", Method::DELETE),
+            ("devices/ne101-01", Method::DELETE),
+            ("extensions/weather/config", Method::PUT),
+        ] {
+            assert!(
+                !is_allowed_share_method(path, &method, true),
+                "interactive share must not allow {method} `{path}`"
+            );
+            assert!(
+                !is_allowed_share_method(path, &method, false),
+                "read-only share must not allow {method} `{path}`"
+            );
+        }
+
+        // GET stays open for both modes (path allowlist handles scope).
+        assert!(is_allowed_share_method(
+            "telemetry/latest",
+            &Method::GET,
+            false
+        ));
+        assert!(is_allowed_share_method(
+            "telemetry/latest",
+            &Method::GET,
+            true
+        ));
+    }
 
     #[test]
     fn rewrite_component_transform_refs_updates_all_three_fields() {
@@ -1691,6 +2225,7 @@ mod tests {
         let src_dashboard = StoredDashboard {
             id: "dashboard_src".to_string(),
             name: "My Dashboard".to_string(),
+            description: None,
             layout: StoredLayout::default_layout(),
             components: vec![src_component],
             created_at: 100,
@@ -1747,6 +2282,7 @@ mod tests {
         let src = StoredDashboard {
             id: "x".to_string(),
             name: "X (copy)".to_string(),
+            description: None,
             layout: StoredLayout::default_layout(),
             components: vec![],
             created_at: 0,
@@ -1756,5 +2292,261 @@ mod tests {
         };
         let result = build_duplicate_dashboard(&src, vec![], 0);
         assert_eq!(result.dashboard.name, "X (copy) (copy)");
+    }
+
+    #[test]
+    fn deep_merge_json_merges_objects_and_replaces_scalars() {
+        let mut target = serde_json::json!({
+            "title": "Old",
+            "position": {"x": 0, "y": 0, "w": 4, "h": 2},
+            "data_source": {"id": "demo-001", "field": "temperature", "timeWindow": {"type": "last_24hours"}},
+            "tags": ["a", "b"]
+        });
+        let patch = serde_json::json!({
+            "title": "New",
+            "position": {"w": 6},                       // partial — x/y/h kept
+            "data_source": {"timeWindow": {"type": "last_6hours"}}, // nested merge
+            "tags": ["z"]                                // arrays REPLACE
+        });
+        deep_merge_json(&mut target, &patch);
+        assert_eq!(target["title"], "New");
+        assert_eq!(
+            target["position"],
+            serde_json::json!({"x": 0, "y": 0, "w": 6, "h": 2})
+        );
+        assert_eq!(target["data_source"]["id"], "demo-001");
+        assert_eq!(target["data_source"]["field"], "temperature");
+        assert_eq!(target["data_source"]["timeWindow"]["type"], "last_6hours");
+        assert_eq!(target["tags"], serde_json::json!(["z"]));
+    }
+}
+
+/// Wire-contract tests: the exact JSON the API emits must match what the
+/// frontend `fromDashboardDTO` (web/src/store/persistence/types.ts) parses,
+/// and the JSON the frontend `toDashboardDTO` sends must parse back. Field
+/// drift here breaks the dashboard UI SILENTLY (the TS converter drops
+/// unknown/renamed keys without error), which is why every key is pinned.
+#[cfg(test)]
+mod dto_contract_tests {
+    use super::*;
+
+    fn sample_component() -> DashboardComponent {
+        DashboardComponent {
+            id: "comp-1".into(),
+            component_type: "metric-card".into(),
+            position: ComponentPosition {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 3,
+                min_w: Some(2),
+                min_h: None,
+                max_w: None,
+                max_h: Some(8),
+            },
+            title: Some("Temperature".into()),
+            data_source: Some(serde_json::json!({"deviceId": "d1"})),
+            display: None,
+            config: Some(serde_json::json!({"unit": "°C"})),
+            actions: None,
+        }
+    }
+
+    fn sample_dashboard() -> Dashboard {
+        Dashboard {
+            id: "dash-1".into(),
+            name: "Home".into(),
+            description: None,
+            layout: DashboardLayout::default(),
+            components: vec![sample_component()],
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_001,
+            is_default: Some(true),
+            sort_order: Some(2),
+        }
+    }
+
+    /// The component emits `type` (NOT `component_type`) and snake_case
+    /// position min/max keys — exactly what `positionFromDTO` reads.
+    #[test]
+    fn component_wire_keys_match_frontend_contract() {
+        let json = serde_json::to_value(sample_component()).unwrap();
+        let obj = json.as_object().unwrap();
+
+        assert_eq!(
+            obj.keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["id", "type", "position", "title", "data_source", "config"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>(),
+            "exact component key set drifted — frontend silently drops unknown/renamed keys"
+        );
+        assert_eq!(
+            obj["type"], "metric-card",
+            "must emit `type`, not `component_type`"
+        );
+
+        let pos = obj["position"].as_object().unwrap();
+        assert_eq!(
+            pos.keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["x", "y", "w", "h", "min_w", "max_h"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(pos["min_w"], 2);
+        assert_eq!(pos["max_h"], 8);
+    }
+
+    /// Dashboard level is snake_case (`created_at`, `is_default`,
+    /// `sort_order`), `rows` carries the "auto"-or-number duality.
+    #[test]
+    fn dashboard_wire_keys_match_frontend_contract() {
+        let json = serde_json::to_value(sample_dashboard()).unwrap();
+        let obj = json.as_object().unwrap();
+
+        assert_eq!(
+            obj.keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "id",
+                "name",
+                "layout",
+                "components",
+                "created_at",
+                "updated_at",
+                "is_default",
+                "sort_order"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(obj["created_at"], 1_700_000_000);
+        assert_eq!(obj["is_default"], true);
+        assert_eq!(obj["sort_order"], 2);
+
+        // Layout contract: columns + rows ("auto" string OR number) +
+        // all four breakpoints present — the TS interface requires all.
+        let layout = obj["layout"].as_object().unwrap();
+        assert_eq!(layout["rows"], "auto");
+        let bps = layout["breakpoints"].as_object().unwrap();
+        assert_eq!(
+            bps.keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["lg", "md", "sm", "xs"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    /// The frontend's `toDashboardDTO` payload must round-trip into the
+    /// create request — including `type` for component_type and a numeric
+    /// `rows` variant.
+    #[test]
+    fn create_request_parses_frontend_payload() {
+        let payload = serde_json::json!({
+            "name": "From UI",
+            "layout": {
+                "columns": 12,
+                "rows": 8,
+                "breakpoints": {"lg": 1200, "md": 996, "sm": 768, "xs": 480}
+            },
+            "components": [{
+                "id": "c-ui",
+                "type": "chart",
+                "position": {"x": 1, "y": 2, "w": 3, "h": 4},
+                "title": "Chart",
+                "data_source": {"deviceId": "d2", "metric": "temp"}
+            }]
+        });
+        let req: CreateDashboardRequest = serde_json::from_value(payload).unwrap();
+        assert_eq!(req.name, "From UI");
+        assert!(matches!(req.layout.rows, RowsValue::Number(8)));
+        assert_eq!(req.components.len(), 1);
+        assert_eq!(req.components[0].component_type, "chart");
+        assert!(req.components[0].data_source.is_some());
+    }
+
+    /// Wire input contract: `type` is THE accepted spelling. Note that the
+    /// Rust field name `component_type` is NOT accepted — `rename = "type"`
+    /// fully replaces the original name (an alias of the same value adds
+    /// nothing). Persisted rows never hit this path (storage converts via
+    /// the stored_to_api mappers, not serde), and the frontend/CLI only
+    /// emit `type`, so the single spelling is correct — this test pins it
+    /// so nobody "fixes" the rename without updating the frontend.
+    #[test]
+    fn deserialization_accepts_type_and_rejects_rust_field_name() {
+        let rust_spelling = serde_json::json!({
+            "id": "dash-old",
+            "name": "Legacy",
+            "layout": {
+                "columns": 12, "rows": "auto",
+                "breakpoints": {"lg": 1200, "md": 996, "sm": 768, "xs": 480}
+            },
+            "components": [{
+                "id": "c1",
+                "component_type": "metric-card",
+                "position": {"x": 0, "y": 0, "w": 4, "h": 3}
+            }],
+            "created_at": 1,
+            "updated_at": 2
+        });
+        let err = serde_json::from_value::<Dashboard>(rust_spelling).unwrap_err();
+        assert!(
+            err.to_string().contains("type"),
+            "rejecting the Rust spelling must point at `type`, got: {err}"
+        );
+
+        let modern = serde_json::json!({
+            "id": "dash-new",
+            "name": "Modern",
+            "layout": {
+                "columns": 12, "rows": "auto",
+                "breakpoints": {"lg": 1200, "md": 996, "sm": 768, "xs": 480}
+            },
+            "components": [{
+                "id": "c1",
+                "type": "metric-card",
+                "position": {"x": 0, "y": 0, "w": 4, "h": 3}
+            }],
+            "created_at": 1,
+            "updated_at": 2
+        });
+        let dash: Dashboard = serde_json::from_value(modern).unwrap();
+        assert_eq!(dash.components[0].component_type, "metric-card");
+    }
+
+    /// The list response envelope: `dashboards` + `count`, with pagination
+    /// keys only when present — the frontend reads `dashboards` by name.
+    #[test]
+    fn list_response_envelope_shape() {
+        let resp = DashboardsResponse {
+            dashboards: vec![sample_dashboard()],
+            count: 1,
+            total: None,
+            limit: None,
+            offset: None,
+        };
+        let json = serde_json::to_value(resp).unwrap();
+        assert_eq!(
+            json.as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["dashboards", "count"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert!(json["dashboards"].is_array());
     }
 }

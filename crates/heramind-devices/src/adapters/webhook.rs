@@ -300,15 +300,24 @@ impl WebhookAdapter {
             let mut counts = self.request_count.write().await;
             let now = std::time::Instant::now();
 
-            // Clean up old entries (older than 1 minute)
-            counts.retain(|_, (_, timestamp)| now.duration_since(*timestamp).as_secs() < 60);
+            // Only run the full cleanup scan when the map grows large (>1000
+            // entries) — avoids a per-request O(N) retain on the hot path.
+            if counts.len() > 1000 {
+                counts.retain(|_, (_, ts)| now.duration_since(*ts).as_secs() < 60);
+            }
 
-            let (count, _) = counts.entry(device_id.to_string()).or_insert((0, now));
+            let (count, ts) = counts.entry(device_id.to_string()).or_insert((0, now));
+
+            // Reset stale per-device counter (outside the 1-min window) —
+            // handles expiry without a full map scan.
+            if now.duration_since(*ts).as_secs() >= 60 {
+                *count = 0;
+                *ts = now;
+            }
 
             if *count >= limit {
                 return Err(AdapterError::Connection("Rate limit exceeded".to_string()));
             }
-
             *count += 1;
         }
 
@@ -377,8 +386,15 @@ impl WebhookAdapter {
         // Check rate limit
         self.check_rate_limit(&device_id).await?;
 
+        // [unit detection] Senders disagree on epoch units — a raw ms value
+        // used to be stored as-is (year-58,000 seconds: the point became
+        // invisible to every window query). Route through the same
+        // magnitude-based normalizer + future guard the MQTT path uses;
+        // implausible values fall back to server time instead of poisoning
+        // the series.
         let timestamp = payload
             .timestamp
+            .and_then(crate::adapters::mqtt::normalize_epoch_seconds)
             .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
         // Track device first sighting (for DeviceOnline emission on registered devices)

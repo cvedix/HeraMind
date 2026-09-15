@@ -257,7 +257,11 @@ unsafe extern "C" fn runner_native_capability_free(ptr: *mut c_char) {
 // ============================================================================
 
 /// Maximum queued frames before dropping the oldest.
-const PUSH_BUFFER_CAPACITY: usize = 16;
+///
+/// 64: a 30 fps H.264 relay with ~300 KB keyframes needs burst headroom
+/// far beyond the old 16 — the silent oldest-drop here was one of the
+/// measured loss points (49.6% end-to-end at one point).
+const PUSH_BUFFER_CAPACITY: usize = 64;
 
 /// Shared push-output buffer: newest frames survive, oldest get dropped.
 static PUSH_BUFFER: std::sync::OnceLock<(std::sync::Mutex<VecDeque<Vec<u8>>>, std::sync::Condvar)> =
@@ -316,6 +320,69 @@ fn push_stdout_writer_thread() {
 /// the **oldest** frame is dropped so the newest data always gets through.
 /// A background thread drains the buffer to stdout, keeping this callback
 /// non-blocking regardless of downstream backpressure.
+/// Raw push writer: fields arrive as ptr+len slices — NO JSON parse and
+/// NO base64 on the payload (the legacy path below pays both). Builds
+/// the small segmented header directly and enqueues the frame; the data
+/// bytes go from the extension's Vec<u8> into the IPC segment untouched.
+unsafe extern "C" fn push_output_raw_writer(
+    session_id: *const u8,
+    session_id_len: usize,
+    sequence: u64,
+    data_type: *const u8,
+    data_type_len: usize,
+    timestamp: i64,
+    metadata_json: *const u8,
+    metadata_len: usize,
+    data: *const u8,
+    data_len: usize,
+) -> i32 {
+    if session_id.is_null() || data.is_null() || data_len == 0 {
+        warn!("PushOutputRawWriter: null/empty fields");
+        return -1;
+    }
+    let sid = std::str::from_utf8(std::slice::from_raw_parts(session_id, session_id_len))
+        .unwrap_or_default();
+    let dtype = std::str::from_utf8(std::slice::from_raw_parts(data_type, data_type_len))
+        .unwrap_or("application/octet-stream");
+    let metadata: Option<serde_json::Value> = if metadata_len > 0 && !metadata_json.is_null() {
+        serde_json::from_slice(std::slice::from_raw_parts(metadata_json, metadata_len)).ok()
+    } else {
+        None
+    };
+    let bytes = std::slice::from_raw_parts(data, data_len);
+    let header = serde_json::json!({
+        "PushOutput": {
+            "session_id": sid,
+            "sequence": sequence,
+            "data_len": data_len,
+            "data_type": dtype,
+            "timestamp": if timestamp != 0 { timestamp } else { chrono::Utc::now().timestamp_millis() },
+            "metadata": metadata,
+        }
+    });
+    let header_bytes = match serde_json::to_vec(&header) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("PushOutputRawWriter: serialise error: {e}");
+            return -3;
+        }
+    };
+    let payload = heramind_extension_sdk::encode_segmented_payload(&header_bytes, bytes);
+    let frame = IpcFrame::new(payload);
+    let encoded = frame.encode();
+
+    let (lock, cvar) = PUSH_BUFFER.get().expect("PUSH_BUFFER not initialized");
+    let mut guard = lock.lock().unwrap();
+    if guard.len() >= PUSH_BUFFER_CAPACITY {
+        guard.pop_front();
+        PUSH_DROPPED_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    guard.push_back(encoded);
+    drop(guard);
+    cvar.notify_one();
+    0
+}
+
 unsafe extern "C" fn push_output_writer(data: *const u8, len: usize) -> i32 {
     if data.is_null() || len == 0 {
         warn!("PushOutputWriter: null/empty data");
@@ -331,43 +398,44 @@ unsafe extern "C" fn push_output_writer(data: *const u8, len: usize) -> i32 {
         }
     };
 
-    // Build IpcResponse::PushOutput from the JSON fields
-    let response = IpcResponse::PushOutput {
-        session_id: msg
-            .get("session_id")
-            .and_then(|v| v.as_str())
+    // SEGMENTED BINARY (perf-critical): the FFI payload carries `data` as
+    // a base64 string. The historical path re-embedded it as base64 in
+    // JSON (and older builds even decoded+re-encoded it) — multiple full
+    // codec passes per 40-300 KB frame capped the relay at ~20 fps with
+    // 49.6% measured loss. Now: ONE base64 decode here, then the payload
+    // is `[header_len][small header JSON with data_len][raw bytes]` — the
+    // core side parses the small header and takes the bytes verbatim
+    // (see heramind_extension_sdk::parse_response_payload).
+    let data: Vec<u8> = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(msg.get("data").and_then(|v| v.as_str()).unwrap_or_default())
             .unwrap_or_default()
-            .to_string(),
-        sequence: msg.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0),
-        data: msg
-            .get("data")
-            .and_then(|v| v.as_str())
-            .map(|s| {
-                use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD
-                    .decode(s)
-                    .unwrap_or_else(|_| s.as_bytes().to_vec())
-            })
-            .unwrap_or_default(),
-        data_type: msg
-            .get("data_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("application/octet-stream")
-            .to_string(),
-        timestamp: msg
-            .get("timestamp")
-            .and_then(|v| v.as_i64())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
-        metadata: msg.get("metadata").cloned(),
     };
-
-    let payload = match response.to_bytes() {
-        Ok(p) => p,
-        Err(e) => {
-            error!("PushOutputWriter: serialise error: {e}");
-            return -3;
+    let header = serde_json::to_vec(&serde_json::json!({
+        "PushOutput": {
+            "session_id": msg.get("session_id")
+                .and_then(|v| v.as_str()).unwrap_or_default(),
+            "sequence": msg.get("sequence")
+                .and_then(|v| v.as_u64()).unwrap_or(0),
+            "data_len": data.len(),
+            "data_type": msg.get("data_type")
+                .and_then(|v| v.as_str()).unwrap_or("application/octet-stream"),
+            "timestamp": msg.get("timestamp")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+            "metadata": msg.get("metadata").cloned(),
         }
+    }))
+    .map_err(|e| {
+        error!("PushOutputWriter: serialise error: {e}");
+        e
+    });
+    let header = match header {
+        Ok(p) => p,
+        Err(_) => return -3,
     };
+    let payload = heramind_extension_sdk::encode_segmented_payload(&header, &data);
 
     let frame = IpcFrame::new(payload);
     let encoded = frame.encode();
@@ -388,6 +456,8 @@ unsafe extern "C" fn push_output_writer(data: *const u8, len: usize) -> i32 {
 }
 
 type RegisterPushWriterFn = unsafe extern "C" fn(heramind_extension_sdk::PushOutputWriterFn) -> i32;
+type RegisterPushWriterRawFn =
+    unsafe extern "C" fn(heramind_extension_sdk::PushOutputRawWriterFn) -> i32;
 
 struct NativeExtensionBridge {
     _library: Arc<libloading::Library>,
@@ -395,6 +465,7 @@ struct NativeExtensionBridge {
     descriptor_json: JsonFn0,
     set_capability_bridge: Option<SetCapabilityBridgeFn>,
     register_push_writer: Option<RegisterPushWriterFn>,
+    register_push_writer_raw: Option<RegisterPushWriterRawFn>,
     execute_command_json: JsonFn1,
     configure_json: Option<JsonFn1>,
     produce_metrics_json: JsonFn0,
@@ -440,6 +511,10 @@ impl NativeExtensionBridge {
             register_push_writer: Self::load_optional_symbol(
                 &library,
                 b"heramind_extension_register_push_writer\0",
+            ),
+            register_push_writer_raw: Self::load_optional_symbol(
+                &library,
+                b"heramind_extension_register_push_writer_raw\0",
             ),
             execute_command_json: Self::load_symbol(
                 &library,
@@ -540,6 +615,19 @@ impl NativeExtensionBridge {
                 error!(error = %e, "Failed to register push output writer");
             } else {
                 debug!("Push output writer registered successfully");
+            }
+        }
+        // Zero-serialization push path: only present when the extension
+        // was built against an SDK that exports the v2 registration
+        // (optional symbol — legacy extensions simply skip this).
+        if let Some(register) = self.register_push_writer_raw {
+            if let Err(e) = safe_ffi_call(
+                "register_push_writer_raw",
+                AssertUnwindSafe(|| unsafe { register(push_output_raw_writer) }),
+            ) {
+                warn!(error = %e, "Failed to register RAW push writer; JSON path stays active");
+            } else {
+                debug!("RAW push output writer registered (zero-serialization path)");
             }
         }
     }
@@ -835,7 +923,16 @@ impl NativeExtensionBridge {
     }
 
     fn load_symbol<T: Copy>(library: &libloading::Library, name: &[u8]) -> Result<T, String> {
-        let symbol: libloading::Symbol<T> = unsafe { library.get(name) }.map_err(|e| {
+        let symbol: libloading::Symbol<T> = unsafe {
+            library.get(name).or_else(|error| {
+                let Some(suffix) = name.strip_prefix(b"heramind_") else {
+                    return Err(error);
+                };
+                let alias = [b"neomind_".as_slice(), suffix].concat();
+                library.get(&alias)
+            })
+        }
+        .map_err(|e| {
             format!(
                 "Failed to load symbol {:?}: {}",
                 String::from_utf8_lossy(name),
@@ -846,8 +943,7 @@ impl NativeExtensionBridge {
     }
 
     fn load_optional_symbol<T: Copy>(library: &libloading::Library, name: &[u8]) -> Option<T> {
-        let symbol: libloading::Symbol<T> = unsafe { library.get(name).ok()? };
-        Some(*symbol)
+        Self::load_symbol(library, name).ok()
     }
 }
 
@@ -1605,7 +1701,7 @@ impl SyncIpcClient {
                     }
                     _ => {
                         warn!("SyncIpcClient: unexpected response type");
-                        json!({"success": false, "error": format!("Unexpected response type")})
+                        json!({"success": false, "error": "Unexpected response type".to_string()})
                     }
                 }
             }
@@ -2728,8 +2824,14 @@ impl Runner {
                 self.send_response(result);
             }
 
-            IpcMessage::Ping { timestamp } => {
-                self.send_response(IpcResponse::Pong { timestamp });
+            IpcMessage::Ping {
+                request_id,
+                timestamp,
+            } => {
+                self.send_response(IpcResponse::Pong {
+                    request_id,
+                    timestamp,
+                });
             }
 
             // Streaming support
@@ -3540,8 +3642,32 @@ impl Runner {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() {
+// Worker-thread count: configurable via HERAMIND_RUNNER_WORKERS, default 4
+// — DO NOT lower the default. The runtime hosts command dispatch (FFI
+// calls into extensions BLOCK their worker) and async stream sessions
+// (e.g. bidirectional audio); 2 workers can stall health checks/IPC
+// routing under two concurrent blocking commands. The knob exists for
+// memory-constrained hosts (NE503 on-device) where the tradeoff is
+// deliberate.
+fn runner_worker_threads() -> usize {
+    std::env::var("HERAMIND_RUNNER_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| (1..=16).contains(n))
+        .unwrap_or(4)
+}
+
+fn main() {
+    let workers = runner_worker_threads();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .expect("failed to build runner tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() {
     // Set up panic hook FIRST to capture any panics during loading
     // This ensures we can report errors to the parent process before dying
     std::panic::set_hook(Box::new(|panic_info| {
@@ -3633,6 +3759,50 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_symbols_accept_both_sdk_namespaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("symbols.rs");
+        std::fs::write(
+            &source,
+            r#"
+            #[no_mangle] pub extern "C" fn neomind_extension_abi_version() -> u32 { 3 }
+            #[no_mangle] pub extern "C" fn heramind_extension_preferred() -> u32 { 24 }
+            #[no_mangle] pub extern "C" fn neomind_extension_preferred() -> u32 { 11 }
+        "#,
+        )
+        .unwrap();
+        let library_path = tmp
+            .path()
+            .join(format!("symbols{}", std::env::consts::DLL_SUFFIX));
+        let status = std::process::Command::new("rustc")
+            .args(["--crate-type", "cdylib", "--edition", "2021"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&library_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let library = unsafe { libloading::Library::new(&library_path) }.unwrap();
+        let abi: unsafe extern "C" fn() -> u32 = super::NativeExtensionBridge::load_symbol(
+            &library,
+            b"heramind_extension_abi_version\0",
+        )
+        .unwrap();
+        let preferred: unsafe extern "C" fn() -> u32 =
+            super::NativeExtensionBridge::load_symbol(&library, b"heramind_extension_preferred\0")
+                .unwrap();
+        assert_eq!(unsafe { abi() }, 3);
+        assert_eq!(unsafe { preferred() }, 24);
+        assert!(
+            super::NativeExtensionBridge::load_optional_symbol::<unsafe extern "C" fn()>(
+                &library,
+                b"heramind_extension_missing\0"
+            )
+            .is_none()
+        );
+    }
+
     use super::*;
     use std::path::PathBuf;
 

@@ -355,5 +355,7 @@
   "extensionInstalled": "Đã cài đặt extension",
   "confirmReload": "Xác nhận tải lại",
   "confirmReloadDescription": "Xác nhận tải lại mô tả",
-  "reload": "Tải lại"
+  "reload": "Tải lại",
+  "crashed": "Đã gặp sự cố",
+  "crashedTooltip": "Đã dừng sau nhiều lần gặp sự cố"
 }

@@ -12,15 +12,17 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use heramind_core::llm::backend::{
     BackendCapabilities, BackendId, BackendMetrics, FinishReason, LlmError, LlmOutput, LlmRuntime,
-    StreamChunk, TokenUsage,
+    ReasoningCapabilities, ReasoningControl, StreamChunk, ThinkingEffort, TokenUsage,
 };
 use heramind_core::message::{Content, ContentPart, Message, MessageRole};
+
+use crate::llm_backends::text_tool_calls;
 
 /// Default llama.cpp server endpoint.
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080";
@@ -51,6 +53,42 @@ pub struct LlamaCppConfig {
     /// Enable KV cache reuse via `cache_prompt` (default: true).
     #[serde(default = "default_true")]
     pub cache_prompt: bool,
+}
+
+/// llama-server answers 503 {"error":{"message":"Loading model",...}} while
+/// the model is still being loaded into memory — most commonly right after
+/// switching to the builtin backend. That's not a failure; the server IS
+/// coming up. Failing fast here surfaced a spurious error during backend
+/// switches, so both call paths wait for readiness and resend once.
+fn is_model_loading(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE && body.contains("Loading model")
+}
+
+/// Poll the server's /health until it answers 200 (model ready) or the
+/// deadline passes. llama-server serves /health with 503 during load.
+async fn wait_for_llama_model_ready(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &Option<String>,
+    timeout: std::time::Duration,
+) -> bool {
+    let health = format!("{}/health", base_url.trim_end_matches('/'));
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        let mut req = client
+            .get(&health)
+            .timeout(std::time::Duration::from_secs(2));
+        if let Some(ref key) = api_key {
+            req = req.bearer_auth(key);
+        }
+        if let Ok(r) = req.send().await {
+            if r.status().is_success() {
+                return true;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    false
 }
 
 fn default_endpoint() -> String {
@@ -125,10 +163,6 @@ pub struct LlamaCppCapabilities {
     pub supports_thinking: bool,
     pub supports_tools: bool,
     pub max_context: usize,
-    /// Reported by `/props` `modalities.audio`. Currently informational — the
-    /// agent pipeline does not yet emit audio `ContentPart`s — but surfaced so
-    /// the capability report is honest.
-    pub supports_audio: bool,
 }
 
 /// llama.cpp runtime backend.
@@ -175,14 +209,12 @@ impl LlamaCppRuntime {
         supports_thinking: bool,
         supports_tools: bool,
         max_context: usize,
-        supports_audio: bool,
     ) -> Self {
         self.capabilities_override = Some(LlamaCppCapabilities {
             supports_multimodal,
             supports_thinking,
             supports_tools,
             max_context,
-            supports_audio,
         });
         self
     }
@@ -215,7 +247,6 @@ impl LlamaCppRuntime {
             .unwrap_or(128000);
 
         let supports_multimodal = props.modalities.as_ref().map(|m| m.vision).unwrap_or(false);
-        let supports_audio = props.modalities.as_ref().map(|m| m.audio).unwrap_or(false);
 
         let supports_tools = props
             .chat_template_caps
@@ -229,15 +260,17 @@ impl LlamaCppRuntime {
             .as_deref()
             .or(props.model_path.as_deref())
             .unwrap_or("");
-        let supports_thinking = model_name.to_lowercase().contains("thinking")
-            || model_name.to_lowercase().contains("deepseek-r1")
-            || model_name.to_lowercase().contains("qwen3");
+        // Use the unified thinking detector (covers qwen3 / deepseek-r1 /
+        // qwq / glm-z1 / gpt-oss / "thinking"-suffixed models). The old
+        // inline rule only matched a subset and missed e.g. qwq-32b, so a
+        // thinking model could be misdetected as non-thinking and the UI
+        // would hide the thinking control entirely.
+        let supports_thinking = heramind_core::llm::detect_thinking(model_name);
 
         tracing::info!(
             model = model_name,
             n_ctx,
             supports_multimodal,
-            supports_audio,
             supports_tools,
             supports_thinking,
             "Detected llama.cpp capabilities from /props"
@@ -248,7 +281,6 @@ impl LlamaCppRuntime {
             supports_thinking,
             supports_tools,
             max_context: n_ctx,
-            supports_audio,
         })
     }
 
@@ -340,24 +372,60 @@ impl LlmRuntime for LlamaCppRuntime {
         let model = input.model.unwrap_or_else(|| self.model.clone());
         let url = format!("{}/v1/chat/completions", self.config.base_url());
 
-        // Handle max_tokens: llama.cpp will error if max_tokens exceeds the model's
-        // context window. When the caller sends a sentinel value (usize::MAX), omit
-        // max_tokens entirely and let the server use its own default.
+        // Handle max_tokens. When the caller delegates (sentinel usize::MAX or
+        // unset), apply a bounded generation cap instead of omitting the field —
+        // omitted means UNLIMITED on llama-server, and a runaway generation
+        // (observed: 22177 tokens / 7.4 min on prod T4) keeps the slot busy
+        // even after the client disconnects (llama-server does not cancel
+        // in-flight tasks). 8192 is ~4x a long legitimate answer and still cuts
+        // a runaway short.
+        //
+        // "Per remaining context" needs no client-side arithmetic: empirically
+        // (verified 2026-08-17 on b10360 AND prod's 2da6686) llama-server does
+        // NOT error when max_tokens exceeds the available context — it clamps
+        // generation at the actual context wall (finish=length). The effective
+        // bound is therefore min(cap, remaining) with the precise part
+        // enforced server-side. The old comment claimed llama.cpp "will error"
+        // on overflow; no version in production use does.
+        let delegated_cap = || {
+            let ctx = self.max_context_length() as u32;
+            let cap = 8192u32;
+            if ctx > 0 {
+                Some(cap.min(ctx))
+            } else {
+                Some(cap)
+            }
+        };
         let max_tokens = match input.params.max_tokens {
-            Some(v) if v >= usize::MAX - 1000 => None, // sentinel → omit
+            Some(v) if v >= usize::MAX - 1000 => delegated_cap(), // delegated → bounded default
             Some(v) => {
                 let cap = self.max_context_length() as u32;
-                if cap > 0 && (v as u32) > cap {
-                    None // would exceed context → omit
+                if cap > 0 {
+                    if (v as u32) > cap {
+                        delegated_cap()
+                    } else {
+                        Some(v as u32)
+                    }
                 } else {
-                    Some((v as u32).min(cap))
+                    Some(v as u32) // context unknown → trust the caller's explicit value
                 }
             }
-            None => None,
+            None => delegated_cap(),
         };
 
+        // Text tool-calling teaching — see `llm_backends::text_tool_calls`.
+        // The /props probe (or a user override) decides whether the server's
+        // chat template lifts tools natively; when it reports no function
+        // calling, teach the JSON protocol in the system message so the
+        // agent-layer `tool_parser` can act on the reply.
+        let messages = text_tool_calls::prepare_messages(
+            input.messages,
+            input.tools.as_deref(),
+            self.capabilities().function_calling,
+        );
+
         let mut req_body = serde_json::json!({
-            "messages": self.messages_to_api(&input.messages),
+            "messages": self.messages_to_api(&messages),
             "stream": false,
             "cache_prompt": self.config.cache_prompt,
         });
@@ -387,19 +455,46 @@ impl LlmRuntime for LlamaCppRuntime {
             }
         }
 
-        let response = self
-            .auth_request(reqwest::Method::POST, &url)
-            .json(&req_body)
-            .timeout(self.config.timeout())
-            .send()
-            .await
-            .map_err(|e| LlmError::Network(e.to_string()))?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| LlmError::Network(e.to_string()))?;
+        // Model-loading gate: on 503 "Loading model" wait for /health (≤60s)
+        // and resend once before surfacing an error.
+        let (status, body) = {
+            let mut retried = false;
+            loop {
+                let response = self
+                    .auth_request(reqwest::Method::POST, &url)
+                    .json(&req_body)
+                    .timeout(self.config.timeout())
+                    .send()
+                    .await
+                    .map_err(|e| LlmError::Network(e.to_string()))?;
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .map_err(|e| LlmError::Network(e.to_string()))?;
+                if !retried && is_model_loading(status, &body) {
+                    retried = true;
+                    tracing::info!(
+                        "llama.cpp model still loading — waiting for readiness (up to 60s)"
+                    );
+                    let client = Client::builder()
+                        .timeout(self.config.timeout())
+                        .build()
+                        .map_err(|e| LlmError::Network(e.to_string()))?;
+                    if wait_for_llama_model_ready(
+                        &client,
+                        self.config.base_url(),
+                        &self.config.api_key,
+                        std::time::Duration::from_secs(60),
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                }
+                break (status, body);
+            }
+        };
 
         if !status.is_success() {
             self.metrics
@@ -544,22 +639,44 @@ impl LlmRuntime for LlamaCppRuntime {
         let cache_prompt = self.config.cache_prompt;
 
         // Handle max_tokens: llama.cpp will error if max_tokens exceeds the model's
-        // context window. When the caller sends a sentinel value (usize::MAX), omit
-        // max_tokens entirely and let the server use its own default.
+        // context window. When the caller delegates (sentinel usize::MAX or unset),
+        // apply a bounded generation cap instead of omitting the field — omitted
+        // means UNLIMITED on llama-server and a runaway generation (observed:
+        // 22177 tokens / 7.4 min on prod T4) blocks a slot even after the client
+        // disconnects. See the non-streaming `generate` above for the rationale.
         let max_context = self.max_context_length() as u32;
+        let delegated_cap = || {
+            let cap = 8192u32;
+            if max_context > 0 {
+                Some(cap.min(max_context))
+            } else {
+                Some(cap)
+            }
+        };
         let max_tokens = match input.params.max_tokens {
-            Some(v) if v >= usize::MAX - 1000 => None, // sentinel → omit
+            Some(v) if v >= usize::MAX - 1000 => delegated_cap(), // delegated → bounded default
             Some(v) => {
-                if max_context > 0 && (v as u32) > max_context {
-                    None // would exceed context → omit
+                if max_context > 0 {
+                    if (v as u32) > max_context {
+                        delegated_cap()
+                    } else {
+                        Some(v as u32)
+                    }
                 } else {
-                    Some((v as u32).min(max_context))
+                    Some(v as u32) // context unknown → trust the caller's explicit value
                 }
             }
-            None => None,
+            None => delegated_cap(),
         };
 
-        let api_messages = self.messages_to_api(&input.messages);
+        // Same teaching gate as non-streaming `generate` — see
+        // `llm_backends::text_tool_calls`.
+        let messages = text_tool_calls::prepare_messages(
+            input.messages,
+            input.tools.as_deref(),
+            self.capabilities().function_calling,
+        );
+        let api_messages = self.messages_to_api(&messages);
         let msg_count = api_messages.len();
 
         let mut req_body = serde_json::json!({
@@ -601,6 +718,12 @@ impl LlmRuntime for LlamaCppRuntime {
 
         // Capture max_context for error reporting inside spawned task
         let max_context_capture = self.max_context_length();
+        // Idle timeout for the streaming byte read (see `next_bytes_or_end`): a
+        // stalled upstream SSE connection must force-complete the loop instead
+        // of hanging `bytes_stream().next()` forever. openai already had this
+        // (commit 162c73ff); llamacpp was missed — root cause of the eval
+        // mid-stream wedge on thinking-loop stalls.
+        let read_idle_timeout = self.config.timeout();
 
         tokio::spawn(async move {
             let mut req_builder = client.post(&url).json(&req_body);
@@ -608,7 +731,63 @@ impl LlmRuntime for LlamaCppRuntime {
                 req_builder = req_builder.bearer_auth(key);
             }
 
-            let result = req_builder.send().await;
+            // Model-loading gate (mirrors the non-stream path): on 503
+            // "Loading model" wait for /health (≤60s) and resend once —
+            // a freshly switched builtin backend is loading, not broken.
+            let mut result = req_builder.send().await;
+            // Take ownership only when the gate actually fires; every path
+            // through the block either returns or reassigns `result`, so the
+            // match below always sees a valid value.
+            let gate_needed = matches!(
+                &result,
+                Ok(r) if r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            );
+            if gate_needed {
+                let resp = match result {
+                    Ok(r) => r,
+                    Err(_) => unreachable!("gate only fires on Ok"),
+                };
+                let status_now = resp.status();
+                let body_text = resp.text().await.unwrap_or_default();
+                if is_model_loading(status_now, &body_text) {
+                    tracing::info!("llama.cpp model still loading (stream) — waiting for readiness (up to 60s)");
+                    let base = url
+                        .trim_end_matches('/')
+                        .trim_end_matches("/v1/chat/completions")
+                        .to_string();
+                    if wait_for_llama_model_ready(
+                        &client,
+                        &base,
+                        &api_key,
+                        std::time::Duration::from_secs(60),
+                    )
+                    .await
+                    {
+                        let mut rb = client.post(&url).json(&req_body);
+                        if let Some(ref key) = api_key {
+                            rb = rb.bearer_auth(key);
+                        }
+                        result = rb.send().await;
+                    } else {
+                        let _ = tx
+                            .send(Err(LlmError::Generation(
+                                "llama.cpp API error 503: model still loading after 60s"
+                                    .to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
+                } else {
+                    let _ = tx
+                        .send(Err(LlmError::Generation(format!(
+                            "llama.cpp API error {}: {}",
+                            status_now.as_u16(),
+                            body_text
+                        ))))
+                        .await;
+                    return;
+                }
+            }
 
             match result {
                 Ok(response) => {
@@ -671,7 +850,9 @@ impl LlmRuntime for LlamaCppRuntime {
                         AccumulatedToolCall,
                     > = std::collections::HashMap::new();
 
-                    while let Some(chunk_result) = stream.next().await {
+                    while let Some(chunk_result) =
+                        super::next_bytes_or_end(&mut stream, read_idle_timeout).await
+                    {
                         match chunk_result {
                             Ok(chunk) => {
                                 buffer.extend_from_slice(&chunk);
@@ -855,24 +1036,18 @@ impl LlmRuntime for LlamaCppRuntime {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        let (
-            supports_multimodal,
-            supports_function_calling,
-            supports_thinking,
-            max_context,
-            supports_audio,
-        ) = if let Some(ref caps) = self.capabilities_override {
-            (
-                caps.supports_multimodal,
-                caps.supports_tools,
-                caps.supports_thinking,
-                caps.max_context,
-                caps.supports_audio,
-            )
-        } else {
-            // Default: llama.cpp supports streaming and tools via --jinja flag
-            (false, true, true, 4096, false)
-        };
+        let (supports_multimodal, supports_function_calling, supports_thinking, max_context) =
+            if let Some(ref caps) = self.capabilities_override {
+                (
+                    caps.supports_multimodal,
+                    caps.supports_tools,
+                    caps.supports_thinking,
+                    caps.max_context,
+                )
+            } else {
+                // Default: llama.cpp supports streaming and tools via --jinja flag
+                (false, true, true, 4096)
+            };
 
         BackendCapabilities {
             streaming: true,
@@ -883,7 +1058,18 @@ impl LlmRuntime for LlamaCppRuntime {
             modalities: vec!["text".to_string()],
             thinking_display: supports_thinking,
             supports_images: supports_multimodal,
-            supports_audio,
+            // llama.cpp has no request-side thinking toggle — thinking follows
+            // the model default and is only readable via `reasoning_content`.
+            reasoning: ReasoningCapabilities {
+                supported_efforts: Vec::new(),
+                default_effort: if supports_thinking {
+                    Some(ThinkingEffort::High)
+                } else {
+                    None
+                },
+                mandatory: false,
+                control: ReasoningControl::ReadOnly,
+            },
         }
     }
 
@@ -1206,13 +1392,12 @@ mod tests {
         let config = LlamaCppConfig::default();
         let runtime = LlamaCppRuntime::new(config)
             .unwrap()
-            .with_capabilities_override(true, true, true, 32768, true);
+            .with_capabilities_override(true, true, true, 32768);
         let caps = runtime.capabilities();
         assert!(caps.streaming);
         assert!(caps.multimodal);
         assert!(caps.function_calling);
         assert!(caps.thinking_display);
         assert_eq!(caps.max_context, Some(32768));
-        assert!(caps.supports_audio);
     }
 }

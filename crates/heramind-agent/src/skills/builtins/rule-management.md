@@ -1,6 +1,7 @@
 ---
 id: rule-management
 name: Rule Management Guide
+description: Use when the user wants to create or manage rules — conditions (comparison/range/logical), triggers, actions (notify/execute/trigger-agent), thresholds, enabling/disabling. Covers rule create/update/enable/disable even without saying 'rule' (e.g. '温度超过30就告警', '低于20发通知'). Includes 规则/告警/条件/阈值/自动化.
 category: rule
 origin: builtin
 priority: 85
@@ -15,6 +16,22 @@ anti_triggers:
 ---
 
 # Rule Management
+
+## Command Cheat-Sheet (run these via `shell`)
+
+Always RUN the command yourself and report the real output.
+
+| Command | Purpose |
+|---|---|
+| `heramind rule list` | List all rules |
+| `heramind rule get <id>` | Rule details |
+| `heramind rule create` | Create a new rule |
+| `heramind rule update <id>` | Update a rule |
+| `heramind rule delete <id>` | Delete a rule |
+| `heramind rule enable <id>` | Enable a rule |
+| `heramind rule disable <id>` | Disable a rule |
+| `heramind rule test <id>` | Test a rule |
+| `heramind rule history <id>` | Rule execution history |
 
 Create, update, diagnose, or delete event-driven rules over device / extension / transform metrics. Skipped discovery is the #1 cause of silent rule failures.
 
@@ -93,7 +110,7 @@ What does the user want?
 
 - `device:<device_id>:<metric>` — most common
 - `extension:<ext_id>:<metric>` — needs `heramind extension get <id>` first
-- `transform:<output_prefix>:<field>` — needs `heramind transform list` first
+- `transform:<transform_id>:<field>` — needs `heramind transform list` first. **`transform_id` is the transform's `id` from `transform list` (NOT its `output_prefix`). `field` is the plain output field name (e.g. `roi_count`, `full_dustbin_count`) — NOT a dotted `extension.field`, and NOT the `output_prefix`.**
 
 ### Action Types
 
@@ -128,7 +145,14 @@ Before running `heramind rule create`, tick every box:
 ## Phase 4: Activate & Verify
 
 ```bash
-# Rule is ENABLED by default on creation — no separate enable step needed.
+# FAST PATH for single-metric threshold rules — flags, no JSON.
+# Rule is ENABLED by default on creation; cooldown defaults to 300000 (5 min).
+heramind rule create --name "High Temp" \
+  --trigger-device living-room-sensor --metric temperature \
+  --operator greater_than --threshold 30 \
+  --notify "Too hot: {value}"
+
+# FULL FORM for anything else (range/logical/multi-action/schedule):
 heramind rule create --body '<your_json>'
 # Note the returned rule ID.
 
@@ -138,6 +162,8 @@ heramind rule test <ID> --input '{"<metric>": <value_above_threshold>}'
 # For ongoing monitoring of when/how it fires.
 heramind rule history <ID>
 ```
+
+Fast-path variants: `--operator` accepts greater_than | less_than | greater_equal | less_equal | equal | not_equal; `--severity` (info | warning | critical | emergency, default warning) and `--cooldown <ms>` tune the notify action; non-device metrics use `--source extension:<id>:<metric>` (or `transform:<id>:<field>`) instead of `--trigger-device`/`--metric`.
 
 ## Diagnosis Flow — "Why didn't my rule fire?"
 
@@ -167,8 +193,10 @@ Run these in order. Stop at the first failure.
 ```bash
 heramind rule list                         # all rules
 heramind rule get <ID>                     # inspect one
-heramind rule create --body '<JSON>'       # create (enabled by default)
-heramind rule update <ID> --body '<JSON>'  # modify fields
+heramind rule create --name <N> --trigger-device <D> --metric <M> --operator <OP> --threshold <V> --notify <MSG>
+                                          # fast path: single-metric threshold rule (flags)
+heramind rule create --body '<JSON>'       # full form: range/logical/multi-action (enabled by default)
+heramind rule update <ID> --body '<JSON>'  # modify fields (ID also accepted as --id <ID>)
 heramind rule enable <ID>                  # re-enable a paused rule
 heramind rule disable <ID>                 # pause without deleting
 heramind rule delete <ID>                  # permanent removal
@@ -181,7 +209,7 @@ heramind rule history <ID>                 # evaluation log
 | Error | Cause | Solution |
 |-------|-------|----------|
 | "Missing 'name' field" | JSON body missing name | Add `"name": "..."` |
-| "Invalid DataSourceId" | Wrong source format | Use `device:ID:METRIC` / `extension:ID:METRIC` / `transform:PREFIX:FIELD` |
+| "Invalid DataSourceId" | Wrong source format | Use `device:ID:METRIC` / `extension:ID:METRIC` / `transform:ID:FIELD` |
 | "Device not found in condition" | Wrong device ID (guessed) | Run Phase 1 discovery |
 | "Unknown metric" | Wrong metric name (guessed) | Run `device list` (check `metric_fields`) or `device get <ID>` |
 | Rule not triggering | Disabled | `heramind rule enable <ID>` |
