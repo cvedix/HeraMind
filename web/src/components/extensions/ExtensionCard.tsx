@@ -1,4 +1,5 @@
 import { Card, CardContent } from "@/components/ui/card"
+import { interactiveCardHover } from "@/design-system/tokens/size"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -14,11 +15,50 @@ import {
   Database,
   RefreshCw,
   EyeOff,
+  Eye,
+  Plug,
+  CloudSun,
+  Cpu,
+  Factory,
+  Wifi,
+  Camera,
+  Home,
+  Brain,
+  MonitorPlay,
+  ScanText,
+  UserCheck,
+  type LucideIcon,
 } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import { cn } from "@/lib/utils"
-import { textNano, textMini } from "@/design-system/tokens/typography"
+import { textNano, textMini, textMicro } from "@/design-system/tokens/typography"
 import type { Extension } from "@/types"
+
+/// Pick a scannable category icon from the extension id/name keywords.
+/// Backend sends no category/icon field, so heuristics keep the grid
+/// distinguishable. Last-match wins; falls back to Code2.
+function categoryIcon(id: string, name: string): LucideIcon {
+  const haystack = `${id} ${name}`.toLowerCase()
+  const pairs: [RegExp, LucideIcon][] = [
+    [/vision|yolo|object.?detect|image|analy|ocr|face/, Eye],
+    [/bridge|modbus|opc.?ua|bacnet|mqtt|lorawan|ha\b|home.?assist/, Plug],
+    [/weather|forecast/, CloudSun],
+    [/stream|player|rtsp|video|media/, MonitorPlay],
+    [/onvif|camera|ip.?cam/, Camera],
+    [/transcri|speech|voice|asr|tts/, Brain],
+    [/scan|text|ocr/, ScanText],
+    [/ident|recogn/, UserCheck],
+    [/wasm|demo|core|runtime/, Cpu],
+    [/industrial|scada|plc/, Factory],
+    [/wifi|sensor|iot/, Wifi],
+    [/push|export|telemetry|notif/, Database],
+    [/tool|command|cli|skill/, Terminal],
+  ]
+  for (const [re, icon] of pairs) {
+    if (re.test(haystack)) return icon
+  }
+  return Code2
+}
 
 interface ExtensionCardProps {
   extension: Extension
@@ -35,22 +75,41 @@ export function ExtensionCard({
 }: ExtensionCardProps) {
   const { t } = useTranslation(["extensions", "common"])
 
+  // Extension type has no category/icon field, so derive a scannable icon
+  // from the id/name keywords (keeps a 20-extension grid distinguishable at
+  // a glance instead of every card showing the same Code2 glyph).
+  const CategoryIcon = categoryIcon(extension.id, extension.name)
+
   // toolsEnabled = master toggle for exposing commands to the agent.
   // The card only shows state; toggling lives in the details dialog to keep
   // the card height stable across on/off (no extra line, no alignment drift).
   const toolsEnabled = extension.enabled !== false
 
   const hasError = extension.state === "Error"
+  // Crashed = stopped by crash-loop, not on purpose — error-tinted, with the
+  // crash reason on hover (backend: consecutive_crashes/last_crash_reason).
+  // Only when the backend says Crashed (stopped by crash-loop). A RUNNING
+  // extension with crash history must not show as Crashed — the old OR on
+  // consecutive_crashes tinted healthy restarted extensions red.
+  const hasCrashed = extension.state === "Crashed"
   const hasWarning = extension.state === "Warning"
   const isFailed = extension.state === "Failed" || extension.state === "Stopped"
 
   const displayState = hasError
     ? t('error', { defaultValue: 'Error' })
-    : hasWarning
-      ? t('warning', { defaultValue: 'Warning' })
-      : isFailed
-        ? extension.state
-        : t('active', { defaultValue: 'Active' })
+    : hasCrashed
+      ? t('crashed', { defaultValue: 'Crashed' })
+      : hasWarning
+        ? t('warning', { defaultValue: 'Warning' })
+        : isFailed
+          ? extension.state
+          : t('active', { defaultValue: 'Active' })
+
+  const crashTitle = hasCrashed
+    ? extension.last_crash_reason
+      ? `${t('crashed', { defaultValue: 'Crashed' })} ×${extension.consecutive_crashes}: ${extension.last_crash_reason}`
+      : t('crashedTooltip', { defaultValue: 'Stopped after repeated crashes' })
+    : undefined
 
   return (
     <Card
@@ -59,8 +118,8 @@ export function ExtensionCard({
       onClick={() => onDetails?.()}
       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onDetails?.() } }}
       className={cn(
-        "group h-full transition-all duration-200 overflow-hidden flex flex-col cursor-pointer",
-        "hover:shadow-md hover:-translate-y-0.5",
+        "group h-full overflow-hidden flex flex-col cursor-pointer",
+        interactiveCardHover,
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
       )}
     >
@@ -71,16 +130,16 @@ export function ExtensionCard({
             {/* Icon with status-tinted background (mirrors AgentCard) */}
             <div className={cn(
               "relative w-11 h-11 rounded-xl flex items-center justify-center shrink-0 transition-colors",
-              hasError ? "bg-error-light text-error" :
+              hasError || hasCrashed ? "bg-error-light text-error" :
               hasWarning ? "bg-warning-light text-warning" :
               isFailed ? "bg-muted text-muted-foreground" :
               "bg-success-light text-success",
             )}>
-              <Code2 className="h-5 w-5" />
+            <CategoryIcon className="h-5 w-5" />
               {/* Status indicator dot */}
               <div className={cn(
                 "absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-background",
-                hasError ? "bg-error" : hasWarning ? "bg-warning" : isFailed ? "bg-muted-foreground" : "bg-success"
+                hasError || hasCrashed ? "bg-error" : hasWarning ? "bg-warning" : isFailed ? "bg-muted-foreground" : "bg-success"
               )} />
             </div>
             <div className="min-w-0">
@@ -88,11 +147,11 @@ export function ExtensionCard({
                 <h3 className="font-semibold text-sm truncate" title={extension.name}>{extension.name}</h3>
                 <span className={cn(
                   textNano, "px-1.5 py-0.5 rounded-full shrink-0",
-                  hasError ? "bg-error-light text-error" :
+                  hasError || hasCrashed ? "bg-error-light text-error" :
                   hasWarning ? "bg-warning-light text-warning" :
                   isFailed ? "bg-muted-30 text-muted-foreground" :
                   "bg-success-light text-success"
-                )}>
+                )} title={crashTitle}>
                   {displayState}
                 </span>
               </div>
@@ -127,6 +186,13 @@ export function ExtensionCard({
         {extension.description && (
           <p className="text-xs text-muted-foreground line-clamp-2 mb-3 leading-relaxed">
             {extension.description}
+          </p>
+        )}
+
+        {/* Error summary — the card shows WHY it's red without opening details */}
+        {hasError && extension.last_error && (
+          <p className="text-xs text-error line-clamp-2 mb-3 leading-relaxed break-words">
+            {extension.last_error}
           </p>
         )}
 

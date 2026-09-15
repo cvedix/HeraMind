@@ -305,7 +305,7 @@ export function MarketplaceDialog({
   return (
     <FullScreenDialog open={open} onOpenChange={(v) => { if (!v) handleClose(); else onOpenChange(v) }}>
       {showDetail ? (
-        <header className="shrink-0 flex items-center justify-between gap-3 px-3 md:px-5 py-3 md:py-4 border-b border-border">
+        <header className="shrink-0 flex items-center justify-between gap-3 px-3 md:px-5 py-3 md:py-4 ">
           <div className="flex items-center gap-2 min-w-0">
             <Button variant="ghost" size={isMobile ? "icon" : "sm"} onClick={handleBack} disabled={installing} className="-ml-2 shrink-0">
               <ChevronLeft className="h-4 w-4" />
@@ -540,7 +540,7 @@ function ExtensionDetailView({
   const resolveReadmeUrl = (raw: string | undefined): string | undefined => {
     if (!raw) return raw
     if (/^(https?:|mailto:|#|data:)/i.test(raw)) return raw
-    const base = `https://raw.githubusercontent.com/camthink-ai/HeraMind-Extensions/main/extensions/${extension.id}/`
+    const base = `https://raw.githubusercontent.com/camthink-ai/NeoMind-Extensions/main/extensions/${extension.id}/`
     return base + raw.replace(/^\.?\//, "")
   }
 
@@ -549,7 +549,7 @@ function ExtensionDetailView({
       {/* Header */}
       <div className="border-b pb-4">
         <div className="flex items-center gap-2 mb-2 flex-wrap">
-          <h2 className="text-xl font-semibold">{extension.name}</h2>
+          <h2 className="text-lg font-semibold">{extension.name}</h2>
           <Badge variant="outline">{extension.version}</Badge>
           {extension.package_url && (
             <Badge variant="default" className="text-xs">
@@ -653,7 +653,7 @@ function ExtensionDetailView({
 
         {/* Requirements */}
         {(extension.requirements.network || extension.requirements.api_keys.length > 0) && (
-          <div className="bg-muted-50 rounded-lg p-4">
+          <div className="rounded-lg p-4">
             <h3 className="font-semibold mb-2 flex items-center gap-2">
               <AlertCircle className="h-4 w-4" />
               {t("extensions:market.requirements", "Requirements")}
@@ -682,7 +682,7 @@ function ExtensionDetailView({
                 remarkPlugins={[remarkGfm]}
                 components={{
                   img: ({ node: _node, ...props }) => (
-                    <img {...props} src={resolveReadmeUrl(props.src)} />
+                    <img {...props} src={resolveReadmeUrl(props.src)} alt={props.alt || 'image'} />
                   ),
                   a: ({ node: _node, ...props }) => (
                     <a

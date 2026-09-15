@@ -1,6 +1,6 @@
 {
   "title": "Extensions",
-  "description": "Manage system extensions and connections",
+  "description": "Discover, install, and manage platform extensions",
   "llmBackends": "LLM Backends",
   "deviceConnections": "Device Connections",
   "alertChannels": "Message Channels",
@@ -257,10 +257,8 @@
       "Stopped": "Stopped",
       "Error": "Error"
     },
-    "uninstall": "Uninstall",
     "unregister": "Unregister",
     "details": "Details",
-    "reload": "Reload",
     "active": "Active"
   },
   "marketplace": "Marketplace",
@@ -357,5 +355,7 @@
   "extensionInstalled": "Extension Installed",
   "confirmReload": "Confirm Reload",
   "confirmReloadDescription": "Confirm Reload Description",
-  "reload": "Reload"
+  "reload": "Reload",
+  "crashed": "Crashed",
+  "crashedTooltip": "Stopped after repeated crashes"
 }

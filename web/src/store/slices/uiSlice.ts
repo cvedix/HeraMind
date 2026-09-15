@@ -1,7 +1,8 @@
 /**
  * UI Slice
  *
- * Handles UI state like sidebar and WebSocket connection.
+ * WebSocket connection state + per-domain data version counters.
+ * (The app sidebar is fixed-width — no state.)
  */
 
 import type { StateCreator } from 'zustand'
@@ -9,9 +10,11 @@ import type { UIState } from '../types'
 
 export interface UISlice extends UIState {
   // Actions
-  toggleSidebar: () => void
-  setSidebarOpen: (open: boolean) => void
   setWsConnected: (connected: boolean) => void
+  /** Bump a domain's data version (triggers version-gated page refetches). */
+  bumpDataVersion: (domain: string) => void
+  /** Open the global chat side panel (counter-based request — see UIState). */
+  openChatPanel: () => void
 }
 
 export const createUISlice: StateCreator<
@@ -20,20 +23,21 @@ export const createUISlice: StateCreator<
   [],
   UISlice
 > = (set) => ({
-  // Initial state
-  sidebarOpen: true,
   wsConnected: false,
-
-  // Actions
-  toggleSidebar: () => {
-    set((state) => ({ sidebarOpen: !state.sidebarOpen }))
-  },
-
-  setSidebarOpen: (open: boolean) => {
-    set({ sidebarOpen: open })
-  },
+  dataVersions: {},
+  chatPanelRequest: 0,
 
   setWsConnected: (connected: boolean) => {
     set({ wsConnected: connected })
+  },
+
+  bumpDataVersion: (domain: string) => {
+    set((state) => ({
+      dataVersions: { ...state.dataVersions, [domain]: (state.dataVersions[domain] ?? 0) + 1 },
+    }))
+  },
+
+  openChatPanel: () => {
+    set((state) => ({ chatPanelRequest: state.chatPanelRequest + 1 }))
   },
 })

@@ -120,6 +120,16 @@ pub struct ExtensionPackageManifest {
     #[serde(default = "default_extension_type")]
     #[serde(rename = "type")]
     pub extension_type: String,
+
+    /// Opt-in env vars the runner injects at spawn, for extensions that
+    /// need runtime-specific library paths (e.g. `ORT_DYLIB_PATH` for
+    /// load-dynamic ONNX Runtime). Value is a path template with
+    /// `{binaries}` (this spawn's platform binaries dir) and
+    /// `{extension_dir}` placeholders. A hint applies only when the env var
+    /// is unset and the resolved file exists — absent entries are skipped,
+    /// so variant builds (jetson/cuda) can ship conditional libraries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_hints: Option<HashMap<String, String>>,
 }
 
 fn default_abi_version() -> u32 {
@@ -462,6 +472,20 @@ impl ExtensionPackage {
                 "Extension ID is required".to_string(),
             ));
         }
+        // Reject path-traversal characters — the id is joined directly into the
+        // install path (`target_dir.join(ext_id)`), so an id like
+        // "../../etc/cron.d/x" would write files outside the install dir
+        // (RCE-equivalent once the marketplace opens to third-party packages).
+        if manifest.id.contains("..")
+            || manifest.id.contains('/')
+            || manifest.id.contains('\\')
+            || manifest.id.contains('\0')
+        {
+            return Err(PackageError::InvalidManifest(format!(
+                "Extension ID contains invalid path characters: {:?}",
+                manifest.id
+            )));
+        }
 
         // Validate version
         if manifest.version.is_empty() {
@@ -704,7 +728,8 @@ impl ExtensionPackage {
 
         // Extract manifest.json
         let manifest_path = ext_dir.join("manifest.json");
-        Self::extract_file_sync(archive, "manifest.json", &manifest_path)?;
+        let mut budget = InstallBudget::new();
+        Self::extract_file_sync(archive, "manifest.json", &manifest_path, &mut budget)?;
 
         // Get binary path for current platform
         let platform = detect_platform();
@@ -735,7 +760,7 @@ impl ExtensionPackage {
         // (the async install path uses `file_name()` to flatten; this path
         // preserves subdirs for shared libraries, so we must guard instead).
         let binary_file = Self::safe_join_within(&ext_dir, &binary_rel_path)?;
-        Self::extract_file_sync(archive, &binary_rel_path, &binary_file)?;
+        Self::extract_file_sync(archive, &binary_rel_path, &binary_file, &mut budget)?;
         tracing::info!("install: binary extracted");
 
         // Extract all sibling files in the same directory as the binary
@@ -755,9 +780,26 @@ impl ExtensionPackage {
                     if name.starts_with(&dir_prefix)
                         && !name.ends_with('/')
                         && name != binary_rel_path
+                        // data/ is extension-private runtime state — packages
+                        // must never write there (upgrade-preservation contract)
+                        && !name.starts_with("data/")
                         && !name[name.len() - 1..].starts_with('/')
                         && name.matches('/').count() == binary_rel_path.matches('/').count()
                     {
+                        if file.is_symlink() {
+                            return Err(PackageError::Zip(format!(
+                                "symlink entry rejected: '{}'",
+                                name
+                            )));
+                        }
+                        if file.size() > Self::MAX_EXTRACT_FILE_SIZE {
+                            return Err(PackageError::Zip(format!(
+                                "Bundled library '{}' is {} bytes (exceeds limit)",
+                                name,
+                                file.size()
+                            )));
+                        }
+                        budget.charge(file.size())?;
                         let dest = Self::safe_join_within(
                             &dest_dir,
                             name.trim_start_matches(&dir_prefix),
@@ -789,7 +831,7 @@ impl ExtensionPackage {
         // Extract frontend directory if exists
         let frontend_dir = if manifest.frontend.is_some() {
             let frontend_path = ext_dir.join("frontend");
-            Self::extract_directory_sync(archive, "frontend/", &frontend_path)?;
+            Self::extract_directory_sync(archive, "frontend/", &frontend_path, &mut budget)?;
             Some(frontend_path)
         } else {
             None
@@ -797,15 +839,15 @@ impl ExtensionPackage {
 
         // Extract models directory if exists (for AI/ML extensions)
         let models_path = ext_dir.join("models");
-        Self::extract_directory_sync(archive, "models/", &models_path)?;
+        Self::extract_directory_sync(archive, "models/", &models_path, &mut budget)?;
 
         // Extract assets directory if exists (for static assets)
         let assets_path = ext_dir.join("assets");
-        Self::extract_directory_sync(archive, "assets/", &assets_path)?;
+        Self::extract_directory_sync(archive, "assets/", &assets_path, &mut budget)?;
 
         // Extract config directory if exists (for configuration files)
         let config_path = ext_dir.join("config");
-        Self::extract_directory_sync(archive, "config/", &config_path)?;
+        Self::extract_directory_sync(archive, "config/", &config_path, &mut budget)?;
         tracing::info!("install: resource dirs done");
 
         // 🔧 macOS: Re-sign all extracted dylibs after installation.
@@ -934,10 +976,28 @@ impl ExtensionPackage {
         archive: &mut ZipArchive<R>,
         src_path: &str,
         dst_path: &Path,
+        budget: &mut InstallBudget,
     ) -> Result<(), PackageError> {
         let mut file = archive
             .by_name(src_path)
             .map_err(|e| PackageError::MissingFile(format!("{}: {}", src_path, e)))?;
+
+        if file.is_symlink() {
+            return Err(PackageError::Zip(format!(
+                "symlink entry rejected: '{}'",
+                src_path
+            )));
+        }
+        // Zip-bomb defense: reject oversized entries.
+        if file.size() > Self::MAX_EXTRACT_FILE_SIZE {
+            return Err(PackageError::Zip(format!(
+                "File '{}' is {} bytes (exceeds {} byte limit)",
+                src_path,
+                file.size(),
+                Self::MAX_EXTRACT_FILE_SIZE
+            )));
+        }
+        budget.charge(file.size())?;
 
         // Create parent directory
         if let Some(parent) = dst_path.parent() {
@@ -957,6 +1017,13 @@ impl ExtensionPackage {
         std::io::copy(&mut file, &mut out)?;
         Ok(())
     }
+
+    /// Zip-bomb defense caps — shared by BOTH extraction paths. The async
+    /// path (`extract_file`/`extract_directory`, used by `install()`) had NO
+    /// caps while the sync path did; one definition so they can't drift again.
+    pub(crate) const MAX_EXTRACT_FILE_SIZE: u64 = 200 * 1024 * 1024;
+    pub(crate) const MAX_EXTRACT_TOTAL_SIZE: u64 = 500 * 1024 * 1024;
+    pub(crate) const MAX_EXTRACT_FILE_COUNT: usize = 10_000;
 
     /// Resolve `rel_path` against `dst_dir`, rejecting any entry that would
     /// escape `dst_dir` via `..` traversal or absolute paths.
@@ -996,7 +1063,10 @@ impl ExtensionPackage {
         archive: &mut ZipArchive<R>,
         src_prefix: &str,
         dst_dir: &Path,
+        budget: &mut InstallBudget,
     ) -> Result<(), PackageError> {
+        // Zip-bomb defense caps (shared with the async path).
+
         std::fs::create_dir_all(dst_dir)?;
 
         for i in 0..archive.len() {
@@ -1011,6 +1081,24 @@ impl ExtensionPackage {
                 // Remove prefix to get relative path
                 let rel_path = name[src_prefix.len()..].to_string();
                 let dst_path = Self::safe_join_within(dst_dir, &rel_path)?;
+
+                // Per-file + cumulative size caps.
+                let entry_size = file.size();
+                if file.is_symlink() {
+                    return Err(PackageError::Zip(format!(
+                        "symlink entry rejected: '{}'",
+                        name
+                    )));
+                }
+                if entry_size > Self::MAX_EXTRACT_FILE_SIZE {
+                    return Err(PackageError::Zip(format!(
+                        "File '{}' is {} bytes (exceeds {} byte limit)",
+                        name,
+                        entry_size,
+                        Self::MAX_EXTRACT_FILE_SIZE
+                    )));
+                }
+                budget.charge(entry_size)?;
 
                 // Create parent directory
                 if let Some(parent) = dst_path.parent() {
@@ -1131,6 +1219,21 @@ impl ExtensionPackage {
             .by_name(src_path)
             .map_err(|e| PackageError::MissingFile(format!("{}: {}", src_path, e)))?;
 
+        if file.is_symlink() {
+            return Err(PackageError::Zip(format!(
+                "symlink entry rejected: '{}'",
+                src_path
+            )));
+        }
+        if file.size() > Self::MAX_EXTRACT_FILE_SIZE {
+            return Err(PackageError::Zip(format!(
+                "File '{}' is {} bytes (exceeds {} byte limit)",
+                src_path,
+                file.size(),
+                Self::MAX_EXTRACT_FILE_SIZE
+            )));
+        }
+
         // Create parent directory
         if let Some(parent) = dst_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -1167,8 +1270,15 @@ impl ExtensionPackage {
         dst_dir: &Path,
     ) -> Result<(), PackageError> {
         tokio::fs::create_dir_all(dst_dir).await?;
+        let mut total_bytes: u64 = 0;
 
         for i in 0..archive.len() {
+            if i + 1 > Self::MAX_EXTRACT_FILE_COUNT {
+                return Err(PackageError::Zip(format!(
+                    "Archive contains more than {} files (zip-bomb suspected)",
+                    Self::MAX_EXTRACT_FILE_COUNT
+                )));
+            }
             let mut file = archive
                 .by_index(i)
                 .map_err(|e| PackageError::Zip(format!("Failed to access file {}: {}", i, e)))?;
@@ -1180,6 +1290,29 @@ impl ExtensionPackage {
                 // Remove prefix to get relative path
                 let rel_path = name[src_prefix.len()..].to_string();
                 let dst_path = Self::safe_join_within(dst_dir, &rel_path)?;
+
+                if file.is_symlink() {
+                    return Err(PackageError::Zip(format!(
+                        "symlink entry rejected: '{}'",
+                        name
+                    )));
+                }
+                let entry_size = file.size();
+                if entry_size > Self::MAX_EXTRACT_FILE_SIZE {
+                    return Err(PackageError::Zip(format!(
+                        "File '{}' is {} bytes (exceeds {} byte limit)",
+                        name,
+                        entry_size,
+                        Self::MAX_EXTRACT_FILE_SIZE
+                    )));
+                }
+                total_bytes += entry_size;
+                if total_bytes > Self::MAX_EXTRACT_TOTAL_SIZE {
+                    return Err(PackageError::Zip(format!(
+                        "Total extracted size exceeds {} bytes (zip-bomb suspected)",
+                        Self::MAX_EXTRACT_TOTAL_SIZE
+                    )));
+                }
 
                 // Create parent directory
                 if let Some(parent) = dst_path.parent() {
@@ -1297,12 +1430,32 @@ impl ExtensionPackage {
         Ok(())
     }
 
-    /// Uninstall an extension (remove its directory)
+    /// Uninstall an extension — removes its directory EXCEPT the
+    /// extension-private `data/` subdir, which the platform contract
+    /// guarantees survives upgrades AND uninstall (pipelines, face
+    /// libraries, licenses, capture history live there). Operators wipe
+    /// it explicitly if they truly want a clean removal.
     pub async fn uninstall(install_dir: &Path, extension_id: &str) -> Result<(), PackageError> {
         let ext_dir = install_dir.join(extension_id);
 
         if ext_dir.exists() {
-            tokio::fs::remove_dir_all(&ext_dir).await?;
+            let data_dir = ext_dir.join("data");
+            let mut entries = tokio::fs::read_dir(&ext_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if path == data_dir {
+                    tracing::info!(
+                        "uninstall: preserving extension data dir: {}",
+                        data_dir.display()
+                    );
+                    continue;
+                }
+                if path.is_dir() {
+                    tokio::fs::remove_dir_all(&path).await?;
+                } else {
+                    tokio::fs::remove_file(&path).await?;
+                }
+            }
         }
 
         Ok(())
@@ -1389,6 +1542,115 @@ pub fn convert_platform_format(platform: &str, target_format: PlatformFormat) ->
     match target_format {
         PlatformFormat::Hyphen => format!("{}-{}", os, normalized_arch.0),
         PlatformFormat::Underscore => format!("{}_{}", os, normalized_arch.1),
+    }
+}
+
+/// Per-INSTALL extraction budget, shared across every phase (manifest,
+/// binary, bundled libs, frontend/models/assets/config directories).
+/// Each phase used to carry its own 500MB budget — a crafted package
+/// could legally extract ~2.7GB total. One budget, charged by all.
+#[derive(Debug)]
+pub(crate) struct InstallBudget {
+    total_bytes: u64,
+    file_count: usize,
+}
+
+impl InstallBudget {
+    pub(crate) fn new() -> Self {
+        Self {
+            total_bytes: 0,
+            file_count: 0,
+        }
+    }
+
+    /// Charge one extracted file; error when cumulative caps blow.
+    pub(crate) fn charge(&mut self, bytes: u64) -> Result<(), PackageError> {
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.file_count += 1;
+        if self.total_bytes > ExtensionPackage::MAX_EXTRACT_TOTAL_SIZE {
+            return Err(PackageError::Zip(format!(
+                "Total extracted size exceeds {} bytes across the whole install (zip-bomb suspected)",
+                ExtensionPackage::MAX_EXTRACT_TOTAL_SIZE
+            )));
+        }
+        if self.file_count > ExtensionPackage::MAX_EXTRACT_FILE_COUNT {
+            return Err(PackageError::Zip(format!(
+                "More than {} files extracted across the whole install (zip-bomb suspected)",
+                ExtensionPackage::MAX_EXTRACT_FILE_COUNT
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for InstallBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod data_dir_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nep-datadir-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn uninstall_preserves_extension_data_dir() {
+        let install_dir = scratch("un");
+        let ext_dir = install_dir.join("vision-hub");
+        std::fs::create_dir_all(ext_dir.join("data")).unwrap();
+        std::fs::write(ext_dir.join("data/pipelines.json"), r#"[{"id":"gate"}]"#).unwrap();
+        std::fs::write(ext_dir.join("data/license.key"), "NP1.x.y").unwrap();
+        std::fs::write(ext_dir.join("manifest.json"), "{}").unwrap();
+        std::fs::create_dir_all(ext_dir.join("binaries")).unwrap();
+        std::fs::write(ext_dir.join("binaries/extension.dylib"), b"bin").unwrap();
+
+        ExtensionPackage::uninstall(&install_dir, "vision-hub")
+            .await
+            .unwrap();
+
+        // Package files gone…
+        assert!(!ext_dir.join("manifest.json").exists());
+        assert!(!ext_dir.join("binaries").exists());
+        // …private data survives
+        assert!(ext_dir.join("data/pipelines.json").exists());
+        assert!(ext_dir.join("data/license.key").exists());
+        let _ = std::fs::remove_dir_all(&install_dir);
+    }
+}
+
+#[cfg(test)]
+mod install_budget_tests {
+    use super::*;
+
+    #[test]
+    fn budget_is_cumulative_across_phases() {
+        // Each phase used to carry its own 500MB budget; the shared budget
+        // must trip on the CUMULATIVE total, which is the whole point.
+        let mut b = InstallBudget::new();
+        let per = 200 * 1024 * 1024 + 1; // exceeds nothing alone? 200MB+1 each
+                                         // 500MB cap / (200MB+1) → third charge must blow the total.
+        assert!(b.charge(200 * 1024 * 1024).is_ok());
+        assert!(b.charge(200 * 1024 * 1024).is_ok());
+        let err = b.charge(per).unwrap_err().to_string();
+        assert!(err.contains("Total extracted size"), "got: {err}");
+        let _ = per;
+    }
+
+    #[test]
+    fn budget_counts_files_cumulatively() {
+        let mut b = InstallBudget::new();
+        for _ in 0..ExtensionPackage::MAX_EXTRACT_FILE_COUNT {
+            b.charge(1).unwrap();
+        }
+        let err = b.charge(1).unwrap_err().to_string();
+        assert!(err.contains("files"), "got: {err}");
     }
 }
 

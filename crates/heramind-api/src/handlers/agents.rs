@@ -14,6 +14,18 @@ use heramind_storage::{
     AiAgent, ExecutionMode, ExecutionStatus, ResourceType, ScheduleType, UserMessage,
 };
 
+/// Map a store error to a response WITHOUT lying about the status: a
+/// NotFound (e.g. "Agent X not found") is a 404, not a 500 — third-party
+/// consumers branch on status codes.
+fn store_error_to_response(context: &str, e: heramind_storage::Error) -> ErrorResponse {
+    match e {
+        heramind_storage::Error::NotFound(msg) => {
+            ErrorResponse::not_found(format!("{context}: {msg}"))
+        }
+        other => ErrorResponse::internal(format!("{context}: {other}")),
+    }
+}
+
 use super::{
     common::{ok, HandlerResult},
     ServerState,
@@ -35,6 +47,7 @@ fn status_to_string(status: &AgentStatus) -> &'static str {
         AgentStatus::Stopped => "Stopped",
         AgentStatus::Error => "Error",
         AgentStatus::Executing => "Executing",
+        AgentStatus::Completed => "Completed",
     }
 }
 
@@ -62,6 +75,7 @@ fn schedule_type_to_string(schedule_type: &ScheduleType) -> &'static str {
         ScheduleType::Interval => "interval",
         ScheduleType::Cron => "cron",
         ScheduleType::Event => "event",
+        ScheduleType::Manual => "manual",
     }
 }
 
@@ -145,8 +159,6 @@ struct AgentDto {
     avg_duration_ms: u64,
     // Advanced configuration fields
     #[serde(skip_serializing_if = "Option::is_none")]
-    enable_tool_chaining: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     max_chain_depth: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<u8>,
@@ -188,8 +200,6 @@ struct AgentDetailDto {
     llm_backend_id: Option<String>,
     // Advanced configuration fields
     #[serde(skip_serializing_if = "Option::is_none")]
-    enable_tool_chaining: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     max_chain_depth: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<u8>,
@@ -200,6 +210,9 @@ struct AgentDetailDto {
     /// Custom system prompt override
     #[serde(skip_serializing_if = "Option::is_none")]
     system_prompt: Option<String>,
+    /// Tool scoping (None = all tools; allowed_tools empty = all tools)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_config: Option<heramind_storage::AgentToolConfig>,
 }
 
 /// Agent resource for API responses.
@@ -383,7 +396,7 @@ struct AgentExecutionDetailDto {
 }
 
 /// Request body for creating a new AI Agent.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct CreateAgentRequest {
     pub name: String,
     #[serde(default)]
@@ -404,9 +417,6 @@ pub struct CreateAgentRequest {
     pub schedule: AgentScheduleRequest,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_backend_id: Option<String>,
-    /// Enable tool chaining (default: false)
-    #[serde(default)]
-    pub enable_tool_chaining: Option<bool>,
     /// Maximum chain depth (default: 3)
     #[serde(default)]
     pub max_chain_depth: Option<usize>,
@@ -422,10 +432,16 @@ pub struct CreateAgentRequest {
     /// Custom system prompt override (replaces default IoT role prompt)
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Tool scoping: restrict which tools this agent may call. Omit (or set
+    /// `allowed_tools: []`) for all tools — the default. Scoping the tool set
+    /// per task is the highest-leverage fix for small-model tool selection.
+    #[serde(default)]
+    #[schema(value_type = Option<AgentToolConfigMirror>)]
+    pub tool_config: Option<heramind_storage::AgentToolConfig>,
 }
 
 /// Resource request in the new unified format.
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize, serde::Serialize)]
 pub struct ResourceRequest {
     pub resource_id: String,
     pub resource_type: String,
@@ -436,7 +452,7 @@ pub struct ResourceRequest {
 }
 
 /// Metric selection in create request.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct MetricSelectionRequest {
     pub device_id: String,
     pub metric_name: String,
@@ -447,7 +463,7 @@ pub struct MetricSelectionRequest {
 }
 
 /// Command selection in create request.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct CommandSelectionRequest {
     pub device_id: String,
     pub command_name: String,
@@ -456,7 +472,7 @@ pub struct CommandSelectionRequest {
 }
 
 /// Agent schedule in create request.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct AgentScheduleRequest {
     pub schedule_type: String,
     #[serde(default)]
@@ -470,7 +486,7 @@ pub struct AgentScheduleRequest {
 }
 
 /// Request body for updating an agent.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct UpdateAgentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -496,8 +512,6 @@ pub struct UpdateAgentRequest {
     pub commands: Option<Vec<CommandSelectionRequest>>,
     // Advanced options
     #[serde(default)]
-    pub enable_tool_chaining: Option<bool>,
-    #[serde(default)]
     pub max_chain_depth: Option<usize>,
     #[serde(default)]
     pub priority: Option<u8>,
@@ -509,10 +523,15 @@ pub struct UpdateAgentRequest {
     /// Custom system prompt override (replaces default IoT role prompt)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Tool scoping override. Send an object to set/replace it; omit to leave
+    /// unchanged. Set `allowed_tools: []` to mean "all tools".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<AgentToolConfigMirror>)]
+    pub tool_config: Option<heramind_storage::AgentToolConfig>,
 }
 
 /// Resource in update request (new format).
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct AgentResourceRequest {
     pub resource_id: String,
     pub resource_type: String, // "Device", "Metric", "Command", etc.
@@ -522,7 +541,7 @@ pub struct AgentResourceRequest {
 }
 
 /// Request body for triggering an agent execution.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct ExecuteAgentRequest {
     #[serde(default)]
     pub trigger_type: Option<String>,
@@ -554,7 +573,6 @@ impl From<AiAgent> for AgentDto {
             error_count: agent.stats.failed_executions as u32,
             avg_duration_ms: agent.stats.avg_duration_ms,
             // Advanced configuration
-            enable_tool_chaining: Some(agent.enable_tool_chaining),
             max_chain_depth: Some(agent.max_chain_depth),
             priority: Some(agent.priority),
             context_window_size: Some(agent.context_window_size),
@@ -637,12 +655,12 @@ impl From<&AiAgent> for AgentDetailDto {
             error_message: agent.error_message.clone(),
             llm_backend_id: agent.llm_backend_id.clone(),
             // Advanced configuration
-            enable_tool_chaining: Some(agent.enable_tool_chaining),
             max_chain_depth: Some(agent.max_chain_depth),
             priority: Some(agent.priority),
             context_window_size: Some(agent.context_window_size),
             execution_mode: execution_mode_to_string(&agent.execution_mode).to_string(),
             system_prompt: agent.system_prompt.clone(),
+            tool_config: agent.tool_config.clone(),
         }
     }
 }
@@ -770,6 +788,17 @@ pub struct ListAgentsQuery {
     view: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agents",
+    tag = "agents",
+    params(
+        ("view" = Option<String>, Query, description = "summary = lightweight rows"),
+    ),
+    responses(
+        (status = 200, description = "User-defined agents"),
+    )
+)]
 pub async fn list_agents(
     State(state): State<ServerState>,
     Query(query): Query<ListAgentsQuery>,
@@ -805,6 +834,18 @@ pub async fn list_agents(
 }
 
 /// Get an AI Agent by ID.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    responses(
+        (status = 200, description = "One agent"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_agent(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -822,6 +863,15 @@ pub async fn get_agent(
 }
 
 /// Create a new AI Agent.
+#[utoipa::path(
+    post,
+    path = "/api/agents",
+    tag = "agents",
+    request_body = CreateAgentRequest,
+    responses(
+        (status = 200, description = "Agent created"),
+    )
+)]
 pub async fn create_agent(
     State(state): State<ServerState>,
     Json(request): Json<CreateAgentRequest>,
@@ -888,9 +938,15 @@ pub async fn create_agent(
     // Validate interval_seconds when schedule type is interval
     if request.schedule.schedule_type == "interval" {
         match request.schedule.interval_seconds {
-            None | Some(0) => {
+            // Some(0) is the legacy on-demand encoding: a manual-only agent that
+            // never auto-schedules (the scheduler maps it to a never-due
+            // next_execution). Previously rejected here, which made the
+            // frontend's "on-demand" option fail with 400 on create while
+            // the read path still interpreted stored 0 as on-demand.
+            Some(0) => {}
+            None => {
                 return Err(ErrorResponse::validation(
-                    "interval_seconds must be > 0 when schedule_type is 'interval'",
+                    "interval_seconds is required when schedule_type is 'interval'",
                 ));
             }
             Some(secs) if secs < 10 => {
@@ -935,6 +991,7 @@ pub async fn create_agent(
         "interval" => ScheduleType::Interval,
         "cron" => ScheduleType::Cron,
         "event" => ScheduleType::Event,
+        "manual" => ScheduleType::Manual,
         _ => {
             return Err(ErrorResponse::bad_request(format!(
                 "Invalid schedule type: {}",
@@ -1042,6 +1099,8 @@ pub async fn create_agent(
         id: uuid::Uuid::new_v4().to_string(),
         name: request.name.clone(),
         description: request.description.clone(),
+        // Deprecated dead field — always false (see AiAgent docs).
+        enable_tool_chaining: false,
         user_prompt: request.user_prompt,
         llm_backend_id: {
             // Auto-lock to the current active backend so the agent
@@ -1073,9 +1132,8 @@ pub async fn create_agent(
         user_messages: Default::default(),
         conversation_summary: Default::default(),
         context_window_size: request.context_window_size.unwrap_or(10),
-        enable_tool_chaining: request.enable_tool_chaining.unwrap_or(false),
         max_chain_depth: request.max_chain_depth.unwrap_or(3),
-        tool_config: None,
+        tool_config: request.tool_config,
         execution_mode,
     };
 
@@ -1161,6 +1219,7 @@ async fn init_agent_knowledge_file(state: &crate::server::ServerState, agent: &A
             agent.schedule.cron_expression.as_deref().unwrap_or("?")
         ),
         ScheduleType::Event => "Event-driven".to_string(),
+        ScheduleType::Manual => "Manual task (runs on invoke/delegation, repeatable)".to_string(),
     };
 
     let content = format!(
@@ -1242,6 +1301,19 @@ async fn init_agent_knowledge_file(state: &crate::server::ServerState, agent: &A
 }
 
 /// Update an AI Agent.
+#[utoipa::path(
+    put,
+    path = "/api/agents/{id}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    request_body = UpdateAgentRequest,
+    responses(
+        (status = 200, description = "Agent updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_agent(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1310,6 +1382,11 @@ pub async fn update_agent(
     if let Some(system_prompt) = request.system_prompt {
         agent.system_prompt = Some(system_prompt);
     }
+    // Tool scoping override: Some replaces; omit leaves unchanged. Send
+    // `{allowed_tools: []}` to clear scoping (meaning "all tools").
+    if let Some(tool_config) = request.tool_config {
+        agent.tool_config = Some(tool_config);
+    }
     if let Some(status_str) = request.status {
         agent.status = match status_str.as_str() {
             "active" => AgentStatus::Active,
@@ -1336,6 +1413,7 @@ pub async fn update_agent(
             "interval" => heramind_storage::ScheduleType::Interval,
             "cron" => heramind_storage::ScheduleType::Cron,
             "event" => heramind_storage::ScheduleType::Event,
+            "manual" => heramind_storage::ScheduleType::Manual,
             _ => {
                 return Err(ErrorResponse::bad_request(format!(
                     "Invalid schedule_type: {}",
@@ -1481,9 +1559,6 @@ pub async fn update_agent(
     }
 
     // Update advanced options if provided
-    if let Some(enable_chaining) = request.enable_tool_chaining {
-        agent.enable_tool_chaining = enable_chaining;
-    }
     if let Some(max_depth) = request.max_chain_depth {
         // Validate BEFORE assigning — same bounds as create_agent. Rejecting
         // here keeps storage consistent with the create path so consumers can
@@ -1565,6 +1640,18 @@ pub async fn update_agent(
 }
 
 /// Delete an AI Agent.
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{id}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    responses(
+        (status = 200, description = "Agent deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_agent(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1618,6 +1705,19 @@ pub async fn delete_agent(
 }
 
 /// Execute an AI Agent immediately (async — returns execution_id right away).
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/execute",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    request_body = ExecuteAgentRequest,
+    responses(
+        (status = 200, description = "Synchronous agent run; result returned"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn execute_agent(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1694,6 +1794,19 @@ pub async fn execute_agent(
 }
 
 /// Invoke an AI Agent synchronously — waits for execution to complete and returns results.
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/invoke",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    request_body = ExecuteAgentRequest,
+    responses(
+        (status = 200, description = "Agent invoked via the tool interface"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn invoke_agent(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1738,16 +1851,25 @@ pub async fn invoke_agent(
         None
     };
 
-    // Execute with timeout protection (60s default)
+    // Run the execution in its own task so a slow agent is not killed by
+    // this handler's patience window. Previously the 60s timeout DROPPED
+    // the inline execution future — the run died mid-flight with no
+    // execution record and no journal entry (a ghost execution the agent
+    // could never learn from). Now the timeout only bounds how long the
+    // CALLER waits: past it the JoinHandle is dropped (= detached, not
+    // aborted) and the run continues to completion in the background,
+    // writing its execution record + journal as usual.
+    let mgr = agent_manager.clone();
+    let run_agent_id = id.clone();
+    let handle =
+        tokio::spawn(async move { mgr.execute_agent_now(&run_agent_id, invocation_input).await });
+
+    // Wait up to 60s for the result; longer runs keep going in background.
     let timeout = std::time::Duration::from_secs(60);
-    let result = tokio::time::timeout(
-        timeout,
-        agent_manager.execute_agent_now(&id, invocation_input),
-    )
-    .await;
+    let result = tokio::time::timeout(timeout, handle).await;
 
     match result {
-        Ok(Ok(summary)) => {
+        Ok(Ok(Ok(summary))) => {
             // Fetch execution by ID (not "latest") to avoid race condition under concurrent load
             let execution = agent_manager
                 .executor()
@@ -1789,23 +1911,45 @@ pub async fn invoke_agent(
                 "has_error": summary.has_error,
             }))
         }
-        Ok(Err(e)) => Err(ErrorResponse::new(
+        Ok(Ok(Err(e))) => Err(ErrorResponse::new(
             "AGENT_EXECUTION_FAILED",
             format!("Agent '{}' execution failed: {}", agent_name, e),
             StatusCode::INTERNAL_SERVER_ERROR,
         )),
-        Err(_) => Err(ErrorResponse::new(
-            "AGENT_EXECUTION_TIMEOUT",
-            format!(
-                "Agent '{}' execution timed out after 60 seconds",
-                agent_name
-            ),
-            StatusCode::GATEWAY_TIMEOUT,
-        )),
+        Ok(Err(join_err)) => Err(ErrorResponse::internal(format!(
+            "Agent '{}' execution task panicked: {}",
+            agent_name, join_err
+        ))),
+        Err(_elapsed) => {
+            // Still executing in the background (detached task). The caller
+            // polls; the run itself will complete normally — record +
+            // journal are written either way.
+            ok(json!({
+                "agent_id": id,
+                "agent_name": agent_name,
+                "status": "Executing",
+                "still_executing": true,
+                "message": "Execution is still running in the background and will complete with a full record.",
+                "poll_execution": format!("/api/agents/{}/executions?limit=1", id),
+                "poll_command": format!("heramind agent executions {} --limit 1", id),
+            }))
+        }
     }
 }
 
 /// Get execution history for an agent.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/executions",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    responses(
+        (status = 200, description = "Execution history of an agent"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_agent_executions(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1841,6 +1985,19 @@ pub async fn get_agent_executions(
 }
 
 /// Get a specific execution record.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/executions/{execution_id}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+        ("execution_id" = String, Path, description = "Execution id"),
+    ),
+    responses(
+        (status = 200, description = "One execution record"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_execution(
     State(state): State<ServerState>,
     Path((_id, execution_id)): Path<(String, String)>,
@@ -1862,7 +2019,7 @@ pub async fn get_execution(
 }
 
 /// Request body for batch execution details.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct BatchExecutionIds {
     pub ids: Vec<String>,
 }
@@ -1873,6 +2030,19 @@ pub struct BatchExecutionIds {
 /// Body: { "ids": ["exec-id-1", "exec-id-2", ...] }
 ///
 /// Returns a map of execution_id -> execution detail.
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/executions/details",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    request_body = BatchExecutionIds,
+    responses(
+        (status = 200, description = "Execution records for a list of ids"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn batch_get_executions(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1931,6 +2101,19 @@ pub async fn batch_get_executions(
 }
 
 /// Update agent status.
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/status",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Agent enabled/disabled"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn set_agent_status(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1975,6 +2158,18 @@ pub async fn set_agent_status(
 }
 
 /// Get agent memory.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/memory",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    responses(
+        (status = 200, description = "Memory entries of an agent"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_agent_memory(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -2031,6 +2226,18 @@ pub async fn get_agent_memory(
 }
 
 /// Clear agent memory.
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{id}/memory",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    responses(
+        (status = 200, description = "Agent memory cleared"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn clear_agent_memory(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -2061,6 +2268,18 @@ pub async fn clear_agent_memory(
 }
 
 /// Get agent statistics.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/stats",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    responses(
+        (status = 200, description = "Run counters of an agent"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_agent_stats(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -2086,7 +2305,7 @@ pub async fn get_agent_stats(
 // ============================================================================
 
 /// Request body for adding a user message.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct AddUserMessageRequest {
     /// Message content
     content: String,
@@ -2118,6 +2337,19 @@ impl From<UserMessage> for UserMessageDto {
 /// Add a user message to an agent.
 ///
 /// POST /api/agents/{id}/messages
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/messages",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    request_body = AddUserMessageRequest,
+    responses(
+        (status = 200, description = "User message added"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn add_user_message(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -2128,7 +2360,7 @@ pub async fn add_user_message(
     let message = store
         .add_user_message(&id, request.content, request.message_type)
         .await
-        .map_err(|e| ErrorResponse::internal(format!("Failed to add message: {}", e)))?;
+        .map_err(|e| store_error_to_response("Failed to add message", e))?;
 
     tracing::debug!("Added user message {} to agent {}", message.id, id);
 
@@ -2138,6 +2370,18 @@ pub async fn add_user_message(
 /// Get user messages for an agent.
 ///
 /// GET /api/agents/{id}/messages
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/messages",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    responses(
+        (status = 200, description = "Custom user messages of an agent"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_user_messages(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -2147,7 +2391,7 @@ pub async fn get_user_messages(
     let messages = store
         .get_user_messages(&id, Some(50))
         .await
-        .map_err(|e| ErrorResponse::internal(format!("Failed to get messages: {}", e)))?;
+        .map_err(|e| store_error_to_response("Failed to get messages", e))?;
 
     ok(json!(messages
         .into_iter()
@@ -2158,6 +2402,19 @@ pub async fn get_user_messages(
 /// Delete a specific user message.
 ///
 /// DELETE /api/agents/{id}/messages/{message_id}
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{id}/messages/{message_id}",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+        ("message_id" = String, Path, description = "Message id"),
+    ),
+    responses(
+        (status = 200, description = "One user message removed"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_user_message(
     State(state): State<ServerState>,
     Path((id, message_id)): Path<(String, String)>,
@@ -2167,7 +2424,7 @@ pub async fn delete_user_message(
     let deleted = store
         .delete_user_message(&id, &message_id)
         .await
-        .map_err(|e| ErrorResponse::internal(format!("Failed to delete message: {}", e)))?;
+        .map_err(|e| store_error_to_response("Failed to delete message", e))?;
 
     if !deleted {
         return Err(ErrorResponse::not_found(format!(
@@ -2184,6 +2441,18 @@ pub async fn delete_user_message(
 /// Clear all user messages for an agent.
 ///
 /// DELETE /api/agents/{id}/messages
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{id}/messages",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    responses(
+        (status = 200, description = "All user messages removed"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn clear_user_messages(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -2193,7 +2462,7 @@ pub async fn clear_user_messages(
     let count = store
         .clear_user_messages(&id)
         .await
-        .map_err(|e| ErrorResponse::internal(format!("Failed to clear messages: {}", e)))?;
+        .map_err(|e| store_error_to_response("Failed to clear messages", e))?;
 
     tracing::debug!("Cleared {} user messages from agent {}", count, id);
 
@@ -2208,7 +2477,7 @@ pub async fn clear_user_messages(
 // ============================================================================
 
 /// Request to validate a cron expression.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct ValidateCronRequest {
     /// Cron expression to validate (e.g., "0 8 * * *")
     pub expression: String,
@@ -2236,6 +2505,15 @@ pub struct ValidateCronResponse {
 /// Validate a cron expression.
 ///
 /// POST /api/agents/validate-cron
+#[utoipa::path(
+    post,
+    path = "/api/agents/validate-cron",
+    tag = "agents",
+    request_body = ValidateCronRequest,
+    responses(
+        (status = 200, description = "Cron expression validated (next fires returned)"),
+    )
+)]
 pub async fn validate_cron_expression(
     State(state): State<ServerState>,
     Json(request): Json<ValidateCronRequest>,
@@ -2294,6 +2572,15 @@ fn validate_with_scheduler(
 /// Validate that an LLM backend is available and working.
 ///
 /// POST /api/agents/validate-llm
+#[utoipa::path(
+    post,
+    path = "/api/agents/validate-llm",
+    tag = "agents",
+    request_body = ValidateLlmRequest,
+    responses(
+        (status = 200, description = "Backend reachable and usable"),
+    )
+)]
 pub async fn validate_llm_backend(
     State(_state): State<ServerState>,
     Json(request): Json<ValidateLlmRequest>,
@@ -2342,7 +2629,7 @@ pub async fn validate_llm_backend(
 }
 
 /// Request body for validating an LLM backend.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct ValidateLlmRequest {
     /// Backend ID to validate (if not specified, validates the active/default backend)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2394,6 +2681,18 @@ fn describe_cron_expression(expr: &str) -> Option<String> {
 /// can potentially use for its operations.
 ///
 /// GET /api/agents/:id/available-resources
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/available-resources",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    responses(
+        (status = 200, description = "Devices/metrics/tools an agent may reference"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_available_resources(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -2481,6 +2780,14 @@ pub async fn get_available_resources(
 /// - `"built-in"`   — shipped with the server, compiled into the binary
 /// - `"extension"`  — contributed by an installed `.nep` package
 /// - `"custom"`     — reserved for the future HTTP-tool feature (name prefix `custom:`)
+#[utoipa::path(
+    get,
+    path = "/api/agents/tools",
+    tag = "agents",
+    responses(
+        (status = 200, description = "Server tool registry (read-only catalog)"),
+    )
+)]
 pub async fn list_agent_tools(State(state): State<ServerState>) -> HandlerResult<Value> {
     let registry_opt = state.agents.session_manager.get_tool_registry().await;
 

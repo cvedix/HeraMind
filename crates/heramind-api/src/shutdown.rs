@@ -9,6 +9,34 @@ use crate::server::ServerState;
 /// Shutdown timeout in seconds.
 const SHUTDOWN_TIMEOUT: u64 = 30;
 
+/// `shutdown_signal`, plus a test-only deadline: when
+/// `HERAMIND_EXIT_AFTER_READY_MS` is set, the server exits gracefully that
+/// many milliseconds after it starts serving. Lets the CLI integration
+/// tests assert a FULL startup (bind → stores → services → ready) by simply
+/// waiting for exit code 0 instead of "did it stay alive", which is what
+/// made those tests environment-sensitive (they needed free ports for a
+/// server that never exits).
+pub async fn shutdown_signal_or_test_deadline() {
+    let exit_after_ms = std::env::var("HERAMIND_EXIT_AFTER_READY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    tokio::select! {
+        _ = shutdown_signal() => {}
+        _ = async {
+            match exit_after_ms {
+                Some(ms) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    tracing::info!(
+                        exit_after_ms = ms,
+                        "HERAMIND_EXIT_AFTER_READY_MS elapsed — graceful exit (test mode)"
+                    );
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => {}
+    }
+}
+
 /// Wait for shutdown signal (Ctrl+C or SIGTERM).
 pub async fn shutdown_signal() {
     let ctrl_c = async {
@@ -42,7 +70,22 @@ pub async fn shutdown_signal() {
 pub async fn cleanup_resources(state: &ServerState) {
     tracing::info!("Cleaning up resources...");
 
-    // 1. Stop MQTT adapter through DeviceService (with timeout)
+    // 0. Abort in-flight event-triggered agent executions. These spawn
+    // detached from the scheduler (which only aborts scheduled tasks), so
+    // without this they keep running through shutdown, bounded only by
+    // their execution timeout.
+    if let Some(manager) = state.agents.agent_manager.read().await.clone() {
+        manager.executor().abort_event_tasks();
+    }
+
+    // 1. Stop the builtin llama-server children EXPLICITLY. kill_on_drop
+    // covers abnormal exits; this makes graceful shutdown immediate and
+    // observable instead of waiting for process-exit reap. Without it, every
+    // `systemctl restart` left a model-loaded llama-server (~2 GB) orphaned
+    // and relied on the NEXT boot's port-conflict detection to reclaim it.
+    crate::builtin_llm::server::stop_all_llama_servers();
+
+    // 2. Stop MQTT adapter through DeviceService (with timeout)
     let device_service = state.devices.service.clone();
     let mqtt_task = tokio::spawn(async move {
         if let Some(adapter) = device_service.get_adapter("internal-mqtt").await {
@@ -53,7 +96,7 @@ pub async fn cleanup_resources(state: &ServerState) {
     });
     let _ = tokio::time::timeout(Duration::from_secs(5), mqtt_task).await;
 
-    // 2. Stop embedded broker (feature-gated)
+    // 3. Stop embedded broker (feature-gated)
     #[cfg(feature = "embedded-broker")]
     {
         let broker = state.devices.embedded_broker.read().unwrap().clone();
@@ -67,17 +110,17 @@ pub async fn cleanup_resources(state: &ServerState) {
         }
     }
 
-    // 3. Flush any pending database writes
+    // 4. Flush any pending database writes
     tracing::info!("Flushing storage...");
 
     // Note: TimeSeriesStorage doesn't have explicit flush/close
     // The redb database handles this via Drop
 
-    // 4. Log session counts
+    // 5. Log session counts
     let sessions = state.agents.session_manager.list_sessions().await;
     tracing::info!("Shutdown complete. Active sessions: {}", sessions.len());
 
-    // 5. Log uptime
+    // 6. Log uptime
     let uptime = chrono::Utc::now().timestamp() - state.started_at;
     tracing::info!("Server uptime: {} seconds", uptime);
 }

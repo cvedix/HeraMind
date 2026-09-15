@@ -1,9 +1,12 @@
 pub mod api_client;
 pub mod auth_cmd;
 pub mod auto_auth;
+pub mod data_dir;
 pub mod dispatch;
+pub mod kv;
 pub mod output;
 pub mod types;
+pub mod user_cmd;
 
 // Command modules
 pub mod agent_cmd;

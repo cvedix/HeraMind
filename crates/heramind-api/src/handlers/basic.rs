@@ -26,7 +26,7 @@ pub struct DependencyStatus {
 
 impl DependencyStatus {
     pub fn all_ready(&self) -> bool {
-        self.llm || self.mqtt || self.database // At least one dependency is ready
+        self.llm && self.mqtt && self.database
     }
 }
 
@@ -35,9 +35,21 @@ impl DependencyStatus {
 pub struct ReadinessStatus {
     pub ready: bool,
     pub dependencies: DependencyStatus,
+    /// Caveats for dependency checks that cannot be fully verified
+    /// (e.g. external-broker deployments have no cheap MQTT probe).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// Basic health check handler (public endpoint).
+#[utoipa::path(
+    get,
+    path = "/api/health",
+    tag = "health",
+    responses(
+        (status = 200, description = "Basic service health"),
+    )
+)]
 pub async fn health_handler() -> Json<serde_json::Value> {
     Json(json!({
         "status": "ok",
@@ -47,6 +59,14 @@ pub async fn health_handler() -> Json<serde_json::Value> {
 }
 
 /// Detailed health check with uptime.
+#[utoipa::path(
+    get,
+    path = "/api/health/status",
+    tag = "health",
+    responses(
+        (status = 200, description = "Detailed component health (devices, storage, brokers)"),
+    )
+)]
 pub async fn health_status_handler(State(state): State<ServerState>) -> Json<HealthStatus> {
     let uptime = chrono::Utc::now().timestamp() - state.started_at;
 
@@ -59,25 +79,80 @@ pub async fn health_status_handler(State(state): State<ServerState>) -> Json<Hea
 }
 
 /// Liveness probe - simple check if server is running.
+#[utoipa::path(
+    get,
+    path = "/api/health/live",
+    tag = "health",
+    responses(
+        (status = 200, description = "Liveness probe"),
+    )
+)]
 pub async fn liveness_handler() -> Json<serde_json::Value> {
     Json(json!({
         "status": "alive",
     }))
 }
 
-/// Readiness probe - check if dependencies are ready.
+/// Readiness probe - check real dependency status.
+///
+/// Previously every dependency was hardcoded `true` ("we can't easily
+/// check"), which hid real outages — during a 2026-08-14 eval session the
+/// embedded broker failed to start on EVERY server instance (stale process
+/// squatting port 1883) and `/health/ready` kept reporting ready=true the
+/// whole time. Now each check is real:
+///
+/// - `database`: open the settings redb and read a value (proves redb is
+///   accessible and readable, not just that a handle exists).
+/// - `llm`: an active LLM backend is configured. NOT a reachability probe
+///   (that would add an upstream round-trip per readiness call) — an
+///   unreachable configured backend still reports true here.
+/// - `mqtt`: the embedded broker handle exists AND reports running.
+///   External-broker deployments don't run the embedded broker; there is
+///   no cheap outbound-connection probe, so this is reported as a note
+///   rather than a false "down".
+///
+/// `ready` gates on what can be truly verified: database && llm (a chat
+/// platform minimally needs storage + a configured model). MQTT status is
+/// surfaced for diagnosis but does not gate readiness in external mode.
+#[utoipa::path(
+    get,
+    path = "/api/health/ready",
+    tag = "health",
+    responses(
+        (status = 200, description = "Readiness probe"),
+    )
+)]
 pub async fn readiness_handler(State(state): State<ServerState>) -> Json<ReadinessStatus> {
-    // Check if session manager is working (just check if we can access it)
-    let _sessions = state.agents.session_manager.list_sessions().await;
+    // Database: a real redb open + read proves storage is accessible.
+    let database = crate::config::open_settings_store()
+        .map(|store| store.load("health_probe").is_ok())
+        .unwrap_or(false);
 
-    // Check if LLM might be configured (best effort check)
-    let llm = true; // We can't easily check this without making a call
+    // LLM: an active backend is configured (cheap; no upstream probe).
+    let llm = heramind_agent::llm_backends::get_instance_manager()
+        .ok()
+        .and_then(|m| m.get_active_instance())
+        .is_some();
 
-    // Check MQTT status (assume it's working if we got this far)
-    let mqtt = true; // MqttDeviceManager doesn't expose a simple is_connected
-
-    // Check if database/storage is accessible
-    let database = true; // TimeSeriesStorage doesn't have an is_ready method
+    // MQTT: embedded broker actually running. `None` means either an
+    // external-broker deployment or a broker that failed to start — the
+    // two are indistinguishable without more plumbing, so `None` reports
+    // false with an explanatory note instead of silently claiming ok.
+    let mut notes = Vec::new();
+    let (mqtt, embedded_present) = match state.embedded_broker() {
+        Some(broker) => (broker.is_running(), true),
+        None => (false, false),
+    };
+    if !embedded_present {
+        notes.push(
+            "embedded broker not present — either an external-broker deployment (not probed) \
+             or the broker failed to start; check server logs for 'Failed to start embedded broker'"
+                .to_string(),
+        );
+    }
+    if !llm {
+        notes.push("no active LLM backend configured".to_string());
+    }
 
     let dependencies = DependencyStatus {
         llm,
@@ -85,17 +160,26 @@ pub async fn readiness_handler(State(state): State<ServerState>) -> Json<Readine
         database,
     };
 
-    let ready = true; // If server is responding, we're ready
+    let ready = database && llm;
 
     Json(ReadinessStatus {
         ready,
         dependencies,
+        notes,
     })
 }
 
 /// Get local network info (WiFi SSID, LAN IP) for BLE provisioning.
 ///
 /// `GET /api/system/network-info`
+#[utoipa::path(
+    get,
+    path = "/api/system/network-info",
+    tag = "system",
+    responses(
+        (status = 200, description = "Server network interfaces and addresses"),
+    )
+)]
 pub async fn network_info_handler(
     headers: axum::http::HeaderMap,
 ) -> HandlerResult<serde_json::Value> {
@@ -111,6 +195,10 @@ pub async fn network_info_handler(
         "ip": ip,
         "server_url": server_url,
         "server_url_source": url_source.as_str(),
+        // Whether LAN devices can actually reach the server (bind ≠ loopback).
+        // The URL may still be the LAN address when this is false — the UI
+        // teaches the rebind instead of hiding the address.
+        "lan_reachable": !crate::server::http_bind_is_loopback(),
     }))
 }
 
@@ -170,4 +258,31 @@ fn get_wifi_ssid() -> Option<String> {
         }
     }
     None
+}
+
+/// Prometheus-format process metrics (public endpoint).
+///
+/// Counters only (HTTP totals, EventBus drops, uptime, build info) — no
+/// per-user/device data, so it stays unauthenticated like the health checks.
+/// See `crate::metrics` for the rationale behind each metric.
+#[utoipa::path(
+    get,
+    path = "/api/metrics",
+    tag = "system",
+    responses(
+        (status = 200, description = "Prometheus-format process metrics"),
+    )
+)]
+pub async fn metrics_handler(
+    State(state): State<ServerState>,
+) -> axum::http::Response<axum::body::Body> {
+    let body = crate::metrics::render_prometheus(state.core.event_bus.as_deref());
+    axum::http::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(axum::body::Body::from(body))
+        .expect("static response parts")
 }

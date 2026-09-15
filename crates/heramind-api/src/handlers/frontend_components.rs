@@ -26,11 +26,11 @@ use heramind_storage::frontend_components::{ComponentManifest, MarketIndex};
 /// Base URL for marketplace content.
 /// Override via `HERAMIND_MARKET_URL` env var to use a mirror (e.g. GitHub proxy).
 /// Examples:
-///   - Default: https://raw.githubusercontent.com/camthink-ai/HeraMind-Dashboard-Components
-///   - Mirror:  https://ghfast.top/https://raw.githubusercontent.com/camthink-ai/HeraMind-Dashboard-Components
+///   - Default: https://raw.githubusercontent.com/camthink-ai/NeoMind-Dashboard-Components
+///   - Mirror:  https://ghfast.top/https://raw.githubusercontent.com/camthink-ai/NeoMind-Dashboard-Components
 fn market_base_url() -> String {
     std::env::var("HERAMIND_MARKET_URL").unwrap_or_else(|_| {
-        "https://raw.githubusercontent.com/camthink-ai/HeraMind-Dashboard-Components".to_string()
+        "https://raw.githubusercontent.com/camthink-ai/NeoMind-Dashboard-Components".to_string()
     })
 }
 const MARKET_BRANCH: &str = "main";
@@ -194,7 +194,7 @@ async fn fetch_market_index(client: &reqwest::Client) -> Result<MarketIndex, Err
 // Request / Response types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct MarketInstallRequest {
     pub component_id: String,
 }
@@ -207,6 +207,14 @@ pub struct MarketInstallRequest {
 ///
 /// Fetch the community component index from GitHub.
 /// Public endpoint — no authentication required.
+#[utoipa::path(
+    get,
+    path = "/api/frontend-components/market/list",
+    tag = "frontend-components",
+    responses(
+        (status = 200, description = "Marketplace component catalog"),
+    )
+)]
 pub async fn market_list_handler(
     State(_state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -246,6 +254,14 @@ pub async fn market_list_handler(
 /// Protected endpoint — requires authentication.
 /// Tolerates network failures: returns `{ updates: [], count: 0, error: "network_error" }`
 /// rather than an HTTP error so the UI can degrade gracefully.
+#[utoipa::path(
+    get,
+    path = "/api/frontend-components/updates",
+    tag = "frontend-components",
+    responses(
+        (status = 200, description = "Available component updates"),
+    )
+)]
 pub async fn check_updates_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -317,6 +333,15 @@ pub async fn check_updates_handler(
 ///
 /// Download and install a component from the community marketplace.
 /// Protected endpoint — requires authentication.
+#[utoipa::path(
+    post,
+    path = "/api/frontend-components/market/install",
+    tag = "frontend-components",
+    request_body = MarketInstallRequest,
+    responses(
+        (status = 200, description = "Marketplace component installed"),
+    )
+)]
 pub async fn market_install_handler(
     State(state): State<ServerState>,
     Json(req): Json<MarketInstallRequest>,
@@ -327,10 +352,10 @@ pub async fn market_install_handler(
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
-            return ok(json!({
-                "success": false,
-                "error": format!("Failed to create HTTP client: {}", e)
-            }));
+            return Err(ErrorResponse::internal(format!(
+                "Failed to create HTTP client: {}",
+                e
+            )));
         }
     };
 
@@ -339,10 +364,10 @@ pub async fn market_install_handler(
         Ok(idx) => idx,
         Err(e) => {
             tracing::error!("Failed to fetch marketplace index: {}", e);
-            return ok(json!({
-                "success": false,
-                "error": format!("Network error: Unable to connect to component marketplace. {}", e)
-            }));
+            return Err(ErrorResponse::internal(format!(
+                "Network error: Unable to connect to component marketplace. {}",
+                e
+            )));
         }
     };
 
@@ -350,10 +375,10 @@ pub async fn market_install_handler(
     let entry = match index.components.iter().find(|c| c.id == component_id) {
         Some(e) => e,
         None => {
-            return ok(json!({
-                "success": false,
-                "error": format!("Component '{}' not found in marketplace", component_id)
-            }));
+            return Err(ErrorResponse::bad_request(format!(
+                "Component '{}' not found in marketplace",
+                component_id
+            )));
         }
     };
 
@@ -375,34 +400,28 @@ pub async fn market_install_handler(
     let manifest_resp = match manifest_result {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            return ok(json!({
-                "success": false,
-                "error": format!("Failed to download manifest: HTTP {}", r.status())
-            }));
+            return Err(ErrorResponse::internal(format!(
+                "Failed to download manifest: HTTP {}",
+                r.status()
+            )));
         }
         Err(e) => {
             tracing::error!("Failed to download manifest: {}", e);
-            return ok(json!({
-                "success": false,
-                "error": "Network error: Unable to download component manifest. Please check your internet connection."
-            }));
+            return Err(ErrorResponse::internal("Network error: Unable to download component manifest. Please check your internet connection."));
         }
     };
 
     let bundle_resp = match bundle_result {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            return ok(json!({
-                "success": false,
-                "error": format!("Failed to download bundle: HTTP {}", r.status())
-            }));
+            return Err(ErrorResponse::internal(format!(
+                "Failed to download bundle: HTTP {}",
+                r.status()
+            )));
         }
         Err(e) => {
             tracing::error!("Failed to download bundle: {}", e);
-            return ok(json!({
-                "success": false,
-                "error": "Network error: Unable to download component bundle. Please check your internet connection."
-            }));
+            return Err(ErrorResponse::internal("Network error: Unable to download component bundle. Please check your internet connection."));
         }
     };
 
@@ -410,27 +429,21 @@ pub async fn market_install_handler(
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(s) => s,
             Err(e) => {
-                return ok(json!({
-                    "success": false,
-                    "error": format!("Manifest is not valid UTF-8: {}", e)
-                }));
+                return Err(ErrorResponse::bad_request(format!(
+                    "Manifest is not valid UTF-8: {}",
+                    e
+                )));
             }
         },
         Err(e) => {
-            return ok(json!({
-                "success": false,
-                "error": e.to_string()
-            }));
+            return Err(ErrorResponse::internal(e.to_string()));
         }
     };
 
     let bundle_bytes = match collect_capped(bundle_resp, "bundle").await {
         Ok(b) => b,
         Err(e) => {
-            return ok(json!({
-                "success": false,
-                "error": e.to_string()
-            }));
+            return Err(ErrorResponse::internal(e.to_string()));
         }
     };
 
@@ -438,19 +451,19 @@ pub async fn market_install_handler(
     let mut manifest: ComponentManifest = match serde_json::from_str(&manifest_text) {
         Ok(m) => m,
         Err(e) => {
-            return ok(json!({
-                "success": false,
-                "error": format!("Invalid manifest JSON: {}", e)
-            }));
+            return Err(ErrorResponse::bad_request(format!(
+                "Invalid manifest JSON: {}",
+                e
+            )));
         }
     };
 
     // Validate manifest ID matches requested ID
     if manifest.id != component_id {
-        return ok(json!({
-            "success": false,
-            "error": format!("Manifest ID '{}' does not match requested component ID '{}'", manifest.id, component_id)
-        }));
+        return Err(ErrorResponse::bad_request(format!(
+            "Manifest ID '{}' does not match requested component ID '{}'",
+            manifest.id, component_id
+        )));
     }
 
     // Set install timestamp
@@ -467,16 +480,16 @@ pub async fn market_install_handler(
     match install_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            return ok(json!({
-                "success": false,
-                "error": format!("Failed to install component: {}", e)
-            }));
+            return Err(ErrorResponse::internal(format!(
+                "Failed to install component: {}",
+                e
+            )));
         }
         Err(e) => {
-            return ok(json!({
-                "success": false,
-                "error": format!("Install task failed: {}", e)
-            }));
+            return Err(ErrorResponse::internal(format!(
+                "Install task failed: {}",
+                e
+            )));
         }
     }
 
@@ -502,6 +515,14 @@ pub async fn market_install_handler(
 /// 2. **Separate files**: `manifest` (JSON text) + `bundle` (JS bytes) fields
 ///
 /// Protected endpoint with 5 MB body limit.
+#[utoipa::path(
+    post,
+    path = "/api/frontend-components",
+    tag = "frontend-components",
+    responses(
+        (status = 200, description = "Multipart bundle upload installed (5MB limit)"),
+    )
+)]
 pub async fn install_component_handler(
     State(state): State<ServerState>,
     mut multipart: Multipart,
@@ -573,6 +594,85 @@ pub async fn install_component_handler(
     let bundle_bytes = bundle_bytes
         .ok_or_else(|| ErrorResponse::bad_request("Missing 'bundle' or 'package' field"))?;
 
+    install_from_parts(&state, manifest_text, bundle_bytes, "manual upload").await
+}
+
+#[derive(utoipa::ToSchema, serde::Deserialize)]
+pub struct InstallFromPathRequest {
+    pub file_path: String,
+}
+
+/// POST `/api/frontend-components/from-path`
+///
+/// Install a community component from a `.zip` package that already sits
+/// on the server, inside the data directory. Mirrors the extensions
+/// upload API's `file_path` pattern: edge deployments often receive
+/// packages via scp/USB, and a phone browser has no way to pick a file
+/// that lives on the box.
+#[utoipa::path(
+    post,
+    path = "/api/frontend-components/from-path",
+    tag = "frontend-components",
+    request_body = InstallFromPathRequest,
+    responses(
+        (status = 200, description = "Component installed from a local path"),
+    )
+)]
+pub async fn install_component_from_path_handler(
+    State(state): State<ServerState>,
+    Json(req): Json<InstallFromPathRequest>,
+) -> HandlerResult<serde_json::Value> {
+    let path = crate::handlers::extensions::resolve_confined_package_path(&req.file_path)?;
+
+    if path.extension().and_then(|e| e.to_str()) != Some("zip") {
+        return Err(ErrorResponse::bad_request(
+            "file_path must point to a .zip package",
+        ));
+    }
+
+    // Reject oversized packages BEFORE reading them into memory — the
+    // data directory also hosts large stores, and buffering a multi-GB
+    // file just to fail the cap check would be a free memory DoS.
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| ErrorResponse::bad_request(format!("Failed to stat package file: {}", e)))?;
+    if metadata.len() as usize > MARKETPLACE_DOWNLOAD_CAP_BYTES {
+        return Err(ErrorResponse::bad_request(format!(
+            "Package too large ({} bytes); local install cap is {} bytes",
+            metadata.len(),
+            MARKETPLACE_DOWNLOAD_CAP_BYTES
+        )));
+    }
+
+    let zip_data = tokio::fs::read(&path)
+        .await
+        .map_err(|e| ErrorResponse::bad_request(format!("Failed to read package file: {}", e)))?;
+
+    if zip_data.len() > MARKETPLACE_DOWNLOAD_CAP_BYTES {
+        return Err(ErrorResponse::bad_request(format!(
+            "Package too large ({} bytes); local install cap is {} bytes",
+            zip_data.len(),
+            MARKETPLACE_DOWNLOAD_CAP_BYTES
+        )));
+    }
+
+    let (manifest_text, bundle_bytes) =
+        tokio::task::spawn_blocking(move || extract_zip_contents(&zip_data))
+            .await
+            .map_err(|e| ErrorResponse::internal(format!("ZIP extraction task failed: {}", e)))??;
+
+    install_from_parts(&state, manifest_text, bundle_bytes, "server path").await
+}
+
+/// Shared install tail for every manual install entry point (multipart
+/// upload, server path): parse + validate the manifest, persist via the
+/// store, publish the lifecycle event.
+async fn install_from_parts(
+    state: &ServerState,
+    manifest_text: String,
+    bundle_bytes: Vec<u8>,
+    via: &str,
+) -> HandlerResult<serde_json::Value> {
     // Parse manifest
     let mut manifest: ComponentManifest = serde_json::from_str(&manifest_text)
         .map_err(|e| ErrorResponse::bad_request(format!("Invalid manifest JSON: {}", e)))?;
@@ -593,11 +693,12 @@ pub async fn install_component_handler(
         .map_err(|e| ErrorResponse::internal(format!("Failed to install component: {}", e)))?;
 
     // Publish lifecycle event
-    publish_lifecycle_event(&state, &id_for_event, "installed").await;
+    publish_lifecycle_event(state, &id_for_event, "installed").await;
 
     tracing::info!(
         component_id = %id_for_event,
-        "Component installed via manual upload"
+        via = %via,
+        "Community component installed"
     );
 
     ok(json!({
@@ -626,16 +727,37 @@ fn extract_zip_contents(zip_data: &[u8]) -> Result<(String, Vec<u8>), ErrorRespo
         match filename.as_str() {
             "manifest.json" => {
                 let mut text = String::new();
-                file.read_to_string(&mut text).map_err(|e| {
+                // Manifests are tiny JSON documents; anything large is
+                // malformed or malicious.
+                let mut limited = file.take(1024 * 1024);
+                limited.read_to_string(&mut text).map_err(|e| {
                     ErrorResponse::bad_request(format!("Failed to read manifest.json: {}", e))
                 })?;
                 manifest_text = Some(text);
             }
             "bundle.js" => {
                 let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).map_err(|e| {
-                    ErrorResponse::bad_request(format!("Failed to read bundle.js: {}", e))
-                })?;
+                // Bound the decompressed size: a small zip can inflate to
+                // gigabytes (zip bomb), and whatever we buffer here gets
+                // persisted to disk by store.install.
+                let mut remaining = MARKETPLACE_DOWNLOAD_CAP_BYTES;
+                let mut chunk = [0u8; 64 * 1024];
+                loop {
+                    let n = file.read(&mut chunk).map_err(|e| {
+                        ErrorResponse::bad_request(format!("Failed to read bundle.js: {}", e))
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    if remaining < n {
+                        return Err(ErrorResponse::bad_request(format!(
+                            "bundle.js decompresses beyond the {} byte cap",
+                            MARKETPLACE_DOWNLOAD_CAP_BYTES
+                        )));
+                    }
+                    remaining -= n;
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
                 bundle_bytes = Some(bytes);
             }
             _ => {}
@@ -654,6 +776,14 @@ fn extract_zip_contents(zip_data: &[u8]) -> Result<(String, Vec<u8>), ErrorRespo
 ///
 /// List all installed community components.
 /// Protected endpoint — requires authentication.
+#[utoipa::path(
+    get,
+    path = "/api/frontend-components",
+    tag = "frontend-components",
+    responses(
+        (status = 200, description = "Installed frontend components"),
+    )
+)]
 pub async fn list_components_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -690,6 +820,18 @@ pub async fn list_components_handler(
 /// Get a single component manifest by ID.
 /// Checks built-in components first, then installed community components.
 /// Protected endpoint — requires authentication.
+#[utoipa::path(
+    get,
+    path = "/api/frontend-components/{id}",
+    tag = "frontend-components",
+    params(
+        ("id" = String, Path, description = "Component id"),
+    ),
+    responses(
+        (status = 200, description = "One installed component"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_component_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1451,6 +1593,18 @@ fn builtin_component_list() -> Vec<ComponentManifest> {
 ///
 /// Serve a component's bundle.js file.
 /// Public endpoint — allows unauthenticated loading of component bundles.
+#[utoipa::path(
+    get,
+    path = "/api/frontend-components/{id}/bundle",
+    tag = "frontend-components",
+    params(
+        ("id" = String, Path, description = "Component id"),
+    ),
+    responses(
+        (status = 200, description = "Component JS bundle (public so <script> can load it)"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_bundle_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -1484,6 +1638,18 @@ pub async fn get_bundle_handler(
 ///
 /// Uninstall (delete) a community component.
 /// Protected endpoint — requires authentication.
+#[utoipa::path(
+    delete,
+    path = "/api/frontend-components/{id}",
+    tag = "frontend-components",
+    params(
+        ("id" = String, Path, description = "Component id"),
+    ),
+    responses(
+        (status = 200, description = "Component uninstalled"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn uninstall_component_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,

@@ -48,6 +48,14 @@ pub struct LlmBackendInstance {
     /// Whether this is the currently active backend
     pub is_active: bool,
 
+    /// 是否为内置(bundled llama-server)提供的实例——非用户配置。
+    #[serde(default)]
+    pub is_builtin: bool,
+
+    /// 模型的思考是否不可关(如 LFM2.5):非 chat 调用也不强制 thinking_enabled=false。
+    #[serde(default)]
+    pub thinking_is_integral: bool,
+
     /// Generation parameters
     #[serde(default = "default_temperature")]
     pub temperature: f32,
@@ -65,6 +73,11 @@ pub struct LlmBackendInstance {
     #[serde(default = "default_thinking_enabled")]
     pub thinking_enabled: bool,
 
+    /// Unified thinking/reasoning effort (preferred over `thinking_enabled`).
+    /// `None` = not explicitly set; the backend falls back to `thinking_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<heramind_core::ThinkingEffort>,
+
     /// Backend capabilities
     #[serde(default)]
     pub capabilities: BackendCapabilities,
@@ -74,7 +87,7 @@ pub struct LlmBackendInstance {
 }
 
 /// Backend capabilities description
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(utoipa::ToSchema, Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BackendCapabilities {
     /// Supports streaming responses
     #[serde(default)]
@@ -110,20 +123,41 @@ pub struct BackendCapabilities {
     #[serde(default)]
     pub supports_thinking: bool,
 
+    /// Declared reasoning/thinking capabilities — which effort levels this
+    /// backend can honor, how thinking is controlled, and whether it's
+    /// mandatory. Populated from the runtime's `capabilities().reasoning`
+    /// (which reflects the actual backend + model); drives the frontend's
+    /// thinking-effort UI. `None` on rows predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningCapabilities>,
+
     /// Supports function/tool calling
     #[serde(default)]
     pub supports_tools: bool,
 
-    /// Supports audio input (e.g. qwen-omni, gpt-4o-audio, whisper-class models).
-    /// Currently informational — the agent pipeline does not yet emit audio
-    /// `ContentPart`s. Surfaced so the frontend/user can see whether a backend
-    /// reports audio capability without lying.
-    #[serde(default)]
-    pub supports_audio: bool,
-
     /// Maximum context window size
     #[serde(default = "default_max_context")]
     pub max_context: usize,
+}
+
+/// Declared reasoning/thinking capabilities, serialized to the frontend.
+/// Mirrors `heramind_core::ReasoningCapabilities`; kept storage-local to avoid
+/// a core dependency in the serialized schema. Populated from the runtime's
+/// `capabilities().reasoning` so the UI can render the right control.
+#[derive(utoipa::ToSchema, Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReasoningCapabilities {
+    /// Effort levels this backend can honor. Empty = unknown.
+    #[serde(default)]
+    pub supported_efforts: Vec<String>,
+    /// The model's default effort when nothing is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    /// Whether thinking is mandatory (cannot be turned off).
+    #[serde(default)]
+    pub mandatory: bool,
+    /// How the backend controls thinking: "readonly" | "boolean" | "level" | "effort".
+    #[serde(default)]
+    pub control: String,
 }
 
 /// Connection test result
@@ -324,11 +358,14 @@ impl LlmBackendInstance {
             model,
             api_key: None,
             is_active: false,
+            is_builtin: false,
+            thinking_is_integral: false,
             temperature: default_temperature(),
             top_p: default_top_p(),
             max_tokens: default_max_tokens(),
             top_k: default_top_k(),
             thinking_enabled: default_thinking_enabled(),
+            thinking_effort: None,
             capabilities,
             updated_at: Utc::now().timestamp(),
         }
@@ -522,6 +559,8 @@ pub struct LlmBackendStore {
     db: Arc<Database>,
     /// Path to the database file
     path: String,
+    /// Seals the `api_key` field at rest; key file lives next to the db.
+    crypto: heramind_core::crypto::CryptoService,
 }
 
 impl LlmBackendStore {
@@ -546,10 +585,14 @@ impl LlmBackendStore {
         } else {
             Database::create(path_ref)?
         };
+        // Rollback guard: refuse databases stamped by a newer build (see schema.rs).
+        crate::schema::check_or_stamp(&db)
+            .map_err(|e| Error::Storage(format!("schema version: {e}")))?;
 
         let store = Arc::new(LlmBackendStore {
             db: Arc::new(db),
             path: path_str,
+            crypto: crate::secret::crypto_for_db(path_ref),
         });
 
         // Ensure tables exist
@@ -573,16 +616,22 @@ impl LlmBackendStore {
     }
 
     /// Save an LLM backend instance
+    ///
+    /// The `api_key` field is sealed (AES-256-GCM, shared `encryption_key`)
+    /// before it touches the database; callers keep passing plaintext.
     pub fn save_instance(&self, instance: &LlmBackendInstance) -> Result<(), Error> {
         instance
             .validate()
             .map_err(|e| Error::InvalidInput(e.to_string()))?;
 
+        let mut sealed = instance.clone();
+        sealed.api_key = crate::secret::seal(&self.crypto, &instance.api_key);
+
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(LLM_BACKENDS_TABLE)?;
             let value =
-                serde_json::to_vec(instance).map_err(|e| Error::Serialization(e.to_string()))?;
+                serde_json::to_vec(&sealed).map_err(|e| Error::Serialization(e.to_string()))?;
             table.insert(instance.id.as_str(), value.as_slice())?;
         }
         write_txn.commit()?;
@@ -590,6 +639,9 @@ impl LlmBackendStore {
     }
 
     /// Load an LLM backend instance by ID
+    ///
+    /// Unseals `api_key` on the way out; pre-encryption plaintext rows load
+    /// unchanged (and get sealed on their next save).
     pub fn load_instance(&self, id: &str) -> Result<Option<LlmBackendInstance>, Error> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(LLM_BACKENDS_TABLE)?;
@@ -598,6 +650,7 @@ impl LlmBackendStore {
             let mut instance: LlmBackendInstance = serde_json::from_slice(data.value())
                 .map_err(|e| Error::Serialization(e.to_string()))?;
             instance.ensure_capabilities(); // Fix missing capabilities for old data
+            instance.api_key = crate::secret::unseal(&self.crypto, instance.api_key.take());
             Ok(Some(instance))
         } else {
             Ok(None)
@@ -616,6 +669,7 @@ impl LlmBackendStore {
             let mut instance: LlmBackendInstance = serde_json::from_slice(data.value())
                 .map_err(|e| Error::Serialization(e.to_string()))?;
             instance.ensure_capabilities(); // Fix missing capabilities for old data
+            instance.api_key = crate::secret::unseal(&self.crypto, instance.api_key.take());
             instances.push(instance);
         }
 
@@ -768,6 +822,22 @@ mod tests {
         assert_eq!(instance.model, "ministral-3:3b");
         assert!(instance.endpoint.is_some());
         assert!(instance.capabilities.supports_streaming);
+    }
+
+    #[test]
+    fn new_fields_default_false() {
+        let inst = LlmBackendInstance::new("id".into(), "name".into(), LlmBackendType::LlamaCpp);
+        assert!(!inst.is_builtin);
+        assert!(!inst.thinking_is_integral);
+    }
+
+    #[test]
+    fn legacy_json_deserializes_without_new_fields() {
+        // 模拟旧存储数据(无 is_builtin / thinking_is_integral 键)
+        let json = r#"{"id":"old","name":"old","backend_type":"llamacpp","model":"","is_active":false,"updated_at":0}"#;
+        let inst: LlmBackendInstance = serde_json::from_str(json).unwrap();
+        assert!(!inst.is_builtin);
+        assert!(!inst.thinking_is_integral);
     }
 
     #[test]

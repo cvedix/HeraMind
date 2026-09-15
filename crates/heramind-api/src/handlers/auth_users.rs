@@ -1,28 +1,69 @@
 //! User authentication API handlers.
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{ConnectInfo, Extension, Path, State},
     http::{HeaderMap, StatusCode},
     response::Json,
 };
+use std::net::SocketAddr;
 
 use crate::auth_users::{
-    AuthError, ChangePasswordRequest, LoginRequest, LoginResponse, RegisterRequest, SessionInfo,
-    UserRole,
+    client_ip_for_throttle, AuthError, ChangePasswordRequest, LoginRequest, LoginResponse,
+    RegisterRequest, SessionInfo, UserRole,
 };
 use crate::server::ServerState;
 
 /// Login handler - authenticate user and return JWT token.
+///
+/// Brute-force throttled: the request is checked (per username AND per client
+/// IP) before the password is verified, and only credential failures count —
+/// a successful login clears both keys.
+#[utoipa::path(
+    post,
+    path = "/api/auth/login",
+    tag = "auth",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "JWT issued", body = LoginResponse),
+        (status = 401, description = "Invalid credentials or throttled (unified error envelope, code UNAUTHORIZED/FORBIDDEN)"),
+    )
+)]
 pub async fn login_handler(
     State(state): State<ServerState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, AuthError> {
-    let response = state
+    let ip = client_ip_for_throttle(&headers, &addr);
+    state
+        .auth
+        .user_state
+        .check_login_throttle(&req.username, Some(&ip))?;
+
+    match state
         .auth
         .user_state
         .login(&req.username, &req.password)
-        .await?;
-    Ok(Json(response))
+        .await
+    {
+        Ok(response) => {
+            state
+                .auth
+                .user_state
+                .clear_login_throttle(&req.username, Some(&ip));
+            Ok(Json(response))
+        }
+        // Only credential failures count — a database error must not push an
+        // honest user toward a lockout.
+        Err(e @ (AuthError::InvalidCredentials | AuthError::UserNotFound)) => {
+            state
+                .auth
+                .user_state
+                .record_login_failure(&req.username, Some(&ip));
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Register handler - create a new user account.
@@ -32,10 +73,45 @@ pub async fn login_handler(
 /// Promoting to admin must go through the admin-only `create_user_handler`.
 /// The `role` field on `RegisterRequest` is accepted (for backwards-
 /// compatibility with older clients) but silently ignored.
+///
+/// Every attempt counts against the per-IP signup throttle — each call
+/// creates a user, so there is no honest high-volume caller.
+#[utoipa::path(
+    post,
+    path = "/api/auth/register",
+    tag = "auth",
+    request_body = RegisterRequest,
+    responses(
+        (status = 200, description = "Account created (role is always User; the role field is ignored)"),
+        (status = 403, description = "Self-registration disabled"),
+        (status = 429, description = "Signup throttle (per IP)"),
+    )
+)]
 pub async fn register_handler(
     State(state): State<ServerState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AuthError> {
+    let ip = client_ip_for_throttle(&headers, &addr);
+    state
+        .auth
+        .user_state
+        .check_signup_throttle("reg", Some(&ip))?;
+    state
+        .auth
+        .user_state
+        .record_signup_attempt("reg", Some(&ip));
+
+    // Self-registration is admin-gated: closed unless explicitly enabled
+    // (`PUT /api/settings/registration`). The first admin comes from the
+    // setup wizard; additional users are created by an admin
+    // (`POST /api/users`) — on a 0.0.0.0-bound edge box, open
+    // self-registration lets any LAN client mint an account.
+    if !state.auth.user_state.allow_registration() {
+        return Err(AuthError::RegistrationDisabled);
+    }
+
     let (user, token) = state
         .auth
         .user_state
@@ -49,12 +125,29 @@ pub async fn register_handler(
 }
 
 /// Logout handler - invalidate the current session.
+#[utoipa::path(
+    post,
+    path = "/api/auth/logout",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Session token invalidated"),
+    )
+)]
 pub async fn logout_handler(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
     Extension(user): Extension<SessionInfo>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AuthError> {
-    // Note: In a real implementation, you'd track which token to invalidate
-    // For now, we just acknowledge the logout
+    // Invalidate the session server-side so the bearer token can't be reused.
+    // (Previously a no-op: returned 200 but left the token valid for its full
+    // lifetime — anyone who grabbed the token stayed logged in for days.)
+    if let Some(token) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        let _ = state.auth_user_state().logout(token).await;
+    }
     tracing::info!(username = %user.username, "User logged out");
     Ok(Json(
         serde_json::json!({"message": "Logged out successfully"}),
@@ -63,6 +156,14 @@ pub async fn logout_handler(
 
 /// Get current user info handler.
 /// Requires JWT authentication (API key auth is not supported for user info).
+#[utoipa::path(
+    get,
+    path = "/api/auth/me",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Current user profile from the JWT"),
+    )
+)]
 pub async fn get_current_user_handler(
     Extension(user): Extension<SessionInfo>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
@@ -76,6 +177,14 @@ pub async fn get_current_user_handler(
 
 /// Get auth status handler for API key auth.
 /// Returns basic info when authenticated via API key (no user session).
+#[utoipa::path(
+    get,
+    path = "/api/auth/verify",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Credential check (validates the presented Authorization header)"),
+    )
+)]
 pub async fn get_auth_status_handler(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -113,6 +222,15 @@ pub async fn get_auth_status_handler(
 }
 
 /// Change password handler.
+#[utoipa::path(
+    post,
+    path = "/api/auth/change-password",
+    tag = "auth",
+    request_body = ChangePasswordRequest,
+    responses(
+        (status = 200, description = "Password changed; other sessions stay valid"),
+    )
+)]
 pub async fn change_password_handler(
     State(state): State<ServerState>,
     Extension(user): Extension<SessionInfo>,
@@ -129,6 +247,14 @@ pub async fn change_password_handler(
 }
 
 /// List all users handler (admin only).
+#[utoipa::path(
+    get,
+    path = "/api/users",
+    tag = "auth",
+    responses(
+        (status = 200, description = "All user accounts (admin only)"),
+    )
+)]
 pub async fn list_users_handler(
     State(state): State<ServerState>,
     Extension(user): Extension<SessionInfo>,
@@ -143,6 +269,15 @@ pub async fn list_users_handler(
 }
 
 /// Create a new user handler (admin only).
+#[utoipa::path(
+    post,
+    path = "/api/users",
+    tag = "auth",
+    request_body = RegisterRequest,
+    responses(
+        (status = 200, description = "User created"),
+    )
+)]
 pub async fn create_user_handler(
     State(state): State<ServerState>,
     Extension(admin_user): Extension<SessionInfo>,
@@ -172,6 +307,18 @@ pub async fn create_user_handler(
 }
 
 /// Delete user handler (admin only).
+#[utoipa::path(
+    delete,
+    path = "/api/users/{username}",
+    tag = "auth",
+    params(
+        ("username" = String, Path, description = "Username"),
+    ),
+    responses(
+        (status = 200, description = "User deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_user_handler(
     State(state): State<ServerState>,
     Extension(admin_user): Extension<SessionInfo>,
@@ -199,5 +346,73 @@ pub async fn delete_user_handler(
 
     Ok(Json(
         serde_json::json!({"message": format!("User '{}' deleted successfully", username)}),
+    ))
+}
+
+/// Request body for the registration-settings admin endpoint.
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
+pub struct UpdateRegistrationSettingsRequest {
+    /// Whether unauthenticated self-registration (`POST /api/auth/register`)
+    /// should be allowed.
+    pub allow_registration: bool,
+}
+
+/// Get registration settings (admin only).
+#[utoipa::path(
+    get,
+    path = "/api/settings/registration",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Whether public self-registration is open (admin only)"),
+    )
+)]
+pub async fn get_registration_settings_handler(
+    State(state): State<ServerState>,
+    Extension(admin_user): Extension<SessionInfo>,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    if admin_user.role != UserRole::Admin {
+        return Err(AuthError::InvalidInput("Admin access required".into()));
+    }
+
+    Ok(Json(serde_json::json!({
+        "allow_registration": state.auth.user_state.allow_registration(),
+    })))
+}
+
+/// Update registration settings (admin only).
+///
+/// When registration is closed, the only account-creation paths are the
+/// first-run setup wizard (admin) and `POST /api/users` (admin).
+#[utoipa::path(
+    put,
+    path = "/api/settings/registration",
+    tag = "settings",
+    request_body = UpdateRegistrationSettingsRequest,
+    responses(
+        (status = 200, description = "Registration gate updated"),
+    )
+)]
+pub async fn update_registration_settings_handler(
+    State(state): State<ServerState>,
+    Extension(admin_user): Extension<SessionInfo>,
+    Json(req): Json<UpdateRegistrationSettingsRequest>,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    if admin_user.role != UserRole::Admin {
+        return Err(AuthError::InvalidInput("Admin access required".into()));
+    }
+
+    state
+        .auth
+        .user_state
+        .set_allow_registration(req.allow_registration);
+
+    tracing::info!(
+        admin = %admin_user.username,
+        allow_registration = req.allow_registration,
+        "Admin updated registration settings"
+    );
+
+    Ok(Json(
+        serde_json::json!({"allow_registration": req.allow_registration}),
     ))
 }

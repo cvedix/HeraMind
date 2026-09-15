@@ -55,6 +55,27 @@ pub async fn get_transform(client: &ApiClient, id: &str) -> Result<CliResponse> 
     Ok(CliResponse::success(data, "Transform retrieved"))
 }
 
+/// Recent execution records of a transform (status / error / output summary).
+pub async fn get_transform_executions(
+    client: &ApiClient,
+    id: &str,
+    limit: Option<usize>,
+) -> Result<CliResponse> {
+    let lim = limit.unwrap_or(10);
+    let data = client
+        .get(&format!("/automations/{}/executions?limit={}", id, lim))
+        .await?;
+    let count = data
+        .get("data")
+        .and_then(|d| d.get("count"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Ok(CliResponse::success(
+        data,
+        format!("{} execution record(s)", count),
+    ))
+}
+
 /// Parse scope string to JSON matching API's TransformScope serde format
 /// "global" → "global"
 /// "device_type:TH" → {"device_type": "TH"}
@@ -100,7 +121,8 @@ pub async fn create_transform(
         .and_then(|a| a.get("metadata"))
         .and_then(|m| m.get("id"))
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
     let meta = BuildMeta {
         r#type: "transform".to_string(),
         action: "create".to_string(),
@@ -110,7 +132,12 @@ pub async fn create_transform(
     };
     Ok(CliResponse::success_with_meta(
         data,
-        "Transform created",
+        // Transforms only run when data flows — teach where to look instead
+        // of leaving the workflow at "created, now what".
+        format!(
+            "Transform created. It runs on new data points; check results with: heramind transform executions {}",
+            transform_id
+        ),
         meta,
     ))
 }

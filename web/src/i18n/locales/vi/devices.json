@@ -530,7 +530,36 @@
         "createdDesc": "Đã tạo thành công {{name}}"
       }
     },
-    "adding": "Thêm"
+    "adding": "Thêm",
+    "editTitle": "Sửa loại thiết bị",
+    "sections": {
+      "basic": "Thông tin cơ bản",
+      "data": "Định nghĩa dữ liệu",
+      "commands": "Lệnh"
+    },
+    "form": {
+      "nameLabel": "Tên loại",
+      "namePlaceholder": "Ví dụ: Cảm biến nhiệt độ thông minh",
+      "typeIdLabel": "ID loại",
+      "typeIdHint": "Tự tạo từ tên — có thể sửa nếu cần",
+      "descLabel": "Mô tả",
+      "descPlaceholder": "Mô tả chức năng của loại thiết bị này…",
+      "categoriesLabel": "Danh mục",
+      "addCategoryPlaceholder": "Nhập rồi nhấn Enter",
+      "removeCategory": "Xóa danh mục"
+    },
+    "data": {
+      "modeMetrics": "Định nghĩa metric",
+      "modeMetricsDesc": "Phân tích và lưu từng trường",
+      "modeRaw": "Chế độ dữ liệu thô",
+      "modeRawDesc": "Lưu nguyên payload",
+      "noMetrics": "Chưa định nghĩa metric"
+    },
+    "commands": {
+      "addCommand": "Thêm lệnh",
+      "emptyCommand": "Lệnh trống",
+      "noCommands": "Chưa định nghĩa lệnh"
+    }
   },
   "pending": {
     "tab": "Thiết bị đang chờ xử lý",
@@ -670,7 +699,16 @@
     "deviceNamePlaceholder": "ví dụ: Cảm Biến Nhiệt Độ 01",
     "deviceTypeSelection": "Lựa chọn loại thiết bị",
     "deviceTypeId": "ID loại thiết bị",
-    "typeNameHint": "Nhập tên loại thiết bị duy nhất"
+    "typeNameHint": "Nhập tên loại thiết bị duy nhất",
+    "register": "Đăng ký",
+    "registrationSuccess": "Đã đăng ký thiết bị",
+    "originalId": "ID gốc",
+    "systemId": "ID hệ thống",
+    "recommendedTopic": "Topic đề xuất",
+    "recommendedTopicHint": "Dữ liệu thiết bị đến qua topic này (đã đăng ký nhận — không cần sửa phía thiết bị)",
+    "editDeviceType": "Sửa loại thiết bị",
+    "metricsEditHint": "Metric được suy ra từ dữ liệu mẫu. Để sửa tên, đơn vị hoặc kiểu dữ liệu, hãy sửa loại thiết bị sau khi đăng ký.",
+    "createTypeOption": "Tạo loại mới \"{{value}}\""
   },
   "id": {
     "autoGenerate": "Tự động tạo ID ngẫu nhiên 10 ký tự",

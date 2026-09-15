@@ -243,7 +243,7 @@ impl LlmBackendInstanceManager {
             // fall back to stored capabilities
             let detected = ollama_runtime.fetch_capabilities_from_api().await;
 
-            let (multimodal, thinking, tools, max_ctx, audio) = match &detected {
+            let (multimodal, thinking, tools, max_ctx) = match &detected {
                 Some(caps) => {
                     // Update stored capabilities if detection succeeded and values differ.
                     // CRITICAL: respect user override — only update fields that aren't
@@ -256,7 +256,6 @@ impl LlmBackendInstanceManager {
                     let other_changed = instance.capabilities.supports_thinking
                         != caps.supports_thinking
                         || instance.capabilities.supports_tools != caps.supports_tools
-                        || instance.capabilities.supports_audio != caps.supports_audio
                         || instance.capabilities.max_context != caps.max_context;
                     if multimodal_changed || other_changed {
                         tracing::info!(
@@ -277,7 +276,6 @@ impl LlmBackendInstanceManager {
                         }
                         updated.capabilities.supports_thinking = caps.supports_thinking;
                         updated.capabilities.supports_tools = caps.supports_tools;
-                        updated.capabilities.supports_audio = caps.supports_audio;
                         let cap = std::env::var("HERAMIND_MAX_CONTEXT")
                             .ok()
                             .and_then(|v| v.parse::<usize>().ok())
@@ -289,7 +287,13 @@ impl LlmBackendInstanceManager {
                             updated.capabilities.multimodal_source =
                                 Some("runtime_api".to_string());
                         }
-                        let _ = self.storage.save_instance(&updated);
+                        if let Err(e) = self.storage.save_instance(&updated) {
+                            tracing::warn!(
+                                error = %e,
+                                instance_id = %instance.id,
+                                "Failed to persist updated instance capabilities; in-memory value is current but will revert on restart"
+                            );
+                        }
                         self.instances.insert(instance.id.clone(), updated);
                     }
                     // For runtime override: if user has override, use their value;
@@ -300,7 +304,6 @@ impl LlmBackendInstanceManager {
                         caps.supports_thinking,
                         caps.supports_tools,
                         caps.max_context,
-                        caps.supports_audio,
                     )
                 }
                 None => {
@@ -327,13 +330,12 @@ impl LlmBackendInstanceManager {
                         caps.supports_thinking,
                         caps.supports_tools,
                         max_ctx,
-                        caps.supports_audio,
                     )
                 }
             };
 
-            let ollama_runtime = ollama_runtime
-                .with_capabilities_override(multimodal, thinking, tools, max_ctx, audio);
+            let ollama_runtime =
+                ollama_runtime.with_capabilities_override(multimodal, thinking, tools, max_ctx);
 
             Arc::new(ollama_runtime) as Arc<dyn LlmRuntime>
         } else if matches!(instance.backend_type, LlmBackendType::LlamaCpp) {
@@ -360,7 +362,7 @@ impl LlmBackendInstanceManager {
                 // fall back to stored capabilities
                 let detected = llamacpp_runtime.detect_capabilities().await;
 
-                let (multimodal, thinking, tools, max_ctx, audio) = match &detected {
+                let (multimodal, thinking, tools, max_ctx) = match &detected {
                     Some(caps) => {
                         // Update stored capabilities if detection succeeded and values differ.
                         // Respect user override — only update fields that aren't explicitly
@@ -370,8 +372,7 @@ impl LlmBackendInstanceManager {
                             user_override.unwrap_or(instance.capabilities.supports_multimodal);
                         let multimodal_changed = old_multimodal != caps.supports_multimodal;
                         let other_changed = instance.capabilities.max_context != caps.max_context
-                            || instance.capabilities.supports_tools != caps.supports_tools
-                            || instance.capabilities.supports_audio != caps.supports_audio;
+                            || instance.capabilities.supports_tools != caps.supports_tools;
                         if multimodal_changed || other_changed {
                             tracing::info!(
                                 backend_id = %instance.id,
@@ -390,9 +391,14 @@ impl LlmBackendInstanceManager {
                             }
                             updated.capabilities.supports_thinking = caps.supports_thinking;
                             updated.capabilities.supports_tools = caps.supports_tools;
-                            updated.capabilities.supports_audio = caps.supports_audio;
                             updated.capabilities.max_context = caps.max_context;
-                            let _ = self.storage.save_instance(&updated);
+                            if let Err(e) = self.storage.save_instance(&updated) {
+                                tracing::warn!(
+                                    error = %e,
+                                    instance_id = %instance.id,
+                                    "Failed to persist updated instance capabilities; in-memory value is current but will revert on restart"
+                                );
+                            }
                             self.instances.insert(instance.id.clone(), updated);
                         }
                         let runtime_multimodal = user_override.unwrap_or(caps.supports_multimodal);
@@ -401,7 +407,6 @@ impl LlmBackendInstanceManager {
                             caps.supports_thinking,
                             caps.supports_tools,
                             caps.max_context,
-                            caps.supports_audio,
                         )
                     }
                     None => {
@@ -415,13 +420,12 @@ impl LlmBackendInstanceManager {
                             caps.supports_thinking,
                             caps.supports_tools,
                             caps.max_context,
-                            caps.supports_audio,
                         )
                     }
                 };
 
                 let llamacpp_runtime = llamacpp_runtime
-                    .with_capabilities_override(multimodal, thinking, tools, max_ctx, audio);
+                    .with_capabilities_override(multimodal, thinking, tools, max_ctx);
 
                 Arc::new(llamacpp_runtime) as Arc<dyn LlmRuntime>
             }
@@ -485,7 +489,6 @@ impl LlmBackendInstanceManager {
                             caps.supports_thinking,
                             caps.supports_tools,
                             caps.max_context,
-                            caps.supports_audio,
                         );
 
                         Arc::new(runtime) as Arc<dyn LlmRuntime>
@@ -512,6 +515,54 @@ impl LlmBackendInstanceManager {
                     .map_err(|e| LlmError::BackendUnavailable(e.to_string()))?
             }
         };
+
+        // Backfill the declared reasoning capabilities from the runtime back
+        // into the persisted instance capabilities, so the frontend can render
+        // the correct thinking-effort control (ReadOnly vs Boolean vs Level).
+        // Best-effort: a stale DB row with no reasoning gets populated; a
+        // failure to persist is non-fatal (in-memory value stays current).
+        let reasoning = runtime.capabilities().reasoning.clone();
+        let stored = instance.capabilities.reasoning.as_ref().map(|r| {
+            (
+                r.supported_efforts.clone(),
+                r.default_effort.clone(),
+                r.mandatory,
+                r.control.clone(),
+            )
+        });
+        let runtime_tuple = (
+            reasoning
+                .supported_efforts
+                .iter()
+                .map(|e| e.as_str().to_string())
+                .collect::<Vec<_>>(),
+            reasoning.default_effort.map(|e| e.as_str().to_string()),
+            reasoning.mandatory,
+            match reasoning.control {
+                heramind_core::ReasoningControl::ReadOnly => "readonly",
+                heramind_core::ReasoningControl::Boolean => "boolean",
+                heramind_core::ReasoningControl::Level => "level",
+                heramind_core::ReasoningControl::Effort => "effort",
+            }
+            .to_string(),
+        );
+        if stored.as_ref() != Some(&runtime_tuple) {
+            let mut updated = instance.clone();
+            updated.capabilities.reasoning = Some(heramind_storage::ReasoningCapabilities {
+                supported_efforts: runtime_tuple.0,
+                default_effort: runtime_tuple.1,
+                mandatory: runtime_tuple.2,
+                control: runtime_tuple.3,
+            });
+            if let Err(e) = self.storage.save_instance(&updated) {
+                tracing::warn!(
+                    error = %e,
+                    instance_id = %instance.id,
+                    "Failed to persist backfilled reasoning capabilities; in-memory value is current"
+                );
+            }
+            self.instances.insert(instance.id.clone(), updated);
+        }
 
         Ok(runtime)
     }
@@ -710,7 +761,6 @@ impl LlmBackendInstanceManager {
 
             if let Some(caps) = runtime.detect_capabilities().await {
                 let changed = instance.capabilities.supports_multimodal != caps.supports_multimodal
-                    || instance.capabilities.supports_audio != caps.supports_audio
                     || instance.capabilities.max_context != caps.max_context
                     || instance.capabilities.supports_tools != caps.supports_tools;
                 if changed {
@@ -719,24 +769,134 @@ impl LlmBackendInstanceManager {
                         model = %instance.model,
                         old_multimodal = instance.capabilities.supports_multimodal,
                         new_multimodal = caps.supports_multimodal,
-                        old_audio = instance.capabilities.supports_audio,
-                        new_audio = caps.supports_audio,
                         old_ctx = instance.capabilities.max_context,
                         new_ctx = caps.max_context,
                         "Startup: updated llama.cpp capabilities from /props"
                     );
                     let mut updated = instance.clone();
                     updated.capabilities.supports_multimodal = caps.supports_multimodal;
-                    updated.capabilities.supports_audio = caps.supports_audio;
                     updated.capabilities.supports_thinking = caps.supports_thinking;
                     updated.capabilities.supports_tools = caps.supports_tools;
                     updated.capabilities.max_context = caps.max_context;
-                    let _ = self.storage.save_instance(&updated);
+                    if let Err(e) = self.storage.save_instance(&updated) {
+                        tracing::warn!(
+                            error = %e,
+                            instance_id = %instance.id,
+                            "Failed to persist updated instance capabilities; in-memory value is current but will revert on restart"
+                        );
+                    }
                     self.instances.insert(instance.id.clone(), updated);
                 }
             }
         }
     }
+
+    #[cfg(feature = "llamacpp")]
+    /// Auto-register a local llama.cpp backend if a llama-server is reachable.
+    ///
+    /// Idempotent: skips entirely if a llama.cpp instance already exists, if the
+    /// operator opted out (empty endpoint env), or if the endpoint is unreachable.
+    /// Called once at startup before `detect_llamacpp_capabilities`, so the freshly
+    /// created instance's capabilities are refreshed in the same pass.
+    pub async fn auto_register_llamacpp(&self) {
+        // Idempotency guard (commit 76bd555a lesson): never seed a backend the
+        // user didn't ask for. We only act when the endpoint is provably reachable,
+        // but we still never create a second llama.cpp instance.
+        let already_exists = self
+            .instances
+            .iter()
+            .any(|item| matches!(item.value().backend_type, LlmBackendType::LlamaCpp));
+        if already_exists {
+            return;
+        }
+
+        // Endpoint: env override lets the Docker companion (http://llama:8080) or a
+        // native llama-server (default http://127.0.0.1:8080) be targeted.
+        // An empty value = operator opted out of auto-registration.
+        let endpoint = std::env::var("HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+        if endpoint.trim().is_empty() {
+            return;
+        }
+        let endpoint = endpoint.trim().to_string();
+
+        // Probe reachability + detect capabilities in one pass (GET /props).
+        // Retry briefly: the server may be up but the model still loading.
+        let config = LlamaCppConfig::new("")
+            .with_endpoint(&endpoint)
+            .with_timeout_secs(10);
+        let runtime = match LlamaCppRuntime::new(config) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, endpoint = %endpoint, "llama.cpp auto-register: failed to build runtime; skipping");
+                return;
+            }
+        };
+        let mut caps = None;
+        for attempt in 0..3 {
+            caps = runtime.detect_capabilities().await;
+            if caps.is_some() {
+                break;
+            }
+            tracing::info!(
+                endpoint = %endpoint,
+                attempt = attempt + 1,
+                "llama.cpp auto-register: server not reachable, retrying"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        let caps = match caps {
+            Some(c) => c,
+            None => {
+                tracing::info!(endpoint = %endpoint, "llama.cpp auto-register: server not reachable; skipping");
+                return;
+            }
+        };
+
+        // Build instance. new() gives the LlamaCpp defaults (endpoint
+        // http://127.0.0.1:8080, empty model, max_context 4096); we override the
+        // endpoint + probed capabilities.
+        let id = LlmBackendStore::generate_id("llamacpp");
+        let mut instance = LlmBackendInstance::new(
+            id.clone(),
+            "llama.cpp (auto)".to_string(),
+            LlmBackendType::LlamaCpp,
+        );
+        instance.endpoint = Some(endpoint.clone());
+        // Mark multimodal source as runtime API so ensure_instance_capabilities
+        // (called by list_instances) doesn't re-derive it from the (empty) model
+        // name and clobber the /props result — same provenance as Ollama /api/show.
+        instance.capabilities.supports_multimodal = caps.supports_multimodal;
+        instance.capabilities.multimodal_source = Some("runtime_api".to_string());
+        instance.capabilities.supports_thinking = caps.supports_thinking;
+        instance.capabilities.supports_tools = caps.supports_tools;
+        // Respect the global context cap, mirroring the Ollama path.
+        let cap = std::env::var("HERAMIND_MAX_CONTEXT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        instance.capabilities.max_context = caps.max_context.min(cap);
+
+        // Persist + insert into the in-memory cache.
+        if let Err(e) = self.upsert_instance(instance).await {
+            tracing::warn!(error = %e, "llama.cpp auto-register: failed to persist instance; skipping");
+            return;
+        }
+
+        // Set active ONLY if no active backend exists — never steal active status
+        // from a user-configured backend.
+        if self.get_active_instance().is_none() {
+            if let Err(e) = self.set_active(&id).await {
+                tracing::warn!(error = %e, id = %id, "llama.cpp auto-register: failed to set active");
+                return;
+            }
+        }
+
+        tracing::info!(id = %id, endpoint = %endpoint, "Auto-registered llama.cpp backend");
+    }
+
+    #[cfg(not(feature = "llamacpp"))]
+    pub async fn auto_register_llamacpp(&self) {}
 
     #[cfg(not(feature = "llamacpp"))]
     pub async fn detect_llamacpp_capabilities(&self) {}
@@ -758,8 +918,8 @@ impl LlmBackendInstanceManager {
             BackendTypeDefinition {
                 id: "openai".to_string(),
                 name: "OpenAI".to_string(),
-                description: "OpenAI API (GPT-4, GPT-3.5)".to_string(),
-                default_model: "gpt-4o-mini".to_string(),
+                description: "OpenAI API (GPT-4.1)".to_string(),
+                default_model: "gpt-4.1-mini".to_string(),
                 default_endpoint: Some("https://api.openai.com/v1".to_string()),
                 requires_api_key: true,
                 supports_streaming: true,
@@ -770,7 +930,7 @@ impl LlmBackendInstanceManager {
                 id: "anthropic".to_string(),
                 name: "Anthropic".to_string(),
                 description: "Anthropic Claude API".to_string(),
-                default_model: "claude-3-5-sonnet-20241022".to_string(),
+                default_model: "claude-sonnet-4-5".to_string(),
                 default_endpoint: Some("https://api.anthropic.com/v1".to_string()),
                 requires_api_key: true,
                 supports_streaming: true,
@@ -781,7 +941,7 @@ impl LlmBackendInstanceManager {
                 id: "google".to_string(),
                 name: "Google".to_string(),
                 description: "Google Gemini API".to_string(),
-                default_model: "gemini-1.5-flash".to_string(),
+                default_model: "gemini-2.5-flash".to_string(),
                 default_endpoint: Some(
                     "https://generativelanguage.googleapis.com/v1beta".to_string(),
                 ),
@@ -794,7 +954,7 @@ impl LlmBackendInstanceManager {
                 id: "xai".to_string(),
                 name: "xAI".to_string(),
                 description: "xAI Grok API".to_string(),
-                default_model: "grok-beta".to_string(),
+                default_model: "grok-3-mini".to_string(),
                 default_endpoint: Some("https://api.x.ai/v1".to_string()),
                 requires_api_key: true,
                 supports_streaming: true,
@@ -829,7 +989,7 @@ impl LlmBackendInstanceManager {
                 id: "glm".to_string(),
                 name: "GLM".to_string(),
                 description: "智谱 GLM API".to_string(),
-                default_model: "glm-4-flash".to_string(),
+                default_model: "glm-4.5-flash".to_string(),
                 default_endpoint: Some("https://open.bigmodel.cn/api/paas/v4".to_string()),
                 requires_api_key: true,
                 supports_streaming: true,
@@ -840,7 +1000,7 @@ impl LlmBackendInstanceManager {
                 id: "minimax".to_string(),
                 name: "MiniMax".to_string(),
                 description: "MiniMax API".to_string(),
-                default_model: "abab6.5s-chat".to_string(),
+                default_model: "MiniMax-M2".to_string(),
                 default_endpoint: Some("https://api.minimax.chat/v1".to_string()),
                 requires_api_key: true,
                 supports_streaming: true,
@@ -863,115 +1023,151 @@ impl LlmBackendInstanceManager {
 
     /// Get configuration schema for a backend type
     pub fn get_config_schema(&self, backend_type: &str) -> serde_json::Value {
-        let requires_api_key = matches!(
-            backend_type,
-            "openai" | "anthropic" | "google" | "xai" | "qwen" | "deepseek" | "glm" | "minimax"
-        );
+        // Sampling params differ by protocol: temperature is supported by
+        // every backend; top_p is an OpenAI-compat/Ollama concept and is NOT
+        // part of the Anthropic Messages API — hide it there.
+        let mut schema = {
+            let requires_api_key = matches!(
+                backend_type,
+                "openai" | "anthropic" | "google" | "xai" | "qwen" | "deepseek" | "glm" | "minimax"
+            );
 
-        // Build required fields array - only essential fields are required
-        let required: Vec<&str> = vec!["name"]
-            .into_iter()
-            .chain(if requires_api_key {
-                Some("api_key")
-            } else {
-                None
-            })
-            .collect();
+            // Build required fields array - only essential fields are required
+            let required: Vec<&str> = vec!["name"]
+                .into_iter()
+                .chain(if requires_api_key {
+                    Some("api_key")
+                } else {
+                    None
+                })
+                .collect();
 
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "title": "实例ID",
-                    "description": "唯一标识符，自动生成",
-                },
-                "name": {
-                    "type": "string",
-                    "title": "名称",
-                    "description": "显示名称",
-                },
-                "backend_type": {
-                    "type": "string",
-                    "title": "后端类型",
-                    "enum": ["ollama", "openai", "anthropic", "google", "xai", "qwen", "deepseek", "glm", "minimax", "llamacpp"],
-                    "default": backend_type,
-                },
-                "endpoint": {
-                    "type": "string",
-                    "title": "API 端点",
-                    "format": "uri",
-                    "default": match backend_type {
-                        "ollama" => "http://localhost:11434",
-                        "openai" => "https://api.openai.com/v1",
-                        "anthropic" => "https://api.anthropic.com/v1",
-                        "google" => "https://generativelanguage.googleapis.com/v1beta",
-                        "xai" => "https://api.x.ai/v1",
-                        "llamacpp" => "http://127.0.0.1:8080",
-                        _ => "",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "title": "实例ID",
+                        "description": "唯一标识符，自动生成",
+                    },
+                    "name": {
+                        "type": "string",
+                        "title": "名称",
+                        "description": "显示名称",
+                    },
+                    "backend_type": {
+                        "type": "string",
+                        "title": "后端类型",
+                        "enum": ["ollama", "openai", "anthropic", "google", "xai", "qwen", "deepseek", "glm", "minimax", "llamacpp"],
+                        "default": backend_type,
+                    },
+                    "endpoint": {
+                        "type": "string",
+                        "title": "API 端点",
+                        "format": "uri",
+                        "default": match backend_type {
+                            "ollama" => "http://localhost:11434",
+                            "openai" => "https://api.openai.com/v1",
+                            "anthropic" => "https://api.anthropic.com/v1",
+                            "google" => "https://generativelanguage.googleapis.com/v1beta",
+                            "xai" => "https://api.x.ai/v1",
+                            "qwen" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "deepseek" => "https://api.deepseek.com/v1",
+                            "glm" => "https://open.bigmodel.cn/api/paas/v4",
+                            "minimax" => "https://api.minimax.chat/v1",
+                            "llamacpp" => "http://127.0.0.1:8080",
+                            _ => "",
+                        },
+                    },
+                    "model": {
+                        "type": "string",
+                        "title": "Model Name",
+                        "description": "The model to use",
+                        "default": match backend_type {
+                            "ollama" => "qwen3.5:4b",
+                            "openai" => "gpt-4.1-mini",
+                            "anthropic" => "claude-sonnet-4-5",
+                            "google" => "gemini-2.5-flash",
+                            "xai" => "grok-3-mini",
+                            "qwen" => "qwen-plus",
+                            "deepseek" => "deepseek-chat",
+                            "glm" => "glm-4.5-flash",
+                            "minimax" => "MiniMax-M2",
+                            _ => "",
+                        },
+                    },
+                    "api_key": {
+                        "type": "string",
+                        "title": "API Key",
+                        "description": "Leave blank when editing to keep existing key",
+                        "x_secret": true,
+                    },
+                    "temperature": {
+                        "type": "number",
+                        "title": "Temperature",
+                        "description": "Controls generation randomness (0.0-2.0)",
+                        "minimum": 0.0,
+                        "maximum": 2.0,
+                        "default": 0.7,
+                    },
+                    "top_p": {
+                        "type": "number",
+                        "title": "Top-P",
+                        "description": "Nucleus sampling parameter (0.0-1.0)",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 0.9,
                     },
                 },
-                "model": {
-                    "type": "string",
-                    "title": "Model Name",
-                    "description": "The model to use",
-                    "default": match backend_type {
-                        "ollama" => "qwen3.5:4b",
-                        "openai" => "gpt-4o-mini",
-                        "anthropic" => "claude-3-5-sonnet-20241022",
-                        "google" => "gemini-1.5-flash",
-                        "xai" => "grok-beta",
-                        _ => "",
+                "required": required,
+                "ui_hints": {
+                    "field_order": ["name", "endpoint", "model", "api_key", "temperature", "top_p"],
+                    "display_names": {
+                        "id": "Instance ID",
+                        "name": "Display Name",
+                        "backend_type": "Backend Type",
+                        "endpoint": "API Endpoint",
+                        "model": "Model",
+                        "api_key": "API Key",
+                        "temperature": "Temperature",
+                        "top_p": "Top-P",
                     },
-                },
-                "api_key": {
-                    "type": "string",
-                    "title": "API Key",
-                    "description": "Leave blank when editing to keep existing key",
-                    "x_secret": true,
-                },
-                "temperature": {
-                    "type": "number",
-                    "title": "Temperature",
-                    "description": "Controls generation randomness (0.0-2.0)",
-                    "minimum": 0.0,
-                    "maximum": 2.0,
-                    "default": 0.7,
-                },
-                "top_p": {
-                    "type": "number",
-                    "title": "Top-P",
-                    "description": "Nucleus sampling parameter (0.0-1.0)",
-                    "minimum": 0.0,
-                    "maximum": 1.0,
-                    "default": 0.9,
-                },
-            },
-            "required": required,
-            "ui_hints": {
-                "field_order": ["name", "endpoint", "model", "api_key", "temperature", "top_p"],
-                "display_names": {
-                    "id": "Instance ID",
-                    "name": "Display Name",
-                    "backend_type": "Backend Type",
-                    "endpoint": "API Endpoint",
-                    "model": "Model",
-                    "api_key": "API Key",
-                    "temperature": "Temperature",
-                    "top_p": "Top-P",
-                },
-                "placeholders": {
-                    "model": match backend_type {
-                        "ollama" => "qwen3.5:4b",
-                        "openai" => "gpt-4o-mini",
-                        "anthropic" => "claude-3-5-sonnet-20241022",
-                        "google" => "gemini-1.5-flash",
-                        "xai" => "grok-beta",
-                        _ => "",
-                    },
+                    "placeholders": {
+                        "model": match backend_type {
+                            "ollama" => "qwen3.5:4b",
+                            "openai" => "gpt-4.1-mini",
+                            "anthropic" => "claude-sonnet-4-5",
+                            "google" => "gemini-2.5-flash",
+                            "xai" => "grok-3-mini",
+                            "qwen" => "qwen-plus",
+                            "deepseek" => "deepseek-chat",
+                            "glm" => "glm-4.5-flash",
+                            "minimax" => "MiniMax-M2",
+                            _ => "",
+                        },
+                    }
                 }
+            })
+        };
+        if backend_type == "anthropic" {
+            if let Some(props) = schema
+                .pointer_mut("/properties")
+                .and_then(|v| v.as_object_mut())
+            {
+                props.remove("top_p");
             }
-        })
+            if let Some(order) = schema
+                .pointer_mut("/ui_hints/field_order")
+                .and_then(|v| v.as_array_mut())
+            {
+                order.retain(|s| s != "top_p");
+            }
+            schema
+                .pointer_mut("/ui_hints/display_names")
+                .and_then(|v| v.as_object_mut())
+                .map(|d| d.remove("top_p"));
+        }
+        schema
     }
 
     /// Clear the runtime cache (e.g., after configuration change)
@@ -1056,13 +1252,10 @@ impl LlmBackendInstanceManager {
             };
 
             let new_multimodal = new_caps.supports_multimodal;
-            let new_audio = new_caps.supports_audio;
 
             // Skip if nothing actually changed — avoids spurious writes &
             // runtime-cache invalidations on every refresh tick.
-            if inst.capabilities.supports_multimodal == new_multimodal
-                && inst.capabilities.supports_audio == new_audio
-            {
+            if inst.capabilities.supports_multimodal == new_multimodal {
                 continue;
             }
 
@@ -1092,13 +1285,10 @@ impl LlmBackendInstanceManager {
                 model = %current.model,
                 old_multimodal = current.capabilities.supports_multimodal,
                 new_multimodal,
-                old_audio = current.capabilities.supports_audio,
-                new_audio,
                 source = "runtime_api",
                 "Refreshed capabilities from runtime API"
             );
             current.capabilities.supports_multimodal = new_multimodal;
-            current.capabilities.supports_audio = new_audio;
             current.capabilities.multimodal_source = Some("runtime_api".to_string());
             current.updated_at = chrono::Utc::now().timestamp();
 
@@ -1131,7 +1321,7 @@ impl LlmBackendInstanceManager {
     }
 
     /// Query an Ollama instance's `/api/show` to determine current
-    /// multimodal + audio capability. Returns `None` if the API is unavailable.
+    /// multimodal capability. Returns `None` if the API is unavailable.
     /// Returns the full `ModelCapability` so the caller can refresh every
     /// runtime-detected field in one pass without re-querying.
     async fn query_ollama_capabilities(
@@ -1195,8 +1385,9 @@ pub fn get_instance_manager() -> Result<Arc<LlmBackendInstanceManager>, LlmError
 
     // Use a separate database file to avoid conflicts with settings store
     // The settings store uses data/settings.redb, so we use data/llm_backends.redb
-    let backend_store = LlmBackendStore::open("data/llm_backends.redb")
-        .map_err(|e| LlmError::InvalidInput(format!("Failed to open backend store: {}", e)))?;
+    let backend_store =
+        LlmBackendStore::open(heramind_core::paths::store_path("llm_backends.redb"))
+            .map_err(|e| LlmError::InvalidInput(format!("Failed to open backend store: {}", e)))?;
 
     let manager = Arc::new(LlmBackendInstanceManager::new(backend_store));
     // Start the background capability-refresh loop (runtime API re-query).
@@ -1204,6 +1395,23 @@ pub fn get_instance_manager() -> Result<Arc<LlmBackendInstanceManager>, LlmError
     manager.start_capability_refresh_loop();
     *guard = Some(manager.clone());
     Ok(manager)
+}
+
+/// Install a specific process-global instance manager, replacing any existing
+/// one.
+///
+/// `get_instance_manager()` lazily opens the real `data/llm_backends.redb`;
+/// tests that need a hermetic manager (and production code that must guarantee
+/// which store backs the singleton) can install one here. The global is read by
+/// e.g. `LlmInterface::active_thinking_is_integral`, which must resolve the
+/// ACTIVE instance in production where per-interface managers are absent.
+pub fn set_instance_manager(manager: Arc<LlmBackendInstanceManager>) {
+    let rwlock = INSTANCE_MANAGER.get_or_init(|| RwLock::new(None));
+    let mut guard = rwlock
+        .write()
+        .map_err(|_| ())
+        .expect("instance manager write lock");
+    *guard = Some(manager);
 }
 
 #[cfg(test)]
@@ -1256,11 +1464,14 @@ mod tests {
             model: "deepseek-v4-flash".to_string(),
             api_key: Some("sk-test".to_string()),
             is_active: true,
+            is_builtin: false,
+            thinking_is_integral: false,
             temperature: 0.7,
             top_p: 1.0,
             max_tokens: 4096,
             top_k: 0,
             thinking_enabled: false,
+            thinking_effort: None,
             capabilities: BackendCapabilities {
                 supports_streaming: true,
                 // Stale: deepseek-v4-flash is text-only but DB says true.
@@ -1269,8 +1480,8 @@ mod tests {
                 multimodal_source: None,
                 supports_thinking: false,
                 supports_tools: true,
-                supports_audio: false,
                 max_context: 128000,
+                reasoning: None,
             },
             updated_at: 0,
         };
@@ -1297,11 +1508,14 @@ mod tests {
             model: "deepseek-v4-flash".to_string(),
             api_key: None,
             is_active: true,
+            is_builtin: false,
+            thinking_is_integral: false,
             temperature: 0.7,
             top_p: 1.0,
             max_tokens: 4096,
             top_k: 0,
             thinking_enabled: false,
+            thinking_effort: None,
             capabilities: BackendCapabilities {
                 supports_streaming: true,
                 // Wrong vs. detection, but user override is sacred.
@@ -1310,8 +1524,8 @@ mod tests {
                 multimodal_source: Some("user_override".to_string()),
                 supports_thinking: false,
                 supports_tools: true,
-                supports_audio: false,
                 max_context: 128000,
+                reasoning: None,
             },
             updated_at: 0,
         };
@@ -1324,6 +1538,131 @@ mod tests {
         assert_eq!(
             refreshed.capabilities.multimodal_source.as_deref(),
             Some("user_override"),
+        );
+    }
+
+    /// Open a throwaway store at a unique temp path. The store layer keeps a
+    /// process-global singleton keyed by path, so distinct paths yield isolated
+    /// databases — ":memory:" would be shared across tests and leak instances.
+    #[cfg(feature = "llamacpp")]
+    fn test_store(tag: &str) -> Arc<LlmBackendStore> {
+        let path =
+            std::env::temp_dir().join(format!("heramind-test-{}-{}.redb", tag, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        LlmBackendStore::open(&path).expect("open test store")
+    }
+
+    // ==== auto_register_llamacpp ====
+
+    #[cfg(feature = "llamacpp")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_auto_register_llamacpp_skips_when_unreachable() {
+        let manager = LlmBackendInstanceManager::new(test_store("skips-unreach"));
+        std::env::set_var(
+            "HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT",
+            "http://127.0.0.1:9",
+        ); // refused
+        manager.auto_register_llamacpp().await;
+        std::env::remove_var("HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT");
+        assert!(
+            manager.list_instances().is_empty(),
+            "unreachable server must not create a backend"
+        );
+    }
+
+    #[cfg(feature = "llamacpp")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_auto_register_llamacpp_is_idempotent() {
+        let manager = LlmBackendInstanceManager::new(test_store("is-idempotent"));
+        manager
+            .upsert_instance(LlmBackendInstance::new(
+                "llamacpp_existing".into(),
+                "Existing".into(),
+                LlmBackendType::LlamaCpp,
+            ))
+            .await
+            .unwrap();
+        std::env::set_var(
+            "HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT",
+            "http://127.0.0.1:9",
+        );
+        manager.auto_register_llamacpp().await;
+        std::env::remove_var("HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT");
+        assert_eq!(
+            manager.list_instances().len(),
+            1,
+            "existing instance must not be duplicated"
+        );
+    }
+
+    #[cfg(feature = "llamacpp")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_auto_register_llamacpp_opt_out_with_empty_endpoint() {
+        let manager = LlmBackendInstanceManager::new(test_store("opt-out"));
+        std::env::set_var("HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT", ""); // empty → opt out
+        manager.auto_register_llamacpp().await;
+        std::env::remove_var("HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT");
+        assert!(manager.list_instances().is_empty());
+    }
+
+    #[cfg(feature = "llamacpp")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_auto_register_llamacpp_creates_active_backend() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let props = r#"{"default_generation_settings":{"n_ctx":16384},
+            "model_alias":"gemma-4-E2B_q4_0-it",
+            "modalities":{"vision":true,"audio":false},
+            "chat_template_caps":{"supports_tool_calls":true,"supports_tools":true,
+                "supports_parallel_tool_calls":true,"supports_system_role":true}}"#;
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    props.len(),
+                    props
+                );
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+
+        let manager = LlmBackendInstanceManager::new(test_store("auto-reg"));
+        std::env::set_var(
+            "HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT",
+            format!("http://{}", addr),
+        );
+        manager.auto_register_llamacpp().await;
+        std::env::remove_var("HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT");
+        server.abort();
+
+        let instances = manager.list_instances();
+        assert_eq!(
+            instances.len(),
+            1,
+            "reachable server must create one backend"
+        );
+        let inst = &instances[0];
+        assert!(matches!(inst.backend_type, LlmBackendType::LlamaCpp));
+        assert_eq!(inst.capabilities.max_context, 16384);
+        assert!(
+            inst.capabilities.supports_multimodal,
+            "mmproj reports vision=true"
+        );
+        assert!(inst.capabilities.supports_tools);
+        assert!(
+            manager.get_active_instance().is_some(),
+            "no active backend → auto-registered instance must be active"
         );
     }
 }

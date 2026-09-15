@@ -24,29 +24,12 @@ fn mask_key(key: &str) -> String {
 /// 3. `./data` (if it exists — backward compat with the main scenario)
 /// 4. Platform default `dirs::data_local_dir()/heramind` (if it exists)
 /// 5. Error
-fn resolve_login_data_dir(explicit: Option<String>) -> Result<String> {
-    if let Some(d) = explicit {
-        return Ok(d);
-    }
-    if let Ok(dir) = std::env::var("HERAMIND_DATA_DIR") {
-        if !dir.is_empty() {
-            return Ok(dir);
-        }
-    }
-    if std::path::Path::new("data/api_keys.redb").exists() {
-        return Ok("data".to_string());
-    }
-    if let Some(local) = dirs::data_local_dir() {
-        let candidate = local.join("heramind");
-        if candidate.join("api_keys.redb").exists() {
-            return Ok(candidate.to_string_lossy().into_owned());
-        }
-    }
-    anyhow::bail!(
-        "No HeraMind server data directory found. \
-         Start the server first with: heramind serve\n\
-         Or specify the data directory with --data-dir"
-    )
+pub fn resolve_login_data_dir(explicit: Option<String>) -> Result<String> {
+    // Delegates to the shared resolver (crate::data_dir), which probes the
+    // DESKTOP app data dir as well — the old logic here only looked at
+    // `./data` and `~/Library/Application Support/heramind` and so could
+    // never find a desktop install's store.
+    crate::data_dir::resolve_or_message(explicit).map(|p| p.to_string_lossy().into_owned())
 }
 
 /// `heramind login` — read a key from the server's auth DB and persist it to
@@ -220,8 +203,15 @@ mod tests {
         assert_eq!(dir, "/tmp/explicit-test");
     }
 
+    /// Serializes tests that touch the process-global HERAMIND_DATA_DIR env.
+    /// Reuses auto_auth's lock: both test modules share one test binary, so
+    /// a module-local lock still raced against auto_auth's env tests (the
+    /// CI flake in test_resolve_data_dir_env_override).
+    use crate::auto_auth::DATA_DIR_ENV_LOCK;
+
     #[test]
     fn test_resolve_login_data_dir_env() {
+        let _lock = DATA_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("HERAMIND_DATA_DIR", "/tmp/env-data-dir-test");
         // Explicit takes priority
         let dir = resolve_login_data_dir(Some("/tmp/explicit".to_string())).unwrap();
@@ -234,6 +224,7 @@ mod tests {
 
     #[test]
     fn test_resolve_login_data_dir_not_found() {
+        let _lock = DATA_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Clear all sources so resolution fails.
         std::env::remove_var("HERAMIND_DATA_DIR");
         // This test may pass or fail depending on whether ./data or platform

@@ -87,7 +87,7 @@ export interface UseGlobalTimezoneReturn {
 }
 
 export function useGlobalTimezone(): UseGlobalTimezoneReturn {
-  const [timezone, setTimezone] = useState<string>("Asia/Shanghai")
+  const [timezone, setTimezone] = useState<string>("Asia/Ho_Chi_Minh")
   const [isDefault, setIsDefault] = useState(true)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -127,7 +127,7 @@ export function useGlobalTimezone(): UseGlobalTimezoneReturn {
       const result = await api.updateTimezone(newTimezone)
 
       setTimezone(result.timezone)
-      setIsDefault(result.timezone === "Asia/Shanghai")
+      setIsDefault(result.timezone === "Asia/Ho_Chi_Minh")
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to update timezone")
       throw e

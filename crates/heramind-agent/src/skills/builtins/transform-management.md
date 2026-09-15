@@ -1,6 +1,7 @@
 ---
 id: transform-management
 name: Transform Management & Data Processing
+description: Use when the user wants to process or transform data — computing derived/virtual metrics, unit conversion, formulas, JS scripts, averaging/summing telemetry. Covers transform create/test-code/metrics even without saying 'transform' (e.g. '温度转华氏', '算个平均值'). Includes 数据转换/计算/公式/虚拟指标.
 category: transform
 origin: builtin
 priority: 80
@@ -15,6 +16,24 @@ anti_triggers:
 ---
 
 # Transform Management & Data Processing
+
+## Command Cheat-Sheet (run these via `shell`)
+
+Always RUN the command yourself and report the real output.
+
+| Command | Purpose |
+|---|---|
+| `heramind transform executions <id>` | Recent run records (status/error/output) — check when output is empty or failing |
+| `heramind transform list` | List all transforms |
+| `heramind transform get <id>` | Transform details |
+| `heramind transform create` | Create a new transform |
+| `heramind transform update <id>` | Update a transform |
+| `heramind transform enable <id>` | Enable a transform |
+| `heramind transform disable <id>` | Disable a transform |
+| `heramind transform delete <id>` | Delete a transform |
+| `heramind transform metrics` | List virtual metrics from transforms |
+| `heramind transform test-code` | Test transform code |
+| `heramind transform data-sources` | List transform data sources |
 
 Transforms process raw metric data into derived values using JavaScript code. They create virtual metrics that can be used in dashboards just like device data.
 
@@ -110,18 +129,17 @@ heramind transform metrics
 heramind transform data-sources
 ```
 
-**Workflow: Discover → Test → Create**
+**Workflow: Discover → Test → Create — then ACT, don't stop at discovery!**
 1. Run discovery commands above to learn actual field names
 2. `heramind transform test-code --code '...' --input '<actual_data>'` to verify
-3. `heramind transform create --name ... --code ... --scope ...` to save
+3. **`heramind transform create --name ... --code ... --scope ...`** to save — THIS IS THE GOAL. Don't stop at step 1 or 2. The user wants a transform CREATED, not just explored.
+
+**⚠️ Common mistake: discovering field names then stopping without creating.** After `transform data-sources` or `device get`, the NEXT command must be `transform test-code` then `transform create`.
 
 **Output format depends on context**:
 
-- **Rules** use DataSourceId format: `transform:<output_prefix>:<field>` (colon-separated)
-- **Dashboards** use extension-metric binding (dot in metric name):
-```json
-{"type":"extension-metric","extensionId":"transform","extensionMetric":"<output_prefix>.<field>"}
-```
+- **Rules** use DataSourceId format: `transform:<transform_id>:<field>` (colon-separated) — `transform_id` is the transform's `id` from `transform list`, NOT `output_prefix`; `field` is the plain field name.
+- **Dashboards** bind to a transform output using the transform's `id` + plain `field` (frontend: `transformId` + `metricId`, or `sourceId: "transform:{id}"`). NOT the `output_prefix`, and NOT `extensionMetric` — `extensionMetric` is for EXTENSION sources only (`command:field`).
 
 ## Command Reference
 

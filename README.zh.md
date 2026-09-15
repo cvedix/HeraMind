@@ -13,7 +13,7 @@
     <img src="https://github.com/CVEDIX/HeraMind/actions/workflows/build.yml/badge.svg" alt="构建状态">
   </a>
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="许可证">
-  <img src="https://img.shields.io/badge/v-0.9.11-information.svg" alt="版本">
+  <img src="https://img.shields.io/badge/v-0.9.24-information.svg" alt="版本">
   <img src="https://img.shields.io/badge/Rust-1.85+-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/平台-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg" alt="平台支持">
 </p>
@@ -21,8 +21,8 @@
 <br/>
 
 <div align="center">
-  <img src="docs/img/dashboard-main.png" alt="仪表板" width="800" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);" />
-  <br/><sub><b>仪表板</b></sub>
+  <img src="docs/img/llm_backend.png" alt="LLM 配置" width="800" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);" />
+  <br/><sub><b>LLM 配置</b></sub>
 </div>
 
 <br/>
@@ -47,6 +47,10 @@
 </div>
 
 <br/>
+
+## HeraMind 0.9.24
+
+本次源码更新集成 [NeoMind v0.9.24](https://github.com/camthink-ai/NeoMind/releases/tag/v0.9.24)：内置本地 LLM、即时通讯桥接、OpenAPI、数据库保护和扩展 SDK 0.7.1。保留 HeraMind 的越南语默认设置、蓝色主题和标志、HeraCam/bodycam 分析、数据目录及更新渠道。参见[集成与验证记录](docs/upstream-sync-0.9.24.md)。源码版本不代表 HeraMind 二进制版本已发布。
 
 ## HeraMind 是什么？
 
@@ -121,7 +125,7 @@ HeraMind 是一个模块化的生态系统，每个关注点都有专门的资�
 
 ### 可用扩展
 
-共 22 个官方扩展，覆盖视觉、语音、IoT 桥接和实用工具。完整列表请浏览 [扩展市场](https://github.com/camthink-ai/HeraMind-Extensions)。
+共 22 个官方扩展，覆盖视觉、语音、IoT 桥接和实用工具。完整列表请浏览 [扩展市场](https://github.com/camthink-ai/NeoMind-Extensions)。
 
 | 扩展 | 分类 | 说明 |
 |------|------|------|
@@ -198,7 +202,7 @@ docker compose up -d
 
 **指定版本：**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | VERSION=0.9.11 sh
+curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | sh
 ```
 
 **自定义目录：**
@@ -218,7 +222,7 @@ curl -fsSL ... | USE_NGINX=true sh
 
 **手动安装：**
 ```bash
-VERSION=0.9.11
+VERSION=$(curl -fsSL https://api.github.com/repos/cvedix/HeraMind/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].removeprefix("v"))')
 wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-server-linux-amd64.tar.gz
 wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-web-${VERSION}.tar.gz
 tar xzf heramind-server-linux-amd64.tar.gz
@@ -333,58 +337,6 @@ HeraMind/
 ├── docker-compose.yml           # Docker Compose 配置
 └── .env.example                 # 环境变量模板
 ```
-
-## 更多截图
-
-<details>
-<summary>点击展开</summary>
-
-<br/>
-
-<table>
-  <tr>
-    <td><b>登录</b></td>
-    <td><b>AI 对话</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/login.png" width="480" /></td>
-    <td><img src="docs/img/chat.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>AI 智能体</b></td>
-    <td><b>规则引擎</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/agents.png" width="480" /></td>
-    <td><img src="docs/img/rules.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>数据转换</b></td>
-    <td><b>消息通知</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/transforms.png" width="480" /></td>
-    <td><img src="docs/img/messages.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>扩展系统</b></td>
-    <td><b>数据推送</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/extensions.png" width="480" /></td>
-    <td><img src="docs/img/data-push.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>LLM 后端</b></td>
-    <td><b>移动端</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/llm-backends.png" width="480" /></td>
-    <td><img src="docs/img/mobile_web.png" width="200" /></td>
-  </tr>
-</table>
-
-</details>
 
 ## 配置
 

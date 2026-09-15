@@ -55,6 +55,8 @@ import type {
   CreateLlmBackendRequest,
   UpdateLlmBackendRequest,
   LlmBackendListResponse,
+  BuiltinLlmStatus,
+  BuiltinModelDef,
   BackendTypeDefinition,
   BackendTestResult,
   AdapterType,
@@ -108,6 +110,7 @@ import type {
   MemorySystemConfig,
 } from '@/types'
 import type { SkillSummary, SkillDetail } from '@/types/skill'
+import type { ReasoningCapabilities } from '@/types/llm-backend'
 import { notifyFromError, notifySuccess } from './notify'
 import { tokenManager as unifiedTokenManager } from './auth'
 
@@ -382,6 +385,72 @@ export async function fetchAPI<T>(
   return json as T
 }
 
+// ========== IM Bridges API ==========
+export interface ImBridge {
+  id: string
+  platform: string
+  status: string
+}
+export interface ImInvite {
+  token: string
+  created_at: number
+  used: boolean
+  bound_chat_id: string | null
+  bound_at: number | null
+}
+export interface ImInviteCreated {
+  token: string
+  deep_link: string | null
+}
+export interface ImSession {
+  chat_id: string
+  bound_agent_id: string
+  neo_session_id: string
+  last_active: number
+  created_at: number
+}
+
+// ========== Server self-upgrade (admin, browser/server deployments) ==========
+/** GET /api/system/upgrade/check */
+export interface ServerUpgradeCheck {
+  /** Whether web-triggered upgrade can run on this server. */
+  supported: boolean
+  /** "docker" | "systemd" | "unsupported" */
+  deployment: string
+  /** Whether the root helper units are installed (install.sh). */
+  helper_available: boolean
+  current_version: string
+  latest_version?: string | null
+  /** Release-notes markdown for `latest_version`. */
+  release_notes?: string | null
+  /** `latest_version` is strictly newer than `current_version`. */
+  available: boolean
+  /** Operator hint when upgrade cannot proceed (both languages, \n-separated). */
+  notes?: string | null
+}
+
+/** Upgrade phases — mirrors `upgrade::service::phase` on the backend. */
+export type ServerUpgradePhase =
+  | 'idle'
+  | 'checking'
+  | 'downloading'
+  | 'verifying'
+  | 'staged'
+  | 'applying'
+  | 'restarting'
+  | 'done'
+  | 'error'
+
+/** GET /api/system/upgrade/status */
+export interface ServerUpgradeStatus {
+  running: boolean
+  phase: ServerUpgradePhase
+  target_version?: string | null
+  downloaded: number
+  total: number
+  error?: string | null
+}
+
 // ============================================================================
 // API Methods
 // ============================================================================
@@ -414,11 +483,14 @@ export const api = {
 
   // ========== Authentication API ==========
   login: (username: string, password: string, rememberMe: boolean = false) =>
+    // skipErrorToast: the login page renders its own inline error — a toast
+    // for the same failure is redundant double feedback.
     fetchAPI<LoginResponse>('/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
       skipAuth: true,
       skipGlobalError: true,
+      skipErrorToast: true,
     }).then(res => {
       // Store token
       tokenManager.setToken(res.token, rememberMe)
@@ -430,6 +502,7 @@ export const api = {
       body: JSON.stringify({ username, password }),
       skipAuth: true,
       skipGlobalError: true,
+      skipErrorToast: true,
     }).then(res => {
       // Store token
       tokenManager.setToken(res.token, false)
@@ -474,7 +547,10 @@ export const api = {
       signal,
     }),
   addDevice: (req: AddDeviceRequest) =>
-    fetchAPI<{ device_id: string; added: boolean }>('/devices', {
+    // updated_existing=true means an EXISTING device with this id was
+    // replaced (the backend upserts) — callers can warn before silently
+    // overwriting a device another client created.
+    fetchAPI<{ device_id: string; added: boolean; updated_existing?: boolean }>('/devices', {
       method: 'POST',
       body: JSON.stringify(req),
     }),
@@ -515,44 +591,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(req),
     }),
-  generateDeviceTypeFromSamples: (req: {
-    device_id?: string
-    manufacturer?: string
-    samples: Array<{ timestamp: number; data: Record<string, unknown> }>
-    min_coverage?: number
-    min_confidence?: number
-  }) =>
-    fetchAPI<{
-      id: string
-      name: string
-      description: string
-      category: string
-      manufacturer: string
-      metrics: Array<{
-        name: string
-        path: string
-        display_name: string
-        description: string
-        data_type: string
-        semantic_type: string
-        unit: string | null
-        readable: boolean
-        writable: boolean
-        confidence: number
-      }>
-      commands: Array<{
-        name: string
-        display_name: string
-        description: string
-        parameters: Array<{ name: string; type: string; required: boolean }>
-        confidence: number
-      }>
-      confidence: number
-    }>('/device-types/generate-from-samples', {
-      method: 'POST',
-      body: JSON.stringify(req),
-    }),
-
   // ========== Draft Devices API (Auto-onboarding) ==========
   // List all draft devices discovered through auto-onboarding
   getDraftDevices: () =>
@@ -925,6 +963,7 @@ export const api = {
         supports_thinking: boolean
         supports_tools: boolean
         max_context: number
+        reasoning?: ReasoningCapabilities
       }>
       count: number
     }>(`/llm-backends/ollama/models${endpoint ? `?endpoint=${encodeURIComponent(endpoint)}` : ''}`),
@@ -979,6 +1018,93 @@ export const api = {
       skipErrorToast: true,
     }),
 
+  // ========== Builtin LLM API (bundled LFM2.5-2.6B) ==========
+  /**
+   * Status of the built-in bundled model + server.
+   * GET /api/builtin-llm/status
+   */
+  getBuiltinLlmStatus: () =>
+    fetchAPI<BuiltinLlmStatus>('/builtin-llm/status'),
+  /** POST /api/builtin-llm/download/cancel — stop the in-flight model
+   * download (partial file is kept; re-download resumes; another model can
+   * be downloaded right after). */
+  cancelModelDownload: () =>
+    fetchAPI<{ cancelled: boolean; active?: boolean }>('/builtin-llm/download/cancel', {
+      method: 'POST',
+    }),
+
+  /**
+   * Start / resume the model download (single-flight on the server).
+   * POST /api/builtin-llm/download
+   */
+  downloadBuiltinLlm: (modelId?: string) =>
+    fetchAPI<{ started: boolean; already_running: boolean }>('/builtin-llm/download', {
+      method: 'POST',
+      body: modelId ? JSON.stringify({ model_id: modelId }) : undefined,
+    }),
+  /**
+   * List installable builtin models with per-entry install state.
+   * GET /api/builtin-llm/models
+   */
+  getBuiltinModels: () =>
+    fetchAPI<{ models: BuiltinModelDef[]; default_model_id: string }>('/builtin-llm/models'),
+
+  /**
+   * Delete the downloaded model files (stops the server first).
+   * DELETE /api/builtin-llm/model
+   */
+  deleteBuiltinLlmModel: () =>
+    fetchAPI<{ deleted: boolean }>('/builtin-llm/model', {
+      method: 'DELETE',
+    }),
+  /**
+   * Ensure the bundled llama-server is running (starts it if stopped).
+   * POST /api/builtin-llm/restart
+   */
+  restartBuiltinLlm: (ctx?: number) =>
+    fetchAPI<{ restarted: boolean; already_running: boolean; endpoint?: string }>(
+      `/builtin-llm/restart${ctx ? `?ctx=${ctx}` : ''}`,
+      { method: 'POST' }
+    ),
+  /**
+   * Activate the built-in backend as the active LLM backend.
+   * POST /api/builtin-llm/activate
+   */
+  activateBuiltinLlm: () =>
+    fetchAPI<{ id: string; message: string }>('/builtin-llm/activate', {
+      method: 'POST',
+    }),
+
+  // ========== IM Bridges API ==========
+  listImBridges: () => fetchAPI<{ bridges: ImBridge[] }>('/im-bridges'),
+  // Mirrors the backend `CreateBridgeRequest` (im_bridges.rs): credential
+  // fields are all optional because they are platform-specific — `bot_token`
+  // + `api_base` for Telegram, `app_id` + `app_secret` + `domain` for Feishu.
+  createImBridge: (req: {
+    platform: string
+    bot_token?: string
+    api_base?: string
+    app_id?: string
+    app_secret?: string
+    domain?: string
+  }) => fetchAPI<ImBridge>('/im-bridges', { method: 'POST', body: JSON.stringify(req) }),
+  deleteImBridge: (id: string) =>
+    fetchAPI<{ id: string; status: string }>(`/im-bridges/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  createImInvite: (id: string) =>
+    fetchAPI<ImInviteCreated>(`/im-bridges/${encodeURIComponent(id)}/invites`, { method: 'POST' }),
+  listImInvites: (id: string) =>
+    fetchAPI<{ invites: ImInvite[] }>(`/im-bridges/${encodeURIComponent(id)}/invites`),
+  revokeImInvite: (id: string, token: string) =>
+    fetchAPI(`/im-bridges/${encodeURIComponent(id)}/invites/${encodeURIComponent(token)}`, { method: 'DELETE' }),
+  listImAllowlist: (id: string) =>
+    fetchAPI<{ allowlist: string[] }>(`/im-bridges/${encodeURIComponent(id)}/allowlist`),
+  removeImAllowed: (id: string, chat_id: string) =>
+    fetchAPI(`/im-bridges/${encodeURIComponent(id)}/allowlist/${encodeURIComponent(chat_id)}`, { method: 'DELETE' }),
+  listImSessions: (id: string) =>
+    fetchAPI<{ sessions: ImSession[] }>(`/im-bridges/${encodeURIComponent(id)}/sessions`),
+  resetImSession: (id: string, chat_id: string) =>
+    fetchAPI(`/im-bridges/${encodeURIComponent(id)}/sessions/${encodeURIComponent(chat_id)}/reset`, { method: 'POST' }),
+
   // ========== MQTT / Brokers API ==========
   // Used by UnifiedDeviceConnectionsTab to display connection status
 
@@ -1018,6 +1144,7 @@ export const api = {
         tls_cert_path: string | null
         tls_key_path: string | null
         tls_ca_path: string | null
+        device_id_field?: string | null
       }
     }>('/mqtt/broker-config').then((res) => res.config),
 
@@ -1026,6 +1153,7 @@ export const api = {
     port?: number
     auth_enabled?: boolean
     tls_enabled?: boolean
+    device_id_field?: string | null
   }) => fetchAPI<{ message: string; restart_required?: boolean }>('/mqtt/broker-config', {
     method: 'PUT',
     body: JSON.stringify(config),
@@ -1092,9 +1220,10 @@ export const api = {
   // Note: Backend returns paginated response with data as array (auto-unwrapped by fetchAPI)
   listSessions: (page = 1, pageSize = 10) =>
     fetchAPI<ChatSession[]>(`/sessions?page=${page}&page_size=${pageSize}`),
-  createSession: () =>
+  createSession: (sessionConfig?: { systemPromptSuffix?: string; allowedTools?: string[] }) =>
     fetchAPI<{ sessionId: string }>('/sessions', {
       method: 'POST',
+      body: sessionConfig ? JSON.stringify({ sessionConfig }) : undefined,
     }),
   getSession: (id: string) => fetchAPI<{ sessionId: string; state: { id: string; created_at: number; last_activity: number; message_count: number } }>(`/sessions/${id}`),
   updateSession: (id: string, title?: string) =>
@@ -1127,7 +1256,16 @@ export const api = {
         ...(offset !== undefined && offset > 0 && { offset: offset.toString() }),
         ...(bucketed && { bucketed: 'true' }),
         ...(aggregate && { aggregate }),
-      })}`
+      })}`,
+      {
+        // [deleted-device 404] A device removed by another client (CLI,
+        // second session) previously answered 200+empty here; since the
+        // backend's 404 contract change this fires on EVERY poll cycle and
+        // toasts forever. Dashboard code treats errors as empty data already
+        // (useDataSource/fetch.ts catch), so the chart degrades gracefully —
+        // only the global toast needs silencing.
+        skipErrorToast: true,
+      }
     ),
   getDeviceTelemetrySummary: (deviceId: string, hours?: number) =>
     fetchAPI<TelemetrySummaryResponse>(
@@ -1139,8 +1277,29 @@ export const api = {
     ),
 
   // ========== Stats API ==========
-  getSystemStats: () => fetchAPI<{ version: string; uptime: number; platform: string; arch: string; cpu_count: number; total_memory: number; used_memory: number; free_memory: number; available_memory: number; gpus: Array<{ name: string; vendor: string; total_memory_mb: number | null; driver_version: string | null }> }>('/stats/system'),
+  getSystemStats: () => fetchAPI<{ version: string; uptime: number; platform: string; arch: string; cpu_count: number; total_memory: number; used_memory: number; free_memory: number; available_memory: number; cpu_usage: number; gpus: Array<{ name: string; vendor: string; total_memory_mb: number | null; driver_version: string | null }>; disks: Array<{ name: string; mount: string; total: number; used: number; available: number }>; networks: Array<{ name: string; ip: string; mac: string; rx_bytes: number; tx_bytes: number }> }>('/stats/system'),
   getRuleStats: () => fetchAPI<{ stats: { total_rules: number; enabled_rules: number; disabled_rules: number; by_type: Record<string, number> } }>('/stats/rules'),
+
+  // ========== Server self-upgrade API (admin, browser/server deployments) ==========
+  /**
+   * Release check for the web-triggered server upgrade (About page).
+   * `supported=false` with a `notes` hint for Docker/unsupported installs.
+   * GET /api/system/upgrade/check
+   */
+  checkServerUpgrade: (force = false) =>
+    fetchAPI<ServerUpgradeCheck>(`/system/upgrade/check${force ? '?force=true' : ''}`),
+  /**
+   * Kick off the staged server upgrade (single-flight on the server).
+   * Progress flows via `SystemUpgradeProgress` WS events + status polling.
+   * POST /api/system/upgrade
+   */
+  startServerUpgrade: (version?: string) =>
+    fetchAPI<{ started: boolean; already_running: boolean }>('/system/upgrade', {
+      method: 'POST',
+      body: version ? JSON.stringify({ version }) : undefined,
+    }),
+  /** GET /api/system/upgrade/status — snapshot of the in-flight upgrade. */
+  getServerUpgradeStatus: () => fetchAPI<ServerUpgradeStatus>('/system/upgrade/status'),
 
   /**
    * Download a ZIP archive of `heramind.log.*` files for diagnostic / support
@@ -1607,10 +1766,14 @@ export const api = {
    * Execute a command on an extension (legacy endpoint)
    * POST /api/extensions/:id/command
    */
-  executeExtensionCommand: (id: string, command: string, args?: Record<string, unknown>) =>
+  executeExtensionCommand: (id: string, command: string, args?: Record<string, unknown>, opts?: { skipErrorToast?: boolean }) =>
     fetchAPI<Record<string, unknown>>(`/extensions/${id}/command`, {
       method: 'POST',
       body: JSON.stringify({ command, args }),
+      // Background fetches (e.g. dashboard auto-refresh) may invoke commands that
+      // fail legitimately (required param not yet configured). Suppress the global
+      // error toast there — callers already fall back to queryData/empty data.
+      skipErrorToast: opts?.skipErrorToast,
     }),
 
   /**
@@ -1792,27 +1955,37 @@ export const api = {
    * Aggregates all data sources (devices, extensions, transforms, AI metrics) in a single call.
    * Supports server-side filtering and pagination.
    */
-  listUnifiedDataSources: (params?: Record<string, string | number>) => {
+  listUnifiedDataSources: (params?: Record<string, string | number>, signal?: AbortSignal) => {
     const qs = params && Object.keys(params).length > 0
       ? new URLSearchParams(
           Object.entries(params).map(([k, v]) => [k, String(v)])
         ).toString()
       : ''
-    return fetchAPI<{ data: UnifiedDataSourceInfo[]; total: number; source_options: [string, string][] }>(qs ? `/data/sources?${qs}` : '/data/sources')
+    return fetchAPI<{ data: UnifiedDataSourceInfo[]; total: number; source_options: [string, string][] }>(qs ? `/data/sources?${qs}` : '/data/sources', { signal })
   },
 
   /**
    * Query telemetry time-series data for any source type
    * GET /api/telemetry?source=...&metric=...&start=...&end=...&limit=...
    */
-  queryTelemetry: (source: string, metric: string, start: number, end: number, limit?: number, bucketed?: boolean, aggregate?: 'avg' | 'min' | 'max' | 'sum' | 'count') => {
+  /**
+   * Aggregate a telemetry series over a time range.
+   * GET /api/telemetry?source=...&metric=...&start=...&end=...&aggregate=avg
+   */
+  aggregateTelemetry: (source: string, metric: string, start: number, end: number, agg: 'avg' | 'min' | 'max' | 'sum' | 'count') => {
+    const qs = new URLSearchParams({ source, metric, start: String(start), end: String(end), aggregate: agg }).toString()
+    return fetchAPI<{ value: number | null; count: number }>(`/telemetry?${qs}`)
+  },
+
+  queryTelemetry: (source: string, metric: string, start: number, end: number, limit?: number, bucketed?: boolean, offsetOrAggregate?: number | 'avg' | 'min' | 'max' | 'sum' | 'count') => {
     const qs = new URLSearchParams({
       source, metric,
       start: String(start),
       end: String(end),
       ...(limit ? { limit: String(limit) } : {}),
       ...(bucketed ? { bucketed: 'true' } : {}),
-      ...(aggregate ? { aggregate } : {}),
+      ...(typeof offsetOrAggregate === 'number' ? { offset: String(offsetOrAggregate) } : {}),
+      ...(typeof offsetOrAggregate === 'string' ? { aggregate: offsetOrAggregate } : {}),
     }).toString()
     return fetchAPI<{
       source_id: string
@@ -1978,6 +2151,11 @@ export const api = {
       actions: Array<{ action: string; reasoning: string; description: string }>
       has_error: boolean
       error?: string
+      /** Present when the run exceeds the 60s wait window: execution
+       * continues in the background; poll poll_execution for the result. */
+      still_executing?: boolean
+      message?: string
+      poll_execution?: string
     }>(`/agents/${id}/invoke`, {
       method: 'POST',
       body: JSON.stringify(req || {}),

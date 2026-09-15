@@ -135,7 +135,8 @@ export function ExtensionsPage() {
         subtitle={t("extensions:description", { defaultValue: "Manage dynamic extensions and plugins" })}
         borderedHeader={false}
         headerContent={
-          <div className="px-4 py-2 sm:px-6 md:px-8">
+          // Same toolbar-row shape as every other page (PageTabsBar row)
+          <div className="flex shrink-0 items-center bg-background px-4 py-2 sm:px-6 md:px-8">
             <div className="flex shrink-0 flex-wrap items-center gap-1.5 sm:gap-2">
               <Button
                 variant="default"
@@ -234,7 +235,7 @@ export function ExtensionsPage() {
             </AlertDialogCancel>
             <AlertDialogAction
               onClick={confirmUninstall}
-              className="bg-destructive text-error-foreground hover:bg-destructive-hover"
+              className="bg-destructive text-destructive-foreground hover:bg-destructive-hover"
             >
               {t("extensions:uninstall", { defaultValue: "Uninstall" })}
             </AlertDialogAction>

@@ -19,9 +19,12 @@ pub const KEY_LLM_CONFIG: &str = "llm_config";
 pub const KEY_MQTT_CONFIG: &str = "mqtt_config";
 pub const KEY_GLOBAL_TIMEZONE: &str = "global_timezone";
 pub const KEY_RETENTION_CONFIG: &str = "retention_config";
+pub const KEY_AGENT_DEFAULTS: &str = "agent_defaults";
+pub const KEY_DEVICE_DEFAULTS: &str = "device_defaults";
+pub const KEY_BACKUP_CONFIG: &str = "backup_config";
 
 /// Default global timezone (IANA format)
-pub const DEFAULT_GLOBAL_TIMEZONE: &str = "Asia/Shanghai";
+pub const DEFAULT_GLOBAL_TIMEZONE: &str = "Asia/Ho_Chi_Minh";
 
 // External brokers table: key = broker_id, value = ExternalBroker (serialized)
 const EXTERNAL_BROKERS_TABLE: TableDefinition<&str, &[u8]> =
@@ -90,7 +93,7 @@ pub struct MqttCredential {
 static SETTINGS_STORE_SINGLETON: Mutex<Option<Arc<SettingsStore>>> = Mutex::new(None);
 
 /// LLM backend type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LlmBackendType {
     /// Ollama (local LLM runner).
@@ -164,7 +167,7 @@ impl Default for LlmSettings {
         Self {
             backend: LlmBackendType::Ollama,
             endpoint: Some("http://localhost:11434".to_string()),
-            model: "ministral-3:3b".to_string(),
+            model: "qwen3.5:4b".to_string(),
             api_key: None,
             temperature: default_temperature(),
             top_p: default_top_p(),
@@ -320,12 +323,72 @@ impl MqttSettings {
 }
 
 /// Retention configuration for data cleanup.
+/// Runtime-configurable backup schedule (Settings → Preferences in the web
+/// UI; executed by the api server's scheduler and the manual admin trigger).
+/// Env vars seed the factory default; a saved value always wins over them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackupConfig {
+    /// Whether the periodic scheduler runs at all.
+    #[serde(default = "default_backup_enabled")]
+    pub enabled: bool,
+    /// Seconds between scheduled backups (>= 300).
+    #[serde(default = "default_backup_interval_secs")]
+    pub interval_secs: u64,
+    /// How many newest backups to keep.
+    #[serde(default = "default_backup_keep")]
+    pub keep: usize,
+}
+
+fn default_backup_enabled() -> bool {
+    true
+}
+fn default_backup_interval_secs() -> u64 {
+    24 * 60 * 60
+}
+fn default_backup_keep() -> usize {
+    3
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_backup_enabled(),
+            interval_secs: default_backup_interval_secs(),
+            keep: default_backup_keep(),
+        }
+    }
+}
+
+impl BackupConfig {
+    /// Factory default seeded from the environment: `HERAMIND_BACKUP_INTERVAL_SECS=0`
+    /// starts disabled (until enabled in the UI), any other value sets the
+    /// interval; `HERAMIND_BACKUP_KEEP` overrides retention. Used when nothing
+    /// has been saved to the settings store yet.
+    pub fn from_env_or_default() -> Self {
+        let mut config = Self::default();
+        if let Ok(v) = std::env::var("HERAMIND_BACKUP_INTERVAL_SECS") {
+            if let Ok(secs) = v.parse::<u64>() {
+                if secs == 0 {
+                    config.enabled = false;
+                } else {
+                    config.interval_secs = secs.max(300);
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("HERAMIND_BACKUP_KEEP") {
+            if let Ok(keep) = v.parse::<usize>() {
+                config.keep = keep.clamp(1, 50);
+            }
+        }
+        config
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionConfig {
     /// Whether automatic cleanup is enabled.
     #[serde(default = "default_retention_enabled")]
     pub enabled: bool,
-
     /// Cleanup interval in hours.
     #[serde(default = "default_retention_interval")]
     pub interval_hours: u64,
@@ -337,6 +400,125 @@ pub struct RetentionConfig {
     /// Retention period in hours for image/binary data (None = forever).
     #[serde(default = "default_retention_image")]
     pub image_retention: Option<u64>,
+}
+
+/// Agent execution defaults (configurable via /api/settings/agent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDefaults {
+    /// Max tool-loop rounds (default 30).
+    #[serde(default = "default_agent_max_rounds")]
+    pub max_rounds: u32,
+    /// Global execution timeout in seconds (default 300).
+    #[serde(default = "default_agent_execution_timeout")]
+    pub execution_timeout_secs: u64,
+    /// Tool execution parallelism (default 6).
+    #[serde(default = "default_agent_tool_concurrency")]
+    pub tool_concurrency: usize,
+    /// Default sampling temperature (default 0.3).
+    #[serde(default = "default_agent_temperature")]
+    pub default_temperature: f32,
+    /// Default top_p (default 0.7).
+    #[serde(default = "default_agent_top_p")]
+    pub default_top_p: f32,
+    /// Default thinking_enabled override (None = use backend default).
+    #[serde(default)]
+    pub default_thinking_enabled: Option<bool>,
+    /// Chat conversation history depth — how many recent TURNS (user+assistant
+    /// pairs) the chat pipeline sends to the model. Applies to chat sessions;
+    /// scheduled agents keep their per-agent context_window_size. Default 50.
+    #[serde(default = "default_agent_chat_history_depth")]
+    pub chat_history_depth: usize,
+    /// Wall-clock budget for ONE interactive chat turn (all multi-round tool
+    /// loop rounds combined). When exhausted the loop exits into the forced
+    /// summary so the user always gets a text reply. Distinct from
+    /// `execution_timeout_secs` (scheduled-agent path) and from the
+    /// per-stream duration cap. Default 1800s.
+    #[serde(default = "default_agent_chat_turn_timeout")]
+    pub chat_turn_timeout_secs: u64,
+}
+
+fn default_agent_max_rounds() -> u32 {
+    30
+}
+fn default_agent_execution_timeout() -> u64 {
+    300
+}
+fn default_agent_tool_concurrency() -> usize {
+    6
+}
+fn default_agent_temperature() -> f32 {
+    0.3
+}
+fn default_agent_top_p() -> f32 {
+    0.7
+}
+fn default_agent_chat_history_depth() -> usize {
+    50
+}
+fn default_agent_chat_turn_timeout() -> u64 {
+    1800
+}
+
+impl Default for AgentDefaults {
+    fn default() -> Self {
+        Self {
+            max_rounds: default_agent_max_rounds(),
+            execution_timeout_secs: default_agent_execution_timeout(),
+            tool_concurrency: default_agent_tool_concurrency(),
+            default_temperature: default_agent_temperature(),
+            default_top_p: default_agent_top_p(),
+            default_thinking_enabled: None,
+            chat_history_depth: default_agent_chat_history_depth(),
+            chat_turn_timeout_secs: default_agent_chat_turn_timeout(),
+        }
+    }
+}
+
+impl AgentDefaults {
+    /// Load from the settings store (singleton), or defaults if unset/unavailable.
+    /// Mirrors the inline read pattern in `data_collector::get_time_context`.
+    pub fn get() -> Self {
+        SettingsStore::open_default()
+            .ok()
+            .map(|s| s.get_agent_defaults())
+            .unwrap_or_default()
+    }
+}
+
+/// Device defaults (configurable via /api/settings/device).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceDefaults {
+    /// Global default offline timeout in seconds (fallback for all devices).
+    #[serde(default = "default_device_offline_timeout")]
+    pub default_offline_timeout_secs: u64,
+    /// Whether unknown MQTT devices are auto-onboarded.
+    #[serde(default = "default_device_auto_onboard")]
+    pub auto_onboard_enabled: bool,
+}
+
+fn default_device_offline_timeout() -> u64 {
+    300
+}
+fn default_device_auto_onboard() -> bool {
+    true
+}
+
+impl Default for DeviceDefaults {
+    fn default() -> Self {
+        Self {
+            default_offline_timeout_secs: default_device_offline_timeout(),
+            auto_onboard_enabled: default_device_auto_onboard(),
+        }
+    }
+}
+
+impl DeviceDefaults {
+    pub fn get() -> Self {
+        SettingsStore::open_default()
+            .ok()
+            .map(|s| s.get_device_defaults())
+            .unwrap_or_default()
+    }
 }
 
 fn default_retention_enabled() -> bool {
@@ -445,6 +627,12 @@ pub struct ExternalBroker {
     #[serde(default = "default_external_broker_subscribe_topics")]
     #[serde(skip_serializing_if = "is_default_subscribe_topics")]
     pub subscribe_topics: Vec<String>,
+
+    /// Payload field used as the device identity when the topic cannot
+    /// uniquely identify a device (gateway forwarding many devices on one
+    /// topic). Empty/None → auto-detect common fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id_field: Option<String>,
 }
 
 fn default_external_broker_port() -> u16 {
@@ -490,6 +678,7 @@ impl ExternalBroker {
             last_error: None,
             updated_at: chrono::Utc::now().timestamp(),
             subscribe_topics: default_external_broker_subscribe_topics(),
+            device_id_field: None,
         }
     }
 
@@ -646,9 +835,19 @@ pub struct SettingsStore {
     db: Arc<Database>,
     /// Path to the database file (for singleton management)
     path: String,
+    /// Seals secret fields (LLM api_key) at rest; key file lives next to the db.
+    crypto: heramind_core::crypto::CryptoService,
 }
 
 impl SettingsStore {
+    /// Open the settings store at its canonical location
+    /// (`$HERAMIND_DATA_DIR/settings.redb`, legacy-compat fallback — see
+    /// `heramind_core::paths`). Callers that used the old
+    /// `SettingsStore::open("data/settings.redb")` literal should use this.
+    pub fn open_default() -> Result<Arc<Self>, Error> {
+        Self::open(heramind_core::paths::store_path("settings.redb"))
+    }
+
     /// Get or create the settings store singleton for the given path.
     /// This keeps the database open across all calls to avoid redb lock conflicts.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Arc<Self>, Error> {
@@ -671,9 +870,14 @@ impl SettingsStore {
         } else {
             Database::create(path_ref)?
         };
+        // Rollback guard: refuse databases stamped by a newer build (see schema.rs).
+        crate::schema::check_or_stamp(&db)
+            .map_err(|e| Error::Storage(format!("schema version: {e}")))?;
+        let crypto = crate::secret::crypto_for_db(path_ref);
         let store = Arc::new(SettingsStore {
             db: Arc::new(db),
             path: path_str,
+            crypto,
         });
 
         // Ensure all tables exist (create them if they don't)
@@ -708,18 +912,19 @@ impl SettingsStore {
         settings: &LlmSettings,
         source: &str,
     ) -> Result<(), Error> {
-        // Get old value for history
+        // Get old value for history (sealed form — history never stores
+        // plaintext secrets)
         let old_value = self
             .load_llm_settings()
             .ok()
             .flatten()
-            .and_then(|s| serde_json::to_value(s).ok());
+            .and_then(|s| self.llm_settings_for_history(&s));
 
         // Save the new settings
         self.save_llm_settings(settings)?;
 
         // Record the change
-        if let Ok(new_value) = serde_json::to_value(settings) {
+        if let Some(new_value) = self.llm_settings_for_history(settings) {
             let entry = ConfigChangeEntry::new(
                 "llm_config".to_string(),
                 old_value,
@@ -730,6 +935,13 @@ impl SettingsStore {
         }
 
         Ok(())
+    }
+
+    /// JSON form of LLM settings for config history, with `api_key` sealed.
+    fn llm_settings_for_history(&self, settings: &LlmSettings) -> Option<serde_json::Value> {
+        let mut sealed = settings.clone();
+        sealed.api_key = crate::secret::seal(&self.crypto, &settings.api_key);
+        serde_json::to_value(sealed).ok()
     }
 
     /// Save MQTT settings with change tracking.
@@ -793,7 +1005,7 @@ impl SettingsStore {
         }
 
         // Sort by timestamp descending (newest first)
-        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
 
         // Apply limit
         entries.truncate(limit);
@@ -816,7 +1028,7 @@ impl SettingsStore {
         }
 
         // Sort by timestamp descending
-        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
 
         entries.truncate(limit);
 
@@ -841,7 +1053,7 @@ impl SettingsStore {
         drop(read_txn);
 
         // Sort by timestamp descending
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|&(_, t)| std::cmp::Reverse(t));
 
         // Delete entries beyond keep_count
         let mut deleted = 0;
@@ -862,12 +1074,18 @@ impl SettingsStore {
     }
 
     /// Save LLM settings.
+    ///
+    /// The `api_key` field is sealed (AES-256-GCM, shared `encryption_key`)
+    /// before it touches the database; callers keep passing plaintext.
     pub fn save_llm_settings(&self, settings: &LlmSettings) -> Result<(), Error> {
+        let mut sealed = settings.clone();
+        sealed.api_key = crate::secret::seal(&self.crypto, &settings.api_key);
+
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(SETTINGS_TABLE)?;
             let value =
-                serde_json::to_vec(settings).map_err(|e| Error::Serialization(e.to_string()))?;
+                serde_json::to_vec(&sealed).map_err(|e| Error::Serialization(e.to_string()))?;
             table.insert("llm_config", value.as_slice())?;
         }
         write_txn.commit()?;
@@ -875,13 +1093,17 @@ impl SettingsStore {
     }
 
     /// Load LLM settings.
+    ///
+    /// Unseals `api_key` on the way out; pre-encryption plaintext rows load
+    /// unchanged (and get sealed on their next save).
     pub fn load_llm_settings(&self) -> Result<Option<LlmSettings>, Error> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(SETTINGS_TABLE)?;
 
         if let Some(data) = table.get("llm_config")? {
-            let settings: LlmSettings = serde_json::from_slice(data.value())
+            let mut settings: LlmSettings = serde_json::from_slice(data.value())
                 .map_err(|e| Error::Serialization(e.to_string()))?;
+            settings.api_key = crate::secret::unseal(&self.crypto, settings.api_key.take());
             Ok(Some(settings))
         } else {
             Ok(None)
@@ -1101,9 +1323,106 @@ impl SettingsStore {
         }
     }
 
+    /// Save backup schedule configuration.
+    pub fn save_backup_config(&self, config: &BackupConfig) -> Result<(), Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SETTINGS_TABLE)?;
+            let value =
+                serde_json::to_vec(config).map_err(|e| Error::Serialization(e.to_string()))?;
+            table.insert(KEY_BACKUP_CONFIG, value.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Load backup schedule configuration (None = never saved; callers fall
+    /// back to [`BackupConfig::from_env_or_default`]).
+    pub fn load_backup_config(&self) -> Result<Option<BackupConfig>, Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SETTINGS_TABLE)?;
+
+        if let Some(data) = table.get(KEY_BACKUP_CONFIG)? {
+            let config: BackupConfig = serde_json::from_slice(data.value())
+                .map_err(|e| Error::Serialization(e.to_string()))?;
+            Ok(Some(config))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Get retention configuration, returning defaults if not set.
     pub fn get_retention_config(&self) -> RetentionConfig {
         self.load_retention_config()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    // ========================================================================
+    // Agent Defaults
+    // ========================================================================
+
+    pub fn save_agent_defaults(&self, config: &AgentDefaults) -> Result<(), Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SETTINGS_TABLE)?;
+            let value =
+                serde_json::to_vec(config).map_err(|e| Error::Serialization(e.to_string()))?;
+            table.insert(KEY_AGENT_DEFAULTS, value.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_agent_defaults(&self) -> Result<Option<AgentDefaults>, Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SETTINGS_TABLE)?;
+        if let Some(data) = table.get(KEY_AGENT_DEFAULTS)? {
+            let config: AgentDefaults = serde_json::from_slice(data.value())
+                .map_err(|e| Error::Serialization(e.to_string()))?;
+            Ok(Some(config))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get agent defaults, returning defaults if not set.
+    pub fn get_agent_defaults(&self) -> AgentDefaults {
+        self.load_agent_defaults()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    // Device Defaults
+
+    pub fn save_device_defaults(&self, config: &DeviceDefaults) -> Result<(), Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SETTINGS_TABLE)?;
+            let value =
+                serde_json::to_vec(config).map_err(|e| Error::Serialization(e.to_string()))?;
+            table.insert(KEY_DEVICE_DEFAULTS, value.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_device_defaults(&self) -> Result<Option<DeviceDefaults>, Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SETTINGS_TABLE)?;
+        if let Some(data) = table.get(KEY_DEVICE_DEFAULTS)? {
+            let config: DeviceDefaults = serde_json::from_slice(data.value())
+                .map_err(|e| Error::Serialization(e.to_string()))?;
+            Ok(Some(config))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_device_defaults(&self) -> DeviceDefaults {
+        self.load_device_defaults()
             .ok()
             .flatten()
             .unwrap_or_default()
@@ -1262,10 +1581,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn heramind_timezone_defaults_to_vietnam_and_preserves_saved_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.redb");
+        {
+            let store = SettingsStore::open(&path).unwrap();
+            assert_eq!(store.get_global_timezone(), "Asia/Ho_Chi_Minh");
+            store.save_global_timezone("Europe/London").unwrap();
+        }
+        let reopened = SettingsStore::open(&path).unwrap();
+        assert_eq!(reopened.get_global_timezone(), "Europe/London");
+    }
+
+    #[test]
     fn test_llm_settings_default() {
         let settings = LlmSettings::default();
         assert_eq!(settings.backend_name(), "ollama");
-        assert_eq!(settings.model, "ministral-3:3b");
+        assert_eq!(settings.model, "qwen3.5:4b");
         assert_eq!(settings.temperature, 0.7);
     }
 
@@ -1306,5 +1638,162 @@ mod tests {
         // Delete settings
         assert!(store.delete_llm_settings().unwrap());
         assert!(!store.has_llm_settings());
+    }
+
+    #[test]
+    fn test_llm_settings_api_key_sealed_at_rest() {
+        // Own temp dir (NOT the ":memory:" singleton): that store is shared
+        // across all tests in this binary, and this test writes llm_config
+        // concurrently with test_settings_store. A real dir also exercises
+        // the persisted encryption_key-next-to-the-db path.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::open(tmp.path().join("settings.redb")).unwrap();
+
+        // Save settings carrying a cloud API key
+        let mut settings = LlmSettings::openai("gpt-4o-mini", "sk-rest-plaintext-leak");
+        settings.touch();
+        store.save_llm_settings(&settings).unwrap();
+
+        // The raw stored row must not contain the plaintext key
+        let read_txn = store.db.begin_read().unwrap();
+        let table = read_txn.open_table(SETTINGS_TABLE).unwrap();
+        let raw = table.get("llm_config").unwrap().unwrap();
+        let raw_str = String::from_utf8_lossy(raw.value()).to_string();
+        assert!(
+            !raw_str.contains("sk-rest-plaintext-leak"),
+            "api_key must be sealed at rest, got raw row: {raw_str}"
+        );
+        assert!(raw_str.contains("enc1:"), "sealed marker expected");
+
+        // Loading hands back the plaintext key for runtime use
+        let loaded = store.load_llm_settings().unwrap().unwrap();
+        assert_eq!(loaded.api_key.as_deref(), Some("sk-rest-plaintext-leak"));
+
+        // Config history must not leak the plaintext key either
+        store.save_llm_settings_tracked(&settings, "test").unwrap();
+        let history = store.get_all_config_history(50).unwrap();
+        for entry in &history {
+            let rendered = serde_json::to_string(entry).unwrap();
+            assert!(
+                !rendered.contains("sk-rest-plaintext-leak"),
+                "config history leaked plaintext api_key: {rendered}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod broker_security_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn broker_at(host: &str, tls: bool, user: Option<&str>, pass: Option<&str>) -> ExternalBroker {
+        let mut b = ExternalBroker::new("t".into(), "t".into(), host.into(), 1883);
+        b.tls = tls;
+        b.username = user.map(str::to_string);
+        b.password = pass.map(str::to_string);
+        b
+    }
+
+    fn levels(warnings: &[SecurityWarning]) -> Vec<&SecurityWarning> {
+        warnings.iter().collect()
+    }
+
+    /// Public broker + plaintext + credentials = the worst practical setup:
+    /// High (public no-TLS) AND Medium (creds in cleartext). Both warnings
+    /// must fire — dropping either hides a real exposure from the user.
+    #[test]
+    fn public_broker_without_tls_and_with_creds_warns_high_and_medium() {
+        let warnings = broker_at("broker.emqx.io", false, Some("u"), Some("p")).validate_security();
+        let lv: Vec<_> = warnings.iter().map(|w| &w.level).collect();
+        assert!(
+            lv.iter().any(|l| matches!(l, SecurityLevel::High)),
+            "public+no-TLS must be High: {warnings:?}"
+        );
+        assert!(
+            lv.iter().any(|l| matches!(l, SecurityLevel::Medium)),
+            "creds over plaintext must be Medium: {warnings:?}"
+        );
+    }
+
+    /// TLS on a public broker with auth configured = clean bill.
+    #[test]
+    fn public_broker_with_tls_and_auth_is_clean() {
+        assert!(broker_at("broker.emqx.io", true, Some("u"), Some("p"))
+            .validate_security()
+            .is_empty());
+    }
+
+    /// RFC1918 / loopback / link-local addresses are NOT public: a LAN
+    /// deployment without TLS must not be scared with the High warning
+    /// (it's the normal on-prem topology).
+    #[test]
+    fn private_addresses_are_not_public() {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.10",
+        ] {
+            let warnings = broker_at(host, false, Some("u"), Some("p")).validate_security();
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|w| matches!(w.level, SecurityLevel::High)),
+                "{host} is private — must not warn High"
+            );
+        }
+        // Boundary checks: 172.15.x and 172.32.x are OUTSIDE 172.16/12 → public.
+        for host in ["172.15.0.1", "172.32.0.1", "8.8.8.8"] {
+            let warnings = broker_at(host, false, None, None).validate_security();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| matches!(w.level, SecurityLevel::High)),
+                "{host} is public — must warn High"
+            );
+        }
+        // sanity: the parser really round-trips these
+        assert!("172.15.0.1".parse::<IpAddr>().is_ok());
+    }
+
+    /// mDNS/local hostnames are treated as private; dotted public-looking
+    /// hostnames as public; bare single-word hostnames as local.
+    #[test]
+    fn hostname_classification() {
+        for host in ["printer.local", "gateway.localhost", "nas.lan."] {
+            let warnings = broker_at(host, false, None, None).validate_security();
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|w| matches!(w.level, SecurityLevel::High)),
+                "{host} is a local-suffix hostname — must not warn High"
+            );
+        }
+        let warnings = broker_at("my-broker.example.com", false, None, None).validate_security();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w.level, SecurityLevel::High)),
+            "public hostname must warn High"
+        );
+        let warnings = broker_at("edgebox", false, None, None).validate_security();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w.level, SecurityLevel::High)),
+            "bare hostname is likely local"
+        );
+        // no-auth always warns Low at minimum
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w.level, SecurityLevel::Low)),
+            "no-auth must warn Low"
+        );
+        let _ = levels(&warnings);
     }
 }

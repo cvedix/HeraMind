@@ -209,16 +209,16 @@ For inline styles (CodeMirror, Recharts), use `fontMonoStack` from `@/design-sys
 
 ### Font Size Tokens
 
-All custom font sizes are defined as semantic tokens in `@/design-system/tokens/typography`. **NEVER hardcode `text-[Xpx]` in components** — import the appropriate token instead.
+The below-`text-xs` scale is registered as **first-class Tailwind fontSize utilities** in `tailwind.config.js` — use the `text-*` class directly in static `className` strings (no import needed); JS contexts use the matching constants from `@/design-system/tokens/typography`. **NEVER hardcode `text-[Npx]`** — tune sizes in the tailwind config (single source), never per-component. Each utility pairs a tuned line-height (~1.3–1.45); explicit `leading-*` still overrides.
 
-| Token | Size | Use Case |
-|-------|------|----------|
-| `textMicro` | 9px | Extreme micro labels — data type badges in execution details |
-| `textNano` | 10px | Timestamps, tiny metadata, compact badges |
-| `textMini` | 11px | Badge text, secondary labels, tab labels |
-| `textCode` | 12px | Inline code in markdown, code snippets |
-| `textBody` | 13px | Chat messages, tool call text, markdown body |
-| `textHeading` | 15px | Markdown headings within content |
+| Utility | Constant | Size / Line | Use Case |
+|---------|----------|-------------|----------|
+| `text-micro` | `textMicro` | 9px / 12px | Extreme micro labels — data type badges in execution details |
+| `text-nano` | `textNano` | 10px / 14px | Timestamps, tiny metadata, compact badges |
+| `text-mini` | `textMini` | 11px / 16px | Badge text, secondary labels, tab labels |
+| `text-code` | `textCode` | 12px / 17px | Inline code in markdown, code snippets |
+| `text-body` | `textBody` | 13px / 19px | Chat messages, tool call text, markdown body |
+| `text-heading` | `textHeading` | 15px / 22px | Markdown headings within content |
 
 Standard Tailwind sizes fill the remaining tiers:
 
@@ -287,12 +287,15 @@ Every page must use `PageLayout` from `@/components/layout/PageLayout`.
 ```
 
 **Rules:**
+- Desktop title row via PageHeader: **title + one-line description** (subtitle prop); the row is `mx-auto` + maxWidth so the title left-aligns with the content below. The visual-dashboard page is the exception — title only (its toolbar with the dashboard name follows)
 - Content area uses `overflow-auto` via PageLayout's scroll container — do NOT add your own scroll
-- Fixed headers (tabs) go in `headerContent` prop
-- Fixed footers (pagination) go in `footer` prop
+- Fixed headers (tabs/toolbars) go in `headerContent` prop — toolbar rows use `px-4 sm:px-6 md:px-8` matching the title row; NO border-b under the row (content separation is the capsule/toolbar's own affordances)
+- Fixed footers (pagination) go in `footer` prop; the footer offsets past both sidebars via `--app-sidebar-width`
 - Page-level loading MUST use skeleton screens, never spinners
 
 ### Tabs Pattern: `PageTabsBar` + `PageTabsContent`
+
+**Page-level primary actions (Add / Configure / Create) live in `PageTabsBar` `actions` — level with the tabs, top-right — NOT inside the tab content.** Build `actions` per `activeTab` (e.g. "Add Channel" on the channels tab, "Configure IM bridge" on the IM tab). Do not render a separate toolbar or button row inside `PageTabsContent` for a primary add/configure action.
 
 ```tsx
 <PageLayout title="Title" headerContent={<PageTabsBar tabs={tabs} />}>
@@ -342,16 +345,6 @@ const yes = await confirm({ title: 'Delete?', description: 'This cannot be undon
 if (yes) await api.deleteItem(id)
 ```
 
-### Dialog State Hook: `useDialog`
-
-```tsx
-import { useDialog } from '@/hooks/useDialog'
-
-const { open, data, openDialog, closeDialog } = useDialog<User>()
-openDialog(user)  // passes user as data
-```
-
----
 
 ## 5. Loading States
 
@@ -445,9 +438,7 @@ const { isLoading, handleClick } = useLoadingButton(async () => { await api.save
 
 **Mobile behavior:** First column becomes card title, remaining columns become key-value pairs. Skeleton rows shown during loading.
 
-### Virtual List: `VirtualList`
-
-For rendering 1000+ items (sessions, logs, etc.), use `VirtualList` from `@/components/ui/virtual-list` for high-performance rendering.
+**Empty state (hard rule):** `ResponsiveTable` always renders the header and shows its built-in `EmptyStateCompact` when `data` is empty. Do NOT swap the whole table for a standalone `EmptyState` on empty data, and do NOT hand-roll a custom `<p>` empty hint. If you need a custom message, pass it via `emptyState={<EmptyState .../>}` (same component family) — never a bare paragraph. The table + header must stay visible at all times so every tab's empty state looks the same.
 
 ### Pagination: `Pagination`
 
@@ -462,25 +453,6 @@ Default page size is **10** across all pages.
   hideOnMobile  // enables infinite scroll on mobile
   onLoadMore={loadMore}
 />
-```
-
-### Bulk Actions: `BulkActionBar`
-
-For multi-select operations:
-
-```tsx
-<BulkActionBar
-  selectedCount={selected.length}
-  onCancel={() => setSelected([])}
-  actions={[{ label: 'Delete', variant: 'destructive', onClick: handleBulkDelete }]}
-/>
-```
-
-### Stats Display: `StatsCard` / `MonitorStatsGrid`
-
-```tsx
-<StatsCard title="Devices" value={42} icon={Server} trend="+5%" />
-<MonitorStatsGrid stats={stats} />
 ```
 
 ### Status Badges: `StatusBadge`
@@ -581,17 +553,29 @@ import { getStatusColorClass, getStatusBgClass } from '@/design-system/utils/for
 
 ## 8. Dialog & Z-Index Layering Standard
 
-### Z-Index Stack
+### Z-Index Stack (complete ladder)
 
 | Level | Value | Usage |
 |-------|-------|-------|
 | Base | `z-0` | Normal content |
-| Sticky | `z-10` | Sticky headers |
+| Sticky | `z-10` | In-page sticky headers, toolbars, table headers |
+| Desktop chrome | `z-20` | Fixed top navigation bar (TopNav) |
+| Mobile chrome | `z-30` | Mobile sticky page header (MobilePageHeader) |
 | Dropdowns | `z-40` | Mobile nav, sidebars |
-| Overlay | `z-50` | Dialog overlays (UnifiedFormDialog, Sheet) |
-| Full Screen | `z-[100]` | Full-screen dialogs (FullScreenDialog) |
-| Full Screen Header | `z-[110]` | Full-screen dialog headers, nested dialogs |
+| Overlay | `z-50` | Dialog overlays (UnifiedFormDialog, Sheet, drawers, FAB) |
+| Floating window | `z-[90]` | Non-modal floating panels (GlobalChatFab panel) — below fullscreen layers, above dialogs |
+| Full Screen | `z-[100]` | Full-screen layers (FullScreenDialog, SettingsDialog, dashboard fullscreen, mobile full-screen portals) |
+| Full Screen Header | `z-[110]` | Full-screen dialog headers, nested dialogs, widget fullscreen viewers (image/video/map) |
 | Popovers / Alerts | `z-[200]` | Select, DropdownMenu, Popover, Tooltip, AlertDialog |
+| Toast | `z-[210]` | Toast viewport — must stay visible above AlertDialog scrims |
+| System | `z-[300]` | Route progress bar, instance switch overlay, backend-unavailable takeover |
+| Accessibility | `z-[400]` | Skip-to-content link (focused state only) |
+
+Rules of the ladder:
+
+- **Every fixed/overlay element must map onto a tier in this table.** Introducing a new value (e.g. `z-[55]`, `z-[70]`) is a spec violation — extend the table instead.
+- **Chrome tiers (z-20/z-30) lose to everything modal.** Drawers and dialogs cover the chrome; never geometrically dodge it with `top: var(--topnav-height)` hacks.
+- **Portal policy:** all fixed overlays must portal to `#dialog-root` via `getPortalRoot()` — never to `document.body`, and never rendered inline inside the page tree. Inline fixed elements can be trapped by ancestor stacking contexts (`z-index`/`opacity`/`transform`), which silently caps them below the chrome.
 
 ### Dialog Type → Z-Index Mapping
 
@@ -602,10 +586,13 @@ import { getStatusColorClass, getStatusBgClass } from '@/design-system/utils/for
 | `FullScreenDialog` header | `z-[110]` (via `zIndex` prop) | — | — |
 | Nested `UnifiedFormDialog` inside `FullScreenDialog` | `z-[110]` via `className` | `bg-black/80 backdrop-blur-sm` | `#dialog-root` |
 | Nested `Dialog` inside `FullScreenDialog` (image viewer) | `z-[110]` via `className` | `bg-black/80` | `#dialog-root` |
+| Widget fullscreen viewers (image/video/map/layer) | `z-[110]` | per viewer | `#dialog-root` |
+| Mobile full-screen portals (config editor, item selector) | `z-[100]` | `bg-background` | `#dialog-root` |
 | `AlertDialog` / `useConfirm` (`Confirmer`) | `z-[200]` (always top) | `bg-black/60` | `#dialog-root` |
 | `Sheet` (side panel) | `z-50` | `bg-bg-80 backdrop-blur-sm` | `#dialog-root` |
+| Drawer (SessionSidebar / DashboardListSidebar mobile) | `z-50` (mask + panel) | `bg-overlay-light backdrop-blur-sm` | `#dialog-root` |
 | Popover / Select / DropdownMenu / Tooltip | `z-[200]` | none | `#dialog-root` |
-| Toast notifications | `z-[200]` | none | viewport fixed |
+| Toast notifications | `z-[210]` | none | viewport fixed |
 
 ### Nesting Rules
 
@@ -625,7 +612,7 @@ import { getStatusColorClass, getStatusBgClass } from '@/design-system/utils/for
 
 **Rule 2: UnifiedFormDialog inside FullScreenDialog MUST use `className="z-[110]"`.**
 
-The `UnifiedFormDialog` auto-detects z-index from className: it extracts the value via regex (`z-\[?(\d+)\]?`) and applies it to both overlay and content.
+The `UnifiedFormDialog` auto-detects z-index from className: it extracts the value via regex (`z-\[?(\d+)\]?`) and applies it to both overlay and content. The base `DialogContent` (`ui/dialog.tsx`) does the same extraction **in both its desktop and mobile full-screen branches** — never hardcode a z value on a dialog overlay; pass it through `className` so the overlay lifts with the content.
 
 ```tsx
 // Auto-detection in UnifiedFormDialog (built-in):
@@ -724,22 +711,20 @@ All slices follow the same pattern with `fetchCache`:
 | Slice | File | Key Resources |
 |-------|------|---------------|
 | device | `store/slices/deviceSlice.ts` | Devices, adapters, device metrics |
-| agent | `store/slices/agentSlice.ts` | AI agents |
+| agent | (no slice — pages fetch via `api` + local state) | AI agents |
 | llmBackend | `store/slices/llmBackendSlice.ts` | LLM backends |
 | extension | `store/slices/extensionSlice.ts` | Extensions |
 | session | `store/slices/sessionSlice.ts` | Chat sessions |
 | alert | `store/slices/alertSlice.ts` | Alerts |
-| dashboard | `store/slices/dashboardSlice.ts` | Dashboards |
+| dashboard | `store/slices/dashboard{Config,Crud,Layout,UI}Slice.ts` | Dashboards (four slices) |
 | settings | `store/slices/settingsSlice.ts` | System settings |
 | auth | `store/slices/authSlice.ts` | Authentication (JWT + API key) |
 | ui | `store/slices/uiSlice.ts` | UI state |
 | update | `store/slices/updateSlice.ts` | Update checks |
 | aiAnalyst | `store/slices/aiAnalystSlice.ts` | AI analyst |
 | instance | `store/slices/instanceSlice.ts` | Multi-instance management |
-| command | `store/slices/commandSlice.ts` | Device commands |
-| message | `store/slices/messageSlice.ts` | Notification messages |
-| transform | `store/slices/transformSlice.ts` | Data transforms |
-| storage | `store/slices/storageSlice.ts` | Storage metrics |
+| dataPush | `store/slices/dataPushSlice.ts` | Data-push targets + delivery logs |
+| frontendComponent | `store/slices/frontendComponentSlice.ts` | Community dashboard widgets |
 
 ### useDataSource Hook
 
@@ -947,8 +932,13 @@ When adding i18n keys, follow this checklist:
 | Glass border hover | `border-glass-border-hover` | Hover state |
 | Card | `bg-card` | Content cards |
 | Muted | `bg-muted` | Subtle backgrounds |
+| Chrome | `bg-[var(--chrome)]` | App chrome: top navigation bar |
 
-Fixed headers and footers should use `bg-surface-glass backdrop-blur` for the frosted glass effect.
+**Chrome is opaque by design.** Navigation chrome (TopNav) uses the opaque `--chrome`
+token, not glass: translucent bars caused transparent→solid paint flashes on WebKit and
+let content bleed through during overscroll. Glass surfaces are for *floating* elements
+(panels, masks, FABs) — `PageLayout`'s fixed footer (`bg-surface-glass`) is the one
+deliberate exception.
 
 ---
 
@@ -1069,14 +1059,14 @@ const { values, errors, setValue, handleSubmit, isSubmitting } = useForm({
 
 ## 16. Spacing & Radius
 
-Use Tailwind's standard spacing utilities (`p-2`, `gap-4`, etc.) and the predefined radius tokens:
+Use Tailwind's standard spacing utilities (`p-2`, `gap-4`, etc.) and the predefined radius tokens. Base `--radius` is 8px — a tight, professional feel (reference design language); Tailwind derives the ladder from it:
 
 | Token | Value | Class |
 |-------|-------|-------|
-| sm | 6px | `rounded-sm` |
-| md | 8px | `rounded-md` |
-| lg | 10px | `rounded-lg` |
-| xl | 15px | `rounded-xl` |
+| sm | 4px | `rounded-sm` |
+| md | 6px | `rounded-md` |
+| lg | 8px | `rounded-lg` |
+| xl | 12px | `rounded-xl` |
 | 2xl | 16px | `rounded-2xl` |
 | full | circle | `rounded-full` |
 
@@ -1253,7 +1243,7 @@ ws.isConnected()
 ```tsx
 import { ExtensionStreamClient } from '@/lib/extension-stream'
 
-const client = new ExtensionStreamClient('weather-forecast-v2')
+const client = new ExtensionStreamClient('weather-forecast')
 client.connect({ /* config */ })
 client.onResult((data, dataType, sequence) => { /* handle binary data */ })
 client.onSessionClosed((stats) => { /* session ended */ })
@@ -1311,6 +1301,8 @@ Pages are in `src/pages/`, lazy-loaded via `React.lazy()` for bundle splitting:
 | `/settings` | SettingsPage | `pages/settings.tsx` |
 | `/messages`, `/messages/channels` | MessagesPage | `pages/messages.tsx` |
 | `/extensions` | ExtensionsPage | `pages/extensions.tsx` |
+
+**Settings is a dialog, not a page.** The `SettingsDialog` is mounted once at the app root (`App.tsx`); pages open it via `useStore.getState().openSettings(section?)`. The legacy `/settings` route renders a small shell (`SettingsRoute` in `App.tsx`) that opens the dialog and redirects to `/` — deep links land on chat with settings open, never a blank page. Do NOT create a settings page route.
 
 ### Protected Route Pattern
 
@@ -1575,41 +1567,35 @@ import { ThemeToggle } from '@/components/layout/ThemeToggle'
 
 ---
 
-## 28. Navigation (TopNav)
+## 28. Navigation & Shell (AppSidebar rail + floating controls)
 
-### Desktop Navigation
+### Architecture (desktop)
 
-- **Layout**: Fixed top bar (`z-20`, `bg-surface-glass backdrop-blur-xl`)
-- **Nav items**: Icon buttons with `Tooltip` (delay 500ms), ghost variant, `w-11 h-11 rounded-lg`
-- **Active state**: `bg-muted text-primary`
-- **Right side**: Instance selector → Language toggle (中/EN) → Theme toggle → Alert bell (with unread badge) → User avatar dropdown
-- **Alert dropdown**: Shows latest 10 alerts with severity badges, unread indicator, acknowledge button
+- **AppSidebar** (`components/layout/AppSidebar.tsx`): a fixed **72px** icon rail, full height — the app's primary navigation. The shell (`App.tsx`) lays out `[AppSidebar][page-sidebar slot][content column]`; there is NO top bar.
+- **navItems.ts** (`components/layout/navItems.ts`): shared nav definition (paths, icons, i18n keys, active-route logic). The rail and MobileNav must not fork these.
+- **GlobalControls** (`components/layout/GlobalControls.tsx`): the top-right cluster — theme / language / alerts — floating over the content area's title row (chat: over the message area with a faint surface). Instance selector and onboarding live in the rail footer.
 
-### Mobile Navigation
+### Rail structure (top → bottom)
 
-- **Layout**: Same fixed top bar + scrollable text tab bar below
-- **Tab bar**: Horizontally scrollable text labels (uses `mobileLabelKey` — shorter than desktop labels)
-- **Active indicator**: Animated underline (`h-[3px] bg-primary`, `transition-all duration-250 ease-out`)
-- **Swipe gesture**: Left/right swipe on tab bar navigates to adjacent tabs (threshold: 50px)
-- **Auto-scroll**: Active tab scrolled into view with `scrollIntoView({ behavior: 'smooth', inline: 'center' })`
+- Brand mark (traffic-light strip `--titlebar-inset`=32px reserved above it, macOS Tauri)
+- Nav: flat icon list (8 items) — tooltips on `side="right"`; active = `bg-muted` square; all icons h-5
+- Footer: instance selector (compact square) · onboarding rocket (badge) · settings · **user avatar LAST** (upward dropdown: theme / language / settings / about / logout); `gap-2` spacing
 
-### Nav Items
+### Window dragging (Tauri)
 
-| ID | Path | Icon | Desktop Label | Mobile Label |
-|----|------|------|---------------|--------------|
-| dashboard | `/chat` | MessageSquare | nav.dashboard | navShort.dashboard |
-| agents | `/agents` | Bot | nav.agents | navShort.agents |
-| visual-dashboard | `/visual-dashboard` | LayoutDashboard | nav.visual-dashboard | navShort.visual-dashboard |
-| devices | `/devices` | Cpu | nav.devices | navShort.devices |
-| automation | `/automation` | Workflow | nav.automation | navShort.automation |
-| data | `/data` | Database | nav.data | navShort.data |
-| messages | `/messages` | Bell | nav.messages | navShort.messages |
-| extensions | `/extensions` | Puzzle | nav.extensions | navShort.extensions |
-| settings | `/settings` | Settings | nav.settings | navShort.settings |
+Three drag surfaces, all via `lib/windowDrag.ts` (mousedown → `startDragging`, skips interactive elements): the rail itself, each page-drawer's top strip (absolute, covers clearance + header; header content sits at z-[1]), and the content area's top strip (h-14, z-10 — below GlobalControls z-20, below page headers at z-[15]+).
 
-### Height Management
+### Fixed surfaces & widths
 
-TopNav height is tracked via `setTopNavHeight()` and exposed as `--topnav-height` CSS variable for use by `PageLayout` and other components.
+- `--app-sidebar-width` (72px desktop / 0 mobile) and `--page-sidebar-width` (drawer column, live-tracked via ResizeObserver) are exported on `<html>`; ChatPage's keyboard container offsets `left: calc(app + page sidebar)`. **Any new fixed element must offset the same way.**
+- `--topnav-height` is 0 everywhere (no top bar).
+- Page drawers (session list, dashboard list): fixed 256px, never collapse, `bg-background` + `border-r`, titles aligned with the page title row (safe-area + 1rem top padding; no traffic-light inset — the lights only cover the rail).
+
+### Page chrome pattern (all desktop pages)
+
+Title row (`PageHeader`, single compact line, no descriptions, mx-auto maxWidth aligned with content) → optional toolbar row (PageTabsBar / DashboardToolbar: tabs left, actions right, `px-4 sm:px-6 md:px-8`, no border-b) → content. Chat has no title row; its floating controls carry a faint `bg-background/60` pill.
+
+Style: mono accent — no brand color in UI chrome (orange lives in the logo, semantic/data colors, login/setup washes). Rail = `--sidebar-bg` (light ~#F8F9FA, dark 0.10), drawers = content tone, separated by color contrast + the drawer's border-r.
 
 ---
 
@@ -1898,7 +1884,6 @@ The `Field` component from `@/components/ui/field` auto-links labels, errors, an
 | i18n Locales | `web/src/i18n/locales/{en,zh}/` |
 | Mobile Hooks | `web/src/hooks/useMobile.ts` |
 | Form Hook | `web/src/hooks/useForm.ts` |
-| Dialog Hook | `web/src/hooks/useDialog.ts` |
 | Infinite Scroll | `web/src/hooks/useInfiniteScroll.ts` |
 | Store Slices | `web/src/store/slices/` |
 | API Client | `web/src/lib/api.ts` |
@@ -1919,7 +1904,11 @@ The `Field` component from `@/components/ui/field` auto-links labels, errors, an
 | Icon System | `web/src/design-system/icons/index.tsx` |
 | Theme Provider | `web/src/components/ui/theme.tsx` |
 | Theme Toggle | `web/src/components/layout/ThemeToggle.tsx` |
-| TopNav | `web/src/components/layout/TopNav.tsx` |
+| App Sidebar | `web/src/components/layout/AppSidebar.tsx` |
+| Global Controls | `web/src/components/layout/GlobalControls.tsx` |
+| Alerts Menu | `web/src/components/layout/AlertsMenu.tsx` |
+| Window Drag | `web/src/lib/windowDrag.ts` |
+| Nav Items (shared) | `web/src/components/layout/navItems.ts` |
 | Toast Hook | `web/src/components/ui/use-toast.ts` |
 | Toast Component | `web/src/components/ui/toast.tsx` |
 | Global Notify | `web/src/lib/notify.ts` |

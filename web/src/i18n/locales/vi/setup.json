@@ -54,5 +54,8 @@
   "minPasswordLength": "Độ dài mật khẩu tối thiểu",
   "minUsernameLength": "Độ dài tên đăng nhập tối thiểu",
   "passwordNeedsLetter": "Mật khẩu cần có chữ cái",
-  "passwordNeedsNumber": "Mật khẩu cần có chữ số"
+  "passwordNeedsNumber": "Mật khẩu cần có chữ số",
+  "subscribedToast": "Đã đăng ký bản tin",
+  "quickBuiltin": "Dùng mô hình tích hợp (khuyến nghị)",
+  "quickBuiltinDesc": "Tải mô hình bằng một lần nhấn — chạy ngoại tuyến sau khi tải, không cần API key"
 }

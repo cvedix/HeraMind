@@ -133,26 +133,32 @@ fn set_file_mode_0600(_path: &std::path::Path) {}
 /// This lets the CLI auto-authenticate regardless of working directory on
 /// macOS / Linux / Windows, without depending on platform keychains (which are
 /// unavailable on headless edge devices).
+/// Best-effort data-dir for path-joining call sites (images, widget
+/// bundles): env override, else the platform dir when it holds a store,
+/// else the cwd-relative "data". This is `resolve_data_dir`'s precedence
+/// without the legacy-fallback subtleties of store_path (these sites
+/// historically hand-rolled env-or-"data" and silently missed the
+/// platform-dir tier on hosts without ./data).
+pub fn data_dir_for_paths() -> String {
+    match crate::data_dir::resolve(None) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        // Nothing found: keep the historical relative default so first-run
+        // creation still lands somewhere predictable.
+        Err(_) => "data".to_string(),
+    }
+}
+
 pub fn resolve_data_dir() -> String {
-    // 1. Explicit override
-    if let Ok(dir) = std::env::var("HERAMIND_DATA_DIR") {
-        if !dir.is_empty() {
-            return dir;
-        }
+    // Shared precedence: env → desktop app dir → ./data → platform default.
+    // The desktop tier matters: `heramind login` on a machine whose only
+    // store is the desktop app's must find THAT store, not a stale ./data.
+    // (dirs::data_local_dir() alone is unsafe here: on macOS it equals
+    // ~/Library/Application Support, where our own credential file lives —
+    // hence the store-file checks the shared resolver performs.)
+    match crate::data_dir::resolve(None) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => "data".to_string(),
     }
-    // 2. Platform user-level default (only if it has api_keys.redb).
-    //    On macOS, data_local_dir() == config_dir() == ~/Library/Application Support/,
-    //    so `heramind login` creating ~/Library/Application Support/heramind/ for the
-    //    credential file would make resolve_data_dir() wrongly return it as the
-    //    data dir. Checking for api_keys.redb prevents this false positive.
-    if let Some(local) = dirs::data_local_dir() {
-        let candidate = local.join("heramind");
-        if candidate.join("api_keys.redb").exists() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-    // 3. Legacy fallback (relative to CWD)
-    "data".to_string()
 }
 
 /// Try to read the default API key.
@@ -269,6 +275,17 @@ fn decrypt_api_key(cipher: &Aes256Gcm, encoded: &str) -> Option<String> {
     String::from_utf8(plaintext).ok()
 }
 
+/// Serializes EVERY test in this crate that touches the process-global
+/// HERAMIND_DATA_DIR env. `std::env::set_var`/`remove_var` race under
+/// Rust's parallel test threads — one test's `remove_var` (or its
+/// `set_var("")`) lands between another's `set_var` and its read, and
+/// the reader correctly ignores the empty/missing override and falls
+/// through to the "data" legacy default (the CI flake in
+/// test_resolve_data_dir_env_override). auth_cmd's env tests take the
+/// SAME lock: they share one test binary with this module.
+#[cfg(test)]
+pub(crate) static DATA_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +298,7 @@ mod tests {
 
     #[test]
     fn test_resolve_data_dir_env_override() {
+        let _lock = DATA_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // HERAMIND_DATA_DIR takes priority over platform default and legacy "data".
         std::env::set_var("HERAMIND_DATA_DIR", "/tmp/heramind-resolve-test-unique");
         assert_eq!(resolve_data_dir(), "/tmp/heramind-resolve-test-unique");
@@ -289,6 +307,7 @@ mod tests {
 
     #[test]
     fn test_resolve_data_dir_empty_env_falls_back() {
+        let _lock = DATA_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // An empty HERAMIND_DATA_DIR should be ignored (fall through to other sources).
         std::env::set_var("HERAMIND_DATA_DIR", "");
         let resolved = resolve_data_dir();

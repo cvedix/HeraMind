@@ -208,6 +208,39 @@ pub fn compact_tool_results(messages: &[AgentMessage], keep_recent: usize) -> Ve
 /// - Never compress system messages
 ///
 /// Expected impact: 30-50% token reduction for long conversations.
+/// Cap history to the last N user turns (configurable chat depth,
+/// /api/settings/agent). Walks back to the Nth-from-last user message
+/// and drops everything before it — tool/assistant messages belonging
+/// to those turns go with them. Shared by every chat path (streaming
+/// SSE/WS, multimodal, non-streaming) so the advertised setting behaves
+/// identically everywhere. Scheduled agents are unaffected — they carry
+/// their own per-agent context_window_size.
+pub(crate) fn apply_chat_history_depth(history: &mut Vec<AgentMessage>) {
+    let depth = heramind_storage::AgentDefaults::get().chat_history_depth;
+    let mut user_turns_seen = 0usize;
+    let mut cut_idx = None;
+    for (i, m) in history.iter().enumerate().rev() {
+        if m.role == "user" {
+            user_turns_seen += 1;
+            if user_turns_seen >= depth {
+                cut_idx = Some(i);
+                break;
+            }
+        }
+    }
+    if let Some(idx) = cut_idx {
+        if idx > 0 {
+            tracing::debug!(
+                before = history.len(),
+                after = history.len() - idx,
+                depth,
+                "Applied chat history depth"
+            );
+            history.drain(..idx);
+        }
+    }
+}
+
 pub fn compact_conversation(
     messages: &[AgentMessage],
     keep_recent: usize,
@@ -253,19 +286,13 @@ pub fn compact_conversation(
             continue;
         }
 
-        // Keep user messages verbatim (they contain critical intent)
+        // Keep user messages verbatim (they contain critical intent).
+        // Tightening to 1000 chars happens in the LAST RESORT block below
+        // and only when the assembled set is over budget — truncating here
+        // unconditionally used to destroy intent even when the window had
+        // ample room (and made the last-resort pass dead code).
         if msg.role == "user" {
-            // Truncate very long user messages
-            let truncated_content: Arc<str> = if msg.content.len() > 200 {
-                let s: String = msg.content.chars().take(200).collect();
-                format!("{}... (message truncated)", s).into()
-            } else {
-                msg.content.clone()
-            };
-            compressed_older.push(AgentMessage {
-                content: truncated_content,
-                ..msg.clone()
-            });
+            compressed_older.push(msg.clone());
             _current_tokens += tokenizer::estimate_message_tokens(msg);
             continue;
         }
@@ -311,6 +338,19 @@ pub fn compact_conversation(
             round_thinking: None,
             timestamp,
         });
+    }
+
+    // LAST RESORT — only when tool outputs are cleared and assistants are
+    // summarized and the assembly is STILL over target: truncate the
+    // verbatim user messages (1000 chars each, not the old 200 — user
+    // intent loses fidelity fast below that).
+    if _current_tokens > target_tokens {
+        for msg in compressed_older.iter_mut() {
+            if msg.role == "user" && msg.content.len() > 1000 {
+                let s: String = msg.content.chars().take(1000).collect();
+                msg.content = format!("{}... (message truncated)", s).into();
+            }
+        }
     }
 
     // Combine compressed older messages with recent messages
@@ -743,8 +783,9 @@ pub struct Agent {
     shared_state: Arc<tokio::sync::RwLock<AgentSharedState>>,
     /// Tool result cache - caches recent tool executions to avoid redundant calls
     tool_result_cache: Arc<tokio::sync::RwLock<ToolResultCache>>,
-    /// Frozen memory snapshot for this session (loaded once, never changes)
-    memory_snapshot: std::sync::OnceLock<Option<crate::memory::MemorySnapshot>>,
+    /// Memory snapshot (re-read on each user message so the agent sees its own
+    /// memory writes without restarting the session).
+    memory_snapshot: tokio::sync::RwLock<Option<crate::memory::MemorySnapshot>>,
     /// Semaphore limiting parallel tool executions within a single agent step
     tool_concurrency_limit: Arc<Semaphore>,
 }
@@ -768,8 +809,11 @@ impl Agent {
             concurrent_limit: 3,    // Default to 3 concurrent LLM requests
         };
 
-        let llm_interface =
-            Arc::new(LlmInterface::new(llm_config).with_system_prompt(&config.system_prompt));
+        let llm_interface = Arc::new(
+            LlmInterface::new(llm_config)
+                .with_system_prompt(&config.system_prompt)
+                .with_system_prompt_suffix(config.system_prompt_suffix.clone()),
+        );
 
         // Create semantic mapper with resource index
         let resource_index = Arc::new(RwLock::new(ResourceIndex::new()));
@@ -802,7 +846,7 @@ impl Agent {
                 last_injected_context_hash: 0,
             })),
             tool_result_cache: Arc::new(tokio::sync::RwLock::new(ToolResultCache::new())),
-            memory_snapshot: std::sync::OnceLock::new(),
+            memory_snapshot: tokio::sync::RwLock::new(None),
             tool_concurrency_limit: Arc::new(Semaphore::new(
                 std::env::var("HERAMIND_TOOL_CONCURRENCY")
                     .ok()
@@ -884,37 +928,67 @@ impl Agent {
                 let mut runtime =
                     OllamaRuntime::new(config).map_err(|e| HeraMindError::llm(e.to_string()))?;
 
-                // Set capabilities override if provided
-                if let Some(caps) = capabilities {
-                    let reported_max_context = caps.max_context.unwrap_or(128000);
-                    // The service-level cap is authoritative even when a
-                    // persisted capability is stale. The Ollama request path
-                    // already caps `num_ctx`; prompt budgeting must use the
-                    // same effective value.
-                    let max_context = std::env::var("HERAMIND_MAX_CONTEXT")
-                        .ok()
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .map(|cap| reported_max_context.min(cap))
-                        .unwrap_or(reported_max_context);
-                    tracing::debug!(
-                        multimodal = %caps.multimodal,
-                        thinking_display = %caps.thinking_display,
-                        function_calling = %caps.function_calling,
-                        reported_max_context = %reported_max_context,
-                        max_context = %max_context,
-                        "Applying capabilities override to OllamaRuntime"
-                    );
-                    runtime = runtime.with_capabilities_override(
-                        caps.multimodal,
-                        caps.thinking_display,
-                        caps.function_calling,
-                        max_context,
-                        caps.supports_audio,
-                    );
-                } else {
-                    tracing::debug!(
-                        "No capabilities provided for OllamaRuntime, using default detection"
-                    );
+                // [fresh runtime probe] The direct chat runtime built here is
+                // cached for the process lifetime and is NOT rebuilt when the
+                // instance manager later refreshes stored capabilities — so a
+                // creation-time registry default (max_context = 128000 for
+                // unknown models) would survive forever in the prompt budget
+                // while the server enforces its real window (measured
+                // 2026-08-17: every turn sent a full-history prompt that
+                // overflowed and got rescued by the compact-retry ladder).
+                // Probe /api/show NOW; the probe is authoritative except for
+                // an explicit user override (gotcha #3).
+                // The probe is authoritative for max_context/tools (no user
+                // override channel exists for those); multimodal/thinking keep
+                // the stored value when present — the effective stored value
+                // may already encode a user override we cannot see from here
+                // (BackendCapabilities carries no override marker; that lives
+                // on the instance record) — gotcha #3.
+                let detected = runtime.fetch_capabilities_from_api().await;
+                match (&detected, &capabilities) {
+                    (Some(d), stored) => {
+                        let (multimodal, thinking) = match stored {
+                            Some(c) => (c.multimodal, c.thinking_display),
+                            None => (d.supports_multimodal, d.supports_thinking),
+                        };
+                        tracing::info!(
+                            multimodal,
+                            thinking,
+                            tools = d.supports_tools,
+                            max_ctx = d.max_context,
+                            "OllamaRuntime capabilities resolved from /api/show"
+                        );
+                        runtime = runtime.with_capabilities_override(
+                            multimodal,
+                            thinking,
+                            d.supports_tools,
+                            d.max_context,
+                        );
+                    }
+                    (None, Some(caps)) => {
+                        // Probe failed — stored values. Conservative context
+                        // fallback: OVER-claiming context turns every turn into
+                        // an overflow-then-retry (wasted full prefill);
+                        // under-claiming only trims history.
+                        tracing::debug!(
+                            multimodal = %caps.multimodal,
+                            thinking_display = %caps.thinking_display,
+                            function_calling = %caps.function_calling,
+                            max_context = %caps.max_context.unwrap_or(8192),
+                            "Applying capabilities override to OllamaRuntime (probe failed)"
+                        );
+                        runtime = runtime.with_capabilities_override(
+                            caps.multimodal,
+                            caps.thinking_display,
+                            caps.function_calling,
+                            caps.max_context.unwrap_or(8192),
+                        );
+                    }
+                    (None, None) => {
+                        tracing::debug!(
+                            "No capabilities and no probe for OllamaRuntime, using runtime defaults"
+                        );
+                    }
                 }
 
                 (Arc::new(runtime) as Arc<dyn LlmRuntime>, model)
@@ -1137,22 +1211,59 @@ impl Agent {
                     crate::llm_backends::backends::llamacpp::LlamaCppRuntime::new(config)
                         .map_err(|e| HeraMindError::llm(e.to_string()))?;
 
-                // Set capabilities override if provided
-                if let Some(caps) = capabilities {
-                    tracing::debug!(
-                        multimodal = %caps.multimodal,
-                        thinking_display = %caps.thinking_display,
-                        function_calling = %caps.function_calling,
-                        max_context = %caps.max_context.unwrap_or(128000),
-                        "Applying capabilities override to LlamaCppRuntime"
-                    );
-                    runtime = runtime.with_capabilities_override(
-                        caps.multimodal,
-                        caps.thinking_display,
-                        caps.function_calling,
-                        caps.max_context.unwrap_or(128000),
-                        caps.supports_audio,
-                    );
+                // [fresh runtime probe] Same rationale as the Ollama arm: the
+                // direct chat runtime is cached for the process lifetime, so
+                // bake the REAL window in at creation instead of trusting the
+                // stored registry default (128000). /props is authoritative
+                // for a local llama-server; only a user override wins over it.
+                // Same authority split as the Ollama arm: probe wins for
+                // max_context/tools (no override channel); multimodal/thinking
+                // keep stored when present (stored may encode a user override
+                // invisible at this layer) — gotcha #3.
+                let detected = runtime.detect_capabilities().await;
+                match (&detected, &capabilities) {
+                    (Some(d), stored) => {
+                        let (multimodal, thinking) = match stored {
+                            Some(c) => (c.multimodal, c.thinking_display),
+                            None => (d.supports_multimodal, d.supports_thinking),
+                        };
+                        tracing::info!(
+                            multimodal,
+                            thinking,
+                            tools = d.supports_tools,
+                            max_ctx = d.max_context,
+                            "LlamaCppRuntime capabilities resolved from /props"
+                        );
+                        runtime = runtime.with_capabilities_override(
+                            multimodal,
+                            thinking,
+                            d.supports_tools,
+                            d.max_context,
+                        );
+                    }
+                    (None, Some(caps)) => {
+                        // Probe failed — stored values + conservative context
+                        // fallback (over-claiming = overflow-then-retry churn;
+                        // under-claiming = harmless trimming).
+                        tracing::debug!(
+                            multimodal = %caps.multimodal,
+                            thinking_display = %caps.thinking_display,
+                            function_calling = %caps.function_calling,
+                            max_context = %caps.max_context.unwrap_or(8192),
+                            "Applying capabilities override to LlamaCppRuntime (probe failed)"
+                        );
+                        runtime = runtime.with_capabilities_override(
+                            caps.multimodal,
+                            caps.thinking_display,
+                            caps.function_calling,
+                            caps.max_context.unwrap_or(8192),
+                        );
+                    }
+                    (None, None) => {
+                        tracing::debug!(
+                            "No capabilities and no probe for LlamaCppRuntime, using runtime defaults"
+                        );
+                    }
                 }
 
                 (Arc::new(runtime) as Arc<dyn LlmRuntime>, model)
@@ -1198,12 +1309,11 @@ impl Agent {
     pub async fn update_tool_definitions(&self) {
         use heramind_core::llm::backend::ToolDefinition as CoreToolDefinition;
 
-        // definitions_for_llm() already filters out disabled tools (master-off
-        // extension or per-command disable). Use it directly instead of
-        // iterating list() + get() so the chat path can't leak disabled tools.
+        // allowed_tool_defs() already filters out disabled tools AND applies
+        // the per-session allowlist. Use it instead of iterating list() + get()
+        // so the chat path can't leak disabled or out-of-profile tools.
         let core_defs: Vec<CoreToolDefinition> = self
-            .tools
-            .definitions_for_llm()
+            .allowed_tool_defs()
             .into_iter()
             .map(|def| CoreToolDefinition {
                 name: def.name,
@@ -1223,6 +1333,25 @@ impl Agent {
             "Updated {} tool definitions for LLM (from registry)",
             tool_count
         );
+    }
+
+    /// Tool definitions visible to this session's LLM: the registry's
+    /// definitions (disabled tools already excluded) filtered through
+    /// `config.allowed_tools`. Empty allowlist = all tools. The
+    /// user-interaction tools (ask_user / confirm_action / clarify_intent)
+    /// are never filtered out — they are UX, not domain capability.
+    fn allowed_tool_defs(&self) -> Vec<crate::toolkit::tool::ToolDefinition> {
+        let defs = self.tools.definitions_for_llm();
+        if self.config.allowed_tools.is_empty() {
+            return defs;
+        }
+        const ALWAYS_KEEP: [&str; 3] = ["ask_user", "confirm_action", "clarify_intent"];
+        defs.into_iter()
+            .filter(|d| {
+                ALWAYS_KEEP.contains(&d.name.as_str())
+                    || self.config.allowed_tools.iter().any(|a| a == &d.name)
+            })
+            .collect()
     }
 
     /// Generate a dynamic system prompt with tool descriptions.
@@ -1246,8 +1375,8 @@ impl Agent {
             prompt.push_str(&capability);
         }
 
-        // === Memory snapshot injection (frozen, loaded once per session) ===
-        if let Some(snapshot) = self.memory_snapshot.get().and_then(|opt| opt.as_ref()) {
+        // === Memory snapshot injection (re-read each user message) ===
+        if let Some(snapshot) = self.memory_snapshot.read().await.as_ref() {
             let section = snapshot.to_prompt_section();
             if !section.is_empty() {
                 prompt.push_str(&section);
@@ -1264,9 +1393,10 @@ impl Agent {
 
         prompt.push_str("\n\n## Available Tools (Quick Reference)\n\n");
 
-        // definitions_for_llm() filters out disabled tools so the text prompt
-        // stays in sync with the function-calling schema.
-        let defs = self.tools.definitions_for_llm();
+        // allowed_tool_defs() filters out disabled tools and applies the
+        // per-session allowlist so the text prompt stays in sync with the
+        // function-calling schema.
+        let defs = self.allowed_tool_defs();
         let extension_defs: Vec<_> = defs.iter().filter(|d| d.name.contains(':')).collect();
 
         for def in defs.iter().filter(|d| !d.name.contains(':')) {
@@ -1308,15 +1438,20 @@ impl Agent {
         &self.session_id
     }
 
-    /// Set the frozen memory snapshot for this session.
-    /// Called once when memory is enabled for the session.
-    pub fn set_memory_snapshot(&self, snapshot: crate::memory::MemorySnapshot) {
-        let _ = self.memory_snapshot.set(Some(snapshot));
+    /// Set the memory snapshot for this session. Called on each user message
+    /// (not just the first) so the agent sees memory writes from the previous
+    /// turn. Also pushes the snapshot's prompt section to the LLM interface.
+    pub async fn set_memory_snapshot(&self, snapshot: crate::memory::MemorySnapshot) {
+        let section = snapshot.to_prompt_section();
+        if !section.is_empty() {
+            self.llm_interface.set_memory_context(Some(section)).await;
+        }
+        *self.memory_snapshot.write().await = Some(snapshot);
     }
 
     /// Check if a memory snapshot has been loaded.
-    pub fn has_memory_snapshot(&self) -> bool {
-        self.memory_snapshot.get().is_some_and(|opt| opt.is_some())
+    pub async fn has_memory_snapshot(&self) -> bool {
+        self.memory_snapshot.read().await.is_some()
     }
 
     /// Get the session state.
@@ -1850,7 +1985,7 @@ impl Agent {
 
         // Get existing history (user message already added by caller in `process`)
         // Optimize: Clone only needed messages in one pass, avoiding double-clone
-        let history_without_last: Vec<AgentMessage> = {
+        let mut history_without_last: Vec<AgentMessage> = {
             let state = self.internal_state.read().await;
             let memory = &state.memory;
             if memory.len() > 1 {
@@ -1860,6 +1995,9 @@ impl Agent {
                 Vec::new()
             }
         };
+
+        // === CHAT HISTORY DEPTH (configurable, /api/settings/agent) ===
+        apply_chat_history_depth(&mut history_without_last);
 
         // === DYNAMIC CONTEXT WINDOW: Get model's actual capacity ===
         // Query the LLM backend for the actual context window size.
@@ -1893,46 +2031,69 @@ impl Agent {
             effective_max
         );
 
-        // === ANTHROPIC-STYLE IMPROVEMENT: Apply context window with tool result clearing ===
-        // This prevents context bloat from old tool calls while maintaining conversation continuity
-        // Uses compaction cache for incremental updates when only a few messages changed
-        let compacted_history = {
-            let mut state = self.internal_state.write().await;
-            let current_count = state.memory.len().saturating_sub(1); // without last
+        // === BUDGET-FIRST SHORT-CIRCUIT ===
+        // Compaction is LOSSY (old user messages truncated to 200 chars,
+        // assistant turns squeezed to one-line summaries). Running it before
+        // knowing the budget destroyed history even when the window had ample
+        // room. Measure first: when the whole (depth-capped) history fits the
+        // effective window, pass it through untouched — the lossy pipeline
+        // below only runs when it genuinely doesn't fit.
+        let history_tokens: usize = history_without_last
+            .iter()
+            .map(tokenizer::estimate_message_tokens)
+            .sum();
+        let compacted_history = if history_tokens <= effective_max {
+            tracing::debug!(
+                history_tokens,
+                effective_max,
+                msgs = history_without_last.len(),
+                "History fits budget — skipping lossy compaction"
+            );
+            history_without_last.clone()
+        } else {
+            // === ANTHROPIC-STYLE IMPROVEMENT: Apply context window with tool result clearing ===
+            // This prevents context bloat from old tool calls while maintaining conversation continuity
+            // Uses compaction cache for incremental updates when only a few messages changed
+            let compacted_history = {
+                let mut state = self.internal_state.write().await;
+                let current_count = state.memory.len().saturating_sub(1); // without last
 
-            // Check cache validity: same max_tokens and small message delta
-            let cached = state.compaction_cache.take();
-            let compacted = if let Some((cached_count, cached_max, ref cached_msgs)) = cached {
-                if cached_max == effective_max
-                    && current_count > cached_count
-                    && current_count <= cached_count + 4
-                {
-                    // Incremental: only compact the new messages and append
-                    let new_msgs: Vec<AgentMessage> = history_without_last
-                        .iter()
-                        .skip(cached_count)
-                        .cloned()
-                        .collect();
-                    let mut base = cached_msgs.clone();
-                    if !new_msgs.is_empty() {
-                        // Re-compact the tail with existing context
-                        // For small deltas, just append (tool compaction will handle on next full run)
-                        base.extend(new_msgs);
-                        build_context_window(&base, effective_max)
+                // Check cache validity: same max_tokens and small message delta
+                let cached = state.compaction_cache.take();
+                let compacted = if let Some((cached_count, cached_max, ref cached_msgs)) = cached {
+                    if cached_max == effective_max
+                        && current_count > cached_count
+                        && current_count <= cached_count + 4
+                    {
+                        // Incremental: only compact the new messages and append
+                        let new_msgs: Vec<AgentMessage> = history_without_last
+                            .iter()
+                            .skip(cached_count)
+                            .cloned()
+                            .collect();
+                        let mut base = cached_msgs.clone();
+                        if !new_msgs.is_empty() {
+                            // Re-compact the tail with existing context
+                            // For small deltas, just append (tool compaction will handle on next full run)
+                            base.extend(new_msgs);
+                            build_context_window(&base, effective_max)
+                        } else {
+                            base
+                        }
                     } else {
-                        base
+                        // Full recompaction needed
+                        build_context_window(&history_without_last, effective_max)
                     }
                 } else {
-                    // Full recompaction needed
                     build_context_window(&history_without_last, effective_max)
-                }
-            } else {
-                build_context_window(&history_without_last, effective_max)
+                };
+
+                // Update cache
+                state.compaction_cache = Some((current_count, effective_max, compacted.clone()));
+                compacted
             };
 
-            // Update cache
-            state.compaction_cache = Some((current_count, effective_max, compacted.clone()));
-            compacted
+            compacted_history
         };
 
         tracing::debug!(
@@ -2203,11 +2364,11 @@ impl Agent {
             };
             AgentMessage::assistant_with_tools_and_thinking(
                 &final_text,
-                tool_calls_with_results,
+                tool_calls_with_results.clone(),
                 &cleaned_thinking,
             )
         } else {
-            AgentMessage::assistant_with_tools(&final_text, tool_calls_with_results)
+            AgentMessage::assistant_with_tools(&final_text, tool_calls_with_results.clone())
         };
         self.internal_state
             .write()
@@ -2216,7 +2377,11 @@ impl Agent {
 
         Ok(AgentResponse {
             message: final_message,
-            tool_calls,
+            // Accumulated across every round of the multi-round loop — the
+            // first round alone under-reports turns where the model
+            // investigates before acting (and made eval metrics blind to
+            // exactly that behavior).
+            tool_calls: tool_calls_with_results,
             memory_context_used: true,
             tools_used,
             processing_time_ms: 0,
@@ -2740,7 +2905,7 @@ END"#
         let args_preview = if semantically_mapped.to_string().len() > 200 {
             format!(
                 "{}...",
-                &semantically_mapped
+                semantically_mapped
                     .to_string()
                     .chars()
                     .take(200)
@@ -3009,7 +3174,6 @@ fn apply_cloud_capabilities(
             caps.thinking_display,
             caps.function_calling,
             caps.max_context.unwrap_or(128000),
-            caps.supports_audio,
         );
     } else {
         tracing::debug!(
@@ -3121,6 +3285,52 @@ mod tests {
 
         let state = agent.state().await;
         assert_eq!(state.id, "test_session");
+    }
+
+    #[tokio::test]
+    async fn allowed_tools_filters_definitions_but_keeps_interaction_tools() {
+        // A per-session allowlist trims domain tools from BOTH the
+        // function-calling schema and the text quick-reference prompt, while
+        // the user-interaction tools always survive (they are UX, not domain
+        // capability).
+        use crate::toolkit::ToolRegistryBuilder;
+        let mut registry = ToolRegistryBuilder::new().build();
+        registry.register(std::sync::Arc::new(MockShellTool));
+        registry.register(std::sync::Arc::new(MockListRulesTool));
+        use crate::tools::{AskUserTool, ClarifyIntentTool, ConfirmActionTool};
+        registry.register(std::sync::Arc::new(AskUserTool::new()));
+        registry.register(std::sync::Arc::new(ConfirmActionTool::new()));
+        registry.register(std::sync::Arc::new(ClarifyIntentTool::new()));
+
+        let config = AgentConfig {
+            allowed_tools: vec!["shell".to_string()],
+            ..Default::default()
+        };
+        let agent = Agent::with_tools(
+            config,
+            "allowlist-test".to_string(),
+            std::sync::Arc::new(registry),
+        );
+        agent.update_tool_definitions().await;
+
+        let defs = agent.llm_interface().get_tool_definitions().await;
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"shell"), "allowlisted tool must be kept");
+        for ux in ["ask_user", "confirm_action", "clarify_intent"] {
+            assert!(
+                names.contains(&ux),
+                "interaction tool {ux} must survive allowlisting"
+            );
+        }
+        assert!(
+            !names.contains(&"list_rules"),
+            "out-of-profile tool must be filtered"
+        );
+
+        // Text quick-reference prompt stays in sync with the schema
+        let prompt = agent.generate_dynamic_system_prompt().await;
+        assert!(prompt.contains("**shell**"));
+        assert!(!prompt.contains("**list_rules**"));
     }
 
     #[tokio::test]

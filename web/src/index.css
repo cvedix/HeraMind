@@ -59,14 +59,12 @@ body,
    never apply, which causes downstream var() fallbacks to kick in. This was
    the root cause of PWA content overflowing the top safe area on iOS. */
 :root {
-  /* TopNav height including safe area (4rem chrome + safe-area-inset-top) */
-  --topnav-height: calc(4rem + env(safe-area-inset-top, 0px));
-  /* Chat page top padding: TopNav + Mobile Header + safe area */
-  --chat-content-padding-top: calc(6.5rem + env(safe-area-inset-top, 0px));
+  /* (Empty — the topbar-era vars were removed; --titlebar-inset is set at
+     runtime by the AppSidebar.) */
 }
 @supports (padding: env(safe-area-inset-top)) {
   .safe-top {
-    padding-top: env(safe-area-inset-top, 0px);
+    padding-top: calc(env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px));
   }
   /* Mobile nav drawer: hide the built-in SheetContent close (X) button —
      we render our own inside the header for proper safe-area handling
@@ -80,6 +78,10 @@ body,
     padding-top: env(safe-area-inset-top, 12px);
   }
 }
+/* TRAP: .safe-bottom is a non-layer rule — it OVERRIDES any bottom-padding
+   utility (pb- / py-) on the same element (that's how the About copyright
+   and the chat composer lost their bottom padding). Never combine them: use
+   pb-[calc(<size>+env(safe-area-inset-bottom,0px))] instead. */
 .safe-bottom {
   padding-bottom: 0px;
 }
@@ -288,16 +290,19 @@ html {
 
 @layer base {
   :root {
-    /* Blue / white / black product palette.
-       Light mode keeps the workspace white with a faint blue temperature,
-       while interaction and brand surfaces use saturated HeraMind blue. */
-    --background: oklch(0.99 0.004 255);
+    /* White canvas (reference palette): content sits directly on white and
+       separates via subtle borders; the sidebar is the gray layer, not the
+       page. Cards/inputs share the white canvas. */
+    --background: oklch(1 0 0);
     /* Solid white for stable chrome layers (TopNav, tab strips, toolbars,
-       page headers). These anchor the layout — they should NOT float with
-       the aurora the way the scrollable content area does. In dark mode
-       this token falls back to --card so the same class works in both. */
+       page headers). These anchor the layout as a distinct elevated layer
+       above the gray content canvas. In dark mode this token falls back to
+       --card so the same class works in both. */
     --chrome: oklch(1 0 0);
-    --foreground: oklch(0.13 0.02 255);
+    /* Sidebar rail — the one gray chrome layer (~#F8F9FA), separating from
+       the white canvas by color contrast; no border (reference palette). */
+    --sidebar-bg: oklch(0.97 0 0);
+    --foreground: oklch(0.21 0.01 264);
     --card: oklch(1 0 0);
     --card-foreground: oklch(0.13 0.02 255);
     --popover: oklch(1 0 0);
@@ -312,17 +317,17 @@ html {
     --accent-foreground: oklch(0.13 0.02 255);
     --destructive: oklch(0.42 0.14 255);
     --destructive-foreground: oklch(1 0 0);
-    /* Alias: some components use text-error-foreground; map it to the same
-       white so action buttons/toasts render correctly (was missing -> black text) */
-    --error-foreground: oklch(1 0 0);
-    --border: oklch(0.13 0.02 255 / 10%);
-    --input: oklch(0.13 0.02 255 / 11%);
-    /* Focus ring uses the product blue, with opacity kept low enough to avoid
-     * a heavy halo on repeated controls. */
-    --ring: color-mix(in oklch, var(--primary) 42%, transparent);
-    /* Base radius — slightly larger (12px) for a softer, more modern feel.
-       Tailwind's rounded-lg/md/sm all derive from this via calc(). */
-    --radius: 0.75rem;
+    --border: oklch(0.21 0.01 264 / 9%);
+    --input: oklch(0.21 0.01 264 / 10%);
+    /* Focus ring — neutral foreground tint, NOT brand orange. The previous
+     * `--ring: var(--brand)` made every focused input/tab/button flash a
+     * bright orange halo, which users read as "random orange edges". A
+     * subtle foreground-tinted ring still satisfies WCAG focus-indicator
+     * contrast for keyboard a11y without screaming brand color everywhere. */
+    --ring: color-mix(in oklch, var(--foreground) 35%, transparent);
+    /* Base radius — 8px: professional, dense feel (reference design
+       language). Tailwind derives the ladder from this: lg 8 / md 6 / sm 4. */
+    --radius: 0.5rem;
     --space-1: 0.25rem;
     --space-2: 0.5rem;
     --space-3: 0.75rem;
@@ -330,15 +335,19 @@ html {
     --space-6: 1.5rem;
     --space-8: 2rem;
 
-    /* Border radius scale — consistent 2px steps */
-    --radius-sm: 0.5rem;
-    --radius-md: 0.625rem;
-    --radius-lg: 0.75rem;
-    --radius-xl: 1rem;
-    --radius-2xl: 1.25rem;
+    /* Border radius scale — tight professional steps */
+    --radius-sm: 0.25rem;
+    --radius-md: 0.375rem;
+    --radius-lg: 0.5rem;
+    --radius-xl: 0.75rem;
+    --radius-2xl: 1rem;
     --radius-full: 9999px;
 
-    /* Chart colors */
+    /* Chart colors. CONSTRAINT: keep light and dark values identical — charts
+       are driven by the JS constants in design-system/tokens/color.ts, which
+       are theme-blind; diverging here would split the palette by consumer
+       type. A per-theme chart palette requires reading these vars at runtime
+       (getComputedStyle) at the chart layer. */
     --chart-1: oklch(0.52 0.23 255);
     --chart-2: oklch(0.61 0.20 245);
     --chart-3: oklch(0.70 0.14 235);
@@ -350,11 +359,18 @@ html {
     --duration-fast: 150ms;
     --duration-normal: 200ms;
     --duration-slow: 300ms;
+    /* Stagger: list-entrance cascade step (consumed by ResponsiveTable inline calc) */
+    --stagger-step: 50ms;
 
-    /* Easing functions */
-    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-    --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
-    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+    /* Easing functions — Linear-style motion language.
+       Two families: standard (no overshoot) + spring (overshoot that
+       approximates physical bounce; single-overshoot cubic-bezier, NOT
+       multi-bounce inertia — a known limit of the pure-CSS approach). */
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);            /* emphasized decelerate: element entrance */
+    --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);          /* symmetric standard transition */
+    --ease-standard: cubic-bezier(0.2, 0, 0, 1);          /* Linear standard: crisp linear motion */
+    --ease-spring-snappy: cubic-bezier(0.5, 1.5, 0.5, 1); /* light overshoot: micro-interactions, toggles, small elements */
+    --ease-spring-soft: cubic-bezier(0.34, 1.4, 0.64, 1); /* soft overshoot: large elements, dialog/sheet entrance */
 
     /* Semantic colors */
     --color-success: oklch(0.55 0.21 250);
@@ -390,11 +406,13 @@ html {
     --accent-indigo: oklch(0.44 0.15 260);
     --accent-indigo-bg: oklch(0.44 0.15 260 / 10%);
 
-    /* Shadow system */
-    --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 5%);
-    --shadow-md: 0 2px 4px -1px oklch(0 0 0 / 8%);
-    --shadow-lg: 0 4px 12px -2px oklch(0 0 0 / 8%);
-    --shadow-xl: 0 8px 20px -4px oklch(0 0 0 / 10%);
+    /* Shadow system — layered (contact + ambient) for soft, realistic
+       elevation. Each step up adds a wider, fainter ambient layer rather than
+       just scaling one shadow. */
+    --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 6%);
+    --shadow-md: 0 1px 2px 0 oklch(0 0 0 / 5%), 0 2px 6px -1px oklch(0 0 0 / 7%);
+    --shadow-lg: 0 1px 2px 0 oklch(0 0 0 / 5%), 0 4px 12px -2px oklch(0 0 0 / 9%), 0 12px 24px -8px oklch(0 0 0 / 6%);
+    --shadow-xl: 0 2px 4px 0 oklch(0 0 0 / 5%), 0 8px 20px -4px oklch(0 0 0 / 10%), 0 20px 40px -12px oklch(0 0 0 / 8%);
 
     /* Glass-specific tokens (light) */
     --glass: oklch(1 0 0 / 55%);
@@ -406,9 +424,12 @@ html {
     --shadow-glass-lg: 0 2px 8px 0 oklch(0 0 0 / 8%);
     --shadow-brand: 0 2px 12px 0 oklch(0.52 0.23 255 / 18%);
 
-    /* Brand color - HeraMind blue */
+    /* Brand color - HeraMind blue, full scale. hover = press-deep,
+       active = pressed, bg = soft tint for selected/active states (nav pills). */
     --brand: oklch(0.52 0.23 255);
-    --brand-bg: oklch(0.52 0.23 255 / 11%);
+    --brand-hover: oklch(0.46 0.24 255);
+    --brand-active: oklch(0.40 0.22 255);
+    --brand-bg: oklch(0.52 0.23 255 / 10%);
     --brand-foreground: oklch(1 0 0);
     /* Drop-shadow color for the 3D brand wordmark (fixed hex — drop-shadow
        does not resolve CSS vars reliably across renderers) */
@@ -430,10 +451,21 @@ html {
     /* Chat-specific colors - light mode */
     --msg-user-bg: oklch(0.52 0.23 255);
     --msg-user-text: oklch(1 0 0);
-    --msg-ai-bg: oklch(0.97 0.012 255);
-    --msg-ai-text: oklch(0.13 0.02 255);
-    --msg-system-bg: oklch(0.95 0.018 255);
-    --msg-system-text: oklch(0.38 0.04 255);
+    --msg-ai-bg: oklch(0.97 0.003 270);
+    --msg-ai-text: oklch(0.18 0.02 270);
+    /* Syntax-highlighting palette (rehype-highlight / hljs). GitHub-based,
+       tuned for the muted code background. Light theme. */
+    --syn-text: oklch(0.20 0.01 270);
+    --syn-keyword: oklch(0.54 0.22 25);
+    --syn-string: oklch(0.37 0.10 235);
+    --syn-comment: oklch(0.55 0.01 270);
+    --syn-number: oklch(0.50 0.18 265);
+    --syn-function: oklch(0.53 0.20 305);
+    --syn-builtin: oklch(0.50 0.18 265);
+    --syn-variable: oklch(0.45 0.13 28);
+    --syn-tag: oklch(0.50 0.15 145);
+    --msg-system-bg: oklch(0.95 0.003 270);
+    --msg-system-text: oklch(0.45 0.01 270);
 
     --tool-bg: oklch(0.97 0.012 255);
     --tool-border: oklch(0.52 0.23 255);
@@ -478,15 +510,25 @@ html {
   }
 
   .dark {
-    /* Black-first dark mode with a blue undertone for brand continuity. */
+    /* Subtle warm charcoal — avoids the cold dead-black by mixing a touch of
+       brand warmth (hue 280→270 with slight chroma) for a richer dark mode. */
     --background: oklch(0.10 0.018 255 / 98%);
     --foreground: oklch(0.97 0.004 255);
+    /* Surface ladder (dark): background 0.135 < card 0.175 < popover 0.19 <
+       chrome 0.20 — each elevation step raises lightness so layers separate
+       without relying on shadows (which barely read on dark). Card keeps a
+       slight translucency for depth over colorful dashboard content. */
     --card: oklch(0.145 0.018 255 / 86%);
     /* Dark-mode chrome: slightly lighter than background so nav/toolbars
        read as a distinct elevated layer, mirroring how light-mode --chrome
        (pure white) sits above --background. */
     --chrome: oklch(0.13 0.018 255);
+    /* Sidebar rail — clearly BELOW the page/drawer background (0.135) so
+       the rail vs content step reads in dark mode just like light mode
+       (#F8F9FA rail vs white content). */
+    --sidebar-bg: oklch(0.085 0.018 255);
     --card-foreground: oklch(0.97 0.004 255);
+    /* Popovers/menus float above cards — one step up, just under chrome. */
     --popover: oklch(0.145 0.018 255);
     --popover-foreground: oklch(0.97 0.004 255);
     --primary: oklch(0.62 0.22 255);
@@ -497,22 +539,21 @@ html {
     --muted-foreground: oklch(0.68 0.018 255);
     --accent: oklch(0.22 0.035 255);
     --accent-foreground: oklch(0.97 0.004 255);
-    --destructive: oklch(0.62 0.18 255);
-    --destructive-foreground: oklch(1 0 0);
-    --error-foreground: oklch(1 0 0);
-    --border: oklch(1 0 0 / 9%);
-    --input: oklch(1 0 0 / 11%);
-    /* Blue focus ring (see light-mode --ring rationale). */
+    --destructive: oklch(0.577 0.245 27);
+    --destructive-foreground: oklch(0.95 0.006 270);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 12%);
+    /* Neutral focus ring (see light-mode --ring rationale). */
     --ring: color-mix(in oklch, var(--primary) 48%, transparent);
 
-    --color-success: oklch(0.70 0.15 235);
-    --color-success-bg: oklch(0.70 0.15 235 / 12%);
-    --color-warning: oklch(0.72 0.08 235);
-    --color-warning-bg: oklch(0.72 0.08 235 / 12%);
-    --color-error: oklch(0.66 0.18 265);
-    --color-error-bg: oklch(0.66 0.18 265 / 12%);
-    --color-info: oklch(0.68 0.19 255);
-    --color-info-bg: oklch(0.68 0.19 255 / 12%);
+    --color-success: oklch(0.72 0.19 155);
+    --color-success-bg: oklch(0.72 0.19 155 / 10%);
+    --color-warning: oklch(0.72 0.16 85);
+    --color-warning-bg: oklch(0.72 0.16 85 / 10%);
+    --color-error: oklch(0.577 0.245 27);
+    --color-error-bg: oklch(0.577 0.245 27 / 10%);
+    --color-info: oklch(0.65 0.15 250);
+    --color-info-bg: oklch(0.65 0.15 250 / 10%);
 
     /* Tint backgrounds (dark: white-based for visibility on dark bg) */
     --primary-bg: oklch(0.68 0.19 255 / 16%);
@@ -538,10 +579,13 @@ html {
     --accent-indigo: oklch(0.64 0.16 260);
     --accent-indigo-bg: oklch(0.64 0.16 260 / 15%);
 
-    --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 20%);
-    --shadow-md: 0 2px 6px -1px oklch(0 0 0 / 25%);
-    --shadow-lg: 0 4px 16px -3px oklch(0 0 0 / 25%);
-    --shadow-xl: 0 8px 24px -5px oklch(0 0 0 / 30%);
+    /* Shadow system (dark) — deeper blacks than light (shadows barely read
+       on dark surfaces), still layered. Real dark elevation comes from the
+       surface lightness ladder + borders above; shadows add depth cue only. */
+    --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 25%);
+    --shadow-md: 0 1px 2px 0 oklch(0 0 0 / 20%), 0 2px 8px -1px oklch(0 0 0 / 30%);
+    --shadow-lg: 0 2px 4px 0 oklch(0 0 0 / 20%), 0 4px 16px -3px oklch(0 0 0 / 40%), 0 10px 28px -8px oklch(0 0 0 / 25%);
+    --shadow-xl: 0 2px 6px 0 oklch(0 0 0 / 22%), 0 8px 24px -5px oklch(0 0 0 / 45%), 0 18px 40px -12px oklch(0 0 0 / 30%);
 
     --glass: oklch(0.16 0.018 255 / 56%);
     --glass-heavy: oklch(0.13 0.018 255 / 84%);
@@ -552,8 +596,12 @@ html {
     --shadow-glass-lg: 0 4px 16px 0 oklch(0 0 0 / 25%);
     --shadow-brand: 0 2px 12px 0 oklch(0.68 0.19 255 / 22%);
 
-    /* Brand color - HeraMind blue (brighter for dark bg) */
+    /* Brand color - HeraMind blue (brighter for dark bg), full scale.
+       Dark hover/active go BRIGHTER (light-mode goes darker) — the surface
+       direction that reads as "engaged" against a dark canvas. */
     --brand: oklch(0.68 0.19 255);
+    --brand-hover: oklch(0.74 0.18 255);
+    --brand-active: oklch(0.80 0.16 255);
     --brand-bg: oklch(0.68 0.19 255 / 16%);
     --brand-foreground: oklch(1 0 0);
     --brand-shadow: #2f83ff;
@@ -569,23 +617,35 @@ html {
     --muted-50: oklch(0.19 0.02 255 / 50%);
     --primary-hover: oklch(0.68 0.19 255 / 92%);
     --secondary-hover: oklch(0.22 0.035 255 / 82%);
-    --destructive-hover: oklch(0.62 0.18 255 / 92%);
+    --destructive-hover: oklch(0.577 0.245 27 / 90%);
 
-    --chart-1: oklch(0.68 0.19 255);
-    --chart-2: oklch(0.74 0.16 240);
-    --chart-3: oklch(0.80 0.11 225);
-    --chart-4: oklch(0.52 0.11 255);
-    --chart-5: oklch(0.66 0.04 255);
-    --chart-6: oklch(0.88 0.04 225);
+    /* Chart colors — MUST mirror the light-theme values exactly (see the
+       constraint note in the :root block). */
+    --chart-1: oklch(0.52 0.23 255);
+    --chart-2: oklch(0.61 0.20 245);
+    --chart-3: oklch(0.70 0.14 235);
+    --chart-4: oklch(0.38 0.08 255);
+    --chart-5: oklch(0.56 0.06 255);
+    --chart-6: oklch(0.76 0.09 225);
 
     --msg-user-bg: oklch(0.68 0.19 255);
     --msg-user-text: oklch(1 0 0);
     --msg-ai-bg: oklch(0.16 0.018 255);
     --msg-ai-text: oklch(0.92 0.006 255);
+    /* Syntax-highlighting palette — dark theme */
+    --syn-text: oklch(0.92 0.004 270);
+    --syn-keyword: oklch(0.70 0.19 18);
+    --syn-string: oklch(0.82 0.07 230);
+    --syn-comment: oklch(0.63 0.01 270);
+    --syn-number: oklch(0.78 0.12 240);
+    --syn-function: oklch(0.80 0.13 310);
+    --syn-builtin: oklch(0.78 0.12 240);
+    --syn-variable: oklch(0.80 0.16 55);
+    --syn-tag: oklch(0.75 0.15 145);
     --msg-system-bg: oklch(0.19 0.02 255);
     --msg-system-text: oklch(0.68 0.018 255);
 
-    --tool-bg: oklch(0.18 0.02 255);
+    --tool-bg: oklch(0.20 0.008 270);
     --tool-border: oklch(1 0 0 / 15%);
     --tool-header-bg: oklch(0.21 0.03 255);
 
@@ -620,40 +680,11 @@ html {
     --syntax-scrollbar-hover: oklch(0.42 0.008 264);
   }
 
-  /* Aurora background - animated flowing gradient layer.
-     Very low opacity (≤10% light / ≤14% dark) so it never competes with
-     content readability; content areas use opaque bg-background/bg-card that
-     fully cover it, so aurora only shows through the translucent nav chrome.
-     Animation is gentle (30s) to minimize repaint cost. */
-  .aurora-bg {
-    position: fixed;
-    inset: 0;
-    z-index: 0;
-    pointer-events: none;
-    background:
-      radial-gradient(ellipse 800px 500px at 10% 5%, oklch(0.56 0.20 255 / 10%) 0%, transparent 70%),
-      radial-gradient(ellipse 600px 600px at 85% 90%, oklch(0.70 0.12 225 / 7%) 0%, transparent 70%),
-      radial-gradient(ellipse 1000px 400px at 50% 40%, oklch(0.45 0.10 260 / 5%) 0%, transparent 70%);
-    background-size: 150% 150%;
-    animation: aurora-shift 30s ease-in-out infinite alternate;
-  }
-
-  .dark .aurora-bg {
-    background:
-      radial-gradient(ellipse 800px 500px at 15% 10%, oklch(0.60 0.21 255 / 16%) 0%, transparent 70%),
-      radial-gradient(ellipse 600px 600px at 85% 90%, oklch(0.74 0.15 225 / 12%) 0%, transparent 70%),
-      radial-gradient(ellipse 1000px 400px at 50% 50%, oklch(0.50 0.10 260 / 9%) 0%, transparent 70%);
-    background-size: 150% 150%;
-  }
-
-  /* Respect reduced-motion: freeze the aurora gradient (still visible, just
-     static) AND neutralize decorative animations/transitions app-wide. The
-     0.01ms duration (not `none`) lets Radix enter/exit animations still fire
-     their animationend/unmount so nothing gets stuck mid-transition. */
+  /* Respect reduced-motion: neutralize decorative animations/transitions
+     app-wide. The 0.01ms duration (not `none`) lets Radix enter/exit
+     animations still fire their animationend/unmount so nothing gets stuck
+     mid-transition. */
   @media (prefers-reduced-motion: reduce) {
-    .aurora-bg {
-      animation: none;
-    }
     *,
     *::before,
     *::after {
@@ -662,12 +693,6 @@ html {
       transition-duration: 0.01ms !important;
       scroll-behavior: auto !important;
     }
-  }
-
-  @keyframes aurora-shift {
-    0%   { background-position: 0% 0%; }
-    50%  { background-position: 50% 50%; }
-    100% { background-position: 100% 100%; }
   }
 }
 
@@ -834,6 +859,19 @@ html {
     display: none;
   }
 
+  /* Subtle dot-grid backdrop used by full-screen loading/switching screens.
+     Replaces a duplicated inline `radial-gradient(circle, #80808015 ...)`
+     in StartupLoading & InstanceSwitchOverlay. Uses a theme-aware muted
+     tint via color-mix so it adapts to dark mode. */
+  .dot-grid {
+    background-image: radial-gradient(
+      circle,
+      color-mix(in oklch, var(--muted-foreground) 8%, transparent) 1px,
+      transparent 1px
+    );
+    background-size: 32px 32px;
+  }
+
   /* ============================================================================
    * CARD SURFACE QUALITY
    * A 1px top highlight via box-shadow inset, giving opaque cards a subtle
@@ -843,15 +881,11 @@ html {
    * ============================================================================ */
   .dashboard-card-sheen,
   .card-sheen {
-    box-shadow:
-      inset 0 1px 0 0 oklch(1 0 0 / 45%),
-      var(--shadow-sm);
+    box-shadow: inset 0 1px 0 0 oklch(1 0 0 / 12%);
   }
   .dark .dashboard-card-sheen,
   .dark .card-sheen {
-    box-shadow:
-      inset 0 1px 0 0 oklch(1 0 0 / 6%),
-      var(--shadow-sm);
+    box-shadow: inset 0 1px 0 0 oklch(1 0 0 / 5%);
   }
 
   /* Glass morphism utilities */
@@ -900,61 +934,17 @@ html {
   }
 }
 
-/* Shimmer loading effect */
-@keyframes shimmer {
-  0% {
-    background-position: -1000px 0;
-  }
-  100% {
-    background-position: 1000px 0;
-  }
-}
+/* Shimmer loading effect — keyframe/utility live in tailwind.config.js
+   (animate-shimmer). The duplicate defined here was dead: Tailwind's utility
+   layer wins for the .animate-shimmer class, and nothing referenced this
+   keyframe directly. */
 
-/* Typing cursor animation */
-@keyframes blink {
-  0%, 50% {
-    opacity: 1;
-  }
-  51%, 100% {
-    opacity: 0;
-  }
-}
+/* Typing cursor animation — canonical in tailwind.config.js (animate-blink);
+   the index.css copy was dead (class + keyframe both unused in src/). */
 
-.animate-blink {
-  animation: blink 1s step-end infinite;
-}
-
-/* Scale in animation */
-@keyframes scale-in {
-  from {
-    opacity: 0;
-    transform: scale(0.95);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
-
-/* Slide from right */
-@keyframes slide-in-right {
-  from {
-    transform: translateX(100%);
-  }
-  to {
-    transform: translateX(0);
-  }
-}
-
-/* Slide from left */
-@keyframes slide-in-left {
-  from {
-    transform: translateX(-100%);
-  }
-  to {
-    transform: translateX(0);
-  }
-}
+/* Scale in animation — canonical in tailwind.config.js (animate-scale-in /
+   animate-scale-out); slide-in-right/left were dead here (no utility, no
+   keyframe refs in src/). */
 
 /* Status badge styles */
 .badge-success {
@@ -1001,22 +991,6 @@ html {
 }
 
 /* ==================== New Design System ==================== */
-
-/* Fade in up animation */
-@keyframes fade-in-up {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.animate-fade-in-up {
-  animation: fade-in-up var(--duration-normal) var(--ease-out);
-}
 
 /* Slide in highlight animation for new events */
 @keyframes slide-in-highlight {
@@ -1072,7 +1046,7 @@ html {
 .tab-indicator {
   @apply transition-all;
   transition-duration: var(--duration-normal);
-  transition-timing-function: var(--ease-spring);
+  transition-timing-function: var(--ease-spring-snappy);
 }
 
 /* Events bar marquee effect */
@@ -1118,51 +1092,18 @@ html {
  * AI messages: use theme variables
  * ============================================================================ */
 
-/* Light theme - User messages: white text on blue background */
+/* Light theme - User messages: white text on blue background.
+   `.prose *` covers every descendant (p/li/span/strong/em/h1-h6/td/th/blockquote/
+   code/pre). The element enumeration that used to follow is redundant — these
+   rules all carry `!important`, so specificity is irrelevant and `*` suffices. */
 .message-bubble-user .prose,
-.message-bubble-user .prose *,
-.message-bubble-user .prose p,
-.message-bubble-user .prose li,
-.message-bubble-user .prose span,
-.message-bubble-user .prose strong,
-.message-bubble-user .prose em,
-.message-bubble-user .prose b,
-.message-bubble-user .prose i,
-.message-bubble-user .prose h1,
-.message-bubble-user .prose h2,
-.message-bubble-user .prose h3,
-.message-bubble-user .prose h4,
-.message-bubble-user .prose h5,
-.message-bubble-user .prose h6,
-.message-bubble-user .prose td,
-.message-bubble-user .prose th,
-.message-bubble-user .prose blockquote,
-.message-bubble-user .prose code,
-.message-bubble-user .prose pre {
+.message-bubble-user .prose * {
   color: #fff !important;
 }
 
 /* Dark theme - User messages: dark text on blue background */
 .dark .message-bubble-user .prose,
 .dark .message-bubble-user .prose *,
-.dark .message-bubble-user .prose p,
-.dark .message-bubble-user .prose li,
-.dark .message-bubble-user .prose span,
-.dark .message-bubble-user .prose strong,
-.dark .message-bubble-user .prose em,
-.dark .message-bubble-user .prose b,
-.dark .message-bubble-user .prose i,
-.dark .message-bubble-user .prose h1,
-.dark .message-bubble-user .prose h2,
-.dark .message-bubble-user .prose h3,
-.dark .message-bubble-user .prose h4,
-.dark .message-bubble-user .prose h5,
-.dark .message-bubble-user .prose h6,
-.dark .message-bubble-user .prose td,
-.dark .message-bubble-user .prose th,
-.dark .message-bubble-user .prose blockquote,
-.dark .message-bubble-user .prose code,
-.dark .message-bubble-user .prose pre,
 .dark .message-bubble-user .dark\:prose-invert,
 .dark .message-bubble-user .dark\:prose-invert * {
   color: #1a1a1a !important;
@@ -1236,17 +1177,69 @@ html {
   color: inherit !important;
 }
 
-/* Thinking block inside message bubbles */
-.message-bubble-user .thinking-content,
-.message-bubble-user .thinking-content *,
-.message-bubble-assistant .thinking-content,
-.message-bubble-assistant .thinking-content *,
-.dark .message-bubble-user .thinking-content,
-.dark .message-bubble-user .thinking-content *,
-.dark .message-bubble-assistant .thinking-content,
-.dark .message-bubble-assistant .thinking-content * {
-  color: inherit !important;
+/* ============================================================================
+ * CODE SYNTAX HIGHLIGHTING (rehype-highlight / highlight.js)
+ * Colors come from --syn-* tokens (defined per-theme above). The !important +
+ * class specificity here are deliberate: the bubble prose rules above use
+ * `.prose[data-variant] * { color !important }`, which would otherwise flatten
+ * every hljs span to a single color and erase all highlighting.
+ * ============================================================================ */
+.hljs {
+  color: var(--syn-text) !important;
+  background: transparent !important;
 }
+.hljs-comment,
+.hljs-quote {
+  color: var(--syn-comment) !important;
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-doctag,
+.hljs-type,
+.hljs-section {
+  color: var(--syn-keyword) !important;
+}
+.hljs-string,
+.hljs-meta .hljs-string,
+.hljs-addition {
+  color: var(--syn-string) !important;
+}
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-meta,
+.hljs-template-tag,
+.hljs-template-variable {
+  color: var(--syn-number) !important;
+}
+.hljs-title,
+.hljs-title.function_,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: var(--syn-function) !important;
+}
+.hljs-built_in,
+.hljs-class .hljs-title,
+.hljs-params {
+  color: var(--syn-builtin) !important;
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-property,
+.hljs-variable {
+  color: var(--syn-variable) !important;
+}
+.hljs-tag,
+.hljs-name,
+.hljs-regexp,
+.hljs-link,
+.hljs-deletion {
+  color: var(--syn-tag) !important;
+}
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
 
 /* Agent Monitor Widget - Sci-fi animations */
 @keyframes shimmer-sweep {
@@ -1269,15 +1262,6 @@ html {
   }
 }
 
-@keyframes fade-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
 /* Page transition — opacity-only fade for route changes. No transform
    (translateY/scale) because some pages use left-drawer layouts where
    vertical movement looks jarring. */
@@ -1289,9 +1273,9 @@ html {
   animation: page-enter 150ms ease-out;
 }
 
-.animate-fade-in {
-  animation: fade-in 200ms var(--ease-out);
-}
+/* .animate-fade-in / @keyframes fade-in are canonical in tailwind.config.js
+   (animate-fade-in, tokenized durations). The manual copies here conflicted
+   with the utility — removed. */
 
 @keyframes pulse-glow {
   0%, 100% {
@@ -1346,6 +1330,14 @@ html {
  * Dashboard Mobile Touch Optimizations
  * ============================================================================ */
 
+/* Chrome-bar ghost buttons: opaque resting background matching the chrome
+   surface avoids the WebKit transparent→solid paint flash on hover that
+   commit 63385cd5 papered over per-button with bg-[var(--chrome)]. Hover
+   backgrounds still win (:hover specificity). */
+.chrome-ghost {
+  background-color: var(--chrome);
+}
+
 /* Touch-friendly dashboard grid items */
 @media (hover: none) and (pointer: coarse) {
   /* Make grid items respond to touch properly */
@@ -1379,19 +1371,6 @@ html {
   }
 }
 
-/* Mobile edit bar - ensure proper z-index and touch handling */
-.mobile-edit-bar {
-  position: fixed;
-  z-index: 9999;
-  touch-action: manipulation;
-}
-
-/* Mobile edit bar buttons */
-.mobile-edit-bar button {
-  touch-action: manipulation;
-  -webkit-tap-highlight-color: transparent;
-}
-
 /* Selected component indicator on mobile */
 @media (hover: none) and (pointer: coarse) {
   .react-grid-layout.edit-mode .react-grid-item.selected {
@@ -1399,11 +1378,16 @@ html {
     outline-offset: 2px;
   }
 }
-/* Brand icon gradient — paints an SVG icon's stroke with HeraMind's
-   blue gradient (see <BrandGradientDef/>).
-   CSS `stroke`/`stroke-width` (specificity 0,1,0) override lucide's
-   stroke="currentColor" / stroke-width="2" presentation attributes. */
-.brand-icon-stroke {
+
+/* Brand icon gradient (dark mode only) — paints an SVG icon's stroke with the
+   logo's segmented blue gradient (see <BrandGradientDef/>).
+   Active nav icons use solid text-brand in light mode and this gradient stroke
+   in dark mode, where a flat fill reads too heavy. CSS `stroke`/`stroke-width`
+   (specificity 0,2,0) override lucide's stroke="currentColor" /
+   stroke-width="2" presentation attributes. NOTE: consumers apply the plain
+   `brand-icon-stroke` class — a `dark:`-prefixed variant can't work (Tailwind
+   generates variants only for its own utilities, not custom classes). */
+.dark .brand-icon-stroke {
   stroke: url(#brand-icon-gradient);
   stroke-width: 2.5;
 }
@@ -1412,4 +1396,31 @@ html {
    icons — on small icons the 3% press-and-release reads as jitter. */
 .no-press-scale:active {
   transform: none !important;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Global reduced-motion backstop (DESIGN_SPEC §33 a11y). When the user has
+   "reduce motion" on at the OS level, collapse every animation/transition to
+   near-instantaneous so nothing moves unexpectedly. Individual components do
+   NOT need to opt in — this covers them all. Linear-style motion is already
+   restrained, so this mostly just removes the last bit of movement.
+   !important is intentional: must win over per-component timings. ──────────── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Tabular numerals app-wide — IoT/data app: device IDs, telemetry values,
+   timestamps align in columns without digit-width jitter (1 vs 7 vs 0 no
+   longer shift width). Linear-style default; override with the
+   `proportional-nums` Tailwind utility where proportional digits are wanted
+   (e.g. large display numerals). */
+html {
+  font-variant-numeric: tabular-nums;
 }

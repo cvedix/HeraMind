@@ -93,6 +93,10 @@ pub struct DashboardComponent {
 pub struct Dashboard {
     pub id: String,
     pub name: String,
+    /// Optional human description. Old rows predate this field — serde
+    /// default keeps them readable (None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub layout: DashboardLayout,
     pub components: Vec<DashboardComponent>,
     #[serde(alias = "created_at")]
@@ -141,6 +145,7 @@ impl Dashboard {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name,
+            description: None,
             layout,
             components: Vec::new(),
             created_at: now,
@@ -282,6 +287,9 @@ impl DashboardStore {
             }
             Database::create(path_ref)?
         };
+        // Rollback guard: refuse databases stamped by a newer build (see schema.rs).
+        crate::schema::check_or_stamp(&db)
+            .map_err(|e| Error::Storage(format!("schema version: {e}")))?;
 
         let store = Arc::new(DashboardStore {
             db: Arc::new(db),
@@ -393,9 +401,17 @@ impl DashboardStore {
             let mut table = write_txn.open_table(DASHBOARDS_TABLE)?;
             table.remove(id)?;
 
-            // Also remove from default table if it was the default
+            // Drop the default pointer ONLY if it pointed at the deleted
+            // dashboard — deleting any non-default board used to clear the
+            // global default too, silently losing the user's default page.
             let mut default_table = write_txn.open_table(DEFAULT_TABLE)?;
-            let _ = default_table.remove("default");
+            let is_default = default_table
+                .get("default")?
+                .map(|v| v.value() == id)
+                .unwrap_or(false);
+            if is_default {
+                let _ = default_table.remove("default");
+            }
         }
 
         write_txn.commit()?;
@@ -753,6 +769,7 @@ mod tests {
         let dashboard = Dashboard {
             id: "test".to_string(),
             name: "Test Dashboard".to_string(),
+            description: None,
             layout: DashboardLayout {
                 columns: 12,
                 rows: RowsValue::String("auto".to_string()),

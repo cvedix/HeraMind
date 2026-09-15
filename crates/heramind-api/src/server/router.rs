@@ -26,9 +26,9 @@ pub fn create_router_with_state(state: ServerState) -> Router {
     use crate::handlers::{
         agents, auth as auth_handlers, auth_users, automations, basic, capabilities, config,
         dashboards, data, data_push, devices, events, extension_stream, extensions,
-        frontend_components, images, instances, llm_backends, logs, memory, message_channels,
-        messages, mqtt, onboarding, rules, sessions, settings, setup, skills, stats, suggestions,
-        tools,
+        frontend_components, im_bridges, images, instances, llm_backends, logs, memory,
+        message_channels, messages, mqtt, onboarding, rules, sessions, settings, setup, skills,
+        stats, suggestions, system, tools,
     };
 
     // Public routes (no authentication required)
@@ -36,6 +36,19 @@ pub fn create_router_with_state(state: ServerState) -> Router {
     // - Health checks, auth, setup, and static metadata are safe.
     // - Device telemetry, data sources, and write operations MUST be in protected_routes.
     let public_routes = Router::new()
+        // API reference index — the route table the CLI help promises.
+        // Hand-maintained table lives in handlers/api_docs.rs; a drift test
+        // fails CI when the router and the table disagree.
+        .route("/api/docs", get(crate::handlers::api_docs::docs_handler))
+        .route(
+            "/api/docs/routes.json",
+            get(crate::handlers::api_docs::routes_json_handler),
+        )
+        .route(
+            "/api/docs/openapi.json",
+            get(crate::handlers::openapi::openapi_json_handler),
+        )
+        .route("/api/docs/*rest", get(crate::handlers::api_docs::docs_404))
         // Health check endpoints
         .route("/api/health", get(basic::health_handler))
         .route("/api/health/status", get(basic::health_status_handler))
@@ -51,6 +64,9 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         .route("/api/auth/register", post(auth_users::register_handler))
         // Setup endpoints (public - only available when no users exist)
         .route("/api/setup/status", get(setup::setup_status_handler))
+        // Prometheus-format process metrics: counters only, no secrets —
+        // same exposure class as the health checks so scrapers need no auth.
+        .route("/api/metrics", get(basic::metrics_handler))
         .route(
             "/api/setup/initialize",
             post(setup::initialize_admin_handler),
@@ -328,6 +344,20 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             "/api/messages/channels/stats",
             get(message_channels::get_channel_stats_handler),
         )
+        // === IM Bridges (read - expose running bridge platforms) ===
+        .route("/api/im-bridges", get(im_bridges::list_bridges_handler))
+        .route(
+            "/api/im-bridges/:id/invites",
+            get(im_bridges::list_invites_handler),
+        )
+        .route(
+            "/api/im-bridges/:id/allowlist",
+            get(im_bridges::list_allowlist_handler),
+        )
+        .route(
+            "/api/im-bridges/:id/sessions",
+            get(im_bridges::list_sessions_handler),
+        )
         // === Skills (moved from public - expose skill configs) ===
         .route("/api/skills", get(skills::list_skills_handler))
         .route("/api/skills/match", post(skills::match_skills_handler))
@@ -475,10 +505,6 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         .route(
             "/api/device-types/:id",
             delete(devices::delete_device_type_handler),
-        )
-        .route(
-            "/api/device-types/generate-from-samples",
-            post(devices::generate_device_type_from_samples_handler),
         )
         // Device Type Import from Cloud API
         .route(
@@ -673,6 +699,28 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             "/api/messages/channels/:name/enabled",
             put(message_channels::toggle_enabled_handler),
         )
+        // IM Bridges API (write operations - create + delete bridges)
+        .route("/api/im-bridges", post(im_bridges::create_bridge_handler))
+        .route(
+            "/api/im-bridges/:id",
+            delete(im_bridges::delete_bridge_handler),
+        )
+        .route(
+            "/api/im-bridges/:id/invites",
+            post(im_bridges::create_invite_handler),
+        )
+        .route(
+            "/api/im-bridges/:id/invites/:token",
+            delete(im_bridges::revoke_invite_handler),
+        )
+        .route(
+            "/api/im-bridges/:id/allowlist/:chat_id",
+            delete(im_bridges::remove_allowlist_handler),
+        )
+        .route(
+            "/api/im-bridges/:id/sessions/:chat_id/reset",
+            post(im_bridges::reset_session_handler),
+        )
         // LLM Generation API (one-shot, no session)
         .route("/api/llm/generate", post(settings::llm_generate_handler))
         // Global Timezone Settings API
@@ -688,9 +736,27 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             "/api/settings/retention",
             put(settings::update_retention_config),
         )
+        // Backup schedule (Settings → Preferences): same exposure class as
+        // the retention config. The manual trigger stays admin-only.
+        .route(
+            "/api/settings/backup-config",
+            get(settings::get_backup_config),
+        )
+        .route(
+            "/api/settings/backup-config",
+            put(settings::update_backup_config),
+        )
         .route(
             "/api/settings/retention/cleanup",
             post(settings::trigger_retention_cleanup),
+        )
+        .route(
+            "/api/settings/agent",
+            get(settings::get_agent_defaults).put(settings::update_agent_defaults),
+        )
+        .route(
+            "/api/settings/device",
+            get(settings::get_device_defaults).put(settings::update_device_defaults),
         )
         // Unified Automations API
         .route(
@@ -942,6 +1008,10 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             post(dashboards::add_components_handler),
         )
         .route(
+            "/api/dashboards/:id/components/:component_id",
+            axum::routing::patch(dashboards::update_component_handler),
+        )
+        .route(
             "/api/dashboards/:id/components",
             delete(dashboards::remove_components_handler),
         )
@@ -1046,6 +1116,48 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             "/api/llm-backends/:id/capabilities",
             axum::routing::patch(llm_backends::update_capabilities_override_handler),
         )
+        // Builtin LLM API (bundled LFM2.5-2.6B — status/download/delete/restart/activate).
+        // Protected like the llm-backends write ops (hybrid auth: JWT or API key).
+        .route(
+            "/api/builtin-llm/status",
+            get(crate::builtin_llm::handlers::status_handler),
+        )
+        .route(
+            "/api/builtin-llm/models",
+            get(crate::builtin_llm::handlers::models_handler),
+        )
+        .route(
+            "/api/builtin-llm/download",
+            post(crate::builtin_llm::handlers::download_handler),
+        )
+        .route(
+            "/api/builtin-llm/download/cancel",
+            post(crate::builtin_llm::handlers::download_cancel_handler),
+        )
+        .route(
+            "/api/builtin-llm/import-local",
+            post(crate::builtin_llm::handlers::import_local_handler),
+        )
+        // Multipart GGUF upload — streamed to disk; GGUFs run to ~5 GB so
+        // this route alone gets a raised body limit (default is 2 MB).
+        .route(
+            "/api/builtin-llm/upload-model",
+            axum::routing::post(crate::builtin_llm::handlers::upload_model_handler).layer(
+                axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024 * 1024),
+            ),
+        )
+        .route(
+            "/api/builtin-llm/model",
+            delete(crate::builtin_llm::handlers::delete_model_handler),
+        )
+        .route(
+            "/api/builtin-llm/restart",
+            post(crate::builtin_llm::handlers::restart_handler),
+        )
+        .route(
+            "/api/builtin-llm/activate",
+            post(crate::builtin_llm::handlers::activate_handler),
+        )
         // Instances API (remote backend management)
         .route("/api/instances", get(instances::list_instances_handler))
         .route("/api/instances", post(instances::create_instance_handler))
@@ -1060,6 +1172,10 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             post(instances::test_instance_handler),
         )
         // Frontend Component API (protected - install/uninstall/list)
+        .route(
+            "/api/frontend-components/from-path",
+            post(frontend_components::install_component_from_path_handler),
+        )
         .route(
             "/api/frontend-components/market/install",
             post(frontend_components::market_install_handler),
@@ -1096,6 +1212,46 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         .route(
             "/api/users/:username",
             delete(auth_users::delete_user_handler),
+        )
+        // Registration settings (admin only): gate for the public
+        // POST /api/auth/register endpoint. Default is closed — see
+        // register_handler.
+        .route(
+            "/api/settings/registration",
+            get(auth_users::get_registration_settings_handler),
+        )
+        .route(
+            "/api/settings/registration",
+            put(auth_users::update_registration_settings_handler),
+        )
+        // Data-directory backup (admin only): manual trigger + listing.
+        // The periodic scheduler runs the same create_backup path.
+        .route(
+            "/api/settings/backup",
+            post(settings::create_backup_handler),
+        )
+        .route("/api/settings/backups", get(settings::list_backups_handler))
+        // Extension marketplace source (admin): default host is unreachable
+        // from some networks; admins can point it at a mirror.
+        .route(
+            "/api/settings/market",
+            get(settings::get_market_source_handler),
+        )
+        .route(
+            "/api/settings/market",
+            put(settings::update_market_source_handler),
+        )
+        // Server self-upgrade (admin only): release check + staged trigger +
+        // progress. Replaces the running binary — the most sensitive write
+        // the API offers, hence JWT-only (no API keys), like backup above.
+        .route(
+            "/api/system/upgrade/check",
+            get(system::upgrade_check_handler),
+        )
+        .route("/api/system/upgrade", post(system::start_upgrade_handler))
+        .route(
+            "/api/system/upgrade/status",
+            get(system::upgrade_status_handler),
         )
         // Apply JWT authentication middleware
         .route_layer(axum::middleware::from_fn_with_state(
@@ -1191,6 +1347,15 @@ pub fn create_router_with_state(state: ServerState) -> Router {
     let router = assets::configure_static_file_serving(router);
 
     router
+        // Global HTTP counter for /api/metrics — mounted outermost so it
+        // observes every route (public, protected, webhooks, assets).
+        .layer(middleware::from_fn(crate::metrics::http_metrics_middleware))
+        // Data-change events: publish DataChanged after successful mutating
+        // requests on data domains (AI/CLI/any actor) so clients refresh.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::server::middleware::data_change_publisher,
+        ))
         // Cache-Control for static assets: immutable for hashed files, no-cache for HTML.
         // Only adds headers when not already set (API responses keep their own headers).
         .layer(middleware::from_fn(cache_headers_middleware))

@@ -156,8 +156,11 @@ class TestServer:
         self._out_thread = None
         self._err_thread = None
         self.port: int = 0
+        import threading
+        self._log_lines: list[str] = []
+        self._log_lock = threading.Lock()
 
-    def spawn(self, startup_timeout: float = 30.0) -> "TestServer":
+    def spawn(self, startup_timeout: float = 30.0, case_id: Optional[str] = None) -> "TestServer":
         self.tmpdir = tempfile.TemporaryDirectory(prefix="heramind-eval-")
         tmpdir_path = Path(self.tmpdir.name)
         data_dir = tmpdir_path / "data"
@@ -182,6 +185,32 @@ class TestServer:
         env["HERAMIND_API_BASE"] = self.api_base
         env["HERAMIND_API_KEY"] = self.api_key
 
+        # Parallel-shard support: the embedded MQTT broker defaults to :1883
+        # and its bind FAILS (logged, server continues with degraded device
+        # flows) when another worker's broker already holds it. Serial runs
+        # are unaffected; when HERAMIND_EVAL_MQTT_PORT is set, seed a
+        # config.toml in the per-case CWD so this worker's broker binds a
+        # private port (fresh settings redb inherits from config.toml on
+        # first run — see get_embedded_broker_config).
+        mqtt_port = os.environ.get("HERAMIND_EVAL_MQTT_PORT")
+        if mqtt_port:
+            (tmpdir_path / "config.toml").write_text(
+                f"[mqtt]\nport = {int(mqtt_port)}\n"
+            )
+
+        # Per-case SFT trace isolation: when HERAMIND_TRACE_ROOT is set, route
+        # each case's LLM traces into its own subdir so a batch run's traces
+        # stay grouped by case. The SFT renderer then joins one case's trace
+        # dir with its CaseRecord. Opt-in — unset => unchanged behavior.
+        trace_root = os.environ.get("HERAMIND_TRACE_ROOT")
+        if trace_root and case_id:
+            case_trace_dir = Path(trace_root) / case_id
+            case_trace_dir.mkdir(parents=True, exist_ok=True)
+            # MUST be absolute: the subprocess runs with CWD=tmpdir, so a
+            # relative path would route the trace into the tmpdir (deleted
+            # after the case) — silently losing every trace.
+            env["HERAMIND_TRACE_DIR"] = str(case_trace_dir.resolve())
+
         self.process = subprocess.Popen(
             [bin_path, "serve", "--host", "127.0.0.1", "--port", str(self.port)],
             cwd=str(tmpdir_path),
@@ -205,6 +234,8 @@ class TestServer:
                     line = raw.decode("utf-8", errors="replace")
                 except Exception:
                     line = repr(raw)
+                with self._log_lock:
+                    self._log_lines.append(line.rstrip())
                 sys_stderr_write(f"{prefix} {line.rstrip()}\n")
 
         threading.Thread(
@@ -234,6 +265,23 @@ class TestServer:
             f"{startup_timeout}s (last error: {last_err})"
         )
 
+    def wait_for_log(self, needle: str, timeout: float = 30.0) -> str | None:
+        """Block until the server's stdout/stderr contains `needle`.
+
+        The embedded MQTT broker and its adapters start asynchronously and can
+        lag ``/health`` going green — publishing telemetry before the adapter
+        has subscribed silently drops the message. This is the deterministic
+        readiness gate for system tests (vs a fixed sleep).
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._log_lock:
+                for line in self._log_lines:
+                    if needle in line:
+                        return line
+            time.sleep(0.2)
+        return None
+
     def shutdown(self):
         if self.process is None:
             return
@@ -261,6 +309,10 @@ class TestServer:
         url = f"{self.api_base}{path}" if path.startswith("/") else f"{self.api_base}/{path}"
         return requests.post(url, json=body, headers=self._headers(), timeout=60)
 
+    def get(self, path: str, timeout: float = 30.0) -> requests.Response:
+        url = f"{self.api_base}{path}" if path.startswith("/") else f"{self.api_base}/{path}"
+        return requests.get(url, headers=self._headers(), timeout=timeout)
+
     def configure_llm_backend(self):
         """Configure the agent-under-test's LLM backend via API.
 
@@ -282,8 +334,8 @@ class TestServer:
             "endpoint": endpoint,
             "model": model,
             "api_key": api_key,
-            "temperature": 0.6,
-            "top_p": 0.85,
+            "temperature": float(os.environ.get("AGENT_LLM_TEMPERATURE", "0.6")),
+            "top_p": float(os.environ.get("AGENT_LLM_TOP_P", "0.85")),
             "thinking_enabled": thinking,
         }
         r = self.post("/llm-backends", body)
@@ -329,7 +381,16 @@ class TestServer:
         data = body.get("data", body)
         return data.get("messages", []) or []
 
-    def chat(self, session_id: str, message: str, timeout: float = 900.0) -> dict:
+    def chat(self, session_id: str, message: str, timeout: float | None = None,
+             images: list[str] | None = None) -> dict:
+        # timeout: env-tunable (EVAL_CHAT_TIMEOUT, default 1400). Raised 900→1400
+        # (2026-08-14) because the chat path's own turn bound is
+        # max_stream_duration=1200s — a 900s outer bound killed turns the agent
+        # would have completed (empty-error agent_failed). Slow local models
+        # (60-90 tok/s) make 20+-round deploy cases legitimately long; set
+        # EVAL_CHAT_TIMEOUT=2400 etc. when re-running the heavyweight cases.
+        if timeout is None:
+            timeout = float(os.environ.get("EVAL_CHAT_TIMEOUT", "1400"))
         """One chat turn via WebSocket (production chat UI path).
 
         Routes through `ws://.../api/chat?api_key=...` →
@@ -373,6 +434,7 @@ class TestServer:
             timeout=timeout,
             history_before=history_before,
             history_fetch=lambda sid: self.get_history(sid),
+            images=images,
         )
         while _is_transient_stall(result) and retry_count < len(backoffs):
             retry_count += 1
@@ -427,7 +489,16 @@ def _is_transient_stall(result: dict) -> bool:
     if not result.get("error"):
         return False
     err = result["error"]
-    if "WS recv gap timeout" not in err:
+    # Transient LLM-call failures worth retrying:
+    #   1. WS recv gap timeout (no event for 240s) — the classic transient
+    #      stall (rate-limit window / network blip before the LLM call returns).
+    #   2. "Network error: error sending request" — the LLM HTTP request itself
+    #      failed to send (connection refused/reset to the backend). Both
+    #      produce ZERO streamed events with the LLM never really running, so
+    #      both deserve a retry. Without this, a burst of backend connection
+    #      failures silently records empty turns (suspected_fallback) and
+    #      inflates the failure count for whatever model is under test.
+    if ("WS recv gap timeout" not in err) and ("Network error: error sending request" not in err):
         return False
     if result.get("response"):
         return False
@@ -449,6 +520,7 @@ def _ws_chat(
     timeout: float,
     history_before: int,
     history_fetch,
+    images: list[str] | None = None,
 ) -> dict:
     """Synchronous wrapper around the async WS chat. Runs an event loop just
     for the duration of one chat call."""
@@ -462,6 +534,7 @@ def _ws_chat(
             timeout=timeout,
             history_before=history_before,
             history_fetch=history_fetch,
+            images=images,
         )
     )
 
@@ -475,6 +548,7 @@ async def _ws_chat_async(
     timeout: float,
     history_before: int,
     history_fetch,
+    images: list[str] | None = None,
 ) -> dict:
     """Connect to /api/chat, send the message, drain events until terminal."""
     import websockets
@@ -489,6 +563,7 @@ async def _ws_chat_async(
     tool_calls_stream: list[dict] = []
     pending_tool_calls: dict[int, dict] = {}  # round → in-flight ToolCallStart info
     error_msg: str | None = None
+    got_end = False  # terminal "end" event received (successful completion)
     server_msg_buffer: list[str] = []  # all raw event JSON, for forensic use
 
     try:
@@ -517,22 +592,32 @@ async def _ws_chat_async(
                     break  # welcome received
 
             # Send the chat message.
-            payload = json.dumps({"message": message, "sessionId": session_id})
+            payload_obj = {"message": message, "sessionId": session_id}
+            # Multimodal: optional images (data URLs) — ChatImage{data, mimeType?}.
+            if images:
+                payload_obj["images"] = [{"data": u} for u in images]
+            payload = json.dumps(payload_obj)
             await ws.send(payload)
 
             # Drain events until terminal.
             # Inner gap timeout must exceed the server's Heartbeat interval
             # (HEARTBEAT_INTERVAL_SECS = 30s in sessions.rs) so a thinking
-            # pause between tool rounds doesn't kill a long run. Use 180s
-            # (6x heartbeat) — production agent execution can run up to 5
-            # minutes (300s) and the first LLM response on long prompts may
-            # take 90-150s on slow models. Outer `timeout` (900s) bounds
-            # total wall clock for very multi-tool runs (raised from 600s
-            # to handle complex lifecycle cases: extension build, widget
-            # tar/gzip, multi-turn state parsing). Inner gap raised to
-            # 240s (8x heartbeat) for thinking models on slow endpoints.
+            # pause between tool rounds doesn't kill a long run. Outer
+            # `timeout` (900s) bounds total wall clock for very multi-tool
+            # runs. Inner gap raised to 240s (8x heartbeat) for thinking
+            # models on slow endpoints, then to 600s (2026-08-14): the chat
+            # path's own turn bound is max_stream_duration=1200s and long
+            # single tool executions (extension build/install, async agent
+            # exec waits) are legitimately silent >240s on local models —
+            # the stream_core heartbeat only fires between stream chunks,
+            # so a blocking tool phase emits nothing. 240s was killing
+            # turns the agent would have completed (~13% of 2.6B full-eval
+            # cases died with an empty-error gap timeout). 600s stays under
+            # the 900s outer deadline so a truly-hung attempt still
+            # terminates; the agent's own 1200s turn bound is the real
+            # completion mechanism.
             deadline = time.monotonic() + timeout
-            inner_gap = 240.0
+            inner_gap = 600.0
             while time.monotonic() < deadline:
                 remaining = max(0.0, deadline - time.monotonic())
                 try:
@@ -584,6 +669,7 @@ async def _ws_chat_async(
                     error_msg = evt.get("message", "unknown error")
                     break
                 elif etype == "end":
+                    got_end = True
                     break
                 elif etype in ("intermediate_end", "Intent", "Plan", "Progress",
                                "Warning", "Heartbeat", "system", "session_created",
@@ -596,6 +682,17 @@ async def _ws_chat_async(
                     pass
     except Exception as e:
         error_msg = f"WS chat failed: {e}"
+
+    # Deadline-exit observability: the drain loop can exit because the outer
+    # deadline passed (while-condition false) WITHOUT any error path setting
+    # error_msg — that left a None/empty error that surfaced upstream as
+    # "turn failed (): " with no diagnosis (2026-08-14: 3 extension cases).
+    # Distinguish it explicitly so the failure is diagnosable.
+    if error_msg is None and not got_end and time.monotonic() >= deadline:
+        error_msg = (
+            f"chat deadline exceeded ({timeout:.0f}s) — the agent turn did not "
+            f"complete within the outer bound (its own max_stream_duration is 1200s)"
+        )
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 

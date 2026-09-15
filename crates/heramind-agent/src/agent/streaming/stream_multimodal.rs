@@ -12,6 +12,7 @@ use futures::{Stream, StreamExt};
 use super::context::{build_context_window_with_summary, ToolExecutionResult};
 use super::dedup::deduplicate_tool_results;
 use super::intent::build_list_only_dead_end_prompt;
+use super::next_chunk_or_timeout;
 use super::resolve::resolve_cached_arguments;
 use super::result_format::format_tool_results;
 use super::sanitize::sanitize_tool_result_for_prompt;
@@ -55,16 +56,21 @@ pub async fn process_multimodal_stream_events_with_safeguards(
 
     // Get conversation history
     let state_guard = internal_state.read().await;
-    let history_messages = state_guard.memory.clone();
+    let mut history_messages = state_guard.memory.clone();
     drop(state_guard);
 
-    // Build context window — measure actual prompt overhead instead of guessing
+    // === CHAT HISTORY DEPTH — same cap as the text-streaming path ===
+    crate::agent::apply_chat_history_depth(&mut history_messages);
+
+    // Build context window — measure actual prompt overhead instead of guessing.
+    // Same budget helper as the text path: the old inline version re-inflated
+    // the budget with a 20%-of-window floor AFTER subtracting the overhead,
+    // constructing overflowing prompts on 8K-class models (the exact bug
+    // fixed in stream_core — this is its multimodal twin, reached by every
+    // image chat turn).
     let max_context = llm_interface.max_context_length().await;
     let prompt_overhead = llm_interface.estimate_prompt_overhead_tokens().await;
-    let effective_max = max_context
-        .saturating_sub(prompt_overhead)
-        .saturating_sub(1024)
-        .max((max_context * 20) / 100);
+    let effective_max = super::stream_core::effective_history_budget(max_context, prompt_overhead);
 
     let history_for_llm: Vec<heramind_core::Message> = build_context_window_with_summary(
         &history_messages,
@@ -101,15 +107,9 @@ pub async fn process_multimodal_stream_events_with_safeguards(
     // Extract base64 data for caching before images are consumed.
     // Use the shared parse_image_data helper instead of fragile split(',')
     // so non-standard data URL formats are handled consistently.
-    let image_base64_list: Vec<String> = images
-        .iter()
-        .filter_map(|data_url| {
-            crate::image_utils::parse_image_data(data_url).map(|p| p.base64.to_string())
-        })
-        .collect();
-
     // Store user message in history with images
     // Convert the image strings to AgentMessageImage
+    let image_data_urls: Vec<String> = images.clone();
     let user_images: Vec<AgentMessageImage> = images
         .into_iter()
         .map(|data_url| {
@@ -126,15 +126,18 @@ pub async fn process_multimodal_stream_events_with_safeguards(
     internal_state.write().await.push_message(user_msg);
 
     // Cache user-uploaded images so tools can reference them via $cached:user_image
-    if !image_base64_list.is_empty() {
+    // (or the auto-inject on image-shaped args). MUST use store_user_image —
+    // the regular store() passes anything under 32KB through uncached, which
+    // silently killed tool access to compressed user images (2026-08-18).
+    if !image_data_urls.is_empty() {
         let mut state = internal_state.write().await;
-        for (i, base64_data) in image_base64_list.iter().enumerate() {
+        for (i, url) in image_data_urls.iter().enumerate() {
             let cache_key = if i == 0 {
                 "user_image".to_string()
             } else {
                 format!("user_image_{}", i)
             };
-            state.large_data_cache.store(&cache_key, base64_data);
+            state.large_data_cache.store_user_image(&cache_key, url);
         }
     }
 
@@ -157,9 +160,26 @@ pub async fn process_multimodal_stream_events_with_safeguards(
             last_event_time = Instant::now();
         }
 
-        // Stream the response
-        while let Some(result) = StreamExt::next(&mut stream).await {
+        // Stream the response — bounded next(): a zero-chunk stall force-breaks
+        // the round instead of hanging (same bug fixed in stream_core).
+        while let Some(result) = next_chunk_or_timeout(&mut stream, safeguards.max_stream_duration).await {
             let elapsed = stream_start.elapsed();
+
+            // [cancellable] Same interrupt check as stream_core — the
+            // multimodal path previously had ZERO references to the
+            // interrupt signal, so the Stop button was dead for image
+            // chats (streams ran to natural end or the 2400s bound).
+            let is_interrupted = safeguards
+                .interrupt_signal
+                .as_ref()
+                .map(|rx| *rx.borrow())
+                .unwrap_or(false);
+            if is_interrupted {
+                tracing::info!("Multimodal stream interrupted by user");
+                yield AgentEvent::content("\n\n[Interrupted]");
+                yield AgentEvent::end();
+                return;
+            }
 
             if elapsed > safeguards.max_stream_duration {
                 tracing::warn!("Stream timeout ({:?} elapsed)", elapsed);
@@ -286,7 +306,36 @@ pub async fn process_multimodal_stream_events_with_safeguards(
                 }
             })).buffer_unordered(6);
 
-            let tool_results_executed: Vec<_> = tool_futures.collect().await;
+            // [keep-alive] Same as stream_core: tool execution can run for
+            // minutes and the stream is otherwise silent during this phase,
+            // so WS listeners see an event gap and kill the turn. Yield
+            // heartbeats on an independent timer while the tool batch runs.
+            let collect_fut = tool_futures.collect::<Vec<_>>();
+            tokio::pin!(collect_fut);
+            let mut tool_heartbeat = tokio::time::interval(safeguards.heartbeat_interval);
+            tool_heartbeat.tick().await; // consume the immediate first tick
+            let tool_results_executed: Vec<_> = loop {
+                tokio::select! {
+                    _ = tool_heartbeat.tick() => {
+                        // [cancellable] surf the interrupt between heartbeats
+                        // so a long tool batch doesn't defer cancel for its
+                        // full duration (up to the shell timeout).
+                        let interrupted = safeguards
+                            .interrupt_signal
+                            .as_ref()
+                            .map(|rx| *rx.borrow())
+                            .unwrap_or(false);
+                        if interrupted {
+                            tracing::info!("Multimodal stream interrupted during tool batch");
+                            yield AgentEvent::content("\n\n[Interrupted]");
+                            yield AgentEvent::end();
+                            return;
+                        }
+                        yield AgentEvent::heartbeat();
+                    }
+                    done = &mut collect_fut => break done,
+                }
+            };
 
             // Process results
             let mut tool_calls_with_results: Vec<ToolCall> = Vec::new();
@@ -335,7 +384,12 @@ pub async fn process_multimodal_stream_events_with_safeguards(
                             }
                         };
 
-                        let display_str = sanitize_tool_result_for_prompt(&slimmed_str);
+                        // [stored-value sanitize] mirror of stream_core: the
+                        // stored value is sanitized too, not just display —
+                        // slim only engages >=64KB so 4-64KB data URLs/base64
+                        // used to reach context + sessions.redb verbatim.
+                        let sanitized_str = sanitize_tool_result_for_prompt(&slimmed_str);
+                        let display_str = sanitized_str.clone();
 
                         tool_calls_with_results.push(ToolCall {
                             name: name.clone(),
@@ -347,7 +401,7 @@ pub async fn process_multimodal_stream_events_with_safeguards(
 
                         yield AgentEvent::tool_call_end(&name, &display_str, output.success);
 
-                        tool_call_results.push((name.clone(), slimmed_str));
+                        tool_call_results.push((name.clone(), sanitized_str));
                     }
                     Err(e) => {
                         let error_msg = format!("Tool execution failed: {}", e);
@@ -431,7 +485,9 @@ pub async fn process_multimodal_stream_events_with_safeguards(
                     // Collect the continuation response — buffer for tool calls
                     let mut cont_buffer = String::new();
                     let mut cont_stream = Box::pin(cont_stream);
-                    while let Some(chunk) = cont_stream.next().await {
+                    while let Some(chunk) =
+                        next_chunk_or_timeout(&mut cont_stream, safeguards.max_stream_duration).await
+                    {
                         match chunk {
                             Ok((text, _)) => cont_buffer.push_str(&text),
                             Err(_) => break,
@@ -504,11 +560,14 @@ pub async fn process_multimodal_stream_events_with_safeguards(
                                             Err(_) => result_str.clone(),
                                         }
                                     };
-                                    let display_str = sanitize_tool_result_for_prompt(&slimmed_str);
+                                    // [stored-value sanitize] continuation path — same
+                                    // as the main path above.
+                                    let sanitized_str = sanitize_tool_result_for_prompt(&slimmed_str);
+                                    let display_str = sanitized_str.clone();
                                     yield AgentEvent::tool_call_end(&name, &display_str, output.success);
                                     let mut state = internal_state.write().await;
-                                    state.push_message(AgentMessage::tool_result(&name, &slimmed_str));
-                                    tool_call_results.push((name.clone(), slimmed_str));
+                                    state.push_message(AgentMessage::tool_result(&name, &sanitized_str));
+                                    tool_call_results.push((name.clone(), sanitized_str));
                                 }
                                 Err(e) => {
                                     let err_msg = format!("Tool execution failed: {}", e);
@@ -542,8 +601,9 @@ pub async fn process_multimodal_stream_events_with_safeguards(
             match summary_result {
                 Ok(stream) => {
                     let mut pin = Box::pin(stream);
-                    use futures::StreamExt;
-                    while let Some(chunk) = pin.next().await {
+                    while let Some(chunk) =
+                        next_chunk_or_timeout(&mut pin, safeguards.max_stream_duration).await
+                    {
                         match chunk {
                             Ok((text, _)) => {
                                 final_content.push_str(&text);
@@ -625,7 +685,10 @@ pub async fn process_multimodal_stream_events_with_safeguards(
 
         let pt = llm_interface.take_last_prompt_tokens().await;
         match pt {
-            Some(t) => yield AgentEvent::end_with_tokens(t),
+            Some(t) => {
+                let (system_tokens, tool_tokens) = llm_interface.estimate_prompt_breakdown().await;
+                yield AgentEvent::end_with_usage(t, system_tokens, tool_tokens);
+            }
             None => yield AgentEvent::end(),
         }
     }))

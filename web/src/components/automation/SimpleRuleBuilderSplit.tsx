@@ -237,18 +237,23 @@ interface CronTemplate {
   icon: React.ReactNode
 }
 
+/** A RuleAction carrying the builder's transient React-key field. The
+ *  builder round-trips these in its local state and strips `_key` at save
+ *  (see buildRulePayload). Typed here instead of `as any`-smuggling. */
+type UIAction = RuleAction & { _key?: string }
+
 const CRON_TEMPLATES: CronTemplate[] = [
-  { id: 'every_minute', label: '每分钟', expression: '* * * * *', description: '每分钟执行', icon: <Timer className="h-4 w-4" /> },
-  { id: 'every_5min', label: '每5分钟', expression: '*/5 * * * *', description: '每5分钟执行', icon: <Timer className="h-4 w-4" /> },
-  { id: 'every_15min', label: '每15分钟', expression: '*/15 * * * *', description: '每15分钟执行', icon: <Timer className="h-4 w-4" /> },
-  { id: 'every_30min', label: '每30分钟', expression: '*/30 * * * *', description: '每30分钟执行', icon: <Timer className="h-4 w-4" /> },
-  { id: 'hourly', label: '每小时', expression: '0 * * * *', description: '每小时的第0分钟', icon: <Clock className="h-4 w-4" /> },
-  { id: 'daily_midnight', label: '每天午夜', expression: '0 0 * * *', description: '每天00:00', icon: <Calendar className="h-4 w-4" /> },
-  { id: 'daily_morning', label: '每天早上', expression: '0 8 * * *', description: '每天08:00', icon: <Calendar className="h-4 w-4" /> },
-  { id: 'daily_evening', label: '每天晚上', expression: '0 20 * * *', description: '每天20:00', icon: <Calendar className="h-4 w-4" /> },
-  { id: 'weekly_monday', label: '每周一', expression: '0 0 * * 1', description: '每周一00:00', icon: <Calendar className="h-4 w-4" /> },
-  { id: 'monthly', label: '每月1号', expression: '0 0 1 * *', description: '每月1号00:00', icon: <Calendar className="h-4 w-4" /> },
-  { id: 'workdays_morning', label: '工作日早上', expression: '0 8 * * 1-5', description: '周一至周五08:00', icon: <Calendar className="h-4 w-4" /> },
+  { id: 'every_minute', label: 'cronTemplates.everyMinuteLabel', description: 'cronTemplates.everyMinuteDesc', expression: '* * * * *', icon: <Timer className="h-4 w-4" /> },
+  { id: 'every_5min', label: 'cronTemplates.every5minLabel', description: 'cronTemplates.every5minDesc', expression: '*/5 * * * *', icon: <Timer className="h-4 w-4" /> },
+  { id: 'every_15min', label: 'cronTemplates.every15minLabel', description: 'cronTemplates.every15minDesc', expression: '*/15 * * * *', icon: <Timer className="h-4 w-4" /> },
+  { id: 'every_30min', label: 'cronTemplates.every30minLabel', description: 'cronTemplates.every30minDesc', expression: '*/30 * * * *', icon: <Timer className="h-4 w-4" /> },
+  { id: 'hourly', label: 'cronTemplates.hourlyLabel', description: 'cronTemplates.hourlyDesc', expression: '0 * * * *', icon: <Clock className="h-4 w-4" /> },
+  { id: 'daily_midnight', label: 'cronTemplates.dailyMidnightLabel', description: 'cronTemplates.dailyMidnightDesc', expression: '0 0 * * *', icon: <Calendar className="h-4 w-4" /> },
+  { id: 'daily_morning', label: 'cronTemplates.dailyMorningLabel', description: 'cronTemplates.dailyMorningDesc', expression: '0 8 * * *', icon: <Calendar className="h-4 w-4" /> },
+  { id: 'daily_evening', label: 'cronTemplates.dailyEveningLabel', description: 'cronTemplates.dailyEveningDesc', expression: '0 20 * * *', icon: <Calendar className="h-4 w-4" /> },
+  { id: 'weekly_monday', label: 'cronTemplates.weeklyMondayLabel', description: 'cronTemplates.weeklyMondayDesc', expression: '0 0 * * 1', icon: <Calendar className="h-4 w-4" /> },
+  { id: 'monthly', label: 'cronTemplates.monthlyFirstLabel', description: 'cronTemplates.monthlyFirstDesc', expression: '0 0 1 * *', icon: <Calendar className="h-4 w-4" /> },
+  { id: 'workdays_morning', label: 'cronTemplates.workdaysMorningLabel', description: 'cronTemplates.workdaysMorningDesc', expression: '0 8 * * 1-5', icon: <Calendar className="h-4 w-4" /> },
 ]
 
 
@@ -585,14 +590,14 @@ function ruleConditionToUiCondition(
   }
 
   // Check for logical conditions first (they have 'conditions' array)
-  if ('conditions' in ruleCond && Array.isArray((ruleCond as any).conditions)) {
-    const op = (ruleCond as any).operator
+  if ('conditions' in ruleCond && Array.isArray(ruleCond.conditions)) {
+    const op = ruleCond.operator
     if (op === 'and' || op === 'or') {
       return {
         id: generateId(),
         type: op,
         source_type: undefined,
-        conditions: ((ruleCond as any).conditions || []).map((c: RuleCondition) => ruleConditionToUiCondition(c, devices, dslPreview)),
+        conditions: (ruleCond.conditions || []).map((c: RuleCondition) => ruleConditionToUiCondition(c, devices, dslPreview)),
       }
     }
     if (op === 'not') {
@@ -600,7 +605,7 @@ function ruleConditionToUiCondition(
         id: generateId(),
         type: 'not',
         source_type: undefined,
-        conditions: [(ruleCond as any).conditions?.[0]].map((c: RuleCondition) => ruleConditionToUiCondition(c, devices, dslPreview)).filter(Boolean),
+        conditions: [ruleCond.conditions?.[0]].map((c: RuleCondition) => ruleConditionToUiCondition(c, devices, dslPreview)).filter(Boolean),
       }
     }
   }
@@ -613,7 +618,7 @@ function ruleConditionToUiCondition(
   const sourceField = sourceParts.length >= 3 ? sourceParts.slice(2).join(':') : 'value'
 
   // Check for range condition (has min/max)
-  if (ruleCond.condition_type === 'range' || ('min' in ruleCond && (ruleCond as any).min !== undefined)) {
+  if (ruleCond.condition_type === 'range' || ('min' in ruleCond && ruleCond.min !== undefined)) {
     return {
       id: generateId(),
       type: 'range',
@@ -624,15 +629,15 @@ function ruleConditionToUiCondition(
         ? { transform_id: sourceId }
         : { device_id: sourceId }),
       metric: sourceField,
-      range_min: (ruleCond as any).min,
-      range_max: (ruleCond as any).max,
+      range_min: ruleCond.min,
+      range_max: ruleCond.max,
     }
   }
 
   // Simple/comparison condition
   const thresholdValue = ruleCond.threshold
   const isStringThreshold = typeof thresholdValue === 'string'
-  const apiThresholdValue = (ruleCond as any).threshold_value as string | undefined
+  const apiThresholdValue = ruleCond.threshold_value as string | undefined
 
   return {
     id: generateId(),
@@ -800,7 +805,7 @@ function ConditionCanvas({
   }, [triggerType, cronExpression])
 
   return (
-    <div className="space-y-4 p-4 rounded-lg border border-border bg-background">
+    <div className="space-y-4 p-4 rounded-lg border border-border">
       {triggerType === 'data_change' && (
         <>
           <div className="flex items-center gap-2 pb-4 border-b">
@@ -868,7 +873,7 @@ function ConditionCanvas({
             <div className="space-y-4">
               <ConditionEditor
                 condition={condition}
-                onChange={onConditionChange}
+                onChange={(c) => { if (c !== null) onConditionChange(c) }}
                 devices={devices}
                 deviceTypes={deviceTypes}
                 extensions={extensions}
@@ -878,7 +883,7 @@ function ConditionCanvas({
                 tBuilder={tBuilder}
               />
 
-              <div className="flex items-center gap-3 p-4 bg-muted-30 rounded-lg border">
+              <div className="flex items-center gap-3 p-4 rounded-lg border">
                 <Clock className="h-4 w-4 text-muted-foreground shrink-0" />
                 <Label className="text-sm font-medium">{tBuilder('duration')}</Label>
                 <Input
@@ -941,7 +946,7 @@ function ConditionCanvas({
                     )}
                   >
                     {template.icon}
-                    <span>{template.label}</span>
+                    <span>{t(template.label)}</span>
                   </button>
                 ))}
               </div>
@@ -986,7 +991,7 @@ function ConditionCanvas({
                   )}
                 />
               ) : (
-                <div className="p-3 bg-muted-30 rounded-lg border">
+                <div className="p-3 rounded-lg border">
                   <code className="text-sm font-mono">{cronExpression}</code>
                 </div>
               )}
@@ -997,7 +1002,7 @@ function ConditionCanvas({
             </div>
 
             {nextExecution && (
-              <div className="flex items-center gap-2 p-3 bg-muted-30 rounded-lg border">
+              <div className="flex items-center gap-2 p-3 rounded-lg border">
                 <Calendar className="h-4 w-4 text-success" />
                 <span className="text-xs text-muted-foreground">
                   {tBuilder('nextExecution') || 'Next execution'}: {nextExecution.toLocaleString('zh-CN', {
@@ -1026,13 +1031,13 @@ function ConditionCanvas({
           </div>
 
           <div className="space-y-3">
-            <div className="flex items-center gap-3 p-3 bg-muted-30 rounded-lg border">
+            <div className="flex items-center gap-3 p-3 rounded-lg border">
               <div className="w-6 h-6 shrink-0 rounded-full bg-success-light flex items-center justify-center">
                 <span className="text-xs font-medium text-success">1</span>
               </div>
               <p className="text-sm text-muted-foreground">{tBuilder('manualStep1') || 'Click execute button in rule list'}</p>
             </div>
-            <div className="flex items-center gap-3 p-3 bg-muted-30 rounded-lg border">
+            <div className="flex items-center gap-3 p-3 rounded-lg border">
               <div className="w-6 h-6 shrink-0 rounded-full bg-success-light flex items-center justify-center">
                 <span className="text-xs font-medium text-success">2</span>
               </div>
@@ -1046,8 +1051,8 @@ function ConditionCanvas({
 }
 
 interface ActionCanvasProps {
-  actions: RuleAction[]
-  onActionsChange: (actions: RuleAction[]) => void
+  actions: UIAction[]
+  onActionsChange: (actions: UIAction[]) => void
   devices: Array<{
     id: string
     name: string
@@ -1066,7 +1071,7 @@ interface ActionCanvasProps {
 
 function ActionCanvas({ actions, onActionsChange, devices, deviceTypes, extensions, messageChannels, agents, errors, t, tBuilder }: ActionCanvasProps) {
   return (
-    <div className="space-y-4 p-4 rounded-lg border border-border bg-background">
+    <div className="space-y-4 p-4 rounded-lg border border-border">
       {/* Header — emerald accent to differentiate from Condition (indigo) */}
       <div className="flex items-center gap-2 pb-3 border-b">
         <div className="p-2 rounded-full bg-accent-emerald-light">
@@ -1083,16 +1088,16 @@ function ActionCanvas({ actions, onActionsChange, devices, deviceTypes, extensio
         <Button size="sm" variant="outline" onClick={() => {
           const firstDevice = devices[0]
           const commands = firstDevice ? getCommandsForResource(firstDevice.id, devices, deviceTypes, extensions) : []
-          onActionsChange([...actions, { type: 'execute', target: firstDevice?.id || '', target_type: 'device' as const, command: commands[0]?.name || 'turn_on', params: {}, _key: generateId() } as any])
+          onActionsChange([...actions, { type: 'execute' as const, target: firstDevice?.id || '', target_type: 'device' as const, command: commands[0]?.name || 'turn_on', params: {}, _key: generateId() } as UIAction])
         }}>
           <Zap className="h-4 w-4 mr-1" />
           {tBuilder('executeCommand') || 'Execute'}
         </Button>
-        <Button size="sm" variant="outline" onClick={() => onActionsChange([...actions, { type: 'notify', message: '', severity: 'info' as const, _key: generateId() } as any])}>
+        <Button size="sm" variant="outline" onClick={() => onActionsChange([...actions, { type: 'notify' as const, message: '', severity: 'info' as const, _key: generateId() } as UIAction])}>
           <Bell className="h-4 w-4 mr-1" />
           {tBuilder('sendNotification') || 'Notify'}
         </Button>
-        <Button size="sm" variant="outline" onClick={() => onActionsChange([...actions, { type: 'trigger_agent', agent_id: '', _key: generateId() } as any])}>
+        <Button size="sm" variant="outline" onClick={() => onActionsChange([...actions, { type: 'trigger_agent' as const, agent_id: '', _key: generateId() } as UIAction])}>
           <Bot className="h-4 w-4 mr-1" />
           {tBuilder('triggerAgent') || 'Trigger Agent'}
         </Button>
@@ -1108,7 +1113,7 @@ function ActionCanvas({ actions, onActionsChange, devices, deviceTypes, extensio
         ) : (
           actions.map((action, index) => (
             <ActionEditorCompact
-              key={(action as any)._key || index}
+              key={action._key || index}
               index={index}
               action={action}
               devices={devices}
@@ -1133,11 +1138,11 @@ function ConditionTypeButton({ label, icon, onClick }: { label: string; icon: Re
   return (
     <button
       onClick={onClick}
-      className="p-4 rounded-lg border-2 border-border hover:border-accent-indigo hover:bg-muted-30 transition-all text-left"
+      className="p-4 rounded-lg border-2 border-border hover:border-accent-indigo hover:transition-all text-left min-w-0"
     >
-      <div className="flex items-center gap-3">
-        <div className="p-2 rounded-lg bg-muted-30">{icon}</div>
-        <span className="font-medium">{label}</span>
+      <div className="flex items-center gap-3 min-w-0">
+        <div className="p-2 rounded-lg shrink-0">{icon}</div>
+        <span className="font-medium min-w-0 break-words">{label}</span>
       </div>
     </button>
   )
@@ -1187,18 +1192,18 @@ export function SimpleRuleBuilderSplit({
         setName(rule.name || '')
         setDescription(rule.description || '')
         setEnabled(rule.enabled ?? true)
-        setTags(rule.tags || (rule as any).source?.tags || [])
+        setTags(rule.tags || rule.source?.tags || [])
         setFormErrors({})
 
         // Restore trigger type - check trigger field or saved source
-        const savedTriggerType = (rule as any).source?.triggerType as TriggerType
-        const savedCronExpression = (rule as any).source?.cronExpression as string
+        const savedTriggerType = rule.source?.triggerType as TriggerType
+        const savedCronExpression = rule.source?.cronExpression as string
 
         if (rule.trigger?.trigger_type === 'schedule' || savedTriggerType === 'schedule') {
           setTriggerType('schedule')
-          setCronExpression(savedCronExpression || (rule.trigger as any)?.cron || '0 0 * * *')
+          setCronExpression(savedCronExpression || (rule.trigger?.trigger_type === 'schedule' ? rule.trigger.cron : undefined) || '0 0 * * *')
           // Find matching template
-          const matchingTemplate = CRON_TEMPLATES.find(t => t.expression === (savedCronExpression || (rule.trigger as any)?.cron))
+          const matchingTemplate = CRON_TEMPLATES.find(t => t.expression === (savedCronExpression || (rule.trigger?.trigger_type === 'schedule' ? rule.trigger.cron : undefined)))
           setSelectedCronTemplate(matchingTemplate?.id || 'custom')
         } else if (rule.trigger?.trigger_type === 'manual' || savedTriggerType === 'manual') {
           setTriggerType('manual')
@@ -1207,7 +1212,8 @@ export function SimpleRuleBuilderSplit({
         }
 
         // Try to restore from source.uiCondition first (exact restoration)
-        const sourceUiCond = (rule as any).source?.uiCondition
+        // Saved blob round-trips a serialized UICondition — assert once.
+        const sourceUiCond = rule.source?.uiCondition as UICondition | undefined
         if (sourceUiCond) {
           setCondition(sourceUiCond)
         } else if (rule.condition) {
@@ -1219,7 +1225,7 @@ export function SimpleRuleBuilderSplit({
         }
 
         // Restore actions - prefer source.uiActions for exact restoration
-        const sourceUiActions = (rule as any).source?.uiActions
+        const sourceUiActions = rule.source?.uiActions
         if (sourceUiActions && sourceUiActions.length > 0) {
           setActions(sourceUiActions)
         } else if (rule.actions && rule.actions.length > 0) {
@@ -1228,11 +1234,11 @@ export function SimpleRuleBuilderSplit({
             // Ensure action has correct structure based on type
             switch (action.type) {
               case 'notify':
-                return { type: 'notify', message: (action as any).message || '', severity: (action as any).severity || 'info' } as RuleAction
+                return { type: 'notify', message: action.message || '', severity: action.severity || 'info' }
               case 'execute':
-                return { type: 'execute', target: (action as any).target || (action as any).device_id || '', target_type: (action as any).target_type || 'device', command: (action as any).command || '', params: (action as any).params || {} } as RuleAction
+                return { type: 'execute', target: action.target || '', target_type: action.target_type || 'device', command: action.command || '', params: action.params || {} }
               case 'trigger_agent':
-                return { type: 'trigger_agent', agent_id: (action as any).agent_id || '', input: (action as any).input, data: (action as any).data } as RuleAction
+                return { type: 'trigger_agent', agent_id: action.agent_id || '', input: action.input, data: action.data }
               default:
                 // Unknown action type, default to notify
                 return { type: 'notify', message: 'Rule triggered', severity: 'info' } as RuleAction
@@ -1244,8 +1250,8 @@ export function SimpleRuleBuilderSplit({
         }
 
         // Restore forDuration and forUnit - prefer source values, then for_duration field
-        const sourceForDuration = (rule as any).source?.forDuration
-        const sourceForUnit = (rule as any).source?.forUnit
+        const sourceForDuration = rule.source?.forDuration
+        const sourceForUnit = rule.source?.forUnit
         if (sourceForDuration !== undefined && sourceForUnit !== undefined) {
           setForDuration(sourceForDuration)
           setForUnit(sourceForUnit)
@@ -1268,11 +1274,11 @@ export function SimpleRuleBuilderSplit({
         }
 
         // Restore cooldown - prefer source values, then cooldown field
-        const sourceCooldownValue = (rule as any).source?.cooldownValue
-        const sourceCooldownUnit = (rule as any).source?.cooldownUnit
+        const sourceCooldownValue = rule.source?.cooldownValue
+        const sourceCooldownUnit = rule.source?.cooldownUnit
         if (sourceCooldownValue !== undefined && sourceCooldownUnit !== undefined) {
           setCooldownValue(sourceCooldownValue)
-          setCooldownUnit(sourceCooldownUnit)
+          setCooldownUnit(sourceCooldownUnit as 'seconds' | 'minutes' | 'hours')
         } else if (rule.cooldown) {
           const ms = rule.cooldown
           if (ms >= 3600000 && ms % 3600000 === 0) {
@@ -1492,7 +1498,7 @@ export function SimpleRuleBuilderSplit({
         tags: tags.length > 0 ? tags : undefined,
         trigger,
         condition: finalCondition,
-        actions: actions.length > 0 ? actions.map(({ _key, ...rest }: any) => rest) as RuleAction[] : undefined,
+        actions: actions.length > 0 ? ((actions as UIAction[]).map(({ _key: _k, ...rest }) => rest) as RuleAction[]) : undefined,
         for_duration: forDurationMs,
         cooldown: cooldownMs,
         // Store original UI state in source field for proper restoration on edit
@@ -1507,7 +1513,7 @@ export function SimpleRuleBuilderSplit({
           cronExpression,
           cooldownValue,
           cooldownUnit,
-        } as any,
+        },
       }
       if (rule?.id) ruleData.id = rule.id
       await onSave(ruleData)
@@ -1602,7 +1608,7 @@ export function SimpleRuleBuilderSplit({
         )}
 
         {workspaceTab === 'dsl' && (
-          <div className="rounded-lg border border-border bg-muted-30 p-4">
+          <div className="rounded-lg border border-border p-4">
             <pre className={cn(textNano, "font-mono overflow-x-auto whitespace-pre-wrap break-all")}>
               {previewJSON || tBuilder('noPreview')}
             </pre>
@@ -1666,7 +1672,7 @@ export function SimpleRuleBuilderSplit({
           {/* Tags editor - lifted from BasicInfoStep */}
           <Field>
             <FieldLabel>{t('automation:ruleBuilder.tags') || 'Tags'}</FieldLabel>
-            <div className="flex flex-wrap gap-2 p-2 border rounded-md bg-background min-h-[42px]">
+            <div className="flex flex-wrap gap-2 p-2 border border-input bg-card rounded-md min-h-[42px] focus-within:ring-1 focus-within:ring-ring transition-all">
               {tags.map(tag => (
                 <Badge key={tag} variant="secondary" className="gap-1 pl-2">
                   {tag}
@@ -1680,7 +1686,7 @@ export function SimpleRuleBuilderSplit({
                   </button>
                 </Badge>
               ))}
-              <input
+              <Input
                 type="text"
                 value={tagInput}
                 onChange={e => setTagInput(e.target.value)}
@@ -1697,7 +1703,7 @@ export function SimpleRuleBuilderSplit({
                   }
                 }}
                 placeholder={tags.length === 0 ? (tBuilder('addTag') || 'Add tag...') : ''}
-                className="flex-1 min-w-[80px] outline-none bg-transparent text-sm"
+                className="flex-1 min-w-[80px] border-0 bg-transparent px-0 shadow-none focus-visible:ring-0"
               />
             </div>
           </Field>
@@ -1759,7 +1765,7 @@ export function SimpleRuleBuilderSplit({
 
 interface ConditionEditorProps {
   condition: UICondition
-  onChange: (c: UICondition) => void
+  onChange: (c: UICondition | null) => void  // null = remove this condition
   devices: Array<{
     id: string
     name: string
@@ -1781,8 +1787,9 @@ function ConditionEditor({ condition, onChange, devices, deviceTypes, extensions
     onChange({ ...condition, [field]: value })
   }
 
-  const updateNestedCondition = (index: number, updates: Partial<UICondition>) => {
+  const updateNestedCondition = (index: number, updates: Partial<UICondition> | null) => {
     if (!condition.conditions) return
+    if (updates === null) { removeNestedCondition(index); return }
     const newConditions = [...condition.conditions]
     newConditions[index] = { ...newConditions[index], ...updates }
     onChange({ ...condition, conditions: newConditions })
@@ -2009,7 +2016,7 @@ function ConditionEditor({ condition, onChange, devices, deviceTypes, extensions
           </Select>
 
           {renderValueInput()}
-          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => onChange(null as any)} aria-label={tBuilder('removeCondition')}>
+          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => onChange(null)} aria-label={tBuilder('removeCondition')}>
             <X className="h-4 w-4" />
           </Button>
         </div>
@@ -2133,7 +2140,7 @@ function ConditionEditor({ condition, onChange, devices, deviceTypes, extensions
             placeholder={tBuilder('maxPlaceholder')}
             disabled={!hasValidId}
           />
-          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => onChange(null as any)} aria-label={tBuilder('removeCondition')}>
+          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => onChange(null)} aria-label={tBuilder('removeCondition')}>
             <X className="h-4 w-4" />
           </Button>
         </div>
@@ -2152,17 +2159,17 @@ function ConditionEditor({ condition, onChange, devices, deviceTypes, extensions
 
     return (
       <div className="space-y-3">
-        <div className="flex items-center gap-2 p-2.5 bg-muted rounded-t-lg border">
+        <div className="flex items-center gap-2 p-2.5 rounded-t-lg border">
           <Badge variant="outline" className={cn('text-xs px-2.5 py-1', badgeClass)}>{label}</Badge>
           <span className="text-xs text-muted-foreground flex-1">
             {condition.type === 'and' ? tBuilder('allConditionsMustMeet') : condition.type === 'or' ? tBuilder('anyConditionMustMeet') : tBuilder('conditionNotMet')}
           </span>
-          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => onChange(null as any)} aria-label={tBuilder('removeCondition')}>
+          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => onChange(null)} aria-label={tBuilder('removeCondition')}>
             <X className="h-4 w-4" />
           </Button>
         </div>
 
-        <div className="p-3 bg-background border border-t-0 rounded-b-lg space-y-3">
+        <div className="p-3 border border-t-0 rounded-b-lg space-y-3">
           {condition.conditions?.map((subCond, i) => (
             <div key={subCond.id} className="relative group">
               {i > 0 && (
@@ -2176,7 +2183,7 @@ function ConditionEditor({ condition, onChange, devices, deviceTypes, extensions
                 </div>
               )}
               <div className="relative pr-8">
-                <div className="rounded-lg bg-muted-30">
+                <div className="rounded-lg">
                   <ConditionEditor
                     condition={subCond}
                     onChange={(c) => updateNestedCondition(i, c)}

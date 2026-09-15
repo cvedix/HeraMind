@@ -1,0 +1,353 @@
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+/// Default builtin model. `BUILTIN_MODELS` (below) is the full registry; the
+/// user picks which one to install, this is the default/recommended entry.
+pub const BUILTIN_MODEL_ID: &str = "minicpm5-2b";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelManifest {
+    pub id: String,
+    pub version: String,
+    pub file_name: String,
+    pub sha256: String,
+    pub quant: String,
+}
+
+impl ModelManifest {
+    pub fn model_path(&self, models_dir: &Path) -> PathBuf {
+        models_dir.join(&self.id).join(&self.file_name)
+    }
+}
+
+/// One installable builtin model (registry entry).
+#[derive(Clone)]
+pub struct BuiltinModelDef {
+    /// Canonical local file name + sha (stored under `models/<id>/`).
+    pub manifest: ModelManifest,
+    /// Human name shown in the picker (e.g. "Qwen3.5-4B").
+    pub display_name: &'static str,
+    /// HuggingFace repo hosting `hf_file`.
+    pub hf_repo: &'static str,
+    /// Filename *in the HF repo* (may differ from the canonical `file_name`).
+    pub hf_file: &'static str,
+    /// Download size in bytes (for the picker).
+    pub size_bytes: u64,
+    /// Default context window for this model (KV size differs a lot — LFM's
+    /// hybrid arch is cheap at 128K; Qwen/Gemma should run at 32K).
+    pub default_ctx: u32,
+    /// Native context ceiling (display); default_ctx is the run default.
+    pub max_ctx: u32,
+    /// Per-model sampling defaults (None = platform-wide legacy default).
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    /// One-line capability note for the picker.
+    pub notes: &'static str,
+    /// This entry is a fallback if the model cannot run (reserved).
+    pub recommended: bool,
+    /// Whether thinking/reasoning is enabled by default for this model.
+    /// LFM's thinking is integral (cannot be off); Qwen3.5 runs faster
+    /// non-thinking for agent tool calls (eval 76% cmd_ok was non-thinking);
+    /// Gemma defaults to thinking.
+    pub default_thinking: bool,
+
+    /// Thinking cannot be turned off for this model (LFM's template ignores
+    /// the toggle). A MODEL property — must never be derived from "is this
+    /// the default" (that comparison silently flipped when the default
+    /// moved to MiniCPM and mis-flagged LFM installs on the restart path).
+    pub thinking_is_integral: bool,
+    /// Recommended MINIMUM available RAM (MB): weights + KV cache + runtime
+    /// + OS headroom. The UI discourages (not blocks) installs below this.
+    pub min_ram_mb: u64,
+}
+
+/// The builtin model registry. MiniCPM5-2B is the default (2026-09
+/// corrected-harness eval: 81% tool accuracy @8K, most robust across
+/// context windows, Apache-2.0); Qwen3.5-4B is the strongest agent when
+/// given 16K; Gemma4-E2B adds a QAT + vision-friendly option; LFM2.5 keeps
+/// the native-128K niche.
+pub static BUILTIN_MODELS: LazyLock<Vec<BuiltinModelDef>> = LazyLock::new(|| {
+    vec![
+        BuiltinModelDef {
+            manifest: ModelManifest {
+                id: "minicpm5-2b".to_string(),
+                version: "1.0".to_string(),
+                file_name: "minicpm5-2b-q4_k_m.gguf".to_string(),
+                // Official openbmb LFS oid (captured 2026-09-14 via the
+                // repo's LFS pointer). NOTE: the previous pin pointed at a
+                // THIRD-PARTY mirror (Abiray) whose bytes differ (2080-byte
+                // size delta — a repack); switching sources means switching
+                // hashes. Already-downloaded installs keep their file: the
+                // sha only gates NEW downloads.
+                sha256: "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd"
+                    .to_string(),
+                quant: "q4_k_m".to_string(),
+            },
+            display_name: "MiniCPM5-2B",
+            // Eval-validated on the 2026-09 harness (81% tool accuracy);
+            // the model card's chat setting is 1.0/0.95 — agent use favors
+            // the focused sampler.
+            temperature: Some(0.6),
+            top_p: Some(0.85),
+            top_k: Some(40),
+            // Official model-author repo — the previous third-party mirror
+            // (Abiray) served a byte-different repack and personal repos
+            // vanish; openbmb is the durable, authoritative source.
+            hf_repo: "openbmb/MiniCPM5-2B-GGUF",
+            hf_file: "MiniCPM5-2B-Q4_K_M.gguf",
+            size_bytes: 1_561_320_448,
+            // 32K default (product decision 2026-09-12): the 2026-09 eval's
+            // "8K optimum" was measured on the HARNESS prompt — the
+            // production platform prompt (system + tool definitions +
+            // memory/skill context) alone weighs 4-6K tokens, which starved
+            // an 8K window (see stream_core::effective_history_budget for
+            // the overflow this caused) and left 16K merely adequate for
+            // long agent turns. The older 5-scenario suite scored 32K at
+            // ~68 (≥ the 8K R24 run within ties), the profile is flat
+            // across windows, and the native ceiling is 128K — so 32K buys
+            // agent headroom at no measured accuracy cost. KV cache for a
+            // 2B model at 32K stays negligible against the 3 GB floor.
+            default_ctx: 32768,
+            max_ctx: 131072,
+            notes: "2026-09 评测首选 — 工具命中 81%、全窗口最稳、Apache-2.0 可分发",
+            recommended: true,
+            default_thinking: true,
+            thinking_is_integral: false,
+            min_ram_mb: 3_072,
+        },
+        BuiltinModelDef {
+            manifest: ModelManifest {
+                id: "lfm25-2.6b".to_string(),
+                version: "1.0".to_string(),
+                file_name: "lfm25-2.6b-qad_q4_0.gguf".to_string(),
+                sha256: "a247afd6414918eac8e520a9e6137dc271235461ecbe1180462221d5b8d40b03"
+                    .to_string(),
+                quant: "qad_q4_0".to_string(),
+            },
+            display_name: "LFM2.5-2.6B",
+            // Measured-best (154-case A/B beat the official 0.1 card values).
+            temperature: Some(0.6),
+            top_p: Some(0.85),
+            top_k: Some(20),
+            hf_repo: "LiquidAI/LFM2.5-2.6B-GGUF",
+            hf_file: "LFM2.5-2.6B-QAD-Q4_0.gguf",
+            size_bytes: 1_500_000_000,
+            default_ctx: 131072,
+            max_ctx: 131072,
+            notes: "原生 128K 上下文(hybrid KV 很省)— 长会话细分场景;默认首选已让位 MiniCPM5-2B",
+            recommended: false,
+            default_thinking: true,
+            thinking_is_integral: true,
+            min_ram_mb: 3_072,
+        },
+        BuiltinModelDef {
+            manifest: ModelManifest {
+                id: "qwen3.5-4b".to_string(),
+                version: "1.0".to_string(),
+                file_name: "qwen3.5-4b-q4_k_m.gguf".to_string(),
+                sha256: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+                    .to_string(),
+                quant: "q4_k_m".to_string(),
+            },
+            display_name: "Qwen3.5-4B",
+            // Official non-thinking recommendation (qwen.readthedocs.io).
+            temperature: Some(0.7),
+            top_p: Some(0.8),
+            top_k: Some(20),
+            hf_repo: "unsloth/Qwen3.5-4B-GGUF",
+            hf_file: "Qwen3.5-4B-Q4_K_M.gguf",
+            size_bytes: 2_740_000_000,
+            // 16K is the measured sweet spot (2026-09 eval: 70/100 @16K vs
+            // 38 @8K starved).
+            default_ctx: 16384,
+            max_ctx: 262144,
+            notes:
+                "16K 窗口下最强端侧 agent(2026-09 评测 70 分)— 8K 下会大幅退化;可挂 mmproj 加视觉",
+            recommended: false,
+            default_thinking: false,
+            thinking_is_integral: false,
+            min_ram_mb: 4_096,
+        },
+        BuiltinModelDef {
+            manifest: ModelManifest {
+                id: "gemma4-e2b".to_string(),
+                version: "1.0".to_string(),
+                file_name: "gemma-4-E2B_q4_0-it.qat.gguf".to_string(),
+                sha256: "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634"
+                    .to_string(),
+                quant: "qat_q4_0".to_string(),
+            },
+            display_name: "Gemma4-E2B",
+            // Official Gemma 4 model card (uniform across the family).
+            temperature: Some(1.0),
+            top_p: Some(0.95),
+            top_k: Some(64),
+            hf_repo: "google/gemma-4-E2B-it-qat-q4_0-gguf",
+            hf_file: "gemma-4-E2B_q4_0-it.gguf",
+            size_bytes: 3_100_000_000,
+            default_ctx: 32768,
+            max_ctx: 131072,
+            notes: "Google 官方 QAT 量化 — 可挂 mmproj 加视觉",
+            recommended: false,
+            default_thinking: true,
+            thinking_is_integral: false,
+            min_ram_mb: 4_608,
+        },
+        BuiltinModelDef {
+            manifest: ModelManifest {
+                id: "ling30-tiny".to_string(),
+                version: "1.0".to_string(),
+                file_name: "ling-3.0-tiny-q4_k_m.gguf".to_string(),
+                sha256: "9842cce7c1a07ad4adefd2b79a1035710ff196576d89128eade29351b79c8e68"
+                    .to_string(),
+                quant: "q4_k_m".to_string(),
+            },
+            display_name: "Ling-3.0-tiny",
+            // Official inclusionAI card (thinking enabled by default).
+            temperature: Some(1.0),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            hf_repo: "inclusionAI/Ling-3.0-tiny-GGUF",
+            hf_file: "Ling-3.0-tiny-Q4_K_M.gguf",
+            size_bytes: 4_823_894_880,
+            // 8K-only per the 2026-09 eval (62 → 48 at 16K — cliff);
+            // the 6 GB floor also steers small devices away.
+            default_ctx: 8192,
+            max_ctx: 131072,
+            notes: "高速 tiny MoE — 仅适合 8K 短会话(过 8K 滑坡),需 llama.cpp ≥ b10545",
+            recommended: false,
+            default_thinking: true,
+            thinking_is_integral: true,
+            min_ram_mb: 6_144,
+        },
+    ]
+});
+
+/// Registry lookup by id.
+pub fn model_def(id: &str) -> Option<&'static BuiltinModelDef> {
+    BUILTIN_MODELS.iter().find(|d| d.manifest.id == id)
+}
+
+/// The default (recommended) registry entry.
+pub fn default_model_def() -> &'static BuiltinModelDef {
+    BUILTIN_MODELS
+        .iter()
+        .find(|d| d.manifest.id == BUILTIN_MODEL_ID)
+        .expect("default model present")
+}
+
+fn manifest_path(models_dir: &Path, id: &str) -> PathBuf {
+    models_dir.join(id).join("manifest.json")
+}
+
+pub fn save_manifest(models_dir: &Path, m: &ModelManifest) -> anyhow::Result<()> {
+    let dir = models_dir.join(&m.id);
+    std::fs::create_dir_all(&dir)?;
+    let json = serde_json::to_string_pretty(m)?;
+    std::fs::write(manifest_path(models_dir, &m.id), json)?;
+    Ok(())
+}
+
+pub fn load_manifest(models_dir: &Path, id: &str) -> anyhow::Result<Option<ModelManifest>> {
+    let p = manifest_path(models_dir, id);
+    if !p.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(p)?;
+    Ok(Some(serde_json::from_str(&raw)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "heramind-builtin-manifest-{}-{}",
+            tag,
+            std::process::id()
+        ))
+    }
+
+    /// Every registry entry must carry an explicit sampling point — the
+    /// spawn path writes these into llama-server defaults and the backend
+    /// instance, and an accidental None would silently fall back to the
+    /// legacy global (0.6/0.85/20) for a model whose official point differs.
+    #[test]
+    fn builtin_models_carry_sampling_points() {
+        for def in BUILTIN_MODELS.iter() {
+            assert!(
+                def.temperature.is_some(),
+                "{} missing temperature",
+                def.manifest.id
+            );
+            assert!(def.top_p.is_some(), "{} missing top_p", def.manifest.id);
+            assert!(def.top_k.is_some(), "{} missing top_k", def.manifest.id);
+        }
+    }
+
+    /// The registry is hand-maintained — lock the four official/measured
+    /// points so a typo can't silently shift a model's behavior.
+    #[test]
+    fn builtin_models_sampling_values_locked() {
+        let by_id = |id: &str| {
+            BUILTIN_MODELS
+                .iter()
+                .find(|d| d.manifest.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from registry"))
+        };
+        let lfm = by_id("lfm25-2.6b");
+        assert_eq!(
+            (lfm.temperature, lfm.top_p, lfm.top_k),
+            (Some(0.6), Some(0.85), Some(20))
+        );
+        let qwen = by_id("qwen3.5-4b");
+        assert_eq!(
+            (qwen.temperature, qwen.top_p, qwen.top_k),
+            (Some(0.7), Some(0.8), Some(20))
+        );
+        let gemma = by_id("gemma4-e2b");
+        assert_eq!(
+            (gemma.temperature, gemma.top_p, gemma.top_k),
+            (Some(1.0), Some(0.95), Some(64))
+        );
+        let ling = by_id("ling30-tiny");
+        assert_eq!(
+            (ling.temperature, ling.top_p, ling.top_k),
+            (Some(1.0), Some(0.95), Some(20))
+        );
+    }
+
+    #[test]
+    fn manifest_roundtrip() {
+        let dir = temp_dir("roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = ModelManifest {
+            id: BUILTIN_MODEL_ID.to_string(),
+            version: "1.0".to_string(),
+            file_name: "lfm25-2.6b-q4_k_m.gguf".to_string(),
+            sha256: "abc123".to_string(),
+            quant: "q4_k_m".to_string(),
+        };
+        save_manifest(&dir, &m).expect("save");
+        let loaded = load_manifest(&dir, BUILTIN_MODEL_ID)
+            .expect("load")
+            .expect("some");
+        assert_eq!(loaded.file_name, m.file_name);
+        assert_eq!(loaded.sha256, "abc123");
+        assert_eq!(
+            m.model_path(&dir),
+            dir.join(BUILTIN_MODEL_ID).join("lfm25-2.6b-q4_k_m.gguf")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_missing_is_none() {
+        let dir = temp_dir("missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load_manifest(&dir, BUILTIN_MODEL_ID).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

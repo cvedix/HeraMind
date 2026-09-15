@@ -1,13 +1,19 @@
 //! Tests for auth_users handlers.
 
-use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Extension, Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use heramind_api::auth_users::{
     ChangePasswordRequest, LoginRequest, RegisterRequest, SessionInfo, UserRole,
 };
 use heramind_api::handlers::auth_users::*;
 use heramind_api::handlers::ServerState;
+use std::net::SocketAddr;
+
+/// Loopback address for the ConnectInfo arg the throttled handlers take.
+fn test_connect_info() -> ConnectInfo<SocketAddr> {
+    ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000)))
+}
 
 async fn create_test_server_state() -> ServerState {
     crate::common::create_test_server_state().await
@@ -24,13 +30,20 @@ mod tests {
             username: "nonexistent".to_string(),
             password: "wrongpassword".to_string(),
         };
-        let result = login_handler(State(state), Json(req)).await;
+        let result = login_handler(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_register_handler() {
         let state = create_test_server_state().await;
+        state.auth.user_state.set_allow_registration(true);
         let username = format!(
             "test_user_{}",
             uuid::Uuid::new_v4().to_string().replace('-', "")
@@ -40,7 +53,13 @@ mod tests {
             password: "test_password_123".to_string(),
             role: Some(UserRole::User),
         };
-        let result = register_handler(State(state), Json(req)).await;
+        let result = register_handler(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await;
         assert!(result.is_ok());
         let (status, response) = result.unwrap();
         assert_eq!(status, StatusCode::CREATED);
@@ -52,6 +71,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_handler_admin_role() {
         let state = create_test_server_state().await;
+        state.auth.user_state.set_allow_registration(true);
         let username = format!(
             "admin_user_{}",
             uuid::Uuid::new_v4().to_string().replace('-', "")
@@ -61,7 +81,13 @@ mod tests {
             password: "admin_password_123".to_string(),
             role: Some(UserRole::Admin),
         };
-        let result = register_handler(State(state), Json(req)).await;
+        let result = register_handler(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await;
         assert!(result.is_ok());
         let (status, response) = result.unwrap();
         assert_eq!(status, StatusCode::CREATED);
@@ -72,6 +98,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_handler_default_role() {
         let state = create_test_server_state().await;
+        state.auth.user_state.set_allow_registration(true);
         let username = format!(
             "default_user_{}",
             uuid::Uuid::new_v4().to_string().replace('-', "")
@@ -81,10 +108,47 @@ mod tests {
             password: "password123".to_string(),
             role: None, // Should default to User
         };
-        let result = register_handler(State(state), Json(req)).await;
+        let result = register_handler(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await;
         assert!(result.is_ok());
         let (status, _response) = result.unwrap();
         assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_register_handler_disabled_by_default() {
+        // Fresh state must reject self-registration: closed unless an admin
+        // opens it (setup wizard / POST /api/users are the sanctioned paths).
+        let state = create_test_server_state().await;
+        assert!(!state.auth.user_state.allow_registration());
+
+        let req = RegisterRequest {
+            username: "blocked_user".to_string(),
+            password: "password123".to_string(),
+            role: None,
+        };
+        let result = register_handler(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await;
+        assert!(result.is_err());
+        use axum::response::{IntoResponse, Response};
+        let resp: Response = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("Self-registration is disabled"),
+            "unexpected body: {body_str}"
+        );
     }
 
     #[tokio::test]
@@ -98,7 +162,12 @@ mod tests {
             created_at: now,
             expires_at: now + 3600,
         };
-        let result = logout_handler(State(state), Extension(user_info)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer dummy-token".parse().expect("valid header value"),
+        );
+        let result = logout_handler(State(state), Extension(user_info), headers).await;
         assert!(result.is_ok());
         let response = result.unwrap();
         let value = response.0;

@@ -60,6 +60,47 @@ struct CommandOutput {
 }
 
 /// Shell tool — executes system commands.
+/// [context-injection] Domains whose `--help` reference has been injected
+/// once already this process (first-use injection, channel C). See
+/// `ShellTool::domain_help` for the rationale.
+static INJECTED_DOMAINS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// [context-injection] Set once the cross-domain index card has been
+/// injected into a shell tool result (channel D — first shell call of the
+/// process). See `DOMAIN_INDEX` for why the index is injected rather than
+/// living in the static tool description.
+static INDEX_INJECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Cross-domain subcommand index (channel D). Delivered ONCE, appended to
+/// the FIRST shell tool result, so the model sees the full CLI surface
+/// right after it has already chosen `shell` — recall without any static
+/// description-length cost.
+///
+/// History: first shipped inside the static description (2026-08-17); the
+/// 2026-08-18 full eval showed the 2600-char description re-triggered the
+/// ≤3B tool-selection suppression (wrong-tool grabs like file_write), so it
+/// moved here. The 27 "detoured via a wrong-but-succeeding command" failures
+/// it fixes need the map BEFORE detouring, which channel D satisfies for
+/// every case that touches shell at least once.
+const DOMAIN_INDEX: &str = r#"
+
+[heramind CLI domain index — the exact subcommands that exist (one line per domain; `heramind <domain> --help` for flags)]
+- device: list get create update delete history control <ID> <CMD> types write-metric webhook-url drafts
+- agent: list get create update delete invoke memory clear-memory executions <ID> latest-execution conversation <ID> send-message <ID> (talking to an agent, NOT `message`)
+- rule: list get create update delete enable disable test history
+- dashboard: list get create update delete add-components update-component remove-components share (ADD widgets → add-components (append); TWEAK one widget → update-component; `update --components` replaces ALL and needs --replace-all — almost never what you want; `dashboard get <ID>` first to see layout/ids)
+- connector: list get create update delete enable disable test subscribe (external I/O bridges: MQTT broker / webhook / HTTP — NOT devices)
+- extension: list get install uninstall status logs config reload create build market-list market-install validate
+- transform: list get create update delete enable disable metrics test-code data-sources executions (executions = recent run records; check it when a transform outputs nothing or fails)
+- widget: list get create install uninstall bundle market-list market-install
+- message: list get send read channel-list channel-get channel-types channel-type-schema channel-create channel-update channel-delete channel-test (platform alerts — NOT for talking to agents)
+- push: list get create update delete enable disable test logs stats
+- llm: list get models create update delete activate test
+- settings: timezone set-timezone timezones retention set-retention cleanup
+- system: info — api-key: create list delete
+Anything not listed above does not exist as a subcommand — do not invent near-misses; use the exact name or `heramind <domain> --help`."#;
+
 pub struct ShellTool {
     config: ShellConfig,
 }
@@ -135,6 +176,90 @@ impl ShellTool {
         })
     }
 
+    /// [context-injection] Domains whose `--help` reference has been injected
+    /// once already (first-use injection). Process-local: the eval spawns a
+    /// fresh server per case (each case gets one injection per domain); a
+    /// long-running server injects each domain on first use only — later
+    /// turns find it in the conversation history.
+    fn domain_injected(domain: &str) -> bool {
+        INJECTED_DOMAINS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .map(|s| s.contains(domain))
+            .unwrap_or(false)
+    }
+
+    fn mark_domain_injected(domain: &str) {
+        if let Some(m) = INJECTED_DOMAINS.get() {
+            if let Ok(mut s) = m.lock() {
+                s.insert(domain.to_string());
+            }
+        }
+    }
+
+    /// [context-injection] Fetch a domain's `--help` (compact subcommand
+    /// reference) so the model sees exact syntax. Two channels:
+    /// (B) on a FAILED `heramind <domain> ...` call → "retry with the exact one"
+    /// (C) on the FIRST successful call in a domain → reference for the
+    ///     upcoming steps of a multi-step flow (create→test→enable...).
+    /// Both keep the static tool description short so ≤3B models still
+    /// SELECT `shell`; channel C is deterministic (fires only after the
+    /// model already chose shell), so there is no intent-detection
+    /// overtrigger risk.
+    async fn domain_help(domain: &str, subcommand: Option<&str>, note: &str) -> Option<String> {
+        if domain.is_empty() {
+            return None;
+        }
+        let exe = std::env::current_exe().ok()?;
+        // Prefer the SUBCOMMAND's help — it lists the actual flags/args the
+        // model guessed wrong (`device list --all`, `rule create --id=...`,
+        // `device types create ...`). A bare domain help only lists
+        // subcommands, which is why failed calls kept retrying bad flags.
+        let deeper = match subcommand {
+            Some(sub) if !sub.starts_with('-') => {
+                let out = tokio::process::Command::new(&exe)
+                    .arg(domain)
+                    .arg(sub)
+                    .arg("--help")
+                    .output()
+                    .await
+                    .ok()?;
+                let body: String = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .take(28)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (body, format!("`heramind {} {}`", domain, sub))
+            }
+            _ => (String::new(), format!("`heramind {}`", domain)),
+        };
+        if !deeper.0.trim().is_empty() {
+            return Some(format!(
+                "\n\n[Reference — {} — {}]:\n{}",
+                deeper.1, note, deeper.0
+            ));
+        }
+        // Fallback: bare domain help.
+        let out = tokio::process::Command::new(&exe)
+            .arg(domain)
+            .arg("--help")
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let body: String = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .take(28)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!(
+            "\n\n[Reference — `heramind {}` subcommands — {}]:\n{}",
+            domain, note, body
+        ))
+    }
+
     /// Attempt in-process dispatch for `heramind` data commands.
     ///
     /// Returns `Some(output)` if the command was handled in-process (either
@@ -150,7 +275,83 @@ impl ShellTool {
         command: &str,
         timeout: Duration,
     ) -> Option<CommandOutput> {
+        // Truncation pipelines (`heramind device list 2>&1 | head -100`) are
+        // applied in-process: dispatch the base command, then cut the output.
+        // Without this the pipes fall back to a subprocess whose CLI goes
+        // through the HTTP API — an auth dependency pure data queries don't
+        // need. Unsupported stages (grep/sort/…) return None → subprocess.
+        let (base, merge_stderr, truncation) = split_truncation_pipeline(command.trim())?;
+        let output = self.dispatch_in_process(&base, timeout).await?;
+        Some(apply_truncation_pipeline(output, merge_stderr, &truncation))
+    }
+
+    /// In-process dispatch of a single (pipe-free) heramind command line.
+    async fn dispatch_in_process(&self, command: &str, timeout: Duration) -> Option<CommandOutput> {
         let trimmed = command.trim();
+
+        // Shell sequencing: `&&` (stop on failure) or `;` (always continue).
+        // The agent naturally batches, e.g. `heramind device get a; heramind
+        // device get b` or `heramind system info; echo "---"; heramind device list`.
+        // Handle in-process when ALL parts are heramind commands; mixed
+        // heramind/non-heramind (e.g. with echo) falls through to subprocess.
+        let has_sep = trimmed.contains("&&") || trimmed.contains(";");
+        if has_sep {
+            // Pick the separator that appears first to split on.
+            let sep = if let Some(amp) = trimmed.find("&&") {
+                if let Some(semi) = trimmed.find(';') {
+                    if semi < amp {
+                        ";"
+                    } else {
+                        "&&"
+                    }
+                } else {
+                    "&&"
+                }
+            } else {
+                ";"
+            };
+            let parts: Vec<&str> = trimmed
+                .split(sep)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let all_heramind = parts.len() > 1
+                && parts
+                    .iter()
+                    .all(|p| p.starts_with("heramind ") || *p == "heramind");
+            if all_heramind {
+                let mut outputs: Vec<String> = Vec::new();
+                for part in parts {
+                    // Boxed: the recursive async call needs indirection (the
+                    // chain length is runtime-variable → unbounded future).
+                    match Box::pin(self.try_in_process_dispatch(part, timeout)).await {
+                        Some(out) => {
+                            let code = out.exit_code.unwrap_or(1);
+                            outputs.push(out.stdout);
+                            // `&&` stops on failure; `;` always continues.
+                            if sep == "&&" && code != 0 {
+                                return Some(CommandOutput {
+                                    exit_code: Some(code),
+                                    stdout: outputs.join("\n--- && ---\n"),
+                                    stderr: String::new(),
+                                    timed_out: false,
+                                });
+                            }
+                        }
+                        None => return None, // a part isn't in-processable → subprocess
+                    }
+                }
+                return Some(CommandOutput {
+                    exit_code: Some(0),
+                    stdout: outputs.join(format!("\n--- {} ---\n", sep.trim()).as_str()),
+                    stderr: String::new(),
+                    timed_out: false,
+                });
+            }
+            // Mixed heramind/non-heramind with && or ; → let /bin/sh handle it.
+            return None;
+        }
+
         // Only intercept commands that start with `heramind ` (or are exactly
         // `heramind`). Anything else goes to the subprocess path.
         if !trimmed.starts_with("heramind ") && trimmed != "heramind" {
@@ -207,12 +408,50 @@ impl ShellTool {
         match tokio::time::timeout(timeout, heramind_cli_ops::dispatch::dispatch(&argv)).await {
             Ok(Ok(resp)) => {
                 let exit_code = if resp.success { 0 } else { 1 };
-                let stdout = serde_json::to_string_pretty(&resp).unwrap_or_else(|e| {
+                let mut stdout = serde_json::to_string_pretty(&resp).unwrap_or_else(|e| {
                     format!(
                         "{{\"success\":false,\"error\":\"serialize failed: {}\"}}",
                         e
                     )
                 });
+                // [context-injection] (D) FIRST shell call of the process →
+                // cross-domain index card (see DOMAIN_INDEX for why this
+                // lives here and not in the static description). (B)
+                // failure → --help to correct on retry; (C) FIRST
+                // successful call in a domain → --help as reference for the
+                // upcoming steps of multi-step flows.
+                if !INDEX_INJECTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    stdout.push_str(DOMAIN_INDEX);
+                }
+                if let Some(domain) = argv.get(1) {
+                    // First non-flag token after the domain = the subcommand;
+                    // its --help lists the actual flags the model may have
+                    // guessed wrong (`--all`, `--format=json`, ...).
+                    let subcommand = argv
+                        .get(2)
+                        .map(String::as_str)
+                        .filter(|s| !s.starts_with('-'));
+                    let help: Option<String> = if !resp.success {
+                        Self::domain_help(domain.as_str(), subcommand, "retry with the exact one")
+                            .await
+                    } else if !Self::domain_injected(domain.as_str()) {
+                        let h = Self::domain_help(
+                            domain.as_str(),
+                            subcommand,
+                            "use the exact one for the next steps",
+                        )
+                        .await;
+                        if h.is_some() {
+                            Self::mark_domain_injected(domain.as_str());
+                        }
+                        h
+                    } else {
+                        None
+                    };
+                    if let Some(help) = help {
+                        stdout.push_str(&help);
+                    }
+                }
                 Some(CommandOutput {
                     exit_code: Some(exit_code),
                     stdout,
@@ -229,12 +468,28 @@ impl ShellTool {
                 );
                 None
             }
-            Ok(Err(heramind_cli_ops::dispatch::DispatchError::Parse(msg))) => Some(CommandOutput {
-                exit_code: Some(2),
-                stdout: String::new(),
-                stderr: format!("error: {}", msg),
-                timed_out: false,
-            }),
+            Ok(Err(heramind_cli_ops::dispatch::DispatchError::Parse(msg))) => {
+                let mut stderr = format!("error: {}", msg);
+                // [context-injection] bad subcommand/args → append domain --help.
+                if let Some(domain) = argv.get(1) {
+                    let subcommand = argv
+                        .get(2)
+                        .map(String::as_str)
+                        .filter(|s| !s.starts_with('-'));
+                    if let Some(help) =
+                        Self::domain_help(domain.as_str(), subcommand, "retry with the exact one")
+                            .await
+                    {
+                        stderr.push_str(&help);
+                    }
+                }
+                Some(CommandOutput {
+                    exit_code: Some(2),
+                    stdout: String::new(),
+                    stderr,
+                    timed_out: false,
+                })
+            }
             Ok(Err(heramind_cli_ops::dispatch::DispatchError::Api(msg))) => Some(CommandOutput {
                 exit_code: Some(1),
                 stdout: String::new(),
@@ -267,6 +522,28 @@ impl ShellTool {
         if let Some(output) = self.try_in_process_dispatch(command, timeout).await {
             return Ok(output);
         }
+
+        // Detect when the agent wraps `heramind` inside a script (python/bash/etc).
+        // This breaks the $cached mechanism: the script captures heramind's output
+        // internally and only prints metadata, so the LargeDataCache never sees
+        // the full payload (images, large JSON). Inject a hint telling the agent
+        // to call `heramind` directly so $cached works.
+        let wrapped_heramind_hint = if !command.trim().starts_with("heramind ")
+            && command.contains("heramind ")
+            && (command.contains("python") || command.contains("bash") || command.contains("sh "))
+        {
+            Some(
+                "\n\n[Hint: You are calling `heramind` through a script wrapper. \
+                 When called directly (shell(command=\"heramind device get <id>\")), \
+                 large payloads like images are automatically cached as $cached references \
+                 that can be passed directly to vision(image=\"$cached:...\"). \
+                 Script wrappers break this — the image data is lost. \
+                 Try calling heramind directly next time.]"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
 
         let mut cmd = Self::build_command(command);
 
@@ -358,6 +635,13 @@ impl ShellTool {
                 // bytes before slim could cache them.
                 let (stdout, stderr) =
                     truncate_output(&raw_stdout, &raw_stderr, self.config.max_output_chars);
+                // Append the wrapped-heramind hint (if any) so the agent sees
+                // it in the tool result and adjusts its next call.
+                let stdout = if let Some(hint) = &wrapped_heramind_hint {
+                    format!("{}{}", stdout, hint)
+                } else {
+                    stdout
+                };
                 Ok(CommandOutput {
                     exit_code: status.code(),
                     stdout,
@@ -547,18 +831,141 @@ fn kill_process_by_pid(pid: Option<u32>) {
     }
 }
 
+/// A supported truncation stage of a `| head/tail` pipeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TruncationOp {
+    Head,
+    Tail,
+}
+
+/// Truncation stages of a split pipeline: `(op, line_count)` per stage.
+type TruncationStages = Vec<(TruncationOp, usize)>;
+
+/// Split a command line into its base command plus an in-process-able
+/// truncation pipeline. Models routinely decorate queries as
+/// `heramind device list 2>&1 | head -100`; handling the `head/tail/cat`
+/// stages in-process keeps the dispatch on the pure-data path (no subprocess
+/// auth dependency). Returns `None` when any pipeline stage is unsupported
+/// (grep/sort/awk/…) — the caller falls back to the real shell.
+///
+/// Returns `(base_command, merge_stderr, stages)`; `merge_stderr` is set when
+/// the base ends with `2>&1` (stderr is folded into stdout, matching what
+/// the shell would have produced).
+fn split_truncation_pipeline(trimmed: &str) -> Option<(String, bool, TruncationStages)> {
+    let (base_raw, pipe_part) = match trimmed.split_once('|') {
+        Some((b, p)) => (b.trim(), Some(p)),
+        None => (trimmed, None),
+    };
+    let (base, merge_stderr) = match base_raw.strip_suffix("2>&1") {
+        Some(b) => (b.trim(), true),
+        None => (base_raw, false),
+    };
+    if base.is_empty() {
+        return None;
+    }
+    let mut stages: Vec<(TruncationOp, usize)> = Vec::new();
+    if let Some(pipes) = pipe_part {
+        for stage in pipes.split('|') {
+            let toks: Vec<&str> = stage.split_whitespace().collect();
+            let parsed = match toks.as_slice() {
+                ["cat"] => None,
+                ["head", rest @ ..] | ["tail", rest @ ..] => {
+                    let op = if toks[0] == "head" {
+                        TruncationOp::Head
+                    } else {
+                        TruncationOp::Tail
+                    };
+                    // `head -100` and `head -n 100` are the two forms in use.
+                    let n = match rest {
+                        [n] => n.strip_prefix('-').unwrap_or(n),
+                        ["-n", n] => *n,
+                        _ => return None,
+                    };
+                    Some((op, n.parse::<usize>().ok()?))
+                }
+                _ => return None,
+            };
+            if let Some(stage) = parsed {
+                stages.push(stage);
+            }
+        }
+    }
+    Some((base.to_string(), merge_stderr, stages))
+}
+
+/// Fold stderr into stdout (`2>&1`) and apply `head/tail` line truncation,
+/// in pipeline order, to an in-process dispatch result.
+fn apply_truncation_pipeline(
+    mut output: CommandOutput,
+    merge_stderr: bool,
+    stages: &[(TruncationOp, usize)],
+) -> CommandOutput {
+    if merge_stderr {
+        if !output.stderr.is_empty() {
+            if !output.stdout.is_empty() {
+                output.stdout.push('\n');
+            }
+            output.stdout.push_str(&output.stderr);
+        }
+        output.stderr = String::new();
+    }
+    for (op, n) in stages {
+        let lines: Vec<&str> = if output.stdout.is_empty() {
+            Vec::new()
+        } else {
+            output.stdout.lines().collect()
+        };
+        let kept: Vec<&str> = match op {
+            TruncationOp::Head => lines.into_iter().take(*n).collect(),
+            TruncationOp::Tail => {
+                let start = lines.len().saturating_sub(*n);
+                lines[start..].to_vec()
+            }
+        };
+        output.stdout = kept.join("\n");
+    }
+    output
+}
+
 /// Tokenize a `heramind` command line into an argv vector, respecting single
 /// and double quotes and backslash escapes.
 ///
 /// This is NOT a full shell parser — it deliberately ignores pipes,
-/// redirections, `$` expansions, and command separators, because those
-/// constructs are never part of a pure `heramind` data query. A command that
-/// uses them is left for the real shell (subprocess path) to interpret.
+/// redirections, `$` expansions, and command separators. Simple truncation
+/// pipes (`| head -100`) are handled one level up by
+/// [`split_truncation_pipeline`]; anything else is left for the real shell
+/// (subprocess path) to interpret.
 ///
 /// The first token is expected to be `heramind`. Returns an error if the input
 /// has unbalanced quotes (so the caller can fall back to the subprocess and
 /// surface the real shell error message).
 fn tokenize_heramind_command(input: &str) -> std::result::Result<Vec<String>, String> {
+    // Shell-construct guard: a pipe / redirection / command-substitution char
+    // OUTSIDE quotes means this is a real shell command line, not a pure
+    // `heramind` invocation — bail so the caller routes it to the subprocess
+    // path. (Previously such chars were silently swallowed as ordinary
+    // arguments and clap rejected the result: `heramind x | grep y` died as
+    // "unexpected argument '|'".)
+    {
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut prev = '\0';
+        for c in input.chars() {
+            match c {
+                '\'' if !in_double => in_single = !in_single,
+                '"' if !in_single => in_double = !in_double,
+                '|' | '<' | '>' | '`' if !in_single && !in_double => {
+                    return Err("shell construct outside quotes".to_string())
+                }
+                '$' if !in_single && !in_double && prev != '\\' => {
+                    return Err("shell construct outside quotes".to_string())
+                }
+                _ => {}
+            }
+            prev = c;
+        }
+    }
+
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
@@ -613,7 +1020,10 @@ fn truncate_output(stdout: &str, stderr: &str, max_total: usize) -> (String, Str
 
     let total = stdout_len + stderr_len;
     let stdout_budget = if total > 0 {
-        (usable * stdout_len / total).min(stdout_len)
+        usable
+            .checked_mul(stdout_len)
+            .map(|p| (p / total).min(stdout_len))
+            .unwrap_or(stdout_len)
     } else {
         usable / 2
     };
@@ -702,9 +1112,9 @@ impl ShellTool {
                 if is_not_found {
                     Some("Run 'heramind device list' to see available devices, then retry with a valid ID.".to_string())
                 } else if action == "create" && is_validation {
-                    Some("Required fields: --name, --type. Use 'heramind device types list' to see valid device types.".to_string())
+                    Some("Required flags: --name, --device-type, --adapter-type (mqtt|webhook). Use 'heramind device types list' to see built-in types.".to_string())
                 } else if action == "control" && is_not_found {
-                    Some("Device not found. Run 'heramind device list' first, then use 'heramind device control <ID> --command <CMD>'.".to_string())
+                    Some("Device not found. Run 'heramind device list' first, then 'heramind device control <ID> <COMMAND> --params {json}' (COMMAND is positional, not a flag).".to_string())
                 } else if (action == "history" || action == "latest") && combined.contains("metric")
                 {
                     Some("Don't guess metric names. Run 'heramind device list' to see all metric_fields per type, or 'heramind device get <ID>' for a specific device's actual field names.".to_string())
@@ -718,9 +1128,9 @@ impl ShellTool {
                 } else if action == "create" && is_validation {
                     Some("Required field: --name. Example: heramind dashboard create --name \"My Dashboard\"".to_string())
                 } else if action == "update" {
-                    Some("Use --components to update widgets. Run 'heramind widget list' to see available widget types, and 'heramind dashboard get <ID>' to see current layout.".to_string())
+                    Some("update --components full-replaces the widget array and requires --replace-all. For ONE widget use 'heramind dashboard update-component <ID> --component-id <CID> --set {json}' (deep-merge patch); to add widgets use 'add-components'; to remove use 'remove-components'.".to_string())
                 } else {
-                    Some("Available actions: list, get, create, update, delete, share".to_string())
+                    Some("Available actions: list, get, create, update, add-components, update-component, remove-components, delete, share.".to_string())
                 }
             }
             "rule" => {
@@ -740,9 +1150,9 @@ impl ShellTool {
                 if is_not_found {
                     Some("Run 'heramind agent list' to see available agents.".to_string())
                 } else if action == "create" && is_validation {
-                    Some("Required fields: --name, --prompt, --schedule-type (event|interval|cron). Example: heramind agent create --name \"monitor\" --prompt \"Check devices\" --schedule-type event".to_string())
+                    Some("Required fields: --name, --prompt, --schedule-type (event|interval|cron|manual). Example: heramind agent create --name \"monitor\" --prompt \"Check devices\" --schedule-type event".to_string())
                 } else if action == "control" && is_validation {
-                    Some("Valid status values: active, paused. Example: heramind agent control <ID> --action active".to_string())
+                    Some("Status is positional: heramind agent control <ID> <active|paused>. Example: heramind agent control abc123 active".to_string())
                 } else {
                     Some("Available actions: list, get, create, update, delete, control, invoke, memory, executions, latest-execution, conversation, send-message".to_string())
                 }
@@ -762,9 +1172,9 @@ impl ShellTool {
                 if is_not_found {
                     Some("Run 'heramind transform list' to see available transforms.".to_string())
                 } else if action == "create" && is_validation {
-                    Some("Required fields: --name, --code (JavaScript function). Use --scope to set input scope. Example: heramind transform create --name \"celsius\" --code \"return value * 9/5 + 32\" --scope global".to_string())
+                    Some("Required flags: --name, --scope (global|device_type:X|device:ID), --code (JavaScript; the input value is bound to `input`). Example: heramind transform create --name \"celsius\" --code \"return input * 1.8 + 32\" --scope global".to_string())
                 } else {
-                    Some("Available actions: list, get, create, update, delete, test-code, metrics, data-sources".to_string())
+                    Some("Available actions: list, get, create, update, enable, disable, delete, test-code, metrics, data-sources, executions".to_string())
                 }
             }
             "widget" => {
@@ -789,19 +1199,21 @@ impl ShellTool {
                 } else if action == "channel-update" {
                     Some("Usage: heramind message channel-update --name <N> --config '<JSON>'. To filter by severity: --config '{\"min_severity\":\"warning\"}'. To filter by source type: --config '{\"source_types\":[\"device\"]}'. channel-create uses --name flag; channel-delete/channel-test take name as positional arg.".to_string())
                 } else {
-                    Some("Available actions: list, get, send, read, channel-list, channel-get, channel-create, channel-update, channel-delete, channel-types, channel-test".to_string())
+                    Some("Available actions: list, get, send, read, delete, channel-list, channel-get, channel-types, channel-type-schema, channel-create, channel-update, channel-delete, channel-test.".to_string())
                 }
             }
             "llm" => {
                 if is_not_found {
                     Some("Run 'heramind llm list' to see configured backends.".to_string())
                 } else if action == "create" && is_validation {
-                    Some("Required fields: --name, --type (ollama|openai|custom), --endpoint, --model. Example: heramind llm create --name local --type ollama --endpoint http://localhost:11434 --model qwen3:4b".to_string())
+                    Some("Required fields: --name, --type (ollama|llamacpp|openai|anthropic), --endpoint, --model. Example: heramind llm create --name local --type ollama --endpoint http://localhost:11434 --model qwen3.5:4b".to_string())
                 } else {
-                    Some("Available actions: list, get, models, create, update, delete, activate, test. Example: heramind llm create --name local --type ollama --endpoint http://localhost:11434 --model qwen3:4b".to_string())
+                    Some("Available actions: list, get, models, create, update, delete, activate, test. Example: heramind llm create --name local --type ollama --endpoint http://localhost:11434 --model qwen3.5:4b".to_string())
                 }
             }
-            _ => None,
+            _ => Some(format!(
+                "Run 'heramind {domain} --help' for the exact actions and flags. Quick map — connector: list,get,create,test,enable,disable,subscribe. push: get,create,test,enable,disable,logs. settings: timezone,timezones,retention,cleanup. system: info."
+            )),
         }
     }
 
@@ -821,7 +1233,6 @@ impl ShellTool {
         // Find the first non-env-assignment token. Skips `KEY=value` prefixes
         // like `DISPLAY=:0` so the bare-command check lands on the real binary.
         let first = command
-            .trim()
             .split_whitespace()
             .find(|t| !t.contains('='))?
             .trim_matches('"');
@@ -854,44 +1265,35 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        r#"Execute shell commands on the host system.
+        // Slim description (canonical): Critical Syntax Rules (hard
+        // constraints) + CLI concept. The per-domain subcommand INDEX lives
+        // in DOMAIN_INDEX below and is INJECTED into the first shell tool
+        // result instead of living here — the 2026-08-18 full eval proved a
+        // 2600-char static description re-triggers the ≤3B tool-selection
+        // suppression (models grabbed file_write/web_fetch instead of shell:
+        // the description-avoidance signature from the 6510-char era), which
+        // cost more cases than the index's recall gained. Defensive knowledge
+        // (easy-to-miss list, GUI guard) stays out — discoverable via
+        // `heramind <domain> <action> --help` or the skill tool.
+        static SLIM: &str = r#"Execute shell commands on the host. This is your PRIMARY tool for ALL HeraMind platform operations via the `heramind` CLI (14 domains: device, dashboard, rule, agent, extension, widget, transform, llm, message, connector, push, settings, system, api-key). All commands return JSON by default — do NOT pass --json.
 
-Use this tool to run any system command. For HeraMind platform operations, use the `heramind` CLI.
+Quick reference (run `heramind <domain> --help` or load the `skill` guide for full syntax):
+- Read: `<domain> get <ID>` (one) / `<domain> list` (all). ID is positional, never `--id`.
+- Write: `<domain> create/update/delete` take flags (`--name`, `--device-type`, …). Pass `--id <id>` on create ONLY if the user gave a specific ID.
+- Control / enable / activate are explicit writes: `device control <ID> <CMD>`, `rule enable <ID>`, `llm activate <ID>`, `connector enable <ID>`, `push enable <ID>`.
+- History & conversation: `agent executions <ID>`, `agent conversation <ID>`, `agent send-message <ID>`.
+- Notification channels are a sub-family: `message channel-list` / `channel-create` / `channel-test`, NOT `message list`.
 
-## Critical Syntax Rules (apply to ALL heramind domains)
-- **ID is always a positional argument**, NEVER a `--id` flag. Correct: `heramind device get abc123`. Wrong: `heramind device get --id abc123`.
-- **NEVER guess metric names**. Discover first via `heramind device list` (returns `metric_fields` per type) or `heramind device get <ID>` (full metric names + values), then use exact names in `--metric`, rule conditions, transform code, or dashboard bindings. The same applies to extension fields — discover via `heramind extension info <ID>`.
-- **"unexpected argument" error** = you used a flag where positional was expected. Rewrite without the flag.
-- On command failure, check the `suggestion` field in the JSON output for recovery hints.
+Critical rules:
+- NEVER guess metric or subcommand names — discover via `get`/`list`/`--help` first, then use exact names.
+- Read before write: `get <ID>` before create/update/control/delete.
+- COMPLETE THE FULL FLOW: a multi-step request ("create X then enable it", "deploy then verify") requires EVERY step — do not stop after the first action.
+  Worked example — "create an MQTT connector named c1 to 192.168.1.100, enable and test it" is ONE request = THREE commands:
+  `heramind connector create --name c1 --host 192.168.1.100 --port 1883` → `heramind connector enable c1` → `heramind connector test c1`. Run them all.
+- On error, read the `suggestion` field in the JSON output for recovery.
 
-## HeraMind CLI Domain Syntax
-The `heramind` CLI has 14 domains: `device`, `dashboard`, `rule`, `agent`, `extension`, `widget`, `transform`, `llm`, `message`, `connector`, `push`, `settings`, `system`, `api-key`.
-
-**Domain-specific command syntax, JSON formats, and copy-paste templates live in skill docs** — use the `skill` tool (`skill(action="search", query="<domain>")`) to load the matching guide, or run `heramind <domain> <action> --help` for flags and examples. All commands return JSON by default in this environment (controlled by the `HERAMIND_JSON` env var) — do NOT pass any `--json` flag.
-
-## Easy-to-miss subcommands (check before falling back to ping/nc/ls)
-When the user asks for a domain-specific action, try the matching `heramind <domain> <subcommand>` FIRST — do NOT fall back to raw shell tools (`ping`, `nc`, `ls`, `curl`) until the CLI subcommand has been tried and returned an error.
-- **`heramind connector test <id>`** — test reachability of an MQTT broker. Use this, NOT `ping`/`nc`/`/dev/tcp`.
-- **`heramind connector subscriptions`** — list active MQTT subscriptions across all brokers (takes no id).
-- **`heramind device drafts list` / `drafts approve <id>` / `drafts reject <id>`** — manage auto-discovery drafts. Drafts are NOT deleted via `device delete`; use `device drafts reject <id>` to dismiss a draft.
-- **`heramind extension status <id>` / `extension logs <id>` / `extension reload <id>` / `extension config <id>`** — runtime introspection beyond `list`/`get`. If `extension list` shows an extension but you need health/logs, use these.
-- **`heramind agent clear-memory <id>` / `agent executions <id>`** — memory reset and execution history (distinct from `agent get`).
-- **`heramind transform test-code`** — dry-run transform JavaScript against sample input before saving. For rules, use `heramind rule test <id> --input '<JSON>'` (what-if evaluation against existing rule).
-
-## Native System Commands
-Runs on host via `/bin/sh -c` (Unix) or `cmd /C` (Windows). Common tools available: ping, traceroute, curl, arp, nmap, ps, df, free, top, uptime, systemctl status, ls, cat, head, tail, grep, find, wc, arp-scan, avahi-browse, bluetoothctl, docker.
-
-## GUI-Launching Commands (IMPORTANT — do NOT loop)
-Commands like `open` (macOS), `xdg-open` (Linux), `start`/`explorer` (Windows), or any app launcher (`preview`, `code`, `safari`) launch a GUI window and return **only** `exit_code: 0` with **empty** stdout/stderr on success.
-
-- An empty-output success means "the launch was accepted" — it does NOT mean the window appeared, and you CANNOT see the window yourself.
-- **Call such a command exactly ONCE**, then move on with your task. Do NOT retry, do NOT try variants (`open -a Preview`, `open -R`, etc.) hoping for output — they all return the same empty result and you will never perceive the GUI.
-- If the user needs to inspect an image's pixels, ask them to look at their screen — do not try to "see" it yourself by re-running `open`.
-
-## Execution Notes
-- Each command runs in a fresh process — no persistent shell state between calls.
-- `heramind` commands are dispatched in-process (no subprocess); they return a structured `CliResponse` as pretty-printed JSON on stdout.
-- Output may be truncated for very long responses."#
+Native host tools also available via `/bin/sh -c`: ping, curl, ps, df, grep, docker, …"#;
+        SLIM
     }
 
     fn parameters(&self) -> Value {
@@ -1014,11 +1416,120 @@ Commands like `open` (macOS), `xdg-open` (Linux), `start`/`explorer` (Windows), 
 mod tests {
     use super::*;
 
+    #[test]
+    fn truncation_pipeline_splits_head_decorations() {
+        let (base, merge, stages) =
+            split_truncation_pipeline("heramind device list 2>&1 | head -100").unwrap();
+        assert_eq!(base, "heramind device list");
+        assert!(merge);
+        assert_eq!(stages, vec![(TruncationOp::Head, 100)]);
+    }
+
+    #[test]
+    fn truncation_pipeline_supports_n_form_and_composition() {
+        let (base, merge, stages) =
+            split_truncation_pipeline("heramind rule list | head -n 20 | tail -n 5").unwrap();
+        assert_eq!(base, "heramind rule list");
+        assert!(!merge);
+        assert_eq!(
+            stages,
+            vec![(TruncationOp::Head, 20), (TruncationOp::Tail, 5)]
+        );
+    }
+
+    #[test]
+    fn truncation_pipeline_rejects_unsupported_stages() {
+        assert!(split_truncation_pipeline("heramind device list | grep temp").is_none());
+        assert!(split_truncation_pipeline("heramind device list | sort").is_none());
+    }
+
+    #[test]
+    fn truncation_pipeline_passes_plain_commands_through() {
+        let (base, merge, stages) = split_truncation_pipeline("heramind device list").unwrap();
+        assert_eq!(base, "heramind device list");
+        assert!(!merge);
+        assert!(stages.is_empty());
+    }
+
+    #[test]
+    fn truncation_applied_head_then_tail_in_order() {
+        let out = CommandOutput {
+            exit_code: Some(0),
+            stdout: "1\n2\n3\n4\n5".into(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        let out = apply_truncation_pipeline(
+            out,
+            false,
+            &[(TruncationOp::Head, 3), (TruncationOp::Tail, 2)],
+        );
+        assert_eq!(out.stdout, "2\n3");
+    }
+
     fn test_config() -> ShellConfig {
         ShellConfig {
             enabled: true,
             timeout_secs: 10,
             max_output_chars: 5000,
+        }
+    }
+
+    /// Regression guard: the shell tool's Command Choice must keep the exact
+    /// subcommand disambiguation for the domains GLM-5.2 failed on
+    /// (extension/message/agent/widget/transform-metrics). A prompt slim that
+    /// drops these lines silently reintroduces command-variant failures — the
+    /// model then improvises subcommands (extension info↔get, data-sources↔metrics)
+    /// because those domains aren't in the always-present reference.
+    /// The skeleton description replaced the old dense per-domain Command
+    /// Choice block (6510 chars) — that block suppressed tool SELECTION on
+    /// ≤3B models (they avoided the huge description and grabbed `skill`
+    /// instead; verified A/B on LFM2.5-VL-3B). The load-bearing property is
+    /// that the description stays SHORT; per-domain subcommand syntax is
+    /// delivered on demand via `--help` injection (see `domain_help`).
+    #[test]
+    fn skeleton_description_stays_concise() {
+        let tool = ShellTool::new(test_config());
+        let d = tool.description();
+        assert!(
+            d.len() < 2600,
+            "shell description grew to {} chars — dense descriptions suppress \
+             tool selection on <=3B models; move detail to on-demand injection",
+            d.len()
+        );
+        // Skeleton essentials
+        let dl = d.to_lowercase();
+        for needle in [
+            "primary tool",      // positions shell as the default
+            "quick reference",   // points at --help / skill for detail
+            "read before write", // sequence directive
+            "complete the full flow",
+            "never guess", // discover-before-use
+        ] {
+            assert!(
+                dl.contains(needle),
+                "skeleton description must keep {needle:?}"
+            );
+        }
+        // The worked multi-step example (small models follow examples, not
+        // directives — the connector create→enable→test sequence).
+        assert!(
+            dl.contains("connector create") && dl.contains("connector enable"),
+            "worked multi-step example must stay"
+        );
+    }
+
+    /// Sequence directives: Ling-3.0-tiny's device/rule failures were dominated
+    /// by "skip the read step before write" and "don't finish multi-step flows".
+    /// Guard the two directives that nudge read-before-write + complete-the-flow.
+    #[test]
+    fn command_choice_directs_sequence() {
+        let d = ShellTool::new(test_config()).description().to_lowercase();
+        for needle in ["read before write", "complete the full flow"] {
+            assert!(
+                d.contains(needle),
+                "Command Choice must keep sequence directive {needle:?}"
+            );
         }
     }
 
@@ -1314,5 +1825,109 @@ mod tests {
             }
             Err(_) => 0, // pgrep unavailable; assertion becomes permissive
         }
+    }
+}
+
+/// Edge coverage for the command tokenizer and output truncation — the
+/// in-process dispatch path the agent uses for every `heramind` invocation.
+/// A tokenizer bug here either crashes the tool call (panic) or silently
+/// rewrites the agent's command; a truncation bug can panic on CJK output
+/// (byte/char boundary mismatch) or lose the entire stderr.
+#[cfg(test)]
+mod dispatch_edge_tests {
+    use super::*;
+
+    #[test]
+    fn tokenizer_handles_quotes_and_escapes() {
+        // Single-quoted blob keeps spaces and double quotes intact.
+        let toks =
+            tokenize_heramind_command(r#"agent send-message a1 'hello "world" now'"#).unwrap();
+        assert_eq!(toks, ["agent", "send-message", "a1", "hello \"world\" now"]);
+
+        // Double quotes + escaped quote inside.
+        let toks = tokenize_heramind_command(r#"message send "say \"hi\"""#).unwrap();
+        assert_eq!(toks, ["message", "send", "say \"hi\""]);
+
+        // Escaped space glues two words into one argument.
+        let toks = tokenize_heramind_command(r"device get my\ device").unwrap();
+        assert_eq!(toks, ["device", "get", "my device"]);
+
+        // CJK passes through as ordinary argument characters.
+        let toks = tokenize_heramind_command("rule create --name 温湿度告警").unwrap();
+        assert_eq!(toks, ["rule", "create", "--name", "温湿度告警"]);
+    }
+
+    #[test]
+    fn tokenizer_rejects_shell_constructs_outside_quotes() {
+        for bad in [
+            "device list | grep x",
+            "device list > out.txt",
+            "device list < in.txt",
+            "device list `date`",
+            "device list $HOME",
+        ] {
+            assert!(
+                tokenize_heramind_command(bad).is_err(),
+                "must reject shell construct: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn tokenizer_accepts_shell_chars_inside_quotes() {
+        // The same constructs are fine when quoted — they become literal
+        // argument content, which clap receives intact.
+        let toks = tokenize_heramind_command(r"message send 'a | b > c $d'").unwrap();
+        assert_eq!(toks, ["message", "send", "a | b > c $d"]);
+    }
+
+    #[test]
+    fn tokenizer_rejects_unbalanced_quotes() {
+        assert!(tokenize_heramind_command("message send 'unclosed").is_err());
+        assert!(tokenize_heramind_command(r#"message send "unclosed"#).is_err());
+    }
+
+    /// Regression for the CJK crash class: budgets are in BYTES while
+    /// content is often multi-byte — truncation must back off to a char
+    /// boundary, never slice mid-codepoint (would panic the tool call).
+    #[test]
+    fn truncation_never_splits_multibyte_chars() {
+        let stdout = "温".repeat(2000); // 3 bytes each, 6000 bytes total
+        let stderr = "";
+        let (out, err) = truncate_output(&stdout, stderr, 300);
+        assert!(out.contains("truncated"), "must mark truncation: {out}");
+        assert!(!out.is_empty() && !err.is_empty() || err.is_empty());
+        // The kept prefix must be valid (test would have panicked otherwise)
+        // and the notice must report the byte count actually omitted.
+        assert!(out.contains("chars omitted"));
+    }
+
+    #[test]
+    fn truncation_splits_budget_between_streams() {
+        // Both streams over budget: each keeps a proportional share and
+        // gets its own notice; stderr must not be dropped wholesale.
+        let stdout = "S".repeat(1000);
+        let stderr = "E".repeat(1000);
+        let (out, err) = truncate_output(&stdout, &stderr, 400);
+        assert!(out.contains("truncated") && out.contains('S'));
+        assert!(err.contains("truncated") && err.contains('E'));
+        assert!(out.matches('S').count() < 1000);
+        assert!(err.matches('E').count() < 1000);
+    }
+
+    #[test]
+    fn truncation_passes_small_output_through_untouched() {
+        let (out, err) = truncate_output("ok", "warn", 100);
+        assert_eq!((out.as_str(), err.as_str()), ("ok", "warn"));
+    }
+
+    #[test]
+    fn safe_truncation_point_backs_off_to_boundary() {
+        // "温" is 3 bytes; max_bytes 4 lands mid-char and must back to 3.
+        let s = "温温温";
+        assert_eq!(find_safe_truncation_point(s, 4), 3);
+        assert_eq!(find_safe_truncation_point(s, 6), 6);
+        assert_eq!(find_safe_truncation_point(s, 999), s.len());
+        assert_eq!(find_safe_truncation_point("", 10), 0);
     }
 }

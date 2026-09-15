@@ -30,7 +30,7 @@ use crate::unified_extractor::UnifiedExtractor;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use heramind_core::EventBus;
 use heramind_core::HeraMindEvent;
 use serde_json::Value;
@@ -63,6 +63,12 @@ pub struct MqttAdapterConfig {
     pub discovery_prefix: String,
     /// Enable auto-discovery
     pub auto_discovery: bool,
+    /// Payload field to use as the device identity when the topic cannot
+    /// uniquely identify a device (e.g. a gateway forwarding many devices on
+    /// one topic). `None`/empty → auto-detect common fields (device_id, sn,
+    /// mac, ...). Explicit value wins over auto-detection.
+    #[serde(default)]
+    pub device_id_field: Option<String>,
     /// Storage directory for persistence
     pub storage_dir: Option<String>,
 }
@@ -78,6 +84,7 @@ impl MqttAdapterConfig {
             discovery_topic: None,
             discovery_prefix: "heramind".to_string(),
             auto_discovery: true,
+            device_id_field: None,
             storage_dir: None,
         }
     }
@@ -587,6 +594,27 @@ impl MqttAdapter {
             broker_id, broker_addr
         );
 
+        // Spawn a periodic metric_cache sweep to prevent unbounded growth from
+        // phantom auto-onboarded devices. Drops entries older than 30 min.
+        let sweep_cache = Arc::clone(&self.metric_cache);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                let cutoff = chrono::Utc::now() - chrono::Duration::minutes(30);
+                let mut cache = sweep_cache.write().await;
+                let before = cache.len();
+                for metrics in cache.values_mut() {
+                    metrics.retain(|_, (_, ts)| *ts > cutoff);
+                }
+                cache.retain(|_, metrics| !metrics.is_empty());
+                let removed = before.saturating_sub(cache.len());
+                if removed > 0 {
+                    tracing::debug!(removed, remaining = cache.len(), "metric_cache sweep");
+                }
+            }
+        });
+
         tokio::spawn(async move {
             let mut eventloop = eventloop;
             let mut error_count: u32 = 0;
@@ -601,26 +629,50 @@ impl MqttAdapter {
                         error_count = 0; // Reset error count on success
                         if was_disconnected {
                             was_disconnected = false;
-                            Self::resubscribe_after_reconnect(&mqtt_clients, &broker_id_clone)
-                                .await;
+                            if let Err(panic) = std::panic::AssertUnwindSafe(
+                                Self::resubscribe_after_reconnect(&mqtt_clients, &broker_id_clone),
+                            )
+                            .catch_unwind()
+                            .await
+                            {
+                                tracing::error!(
+                                    broker = %broker_id_clone,
+                                    panic = ?panic,
+                                    "MQTT resubscribe panicked — eventloop continues"
+                                );
+                            }
                         }
-                        Self::handle_mqtt_notification(
-                            notification,
-                            &config,
-                            &event_tx,
-                            &event_bus,
-                            &device_types,
-                            &metric_cache,
-                            &telemetry_storage,
-                            &device_registry,
-                            &connection_status,
-                            &broker_id_clone,
-                            &extractor,
-                            &topic_to_device,
-                            &outbound_command_topics,
-                            data_dir_clone.read().await.as_ref(),
-                        )
-                        .await;
+                        // [panic guard] A panic inside the notification
+                        // handler (arbitrary device payloads) used to unwind
+                        // and KILL this poll task — the adapter stayed
+                        // "running" but never polled again (MQTT silently
+                        // dead until restart). Catch and keep polling.
+                        if let Err(panic) =
+                            std::panic::AssertUnwindSafe(Self::handle_mqtt_notification(
+                                notification,
+                                &config,
+                                &event_tx,
+                                &event_bus,
+                                &device_types,
+                                &metric_cache,
+                                &telemetry_storage,
+                                &device_registry,
+                                &connection_status,
+                                &broker_id_clone,
+                                &extractor,
+                                &topic_to_device,
+                                &outbound_command_topics,
+                                data_dir_clone.read().await.as_ref(),
+                            ))
+                            .catch_unwind()
+                            .await
+                        {
+                            tracing::error!(
+                                broker = %broker_id_clone,
+                                panic = ?panic,
+                                "MQTT notification handler panicked — eventloop continues"
+                            );
+                        }
                     }
                     Err(e) => {
                         error_count += 1;
@@ -922,8 +974,18 @@ impl MqttAdapter {
                         error_count = 0;
                         if was_disconnected {
                             was_disconnected = false;
-                            Self::resubscribe_after_reconnect(&mqtt_clients, &broker_id_clone2)
-                                .await;
+                            if let Err(panic) = std::panic::AssertUnwindSafe(
+                                Self::resubscribe_after_reconnect(&mqtt_clients, &broker_id_clone2),
+                            )
+                            .catch_unwind()
+                            .await
+                            {
+                                tracing::error!(
+                                    broker = %broker_id_clone2,
+                                    panic = ?panic,
+                                    "MQTT resubscribe panicked — eventloop continues"
+                                );
+                            }
                         }
                         if let Err(e) = eventloop_tx.send(notification).await {
                             warn!("Failed to send MQTT notification to channel: {}", e);
@@ -1069,16 +1131,27 @@ impl MqttAdapter {
             }
             info!("Loaded {} CA certificates", ca_cert_count);
         } else {
-            // Use system's native certificate store
-            let certs = rustls_native_certs::load_native_certs().map_err(|e| {
-                AdapterError::Configuration(format!("Failed to load native certs: {}", e))
-            })?;
-            for cert in certs {
+            // Use system's native certificate store.
+            // rustls-native-certs 0.8: load_native_certs() returns CertificateResult
+            // (not Result); partial failures are collected in `.errors` and don't abort,
+            // so we log them as a warning rather than erroring out.
+            let native = rustls_native_certs::load_native_certs();
+            let cert_count = native.certs.len();
+            for cert in native.certs {
                 root_cert_store.add(cert).map_err(|e| {
                     AdapterError::Configuration(format!("Failed to add native cert: {}", e))
                 })?;
             }
-            info!("Loaded system CA certificates");
+            if native.errors.is_empty() {
+                info!("Loaded {} system CA certificates", cert_count);
+            } else {
+                warn!(
+                    "Loaded {} system CA certs; {} source(s) had errors: {:?}",
+                    cert_count,
+                    native.errors.len(),
+                    native.errors
+                );
+            }
         }
 
         // Build client config
@@ -1816,6 +1889,11 @@ impl MqttAdapter {
                                     device_id, dt
                                 );
 
+                                // Client-supplied timestamp (DEF-001): honor
+                                // backfill payloads like the webhook path does;
+                                // fall back to server receive time.
+                                let client_ts = extract_client_timestamp(&json_value);
+
                                 // Use UnifiedExtractor to extract metrics
                                 let result = extractor.extract(&device_id, dt, &json_value).await;
 
@@ -1834,11 +1912,12 @@ impl MqttAdapter {
 
                                 // Emit all extracted metrics
                                 for metric in result.metrics {
+                                    let point_ts = client_ts.unwrap_or_else(|| now.timestamp());
                                     // Convert Binary to URL before storage + event bus (fork point)
                                     let value = Self::convert_binary_to_url(
                                         &device_id,
                                         &metric.name,
-                                        now.timestamp(),
+                                        point_ts,
                                         metric.value.clone(),
                                         data_dir,
                                     );
@@ -1855,7 +1934,7 @@ impl MqttAdapter {
                                     // Store in telemetry storage
                                     if let Some(storage) = telemetry_storage.read().await.as_ref() {
                                         let data_point = crate::telemetry::DataPoint {
-                                            timestamp: now.timestamp(),
+                                            timestamp: point_ts,
                                             value: value.clone(),
                                             quality: None,
                                         };
@@ -1884,7 +1963,7 @@ impl MqttAdapter {
                                         device_id: device_id.clone(),
                                         metric: metric.name.clone(),
                                         value: value.clone(),
-                                        timestamp: now.timestamp(),
+                                        timestamp: point_ts,
                                     }) {
                                         error!(
                                             "Failed to send metric event to channel: {}/{} - {}",
@@ -1953,13 +2032,20 @@ impl MqttAdapter {
                                     value: value.clone(),
                                     quality: None,
                                 };
-                                let _ = storage
+                                if let Err(e) = storage
                                     .write(
                                         &format!("device:{}", device_id),
                                         &metric_name,
                                         data_point,
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        device_id = %device_id,
+                                        error = %e,
+                                        "Failed to write telemetry to time-series storage"
+                                    );
+                                }
                             }
 
                             // Emit event to device event channel - event forwarding task will publish to EventBus
@@ -2059,6 +2145,9 @@ impl MqttAdapter {
                         // Parse payload and process for the registered device
                         if let Ok(json_data) = serde_json::from_slice::<serde_json::Value>(&payload)
                         {
+                            // Client timestamp (DEF-001) — same policy as the
+                            // registered-type branch above.
+                            let client_ts_fallback = extract_client_timestamp(&json_data);
                             debug!("Successfully parsed JSON payload for device {}", device_id);
 
                             // Use UnifiedExtractor with the full JSON data
@@ -2066,6 +2155,8 @@ impl MqttAdapter {
                             // DO NOT pre-extract the "data" field - it causes double-extraction issues
                             if let Some(dt) = device_type_opt {
                                 let result = extractor.extract(device_id, &dt, &json_data).await;
+                                let point_ts_fb =
+                                    client_ts_fallback.unwrap_or_else(|| now.timestamp());
                                 debug!(
                                     "Extraction result for device {}: mode={:?}, metrics={}",
                                     device_id,
@@ -2102,7 +2193,7 @@ impl MqttAdapter {
                                     // Store in telemetry storage
                                     if let Some(storage) = telemetry_storage.read().await.as_ref() {
                                         let data_point = crate::telemetry::DataPoint {
-                                            timestamp: now.timestamp(),
+                                            timestamp: point_ts_fb,
                                             value: value.clone(),
                                             quality: None,
                                         };
@@ -2127,7 +2218,7 @@ impl MqttAdapter {
                                         device_id: device_id.clone(),
                                         metric: metric.name.clone(),
                                         value: value.clone(),
-                                        timestamp: now.timestamp(),
+                                        timestamp: point_ts_fb,
                                     }) {
                                         error!(
                                             "Failed to send metric event to channel: {}/{} - {}",
@@ -2165,13 +2256,20 @@ impl MqttAdapter {
                                             value: value.clone(),
                                             quality: None,
                                         };
-                                        let _ = storage
+                                        if let Err(e) = storage
                                             .write(
                                                 &format!("device:{}", device_id),
                                                 metric_name,
                                                 data_point,
                                             )
-                                            .await;
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                device_id = %device_id,
+                                                error = %e,
+                                                "Failed to write telemetry to time-series storage"
+                                            );
+                                        }
                                     }
 
                                     // Emit to device event channel - event forwarding task will publish to EventBus
@@ -2227,11 +2325,20 @@ impl MqttAdapter {
                             topic
                         );
 
-                        // Generate a device_id for auto-discovery
-                        // Try to extract from topic, or use a hash-based ID
-                        // Sanitize the extracted id (length + charset); fall back to a
-                        // hash-derived id (already safe format) if missing/invalid.
-                        let auto_device_id = extract_device_id_from_topic(&topic, config)
+                        // Generate a device_id for auto-discovery.
+                        // Precedence (gateway case: many devices forwarded on one
+                        // topic need a payload-carried identity):
+                        //   ① high-confidence topic extraction (device/{type}/{id},
+                        //      subscription patterns)
+                        //   ② payload identity (explicit config.device_id_field, or
+                        //      auto-detect common fields device_id/sn/mac/...)
+                        //   ③ weak topic fallback (parts[1])
+                        //   ④ topic hash (last resort)
+                        let auto_device_id = extract_device_id_from_topic_strong(&topic, config)
+                            .and_then(sanitize_auto_device_id)
+                            .or_else(|| extract_device_id_from_payload(&payload, config))
+                            .and_then(sanitize_auto_device_id)
+                            .or_else(|| extract_device_id_from_topic_weak(&topic))
                             .and_then(sanitize_auto_device_id)
                             .unwrap_or_else(|| {
                                 // Use topic hash as device_id
@@ -2470,7 +2577,55 @@ fn sanitize_auto_device_id(id: String) -> Option<String> {
     }
 }
 
+/// Normalize a raw epoch value to SECONDS with unit auto-detection and a
+/// 5-minute future guard. Shared by MQTT and webhook ingestion — senders
+/// disagree on units (ns/ms/s), and an undetected ms timestamp lands as
+/// year-58,000 seconds, invisible to every time-window query.
+pub(crate) fn normalize_epoch_seconds(raw: i64) -> Option<i64> {
+    // unit detection by magnitude: ns ~1e18 (>1e17), ms ~1e12 (>1e11),
+    // s ~1e9 (>1e8). Thresholds sit well below current epochs and well
+    // above the next-smaller unit, so boundary years can't cross.
+    let secs = if raw > 100_000_000_000_000_000 {
+        raw / 1_000_000_000
+    } else if raw > 100_000_000_000 {
+        raw / 1_000
+    } else if raw > 100_000_000 {
+        raw
+    } else {
+        return None; // implausibly small — not an epoch
+    };
+    let now = chrono::Utc::now().timestamp();
+    if secs > now + 300 {
+        return None; // > 5 min in the future — reject (clock skew / garbage)
+    }
+    Some(secs)
+}
+
+/// Extract a client-supplied timestamp from an uplink JSON payload.
+///
+/// Recognizes the common field names (`timestamp`, `ts`, `ts_ms`, `ts_ns`,
+/// `time`) and auto-detects the epoch unit (seconds / milliseconds /
+/// nanoseconds) from the magnitude. Returns `None` when absent, malformed,
+/// or implausible (> 5 minutes in the future — a wildly wrong clock must
+/// not corrupt the series). This aligns MQTT ingest with the webhook
+/// path, which already honors `payload.timestamp` (DEF-001).
+fn extract_client_timestamp(json: &serde_json::Value) -> Option<i64> {
+    const FIELDS: [&str; 5] = ["timestamp", "ts", "ts_ms", "ts_ns", "time"];
+    let raw = FIELDS.iter().find_map(|f| {
+        json.get(f)
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|x| x as i64)))
+    })?;
+    normalize_epoch_seconds(raw)
+}
+
 fn extract_device_id_from_topic(topic: &str, config: &MqttAdapterConfig) -> Option<String> {
+    extract_device_id_from_topic_strong(topic, config)
+        .or_else(|| extract_device_id_from_topic_weak(topic))
+}
+
+/// High-confidence topic extraction: `device/{type}/{id}/...` or a matching
+/// subscription pattern (`+` at index 1 is the device id).
+fn extract_device_id_from_topic_strong(topic: &str, config: &MqttAdapterConfig) -> Option<String> {
     let parts: Vec<&str> = topic.split('/').collect();
 
     // Try device/{device_type}/{device_id}/{direction} format first
@@ -2485,12 +2640,148 @@ fn extract_device_id_from_topic(topic: &str, config: &MqttAdapterConfig) -> Opti
         }
     }
 
-    // Fallback: extract from common patterns
+    None
+}
+
+/// Weak fallback: the second topic segment. Generic (a gateway forwarding
+/// every device on `gateway/data` yields `"data"` for all), so only used
+/// after the payload identity check.
+fn extract_device_id_from_topic_weak(topic: &str) -> Option<String> {
+    let parts: Vec<&str> = topic.split('/').collect();
     if parts.len() >= 2 {
         Some(parts[1].to_string())
     } else {
         None
     }
+}
+
+/// Payload-carried device identity. Used when the topic cannot uniquely
+/// identify the device (gateway forwarding many devices on one topic).
+/// ① explicit `config.device_id_field` wins (comma-separated list, tried in
+/// order); ② otherwise auto-detect common fields (device_id / deviceId / sn /
+/// mac / mac_address / ...).
+/// Wrapper keys gateways commonly nest telemetry under. Identity lookup
+/// descends ONE level into these when the field isn't at the top level
+/// (e.g. `{"data": {"device_id": "x"}}`).
+const ID_WRAPPER_KEYS: &[&str] = &["data", "payload", "state", "params", "body", "device"];
+
+/// Resolve a field to a string: dotted paths walk (`data.sn`), plain names
+/// check the top level first and then one level inside the wrapper keys.
+fn lookup_id_field(
+    root: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<String> {
+    if field.contains('.') {
+        // Dotted path: walk segments through nested objects; the leaf must
+        // be a non-empty string. `Value::get` returns None on non-objects,
+        // which is the walk's natural stop.
+        let mut segs = field.split('.');
+        let first = segs.next()?;
+        let mut cur: &serde_json::Value = root.get(first)?;
+        for seg in segs {
+            cur = cur.get(seg)?;
+        }
+        return id_value_to_string(cur);
+    }
+    // Plain name: top level first…
+    if let Some(v) = root.get(field).and_then(id_value_to_string) {
+        return Some(v);
+    }
+    // …then one level inside common wrappers.
+    for w in ID_WRAPPER_KEYS {
+        if let Some(inner) = root.get(*w).and_then(serde_json::Value::as_object) {
+            if let Some(v) = inner.get(field).and_then(id_value_to_string) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Accept strings and integers as identity values — gateways do send
+/// numeric SNs (`"sn": 42`); refusing them silently merged those devices.
+fn id_value_to_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) if n.is_u64() || n.is_i64() => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn extract_device_id_from_payload(payload: &[u8], config: &MqttAdapterConfig) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let obj = json.as_object()?;
+
+    if let Some(fields) = config.device_id_field.as_deref() {
+        // Candidate list, tried in order — gateway payloads vary per
+        // firmware, so operators can chain fallbacks. Separators: newline
+        // (the UI is one-field-per-line) and comma (API callers). Dotted
+        // paths (`data.sn`) walk nested objects.
+        for field in fields
+            .split([',', '\n', '\r'])
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+        {
+            if let Some(v) = lookup_id_field(obj, field) {
+                return Some(v);
+            }
+        }
+    }
+
+    // Auto-detect common device-identity fields, high confidence first.
+    // Case-insensitive (device_id / deviceId / DeviceID all match).
+    const CANDIDATES: &[&str] = &[
+        "device_id",
+        "deviceid",
+        "dev_id",
+        "devid",
+        "device_sn",
+        "devicesn",
+        "sn",
+        "serial",
+        "serial_number",
+        "serial_no",
+        "mac",
+        "mac_address",
+        "macaddr",
+        "eui",
+        "deveui",
+        "devaddr",
+        "imei",
+        "iccid",
+        "node_id",
+        "nodeid",
+        "sensor_id",
+        "sensorid",
+        "device_uuid",
+        "deviceuuid",
+        "uuid",
+        "device_name",
+        "devicename",
+        "dev_name",
+    ];
+    for key in CANDIDATES {
+        if let Some(v) = obj.iter().find(|(k, _)| k.to_ascii_lowercase() == *key) {
+            if let Some(s) = id_value_to_string(v.1) {
+                return Some(s);
+            }
+        }
+    }
+    // Same candidates one level inside common wrappers — gateways often
+    // nest identity with the telemetry (`{"data":{"device_id":"x"}}`).
+    for w in ID_WRAPPER_KEYS {
+        let Some(inner) = obj.get(*w).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for key in CANDIDATES {
+            if let Some(v) = inner.iter().find(|(k, _)| k.to_ascii_lowercase() == *key) {
+                if let Some(s) = id_value_to_string(v.1) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Helper function to match topic pattern.
@@ -2735,6 +3026,44 @@ pub async fn test_mqtt_connection(
 }
 
 #[cfg(test)]
+mod ts_tests {
+    use super::extract_client_timestamp;
+    use serde_json::json;
+
+    #[test]
+    fn detects_units_and_fields() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(
+            extract_client_timestamp(&json!({"timestamp": now - 7200})),
+            Some(now - 7200)
+        );
+        assert_eq!(
+            extract_client_timestamp(&json!({"ts": (now - 60) * 1000})),
+            Some(now - 60)
+        );
+        assert_eq!(
+            extract_client_timestamp(&json!({"ts_ns": (now - 1) * 1_000_000_000})),
+            Some(now - 1)
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_and_future() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(extract_client_timestamp(&json!({})), None);
+        assert_eq!(
+            extract_client_timestamp(&json!({"timestamp": "not-a-number"})),
+            None
+        );
+        assert_eq!(extract_client_timestamp(&json!({"timestamp": 123})), None); // 非纪元
+        assert_eq!(
+            extract_client_timestamp(&json!({"timestamp": now + 3600})),
+            None
+        ); // 未来
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2760,6 +3089,173 @@ mod tests {
         // exactly at limit -> kept
         let at = "a".repeat(MAX_AUTOONBOARD_DEVICE_ID_LEN);
         assert!(sanitize_auto_device_id(at).is_some());
+    }
+
+    #[test]
+    fn test_extract_device_id_from_payload_auto_detect() {
+        let cfg = MqttAdapterConfig::new("test", "localhost:1883");
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"device_id\":\"sensor-1\",\"data\":{}}", &cfg)
+                .as_deref(),
+            Some("sensor-1")
+        );
+        // case-insensitive deviceId
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"deviceId\":\"s2\",\"data\":{}}", &cfg).as_deref(),
+            Some("s2")
+        );
+        // mac
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"mac\":\"aa:bb:cc\",\"data\":{}}", &cfg).as_deref(),
+            Some("aa:bb:cc")
+        );
+        // no identity field -> None (caller falls back to topic/hash)
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"temp\":21.5}", &cfg),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_device_id_from_payload_explicit_field() {
+        let cfg = MqttAdapterConfig {
+            device_id_field: Some("DEV".to_string()),
+            ..MqttAdapterConfig::new("test", "localhost:1883")
+        };
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"DEV\":\"gw-42\",\"data\":{}}", &cfg).as_deref(),
+            Some("gw-42")
+        );
+        // explicit field beats auto-detect
+        assert_eq!(
+            extract_device_id_from_payload(
+                b"{\"DEV\":\"gw-42\",\"device_id\":\"other\",\"data\":{}}",
+                &cfg
+            )
+            .as_deref(),
+            Some("gw-42")
+        );
+    }
+
+    #[test]
+    fn test_extract_device_id_nested_wrapper() {
+        let cfg = MqttAdapterConfig::new("test", "localhost:1883");
+        // auto-detect descends into common wrappers
+        assert_eq!(
+            extract_device_id_from_payload(
+                b"{\"data\":{\"device_id\":\"nested-1\",\"temperature\":21}}",
+                &cfg
+            )
+            .as_deref(),
+            Some("nested-1")
+        );
+        // explicit plain field also descends
+        let cfg2 = MqttAdapterConfig {
+            device_id_field: Some("sn".to_string()),
+            ..MqttAdapterConfig::new("test", "localhost:1883")
+        };
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"payload\":{\"sn\":\"SN-9\"}}", &cfg2).as_deref(),
+            Some("SN-9")
+        );
+        // dotted path walks explicitly
+        let cfg3 = MqttAdapterConfig {
+            device_id_field: Some("state.meta.mac".to_string()),
+            ..MqttAdapterConfig::new("test", "localhost:1883")
+        };
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"state\":{\"meta\":{\"mac\":\"aa:bb\"}}}", &cfg3)
+                .as_deref(),
+            Some("aa:bb")
+        );
+        // top level wins over nested
+        let cfg4 = MqttAdapterConfig {
+            device_id_field: Some("sn".to_string()),
+            ..MqttAdapterConfig::new("test", "localhost:1883")
+        };
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"sn\":\"TOP\",\"data\":{\"sn\":\"NESTED\"}}", &cfg4)
+                .as_deref(),
+            Some("TOP")
+        );
+        // numeric ids are accepted (gateways send numeric SNs)
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"data\":{\"device_id\":42}}", &cfg).as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"sn\":777}", &cfg).as_deref(),
+            Some("777")
+        );
+        // non-id leaves (bool/object) still -> None
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"data\":{\"device_id\":true}}", &cfg).as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_device_id_comma_separated_fallback() {
+        // Comma-separated candidate list: tried in order, first hit wins.
+        let cfg = MqttAdapterConfig {
+            device_id_field: Some("sn, dev_id, mac".to_string()),
+            ..MqttAdapterConfig::new("test", "localhost:1883")
+        };
+        // first candidate present
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"sn\":\"SN-1\",\"mac\":\"m1\"}", &cfg).as_deref(),
+            Some("SN-1")
+        );
+        // first absent -> second candidate
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"dev_id\":\"D-2\",\"mac\":\"m2\"}", &cfg).as_deref(),
+            Some("D-2")
+        );
+        // all explicit candidates absent -> falls through to auto-detect
+        // (device_id candidate)
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"device_id\":\"auto-3\"}", &cfg).as_deref(),
+            Some("auto-3")
+        );
+        // spaces around commas are trimmed
+        let cfg_spaced = MqttAdapterConfig {
+            device_id_field: Some("  sn ,  mac  ".to_string()),
+            ..MqttAdapterConfig::new("test", "localhost:1883")
+        };
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"mac\":\"mm\"}", &cfg_spaced).as_deref(),
+            Some("mm")
+        );
+        // newline-separated (the one-field-per-line UI form) — same behavior
+        let cfg_lines = MqttAdapterConfig {
+            device_id_field: Some("sn\n dev_id\nmac".to_string()),
+            ..MqttAdapterConfig::new("test", "localhost:1883")
+        };
+        assert_eq!(
+            extract_device_id_from_payload(b"{\"dev_id\":\"L-9\"}", &cfg_lines).as_deref(),
+            Some("L-9")
+        );
+    }
+
+    #[test]
+    fn test_same_topic_different_payload_ids_distinct() {
+        // Gateway case: two devices forwarded on one topic must get distinct
+        // ids. The topic (`gateway/data`) yields a weak parts[1] = "data" for
+        // both, so the payload `device_id` must win.
+        let cfg = MqttAdapterConfig::new("test", "localhost:1883");
+        let topic = "gateway/data";
+        let derive = |payload: &[u8]| {
+            extract_device_id_from_topic_strong(topic, &cfg)
+                .and_then(sanitize_auto_device_id)
+                .or_else(|| extract_device_id_from_payload(payload, &cfg))
+                .and_then(sanitize_auto_device_id)
+                .or_else(|| extract_device_id_from_topic_weak(topic))
+        };
+        let id1 = derive(b"{\"device_id\":\"sensor-1\",\"temp\":20}");
+        let id2 = derive(b"{\"device_id\":\"sensor-2\",\"temp\":21}");
+        assert_eq!(id1.as_deref(), Some("sensor-1"));
+        assert_eq!(id2.as_deref(), Some("sensor-2"));
+        assert_ne!(id1, id2);
     }
 
     #[test]

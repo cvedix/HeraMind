@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt};
 
+use super::next_chunk_or_timeout;
+
 use super::context::{
     build_context_window_with_config, build_context_window_with_summary, ToolExecutionResult,
 };
@@ -30,6 +32,10 @@ use crate::agent::tool_parser::{
     is_degenerate_fence_only_output, parse_tool_calls, remove_tool_calls_from_response,
 };
 use crate::agent::types::{AgentEvent, AgentInternalState, AgentMessage, ToolCall};
+// No stuck-loop breaker in the chat path — the user is watching and can
+// abort manually. (The scheduled-agent path brakes via cross-round dedup →
+// AllDuplicate; StuckDetector was removed in 0.9.20 — it was unreachable
+// behind that same dedup.)
 use crate::error::{HeraMindError, Result};
 use crate::llm::LlmInterface;
 use heramind_core::llm::compaction::CompactionConfig;
@@ -78,10 +84,10 @@ pub struct StreamSafeguards {
 impl Default for StreamSafeguards {
     fn default() -> Self {
         Self {
-            // Synchronized with StreamConfig::max_stream_duration_secs (1200s)
+            // Synchronized with StreamConfig::max_stream_duration_secs (2400s)
             // This provides adequate time for thinking models like qwen3-vl:2b
             // to complete extended reasoning before generating content.
-            max_stream_duration: Duration::from_secs(1200),
+            max_stream_duration: Duration::from_secs(2400),
 
             // No limit on thinking content - let the LLM backend enforce limits
             max_thinking_length: usize::MAX,
@@ -185,8 +191,29 @@ pub async fn process_stream_events_with_safeguards(
     // This prevents the LLM from repeating actions or calling tools again
     // Pure async - no block_in_place
     let state_guard = internal_state.read().await;
-    let history_messages = state_guard.memory.clone();
+    let mut history_messages = state_guard.memory.clone();
     drop(state_guard); // Release lock before calling LLM
+
+    // [dup-fix] The caller (process_stream_events_with_safeguards) pushes
+    // the current user message into memory BEFORE creating this stream, and
+    // the LLM layer appends the user message itself when building the
+    // request (`msgs.push(user_msg)` in llm.rs) — without dropping the
+    // trailing copy here, every text prompt carried [.., user(current),
+    // user(current)]. The multimodal path pushes after stream creation and
+    // never had this duplication.
+    if history_messages
+        .last()
+        .map(|m| m.role == "user" && m.content.as_ref() == user_message)
+        .unwrap_or(false)
+    {
+        history_messages.pop();
+    }
+
+    // === CHAT HISTORY DEPTH (configurable, /api/settings/agent) ===
+    // Same cap the non-streaming path applies — the server chat entry
+    // points (SSE/WS) all stream, so without this the advertised setting
+    // would never run for real conversations.
+    crate::agent::apply_chat_history_depth(&mut history_messages);
 
     // === DYNAMIC CONTEXT WINDOW: Get model's actual capacity ===
     let max_context = llm_interface.max_context_length().await;
@@ -194,17 +221,7 @@ pub async fn process_stream_events_with_safeguards(
     // Measure actual overhead from system prompt + tool definitions
     let prompt_overhead = llm_interface.estimate_prompt_overhead_tokens().await;
 
-    // Reserve tokens for model response generation (minimum 1024)
-    const RESERVE_FOR_RESPONSE: usize = 1024;
-
-    // History budget = total capacity - prompt overhead - response reserve
-    let effective_max = max_context
-        .saturating_sub(prompt_overhead)
-        .saturating_sub(RESERVE_FOR_RESPONSE);
-
-    // Safety floor: always allow at least 20% of context for history
-    let min_history = (max_context * 20) / 100;
-    let effective_max = effective_max.max(min_history);
+    let effective_max = effective_history_budget(max_context, prompt_overhead);
 
     tracing::debug!(
         "Context window: model_capacity={}, prompt_overhead={}, reserve={}, effective_max={} for history",
@@ -291,6 +308,19 @@ pub async fn process_stream_events_with_safeguards(
         // === SAFEGUARD: Track multi-round tool calling iterations ===
         let mut tool_iteration_count = 0usize;
         const MAX_TOOL_ITERATIONS: usize = 30;
+        // Soft wall-clock budget for the tool loop. The chat WS path has no
+        // total-turn timeout (only a 1200s per-event idle cap), so a
+        // pathological loop grinds forever with no text answer (observed:
+        // 16+ min of verify rounds). Exiting here falls through to the
+        // forced-summary path below, so the user ALWAYS gets a text reply.
+        // Configurable via /api/settings/agent `chat_turn_timeout_secs`
+        // (Settings → Preferences); default 1800s. The original hardcoded
+        // 240s cut legitimate long multi-step tasks (thinking-model rounds +
+        // slow tool executions) off mid-task — the agent "stopped halfway".
+        let turn_wall_clock_budget = std::time::Duration::from_secs(
+            heramind_storage::AgentDefaults::get().chat_turn_timeout_secs,
+        );
+        let turn_started_at = Instant::now();
         // Accumulate ALL tool results across rounds for final summary
         let mut all_round_tool_results: Vec<(String, String)> = Vec::new();
         // Track per-round thinking and content for persistence (round number → text)
@@ -307,6 +337,12 @@ pub async fn process_stream_events_with_safeguards(
         let mut no_tool_data_recovery_attempts = 0usize;
         const MAX_NO_TOOL_DATA_RECOVERY_ATTEMPTS: usize = 2;
 
+        // The list-only dead-end forced continuation fires AT MOST ONCE per
+        // turn. Re-injecting every round while the condition holds traps the
+        // model in an investigate→contradict loop until MAX_TOOL_ITERATIONS
+        // (observed: 11 rounds, no final text).
+        let mut list_only_dead_end_injected = false;
+
         // === INTENT & PLAN VISUALIZATION ===
         // Send intent and plan events first to show user what's happening
         yield intent_event;
@@ -317,7 +353,9 @@ pub async fn process_stream_events_with_safeguards(
         }
 
         // === MULTI-ROUND TOOL CALLING LOOP ===
-        // For complex intents, we may need multiple rounds of tool calling
+        // Chat path: no loop breaker — the user is watching and can abort.
+        // Safety nets: MAX_TOOL_ITERATIONS (30) + stream timeout (max_stream_duration).
+        // (The scheduled-agent path brakes via cross-round dedup → AllDuplicate.)
         'multi_round_loop: loop {
             if tool_iteration_count > 0 {
                 tracing::debug!("Starting tool iteration round {}", tool_iteration_count + 1);
@@ -370,7 +408,18 @@ pub async fn process_stream_events_with_safeguards(
                     // If the user asked for an action (create/delete/control/enable/etc)
                     // but all executed tools were read-only (list/get/latest/history),
                     // inject a FORCED continuation prompt to push the LLM to complete the task.
+                    // At most once per turn (see list_only_dead_end_injected).
                     let commands_ref: Vec<&str> = recently_executed_commands.iter().map(|s| s.as_str()).collect();
+
+                    let dead_end_msg = if list_only_dead_end_injected {
+                        None
+                    } else {
+                        build_list_only_dead_end_prompt(
+                            &user_message,
+                            &commands_ref,
+                            &all_round_tool_results,
+                        )
+                    };
 
                     if let Some(incomplete_query_msg) = build_incomplete_data_query_prompt(
                         &user_message,
@@ -378,23 +427,36 @@ pub async fn process_stream_events_with_safeguards(
                         &all_round_tool_results,
                     ) {
                         incomplete_query_msg
-                    } else if let Some(dead_end_msg) = build_list_only_dead_end_prompt(
-                        &user_message,
-                        &commands_ref,
-                        &all_round_tool_results,
-                    ) {
+                    } else if let Some(dead_end_msg) = dead_end_msg {
+                        list_only_dead_end_injected = true;
                         dead_end_msg
                     } else {
-                        // Normal context message — no list-only dead end detected
+                        // Normal context message — no list-only dead end detected.
+                        // Anti-hallucination guard: small models sometimes
+                        // report FAILED commands as successful in the final
+                        // answer (observed: 404 on add-components → "已成功
+                        // 添加"). When any prior shell command exited non-zero,
+                        // remind the model that lying about it is forbidden and
+                        // point at the recovery path.
+                        let has_failed_cmds = all_round_tool_results.iter().any(|(_, r)| {
+                            r.contains("\"exit_code\"") && !r.contains("\"exit_code\":0")
+                        });
+                        let failure_guard = if has_failed_cmds {
+                            "\n\n⚠️ Some earlier command FAILED (exit≠0). You MUST NOT claim failed operations succeeded in your answer. Either fix and retry using the error/suggestion (e.g. resolve the REAL id via `heramind dashboard list` / `device list`), or report the failure honestly with its cause.".to_string()
+                        } else {
+                            String::new()
+                        };
                         format!(
                             "Round {} of processing.\n\n\
                             Previously executed tools (results are in context above):\n{}\n\n\
                             STOP AND THINK: Do you need MORE tools, or can you answer from the results above?\n\
                             - If tools above already returned the data you need → give the final response NOW. Do NOT call them again.\n\
+                            - If the original goal is NOT yet verified end-to-end (expected data not returned, created resource not yet readable) → continue with the next tool call now — a plan alone is not a completed task.\n\
                             - If you need different tools → call them in ONE batch using JSON array: [{{\"name\":\"tool\",\"arguments\":{{...}}}}]\n\
-                            - NEVER call the same tool with the same arguments — results are already in context.",
+                            - NEVER call the same tool with the same arguments — results are already in context.{}",
                             tool_iteration_count + 1,
-                            executed_summary
+                            executed_summary,
+                            failure_guard
                         )
                     }
                 };
@@ -460,7 +522,9 @@ pub async fn process_stream_events_with_safeguards(
                             match summary_result {
                                 Ok(s) => {
                                     let mut pin = Box::pin(s);
-                                    while let Some(chunk) = pin.next().await {
+                                    while let Some(chunk) =
+                                        next_chunk_or_timeout(&mut pin, safeguards.max_stream_duration).await
+                                    {
                                         match chunk {
                                             Ok((text, _)) => { yield AgentEvent::content(text); }
                                             Err(_) => break,
@@ -490,7 +554,9 @@ pub async fn process_stream_events_with_safeguards(
             }
 
             // === PHASE 1: Stream initial response (thinking + content + tool calls) ===
-            while let Some(result) = StreamExt::next(&mut stream).await {
+            // Bounded `next()`: a zero-chunk stall (upstream LLM never yields)
+            // force-breaks the round instead of hanging forever.
+            while let Some(result) = next_chunk_or_timeout(&mut stream, safeguards.max_stream_duration).await {
                 let elapsed = stream_start.elapsed();
 
                 // Check timeout with early warning at 80% of max duration
@@ -772,12 +838,12 @@ pub async fn process_stream_events_with_safeguards(
                                         .iter()
                                         .map(|command| command.as_str())
                                         .collect();
-                                    if !(requires_data_tool
-                                        && !data_query_was_satisfied(
+                                    if !requires_data_tool
+                                        || data_query_was_satisfied(
                                             &user_message,
                                             &commands_ref,
                                             !all_round_tool_results.is_empty(),
-                                        ))
+                                        )
                                     {
                                         yield AgentEvent::content(text.clone());
                                     }
@@ -902,23 +968,44 @@ pub async fn process_stream_events_with_safeguards(
                 // Execute tool calls with bounded concurrency (max 6 parallel)
                 const MAX_TOOL_CONCURRENCY: usize = 6;
 
-                // Collect into owned tuples to avoid lifetime issues with async_stream
-                let tool_inputs: Vec<(String, serde_json::Value)> = tool_calls_to_execute
+                // Collect into owned tuples to avoid lifetime issues with async_stream.
+                // Carry the emission index so we can restore LLM-emission order after
+                // `buffer_unordered` (which completes out of order) — the stuck
+                // detector's ping-pong pattern needs chronological action order.
+                let tool_inputs: Vec<(usize, String, serde_json::Value)> = tool_calls_to_execute
                     .iter()
-                    .map(|tc| {
+                    .enumerate()
+                    .map(|(i, tc)| {
                         (
+                            i,
                             tc.name.clone(),
                             resolve_cached_arguments(&tc.arguments, &large_cache, &tc.name),
                         )
                     })
                     .collect();
 
-                let tool_futures = futures::stream::iter(tool_inputs.into_iter().map(|(name, arguments)| {
+                let tool_futures = futures::stream::iter(tool_inputs.into_iter().map(|(i, name, arguments)| {
                     let tools_clone = tools.clone();
                     let cache_clone = cache.clone();
 
                     async move {
-                        (name.clone(), ToolExecutionResult {
+                        // Shell policy check — same deny-list as Loop A (tool_loop.rs).
+                        // Blocks catastrophic commands (rm -rf /, dd, mkfs, etc.) in chat.
+                        if name == "shell" {
+                            if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
+                                if let Some(reason) = crate::toolkit::policy::deny_reason(cmd) {
+                                    tracing::warn!("Chat tool call blocked by safety policy: {}", reason);
+                                    return (i, name.clone(), ToolExecutionResult {
+                                        _name: name.clone(),
+                                        arguments: arguments.clone(),
+                                        result: Err(crate::toolkit::error::ToolError::Execution(
+                                            format!("Blocked by safety policy: {}", reason),
+                                        )),
+                                    });
+                                }
+                            }
+                        }
+                        (i, name.clone(), ToolExecutionResult {
                             _name: name.clone(),
                             arguments: arguments.clone(),
                             result: execute_tool_with_retry(&tools_clone, &cache_clone, &name, arguments.clone()).await,
@@ -926,13 +1013,35 @@ pub async fn process_stream_events_with_safeguards(
                     }
                 })).buffer_unordered(MAX_TOOL_CONCURRENCY);
 
-                let tool_results_executed: Vec<_> = tool_futures.collect().await;
+                // [keep-alive] Tool execution can legitimately run for minutes
+                // (extension build/install, async agent exec waits). The stream
+                // is otherwise silent during this phase — the chunk-loop
+                // heartbeat (line ~521) only fires between stream chunks, so a
+                // long tool yields NO events and WS listeners (chat UI / eval)
+                // see an event gap and kill the turn. Yield heartbeats on an
+                // independent timer while the tool batch runs.
+                let collect_fut = tool_futures.collect::<Vec<_>>();
+                tokio::pin!(collect_fut);
+                let mut tool_heartbeat = tokio::time::interval(safeguards.heartbeat_interval);
+                // tokio interval's first tick completes immediately — consume it
+                // so the first heartbeat lands one interval in, not instantly.
+                tool_heartbeat.tick().await;
+                let mut tool_results_executed: Vec<_> = loop {
+                    tokio::select! {
+                        _ = tool_heartbeat.tick() => {
+                            yield AgentEvent::heartbeat();
+                        }
+                        done = &mut collect_fut => break done,
+                    }
+                };
+                // Restore LLM-emission order (buffer_unordered completes in arbitrary order).
+                tool_results_executed.sort_by_key(|(i, _, _)| *i);
 
                 // Process results
                 let mut tool_calls_with_results: Vec<ToolCall> = Vec::new();
                 let mut tool_call_results: Vec<(String, String)> = Vec::new();
 
-                for (name, execution) in tool_results_executed {
+                for (_, name, execution) in tool_results_executed {
                     // Use arguments from the execution result (preserves per-call arguments for same-name tools)
                     let exec_arguments = execution.arguments.clone();
                     yield AgentEvent::tool_call_start_round(&name, exec_arguments.clone(), tool_iteration_count + 1);
@@ -977,10 +1086,14 @@ pub async fn process_stream_events_with_safeguards(
                                 }
                             };
 
-                            // After slimming, no large base64 remains — sanitize is
-                            // essentially a no-op but kept for defense-in-depth (e.g.
-                            // non-JSON tool outputs with stray data URLs).
-                            let display_str = sanitize_tool_result_for_prompt(&slimmed_str);
+                            // [stored-value sanitize] Sanitize the value that is
+                            // STORED too, not just the display copy. Slimming only
+                            // engages >=64KB, so data URLs / base64 between ~4KB and
+                            // 64KB used to flow verbatim into every subsequent LLM
+                            // round and into sessions.redb. The sanitizer strips
+                            // data:image URLs and large base64 blobs to placeholders.
+                            let sanitized_str = sanitize_tool_result_for_prompt(&slimmed_str);
+                            let display_str = sanitized_str.clone();
 
                             tool_calls_with_results.push(ToolCall {
                                 name: name.clone(),
@@ -992,10 +1105,18 @@ pub async fn process_stream_events_with_safeguards(
 
                             yield AgentEvent::tool_call_end_round(&name, &display_str, output.success, tool_iteration_count + 1);
 
-                            tool_call_results.push((name.clone(), slimmed_str));
+                            tool_call_results.push((name.clone(), sanitized_str));
                         }
                         Err(e) => {
-                            let error_msg = format!("Tool execution failed: {}", e);
+                            let mut error_msg = format!("Tool execution failed: {}", e);
+                            // Weak models sometimes emit a whole `heramind ...` command or a
+                            // CLI domain as the tool name. Redirect to `shell` so they recover
+                            // next round instead of looping. No-op for real tool names.
+                            if let Some(hint) =
+                                crate::ai_agent::executor::tool_result::hallucinated_tool_hint(&name)
+                            {
+                                error_msg.push_str(&hint);
+                            }
                             let error_value = serde_json::json!({"error": error_msg});
 
                             tool_calls_with_results.push(ToolCall {
@@ -1024,6 +1145,9 @@ pub async fn process_stream_events_with_safeguards(
                     }
                 }
                 // Track actual shell commands for list-only dead end detection
+                let shell_ran_this_round = tool_calls_to_execute
+                    .iter()
+                    .any(|tc| tc.name == "shell");
                 for tc in &tool_calls_to_execute {
                     if tc.name == "shell" {
                         if let Some(cmd) = tc.arguments.get("command").and_then(|v| v.as_str()) {
@@ -1035,13 +1159,59 @@ pub async fn process_stream_events_with_safeguards(
                     }
                 }
 
+                // [loop-steering hint] Non-aborting nudge when the model keeps
+                // executing similar shell commands without converging (the
+                // 2026-08-17 full eval: 19/154 cases burned their whole budget
+                // circling at 9–15 consecutive similar commands). The hint is
+                // appended to this round's shell tool result, so the LLM sees it
+                // with the next prompt. Deliberately a HINT, not a stop — chat
+                // never force-aborts (by-design; hard brakes are for scheduled
+                // agents only). Fires at streak 4 and every +4 after that.
+                if shell_ran_this_round {
+                    if let Some((key, streak)) =
+                        super::dedup::similar_command_streak(&recently_executed_commands)
+                    {
+                        if streak % super::dedup::LOOP_STREAK_THRESHOLD == 0 {
+                            let hint = format!(
+                                "\n\nLOOP HINT: you have now run {streak} similar \"{key}\" commands in a row without completing the goal. Change your approach: pick a different subcommand from the shell tool's Domain index, run `heramind <domain> --help` to see what exists, or re-read the original request and check each step's actual result before continuing."
+                            );
+                            if let Some(last_shell) = tool_call_results
+                                .iter_mut()
+                                .rev()
+                                .find(|(n, _)| n == "shell")
+                            {
+                                last_shell.1.push_str(&hint);
+                                tracing::info!(
+                                    "[streaming] loop-steering hint injected (streak {} of '{}')",
+                                    streak, key
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // === UNIFIED ReAct LOOP: Save results and continue ===
                 // Always save assistant+tool_calls and tool results to history,
                 // then let the LLM decide in the next round whether to call more tools
                 // or give the final answer.
 
-                // Check iteration limit and duplicate detection
-                let should_continue = tool_iteration_count < MAX_TOOL_ITERATIONS - 1;
+                // Check iteration limit, wall-clock budget and duplicate detection
+                let wall_clock_exhausted = turn_started_at.elapsed() >= turn_wall_clock_budget;
+                if wall_clock_exhausted {
+                    tracing::warn!(
+                        elapsed = ?turn_started_at.elapsed(),
+                        budget_secs = turn_wall_clock_budget.as_secs(),
+                        rounds = tool_iteration_count + 1,
+                        "Turn wall-clock budget exhausted — exiting tool loop for the final summary"
+                    );
+                    yield AgentEvent::progress(
+                        "Time budget reached — generating final response...".to_string(),
+                        "summarizing",
+                        0,
+                    );
+                }
+                let should_continue = !wall_clock_exhausted
+                    && tool_iteration_count < MAX_TOOL_ITERATIONS - 1;
 
                 // === Save assistant message with tool_calls BEFORE tool results ===
                 let response_to_save = if content_before_tools.is_empty() {
@@ -1191,7 +1361,9 @@ pub async fn process_stream_events_with_safeguards(
                     match summary_result {
                         Ok(stream) => {
                             let mut pin = Box::pin(stream);
-                            while let Some(chunk) = pin.next().await {
+                            while let Some(chunk) =
+                                next_chunk_or_timeout(&mut pin, safeguards.max_stream_duration).await
+                            {
                                 match chunk {
                                     Ok((text, _)) => {
                                         final_content.push_str(&text);
@@ -1247,13 +1419,21 @@ pub async fn process_stream_events_with_safeguards(
 
                 tracing::debug!("ReAct loop completed after {} tool iterations", tool_iteration_count + 1);
             } else {
-                // No tool calls - save response directly
-                // Use buffer if content_before_tools is empty (buffer contains all content chunks when no tools)
-                let mut raw_response = if content_before_tools.is_empty() {
-                    buffer.clone()
-                } else {
-                    content_before_tools.clone()
-                };
+                // No tool calls - save response directly.
+                //
+                // `buffer` holds *every* streamed chunk for this round and is the
+                // complete response. `content_before_tools` is only ever assigned
+                // the slice of content sitting in front of a suspected tool-call
+                // by the `might_be_json_start` hold-back heuristic — so when the
+                // model's answer quotes a JSON payload mid-text (e.g. a push log
+                // echoed as `{"source_id": ...}` inside a markdown table cell),
+                // that heuristic leaves a stale fragment behind (e.g. `":`) while
+                // the real summary lives on in `buffer`. Trusting the fragment
+                // over `buffer` here corrupted those summaries. Since no tool
+                // call was detected this round, nothing needs excluding — use the
+                // full buffer. Any residual tool-call JSON is stripped below by
+                // remove_tool_calls_from_response.
+                let mut raw_response = buffer.clone();
 
                 // === RECOVERY: Read-only analytics must execute a tool ===
                 // Never accept "I will query..." as the answer to a current/recent
@@ -1356,7 +1536,9 @@ pub async fn process_stream_events_with_safeguards(
                         Ok(stream) => {
                             let mut summary_content = String::new();
                             let mut pin = Box::pin(stream);
-                            while let Some(chunk) = pin.next().await {
+                            while let Some(chunk) =
+                                next_chunk_or_timeout(&mut pin, safeguards.max_stream_duration).await
+                            {
                                 match chunk {
                                     Ok((text, _)) => {
                                         summary_content.push_str(&text);
@@ -1434,7 +1616,9 @@ pub async fn process_stream_events_with_safeguards(
                         Ok(retry_stream) => {
                             let mut retry_content = String::new();
                             let mut pin = Box::pin(retry_stream);
-                            while let Some(chunk) = pin.next().await {
+                            while let Some(chunk) =
+                                next_chunk_or_timeout(&mut pin, safeguards.max_stream_duration).await
+                            {
                                 match chunk {
                                     Ok((text, _)) => {
                                         retry_content.push_str(&text);
@@ -1472,7 +1656,7 @@ pub async fn process_stream_events_with_safeguards(
                             } else {
                                 tracing::warn!("Retry produced only tool calls, using fallback");
                                 let fallback =
-                                    "Sorry, the model could not produce a response. Please retry."
+                                    "Sorry, the model could not produce a response. Please retry.\n[reason: the model returned empty content after retry — the backend may be slow, over its real context limit, or rejecting the request shape]"
                                         .to_string();
                                 raw_response = fallback.clone();
                                 yield AgentEvent::content(fallback);
@@ -1480,9 +1664,9 @@ pub async fn process_stream_events_with_safeguards(
                         }
                         Err(e) => {
                             tracing::error!("Retry LLM call failed: {}", e);
-                            let fallback =
-                                "Sorry, the model could not produce a response. Please retry."
-                                    .to_string();
+                            let fallback = format!(
+                                "Sorry, the model could not produce a response. Please retry.\n[error: {e}]"
+                            );
                             raw_response = fallback.clone();
                             yield AgentEvent::content(fallback);
                         }
@@ -1521,7 +1705,10 @@ pub async fn process_stream_events_with_safeguards(
         // Read token usage from LLM interface (captured from Ollama backend stream)
         let prompt_tokens = llm_interface.take_last_prompt_tokens().await;
         match prompt_tokens {
-            Some(pt) => yield AgentEvent::end_with_tokens(pt),
+            Some(pt) => {
+                let (system_tokens, tool_tokens) = llm_interface.estimate_prompt_breakdown().await;
+                yield AgentEvent::end_with_usage(pt, system_tokens, tool_tokens);
+            }
             None => yield AgentEvent::end(),
         }
     }))
@@ -1548,4 +1735,95 @@ pub fn events_to_string_stream(
             }
         }
     })
+}
+
+/// Reserve tokens for model response generation (minimum 1024).
+const RESERVE_FOR_RESPONSE: usize = 1024;
+
+/// History budget given the model's context capacity and the measured
+/// prompt overhead (system prompt + tool definitions).
+///
+/// Invariant: the returned budget NEVER exceeds what actually fits —
+/// `overhead + RESERVE_FOR_RESPONSE + budget <= max_context`. The old code
+/// raised the budget to a hard 20%-of-context floor AFTER subtracting the
+/// overhead, so on 8K-class models (where the platform prompt + tools alone
+/// run 4-6K tokens) the floor re-inflated the budget past the window and
+/// CONSTRUCTED an overflowing prompt every turn: llama-server 400 →
+/// compact-retry ladder → tools stripped / hard "context exceeds" error.
+/// The floor is now capped at the real remaining budget; a starved budget
+/// (<20% of the window) is logged instead of silently exceeded.
+pub(crate) fn effective_history_budget(max_context: usize, prompt_overhead: usize) -> usize {
+    let raw_budget = max_context
+        .saturating_sub(prompt_overhead)
+        .saturating_sub(RESERVE_FOR_RESPONSE);
+
+    let floor = ((max_context * 20) / 100).min(raw_budget);
+    let effective = raw_budget.max(floor);
+
+    if effective < (max_context * 20) / 100 {
+        tracing::warn!(
+            max_context,
+            prompt_overhead,
+            effective,
+            "Context starvation: prompt overhead leaves under 20% of the window for \
+             history — consider a larger context preset or a lighter prompt"
+        );
+    }
+    effective
+}
+
+#[cfg(test)]
+mod history_budget_tests {
+    use super::*;
+
+    /// The regression that motivated the extraction: a 8K-class model whose
+    /// platform prompt + tools overhead crosses ~5.5K tokens. The old floor
+    /// forced ~1.6K of history back in, constructing a prompt larger than
+    /// the window itself. The budget must respect the subtraction.
+    #[test]
+    fn budget_never_exceeds_remaining_capacity() {
+        for (max_ctx, overhead) in [
+            (8192usize, 6000usize), // the reported-bug zone
+            (8192, 7100),           // overhead nearly fills the window
+            (8192, 8192),           // overhead alone fills it
+            (4096, 2500),           // small custom backend
+            (16384, 5000),          // healthy 16K
+            (131072, 6000),         // LFM-class
+        ] {
+            let budget = effective_history_budget(max_ctx, overhead);
+            // Saturating form: when the overhead alone fills the window no
+            // budget can satisfy the plain inequality — the real claim is
+            // that the BUDGET never adds overflow beyond the subtraction.
+            let ceiling = max_ctx
+                .saturating_sub(overhead)
+                .saturating_sub(RESERVE_FOR_RESPONSE);
+            assert!(
+                budget <= ceiling,
+                "budget exceeds remaining capacity: budget={budget} ceiling={ceiling} \
+                 overhead={overhead} max={max_ctx}"
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_budget_keeps_normal_arithmetic() {
+        // 16K window, 5K overhead: 16384 - 5000 - 1024 = 10360.
+        assert_eq!(effective_history_budget(16384, 5000), 10360);
+        // The old code returned max(10360, 3276) = 10360 too — unchanged here.
+    }
+
+    #[test]
+    fn starved_budget_degrades_to_zero_not_negative() {
+        assert_eq!(effective_history_budget(8192, 8192), 0);
+        assert_eq!(effective_history_budget(8192, 9000), 0);
+    }
+
+    #[test]
+    fn overflow_free_floor_still_helps_small_overheads() {
+        // Overhead small → floor (20%) is below the raw budget → no effect.
+        // Overhead moderate → raw budget governs. Both directions must hold.
+        let b = effective_history_budget(8192, 3000);
+        assert_eq!(b, 8192 - 3000 - RESERVE_FOR_RESPONSE);
+        assert!(b >= (8192 * 20) / 100);
+    }
 }

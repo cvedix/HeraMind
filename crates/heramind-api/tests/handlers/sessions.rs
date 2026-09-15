@@ -27,6 +27,12 @@ mod tests {
     #[tokio::test]
     async fn test_list_sessions_handler_default_params() {
         let state = create_test_server_state().await;
+        // Isolated per-test session store starts empty; create a session so
+        // the list has something to return. (Previously relied on sessions
+        // leaked from other tests via the global SessionStore singleton.)
+        let _ = create_session_handler(State(state.clone()), None)
+            .await
+            .unwrap();
         let query = ListSessionsQuery {
             page: 1,
             page_size: 20,
@@ -120,7 +126,7 @@ mod tests {
             session_id: None,
             images: None,
             backend_id: None,
-            selected_skills: vec![],
+            selected_skills: None,
             page_context: None,
             session_config: None,
         };
@@ -159,7 +165,7 @@ mod tests {
             session_id: None,
             images: None,
             backend_id: None,
-            selected_skills: vec![],
+            selected_skills: None,
             page_context: None,
             session_config: None,
         };
@@ -215,7 +221,7 @@ mod tests {
             session_id: Some("session123".to_string()),
             images: None,
             backend_id: None,
-            selected_skills: vec![],
+            selected_skills: None,
             page_context: None,
             session_config: None,
         };

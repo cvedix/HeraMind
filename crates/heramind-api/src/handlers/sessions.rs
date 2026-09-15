@@ -57,6 +57,18 @@ async fn process_stream_to_channel(
     // Track stream start time for progress reporting
     let stream_start = std::time::Instant::now();
 
+    // [detached-delivery] A failed channel send means the WS forwarding
+    // loop is gone — the client navigated away or the connection dropped.
+    // The turn must STILL run to completion: the stream itself appends the
+    // final assistant reply to the session, persist_history (below) makes
+    // it durable, and the user expects the conclusion when they switch
+    // back to the session. So a send failure stops DELIVERY, never
+    // CONSUMPTION. The old `break` here cancelled the agent's turn
+    // mid-flight on any page switch, losing the reply forever. The only
+    // legitimate cancellation path is the explicit __CANCEL__ frame,
+    // which reaches the stream through an independent watch channel.
+    let mut client_detached = false;
+
     // Stream timeout: 1200 seconds (20 minutes) to support thinking models
     // This is synchronized with StreamConfig::max_stream_duration_secs
     // qwen3-vl:2b with extended thinking can take significant time for complex queries
@@ -193,9 +205,30 @@ async fn process_stream_to_channel(
                             "sessionId": session_id,
                         })
                     }
-                    AgentEvent::End { prompt_tokens } => {
+                    AgentEvent::End {
+                        prompt_tokens,
+                        system_prompt_tokens,
+                        tool_tokens,
+                    } => {
                         // P0.3: Delete pending state on successful completion
                         let _ = session_store.delete_pending_stream(&session_id);
+
+                        // Background chat memory extraction — the main web UI
+                        // streams over THIS path, not the HTTP handler; without
+                        // this spawn the feature only served API callers.
+                        {
+                            let ext_state = state.clone();
+                            let ext_session = session_id.clone();
+                            let ext_user = pending_state.user_message.clone();
+                            let ext_reply = pending_state.content.clone();
+                            tokio::spawn(async move {
+                                ext_state
+                                    .agents
+                                    .session_manager
+                                    .maybe_extract_memory(&ext_session, &ext_user, &ext_reply)
+                                    .await;
+                            });
+                        }
 
                         // === Context Summarization ===
                         // If context usage exceeds 60%, trigger background summarization
@@ -225,7 +258,9 @@ async fn process_stream_to_channel(
                         });
                         if let Some(pt) = prompt_tokens {
                             end_json["tokenUsage"] = json!({
-                                "promptTokens": pt
+                                "promptTokens": pt,
+                                "systemPromptTokens": system_prompt_tokens,
+                                "toolTokens": tool_tokens,
                             });
                         }
                         end_json
@@ -279,10 +314,15 @@ async fn process_stream_to_channel(
                     json: event_json.to_string(),
                 };
 
-                // Try to send, but don't block if channel is closed
-                if tx.send(stream_event).await.is_err() {
-                    tracing::warn!("Failed to send stream event through channel");
-                    break;
+                // Stop delivering once the client is gone; keep consuming
+                // (see [detached-delivery] above).
+                if !client_detached && tx.send(stream_event).await.is_err() {
+                    tracing::info!(
+                        session_id,
+                        "Stream client detached — continuing the turn to completion \
+                         so the final reply lands in history"
+                    );
+                    client_detached = true;
                 }
 
                 // If this was the End event, exit the loop
@@ -378,6 +418,15 @@ pub struct SessionListItem {
 /// `{"config": { ...AgentConfig }}` (legacy field, kept for compat) or the
 /// more granular patch form understood by `CreateSessionRequest`/`ChatRequest`
 /// to override per-session fields like `system_prompt`.
+#[utoipa::path(
+    post,
+    path = "/api/sessions",
+    tag = "sessions",
+    request_body = CreateSessionRequest,
+    responses(
+        (status = 200, description = "Chat session created"),
+    )
+)]
 pub async fn create_session_handler(
     State(state): State<ServerState>,
     body: Option<Json<Option<CreateSessionRequest>>>,
@@ -387,30 +436,48 @@ pub async fn create_session_handler(
     // layer being None means "no override requested" → fall back to default.
     let req = body.and_then(|Json(b)| b);
 
-    let session_id = match req.and_then(|r| r.config) {
-        Some(cfg) => {
-            // Legacy `config: AgentConfig` path — full struct. Translate to
-            // options patch (only the four commonly-overridden fields flow
-            // through; the rest of AgentConfig stays at platform default).
-            let opts = heramind_agent::CreateSessionOptions {
-                system_prompt: Some(cfg.system_prompt),
-                temperature: Some(cfg.temperature),
-                model: Some(cfg.model),
-                enable_tools: Some(cfg.enable_tools),
-            };
+    let (session_patch, legacy_cfg) = match req {
+        Some(r) => (r.session_config, r.config),
+        None => (None, None),
+    };
+
+    let session_id = match session_patch {
+        Some(patch) => {
+            // Preferred path: `sessionConfig` patch (systemPromptSuffix /
+            // allowedTools / …) merged on top of the platform default.
             state
                 .agents
                 .session_manager
-                .create_session_with_options(opts)
+                .create_session_with_options(patch.into())
                 .await
                 .map_err(|e| ErrorResponse::with_message(e.to_string()))?
         }
-        None => state
-            .agents
-            .session_manager
-            .create_session()
-            .await
-            .map_err(|e| ErrorResponse::with_message(e.to_string()))?,
+        None => match legacy_cfg {
+            Some(cfg) => {
+                // Legacy `config: AgentConfig` path — full struct. Translate to
+                // options patch (only the four commonly-overridden fields flow
+                // through; the rest of AgentConfig stays at platform default).
+                let opts = heramind_agent::CreateSessionOptions {
+                    system_prompt: Some(cfg.system_prompt),
+                    temperature: Some(cfg.temperature),
+                    model: Some(cfg.model),
+                    enable_tools: Some(cfg.enable_tools),
+                    ..Default::default()
+                };
+                state
+                    .agents
+                    .session_manager
+                    .create_session_with_options(opts)
+                    .await
+                    .map_err(|e| ErrorResponse::with_message(e.to_string()))?
+            }
+            None => state
+                .agents
+                .session_manager
+                .create_session()
+                .await
+                .map_err(|e| ErrorResponse::with_message(e.to_string()))?,
+        },
     };
 
     Ok(Json(ApiResponse::success(json!({
@@ -440,6 +507,18 @@ fn default_page_size() -> u32 {
 ///
 /// Performance optimization: Uses lightweight session info (without message count/preview)
 /// to avoid N+1 database queries. For detailed session info, use individual session endpoints.
+#[utoipa::path(
+    get,
+    path = "/api/sessions",
+    tag = "sessions",
+    params(
+        ("page" = Option<u32>, Query, description = "1-indexed page"),
+        ("page_size" = Option<u32>, Query, description = "Items per page"),
+    ),
+    responses(
+        (status = 200, description = "Chat sessions"),
+    )
+)]
 pub async fn list_sessions_handler(
     State(state): State<ServerState>,
     Query(query): Query<ListSessionsQuery>,
@@ -473,6 +552,18 @@ pub async fn list_sessions_handler(
 }
 
 /// Get session info.
+#[utoipa::path(
+    get,
+    path = "/api/sessions/{id}",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Session id"),
+    ),
+    responses(
+        (status = 200, description = "One chat session"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_session_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -491,6 +582,18 @@ pub async fn get_session_handler(
 }
 
 /// Get session history.
+#[utoipa::path(
+    get,
+    path = "/api/sessions/{id}/history",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Session id"),
+    ),
+    responses(
+        (status = 200, description = "Message history of a session"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_session_history_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -517,6 +620,18 @@ pub async fn get_session_history_handler(
 }
 
 /// Delete a session.
+#[utoipa::path(
+    delete,
+    path = "/api/sessions/{id}",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Session id"),
+    ),
+    responses(
+        (status = 200, description = "Session and its history deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_session_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -543,6 +658,18 @@ pub async fn delete_session_handler(
 }
 
 /// P0.3: Get pending stream state for a session (for recovery after disconnection).
+#[utoipa::path(
+    get,
+    path = "/api/sessions/{id}/pending",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Session id"),
+    ),
+    responses(
+        (status = 200, description = "Pending streamed reply for reconnect recovery"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_pending_stream_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -572,6 +699,18 @@ pub async fn get_pending_stream_handler(
 }
 
 /// P0.3: Clear pending stream state for a session (user chose to discard).
+#[utoipa::path(
+    delete,
+    path = "/api/sessions/{id}/pending",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Session id"),
+    ),
+    responses(
+        (status = 200, description = "Pending stream state cleared"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn clear_pending_stream_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -589,13 +728,26 @@ pub async fn clear_pending_stream_handler(
 }
 
 /// Request body for updating session.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct UpdateSessionRequest {
     /// Session title (optional)
     pub title: Option<String>,
 }
 
 /// Update a session (e.g., rename).
+#[utoipa::path(
+    put,
+    path = "/api/sessions/{id}",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Session id"),
+    ),
+    request_body = UpdateSessionRequest,
+    responses(
+        (status = 200, description = "Session (title etc.) updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_session_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -606,7 +758,11 @@ pub async fn update_session_handler(
         .session_manager
         .update_session_title(&id, req.title)
         .await
-        .map_err(|e| ErrorResponse::with_message(e.to_string()))?;
+        .map_err(|e| match e {
+            // Missing session is a 404 per the endpoint contract above.
+            heramind_core::error::Error::NotFound(msg) => ErrorResponse::not_found(msg),
+            other => ErrorResponse::with_message(other.to_string()),
+        })?;
 
     Ok(Json(ApiResponse::success(json!({
         "sessionId": id,
@@ -615,13 +771,26 @@ pub async fn update_session_handler(
 }
 
 /// Request body for toggling memory.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct ToggleMemoryRequest {
     /// Whether memory should be enabled
     pub enabled: bool,
 }
 
 /// Toggle memory enabled state for a session.
+#[utoipa::path(
+    put,
+    path = "/api/sessions/{id}/memory-toggle",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Session id"),
+    ),
+    request_body = ToggleMemoryRequest,
+    responses(
+        (status = 200, description = "Memory recording toggled"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn toggle_memory_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -632,7 +801,10 @@ pub async fn toggle_memory_handler(
         .session_manager
         .toggle_memory(&id, req.enabled)
         .await
-        .map_err(|e| ErrorResponse::with_message(e.to_string()))?;
+        .map_err(|e| match e {
+            heramind_core::error::Error::NotFound(msg) => ErrorResponse::not_found(msg),
+            other => ErrorResponse::with_message(other.to_string()),
+        })?;
 
     Ok(Json(ApiResponse::success(json!({
         "sessionId": id,
@@ -642,6 +814,14 @@ pub async fn toggle_memory_handler(
 
 /// Clean up invalid sessions (dirty data).
 /// Removes sessions that appear in the list but don't have valid data.
+#[utoipa::path(
+    post,
+    path = "/api/sessions/cleanup",
+    tag = "sessions",
+    responses(
+        (status = 200, description = "Expired sessions removed"),
+    )
+)]
 pub async fn cleanup_sessions_handler(
     State(state): State<ServerState>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ErrorResponse> {
@@ -658,6 +838,19 @@ pub async fn cleanup_sessions_handler(
 }
 
 /// Chat handler (REST).
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{id}/chat",
+    tag = "sessions",
+    params(
+        ("id" = String, Path, description = "Session id"),
+    ),
+    request_body = ChatRequest,
+    responses(
+        (status = 200, description = "One-shot (non-streaming) chat turn"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn chat_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -670,7 +863,7 @@ pub async fn chat_handler(
         session_id = %id,
         message_len = req.message.chars().count(),
         backend_id = ?req.backend_id,
-        pinned_skills = req.selected_skills.len(),
+        pinned_skills = req.selected_skills.as_ref().map_or(0, |s| s.len()),
         "chat_handler: HTTP chat via multi-round event stream"
     );
 
@@ -699,9 +892,10 @@ pub async fn chat_handler(
     let stream_result = if has_images {
         // The multimodal stream variant has no selected_skills param; set pinned
         // skills on the agent directly first (same as the WS multimodal path).
-        if !req.selected_skills.is_empty() {
+        // Some(empty) clears — None leaves the pins untouched.
+        if let Some(skills) = &req.selected_skills {
             if let Ok(agent) = state.agents.session_manager.get_session(&id).await {
-                agent.set_pinned_skills(req.selected_skills.clone()).await;
+                agent.set_pinned_skills(skills.clone()).await;
             }
         }
         let images: Vec<String> = req
@@ -729,7 +923,7 @@ pub async fn chat_handler(
                 &id,
                 &final_message,
                 req.backend_id.as_deref(),
-                &req.selected_skills,
+                req.selected_skills.as_deref(),
             )
             .await
     };
@@ -825,6 +1019,18 @@ pub async fn chat_handler(
         tracing::warn!(session_id = %id, error = %e, "chat_handler: failed to persist history");
     }
 
+    // Background chat memory extraction — durable facts from this exchange get
+    // merged into USER.md/KNOWLEDGE.md so the next conversation starts knowing
+    // the user (small models never call the memory tool themselves). Skipped
+    // on errors/timeouts/empty replies.
+    if error_msg.is_none() && !timed_out && !response.trim().is_empty() {
+        state
+            .agents
+            .session_manager
+            .maybe_extract_memory(&id, &req.message, &response)
+            .await;
+    }
+
     Ok(Json(ChatResponse {
         response,
         session_id: id,
@@ -839,6 +1045,14 @@ pub async fn chat_handler(
 /// Supports two authentication methods:
 /// - JWT token via `?token=xxx` parameter (local instance)
 /// - API key via `?api_key=xxx` parameter (remote instance)
+#[utoipa::path(
+    get,
+    path = "/api/chat",
+    tag = "sessions",
+    responses(
+        (status = 101, description = "WebSocket upgrade; JWT via ?token= query param"),
+    )
+)]
 pub async fn ws_chat_handler(
     ws: WebSocketUpgrade,
     State(state): State<ServerState>,
@@ -1201,8 +1415,8 @@ async fn handle_ws_socket(
                                         // (now handled inside Agent::process to avoid cross-session races)
 
                                         // Apply pinned skills for multimodal messages
-                                        let selected_skills = chat_req.selected_skills.clone();
-                                        if !selected_skills.is_empty() {
+                                        // Some(empty) clears — None leaves pins untouched.
+                                        if let Some(selected_skills) = chat_req.selected_skills.clone() {
                                             if let Ok(agent) = task_state.agents.session_manager.get_session(&task_session_id).await {
                                                 agent.set_pinned_skills(selected_skills).await;
                                             }
@@ -1279,40 +1493,101 @@ async fn handle_ws_socket(
                                         };
                                         // Set session ID on memory tool for session-scoped operations
                                         // (now handled inside Agent::process to avoid cross-session races)
-                                        match state.agents.session_manager.process_message_events_with_backend_and_skills(&session_id, &final_message, backend_id, &selected_skills).await {
-                                            Ok(stream) => {
-                                                // Clone the channel sender and session ID for the spawned task
-                                                let task_tx = stream_tx.clone();
-                                                let task_session_id = session_id.clone();
-                                                let task_state = state.clone();
-
-                                                // Spawn a task to process the LLM stream and send events through the channel
-                                                tokio::spawn(async move {
-                                                    process_stream_to_channel(stream, task_session_id, chat_req.message.clone(), task_tx, task_state).await;
-                                                });
-                                            }
-                                            Err(e) => {
-                                                // Fallback to non-streaming on error
-                                                tracing::error!(error = %e, session_id = %session_id, backend_id = ?chat_req.backend_id, "Streaming text failed, falling back to non-streaming");
-                                                let backend_id = chat_req.backend_id.as_deref();
-                                                let response = match state.agents.session_manager.process_message_with_backend(&session_id, &chat_req.message, backend_id).await {
-                                                    Ok(resp) => json!({
-                                                        "type": "response",
-                                                        "content": resp.message.content,
-                                                        "sessionId": session_id,
-                                                        "toolsUsed": resp.tools_used,
-                                                        "processingTimeMs": resp.processing_time_ms,
-                                                    }).to_string(),
-                                                    Err(inner_e) => json!({
-                                                        "type": "Error",
-                                                        "message": inner_e.to_string(),
-                                                    }).to_string(),
-                                                };
-
-                                                if socket.send(AxumMessage::Text(response)).await.is_err() {
-                                                    break;
+                                        // [non-blocking stream creation] Stream creation used to
+                                        // be awaited INLINE in this select arm: during the initial LLM
+                                        // request (tens of seconds on local models before the first
+                                        // chunk) no pings were sent and `__CANCEL__` frames could not
+                                        // be processed — the whole socket looked stalled. The entire
+                                        // creation + fallback path now runs in a spawned task; the
+                                        // fallback response is delivered through the event channel
+                                        // like any other stream event, so this loop keeps serving
+                                        // ping/pong and cancel frames immediately.
+                                        {
+                                            let task_tx = stream_tx.clone();
+                                            let task_session_id = session_id.clone();
+                                            let task_state = state.clone();
+                                            let task_user_message = chat_req.message.clone();
+                                            let task_backend_id = backend_id.map(|s| s.to_string());
+                                            let task_skills = selected_skills.clone();
+                                            let task_final_message = final_message;
+                                            let task_req_backend = chat_req.backend_id.clone();
+                                            tokio::spawn(async move {
+                                                match task_state
+                                                    .agents
+                                                    .session_manager
+                                                    .process_message_events_with_backend_and_skills(
+                                                        &task_session_id,
+                                                        &task_final_message,
+                                                        task_backend_id.as_deref(),
+                                                        task_skills.as_deref(),
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(stream) => {
+                                                        process_stream_to_channel(
+                                                            stream,
+                                                            task_session_id,
+                                                            task_user_message,
+                                                            task_tx,
+                                                            task_state,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    Err(e) => {
+                                                        // [single-stream mutex] A rejection because a turn is
+                                                        // already running (e.g. the previous turn is still
+                                                        // completing in the background after the client
+                                                        // detached) must NOT fall into the non-streaming
+                                                        // fallback: that path bypasses the per-session mutex
+                                                        // and would run CONCURRENTLY on the same internal
+                                                        // state — interleaved history writes, out-of-order
+                                                        // replies. Surface an actionable error instead.
+                                                        let err_str = e.to_string();
+                                                        if err_str.contains("already being generated") {
+                                                            let _ = task_tx
+                                                                .send(StreamEvent {
+                                                                    json: json!({
+                                                                        "type": "Error",
+                                                                        "message": err_str,
+                                                                        "sessionId": task_session_id,
+                                                                    })
+                                                                    .to_string(),
+                                                                })
+                                                                .await;
+                                                            return;
+                                                        }
+                                                        // Fallback to non-streaming on error
+                                                        tracing::error!(error = %e, session_id = %task_session_id, backend_id = ?task_req_backend, "Streaming text failed, falling back to non-streaming");
+                                                        let response = match task_state
+                                                            .agents
+                                                            .session_manager
+                                                            .process_message_with_backend(
+                                                                &task_session_id,
+                                                                &task_user_message,
+                                                                task_req_backend.as_deref(),
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(resp) => json!({
+                                                                "type": "response",
+                                                                "content": resp.message.content,
+                                                                "sessionId": task_session_id,
+                                                                "toolsUsed": resp.tools_used,
+                                                                "processingTimeMs": resp.processing_time_ms,
+                                                            })
+                                                            .to_string(),
+                                                            Err(inner_e) => json!({
+                                                                "type": "Error",
+                                                                "message": inner_e.to_string(),
+                                                            })
+                                                            .to_string(),
+                                                        };
+                                                        let _ = task_tx
+                                                            .send(StreamEvent { json: response })
+                                                            .await;
+                                                    }
                                                 }
-                                            }
+                                            });
                                         }
                                     }
                                 }
@@ -1411,22 +1686,15 @@ async fn handle_ws_socket(
     // Cleanup: persist session history AFTER loop ends (when connection closes)
     let session_id_opt = current_session_id.read().await.clone();
     if let Some(session_id) = session_id_opt.as_ref() {
-        // Cancel any in-flight LLM stream for this session.
-        // Without this, a client disconnect leaves the stream running in its
-        // spawned task (burning tokens) and the cancel_senders entry leaks
-        // because the wrapped cleanup_stream never reaches its end-of-loop remove.
-        let cancelled = state
-            .agents
-            .session_manager
-            .cancel_session(session_id)
-            .await;
-        if cancelled {
-            tracing::info!(
-                category = "session",
-                session_id = %session_id,
-                "Cancelled in-flight LLM stream on WebSocket disconnect"
-            );
-        }
+        // [detached delivery] Do NOT cancel the in-flight stream on
+        // disconnect: the turn must complete in the background and land in
+        // history (the product contract the frontend's "回复将在后台完成"
+        // notice promises). The old cancel existed because the consumer
+        // task used to die on the first failed channel send, leaking the
+        // cancel-sender registration — the consumer now runs to End (or its
+        // 1200s timeout), and the stream's own end-of-loop cleanup removes
+        // the registration. Explicit __CANCEL__ from the user is the only
+        // legitimate interruption path.
         if let Err(e) = state
             .agents
             .session_manager
@@ -1435,5 +1703,69 @@ async fn handle_ws_socket(
         {
             tracing::warn!(category = "session", error = %e, "Failed to persist history on disconnect");
         }
+    }
+}
+
+#[cfg(test)]
+mod detached_delivery_tests {
+    use super::*;
+
+    /// [detached-delivery regression] The consumer must run the stream to its
+    /// End event even when the WS client is ALREADY gone: the turn's final
+    /// reply only lands in session history (and pending-stream state is only
+    /// cleaned up) if consumption reaches completion. The pre-fix code broke
+    /// out of the loop on the first failed channel send, cancelling the
+    /// agent mid-flight on every page switch.
+    #[tokio::test]
+    async fn stream_runs_to_completion_after_client_detaches() {
+        let consumed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = consumed.clone();
+
+        let events = vec![
+            AgentEvent::Thinking {
+                content: "thinking…".to_string(),
+            },
+            AgentEvent::Content {
+                content: "partial".to_string(),
+            },
+            AgentEvent::Content {
+                content: "final answer".to_string(),
+            },
+            AgentEvent::End {
+                prompt_tokens: Some(42),
+                system_prompt_tokens: None,
+                tool_tokens: None,
+            },
+        ];
+        let total = events.len();
+
+        let stream: Pin<Box<dyn Stream<Item = AgentEvent> + Send>> =
+            Box::pin(async_stream::stream! {
+                for event in events {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    yield event;
+                }
+            });
+
+        // Client detaches BEFORE the first event: drop the receiver.
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let state = super::super::ServerState::new_for_testing().await;
+        process_stream_to_channel(
+            stream,
+            "detached-delivery-test".to_string(),
+            "hi".to_string(),
+            tx,
+            state,
+        )
+        .await;
+
+        assert_eq!(
+            consumed.load(std::sync::atomic::Ordering::SeqCst),
+            total,
+            "stream must be fully consumed after client detach — the final reply \
+             only reaches history if consumption reaches End"
+        );
     }
 }

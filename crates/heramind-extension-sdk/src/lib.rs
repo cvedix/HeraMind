@@ -123,7 +123,13 @@
 // ============================================================================
 
 pub mod dynamic_metrics;
+pub mod events;
 mod ipc_types;
+
+/// Protocol-level test kit for extension development.
+/// Enable via `features = ["testkit"]` in dev-dependencies.
+#[cfg(feature = "testkit")]
+pub mod testkit;
 
 /// Stable IPC boundary types for extension communication.
 pub mod ipc {
@@ -188,6 +194,7 @@ pub use host::{
 
     set_native_capability_bridge,
     set_push_output_writer,
+    set_push_output_writer_raw,
     AvailableCapabilities,
     CapabilityError,
     CapabilityManifest,
@@ -203,6 +210,7 @@ pub use host::{
     ExtensionContext,
     ExtensionContextConfig,
     FlowControl,
+    PushOutputRawWriterFn,
     // Push mode
     PushOutputWriterFn,
     SessionStats,

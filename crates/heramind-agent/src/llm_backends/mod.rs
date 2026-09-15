@@ -13,6 +13,7 @@ pub mod backend_plugin;
 pub mod backends;
 pub mod instance_manager;
 pub mod rate_limited_client;
+pub mod text_tool_calls;
 
 // Re-export backend types - available unconditionally for backward compatibility
 // (actual instantiation requires appropriate feature)
@@ -23,7 +24,7 @@ pub use backends::openai::{CloudConfig, CloudProvider, CloudRuntime};
 
 // Instance manager
 pub use instance_manager::{
-    get_instance_manager, BackendTypeDefinition, LlmBackendInstanceManager,
+    get_instance_manager, set_instance_manager, BackendTypeDefinition, LlmBackendInstanceManager,
 };
 
 // Backend creation utilities

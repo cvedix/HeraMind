@@ -16,8 +16,16 @@
 
 use heramind_storage::MarkdownMemoryStore;
 
+use crate::agent::tokenizer::{estimate_tokens, truncate_to_tokens};
+
 /// Hard character budget for memory context in prompts (user + knowledge + procedures).
 const CHAR_BUDGET: usize = 8000;
+
+/// Token budget for the memory snapshot. The snapshot is injected into every
+/// prompt, so it must stay a bounded fraction of context. A char budget alone
+/// balloons for CJK (8000 chars ≈ 15K tokens) and would dominate small windows,
+/// so the snapshot is also capped to this many tokens after the char-budget pass.
+const SNAPSHOT_TOKEN_BUDGET: usize = 2048;
 
 /// Frozen memory snapshot loaded once per session.
 #[derive(Debug, Clone)]
@@ -54,6 +62,11 @@ impl MemorySnapshot {
                 truncated
             }
         };
+
+        // Enforce a token budget so CJK-heavy snapshots don't balloon: 8000 chars
+        // of Chinese is ~15K tokens, which would dominate a small context window.
+        // Keeps the prefix, so the highest-priority User section survives intact.
+        let content = cap_to_token_budget(&content, SNAPSHOT_TOKEN_BUDGET);
 
         Self { content }
     }
@@ -198,6 +211,18 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     chars[..limit].iter().collect()
 }
 
+/// Cap `content` to at most `max_tokens` tokens (via `estimate_tokens`).
+///
+/// Content under the budget passes through unchanged. Over-budget content is
+/// truncated to a prefix — the snapshot lists User first (highest priority),
+/// then Knowledge, then Procedures, so a prefix cut preserves the important bits.
+fn cap_to_token_budget(content: &str, max_tokens: usize) -> String {
+    if estimate_tokens(content) <= max_tokens {
+        return content.to_string();
+    }
+    truncate_to_tokens(content, max_tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +238,32 @@ mod tests {
     #[test]
     fn test_char_budget_is_8000() {
         assert_eq!(CHAR_BUDGET, 8000);
+    }
+
+    /// CJK content balloons under token accounting: 3000 Chinese chars ≈ 5400+
+    /// tokens under `estimate_tokens`. A char-only budget lets non-ASCII memory
+    /// dominate every prompt, so the snapshot must also enforce a token cap.
+    #[test]
+    fn cap_to_token_budget_truncates_cjk_under_budget() {
+        let big = format!("## Knowledge\n{}\n", "知".repeat(3000));
+        let capped = cap_to_token_budget(&big, SNAPSHOT_TOKEN_BUDGET);
+        let tokens = crate::agent::tokenizer::estimate_tokens(&capped);
+        assert!(
+            tokens <= SNAPSHOT_TOKEN_BUDGET,
+            "token cap failed: {tokens} > {SNAPSHOT_TOKEN_BUDGET}",
+        );
+        assert!(
+            capped.chars().count() < big.chars().count(),
+            "over-budget content should have been truncated",
+        );
+    }
+
+    /// Small content under the budget passes through unchanged.
+    #[test]
+    fn cap_to_token_budget_preserves_small_content() {
+        let small = "## User\nhello world\n".to_string();
+        let capped = cap_to_token_budget(&small, SNAPSHOT_TOKEN_BUDGET);
+        assert_eq!(capped, small, "small content must pass through unchanged");
     }
 
     #[tokio::test(flavor = "multi_thread")]

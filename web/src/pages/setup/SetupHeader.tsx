@@ -1,16 +1,17 @@
+import { BrandLogoHorizontal } from '@/components/shared/BrandName'
 /**
  * Shared header for setup pages with language switcher and optional back button
  */
 import { useTranslation } from 'react-i18next'
 import { ArrowLeft, Languages } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { handleWindowDragMouseDown } from '@/lib/windowDrag'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { BrandLogoHorizontal } from '@/components/shared/BrandName'
 
 const languages = [
   { code: 'vi', name: 'Tiếng Việt' },
@@ -28,8 +29,16 @@ export function SetupHeader({ onBack, stepLabel }: SetupHeaderProps) {
 
   return (
     <header className="absolute top-0 left-0 right-0 z-50 safe-top">
-      <div className="flex items-center justify-between px-4 h-14 sm:px-6 sm:h-16">
-        <div className="flex min-w-0 items-center gap-3">
+      {/* Doubles as the Tauri window drag region — overlay titlebar means
+          nothing native is draggable on the setup screens (same contract as
+          the shell TopBar; the helper skips interactive elements). */}
+      <div
+        className="flex items-center justify-between px-4 h-14 sm:px-6 sm:h-16"
+        onMouseDown={handleWindowDragMouseDown}
+      >
+        <div className="flex items-center gap-3">
+          {/* Same brand mark as the login page header — 0-to-1 keeps one
+              continuous brand line from first launch. */}
           <BrandLogoHorizontal className="h-6 max-w-[128px] object-contain object-left sm:h-7 sm:max-w-[150px]" />
           {onBack && (
             <Button

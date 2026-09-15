@@ -620,7 +620,31 @@
     "maxPlaceholder": "Tối đa",
     "between": "GIỮA",
     "and": "VÀ",
-    "systemMetrics": "Chỉ số hệ thống"
+    "systemMetrics": "Chỉ số hệ thống",
+    "cronTemplates": {
+      "everyMinuteLabel": "Mỗi phút",
+      "everyMinuteDesc": "Chạy mỗi phút",
+      "every5minLabel": "Mỗi 5 phút",
+      "every5minDesc": "Chạy mỗi 5 phút",
+      "every15minLabel": "Mỗi 15 phút",
+      "every15minDesc": "Chạy mỗi 15 phút",
+      "every30minLabel": "Mỗi 30 phút",
+      "every30minDesc": "Chạy mỗi 30 phút",
+      "hourlyLabel": "Mỗi giờ",
+      "hourlyDesc": "Vào phút 0 của mỗi giờ",
+      "dailyMidnightLabel": "Hằng ngày lúc nửa đêm",
+      "dailyMidnightDesc": "Mỗi ngày lúc 00:00",
+      "dailyMorningLabel": "Hằng ngày lúc 8 giờ sáng",
+      "dailyMorningDesc": "Mỗi ngày lúc 08:00",
+      "dailyEveningLabel": "Hằng ngày lúc 8 giờ tối",
+      "dailyEveningDesc": "Mỗi ngày lúc 20:00",
+      "weeklyMondayLabel": "Hằng tuần (thứ Hai)",
+      "weeklyMondayDesc": "Mỗi thứ Hai lúc 00:00",
+      "monthlyFirstLabel": "Hằng tháng (ngày 1)",
+      "monthlyFirstDesc": "Ngày 1 mỗi tháng lúc 00:00",
+      "workdaysMorningLabel": "Ngày làm việc lúc 8 giờ sáng",
+      "workdaysMorningDesc": "Thứ Hai đến thứ Sáu lúc 08:00"
+    }
   },
   "transformBuilder": {
     "title": "Tạo chuyển đổi dữ liệu",

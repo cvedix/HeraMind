@@ -81,7 +81,7 @@ pub(crate) fn build_history_context(
 
     // 2. Knowledge Files — inline content when available, index otherwise
     if !agent.memory.knowledge_files.is_empty() {
-        let kc = knowledge_content.and_then(|m| if m.is_empty() { None } else { Some(m) });
+        let kc = knowledge_content.filter(|&m| !m.is_empty());
         if let Some(content_map) = kc {
             // Inline mode: embed actual file contents directly
             let mut sections = Vec::new();
@@ -117,22 +117,44 @@ pub(crate) fn build_history_context(
 
     // 3. Execution Journal
     if !agent.memory.journal.records.is_empty() {
-        let entries = agent
+        // The full `action_taken` (up to 5×150 chars) is the key learning
+        // signal for FAILED runs; for successes a short preview keeps the
+        // journal from dominating a small model's window (5 entries × ~1100
+        // chars is ~10K tokens of CJK).
+        let mut recent: Vec<&heramind_storage::ExecutionRecord> = agent
             .memory
             .journal
             .records
             .iter()
             .rev()
             .take(config.max_journal_entries)
+            .collect();
+        // FAILED runs are the key learning signal — surface them FIRST so the
+        // agent sees what to avoid, successes after. Stable sort keeps the
+        // recency order within each group.
+        recent.sort_by_key(|r| r.success);
+        let entries = recent
+            .into_iter()
             .map(|r| {
                 let ts = format_timestamp(r.timestamp);
                 let status = if r.success { "OK" } else { "FAIL" };
+                let stop_label = if r.stop_reason.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", r.stop_reason)
+                };
+                let action_preview = if r.success {
+                    truncate_to(&r.action_taken, 150)
+                } else {
+                    truncate_to(&r.action_taken, 800)
+                };
                 format!(
-                    "- [{}][{}] {} → {}",
+                    "- [{}][{}]{} {} → {}",
                     ts,
                     status,
+                    stop_label,
                     truncate_to(&r.outcome, 300),
-                    truncate_to(&r.action_taken, 800)
+                    action_preview
                 )
             })
             .collect::<Vec<_>>();

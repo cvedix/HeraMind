@@ -24,7 +24,7 @@ use super::super::AgentExecutor;
 /// them to the real mechanism (`shell` → `heramind <domain> ...`) so they
 /// self-correct next round. Returns None for names with no specific hint
 /// (caller falls back to listing the actually-available tools).
-fn hallucinated_tool_hint(tool_name: &str) -> Option<String> {
+pub(crate) fn hallucinated_tool_hint(tool_name: &str) -> Option<String> {
     let lower = tool_name.to_lowercase();
     // 1. Message/alert family — give the exact send syntax (most common hallucination).
     if matches!(
@@ -51,6 +51,19 @@ fn hallucinated_tool_hint(tool_name: &str) -> Option<String> {
             " There is NO `{}` tool — `{}` is a heramind CLI domain. Use the `shell` tool: \
              `heramind {} <action>` (e.g. `heramind {} list`, or `heramind {} --help` for all actions).",
             tool_name, tool_name, lower, lower, lower
+        ));
+    }
+    // 3. A full `heramind <...>` command emitted as a tool name. Small/weak models
+    //    do this when they can't map intent -> shell(command=...): they emit the
+    //    whole command (e.g. "heramind device list") as the tool name with empty
+    //    args, get NotFound, and loop. Redirect verbatim so they recover in one
+    //    round instead of looping.
+    if lower.trim_start().starts_with("heramind ") {
+        let cmd = tool_name.trim();
+        return Some(format!(
+            " There is NO `{}` tool — that is a shell command. Re-issue it via the `shell` tool \
+             with arguments {{\"command\": \"{cmd}\"}}.",
+            tool_name
         ));
     }
     None
@@ -88,12 +101,19 @@ impl AgentExecutor {
         execution_id: &str,
         mut step_num: u32,
         cache: &mut crate::agent::types::LargeDataCache,
+        context_window: usize,
     ) -> u32 {
+        // Context-aware tool-result cap. The hard 128KB cap is larger than a
+        // small model's whole window; a single oversized result (or 6 parallel
+        // ones) can overflow 8-32K models before per-round compaction runs.
+        // Scale the cap down to a quarter of the context window so results
+        // never starve the rest of the prompt on small models.
+        let result_cap = TOOL_RESULT_MAX_LEN.min(context_window / 4);
         for result in results {
             all_tool_results.push(result.clone());
             let result_text = match &result.result {
                 Ok(output) => {
-                    let raw = serde_json::to_string_pretty(&output.data)
+                    let raw = serde_json::to_string(&output.data)
                         .unwrap_or_else(|_| "Success".to_string());
                     // Slim large/base64 strings into the cache BEFORE sanitize.
                     // Sanitize alone strips `data:image/` to a useless `[image data, N B]`
@@ -111,7 +131,7 @@ impl AgentExecutor {
                                         slimmed_values = n,
                                         "Slimmed large strings from scheduled-agent tool result"
                                     );
-                                    serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.clone())
+                                    serde_json::to_string(&v).unwrap_or_else(|_| raw.clone())
                                 } else {
                                     raw
                                 }
@@ -125,7 +145,7 @@ impl AgentExecutor {
                     // UTF-8 safe truncation (has fast-path for short strings)
                     // 128KB limit: large enough for compact time-series and multi-device
                     // queries. The compaction layer handles context window limits later.
-                    crate::agent::streaming::truncate_result_utf8(&sanitized, TOOL_RESULT_MAX_LEN)
+                    crate::agent::streaming::truncate_result_utf8(&sanitized, result_cap)
                 }
                 Err(e) => {
                     let err_msg = format!("Error: {}", e);
@@ -211,6 +231,10 @@ impl AgentExecutor {
     ) -> Option<String> {
         use heramind_core::llm::backend::{GenerationParams, LlmInput};
 
+        // Context-aware cap, same as process_tool_results: don't let a single
+        // oversized result overflow a small model's window in Phase 2.
+        let result_cap = TOOL_RESULT_MAX_LEN.min(llm_runtime.max_context_length() / 4);
+
         // Build follow-up prompt — natural language, NOT JSON template.
         // Includes full tool results so the LLM can produce a real analysis.
         let task = &agent.user_prompt;
@@ -226,11 +250,11 @@ impl AgentExecutor {
         for r in all_tool_results {
             let result_text = match &r.result {
                 Ok(output) => {
-                    let raw = serde_json::to_string_pretty(&output.data)
+                    let raw = serde_json::to_string(&output.data)
                         .unwrap_or_else(|_| "Success".to_string());
                     // Sanitize base64/image data to prevent context bloat
                     let sanitized = crate::agent::streaming::sanitize_tool_result_for_prompt(&raw);
-                    crate::agent::streaming::truncate_result_utf8(&sanitized, TOOL_RESULT_MAX_LEN)
+                    crate::agent::streaming::truncate_result_utf8(&sanitized, result_cap)
                 }
                 Err(e) => format!("Error: {}", e),
             };
@@ -335,10 +359,17 @@ pub(crate) fn build_tool_result(
 ) -> (DecisionProcess, heramind_storage::ExecutionResult) {
     let ToolLoopOutput {
         final_text,
+        stop_reason,
         all_tool_results,
         round_data_list_raw,
         last_llm_error: _,
     } = loop_output;
+
+    tracing::info!(
+        agent_id = %agent.id,
+        stop_reason = stop_reason.label(),
+        "Tool loop ended"
+    );
 
     // === Free mode: LLM natural language response is the primary output ===
     // Tool calls already executed all actions. The final_text is the LLM's
@@ -463,12 +494,17 @@ pub(crate) fn build_tool_result(
         decisions,
         conclusion,
         confidence: final_confidence,
+        stop_reason: stop_reason.label().to_string(),
     };
 
     let actions_executed: Vec<heramind_storage::ActionExecuted> = all_tool_results
         .iter()
         .map(|r| {
-            let success = r.result.is_ok();
+            // A tool that returns Ok(ToolOutput{success:false}) is a SOFT
+            // failure (the command ran but reported failure) — it must not
+            // count as success, or success_rate pins to 1.0 and the journal
+            // learns nothing. Mirrors the dedup set's success semantics.
+            let success = matches!(&r.result, Ok(o) if o.success);
             heramind_storage::ActionExecuted {
                 action_type: "tool_call".to_string(),
                 description: format!("Execute tool '{}'", r.name),
@@ -570,5 +606,38 @@ mod tests {
                 h
             );
         }
+    }
+
+    #[test]
+    fn test_hallucinated_tool_hint_redirects_full_heramind_command() {
+        // Weak models emit a whole `heramind ...` command as the tool name (e.g.
+        // "heramind device list") with empty args, then loop on NotFound. Redirect
+        // verbatim to shell so they recover next round.
+        for name in &[
+            "heramind device list",
+            "heramind settings set-timezone Asia/Shanghai",
+            "heramind rule create",
+            "  heramind system info  ",
+        ] {
+            let hint = hallucinated_tool_hint(name);
+            assert!(
+                hint.is_some(),
+                "{:?} should redirect as a full heramind command",
+                name
+            );
+            let h = hint.unwrap();
+            assert!(h.contains("shell"), "must point to shell: {}", h);
+            let trimmed = name.trim();
+            assert!(
+                h.contains(trimmed),
+                "must echo the verbatim command {:?}: {}",
+                trimmed,
+                h
+            );
+        }
+        // Real tool names and unrelated strings still get no hint.
+        assert!(hallucinated_tool_hint("shell").is_none());
+        assert!(hallucinated_tool_hint("skill").is_none());
+        assert!(hallucinated_tool_hint("random_thing").is_none());
     }
 }

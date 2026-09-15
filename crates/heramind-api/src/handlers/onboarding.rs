@@ -45,11 +45,19 @@ pub struct StepStatus {
 // ── Handlers ──
 
 /// GET /api/onboarding/status
+#[utoipa::path(
+    get,
+    path = "/api/onboarding/status",
+    tag = "onboarding",
+    responses(
+        (status = 200, description = "Which onboarding steps are done"),
+    )
+)]
 pub async fn get_onboarding_status_handler(
     State(state): State<ServerState>,
 ) -> Result<Json<OnboardingStatusResponse>, StatusCode> {
     // Check dismissed state
-    let dismissed = SettingsStore::open("data/settings.redb")
+    let dismissed = SettingsStore::open_default()
         .ok()
         .and_then(|s| s.load(KEY_ONBOARDING_DISMISSED).ok())
         .flatten()
@@ -85,11 +93,18 @@ pub async fn get_onboarding_status_handler(
 }
 
 /// POST /api/onboarding/dismiss
+#[utoipa::path(
+    post,
+    path = "/api/onboarding/dismiss",
+    tag = "onboarding",
+    responses(
+        (status = 200, description = "Onboarding banner dismissed"),
+    )
+)]
 pub async fn dismiss_onboarding_handler(
     State(_state): State<ServerState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let store =
-        SettingsStore::open("data/settings.redb").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let store = SettingsStore::open_default().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     store
         .save(KEY_ONBOARDING_DISMISSED, "true")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -97,11 +112,18 @@ pub async fn dismiss_onboarding_handler(
 }
 
 /// POST /api/onboarding/reset
+#[utoipa::path(
+    post,
+    path = "/api/onboarding/reset",
+    tag = "onboarding",
+    responses(
+        (status = 200, description = "Onboarding state reset"),
+    )
+)]
 pub async fn reset_onboarding_handler(
     State(_state): State<ServerState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let store =
-        SettingsStore::open("data/settings.redb").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let store = SettingsStore::open_default().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     store
         .save(KEY_ONBOARDING_DISMISSED, "false")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

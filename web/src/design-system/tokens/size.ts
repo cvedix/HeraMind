@@ -106,8 +106,8 @@ export const valueCardSize = {
     headerPadding: 'pb-1.5',
     // Text: value is primary, keep it readable
     titleText: 'text-xs',
-    labelText: 'text-[11px]',
-    valueText: 'text-sm font-semibold',
+    labelText: 'text-mini',
+    valueText: 'text-base font-semibold tabular-nums',
     // Icons: smaller but still visible
     iconSize: 'w-3.5 h-3.5',
     iconContainer: 'w-7 h-7',
@@ -123,8 +123,8 @@ export const valueCardSize = {
     headerPadding: 'pb-2',
     // Text: stronger value/label contrast for data focus
     titleText: 'text-xs uppercase tracking-wide',
-    labelText: 'text-[11px]',
-    valueText: 'text-lg font-semibold tracking-tight tabular-nums',
+    labelText: 'text-mini',
+    valueText: 'text-xl font-semibold tracking-tight tabular-nums',
     // Icons: standard size
     iconSize: 'w-4 h-4',
     iconContainer: 'w-8 h-8',
@@ -149,7 +149,7 @@ export const valueCardSize = {
     contentGap: 'gap-3',
     itemGap: 'gap-2',
     // Border radius
-    radius: 'rounded-xl',
+    radius: 'rounded-lg',
   },
 } as const
 
@@ -166,7 +166,7 @@ export const dashboardComponentSize = {
     headerPadding: 'pb-1.5',
     // Text sizes
     titleText: 'text-xs',
-    labelText: 'text-[10px]',
+    labelText: 'text-nano',
     valueText: 'text-xs',
     // Icons
     iconSize: 'w-3 h-3',
@@ -216,7 +216,7 @@ export const dashboardComponentSize = {
     iconContainer: 'w-10 h-10',
     contentGap: 'gap-4',
     itemGap: 'gap-2.5',
-    radius: 'rounded-xl',
+    radius: 'rounded-lg',
   },
 } as const
 
@@ -306,7 +306,7 @@ export const dashboardScrollableContent = [
  * Equivalent to `rounded-lg border bg-card shadow-sm` but centralized
  */
 export const cardBase = [
-  'rounded-lg border bg-card shadow-sm',
+  'rounded-md border bg-card',
 ].join(' ')
 
 /**
@@ -316,8 +316,22 @@ export const cardBase = [
  * Opaque surface: no backdrop-blur, keeping content legible and GPU-light.
  */
 export const interactiveCard = [
-  'bg-card rounded-lg border shadow-sm',
-  'cursor-pointer transition-all duration-200',
+  'bg-card rounded-md border',
+  'cursor-pointer transition-all duration-fast ease-spring-soft',
+  'hover:shadow-md hover:-translate-y-0.5',
+].join(' ')
+
+/**
+ * Interactive card hover effect — the lift/shadow transition only.
+ *
+ * Use this on cards that already carry their own surface styles (e.g. the
+ * `<Card>` component which includes `cardBase`, or cards with a non-default
+ * radius like `rounded-xl`) but should share the same hover interaction.
+ * This avoids re-declaring `hover:shadow-md hover:-translate-y-0.5
+ * transition-all duration-fast ease-spring-soft` at every call site.
+ */
+export const interactiveCardHover = [
+  'transition-all duration-fast ease-spring-soft',
   'hover:shadow-md hover:-translate-y-0.5',
 ].join(' ')
 
@@ -370,4 +384,4 @@ export const scrollableBody = [
 /**
  * Standard transition — used for interactive elements
  */
-export const transitionDefault = 'transition-all duration-200'
+export const transitionDefault = 'transition-all duration-normal'

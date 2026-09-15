@@ -1,6 +1,7 @@
 ---
 id: dashboard-management
 name: Dashboard Management & Component Creation
+description: Use when the user wants to create or manage dashboards and their components — creating boards, adding/removing chart/widget/gauge components, binding data sources to widgets, sharing dashboards. Covers dashboard create/update/share/add-components even without saying 'dashboard' (e.g. '做个监控面板', '把温度画出来'). Includes 仪表盘/看板/组件/绑定数据.
 category: dashboard
 origin: builtin
 priority: 85
@@ -9,7 +10,7 @@ triggers:
   keywords: [dashboard, 仪表盘, 仪表板, create dashboard, 组件, widget, component, 数据源, data source, dashboard component, dashboard widget, 绑定数据, bind data, 创建仪表盘, 监控面板, share dashboard, 共享仪表盘, add-components, 添加组件, 删除组件, remove component]
   tool_target:
     - tool: dashboard
-      actions: [list, get, create, update, delete, share, add-components, remove-components]
+      actions: [list, get, create, update, delete, share, add-components, update-component, remove-components]
     - tool: widget
       actions: [list, get]
     - tool: device
@@ -22,27 +23,46 @@ anti_triggers:
 
 # Dashboard Management & Component Creation
 
+## Command Cheat-Sheet (run these via `shell`)
+
+Always RUN the command yourself and report the real output.
+
+| Command | Purpose |
+|---|---|
+| `heramind dashboard list` | List all dashboards |
+| `heramind dashboard get <id>` | Dashboard details |
+| `heramind dashboard create` | Create a new dashboard |
+| `heramind dashboard update <id>` | Update name/description/layout (--components needs --replace-all) |
+| `heramind dashboard add-components <id>` | Add components (append mode) |
+| `heramind dashboard update-component <id> --component-id <cid> --set '<partial JSON>'` | **Tweak ONE component** (deep merge — preferred) |
+| `heramind dashboard remove-components <id>` | Remove components by ID |
+| `heramind dashboard delete <id>` | Delete a dashboard |
+| `heramind dashboard share <id>` | Share a dashboard |
+
 Creating dashboards with data-bound components is the most complex CLI operation. Follow the workflows below exactly.
 
 ## CRITICAL Rules
 
 1. **NEVER guess metric names** — always discover them via `device list` (metric_fields per type) or `device get <ID>`
 2. **Use `add-components` to add widgets** — this appends without replacing existing components
-3. **`update --components` replaces ALL components** — avoid this unless intentionally replacing everything
-4. **Grid is 12 columns wide** — plan layout accordingly
-5. **NEVER use Python/pipe/file tricks** — each shell call is an isolated process; you cannot share data between calls via files, pipes, or variables. Build the complete JSON string inline.
-6. **Use `widget get <type>` to inspect config_schema** before configuring unfamiliar widgets
-7. **NEVER use emoji in component titles or descriptions** — use plain text labels only. Example: use "Temperature" not "Temperature", use "Humidity" not "Humidity"
-8. **Charts (line-chart, area-chart, bar-chart, sparkline, pie-chart) MUST use `mode: "timeseries"`** — using `mode: "latest"` on charts causes rendering errors. Always include `timeWindow` (e.g., `"timeWindow": {"type": "last_24hours"}`) for proper historical data. Value-cards and indicators use `mode: "latest"`.
+3. **To change ONE component's fields use `update-component`** — deep-merges a partial JSON into it; no need to re-send the whole component or remove+re-add
+4. **`update --components` is GATED** — it replaces ALL components and requires the explicit `--replace-all` flag; without it the command fails. You almost never want it: ADD → `add-components`, TWEAK → `update-component`
+5. **ALWAYS `dashboard get <ID>` before adding components** — its output ends with a grid summary (occupied rows + `next free row: y=N`); place new widgets at that y. Component ids are listed too (avoid collisions)
+6. **Grid is 12 columns wide** — plan layout accordingly
+7. **NEVER use Python/pipe/file tricks** — each shell call is an isolated process; you cannot share data between calls via files, pipes, or variables. Build the complete JSON string inline.
+8. **Use `widget get <type>` to inspect config_schema** before configuring unfamiliar widgets
+9. **NEVER use emoji in component titles or descriptions** — use plain text labels only. Example: use "Temperature" not "Temperature", use "Humidity" not "Humidity"
+10. **Charts (line-chart, area-chart, bar-chart, sparkline, pie-chart) MUST use `mode: "timeseries"`** — using `mode: "latest"` on charts causes rendering errors. Always include `timeWindow` (e.g., `"timeWindow": {"type": "last_24hours"}`) for proper historical data. Value-cards and indicators use `mode: "latest"`.
 
 ## Component Management Commands
 
 | Command | Purpose |
 |---------|---------|
-| `dashboard add-components <ID> --components '<JSON>'` | **Append** new components (RECOMMENDED) |
+| `dashboard add-components <ID> --components '<JSON>'` | **Append** new components — the reply lists added ids, confirms types verified, and gives the next free row (no follow-up get needed) |
+| `dashboard update-component <ID> --component-id c1 --set '{"title":"New"}'` | **Change fields of ONE component** (deep merge — preferred for tweaks) |
 | `dashboard remove-components <ID> --ids '["c1","c2"]'` | Remove components by ID |
 | `dashboard update <ID> --name 'New Name'` | Update metadata only (name, description) |
-| `dashboard update <ID> --components '<JSON>'` | Replace ALL components (dangerous!) |
+| `dashboard update <ID> --replace-all --components '<JSON>'` | Replace ALL components (gated — rarely needed) |
 | `dashboard delete <ID>` | Delete entire dashboard |
 
 ## Step-by-Step: Create a Data Dashboard
@@ -58,7 +78,7 @@ heramind device get sensor-001
 heramind device get sensor-002
 
 # If using extension data, discover extension metrics
-heramind extension get weather-forecast-v2
+heramind extension get weather-forecast
 ```
 
 **Record the exact metric names** — you will use them in data_source binding. NEVER guess metric names.
@@ -150,6 +170,45 @@ heramind dashboard remove-components <DASHBOARD_ID> --ids '["b1","chart"]'
 ```bash
 heramind dashboard delete <DASHBOARD_ID>
 ```
+
+## Modify ONE Component (PREFERRED for tweaks)
+
+`update-component` deep-merges a partial JSON into an existing component — objects merge recursively, scalars/arrays replace. Only the fields you pass change; `id`/`type` are immutable. This beats remove+re-add or full `update --components`.
+
+```bash
+# Fix a chart's time window (only that field changes)
+heramind dashboard update-component <ID> --component-id c3 \
+  --set '{"data_source":{"timeWindow":{"type":"last_6hours"}}}'
+
+# Re-bind to another device/metric
+heramind dashboard update-component <ID> --component-id c1 \
+  --set '{"data_source":{"id":"sensor-002","field":"humidity","metricId":"humidity"}}'
+
+# Retitle + resize + display tweak
+heramind dashboard update-component <ID> --component-id c2 \
+  --set '{"title":"Humidity","position":{"w":6},"display":{"unit":"%"}}'
+```
+
+Find component IDs with `heramind dashboard get <ID>` (each component has an `id`).
+
+## Expression Data Source (inline computed values — NO transform needed)
+
+For computed values (averages, differences, sums of MULTIPLE devices), bind a
+component directly with an inline expression instead of pre-creating a transform:
+
+```json
+{"type": "telemetry", "source": "expression", "mode": "latest",
+ "expr": "avg(device:sensor-001:values.battery, device:sensor-002:values.battery)"}
+```
+
+- Refs: `device:<id>:<field>` (canonical) or `<id>.<field>` (sugar). Use REAL
+  metric names from `device get` (e.g. `values.battery`).
+- Operators: `+ - * / ( )`; functions: `avg sum min max abs round floor ceil sqrt pow`.
+- Best for value-card / gauge / led-indicator (mode `latest`, live updates).
+- Charts needing a COMPUTED CURVE (mode `timeseries`): community widgets support
+  it; built-in charts still need a transform — create one via `transform create`.
+- Example — 温差卡片:
+  `--set '{"data_source":{"type":"telemetry","source":"expression","mode":"latest","expr":"device:sensor-001:temperature - device:sensor-002:temperature"}}'`
 
 ## DataSource Binding Reference
 
@@ -315,7 +374,7 @@ Row 2: [chart with device+ext data_sources, x=0,w=12,h=4]
 
 ## Adding Components to Existing Dashboard
 
-When adding new widgets to an existing dashboard, use `add-components`:
+When adding new widgets to an existing dashboard, ALWAYS `dashboard get <ID>` first (layout + existing ids), then `add-components` (append — never full replace):
 
 ```bash
 # Step 1: Check current layout to determine y position for new components
@@ -335,7 +394,7 @@ heramind dashboard add-components <ID> --components '[
 ```bash
 # Discover both device and extension metrics
 heramind device get sensor-001
-heramind extension get weather-forecast-v2
+heramind extension get weather-forecast
 
 # Create dashboard with mixed sources
 heramind dashboard create --name 'Weather Comparison'
@@ -346,13 +405,13 @@ heramind dashboard add-components <ID> --components '[
    "display":{"unit":"°C"}},
   {"id":"outdoor","type":"value-card","title":"Outdoor Temp",
    "position":{"x":4,"y":0,"w":4,"h":2},
-   "data_source":{"type":"extension-metric","source":"extension","id":"weather-forecast-v2","field":"get_weather:temperature_c","mode":"timeseries","extensionId":"weather-forecast-v2","extensionMetric":"get_weather:temperature_c"},
+   "data_source":{"type":"extension-metric","source":"extension","id":"weather-forecast","field":"get_weather:temperature_c","mode":"timeseries","extensionId":"weather-forecast","extensionMetric":"get_weather:temperature_c"},
    "display":{"unit":"°C"}},
   {"id":"compare","type":"line-chart","title":"Temperature Comparison",
    "position":{"x":0,"y":2,"w":12,"h":4},
    "data_source":[
      {"type":"telemetry","source":"device","id":"sensor-001","field":"temperature","mode":"timeseries","sourceId":"sensor-001","metricId":"temperature","timeRange":1,"limit":50,"timeWindow":{"type":"last_24hours"}},
-     {"type":"extension-metric","source":"extension","id":"weather-forecast-v2","field":"get_weather:temperature_c","mode":"timeseries","extensionId":"weather-forecast-v2","extensionMetric":"get_weather:temperature_c","timeWindow":{"type":"last_24hours"}}
+     {"type":"extension-metric","source":"extension","id":"weather-forecast","field":"get_weather:temperature_c","mode":"timeseries","extensionId":"weather-forecast","extensionMetric":"get_weather:temperature_c","timeWindow":{"type":"last_24hours"}}
    ],
    "display":{"showLegend":true}}
 ]'
@@ -381,7 +440,7 @@ heramind dashboard share <ID> --expires 3600
 | Error | Cause | Solution |
 |-------|-------|----------|
 | "Invalid widget type" | Type doesn't exist | Run `heramind widget list` to see valid types |
-| Components disappear after update | Used `update --components` which replaces all | Use `add-components` instead |
+| "--components needs --replace-all" error | Used `update --components` to add/tweak | ADD → `add-components`; TWEAK → `update-component`; only true full replacement passes `--replace-all` |
 | "Device not found" | Wrong id | Run `heramind device list` for valid IDs |
 | No data shows | Wrong field name | Run `heramind device list` (metric_fields) or `heramind device get <ID>` for exact metric names |
 | Extension data not binding | Missing unified fields | Add `source:"extension"`, `id`, `field` (format: `COMMAND:FIELD`) |

@@ -93,7 +93,7 @@ pub async fn run_llm_cmd(cmd: LlmCommand) -> Result<(CliResponse, OutputFormat)>
     let response = match cmd {
         LlmCommand::List {} => list_backends(&client).await?,
         LlmCommand::Get { id } => get_backend(&client, &id).await?,
-        LlmCommand::Models { endpoint: _ } => list_ollama_models(&client).await?,
+        LlmCommand::Models { endpoint } => list_ollama_models(&client, Some(&endpoint)).await?,
         LlmCommand::Create {
             name,
             r#type,
@@ -233,12 +233,23 @@ pub async fn run_device_cmd(cmd: DeviceCommand) -> Result<(CliResponse, OutputFo
             id,
             command,
             params,
+            param,
         } => {
-            let params_json = if let Some(params_str) = params {
+            let mut params_json = if let Some(params_str) = params {
                 serde_json::from_str(&params_str)?
             } else {
                 serde_json::json!({})
             };
+            if !param.is_empty() {
+                let overrides =
+                    crate::kv::parse_kv_params(&param).map_err(|e| anyhow::anyhow!("{}", e))?;
+                let Some(obj) = params_json.as_object_mut() else {
+                    anyhow::bail!(
+                        "--params JSON must be an object to combine with --param key=value"
+                    );
+                };
+                obj.extend(overrides);
+            }
             (
                 control_device(&client, &id, &command, params_json).await?,
                 base_format,
@@ -380,14 +391,26 @@ pub async fn run_dashboard_cmd(cmd: DashboardCommand) -> Result<(CliResponse, Ou
             name,
             description,
             layout,
+            components,
         } => {
             let layout_json = if let Some(layout_str) = layout {
                 Some(serde_json::from_str(&layout_str)?)
             } else {
                 None
             };
-            let resp =
-                create_dashboard(&client, &name, description.as_deref(), layout_json).await?;
+            let components_json = if let Some(components_str) = components {
+                Some(serde_json::from_str(&components_str)?)
+            } else {
+                None
+            };
+            let resp = create_dashboard(
+                &client,
+                &name,
+                description.as_deref(),
+                layout_json,
+                components_json,
+            )
+            .await?;
             (resp, output_format)
         }
         DashboardCommand::Update {
@@ -396,7 +419,22 @@ pub async fn run_dashboard_cmd(cmd: DashboardCommand) -> Result<(CliResponse, Ou
             description,
             layout,
             components,
+            replace_all,
         } => {
+            // Explicit gate: --components replaces the ENTIRE component array.
+            // Small models repeatedly reach for it when they mean "add" or
+            // "tweak one widget" — without this gate those mistakes silently
+            // wipe the dashboard. Fail loudly with the right command instead.
+            if components.is_some() && !replace_all {
+                return Err(anyhow::anyhow!(
+                    "--components replaces ALL dashboard components and needs an explicit --replace-all confirmation.\n\
+                     Most likely you want one of these instead:\n\
+                     - ADD widgets:    heramind dashboard add-components {id} --components '[...]'\n\
+                     - TWEAK one widget: heramind dashboard update-component {id} --component-id <cid> --set '{...}'\n\
+                     - TRULY replace everything: re-run with --replace-all"
+                        .replace("{id}", &id)
+                ));
+            }
             let layout_json = if let Some(layout_str) = layout {
                 Some(serde_json::from_str(&layout_str)?)
             } else {
@@ -420,12 +458,24 @@ pub async fn run_dashboard_cmd(cmd: DashboardCommand) -> Result<(CliResponse, Ou
         }
         DashboardCommand::Delete { id } => (delete_dashboard(&client, &id).await?, output_format),
         DashboardCommand::AddComponents { id, components } => {
-            let comps = serde_json::from_str(&components).unwrap_or(serde_json::json!([]));
+            // Propagate parse errors — a silent empty-array fallback made
+            // malformed JSON "succeed" with zero components added, and the
+            // model retried in a confused loop (observed ×5 in evals).
+            let comps = serde_json::from_str(&components)?;
             let resp = add_components(&client, &id, comps).await?;
             (resp, output_format)
         }
+        DashboardCommand::UpdateComponent {
+            id,
+            component_id,
+            set,
+        } => {
+            let patch = serde_json::from_str(&set)?;
+            let resp = update_component(&client, &id, &component_id, patch).await?;
+            (resp, output_format)
+        }
         DashboardCommand::RemoveComponents { id, ids } => {
-            let ids_val = serde_json::from_str(&ids).unwrap_or(serde_json::json!([]));
+            let ids_val = serde_json::from_str(&ids)?;
             let resp = remove_components(&client, &id, ids_val).await?;
             (resp, output_format)
         }
@@ -465,8 +515,59 @@ pub async fn run_rule_cmd(cmd: RuleCommand) -> Result<(CliResponse, OutputFormat
     let response = match cmd {
         RuleCommand::List => list_rules(&client).await?,
         RuleCommand::Get { id } => get_rule(&client, &id).await?,
-        RuleCommand::Create { body } => create_rule(&client, &body).await?,
-        RuleCommand::Update { id, body } => update_rule(&client, &id, &body).await?,
+        RuleCommand::Create {
+            body,
+            name,
+            trigger_device,
+            metric,
+            source,
+            operator,
+            threshold,
+            notify,
+            severity,
+            cooldown,
+        } => {
+            let json_body = match body {
+                Some(b) => b,
+                None => {
+                    let Some(name) = name else {
+                        anyhow::bail!("--name is required on the flag fast path (or use --body)");
+                    };
+                    let Some(operator) = operator else {
+                        anyhow::bail!(
+                            "--operator is required on the flag fast path (or use --body)"
+                        );
+                    };
+                    let Some(threshold) = threshold else {
+                        anyhow::bail!(
+                            "--threshold is required on the flag fast path (or use --body)"
+                        );
+                    };
+                    let Some(notify) = notify else {
+                        anyhow::bail!("--notify is required on the flag fast path (or use --body)");
+                    };
+                    let fast = crate::rule::RuleFastPathArgs {
+                        name: &name,
+                        trigger_device: trigger_device.as_deref(),
+                        metric: metric.as_deref(),
+                        source: source.as_deref(),
+                        operator: &operator,
+                        threshold,
+                        notify: &notify,
+                        severity: severity.as_deref(),
+                        cooldown,
+                    };
+                    crate::rule::build_rule_body(&fast)?.to_string()
+                }
+            };
+            create_rule(&client, &json_body).await?
+        }
+        RuleCommand::Update { id, id_flag, body } => {
+            let rule_id = id.or(id_flag).ok_or_else(|| {
+                anyhow::anyhow!("rule ID is required: pass it positionally (`rule update <ID> --body ...`) or as --id <ID>.\nHint: list rules with: heramind rule list")
+            })?;
+            update_rule(&client, &rule_id, &body).await?
+        }
         RuleCommand::Delete { id } => delete_rule(&client, &id).await?,
         RuleCommand::Enable { id } => enable_rule(&client, &id).await?,
         RuleCommand::Disable { id } => disable_rule(&client, &id).await?,
@@ -502,6 +603,9 @@ pub async fn run_transform_cmd(cmd: TransformCommand) -> Result<(CliResponse, Ou
     let response = match cmd {
         TransformCommand::List => list_transforms(&client).await?,
         TransformCommand::Get { id } => get_transform(&client, &id).await?,
+        TransformCommand::Executions { id, limit } => {
+            get_transform_executions(&client, &id, limit).await?
+        }
         TransformCommand::Create {
             name,
             scope,
@@ -733,6 +837,7 @@ pub async fn run_message_cmd(cmd: MessageCommand) -> Result<(CliResponse, Output
             source,
         } => send_message(&client, &title, &body, &severity, source.as_deref()).await?,
         MessageCommand::Read { id } => acknowledge_message(&client, &id).await?,
+        MessageCommand::Delete { id } => delete_message(&client, &id).await?,
         MessageCommand::ChannelList => list_channels(&client).await?,
         MessageCommand::ChannelGet { name } => get_channel(&client, &name).await?,
         MessageCommand::ChannelTypes => list_channel_types(&client).await?,
@@ -743,7 +848,12 @@ pub async fn run_message_cmd(cmd: MessageCommand) -> Result<(CliResponse, Output
             name,
             channel_type,
             config,
-        } => create_channel(&client, &name, &channel_type, &config).await?,
+            param,
+            enabled,
+        } => {
+            let config_json = merge_channel_config(config.as_deref(), &param)?;
+            create_channel(&client, &name, &channel_type, &config_json, enabled).await?
+        }
         MessageCommand::ChannelUpdate { name, config } => {
             update_channel(&client, &name, &config).await?
         }
@@ -855,8 +965,30 @@ pub async fn run_widget_cmd(cmd: WidgetCommand) -> Result<(CliResponse, OutputFo
             name,
             widget_type,
             output,
+            install,
         } => {
             let resp = create_widget(&name, &widget_type, output.as_deref())?;
+            let resp = if install {
+                // `widget create` wrote manifest.json + bundle.js under
+                // `directory`; register them via the install path — no manual
+                // packaging/tar needed (the create→install gap with a manual
+                // tar step was agent friction even strong models stumbled on).
+                let dir = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("directory"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if dir.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "widget create --install: could not resolve scaffold directory"
+                    ));
+                }
+                install_widget_file(&client, &dir).await?
+            } else {
+                resp
+            };
             (resp, output_format)
         }
         WidgetCommand::Install { file } => {
@@ -889,6 +1021,96 @@ pub async fn run_system_cmd(cmd: SystemCommand) -> Result<(CliResponse, OutputFo
         SystemCommand::Info {} => {
             let resp = crate::system::system_info(&client).await?;
             (resp, base_format)
+        }
+    };
+    Ok(result)
+}
+
+pub async fn run_data_cmd(
+    cmd: crate::dispatch::commands::DataCommand,
+) -> Result<(CliResponse, OutputFormat)> {
+    use crate::dispatch::commands::DataCommand;
+    let client = crate::ApiClient::new();
+    let base_format = if std::env::var("HERAMIND_JSON").is_ok() {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Human
+    };
+    let result = match cmd {
+        DataCommand::List { source_type } => {
+            let path = match &source_type {
+                Some(t) => format!("/data/sources?source_type={}", t),
+                None => "/data/sources".to_string(),
+            };
+            let data = client.get(&path).await?;
+            let inner = data.get("data").cloned().unwrap_or(data.clone());
+            let total = data.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+            let lines: Vec<String> = inner
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .map(|s| {
+                            format!(
+                                "{:<48} {:<10} {}",
+                                s.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+                                s.get("source_type").and_then(|v| v.as_str()).unwrap_or("?"),
+                                s.get("field").and_then(|v| v.as_str()).unwrap_or(""),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut msg = lines.join("\n");
+            if total > 0 {
+                msg.push_str(&format!("\n{} data source(s)", total));
+            }
+            (
+                CliResponse::success(
+                    inner,
+                    if msg.is_empty() {
+                        "No data sources".to_string()
+                    } else {
+                        msg
+                    },
+                ),
+                base_format,
+            )
+        }
+    };
+    Ok(result)
+}
+
+pub async fn run_config_cmd(
+    cmd: crate::dispatch::commands::ConfigCommand,
+) -> Result<(CliResponse, OutputFormat)> {
+    use crate::dispatch::commands::ConfigCommand;
+    let client = crate::ApiClient::new();
+    let base_format = if std::env::var("HERAMIND_JSON").is_ok() {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Human
+    };
+
+    let result = match cmd {
+        ConfigCommand::Export {} => (
+            crate::config_cmd::export_config(&client).await?,
+            base_format,
+        ),
+        ConfigCommand::Import { file } => {
+            let config_json = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("cannot read config file '{}': {}", file, e))?;
+            (
+                crate::config_cmd::import_config(&client, &config_json).await?,
+                base_format,
+            )
+        }
+        ConfigCommand::Validate { file } => {
+            let config_json = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("cannot read config file '{}': {}", file, e))?;
+            (
+                crate::config_cmd::validate_config(&client, &config_json).await?,
+                base_format,
+            )
         }
     };
     Ok(result)
@@ -1098,5 +1320,25 @@ pub async fn run_whoami_cmd() -> Result<(CliResponse, OutputFormat)> {
         OutputFormat::Human
     };
     let resp = crate::auth_cmd::run_whoami().await?;
+    Ok((resp, fmt))
+}
+
+pub async fn run_user_cmd(user_cmd: UserCommand) -> Result<(CliResponse, OutputFormat)> {
+    let fmt = if std::env::var("HERAMIND_JSON").is_ok() {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Human
+    };
+    let resp = match user_cmd {
+        UserCommand::List { data_dir } => crate::user_cmd::run_list_users(data_dir).await?,
+        UserCommand::ResetPassword { username, data_dir } => {
+            crate::user_cmd::run_reset_password(data_dir, &username).await?
+        }
+        UserCommand::SetRole {
+            username,
+            role,
+            data_dir,
+        } => crate::user_cmd::run_set_role(data_dir, &username, &role).await?,
+    };
     Ok((resp, fmt))
 }

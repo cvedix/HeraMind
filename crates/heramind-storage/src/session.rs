@@ -331,6 +331,9 @@ impl SessionStore {
         } else {
             Database::create(path_ref)?
         };
+        // Rollback guard: refuse databases stamped by a newer build (see schema.rs).
+        crate::schema::check_or_stamp(&db)
+            .map_err(|e| Error::Storage(format!("schema version: {e}")))?;
 
         let store = Arc::new(SessionStore {
             db: Arc::new(db),
@@ -343,6 +346,36 @@ impl SessionStore {
         }
         tracing::debug!("[SessionStore] Opened session store at: {}", store.path);
         Ok(store)
+    }
+
+    /// Open a session store WITHOUT registering the global singleton.
+    ///
+    /// Each call creates a fresh, independent instance. Use in tests / isolated
+    /// runs where sharing the singleton would cause cross-test interference
+    /// (e.g. parallel sessions-handler tests racing on one shared store).
+    /// `":memory:"` maps to redb's in-memory backend so every call is truly
+    /// independent; other paths open/create that file directly. Production
+    /// code should keep using [`open`](Self::open).
+    pub fn open_isolated<P: AsRef<Path>>(path: P) -> Result<Arc<Self>, Error> {
+        let path_str = path.as_ref().to_string_lossy().to_string();
+        // ":memory:" → unique temp file. redb 2.1 has no in-memory backend,
+        // and the global singleton would make parallel tests share one store.
+        // A unique path guarantees each call gets an independent store
+        // (matches TimeSeriesStorage::memory's pattern).
+        let db_path: std::path::PathBuf = if path_str == ":memory:" {
+            std::env::temp_dir().join(format!("session_isolated_{}.redb", uuid::Uuid::new_v4()))
+        } else {
+            path.as_ref().to_path_buf()
+        };
+        let db = if db_path.exists() {
+            Database::open(&db_path)?
+        } else {
+            Database::create(&db_path)?
+        };
+        Ok(Arc::new(SessionStore {
+            db: Arc::new(db),
+            path: path_str,
+        }))
     }
 
     /// Save a session ID.
@@ -1815,7 +1848,7 @@ mod tests {
 
         // Elapsed time should be small
         let elapsed = state.elapsed_secs();
-        assert!(elapsed >= 0 && elapsed < 2);
+        assert!((0..2).contains(&elapsed));
 
         // Should not be stale
         assert!(!state.is_stale());

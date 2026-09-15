@@ -306,9 +306,14 @@ pub enum ServerUrlSource {
     /// `X-Forwarded-Proto` + `Host` headers — inferred from reverse proxy.
     /// Trusted iff the server is behind a proxy that sets these headers.
     ProxyHeader,
-    /// Hardcoded `http://localhost:9375` fallback. Almost certainly wrong for
-    /// remote clients; clients should treat as a placeholder.
+    /// Auto-detected LAN host. Correct for devices when the server listens on
+    /// 0.0.0.0 (the default bind).
     Fallback,
+    /// LAN host detected, but the server is bound to loopback only — devices
+    /// can't reach it until it's rebound (`HERAMIND_HOST=0.0.0.0`). The URL is
+    /// still the address traffic should aim at; pair with network-info's
+    /// `lan_reachable` to surface the rebind guidance.
+    Loopback,
 }
 
 impl ServerUrlSource {
@@ -317,6 +322,7 @@ impl ServerUrlSource {
             ServerUrlSource::Env => "env",
             ServerUrlSource::ProxyHeader => "proxy_header",
             ServerUrlSource::Fallback => "fallback",
+            ServerUrlSource::Loopback => "loopback",
         }
     }
 }
@@ -397,18 +403,23 @@ pub fn resolve_server_url(headers: Option<&axum::http::HeaderMap>) -> (String, S
         }
     }
 
-    // 3. Auto-detect LAN IP + known port.
-    //
-    // Previously this returned "http://localhost:9375" — which works for the
-    // FRONTEND running on the same machine, but is wrong when displayed to
-    // the user as the webhook URL devices should POST to (a device's
-    // `localhost` is the device itself, not the server). The auto-detected
-    // LAN IP is what devices actually need.
-    //
-    // MQTT status already does this correctly via `get_server_host()` — this
-    // brings webhook URL resolution in line.
+    // 3. Auto-detect the LAN IP — the address devices should aim at. Even
+    //    when the server is bound to loopback only, the LAN IP is the more
+    //    useful thing to display: it's where traffic should go once the user
+    //    rebinds, and the UI pairs it with network-info's `lan_reachable`
+    //    (and the Loopback source) to teach "restart with
+    //    HERAMIND_HOST=0.0.0.0" rather than silently implying the address is
+    //    fine. Falls back to localhost only when no routable host exists.
+    let port = crate::server::http_bind_port();
+    let port = if port == 0 { 9375 } else { port };
     let host = get_server_host();
-    (format!("http://{}:9375", host), ServerUrlSource::Fallback)
+    let host_is_loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
+    let source = if !host_is_loopback && crate::server::http_bind_is_loopback() {
+        ServerUrlSource::Loopback
+    } else {
+        ServerUrlSource::Fallback
+    };
+    (format!("http://{host}:{port}"), source)
 }
 
 #[cfg(test)]

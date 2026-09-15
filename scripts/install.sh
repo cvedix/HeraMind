@@ -9,6 +9,12 @@
 #   WEB_DIR        - Frontend static files directory (default: /var/www/heramind)
 #   NO_WEB        - Skip frontend installation, backend only (default: false)
 #   NO_SERVICE     - Skip service installation (default: false)
+#   WITH_LLM      - Install the llama.cpp runtime (heramind-llama-server) from
+#                   official prebuilt binaries (default: true)
+#   LLAMA_VERSION - llama.cpp release tag for the runtime (default: b10545)
+#   BUILTIN_MODEL - Pre-download a builtin model GGUF + manifest into DATA_DIR:
+#                   lfm25-2.6b | qwen3.5-4b | gemma4-e2b | none (default: none —
+#                   the in-app wizard offers the same choices)
 #   USE_NGINX      - Configure nginx reverse proxy (default: false)
 #   PORT           - Backend API port (default: 9375)
 
@@ -32,6 +38,9 @@ NO_WEB="${NO_WEB:-false}"
 NO_SERVICE="${NO_SERVICE:-false}"
 USE_NGINX="${USE_NGINX:-false}"
 PORT="${PORT:-9375}"
+WITH_LLM="${WITH_LLM:-true}"
+LLAMA_VERSION="${LLAMA_VERSION:-b10545}"
+BUILTIN_MODEL="${BUILTIN_MODEL:-none}"
 
 status() { echo "${BLUE}[INFO]${NC} $*"; }
 success() { echo "${GREEN}[OK]${NC} $*"; }
@@ -151,7 +160,7 @@ install_linux() {
     if [ "$NO_WEB" = "true" ]; then
         status "Skipping frontend (NO_WEB=true). Backend-only deployment."
     else
-        WEB_FILE="heramind-web-${VERSION}.tar.gz"
+        WEB_FILE="heramind-web.tar.gz"
     WEB_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${WEB_FILE}"
 
     status "Downloading frontend..."
@@ -223,6 +232,49 @@ EOF
         $SUDO systemctl daemon-reload
         $SUDO systemctl enable heramind
         success "Systemd service installed"
+
+        # Web-triggered upgrade helper: a root oneshot + a path unit that
+        # starts it when the API writes ${DATA_DIR}/data/upgrade/apply.trigger.
+        # The API's own unit sets NoNewPrivileges=true + ProtectSystem=full,
+        # so it can neither write the install dir nor sudo — the path-unit
+        # hand-off needs neither (inotify on a data-dir file it can write).
+        # NOTE the /data nesting: the main unit sets NO HERAMIND_DATA_DIR, so
+        # paths::data_dir() resolves cwd-relative "data" under its
+        # WorkingDirectory=${DATA_DIR} — the apply unit must resolve the
+        # same way (WorkingDirectory only, no env override), or the trigger
+        # file and the staging dir land in different trees.
+        status "Installing web-upgrade helper units..."
+        $SUDO mkdir -p "${DATA_DIR}/data/upgrade"
+        $SUDO chown heramind:heramind "${DATA_DIR}/data/upgrade"
+        $SUDO tee /etc/systemd/system/heramind-upgrade-apply.service >/dev/null <<EOF
+[Unit]
+Description=HeraMind web-triggered upgrade apply helper
+Documentation=https://github.com/cvedix/HeraMind
+
+[Service]
+Type=oneshot
+User=root
+# No sandboxing on purpose: this unit must write the install dir and swap
+# the web dir, which the main service's ProtectSystem makes read-only.
+WorkingDirectory=${DATA_DIR}
+Environment=HERAMIND_WEB_DIR=${WEB_DIR}
+ExecStart=${INSTALL_DIR}/heramind upgrade --apply-staged --yes
+TimeoutStartSec=600
+EOF
+        $SUDO tee /etc/systemd/system/heramind-upgrade-apply.path >/dev/null <<EOF
+[Unit]
+Description=Watch for the HeraMind web-upgrade apply trigger
+
+[Path]
+PathExists=${DATA_DIR}/data/upgrade/apply.trigger
+Unit=heramind-upgrade-apply.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        $SUDO systemctl daemon-reload
+        $SUDO systemctl enable --now heramind-upgrade-apply.path
+        success "Web-upgrade helper installed (in-app upgrades enabled)"
     fi
 
     # Configure nginx (optional, for frontend-backend separation)
@@ -386,7 +438,7 @@ install_darwin() {
     if [ "$NO_WEB" = "true" ]; then
         status "Skipping frontend (NO_WEB=true). Backend-only deployment."
     else
-        WEB_FILE="heramind-web-${VERSION}.tar.gz"
+        WEB_FILE="heramind-web.tar.gz"
         WEB_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${WEB_FILE}"
 
         status "Downloading frontend..."
@@ -482,6 +534,9 @@ print_post_install() {
             echo "  Restart: sudo systemctl restart heramind"
             echo "  Logs:    sudo journalctl -u heramind -f"
             echo ""
+            echo "Upgrades: Settings -> About -> Check for updates (web UI),"
+            echo "          or: sudo heramind upgrade"
+            echo ""
             echo "Access the application:"
             if [ "$USE_NGINX" = "true" ] && available nginx; then
                 echo "  Web UI:  ${BOLD}http://${LAN_IP:-localhost}${NC} (nginx)"
@@ -524,6 +579,105 @@ print_post_install() {
     echo ""
 }
 
+# llama.cpp prebuilt asset name for OS/ARCH (official ggml-org releases).
+llama_asset() {
+    case "$OS/$ARCH" in
+        linux/x86_64) echo "ubuntu-x64" ;;
+        linux/aarch64|linux/arm64) echo "ubuntu-arm64" ;;
+        darwin/arm64) echo "macos-arm64" ;;
+        darwin/x86_64) echo "macos-x64" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Optional: download the llama.cpp runtime (heramind-llama-server) from
+# official prebuilt binaries so the built-in LLM works out of the box.
+install_llm_runtime() {
+    [ "$WITH_LLM" = "true" ] || return 0
+    # The prebuilt binaries link OpenMP — on glibc Linux they need libgomp1
+    # (identical to the Docker runtime stage's libgomp1 fix). Missing → the
+    # binary fails to exec with "libgomp.so.1: cannot open shared object".
+    if command -v apt-get >/dev/null 2>&1; then
+        if ! ldconfig -p 2>/dev/null | grep -q 'libgomp.so.1'; then
+            status "Installing libgomp1 (llama.cpp OpenMP dependency)..."
+            apt-get install -y -qq libgomp1 >/dev/null 2>&1 ||                 warning "Could not install libgomp1 — heramind-llama-server may fail to start"
+        fi
+    fi
+    local asset url tmp bin
+    if ! asset=$(llama_asset); then
+        warning "No official llama.cpp prebuilt for ${OS}/${ARCH} — skipping LLM runtime (build from source via scripts/build-llama-server.sh)"
+        return 0
+    fi
+    url="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/llama-${LLAMA_VERSION}-bin-${asset}.tar.gz"
+    status "Downloading llama.cpp runtime (${LLAMA_VERSION}, ${asset})..."
+    tmp=$(mktemp -d)
+    if curl -fsSL "$url" -o "$tmp/llama.tar.gz" && tar -xzf "$tmp/llama.tar.gz" -C "$tmp"; then
+        bin=$(find "$tmp" -name llama-server -type f | head -n1)
+        if [ -n "$bin" ]; then
+            # The binary is a THIN WRAPPER that dlopens sibling libraries
+            # (macOS libllama-server-impl.dylib, Linux libllama-server-impl.so,
+            # Windows .dll) — installing only llama-server makes it fail to
+            # exec. Copy the whole extraction tree (binary + libs together)
+            # into INSTALL_DIR, then rename the binary.
+            libdir=$(dirname "$bin")
+            $SUDO cp -r "$libdir"/. "${INSTALL_DIR}/"
+            if [ "$libdir" != "${INSTALL_DIR}" ]; then
+                $SUDO mv "${INSTALL_DIR}/$(basename "$bin")" "${INSTALL_DIR}/heramind-llama-server"
+            fi
+            $SUDO chmod 0755 "${INSTALL_DIR}/heramind-llama-server"
+            # Post-install exec check: the prebuilt needs libgomp1 + a modern
+            # libstdc++ (GLIBCXX_3.4.32, gcc-13). On old bases it fails with a
+            # cryptic loader error — surface the real requirement instead.
+            if ! "${INSTALL_DIR}/heramind-llama-server" --version >/dev/null 2>&1; then
+                warning "heramind-llama-server failed to exec after install."
+                warning "The llama.cpp ${LLAMA_VERSION} prebuilt requires:"
+                warning "  - libgomp1 (OpenMP)"
+                warning "  - libstdc++ with GLIBCXX_3.4.32 (GCC 13 — e.g. Ubuntu 24.04+,"
+                warning "    or on 22.04: add-apt-repository ppa:ubuntu-toolchain-r/test && apt-get install -y gcc-13)"
+                warning "Fix the above, re-run with WITH_LLM=true, or build from source via scripts/build-llama-server.sh."
+            else
+                success "Installed heramind-llama-server (whole archive) -> ${INSTALL_DIR}/heramind-llama-server"
+            fi
+        else
+            warning "llama-server not found in the release archive"
+        fi
+    else
+        warning "Failed to download llama.cpp runtime from ${url}"
+    fi
+    rm -rf "$tmp"
+}
+
+# Optional: pre-download a builtin model GGUF + manifest into DATA_DIR.
+# ids must match crates/heramind-core/src/builtin_llm/manifest.rs.
+install_builtin_model() {
+    [ "$BUILTIN_MODEL" = "none" ] && return 0
+    local id="$BUILTIN_MODEL" repo file local sha quant dir
+    case "$id" in
+        lfm25-2.6b)
+            repo="LiquidAI/LFM2.5-2.6B-GGUF"; file="LFM2.5-2.6B-QAD-Q4_0.gguf"
+            local="lfm25-2.6b-qad_q4_0.gguf"
+            sha="a247afd6414918eac8e520a9e6137dc271235461ecbe1180462221d5b8d40b03"; quant="qad_q4_0" ;;
+        qwen3.5-4b)
+            repo="unsloth/Qwen3.5-4B-GGUF"; file="Qwen3.5-4B-Q4_K_M.gguf"
+            local="qwen3.5-4b-q4_k_m.gguf"
+            sha="00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"; quant="q4_k_m" ;;
+        gemma4-e2b)
+            repo="google/gemma-4-E2B-it-qat-q4_0-gguf"; file="gemma-4-E2B_q4_0-it.gguf"
+            local="gemma-4-E2B_q4_0-it.qat.gguf"
+            sha="fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634"; quant="qat_q4_0" ;;
+        *) error "Unknown BUILTIN_MODEL: ${id} (lfm25-2.6b | qwen3.5-4b | gemma4-e2b | none)" ;;
+    esac
+    dir="${DATA_DIR}/models/${id}"
+    $SUDO mkdir -p "$dir"
+    status "Downloading builtin model ${id}..."
+    $SUDO curl -fsSL -o "$dir/$local" "https://huggingface.co/$repo/resolve/main/$file" || {
+        error "Failed to download ${id} from HuggingFace"
+    }
+    $SUDO sh -c "printf '{\"id\":\"%s\",\"version\":\"1.0\",\"file_name\":\"%s\",\"sha256\":\"%s\",\"quant\":\"%s\"}' \"$id\" \"$local\" \"$sha\" \"$quant\" > \"$dir/manifest.json\""
+    $SUDO chown -R heramind:heramind "$dir" 2>/dev/null || true
+    success "Builtin model ${id} installed -> ${dir}"
+}
+
 main() {
     echo ""
     echo "${BOLD}╔═══════════════════════════════════════════════════════════╗${NC}"
@@ -553,6 +707,11 @@ main() {
         linux) install_linux ;;
         darwin) install_darwin ;;
     esac
+
+    # Optional LLM runtime + model (closed-loop: the built-in model works
+    # right after install; WITH_LLM=false / BUILTIN_MODEL=none opt out).
+    install_llm_runtime
+    install_builtin_model
 
     print_post_install
 }

@@ -43,5 +43,6 @@
   "dashboard": {
     "defaultTitle": "Trang tổng quan",
     "newChat": "Trò chuyện mới"
-  }
+  },
+  "syncFailureNotify": "Thay đổi dashboard đã được lưu cục bộ nhưng chưa gửi được đến máy chủ."
 }

@@ -103,7 +103,7 @@ impl AgentExecutor {
         self.cleanup_stale_dedup_entries().await;
         let now = chrono::Utc::now().timestamp();
 
-        for (_agent_id, agent) in event_agents.iter() {
+        for agent in event_agents.values() {
             // Check if this agent has event-based schedule
             if matches!(
                 agent.schedule.schedule_type,
@@ -164,7 +164,16 @@ impl AgentExecutor {
                     let agent_id_for_log = agent.id.clone();
                     let recent_executions_clone = self.recent_executions.clone();
 
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
+                        // Acquire the GLOBAL execution semaphore first (WAIT):
+                        // scheduled executions hold this same permit, and event
+                        // bursts used to stack past the global bound because
+                        // only the per-backend permit was held. Held for the
+                        // whole run (dropped when this task ends).
+                        let _global_permit = match executor_config.execution_semaphore.clone() {
+                            Some(sem) => sem.acquire_owned().await.ok(),
+                            None => None,
+                        };
                         // Acquire per-backend semaphore (WAIT, not fail)
                         Self::acquire_backend_permit(
                             &executor_config.backend_semaphores,
@@ -231,6 +240,13 @@ impl AgentExecutor {
                             }
                         }
                     });
+                    // [cancellation] register the handle so shutdown can abort it;
+                    // prune finished entries to keep the registry bounded.
+                    {
+                        let mut handles = self.event_task_handles.lock();
+                        handles.retain(|h| !h.is_finished());
+                        handles.push(handle);
+                    }
                 }
             }
         }
@@ -267,7 +283,7 @@ impl AgentExecutor {
         self.cleanup_stale_dedup_entries().await;
         let now = chrono::Utc::now().timestamp();
 
-        for (_agent_id, agent) in event_agents.iter() {
+        for agent in event_agents.values() {
             // Check if this agent has event-based schedule
             if !matches!(
                 agent.schedule.schedule_type,
@@ -337,7 +353,13 @@ impl AgentExecutor {
             let agent_id_for_log = agent.id.clone();
             let recent_executions_clone = self.recent_executions.clone();
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
+                // Acquire the GLOBAL execution semaphore first (WAIT) — see
+                // the sibling spawn above for rationale.
+                let _global_permit = match executor_config.execution_semaphore.clone() {
+                    Some(sem) => sem.acquire_owned().await.ok(),
+                    None => None,
+                };
                 // Acquire per-backend semaphore (WAIT, not fail)
                 Self::acquire_backend_permit(
                     &executor_config.backend_semaphores,
@@ -403,6 +425,13 @@ impl AgentExecutor {
                     }
                 }
             });
+            // [cancellation] register the handle so shutdown can abort it;
+            // prune finished entries to keep the registry bounded.
+            {
+                let mut handles = self.event_task_handles.lock();
+                handles.retain(|h| !h.is_finished());
+                handles.push(handle);
+            }
         }
 
         Ok(())
@@ -426,6 +455,7 @@ impl AgentExecutor {
             memory_store: self.memory_store.clone(),
             backend_semaphores: self.backend_semaphores.clone(),
             skill_registry: self._config.skill_registry.clone(),
+            execution_semaphore: self._config.execution_semaphore.clone(),
         }
     }
 
@@ -610,6 +640,34 @@ impl AgentExecutor {
                         attempt = attempt,
                         "Event-triggered agent execution completed"
                     );
+                    // execute_agent reports LLM/tool failures as Ok(Failed-record)
+                    // (only storage-level errors return Err). Treating every Ok
+                    // as success made the inline retry and the caller's
+                    // cooldown-clear dead code — transient LLM faults got no
+                    // retry and the 60s window stayed locked.
+                    if record.status == heramind_storage::ExecutionStatus::Failed {
+                        if attempt <= retries {
+                            tracing::warn!(
+                                agent_id = %agent_id,
+                                execution_id = %record.id,
+                                attempt = attempt,
+                                retries = retries,
+                                "Event-triggered execution FAILED — retrying after 5s backoff"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
+                        tracing::error!(
+                            agent_id = %agent_id,
+                            execution_id = %record.id,
+                            attempt = attempt,
+                            "Event-triggered execution failed (status=Failed) after all retries"
+                        );
+                        return Err(crate::error::HeraMindError::Llm(format!(
+                            "event-triggered execution failed (status=Failed) after {} attempts",
+                            attempt
+                        )));
+                    }
                     return Ok(());
                 }
                 Err(e) => {

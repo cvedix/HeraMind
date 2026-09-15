@@ -12,8 +12,9 @@ Group=heramind
 # Working directory
 WorkingDirectory=/var/lib/heramind
 
-# Executables
-ExecStart=/usr/local/bin/heramind
+# Executables — `serve` is required; the install script generates the same
+# unit inline with the chosen host/port.
+ExecStart=/usr/local/bin/heramind serve --host 0.0.0.0 --port 9375
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Auto-restart
@@ -25,9 +26,13 @@ StartLimitInterval=60
 # Environment
 Environment="RUST_LOG=info"
 Environment="HERAMIND_DATA_DIR=/var/lib/heramind"
-Environment="HERAMIND_BIND_ADDR=0.0.0.0:9375"
 
 # Security settings
+# Note: web-triggered upgrades (About 页 → check for updates) do NOT relax
+# these — the sandboxed service can't swap its own binary, so it stages the
+# release under /var/lib/heramind/data/upgrade/ and writes apply.trigger,
+# which the root heramind-upgrade-apply.path unit (written by install.sh)
+# watches.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

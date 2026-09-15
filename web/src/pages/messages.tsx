@@ -8,6 +8,8 @@ import { PageLayout } from '@/components/layout/PageLayout'
 import { PageTabsBar, PageTabsContent, PageTabsBottomNav, Pagination, ResponsiveTable, EmptyState } from '@/components/shared'
 import { MessageSquare, Network, Settings, Filter as FilterIcon, Inbox, Loader2 } from 'lucide-react'
 import { api } from '@/lib/api'
+import { useStore } from '@/store'
+import { useDataVersion } from '@/hooks/useDataVersion'
 import { useToast } from '@/hooks/use-toast'
 import { confirm } from '@/hooks/use-confirm'
 import { useErrorHandler } from '@/hooks/useErrorHandler'
@@ -80,11 +82,12 @@ import {
 } from 'lucide-react'
 import { CreateMessageDialog } from '@/components/messages/CreateMessageDialog'
 import { ChannelEditorDialog } from '@/components/messages/ChannelEditorDialog'
+import { ImSessionsTab } from '@/components/im/ImSessionsTab'
 import { formatTimestamp } from '@/lib/utils/format'
 import { cn } from '@/lib/utils'
 import { textNano, textMini } from "@/design-system/tokens/typography"
 
-type TabValue = 'messages' | 'channels'
+type TabValue = 'messages' | 'channels' | 'im'
 
 // Get tab from URL path
 const getTabFromPath = (pathname: string): TabValue => {
@@ -92,6 +95,9 @@ const getTabFromPath = (pathname: string): TabValue => {
   const lastSegment = pathSegments[pathSegments.length - 1]
   if (lastSegment === 'channels') {
     return 'channels'
+  }
+  if (lastSegment === 'im') {
+    return 'im'
   }
   return 'messages'
 }
@@ -131,6 +137,7 @@ const getCategoryConfig = (category: string) => {
 
 export default function MessagesPage() {
   const { t } = useTranslation()
+  const openSettings = useStore((s) => s.openSettings)
   const { handleError } = useErrorHandler()
   const navigate = useNavigate()
   const location = useLocation()
@@ -421,6 +428,8 @@ export default function MessagesPage() {
     setActiveTab(tab)
     if (tab === 'channels') {
       navigate('/messages/channels')
+    } else if (tab === 'im') {
+      navigate('/messages/im')
     } else {
       navigate('/messages')
     }
@@ -519,13 +528,15 @@ export default function MessagesPage() {
   }, [selectedSeverities, selectedStatuses, selectedCategories])
 
   // Fetch on mount and when page/filters change
+  const dataVersion = useDataVersion('messages', 'message-channels', 'im-bridges')
   useEffect(() => {
     if (activeTab === 'messages') {
       fetchMessages()
-    } else {
+    } else if (activeTab === 'channels') {
       fetchChannels()
     }
-  }, [activeTab, fetchMessages, fetchChannels])
+    // 'im' tab manages its own data lifecycle via ImSessionsTab
+  }, [activeTab, fetchMessages, fetchChannels, dataVersion])
 
   // Message actions - using messages API endpoints
   const handleAcknowledge = async (id: string) => {
@@ -590,6 +601,7 @@ export default function MessagesPage() {
   const tabs = [
     { value: 'messages' as TabValue, label: t('messages.tabs.messages'), icon: <MessageSquare className="h-4 w-4" /> },
     { value: 'channels' as TabValue, label: t('messages.tabs.channels'), icon: <Network className="h-4 w-4" /> },
+    { value: 'im' as TabValue, label: t('messages.tabs.im', 'IM Sessions'), icon: <Send className="h-4 w-4" /> },
   ]
 
   const actions = [
@@ -599,7 +611,15 @@ export default function MessagesPage() {
     ...(activeTab === 'channels' ? [
       { label: t('messages.channels.create', 'Add Channel'), icon: <Plus className="h-4 w-4" />, onClick: () => { setEditingChannel(null); setChannelEditorOpen(true) } },
     ] : []),
-    { label: t('refresh'), variant: 'outline' as const, onClick: activeTab === 'messages' ? fetchMessages : fetchChannels, disabled: loading },
+    ...(activeTab === 'im' ? [
+      { label: t('messages.im.goToSettings', 'Configure IM bridge'), icon: <Settings className="h-4 w-4" />, onClick: () => openSettings('im') },
+    ] : []),
+    ...(activeTab !== 'im' ? [{
+      label: t('refresh'),
+      variant: 'outline' as const,
+      onClick: activeTab === 'messages' ? fetchMessages : fetchChannels,
+      disabled: loading,
+    }] : []),
   ]
 
   // Filter dropdown for actionsExtra
@@ -964,7 +984,7 @@ export default function MessagesPage() {
                 {
                   key: 'messageType',
                   label: t('messages.type.label'),
-                  width: 'w-[100px]',
+                  width: 'w-[72px]',
                   align: 'center',
                 },
                 {
@@ -1004,10 +1024,10 @@ export default function MessagesPage() {
                   width: 'w-[130px]',
                 },
               ]}
-              data={messages as unknown as Record<string, unknown>[]}
-              rowKey={(msg) => (msg as unknown as NotificationMessage).id}
+              data={messages}
+              rowKey={(msg: NotificationMessage) => msg.id}
               renderCell={(columnKey, rowData) => {
-                const message = rowData as unknown as NotificationMessage
+                const message = rowData
                 const severityConfig = SEVERITY_CONFIG[message.severity] || SEVERITY_CONFIG.info
                 const categoryConfig = getCategoryConfig(message.category)
                 const statusConfig = STATUS_CONFIG[message.status] || STATUS_CONFIG.active
@@ -1084,29 +1104,29 @@ export default function MessagesPage() {
                 }
               }}
               getRowClassName={(rowData) => {
-                const message = rowData as unknown as NotificationMessage
+                const message = rowData
                 return (message.status === 'resolved' || message.status === 'archived') ? 'opacity-60' : ''
               }}
               onRowClick={(rowData) => {
                 // Quick-open detail dialog on row click — same as "View Details"
                 // action in the dropdown, just one tap instead of two.
-                setSelectedMessage(rowData as unknown as NotificationMessage)
+                setSelectedMessage(rowData)
               }}
               actions={[
                 {
                   label: t('messages.viewDetails', 'View Details'),
                   icon: <Eye className="h-4 w-4" />,
                   onClick: (rowData) => {
-                    const message = rowData as unknown as NotificationMessage
+                    const message = rowData
                     setSelectedMessage(message)
                   },
                 },
                 {
                   label: t('messages.acknowledge'),
                   icon: <Eye className="h-4 w-4" />,
-                  show: (rowData) => (rowData as unknown as NotificationMessage).status === 'active',
+                  show: (rowData: NotificationMessage) => rowData.status === 'active',
                   onClick: (rowData) => {
-                    const message = rowData as unknown as NotificationMessage
+                    const message = rowData
                     handleAcknowledge(message.id)
                   },
                 },
@@ -1114,11 +1134,11 @@ export default function MessagesPage() {
                   label: t('messages.resolve'),
                   icon: <Eye className="h-4 w-4" />,
                   show: (rowData) => {
-                    const status = (rowData as unknown as NotificationMessage).status
+                    const status = rowData.status
                     return status !== 'resolved' && status !== 'archived'
                   },
                   onClick: (rowData) => {
-                    const message = rowData as unknown as NotificationMessage
+                    const message = rowData
                     handleResolve(message.id)
                   },
                 },
@@ -1127,7 +1147,7 @@ export default function MessagesPage() {
                   icon: <Trash2 className="h-4 w-4" />,
                   variant: 'destructive',
                   onClick: (rowData) => {
-                    const message = rowData as unknown as NotificationMessage
+                    const message = rowData
                     handleDelete(message.id)
                   },
                 },
@@ -1320,10 +1340,11 @@ export default function MessagesPage() {
                 align: 'center',
               },
             ]}
-            data={channels as unknown as Record<string, unknown>[]}
-            rowKey={(ch) => (ch as unknown as MessageChannel).name}
+            data={channels}
+            rowKey={(ch: MessageChannel) => ch.name}
+            onRowClick={(row: MessageChannel) => handleViewChannel(row.name)}
             renderCell={(columnKey, rowData) => {
-              const channel = rowData as unknown as MessageChannel
+              const channel = rowData
               const config: Record<string, { icon: typeof Bell; color: string }> = {
                 console: { icon: Bell, color: 'bg-muted text-muted-foreground' },
                 memory: { icon: RefreshCw, color: 'bg-info-light text-info' },
@@ -1404,7 +1425,7 @@ export default function MessagesPage() {
                 label: t('view'),
                 icon: <Eye className="h-4 w-4" />,
                 onClick: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   handleViewChannel(channel.name)
                 },
               },
@@ -1412,11 +1433,11 @@ export default function MessagesPage() {
                 label: t('edit', 'Edit'),
                 icon: <Settings className="h-4 w-4" />,
                 show: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   return ['webhook', 'email', 'telegram', 'wecom', 'dingtalk', 'slack', 'feishu'].includes(channel.channel_type)
                 },
                 onClick: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   handleEditChannel(channel)
                 },
               },
@@ -1424,11 +1445,11 @@ export default function MessagesPage() {
                 label: t('messages.channels.configureFilter', 'Configure Filter'),
                 icon: <FilterIcon className="h-4 w-4" />,
                 show: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   return channel.channel_type !== 'console' && channel.channel_type !== 'memory'
                 },
                 onClick: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   handleOpenFilterDialog(channel)
                 },
               },
@@ -1436,11 +1457,11 @@ export default function MessagesPage() {
                 label: t('messages.channels.manageRecipients', 'Manage Recipients'),
                 icon: <UserPlus className="h-4 w-4" />,
                 show: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   return channel.channel_type === 'email'
                 },
                 onClick: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   handleManageRecipients(channel)
                 },
               },
@@ -1448,11 +1469,11 @@ export default function MessagesPage() {
                 label: t('enable'),
                 icon: <CheckCircle2 className="h-4 w-4" />,
                 show: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   return !channel.enabled && channel.channel_type !== 'console' && channel.channel_type !== 'memory'
                 },
                 onClick: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   handleToggleEnabled(channel.name, true)
                 },
               },
@@ -1460,11 +1481,11 @@ export default function MessagesPage() {
                 label: t('disable'),
                 icon: <X className="h-4 w-4" />,
                 show: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   return channel.enabled && channel.channel_type !== 'console' && channel.channel_type !== 'memory'
                 },
                 onClick: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   handleToggleEnabled(channel.name, false)
                 },
               },
@@ -1473,11 +1494,11 @@ export default function MessagesPage() {
                 icon: <Trash2 className="h-4 w-4" />,
                 variant: 'destructive',
                 show: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   return channel.channel_type !== 'console' && channel.channel_type !== 'memory'
                 },
                 onClick: (rowData) => {
-                  const channel = rowData as unknown as MessageChannel
+                  const channel = rowData
                   handleDeleteChannel(channel.name)
                 },
               },
@@ -1494,6 +1515,11 @@ export default function MessagesPage() {
             }
           />
           )}
+        </PageTabsContent>
+
+        {/* IM Sessions Tab */}
+        <PageTabsContent value="im" activeTab={activeTab}>
+          <ImSessionsTab />
         </PageTabsContent>
       </PageLayout>
 

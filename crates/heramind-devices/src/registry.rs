@@ -150,7 +150,9 @@ fn convert_parameter_group_from_storage(
 #[serde(rename_all = "lowercase")]
 pub enum DeviceTypeMode {
     #[default]
+    #[serde(alias = "Simple")]
     Simple,
+    #[serde(alias = "Full")]
     Full,
 }
 
@@ -405,6 +407,8 @@ pub struct DeviceRegistry {
     devices: DashMap<String, DeviceConfig>,
     /// Index: device_type -> set of device_ids
     type_index: DashMap<String, Vec<String>>,
+    /// Reverse index: telemetry_topic → device_id (O(1) lookup for MQTT routing).
+    topic_index: DashMap<String, String>,
     /// Optional persistent storage backend
     storage: Option<Arc<DeviceRegistryStore>>,
     /// Whether to auto-save after modifications
@@ -424,6 +428,7 @@ impl DeviceRegistry {
             templates: DashMap::new(),
             devices: DashMap::new(),
             type_index: DashMap::new(),
+            topic_index: DashMap::new(),
             storage: None,
             auto_save: AtomicBool::new(false),
         }
@@ -464,6 +469,7 @@ impl DeviceRegistry {
             templates: DashMap::new(),
             devices: DashMap::new(),
             type_index: DashMap::new(),
+            topic_index: DashMap::new(),
             storage: Some(store),
             auto_save: AtomicBool::new(true),
         };
@@ -475,6 +481,22 @@ impl DeviceRegistry {
     }
 
     /// Load all data from storage into memory
+    /// Seed built-in device type templates (NE101, NE301, ...) via this
+    /// registry's OWN storage handle — the same store the in-memory cache
+    /// reads from. Seeding through a separately-opened `DeviceRegistryStore`
+    /// races with the registry's reload: the seed writes one handle, the
+    /// reload reads another, and the write may not be visible to the read on
+    /// the same boot (seen as intermittent "template not found"). Going
+    /// through `self.storage` keeps seed + reload on the same handle.
+    pub async fn seed_builtin_templates(&self) -> Result<usize, DeviceError> {
+        let Some(store) = &self.storage else {
+            return Err(DeviceError::Storage("No storage configured".to_string()));
+        };
+        store
+            .seed_builtin_templates()
+            .map_err(|e| DeviceError::Storage(format!("seed_builtin_templates failed: {}", e)))
+    }
+
     pub async fn load_from_storage(&self) -> Result<(), DeviceError> {
         let Some(store) = &self.storage else {
             return Err(DeviceError::Storage("No storage configured".to_string()));
@@ -997,7 +1019,14 @@ impl DeviceRegistry {
                             last_seen: updated.last_seen,
                             offline_timeout_secs: updated.offline_timeout_secs,
                         };
-                        let _ = storage.save_device(&sc);
+                        if let Err(e) = storage.save_device(&sc) {
+                            tracing::error!(
+                                device_id = %device_id,
+                                error = %e,
+                                "Failed to persist device re-registration — \
+                                 in-memory updated but change will be lost on restart"
+                            );
+                        }
                     }
                 }
             }
@@ -1053,14 +1082,28 @@ impl DeviceRegistry {
     /// Update only the `last_seen` field for a device.
     /// Lightweight alternative to `update_device` — no template validation or type index updates.
     pub async fn update_last_seen(&self, device_id: &str, last_seen: i64) {
-        // Update in-memory
-        if let Some(mut config) = self.devices.get_mut(device_id) {
-            config.last_seen = last_seen;
-        } else {
+        // [ingest hot path] This fires on EVERY DeviceMetric event — one
+        // redb write txn per metric per report (10-metric device at 1 Hz =
+        // 10 txns/s, each a read-modify-write of the whole DeviceConfig).
+        // Debounce the PERSIST side to ≥15s per device (in line with
+        // heartbeat granularity — is_connected_within works from the
+        // in-memory value, which still updates every event, so status
+        // semantics are unchanged; restart survival loses at most ~15s of
+        // last_seen precision, far inside any offline_timeout floor of 30s).
+        let should_persist = {
+            let mut entry = match self.devices.get_mut(device_id) {
+                Some(c) => c,
+                None => return,
+            };
+            let prev = entry.last_seen;
+            entry.last_seen = last_seen;
+            // First sighting (prev == 0), clock regression, or ≥15s advance.
+            prev == 0 || last_seen - prev >= 15
+        };
+
+        if !should_persist {
             return;
         }
-
-        // Persist to storage
         if let Some(store) = &self.storage {
             if let Err(e) = store.update_last_seen(device_id, last_seen) {
                 tracing::warn!("Failed to persist last_seen for {}: {}", device_id, e);
@@ -1076,9 +1119,33 @@ impl DeviceRegistry {
     /// Find a device by its telemetry topic
     /// This is used by MQTT adapters to route messages from custom topics
     pub fn find_device_by_telemetry_topic(&self, topic: &str) -> Option<(String, DeviceConfig)> {
+        // Fast path: reverse index (O(1))
+        if let Some(device_id) = self.topic_index.get(topic) {
+            let device_id_owned = device_id.value().clone();
+            drop(device_id); // release the DashMap read guard before any write
+            if let Some(config) = self.devices.get(&device_id_owned) {
+                // Verify the device's CURRENT telemetry_topic still matches. The
+                // index is NOT invalidated when update_device changes a device's
+                // telemetry_topic, so without this check a stale entry would
+                // route messages for an old topic to a device that no longer
+                // subscribes to it (silent data corruption + bogus rule fires).
+                if config.connection_config.telemetry_topic.as_deref() == Some(topic) {
+                    return Some((device_id_owned, config.clone()));
+                }
+                drop(config);
+            }
+            // Stale entry — device gone, or its topic changed. Clean up and fall
+            // through to the scan, which returns None (no device owns this topic
+            // anymore) or repairs the index for the new owner if one exists.
+            self.topic_index.remove(topic);
+        }
+        // Fallback: linear scan (auto-repairs the index on hit)
         for entry in self.devices.iter() {
             if let Some(ref telemetry_topic) = entry.value().connection_config.telemetry_topic {
                 if telemetry_topic == topic {
+                    // Repair the index for future lookups
+                    self.topic_index
+                        .insert(topic.to_string(), entry.key().clone());
                     return Some((entry.key().clone(), entry.value().clone()));
                 }
             }
@@ -1102,15 +1169,22 @@ impl DeviceRegistry {
 
     /// Unregister a device configuration
     pub fn unregister_device(&self, device_id: &str) -> Result<(), DeviceError> {
-        // Get device to find its type
-        let device_type = self
+        // Get device to find its type + telemetry_topic (for index cleanup)
+        let device = self
             .devices
             .get(device_id)
-            .map(|d| d.device_type.clone())
             .ok_or_else(|| DeviceError::NotFoundStr(device_id.to_string()))?;
+        let device_type = device.device_type.clone();
+        let telemetry_topic = device.connection_config.telemetry_topic.clone();
+        drop(device);
 
         // Remove device
         self.devices.remove(device_id);
+
+        // Clean up topic index
+        if let Some(topic) = telemetry_topic {
+            self.topic_index.remove(&topic);
+        }
 
         // Update type index
         if let Some(mut type_entry) = self.type_index.get_mut(&device_type) {

@@ -25,7 +25,7 @@ const DialogOverlay = React.forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      "fixed inset-0 bg-overlay-heavy data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+      "fixed inset-0 bg-overlay-heavy duration-normal ease-out data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
       "z-50",
       className
     )}
@@ -60,6 +60,14 @@ const DialogContent = React.forwardRef<
     return false
   })
 
+  // Extract z-index from className for nested dialog support — must happen for
+  // BOTH branches: a dialog nested above a z-[100] fullscreen layer passes
+  // className="z-[110]", and the overlay has to lift with the content or it
+  // renders under the fullscreen layer (content visible, scrim gone,
+  // outside-click dismissal broken).
+  const zIndexMatch = className?.match(/z-\[?(\d+)\]?/)
+  const overlayClassName = zIndexMatch ? `z-[${zIndexMatch[1]}]` : undefined
+
   // Mobile: full screen
   if (isMobile && fullScreenOnMobile) {
     return (
@@ -68,7 +76,8 @@ const DialogContent = React.forwardRef<
           className={cn(
             "fixed inset-0 z-50 bg-overlay-heavy",
             "data-[state=open]:animate-in data-[state=closed]:animate-out",
-            "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
+            "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+            overlayClassName
           )}
         />
         <DialogPrimitive.Content
@@ -103,17 +112,13 @@ const DialogContent = React.forwardRef<
   }
 
   // Desktop: centered dialog
-  // Extract z-index from className for nested dialog support
-  const zIndexMatch = className?.match(/z-\[?(\d+)\]?/)
-  const overlayClassName = zIndexMatch ? `z-[${zIndexMatch[1]}]` : undefined
-
   return (
     <DialogPortal>
       <DialogOverlay className={overlayClassName} />
       <DialogPrimitive.Content
         ref={ref}
         className={cn(
-          "fixed left-[50%] top-[50%] w-full max-w-lg -translate-x-1/2 -translate-y-1/2 border bg-popover shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] rounded-lg sm:rounded-xl",
+          "fixed left-[50%] top-[50%] w-full max-w-lg -translate-x-1/2 -translate-y-1/2 border bg-popover shadow-lg duration-normal ease-spring-soft data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] rounded-lg sm:rounded-xl",
           "z-50",
           "m-0 p-4 sm:p-6",
           !className?.includes("max-h-") && "max-h-[calc(100dvh-2rem)] sm:max-h-[85dvh]",
@@ -192,7 +197,7 @@ const DialogFooter = ({
       className={cn(
         "flex flex-row justify-end gap-2 sm:gap-3",
         "mt-4 sm:mt-0",
-        isMobile && "px-4 py-3 border-t shrink-0 bg-popover sticky bottom-0",
+        isMobile && "px-4 py-3 border-t shrink-0 bg-popover sticky bottom-0 z-10",
         className
       )}
       {...props}

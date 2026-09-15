@@ -181,6 +181,7 @@ function MessageBubble({ message, onDelete }: MessageBubbleProps) {
     <Card className="p-3 relative group">
       <button
         onClick={onDelete}
+        aria-label={t('common:delete')}
         className={cn(
           "absolute top-2 right-2 opacity-0 group-hover:opacity-100",
           "transition-opacity p-1 rounded hover:bg-muted",
@@ -193,7 +194,7 @@ function MessageBubble({ message, onDelete }: MessageBubbleProps) {
 
       <div className="pr-6">
         <div className="flex items-center gap-2 mb-1.5">
-          <MessageSquare className="h-4 w-4 text-info" />
+          <MessageSquare className="h-4 w-4 text-muted-foreground" />
           <span className="text-xs text-muted-foreground flex items-center gap-1">
             <Clock className="h-4 w-4" />
             {formatTimestamp(message.timestamp, false)}

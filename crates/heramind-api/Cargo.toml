@@ -3,9 +3,21 @@ name = "heramind-api"
 version.workspace = true
 edition.workspace = true
 
+# OpenAPI schema generation (utoipa) — first batch covers auth + devices +
+# telemetry, the domains third parties integrate against. The spec is served
+# at /api/docs/openapi.json and rendered by the Scalar console at /api/docs.
+[dependencies.utoipa]
+version = "4"
+features = ["axum_extras", "chrono", "uuid"]
+
 [dev-dependencies]
+regex = { workspace = true }
 # Enable testing feature when running tests
 heramind-api = { path = ".", features = ["testing"] }
+# Cross-crate auth-format check: heramind-cli-ops' offline reset must read/write
+# the same users.redb bincode format (it duplicates our User struct).
+heramind-cli-ops = { path = "../heramind-cli-ops" }
+tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = ["embedded-broker", "webhook", "email", "telegram", "wecom", "dingtalk", "slack", "feishu"]
@@ -21,6 +33,7 @@ static = ["rust-embed", "mime_guess"]
 testing = []  # Enable test-only APIs for parallel test execution
 
 [dependencies]
+socket2 = "0.5"
 heramind-core = { path = "../heramind-core" }
 heramind-extension-sdk = { path = "../heramind-extension-sdk" }
 heramind-agent = { path = "../heramind-agent", features = ["cloud", "llamacpp"] }
@@ -55,6 +68,8 @@ reqwest = { workspace = true }
 # auto-select a CryptoProvider — enable ring here so we can install it at startup
 # (server/mod.rs start_server). ring is portable (alpine/musl + cross-compile).
 rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 
 # Web framework
 axum = { workspace = true, features = ["ws", "multipart", "macros"] }
@@ -101,6 +116,8 @@ cron = "0.12"
 
 # ZIP archive support
 zip = "2"
+tar = "0.4"
+flate2 = "1"
 
 # Image processing (decode headers for dimensions)
 image = { workspace = true }

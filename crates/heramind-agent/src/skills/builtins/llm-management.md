@@ -1,6 +1,7 @@
 ---
 id: llm-management
 name: LLM Backend Management
+description: Use when the user wants to manage LLM backends — adding/removing/activating model backends (Ollama/OpenAI/Qwen/DeepSeek), testing connections, switching default model, multimodal/vision models, API keys. Covers llm create/list/activate/test even without saying 'LLM' (e.g. '换个大模型', '配置一下模型'). Includes 大模型/模型后端/切换模型.
 category: llm
 origin: builtin
 priority: 80
@@ -16,6 +17,21 @@ anti_triggers:
 
 # LLM Backend Management
 
+## Command Cheat-Sheet (run these via `shell`)
+
+Always RUN the command yourself and report the real output.
+
+| Command | Purpose |
+|---|---|
+| `heramind llm list` | List configured LLM backends |
+| `heramind llm get <id>` | LLM backend details |
+| `heramind llm models` | List available models (from Ollama) |
+| `heramind llm create` | Create a new LLM backend |
+| `heramind llm update <id>` | Update LLM backend configuration |
+| `heramind llm delete <id>` | Delete an LLM backend |
+| `heramind llm activate <id>` | Activate a backend (set as default) |
+| `heramind llm test <id>` | Test LLM backend connection |
+
 LLM backends are the model providers that power all agents. Each agent is bound to one backend (via `--llm-backend <ID>`, or the system default if unset). Backends are **multi-instance** — you can register several and switch between them.
 
 ## CRITICAL: Create → Test → Activate Workflow
@@ -30,7 +46,7 @@ heramind llm models --endpoint http://gpu-host:11434   # remote Ollama
 
 # Step 3: Create the backend
 heramind llm create --name local-qwen --type ollama \
-  --endpoint http://localhost:11434 --model qwen3:8b
+  --endpoint http://localhost:11434 --model qwen3.5:4b
 
 # Step 4: VERIFY connectivity before relying on it
 heramind llm test <ID>            # returns latency + sample response
@@ -46,13 +62,16 @@ heramind llm activate <ID>
 | `--type` | Endpoint | Auth | When to Use |
 |----------|----------|------|-------------|
 | `ollama` | `http://host:11434` | None (local) | Local/private deployment, GPU host, air-gapped environments |
-| `openai` | `https://api.openai.com/v1` (or compatible) | `--api-key` (required) | Cloud GPT models, DashScope, DeepSeek, any OpenAI-compatible API |
-| `custom` | Any URL | `--api-key` (optional) | Self-hosted vLLM, LM Studio, OpenRouter, etc. |
+| `llamacpp` | `http://host:8080` (NO `/v1` — client appends its own path) | None (local) | llama.cpp / llama-server, bundled model servers |
+| `openai` | `https://api.openai.com/v1` **with `/v1`** — or ANY OpenAI-compatible endpoint: DashScope, DeepSeek, GLM, xAI, vLLM, OpenRouter, LM Studio... | `--api-key` (required) | ALL cloud providers except the Anthropic protocol |
+| `anthropic` | `https://api.anthropic.com` (`/v1` auto-appended when missing) | `--api-key` (required) | Claude models / Anthropic-compatible endpoints (e.g. GLM's `/api/anthropic`) |
 
-### OpenAI-Compatible Cloud Examples
+> **Two cloud protocols only** (same as the Settings → Cloud AI card). Vendor-specific request params are applied automatically by sniffing the endpoint — e.g. DashScope gets `enable_thinking`, DeepSeek gets its thinking toggle — so Qwen/DeepSeek/GLM backends are created with `--type openai` + the vendor endpoint. Legacy vendor type values (`qwen` `deepseek` `glm` `xai` `google` `minimax`) still parse for back-compat with older backends; don't use them for new ones.
+
+### Cloud Examples
 
 ```bash
-# DashScope (Alibaba Qwen)
+# DashScope (Alibaba Qwen) — openai protocol + vendor endpoint
 heramind llm create --name qwen-plus --type openai \
   --endpoint https://dashscope.aliyuncs.com/compatible-mode/v1 \
   --model qwen-plus --api-key sk-xxx
@@ -62,10 +81,20 @@ heramind llm create --name deepseek --type openai \
   --endpoint https://api.deepseek.com/v1 \
   --model deepseek-chat --api-key sk-xxx
 
-# OpenAI GPT-4o
-heramind llm create --name gpt4o --type openai \
+# OpenAI
+heramind llm create --name gpt41 --type openai \
   --endpoint https://api.openai.com/v1 \
-  --model gpt-4o --api-key sk-xxx
+  --model gpt-4.1-mini --api-key sk-xxx
+
+# Anthropic (/v1 optional — auto-appended)
+heramind llm create --name claude --type anthropic \
+  --endpoint https://api.anthropic.com \
+  --model claude-sonnet-4-5 --api-key sk-xxx
+
+# Any other OpenAI-compatible endpoint (vLLM / OpenRouter / LM Studio)
+heramind llm create --name my-vllm --type openai \
+  --endpoint http://gpu-host:8000/v1 \
+  --model my-model --api-key xxx
 ```
 
 ## Multimodal (Vision) Capability
@@ -128,7 +157,7 @@ Find the backend ID with `heramind llm list` before creating the agent.
 
 ```bash
 # 1. Create the new backend
-heramind llm create --name qwen-new --type ollama --endpoint http://localhost:11434 --model qwen3:32b
+heramind llm create --name qwen-new --type ollama --endpoint http://localhost:11434 --model qwen3.5:8b
 # 2. Test it
 heramind llm test <NEW_ID>
 # 3. Activate as default (optional — or migrate agents individually)
@@ -171,7 +200,7 @@ If a thinking model causes gateway timeouts on long responses, consider:
 | `llm test` returns model not found | Model name typo or not pulled | Ollama: `ollama pull <model>`. Cloud: verify model name in provider docs |
 | Agent fails with "multimodal not supported" | Bound backend is text-only | Check `llm list` capabilities, switch agent to a vision backend |
 | Image input causes API 400 `unknown variant image_url` | Backend reports multimodal but model is text-only | Set user override: `PATCH .../capabilities {"multimodal": false}` |
-| `llm create` says invalid type | Wrong `--type` value | Must be `ollama`, `openai`, or `custom` |
+| `llm create` says invalid type | Wrong `--type` value | Use `ollama` \| `llamacpp` \| `openai` \| `anthropic` (legacy vendor values still accepted; there is no `custom` — any compatible endpoint uses `openai`) |
 | Agent execution hangs / times out on thinking model | Long thinking chains on cloud backend | Reduce `max_rounds`, switch model, or set `thinking_enabled: false` via backend config |
 | No backend is auto-used by new agents | No active default | Run `heramind llm activate <ID>` |
 

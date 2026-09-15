@@ -14,6 +14,7 @@
  * Using unified FullScreenDialog components with glassmorphism style.
  */
 
+import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/components/ui/collapsible'
 import { getPortalRoot } from '@/lib/portal'
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { useTranslation } from "react-i18next"
@@ -340,6 +341,8 @@ export function AgentEditorFullScreen({
   const [priority, setPriority] = useState(5)
   const [contextWindowSize, setContextWindowSize] = useState(10)
   const [maxChainDepth, setMaxChainDepth] = useState(5)
+  // Advanced knobs collapsed by default — defaults suit most agents
+  const [advancedOpen, setAdvancedOpen] = useState(false)
 
   // LLM validation state
   const [llmValidating, setLlmValidating] = useState(false)
@@ -540,9 +543,12 @@ export function AgentEditorFullScreen({
 
   const parseSchedule = (schedule: AgentSchedule) => {
     if (!schedule) return
-    if (schedule.schedule_type === 'interval') {
+    if (schedule.schedule_type === 'manual') {
+      // First-class manual-only form (repeatable via invoke)
+      setScheduleType('on-demand')
+    } else if (schedule.schedule_type === 'interval') {
       if (schedule.interval_seconds === 0) {
-        // interval_seconds=0 means on-demand (no auto-trigger)
+        // Legacy encoding of on-demand (pre-Once rows) — still readable
         setScheduleType('on-demand')
       } else {
         setScheduleType('timer')
@@ -1086,7 +1092,7 @@ export function AgentEditorFullScreen({
     try {
       let cronExpression: string | undefined = undefined
       let intervalSeconds: number | undefined = undefined
-      let finalScheduleType: 'interval' | 'cron' | 'event' = 'interval'
+      let finalScheduleType: 'interval' | 'cron' | 'event' | 'manual' = 'interval'
       let eventFilter: string | undefined = undefined
 
       if (scheduleType === 'timer') {
@@ -1111,8 +1117,8 @@ export function AgentEditorFullScreen({
         }
         eventFilter = JSON.stringify(eventFilterObj)
       } else { // on-demand
-        finalScheduleType = 'interval'
-        intervalSeconds = 0  // 0 = no auto-scheduling
+        finalScheduleType = 'manual'
+        intervalSeconds = undefined  // Manual needs no interval — never auto-scheduled
       }
 
       // Build resources array in the new format that supports both devices and extensions
@@ -1293,6 +1299,7 @@ export function AgentEditorFullScreen({
   // ========================================================================
 
   return (
+    <>
     <FullScreenDialog
       open={open}
       onOpenChange={onOpenChange}
@@ -1324,10 +1331,10 @@ export function AgentEditorFullScreen({
                   type="button"
                   onClick={() => setExecutionMode('focused')}
                   className={cn(
-                    "relative flex flex-col items-start gap-1.5 rounded-lg border-2 p-3 text-left transition-all",
+                    "relative flex flex-col items-start gap-1.5 rounded-lg border p-3 text-left transition-colors",
                     isFocusedMode
-                      ? "border-primary bg-muted shadow-sm"
-                      : "border-border hover:border-border"
+                      ? "border-primary bg-muted"
+                      : "border-muted hover:border-border"
                   )}
                 >
                   <div className="flex items-center gap-2 w-full">
@@ -1350,10 +1357,10 @@ export function AgentEditorFullScreen({
                   type="button"
                   onClick={() => { setExecutionMode('free'); setSelectedResources([]) }}
                   className={cn(
-                    "relative flex flex-col items-start gap-1.5 rounded-lg border-2 p-3 text-left transition-all",
+                    "relative flex flex-col items-start gap-1.5 rounded-lg border p-3 text-left transition-colors",
                     isFreeMode
-                      ? "border-primary bg-muted shadow-sm"
-                      : "border-border hover:border-border"
+                      ? "border-primary bg-muted"
+                      : "border-muted hover:border-border"
                   )}
                 >
                   <div className="flex items-center gap-2 w-full">
@@ -1448,7 +1455,7 @@ export function AgentEditorFullScreen({
               )}
 
               {/* AI Helper Tip */}
-              <div className="flex items-start gap-2 p-3 bg-muted rounded-lg border border-border">
+              <div className="flex items-start gap-2 p-3 rounded-lg border border-border">
                 <Wand2 className="h-4 w-4 text-primary shrink-0 mt-0.5" />
                 <p className="text-xs text-muted-foreground">
                   <span className="font-medium text-primary">Tip:</span> {tAgent('creator.basicInfo.promptTip')}
@@ -1542,6 +1549,20 @@ export function AgentEditorFullScreen({
               )}
             </div>
 
+            {/* Advanced knobs — rarely changed; collapsed so the required
+                fields (mode / name / requirements) keep the visual focus. */}
+            <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+              <CollapsibleTrigger className="w-full flex items-center justify-between py-1 text-left">
+                <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                  {tAgent('creator.advanced.title', 'Advanced Configuration')}
+                </span>
+                <ChevronRight className={cn(
+                  "h-4 w-4 text-muted-foreground transition-transform",
+                  advancedOpen && "rotate-90"
+                )} />
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <div className="pt-3 space-y-6">
             {/* Agent Priority */}
             <div className="space-y-2">
               <div className="flex items-center justify-between">
@@ -1594,6 +1615,9 @@ export function AgentEditorFullScreen({
                 {tAgent('creator.advanced.contextHint', 'Number of recent conversation turns to include as context')}
               </p>
             </div>
+                </div>
+              </CollapsibleContent>
+            </Collapsible>
 
             {/* Execution Schedule */}
             <div className="space-y-3">
@@ -1644,7 +1668,7 @@ export function AgentEditorFullScreen({
               </div>
 
               {/* Schedule Configuration */}
-              <div className={cn("border rounded-lg", isMobile ? "p-4" : "p-4 bg-muted-50")}>
+              <div className={cn("border rounded-lg p-4")}>
                 {scheduleType === 'timer' && (
                   <div className="space-y-3">
                     {/* Timer sub-type tabs */}
@@ -1980,7 +2004,7 @@ export function AgentEditorFullScreen({
                                   hasTrigger && "border-l-2 border-primary",
                                   !hasTrigger && "border-l-2 border-transparent",
                                   isViewing && hasTrigger && "bg-muted",
-                                  isViewing && !hasTrigger && "bg-muted-50",
+                                  isViewing && !hasTrigger && "bg-muted-30",
                                   "hover:bg-muted"
                                 )}
                               >
@@ -2148,7 +2172,7 @@ export function AgentEditorFullScreen({
 
               if (isProminent) {
                 return (
-                  <div className="space-y-3 bg-muted rounded-lg p-3 -mx-3 border border-border">
+                  <div className="space-y-3 rounded-lg p-3 -mx-3 border border-border">
                     <div className={cn(
                       "flex items-center justify-between",
                       isMobile ? "flex-col items-start gap-3" : ""
@@ -2174,7 +2198,7 @@ export function AgentEditorFullScreen({
                     </div>
                     <p className="text-xs text-muted-foreground">{sectionHint}</p>
                     {selectedResources.length === 0 ? (
-                      <div className="flex flex-col items-center justify-center py-6 border rounded-lg bg-background">
+                      <div className="flex flex-col items-center justify-center py-6 border rounded-lg">
                         <Target className="h-6 w-6 text-muted-foreground mb-2" />
                         <p className="text-xs text-muted-foreground">
                           {tAgent('creator.resources.dialog.noResourcesHint')}
@@ -2205,11 +2229,11 @@ export function AgentEditorFullScreen({
 
               // Collapsed style (Reactive / Free / On-demand)
               return (
-                <div className="rounded-lg -mx-3 border bg-muted-30 overflow-hidden">
+                <div className="rounded-lg -mx-3 border overflow-hidden">
                   <button
                     type="button"
                     onClick={() => setFreeModeResourcesExpanded(!freeModeResourcesExpanded)}
-                    className="w-full flex items-center justify-between p-3 text-left hover:bg-muted-50 transition-colors"
+                    className="w-full flex items-center justify-between p-3 text-left hover:bg-muted-30 transition-colors"
                   >
                     <div className="flex items-center gap-2">
                       <ChevronRight className={cn("h-4 w-4 transition-transform", freeModeResourcesExpanded && "rotate-90")} />
@@ -2232,7 +2256,7 @@ export function AgentEditorFullScreen({
                     <div className="px-3 pb-3 pt-0 space-y-2 border-t">
                       <p className="text-xs text-muted-foreground pt-2">{sectionHint}</p>
                       {selectedResources.length === 0 ? (
-                        <div className="flex flex-col items-center justify-center py-4 border rounded-lg bg-background">
+                        <div className="flex flex-col items-center justify-center py-4 border rounded-lg">
                           <Target className="h-6 w-6 text-muted-foreground mb-1" />
                           <p className="text-xs text-muted-foreground">
                             {tAgent('creator.resources.dialog.noResourcesHint')}
@@ -2303,7 +2327,9 @@ export function AgentEditorFullScreen({
         )}
       </FullScreenDialogFooter>
 
-      {/* Resource Selection Dialog */}
+    </FullScreenDialog>
+
+      {/* Resource Selection Dialog — sibling of FullScreenDialog to avoid Radix focus conflict (double-click issue) */}
       <ResourceSelectionDialog
         open={resourceDialogOpen}
         onOpenChange={setResourceDialogOpen}
@@ -2318,7 +2344,7 @@ export function AgentEditorFullScreen({
         toggleRecommendation={toggleRecommendation}
         scheduleType={scheduleType}
       />
-    </FullScreenDialog>
+    </>
   )
 }
 
@@ -2369,7 +2395,7 @@ function ResourceSelectionDialog({
     return createPortal(
       <div
         className={cn(
-          "fixed inset-0 z-[110] bg-background flex flex-col",
+          "fixed inset-0 z-[100] bg-background flex flex-col",
           !open && "hidden"
         )}
         style={{
@@ -2560,7 +2586,7 @@ function ResourceSelectionDialog({
           {/* Dual-pane layout */}
           <div className="flex-1 flex gap-4 min-h-0 p-4 overflow-hidden">
             {/* Available Resources */}
-            <div className="flex-1 flex flex-col bg-muted-30 rounded-lg overflow-hidden">
+            <div className="flex-1 flex flex-col rounded-lg overflow-hidden">
               <div className="p-3 border-b bg-bg-50">
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-sm font-medium">{tAgent('creator.resources.dialog.available')}</span>
@@ -2599,7 +2625,7 @@ function ResourceSelectionDialog({
             </div>
 
             {/* Selected Resources */}
-            <div className="flex-1 flex flex-col bg-background rounded-lg overflow-hidden border">
+            <div className="flex-1 flex flex-col rounded-lg overflow-hidden border">
               <div className="p-3 border-b">
                 <div className="flex items-center justify-between">
                   <span className="text-sm font-medium">{tAgent('creator.resources.dialog.selected')}</span>
@@ -2699,14 +2725,14 @@ function ScheduleCard({ icon, label, description, active, onClick, isMobile = fa
       type="button"
       onClick={onClick}
       className={cn(
-        "flex flex-col items-center rounded-lg border-2 transition-all",
+        "flex flex-col items-center rounded-lg border transition-colors",
         isMobile ? "gap-3 p-4" : "gap-2 p-3",
         active
           ? "border-primary bg-muted"
-          : "border-transparent hover:border-border hover:bg-muted-30"
+          : "border-transparent hover:border-border"
       )}
     >
-      <div className={cn("rounded-lg", active ? "bg-muted" : "bg-muted-50", isMobile ? "p-2" : "p-1.5")}>
+      <div className={cn("rounded-lg", active ? "bg-muted" : "", isMobile ? "p-2" : "p-1.5")}>
         {icon}
       </div>
       <div className="text-center">
@@ -2730,7 +2756,7 @@ function RecommendationCard({ recommendation, selected, onClick }: Recommendatio
       onClick={onClick}
       className={cn(
         "flex items-center gap-2 px-3 py-2 rounded-lg border text-left whitespace-nowrap transition-colors min-w-0",
-        selected ? "border-primary bg-muted" : "border-border hover:bg-muted-50"
+        selected ? "border-primary bg-muted" : "border-border hover:bg-muted-30"
       )}
     >
       <div className={cn(
@@ -2823,7 +2849,7 @@ function SelectedResourceItem({ resource, setSelectedResources, onRemove, onTogg
   const hasCommands = resource.allCommands.length > 0
 
   return (
-    <div className={cn("rounded-lg bg-background border group", isMobile ? "px-4 py-3" : "px-3 py-2")}>
+    <div className={cn("rounded-lg border group", isMobile ? "px-4 py-3" : "px-3 py-2")}>
       {/* Header */}
       <div className="flex items-center justify-between">
         <button
@@ -2921,7 +2947,7 @@ function SelectedResourceItem({ resource, setSelectedResources, onRemove, onTogg
                           : "px-1.5 py-0.5 text-xs",
                         resource.selectedMetrics.has(metric.name)
                           ? "bg-muted text-primary"
-                          : "hover:bg-muted-50"
+                          : "hover:bg-muted-30"
                       )}
                     >
                       <div
@@ -2990,7 +3016,7 @@ function SelectedResourceItem({ resource, setSelectedResources, onRemove, onTogg
                         : "px-1.5 py-0.5 text-xs",
                       resource.selectedCommands.has(command.name)
                         ? "bg-muted text-primary"
-                        : "hover:bg-muted-50"
+                        : "hover:bg-muted-30"
                     )}
                     onClick={() => onToggleCommand(resource.id, command.name)}
                   >

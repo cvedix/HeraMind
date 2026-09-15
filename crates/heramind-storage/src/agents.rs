@@ -77,7 +77,12 @@ pub struct AiAgent {
     /// How many recent turns to include in LLM context
     #[serde(default = "default_context_window")]
     pub context_window_size: usize,
-    /// Enable tool chaining - allows tool outputs to be used as inputs for subsequent tools
+    /// DEPRECATED (dead field, 2026-08-26): written nowhere meaningful — the
+    /// executor unconditionally uses tool-calling when the LLM supports it
+    /// (`should_use_tools` ignores this flag), and it is absent from the API
+    /// DTOs and UI. Kept ONLY for bincode compatibility with rows already in
+    /// `agents.redb` (removing a mid-struct field desyncs every stored agent);
+    /// physically remove alongside the next storage migration. Always false.
     #[serde(default)]
     pub enable_tool_chaining: bool,
     /// Maximum chain depth (prevents infinite loops)
@@ -103,13 +108,21 @@ pub struct AiAgent {
 }
 
 /// Tool configuration for AI Agent function calling mode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct AgentToolConfig {
-    /// Whether tool mode is enabled
+    /// Whether tool mode is enabled (default true). When false, the agent gets
+    /// NO tools (forced to text-only responses).
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Allowed tool names (empty = all available tools)
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+}
+
+/// Serde default helper: `true`. Used by `AgentToolConfig::enabled` so clients
+/// can omit it (tools on by default) instead of getting a 400 "missing field".
+fn default_true() -> bool {
+    true
 }
 
 /// Default value for context window size.
@@ -208,6 +221,13 @@ pub enum ScheduleType {
     Cron,
     /// Fixed interval
     Interval,
+    /// Manual-only task: never auto-scheduled by the scheduler; runs any
+    /// number of times via manual invoke/execute (or delegation, e.g.
+    /// chat's run_agent), and shows `AgentStatus::Completed` while idle
+    /// after a successful run (Completed is a ready-state, not terminal —
+    /// re-invoking always works). First-class form of what the frontend
+    /// used to encode as the `interval_seconds: 0` hack.
+    Manual,
 }
 
 /// Agent status.
@@ -224,6 +244,9 @@ pub enum AgentStatus {
     Error,
     /// Executing
     Executing,
+    /// A manual (`ScheduleType::Manual`) task finished its latest run. Not
+    /// auto-scheduled; manual invoke always works and re-Completes.
+    Completed,
 }
 
 /// Agent execution mode.
@@ -282,6 +305,12 @@ pub struct ExecutionRecord {
     /// Actions taken (≤150 chars), e.g. "sent alert" / "no action"
     pub action_taken: String,
     pub success: bool,
+    /// Why the run ended — `StopReason::label()` from the tool loop
+    /// (e.g. "max-rounds", "stuck", "natural-completion"). Empty for legacy
+    /// records or paths without a tool loop. Lets the agent learn stop reasons
+    /// across executions.
+    #[serde(default)]
+    pub stop_reason: String,
 }
 
 /// Execution journal — FIFO ring buffer of recent execution records.
@@ -317,7 +346,11 @@ fn default_timestamp() -> i64 {
 }
 
 fn default_journal_limit() -> usize {
-    10
+    // 20 (was 10): failed runs are the key learning signal, and a FIFO of 10
+    // meant an old failure was evicted before a run that could have learned
+    // from it. Bigger window = more history for the failure-prioritized
+    // injection (context.rs).
+    20
 }
 
 impl Default for AgentMemory {
@@ -401,6 +434,10 @@ pub struct DecisionProcess {
     pub conclusion: String,
     /// Confidence level (0-1)
     pub confidence: f32,
+    /// Why the tool loop ended (StopReason label); threaded to the journal so
+    /// the agent can learn from prior stop reasons. Empty when no loop ran.
+    #[serde(default)]
+    pub stop_reason: String,
 }
 
 /// Data collected for decision making.
@@ -559,6 +596,9 @@ impl AgentStore {
     /// Open or create an agent store at the given path.
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Arc<Self>, Error> {
         let db = Database::create(path)?;
+        // Rollback guard: refuse databases stamped by a newer build (see schema.rs).
+        crate::schema::check_or_stamp(&db)
+            .map_err(|e| Error::Storage(format!("schema version: {e}")))?;
         let write_txn = db.begin_write()?;
 
         // Create tables if they don't exist
@@ -616,7 +656,17 @@ impl AgentStore {
 
     /// Query agents with filters.
     pub async fn query_agents(&self, filter: AgentFilter) -> Result<Vec<AiAgent>, Error> {
-        let read_txn = self.db.begin_read()?;
+        // [fake-async fix] Full-table scan + deserialize + sort on every call
+        // blocks the executor thread; push it onto the blocking pool. Only
+        // the database handle is needed.
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || Self::query_agents_impl(&db, filter))
+            .await
+            .map_err(|e| Error::Storage(format!("query_agents join error: {}", e)))?
+    }
+
+    fn query_agents_impl(db: &Database, filter: AgentFilter) -> Result<Vec<AiAgent>, Error> {
+        let read_txn = db.begin_read()?;
         let table = read_txn.open_table(AGENTS_TABLE)?;
 
         let mut agents = Vec::new();
@@ -631,13 +681,13 @@ impl AgentStore {
                 }
             };
 
-            if self.matches_agent_filter(&agent, &filter) {
+            if Self::matches_agent_filter(&agent, &filter) {
                 agents.push(agent);
             }
         }
 
         // Sort by updated_at descending
-        agents.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        agents.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
 
         // Apply pagination
         if let Some(offset) = filter.offset {
@@ -977,7 +1027,7 @@ impl AgentStore {
         };
         let mut executions = self.query_executions(filter).await?;
         // Sort by timestamp descending and return the first
-        executions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        executions.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         Ok(executions.into_iter().next())
     }
 
@@ -1007,7 +1057,7 @@ impl AgentStore {
         }
 
         // Sort by timestamp descending
-        executions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        executions.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
 
         // Apply pagination
         if let Some(offset) = filter.offset {
@@ -1081,7 +1131,7 @@ impl AgentStore {
     }
 
     /// Check if an agent matches the given filter.
-    fn matches_agent_filter(&self, agent: &AiAgent, filter: &AgentFilter) -> bool {
+    fn matches_agent_filter(agent: &AiAgent, filter: &AgentFilter) -> bool {
         if let Some(status) = filter.status {
             if agent.status != status {
                 return false;
@@ -1397,6 +1447,7 @@ mod tests {
                 decisions: vec![],
                 conclusion: "No action needed".to_string(),
                 confidence: 0.95,
+                stop_reason: String::new(),
             },
             result: None,
             duration_ms: 150,
@@ -1459,6 +1510,7 @@ mod tests {
             outcome: "Temperature normal".into(),
             action_taken: "no action".into(),
             success: true,
+            stop_reason: String::new(),
         });
 
         store

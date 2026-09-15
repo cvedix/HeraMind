@@ -37,6 +37,21 @@ pub struct ListMessagesQuery {
 
 /// List messages with pagination and filters.
 /// GET /api/messages?limit=10&offset=0&severity=warning&status=active
+#[utoipa::path(
+    get,
+    path = "/api/messages",
+    tag = "messages",
+    params(
+        ("limit" = Option<usize>, Query, description = "Max items"),
+        ("offset" = Option<usize>, Query, description = "Skip items"),
+        ("severity" = Option<String>, Query, description = "Filter by severity"),
+        ("status" = Option<String>, Query, description = "Filter by status"),
+        ("category" = Option<String>, Query, description = "Filter by category"),
+    ),
+    responses(
+        (status = 200, description = "Notification feed"),
+    )
+)]
 pub async fn list_messages_handler(
     State(state): State<ServerState>,
     Query(params): Query<ListMessagesQuery>,
@@ -122,7 +137,7 @@ pub async fn list_messages_handler(
 
     // Sort by timestamp descending (newest first)
     let mut sorted = filtered;
-    sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    sorted.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
 
     // Apply pagination
     let paginated: Vec<&Message> = sorted.into_iter().skip(offset).take(limit).collect();
@@ -136,7 +151,7 @@ pub async fn list_messages_handler(
 }
 
 /// Create message request.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CreateMessageRequest {
     pub category: String, // alert | system | business
     pub severity: String, // info | warning | critical | emergency
@@ -150,16 +165,33 @@ pub struct CreateMessageRequest {
 
 /// Create a message.
 /// POST /api/messages
+#[utoipa::path(
+    post,
+    path = "/api/messages",
+    tag = "messages",
+    request_body = CreateMessageRequest,
+    responses(
+        (status = 200, description = "Message created and fanned out to channels"),
+    )
+)]
 pub async fn create_message_handler(
     State(state): State<ServerState>,
     Json(req): Json<CreateMessageRequest>,
 ) -> HandlerResult<serde_json::Value> {
-    let severity = match req.severity.as_str() {
+    // Unknown severities are REJECTED, not coerced to Info — a typo like
+    // "severe" used to store Info silently, dropping the alert from
+    // critical-tier channel filters with no signal to the caller.
+    let severity = match req.severity.to_lowercase().as_str() {
         "info" => MessageSeverity::Info,
         "warning" => MessageSeverity::Warning,
         "critical" => MessageSeverity::Critical,
         "emergency" => MessageSeverity::Emergency,
-        _ => MessageSeverity::Info,
+        other => {
+            return Err(ErrorResponse::bad_request(format!(
+                "Invalid severity '{}' — expected info | warning | critical | emergency",
+                other
+            )))
+        }
     };
 
     let source = req.source.unwrap_or_else(|| "api".to_string());
@@ -196,6 +228,18 @@ pub async fn create_message_handler(
 
 /// Get a message.
 /// GET /api/messages/:id
+#[utoipa::path(
+    get,
+    path = "/api/messages/{id}",
+    tag = "messages",
+    params(
+        ("id" = String, Path, description = "Message id"),
+    ),
+    responses(
+        (status = 200, description = "One message"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_message_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -216,6 +260,18 @@ pub async fn get_message_handler(
 
 /// Delete a message.
 /// DELETE /api/messages/:id
+#[utoipa::path(
+    delete,
+    path = "/api/messages/{id}",
+    tag = "messages",
+    params(
+        ("id" = String, Path, description = "Message id"),
+    ),
+    responses(
+        (status = 200, description = "Message deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_message_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -239,6 +295,18 @@ pub async fn delete_message_handler(
 
 /// Acknowledge a message.
 /// POST /api/messages/:id/acknowledge
+#[utoipa::path(
+    post,
+    path = "/api/messages/{id}/acknowledge",
+    tag = "messages",
+    params(
+        ("id" = String, Path, description = "Message id"),
+    ),
+    responses(
+        (status = 200, description = "Message acknowledged"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn acknowledge_message_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -262,6 +330,18 @@ pub async fn acknowledge_message_handler(
 
 /// Resolve a message.
 /// POST /api/messages/:id/resolve
+#[utoipa::path(
+    post,
+    path = "/api/messages/{id}/resolve",
+    tag = "messages",
+    params(
+        ("id" = String, Path, description = "Message id"),
+    ),
+    responses(
+        (status = 200, description = "Message resolved"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn resolve_message_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -285,6 +365,18 @@ pub async fn resolve_message_handler(
 
 /// Archive a message.
 /// POST /api/messages/:id/archive
+#[utoipa::path(
+    post,
+    path = "/api/messages/{id}/archive",
+    tag = "messages",
+    params(
+        ("id" = String, Path, description = "Message id"),
+    ),
+    responses(
+        (status = 200, description = "Message archived"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn archive_message_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -308,6 +400,14 @@ pub async fn archive_message_handler(
 
 /// Message statistics.
 /// GET /api/messages/stats
+#[utoipa::path(
+    get,
+    path = "/api/messages/stats",
+    tag = "messages",
+    responses(
+        (status = 200, description = "Counts by severity/status"),
+    )
+)]
 pub async fn message_stats_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -317,23 +417,37 @@ pub async fn message_stats_handler(
 
 /// Bulk acknowledge messages.
 /// POST /api/messages/acknowledge
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct BulkAcknowledgeRequest {
     pub message_ids: Vec<String>,
 }
 
+/// Parse a bulk-request's message id strings into MessageIds. Shared by the
+/// bulk acknowledge/resolve/delete handlers (was triplicated verbatim).
+fn parse_message_ids(raw: &[String]) -> Result<Vec<MessageId>, ErrorResponse> {
+    raw.iter()
+        .map(|id_str| {
+            Ok(MessageId(uuid::Uuid::parse_str(id_str).map_err(|_| {
+                ErrorResponse::bad_request(format!("Invalid message ID: {}", id_str))
+            })?))
+        })
+        .collect()
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/messages/acknowledge",
+    tag = "messages",
+    request_body = BulkAcknowledgeRequest,
+    responses(
+        (status = 200, description = "Matching messages acknowledged"),
+    )
+)]
 pub async fn bulk_acknowledge_handler(
     State(state): State<ServerState>,
     Json(req): Json<BulkAcknowledgeRequest>,
 ) -> HandlerResult<serde_json::Value> {
-    let mut ids = Vec::new();
-    for id_str in &req.message_ids {
-        let msg_id =
-            MessageId(uuid::Uuid::parse_str(id_str).map_err(|_| {
-                ErrorResponse::bad_request(format!("Invalid message ID: {}", id_str))
-            })?);
-        ids.push(msg_id);
-    }
+    let ids = parse_message_ids(&req.message_ids)?;
 
     let count = state
         .core
@@ -349,18 +463,20 @@ pub async fn bulk_acknowledge_handler(
 
 /// Bulk resolve messages.
 /// POST /api/messages/resolve
+#[utoipa::path(
+    post,
+    path = "/api/messages/resolve",
+    tag = "messages",
+    request_body = BulkAcknowledgeRequest,
+    responses(
+        (status = 200, description = "Matching messages resolved"),
+    )
+)]
 pub async fn bulk_resolve_handler(
     State(state): State<ServerState>,
     Json(req): Json<BulkAcknowledgeRequest>,
 ) -> HandlerResult<serde_json::Value> {
-    let mut ids = Vec::new();
-    for id_str in &req.message_ids {
-        let msg_id =
-            MessageId(uuid::Uuid::parse_str(id_str).map_err(|_| {
-                ErrorResponse::bad_request(format!("Invalid message ID: {}", id_str))
-            })?);
-        ids.push(msg_id);
-    }
+    let ids = parse_message_ids(&req.message_ids)?;
 
     let count = state
         .core
@@ -376,18 +492,20 @@ pub async fn bulk_resolve_handler(
 
 /// Bulk delete messages.
 /// POST /api/messages/delete
+#[utoipa::path(
+    post,
+    path = "/api/messages/delete",
+    tag = "messages",
+    request_body = BulkAcknowledgeRequest,
+    responses(
+        (status = 200, description = "Matching messages deleted"),
+    )
+)]
 pub async fn bulk_delete_handler(
     State(state): State<ServerState>,
     Json(req): Json<BulkAcknowledgeRequest>,
 ) -> HandlerResult<serde_json::Value> {
-    let mut ids = Vec::new();
-    for id_str in &req.message_ids {
-        let msg_id =
-            MessageId(uuid::Uuid::parse_str(id_str).map_err(|_| {
-                ErrorResponse::bad_request(format!("Invalid message ID: {}", id_str))
-            })?);
-        ids.push(msg_id);
-    }
+    let ids = parse_message_ids(&req.message_ids)?;
 
     let count = state
         .core
@@ -403,11 +521,20 @@ pub async fn bulk_delete_handler(
 
 /// Cleanup old messages.
 /// POST /api/messages/cleanup
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CleanupRequest {
     pub older_than_days: u32,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/messages/cleanup",
+    tag = "messages",
+    request_body = CleanupRequest,
+    responses(
+        (status = 200, description = "Old messages purged"),
+    )
+)]
 pub async fn cleanup_handler(
     State(state): State<ServerState>,
     Json(req): Json<CleanupRequest>,

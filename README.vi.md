@@ -27,8 +27,8 @@
 <br/>
 
 <div align="center">
-  <img src="docs/img/dashboard-main.png" alt="Bảng điều khiển" width="800" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);" />
-  <br/><sub><b>Bảng điều khiển</b></sub>
+  <img src="docs/img/llm_backend.png" alt="Cấu hình LLM" width="800" style="border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);" />
+  <br/><sub><b>Cấu hình LLM</b></sub>
 </div>
 
 <br/>
@@ -53,6 +53,10 @@
 </div>
 
 <br/>
+
+## HeraMind 0.9.24
+
+Bản mã nguồn này tích hợp [NeoMind v0.9.24](https://github.com/camthink-ai/NeoMind/releases/tag/v0.9.24): hỗ trợ LLM cục bộ tích hợp, kết nối ứng dụng nhắn tin, OpenAPI, bảo vệ cơ sở dữ liệu và SDK extension 0.7.1. HeraMind giữ tiếng Việt mặc định, giao diện xanh và logo riêng, phân tích HeraCam/bodycam, đường dẫn dữ liệu và kênh cập nhật riêng. Xem [ghi chú tích hợp và kiểm chứng](docs/upstream-sync-0.9.24.md). Phiên bản mã nguồn này chưa đồng nghĩa với một bản cài đặt HeraMind đã được phát hành.
 
 ## HeraMind là gì?
 
@@ -199,7 +203,7 @@ docker compose up -d
 
 **Phiên bản cụ thể:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | VERSION=0.9.11 sh
+curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | sh
 ```
 
 **Thư mục tùy chỉnh:**
@@ -219,7 +223,7 @@ curl -fsSL ... | USE_NGINX=true sh
 
 **Cài đặt thủ công:**
 ```bash
-VERSION=0.9.11
+VERSION=$(curl -fsSL https://api.github.com/repos/cvedix/HeraMind/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].removeprefix("v"))')
 wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-server-linux-amd64.tar.gz
 wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-web-${VERSION}.tar.gz
 tar xzf heramind-server-linux-amd64.tar.gz
@@ -335,58 +339,6 @@ HeraMind/
 ├── docker-compose.yml           # Cấu hình Docker Compose
 └── .env.example                 # Mẫu biến môi trường
 ```
-
-## Ảnh chụp thêm
-
-<details>
-<summary>Bấm để mở rộng</summary>
-
-<br/>
-
-<table>
-  <tr>
-    <td><b>Đăng nhập</b></td>
-    <td><b>AI Chat</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/login.png" width="480" /></td>
-    <td><img src="docs/img/chat.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>AI Agent</b></td>
-    <td><b>Rule Engine</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/agents.png" width="480" /></td>
-    <td><img src="docs/img/rules.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>Biến đổi dữ liệu</b></td>
-    <td><b>Tin nhắn</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/transforms.png" width="480" /></td>
-    <td><img src="docs/img/messages.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>Extension</b></td>
-    <td><b>Đẩy dữ liệu</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/extensions.png" width="480" /></td>
-    <td><img src="docs/img/data-push.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>Backend LLM</b></td>
-    <td><b>Di động</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/llm-backends.png" width="480" /></td>
-    <td><img src="docs/img/mobile_web.png" width="200" /></td>
-  </tr>
-</table>
-
-</details>
 
 ## Cấu hình
 

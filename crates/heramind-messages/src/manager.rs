@@ -160,6 +160,31 @@ impl MessageManager {
                     let factory = crate::EmailChannelFactory;
                     factory.create(&config).map(Some)
                 }
+                #[cfg(feature = "telegram")]
+                "telegram" => {
+                    let factory = crate::TelegramChannelFactory;
+                    factory.create(&config).map(Some)
+                }
+                #[cfg(feature = "wecom")]
+                "wecom" => {
+                    let factory = crate::WeComChannelFactory;
+                    factory.create(&config).map(Some)
+                }
+                #[cfg(feature = "dingtalk")]
+                "dingtalk" => {
+                    let factory = crate::DingTalkChannelFactory;
+                    factory.create(&config).map(Some)
+                }
+                #[cfg(feature = "slack")]
+                "slack" => {
+                    let factory = crate::SlackChannelFactory;
+                    factory.create(&config).map(Some)
+                }
+                #[cfg(feature = "feishu")]
+                "feishu" => {
+                    let factory = crate::FeishuChannelFactory;
+                    factory.create(&config).map(Some)
+                }
                 _ => {
                     tracing::warn!("Unknown channel type: {}, skipping", stored.channel_type);
                     Ok(None)
@@ -361,13 +386,16 @@ impl MessageManager {
                             send_results.push((channel_name.clone(), Ok(())));
                         }
                         Err(e) => {
-                            // Log channel failure but don't fail the entire operation
+                            // Log channel failure but don't fail the entire
+                            // operation. Scrub first: reqwest errors embed the
+                            // request URL, and channel tokens live in URLs.
+                            let scrubbed = scrub_credentials(&e.to_string());
                             tracing::warn!(
                                 "Failed to send message through channel '{}': {}",
                                 channel_name,
-                                e
+                                scrubbed
                             );
-                            send_results.push((channel_name.clone(), Err(e.to_string())));
+                            send_results.push((channel_name.clone(), Err(scrubbed)));
                         }
                     }
                 }
@@ -830,9 +858,176 @@ where
     }
 }
 
+/// Scrub credential-looking substrings from a channel error text before it
+/// is logged or returned to an API client. reqwest error Display embeds the
+/// full request URL, and the notification channels carry their tokens in
+/// URLs (telegram bot tokens, dingtalk access_token+sign, wecom/slack/feishu
+/// webhook keys) — an upstream failure used to leak the working credential
+/// into logs, TestResult responses, and rule-engine output verbatim.
+pub(crate) fn scrub_credentials(text: &str) -> String {
+    // Credential-bearing query parameters (value runs to the next & or quote).
+    let mut out = text.to_string();
+    for key in [
+        "token",
+        "key",
+        "sign",
+        "access_token",
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "hook_id",
+        "client_secret",
+        "session_key",
+    ] {
+        // Replace every key=<value> occurrence with key=*** (case-insensitive
+        // on the key). Two guards against the livelock the first version had:
+        // (1) a word boundary before the key — "token" must NOT match inside
+        //     "access_token=" (the substring hit re-found an already-masked
+        //     "***" value, replaced it with itself, and spun forever);
+        // (2) a scan cursor that strictly advances past every occurrence.
+        let needle = format!("{}=", key);
+        let lowered_needle = needle.to_lowercase();
+        let mut cursor = 0usize;
+        while cursor < out.len() {
+            let pos = match out[cursor..].to_lowercase().find(&lowered_needle) {
+                Some(p) => cursor + p,
+                None => break,
+            };
+            let boundary_ok = pos == 0 || {
+                let prev = out[..pos].chars().next_back().unwrap();
+                !(prev.is_ascii_alphanumeric() || prev == '_')
+            };
+            let start = pos + needle.len();
+            let end = out[start..]
+                .find(|c: char| c == '&' || c == '\'' || c == '"' || c == ')' || c.is_whitespace())
+                .map(|e| start + e)
+                .unwrap_or(out.len());
+            if !boundary_ok || start >= end {
+                // Substring false-positive, bare key=, or a mask already
+                // running to the end of the string — skip past it.
+                cursor = start;
+                continue;
+            }
+            out.replace_range(start..end, "***");
+            cursor = start + 3;
+        }
+    }
+    // URL basic-auth userinfo: scheme://user:pass@host → scheme://***:***@host
+    if let Some(scheme_end) = out.find("://") {
+        let rest_start = scheme_end + 3;
+        if let Some(at) = out[rest_start..].find('@') {
+            let userinfo = &out[rest_start..rest_start + at];
+            if userinfo.contains(':') && !userinfo.contains('/') {
+                out.replace_range(rest_start..rest_start + at, "***:***");
+            }
+        }
+    }
+    // Feishu webhook: the secret is the LAST path segment after /hook/.
+    if let Some(pos) = out.find("/hook/") {
+        let start = pos + "/hook/".len();
+        let end = out[start..]
+            .find(|c: char| c == '/' || c == ')' || c.is_whitespace() || c == '\'' || c == '"')
+            .map(|e| start + e)
+            .unwrap_or(out.len());
+        if start < end {
+            out.replace_range(start..end, "***");
+        }
+    }
+    // Slack webhook: hooks.slack.com/services/T/B/X — the whole tail is the
+    // secret (three path segments).
+    if let Some(pos) = out.find("hooks.slack.com/services/") {
+        let start = pos + "hooks.slack.com/services/".len();
+        let end = out[start..]
+            .find(|c: char| c == ')' || c.is_whitespace() || c == '\'' || c == '"')
+            .map(|e| start + e)
+            .unwrap_or(out.len());
+        if start < end {
+            out.replace_range(start..end, "***");
+        }
+    }
+    // Telegram bot-token path form: /bot<digits>:<hash>
+    if let Some(pos) = out.find("/bot") {
+        let rest = &out[pos + 4..];
+        let hash_start = rest.find(':');
+        let digits_end = rest.find(|c: char| !c.is_ascii_digit());
+        if let (Some(colon), Some(nondigit)) = (hash_start, digits_end) {
+            if colon > 0 && Some(colon) == Some(nondigit) {
+                let end = pos + 4 + colon;
+                let tail = &out[end + 1..];
+                let hash_len = tail
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                    .unwrap_or(tail.len());
+                out.replace_range(pos + 4..end + 1 + hash_len, "***");
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (0.9.20): channels persisted via the create/update API must
+    /// come back on restart. `load_persisted_channels` used to only restore
+    /// webhook/email — telegram/wecom/dingtalk/slack/feishu configs sat in
+    /// storage while the registry came up empty, silently disabling alerts.
+    #[tokio::test]
+    async fn test_persisted_channels_restored_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+
+        {
+            let manager = MessageManager::with_storage(&data_dir).unwrap();
+            let registry = manager.channels.read().await;
+            let cases: Vec<(
+                &str,
+                serde_json::Value,
+                Box<dyn crate::channels::ChannelFactory>,
+            )> = vec![
+                (
+                    "telegram",
+                    serde_json::json!({"token": "t", "chat_id": "c"}),
+                    Box::new(crate::TelegramChannelFactory),
+                ),
+                (
+                    "feishu",
+                    serde_json::json!({"hook_id": "h", "secret": "s"}),
+                    Box::new(crate::FeishuChannelFactory),
+                ),
+                (
+                    "webhook",
+                    serde_json::json!({"url": "https://example.com/wh"}),
+                    Box::new(crate::WebhookChannelFactory),
+                ),
+            ];
+            for (i, (ty, cfg, factory)) in cases.into_iter().enumerate() {
+                let _ = ty;
+                let mut with_name = cfg.clone();
+                with_name["name"] = serde_json::json!(format!("ch{i}"));
+                let channel = factory
+                    .create(&with_name)
+                    .expect("factory must accept the same config the create handler does");
+                registry
+                    .register_with_config(format!("ch{i}"), channel, cfg.clone())
+                    .await;
+            }
+        }
+
+        // Fresh manager over the same storage == process restart.
+        let manager = MessageManager::with_storage(&data_dir).unwrap();
+        manager.load_persisted_channels().await;
+        let registry = manager.channels.read().await;
+        for i in 0..3 {
+            assert!(
+                registry.get(&format!("ch{i}")).await.is_some(),
+                "persisted channel ch{i} must be restored after restart"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_manager_creation() {
@@ -996,8 +1191,10 @@ mod tests {
     async fn test_message_filtering_by_source_type() {
         use crate::channels::ChannelFilter;
 
-        let mut filter = ChannelFilter::default();
-        filter.source_types = vec!["device".to_string()];
+        let filter = ChannelFilter {
+            source_types: vec!["device".to_string()],
+            ..Default::default()
+        };
 
         let device_msg = Message::device(
             MessageSeverity::Warning,
@@ -1660,5 +1857,80 @@ mod tests {
         assert_eq!(msg.title, "System Started");
         assert_eq!(msg.source_type, "system");
         assert_eq!(msg.severity, MessageSeverity::Info);
+    }
+}
+
+#[cfg(test)]
+mod credential_scrub_tests {
+    use super::*;
+
+    #[test]
+    fn scrubs_query_param_credentials() {
+        let out = scrub_credentials(
+            "error sending request for url (https://oapi.dingtalk.com/robot/send?access_token=abc123def&sign=XYZ987) connection refused",
+        );
+        assert!(!out.contains("abc123def"), "access_token leaked: {out}");
+        assert!(!out.contains("XYZ987"), "sign leaked: {out}");
+        assert!(
+            out.contains("access_token=***"),
+            "mask marker missing: {out}"
+        );
+    }
+
+    #[test]
+    fn scrubs_basic_auth_userinfo() {
+        let out = scrub_credentials("url (https://user:sup3rsecret@hooks.example.com/x) timeout");
+        assert!(!out.contains("sup3rsecret"), "password leaked: {out}");
+        assert!(out.contains("***:***@"), "userinfo mask missing: {out}");
+    }
+
+    #[test]
+    fn scrubs_telegram_bot_token_path() {
+        let out = scrub_credentials(
+            "url (https://api.telegram.org/bot6821234567:AAH3xQmTz9_bottomhalf/sendMessage) dns error",
+        );
+        assert!(!out.contains("AAH3xQmTz9"), "bot token leaked: {out}");
+        assert!(out.contains("/bot***"), "bot mask missing: {out}");
+    }
+
+    #[test]
+    fn leaves_non_credential_text_intact() {
+        let msg = "connection refused by 10.0.0.5:443 after 30s (topic=devices)";
+        assert_eq!(scrub_credentials(msg), msg);
+    }
+}
+
+#[cfg(test)]
+mod credential_scrub_path_tests {
+    use super::*;
+
+    #[test]
+    fn scrubs_feishu_hook_path() {
+        let out = scrub_credentials(
+            "error for url (https://open.feishu.cn/open-apis/bot/v2/hook/a1b2c3d4-e5f6) timeout",
+        );
+        assert!(!out.contains("a1b2c3d4"), "feishu key leaked: {out}");
+        assert!(out.contains("/hook/***"), "feishu mask missing: {out}");
+        assert!(
+            out.ends_with(") timeout") || out.contains(") timeout"),
+            "closing paren mangled: {out}"
+        );
+    }
+
+    #[test]
+    fn scrubs_slack_services_path() {
+        let out = scrub_credentials(
+            "error for url (https://hooks.slack.com/services/T000AAA/B000BBB/XXXXXXXXXXXXXXXX) dns failure",
+        );
+        assert!(!out.contains("T000AAA"), "slack token leaked: {out}");
+        assert!(out.contains("services/***"), "slack mask missing: {out}");
+    }
+
+    #[test]
+    fn query_mask_preserves_closing_paren() {
+        let out =
+            scrub_credentials("(https://oapi.dingtalk.com/robot/send?access_token=abc123) refused");
+        assert!(!out.contains("abc123"));
+        assert!(out.contains("access_token=***)"), "paren eaten: {out}");
     }
 }

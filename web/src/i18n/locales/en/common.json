@@ -5,14 +5,13 @@
   },
   "alerts": {
     "title": "Alerts",
-    "unread": "unread",
     "noAlerts": "No alerts",
     "acknowledge": "Acknowledge",
     "moreAlerts": "+{{count}} more alerts"
   },
   "messages": {
     "title": "Messages",
-    "description": "Manage notifications, alerts and data push",
+    "description": "Notifications, channels, and IM sessions",
     "tabs": {
       "messages": "Messages",
       "channels": "Channels"
@@ -43,7 +42,6 @@
       "allVisible": "All messages visible",
       "activeCount": "{{count}} filters active"
     },
-    "items": "items",
     "severity": {
       "label": "Severity",
       "info": "Info",
@@ -67,23 +65,17 @@
       "business": "Business"
     },
     "type": {
-      "label": "Message Type",
+      "label": "Type",
       "notification": "Notification"
     },
     "stats": {
       "total": "Total",
       "active": "Active",
       "byCategory": {
-        "alert": "Alerts",
-        "notification": "Notifications",
-        "system": "System",
-        "business": "Business"
+        "alert": "Alerts"
       },
       "bySeverity": {
-        "info": "Info",
-        "warning": "Warnings",
-        "critical": "Critical",
-        "emergency": "Emergency"
+        "critical": "Critical"
       }
     },
     "channels": {
@@ -92,7 +84,6 @@
       "createTitle": "Create Channel",
       "createDescription": "Create a new notification channel",
       "test": "Test",
-      "sendTest": "Send Test Message",
       "config": "Configuration",
       "name": "Channel Name",
       "type": "Channel Type",
@@ -105,15 +96,12 @@
       "deleteChannel": "Delete Channel",
       "confirmDelete": "Are you sure you want to delete the channel \"{{name}}\"?",
       "deleteSuccess": "Channel deleted successfully",
-      "deleteError": "Failed to delete channel",
       "manageRecipients": "Manage Recipients",
       "recipients": "recipients",
       "currentRecipients": "Current Recipients",
       "noRecipients": "No recipients configured",
       "recipientAdded": "Recipient added successfully",
       "recipientRemoved": "Recipient removed successfully",
-      "addRecipientError": "Failed to add recipient",
-      "removeRecipientError": "Failed to remove recipient",
       "emailPlaceholder": "email@example.com",
       "channelDetails": "Channel Details",
       "smtpServer": "SMTP Server",
@@ -136,16 +124,10 @@
       "emailPassword": "Password",
       "optionalPlaceholder": "(optional)",
       "emailFromPlaceholder": "noreply@example.com",
-      "emailTo": "To Address",
-      "yourEmailPlaceholder": "your@email.com",
       "recipientsHint": "Add recipients after creating the channel by clicking \"Manage Recipients\"",
       "channelNamePlaceholder": "My Channel",
-      "goToSettings": "Settings",
       "filterConfig": "Message Filter Configuration",
       "filterConfigDesc": "Configure which messages this channel should receive",
-      "messageTypes": "Message Types",
-      "notification": "Notification",
-      "messageTypesHint": "Leave unchecked to accept all types",
       "sourceTypes": "Source Types",
       "sourceTypesHint": "Leave unchecked to accept all sources",
       "categories": "Categories",
@@ -176,25 +158,13 @@
       "typeFeishu": "Feishu",
       "typeFeishuDesc": "Custom bot",
       "webhookConfig": "Webhook Configuration",
-      "webhookConfigHint": "Configure the webhook endpoint and authentication",
       "emailConfig": "Email Configuration",
-      "emailConfigHint": "Configure SMTP settings for sending email notifications.",
-      "telegramConfig": "Telegram Configuration",
-      "telegramConfigHint": "Configure Telegram Bot to send notifications.",
       "botToken": "Bot Token",
       "chatId": "Chat ID",
-      "wecomConfig": "WeCom Configuration",
-      "wecomConfigHint": "Configure WeCom robot webhook.",
       "webhookKey": "Webhook Key",
-      "dingtalkConfig": "DingTalk Configuration",
-      "dingtalkConfigHint": "Configure DingTalk custom robot.",
       "accessToken": "Access Token",
       "secret": "Secret",
       "secretOptional": "Optional, for sign verification",
-      "slackConfig": "Slack Configuration",
-      "slackConfigHint": "Configure Slack Incoming Webhook.",
-      "feishuConfig": "Feishu Configuration",
-      "feishuConfigHint": "Configure Feishu custom bot.",
       "hookId": "Hook ID",
       "authType": "Authentication",
       "authNone": "None",
@@ -220,10 +190,6 @@
       "smtpPass": "Password",
       "smtpPassPlaceholder": "SMTP password",
       "fromAddress": "From Address",
-      "failed": "Failed",
-      "retrying": "Retrying",
-      "pending": "Pending",
-      "retryCount": "Retry {{count}}",
       "timeoutLabel": "Timeout Label",
       "timeoutHint": "Timeout for webhook delivery",
       "webhookConfigDesc": "Configure webhook endpoint URL and headers",
@@ -235,13 +201,10 @@
     "confirmBulkDelete": "Delete Messages",
     "confirmBulkDeleteDesc": "Are you sure you want to delete {{count}} message(s)?",
     "deleteSuccess": "Messages Deleted",
-    "deleteSuccessDesc": "Successfully deleted {{count}} message(s)",
     "deleteError": "Delete Failed",
     "acknowledgeSuccess": "Messages Acknowledged",
-    "acknowledgeSuccessDesc": "Acknowledged {{count}} message(s)",
     "acknowledgeError": "Acknowledge Failed",
     "resolveSuccess": "Messages Resolved",
-    "resolveSuccessDesc": "Resolved {{count}} message(s)",
     "resolveError": "Resolve Failed",
     "formTitle": {
       "label": "Title",
@@ -263,16 +226,6 @@
     },
     "sourceLabel": "Source",
     "sourcePlaceholder": "e.g. api, system",
-    "sourceId": {
-      "label": "Source ID",
-      "hint": "Unique identifier for filtering (e.g., device:001)"
-    },
-    "payload": {
-      "label": "Payload (JSON)",
-      "section": "Payload Data",
-      "sectionDesc": "Structured data for Data Push messages (JSON format)",
-      "invalidJson": "Invalid JSON format"
-    },
     "timestamp": "Timestamp",
     "metadata": "Metadata",
     "basicSettings": "Basic Settings",
@@ -293,10 +246,7 @@
   },
   "connection": {
     "connected": "Connected",
-    "disconnected": "Disconnected",
-    "connecting": "Connecting",
-    "wsConnected": "WebSocket connected",
-    "wsDisconnected": "WebSocket disconnected"
+    "disconnected": "Disconnected"
   },
   "nav": {
     "dashboard": "Chat",
@@ -304,24 +254,10 @@
     "devices": "Devices",
     "automation": "Automation",
     "agents": "AI Agents",
-    "alerts": "Alerts",
     "data": "Data Explorer",
-    "decisions": "Decisions",
     "messages": "Messages",
     "extensions": "Extensions",
     "settings": "Settings"
-  },
-  "navShort": {
-    "dashboard": "Chat",
-    "visual-dashboard": "Dashboard",
-    "devices": "Devices",
-    "automation": "Auto",
-    "agents": "Agents",
-    "data": "Data",
-    "messages": "Messages",
-    "extensions": "Extensions",
-    "settings": "Settings",
-    "system": "System"
   },
   "add": "Add",
   "edit": "Edit",
@@ -330,6 +266,7 @@
   "save": "Save",
   "cancel": "Cancel",
   "skip": "Skip",
+  "skipToContent": "Skip to content",
   "confirm": "Confirm",
   "search": "Search",
   "refresh": "Refresh",
@@ -356,11 +293,8 @@
   "register": "Register",
   "registering": "Registering...",
   "runStatus": {
-    "running": "Running",
-    "stopped": "Stopped",
-    "error": "Error"
+    "running": "Running"
   },
-  "systemRunning": "System Running",
   "selectAll": "Select All (Current Page)",
   "deselectAll": "Deselect All",
   "hour": "hour",
@@ -373,7 +307,9 @@
   "description": "Description",
   "type": "Type",
   "status": "Status",
-  "actions": "Actions",
+  "actions": {
+    "more": "More"
+  },
   "details": "Details",
   "enable": "Enable",
   "disable": "Disable",
@@ -401,9 +337,7 @@
   "approve": "Approve",
   "reject": "Reject",
   "logout": "Logout",
-  "loggingOut": "Logging out...",
   "selected": "{{count}} selected",
-  "cancelSelection": "Cancel Selection",
   "pagination": {
     "total": "{{total}} total · Page {{currentPage}}/{{totalPages}}",
     "perPage": "{{size}} /page",
@@ -414,23 +348,16 @@
   "hint": "Hint",
   "actionFailed": "Action failed",
   "imageProcessFailed": "Failed to process images. Please try again.",
-  "timeAgo": {
-    "justNow": "Just now",
-    "minutesAgo": "{{count}}m ago",
-    "hoursAgo": "{{count}}h ago",
-    "daysAgo": "{{count}}d ago",
-    "date": "Date"
-  },
   "info": "Info",
   "createdAt": "Created",
   "updatedAt": "Updated",
   "welcome": {
     "greeting": {
-      "earlyMorning": "Good early morning",
+      "earlyMorning": "Good morning",
       "morning": "Good morning",
       "afternoon": "Good afternoon",
       "evening": "Good evening",
-      "night": "Good night"
+      "night": "Good evening"
     },
     "tagline": "{{appName}} Smart IoT Assistant, at your service",
     "stats": {
@@ -460,7 +387,7 @@
   },
   "llm": {
     "providers": {
-      "ollama": "Local Model",
+      "ollama": "Ollama",
       "openai": "OpenAI",
       "anthropic": "Anthropic",
       "google": "Google",
@@ -471,10 +398,12 @@
       "minimax": "MiniMax",
       "llamacpp": "llama.cpp",
       "default": "Default Model"
-    },
-    "providerTypes": {
-      "local": "Local",
-      "cloud": "Cloud"
+    }
+  },
+  "im": {
+    "platforms": {
+      "telegram": "Telegram",
+      "feishu": "Feishu"
     }
   },
   "inputSuggestions": {
@@ -489,16 +418,6 @@
     "recommended": "Recommended",
     "moreOptions": "More options",
     "keyboardHint": "Press ↑↓ to navigate, Enter to select",
-    "timeContext": {
-      "morning": "Morning routine",
-      "evening": "Energy saving",
-      "night": "Night security"
-    },
-    "context": {
-      "devices": "{{count}} devices",
-      "current": "Currently {{count}} devices",
-      "online": "{{online}}/{{total}} online"
-    },
     "categories": {
       "device": "Device",
       "automation": "Automation",
@@ -508,41 +427,6 @@
       "settings": "Settings",
       "general": "General"
     }
-  },
-  "units": {
-    "celsius": "°C",
-    "percent": "%",
-    "kilogram": "kg",
-    "dollar": "$",
-    "degrees": "°",
-    "bytes": "B",
-    "kb": "KB",
-    "mb": "MB",
-    "gb": "GB",
-    "tb": "TB",
-    "milliseconds": "ms",
-    "seconds": "s",
-    "minutes": "min",
-    "hours": "h"
-  },
-  "emptyStates": {
-    "noData": "No data available",
-    "noResults": "No results found",
-    "noItems": "No items",
-    "noDevices": "No devices",
-    "noAgents": "No agents",
-    "noMessages": "No messages",
-    "noAlerts": "No alerts",
-    "trySearch": "Try a different search term",
-    "getStarted": "Get started by adding your first item"
-  },
-  "loadingStates": {
-    "loading": "Loading...",
-    "saving": "Saving...",
-    "processing": "Processing...",
-    "fetching": "Fetching...",
-    "updating": "Updating...",
-    "deleting": "Deleting..."
   },
   "alertLevels": {
     "critical": "Critical",
@@ -594,7 +478,6 @@
     "search": "Search...",
     "noSessions": "No sessions yet",
     "noMatch": "No matching sessions",
-    "totalSessions": "Total {{count}} sessions",
     "messages": "{{count}} messages",
     "defaultTitle": "New Chat",
     "deleteTitle": "Delete Session",
@@ -606,13 +489,10 @@
     "resume": "Resume"
   },
   "language": {
-    "switchToEnglish": "Switch to English",
     "switchToChinese": "Switch to Chinese",
     "switchToVietnamese": "Switch to Vietnamese"
   },
   "dataPush": {
-    "title": "Data Push Targets",
-    "loading": "Loading push targets...",
     "empty": "No push targets configured",
     "emptyHint": "Create a push target to forward data to external systems",
     "create": "Create Target",
@@ -633,17 +513,13 @@
     "targetType": "Target Type",
     "webhookUrl": "Webhook URL",
     "mqttBroker": "MQTT Broker",
-    "mqttTopic": "MQTT Topic",
     "schedule": "Schedule",
     "eventDriven": "Event-driven",
     "intervalSchedule": "Interval",
     "interval": "Every {{secs}}s",
     "intervalSecs": "Interval (seconds)",
     "sourcePatterns": "Data Source Patterns",
-    "sourcePatternsPlaceholder": "device:sensor1:, extension:weather:",
     "sourcePatternsHint": "Comma-separated patterns, e.g. device:sensor1:, extension:weather:",
-    "template": "Payload Template (optional)",
-    "templateHint": "Handlebars template. Variables: {{source_id}}, {{value}}, {{timestamp}}",
     "allSources": "All sources",
     "createTarget": "Create Push Target",
     "editTarget": "Edit Push Target",
@@ -652,19 +528,10 @@
     "noLogsHint": "Logs will appear here after data is pushed",
     "attempts": "{{count}} attempts",
     "attemptsLabel": "Attempts",
-    "stepBasics": "Basics",
-    "stepBasicsDesc": "Name and target type",
-    "stepTarget": "Target",
-    "stepTargetDesc": "Connection settings",
-    "stepSources": "Sources",
-    "stepSourcesDesc": "Data source selection",
-    "stepTemplate": "Template",
-    "stepTemplateDesc": "Payload format",
     "sourcePicker": "Data Source Selection",
     "sourcePickerDesc": "Select data sources to push. Leave empty to push all sources.",
     "sourceSearch": "Search sources...",
     "sourceSelected": "{{count}} selected",
-    "sourceAllFields": "All fields",
     "sourceAdvanced": "Advanced (manual patterns)",
     "sourceLoading": "Loading sources...",
     "sourceEmpty": "No data sources found",
@@ -673,10 +540,7 @@
     "sourceTypeTransform": "Transform",
     "sourceTypeSystem": "System",
     "removeSource": "Remove",
-    "selectAllFields": "Select all",
     "deselectAllFields": "Deselect all",
-    "back": "Back",
-    "next": "Next",
     "webhookAuthToken": "Bearer Token",
     "webhookAuthTokenPlaceholder": "Authorization token",
     "webhookBasicAuth": "Basic Auth",
@@ -687,7 +551,6 @@
     "mqttPort": "Port",
     "mqttUsername": "Username",
     "mqttPassword": "Password",
-    "mqttQos": "QoS",
     "mqttSelectBroker": "Select existing broker",
     "mqttManualInput": "Manual input",
     "testSuccess": "Test Successful",
@@ -708,10 +571,10 @@
     "status": "Status",
     "updated": "Updated",
     "running": "Running",
-    "stopped": "Stopped",
     "toggle": "Start / Stop",
     "nameRequired": "Name Required",
-    "urlRequired": "Url Required"
+    "urlRequired": "Url Required",
+    "topicRequired": "Topic is required"
   },
   "active": "Active",
   "test": "Test Connection",
@@ -740,9 +603,7 @@
       "deviceBinding": "Device Binding",
       "noCompatibleDevices": "No Compatible Devices",
       "selectDevice": "Select Device"
-    },
-    "defaultTitle": "Dashboard",
-    "newChat": "New Chat"
+    }
   },
   "minPasswordLength": "Min Password Length",
   "minUsernameLength": "Min Username Length",
@@ -759,13 +620,13 @@
     "title": "Setup Guide",
     "dismiss": "Skip Setup Guide",
     "completed": "Done",
+    "stepIndicator": "Step {{current}} of {{total}}",
     "nav": {
       "prev": "Back",
       "next": "Next",
       "finish": "Finish"
     },
     "cli": {
-      "toggle": "Quick setup via CLI",
       "provider": "Provider",
       "keyHint": "Replace YOUR_API_KEY with your key before running",
       "copy": "Copy command",
@@ -774,14 +635,12 @@
       "followup": "After creating, replace <ID> below with the returned backend ID to test the connection and set it as default:"
     },
     "deviceCli": {
-      "toggle": "Quick device onboarding via CLI",
       "note": "POST simulated telemetry to the webhook URL below. The system auto-discovers unknown devices and creates a draft — no pre-registration or extra tools needed.",
+      "localhostHint": "This command uses a localhost address. Devices on the LAN should replace localhost with the server's LAN IP.",
+      "unreachableHint": "The server is listening on loopback only (127.0.0.1) — LAN devices cannot connect. Restart it with the default 0.0.0.0 bind (CLI: --host 0.0.0.0; desktop: HERAMIND_HOST=0.0.0.0).",
       "followup": "After publishing, the system auto-discovers the device as a draft. Run these to view and approve it, completing onboarding:"
     },
-    "stepLabels": {
-      "setup": "Core Setup",
-      "ready": "Ready"
-    },
+    "stages": {},
     "setup": {
       "title": "Welcome to HeraMind",
       "heroSubtitle": "An edge AI platform for IoT. Configure your AI brain and connect devices, then just describe what you want in natural language.",
@@ -793,13 +652,39 @@
       },
       "llm": {
         "title": "Configure AI Model",
-        "description": "At HeraMind's core is an AI assistant. Configure an LLM backend — local Ollama (free, private), or cloud like OpenAI / Anthropic / Google — and you can run the whole system in natural language.",
+        "features": {
+          "builtin": {
+            "title": "Built-in model",
+            "desc": "One-click download, offline, no API key needed"
+          },
+          "local": {
+            "title": "Local backends",
+            "desc": "Ollama, llama.cpp"
+          },
+          "cloud": {
+            "title": "Cloud services",
+            "desc": "OpenAI, Anthropic, GLM, DeepSeek, and more"
+          }
+        },
         "purpose": "AI is the primary way to interact with HeraMind. Once set up, connecting devices, creating rules, and building dashboards all happen through conversation — no need to configure each page manually.",
         "action": "Configure AI Model"
       },
       "device": {
         "title": "Connect Devices",
-        "description": "Connect devices over MQTT (built-in broker on port 1883) — they're auto-discovered and ready to approve in one click. Webhook, manual entry, and BLE provisioning are also supported. AI cameras like the NE101 / NE301 work out of the box.",
+        "features": {
+          "mqtt": {
+            "title": "MQTT",
+            "desc": "Built-in broker on port 1883 — auto-discovered, approve in one click"
+          },
+          "other": {
+            "title": "Other options",
+            "desc": "Webhooks, manual entry, BLE provisioning"
+          },
+          "camera": {
+            "title": "AI cameras",
+            "desc": "NE101 / NE301 work out of the box"
+          }
+        },
         "purpose": "Devices are the source of all data. Without them, monitoring, alerting, and analysis aren't possible — this is where the system starts.",
         "action": "View Devices"
       }
@@ -810,14 +695,21 @@
       "partialTitle": "Finish setup anytime",
       "partialSubtitle": "You can complete setup later. Try these prompts once your AI model is ready.",
       "prompts": {
-        "monitoring": { "title": "Build a Dashboard", "desc": "Real-time visualization with 20+ widgets", "prompt": "Create a temperature monitoring dashboard" },
-        "automation": { "title": "Set up Automation", "desc": "Rules, alerts, and scheduled AI agents", "prompt": "Notify me when temperature exceeds 35 degrees" },
-        "extensions": { "title": "Install Extensions", "desc": "AI vision, weather forecasts, and more", "prompt": "Install the weather forecast extension" }
-      },
-      "chatButton": "Start Chatting",
-      "statusLabels": {
-        "llm": "AI Model",
-        "device": "Devices"
+        "monitoring": {
+          "title": "Build a Dashboard",
+          "desc": "Real-time visualization with 20+ widgets",
+          "prompt": "Create a temperature monitoring dashboard"
+        },
+        "automation": {
+          "title": "Set up Automation",
+          "desc": "Rules, alerts, and scheduled AI agents",
+          "prompt": "Notify me when temperature exceeds 35 degrees"
+        },
+        "extensions": {
+          "title": "Install Extensions",
+          "desc": "AI vision, weather forecasts, and more",
+          "prompt": "Install the weather forecast extension"
+        }
       }
     }
   },
@@ -828,13 +720,8 @@
     "goBack": "Go Back"
   },
   "userMenu": {
-    "preferences": "Preferences",
     "about": "About",
-    "help": "Help",
-    "role": "Role"
-  },
-  "actions": {
-    "more": "More"
+    "language": "Language"
   },
   "systemHealth": {
     "title": "System Status",
@@ -843,10 +730,15 @@
     "devicesOnline": "{{online}}/{{total}} Devices Online",
     "unreadAlerts": "{{count}} Unread Alerts"
   },
+  "backendUnavailable": {
+    "title": "Backend Service Unavailable",
+    "portConflict": "Port 9375 is already in use by another HeraMind instance. Close any other running HeraMind (including a manually started 'heramind serve'), then restart this app.",
+    "message": "Cannot connect to the backend service. The backend may have failed to start — please restart the app. If the problem persists, check whether another HeraMind instance is using the port.",
+    "retry": "Retry connection"
+  },
   "system": {
     "pageTitle": "System",
     "menu": "Menu",
-    "sectionPrimary": "Primary",
     "sectionBusiness": "Business",
     "sectionSystem": "System",
     "sectionAbout": "About",
@@ -873,7 +765,6 @@
     "templates": {
       "title": "Create rule from template",
       "subtitle": "Pick a template to quickly configure a common rule",
-      "createFromTemplate": "From template",
       "deviceOffline": {
         "label": "Device offline alert",
         "description": "Fires when a device sends no data for a configured duration",
@@ -886,5 +777,23 @@
         "selectDevice": "Please select a device"
       }
     }
+  },
+  "llmGuide": {
+    "title": "Set up your AI brain",
+    "desc": "AI is the primary way to interact with HeraMind — devices, rules, dashboards all work through conversation. Pick a path to start:",
+    "builtinTitle": "Download the built-in model (Recommended)",
+    "builtinDesc": "LFM2.5-2.6B, ~1.5GB — offline, no API key",
+    "ownTitle": "Bring your own backend",
+    "ownDesc": "Ollama / llama.cpp / OpenAI and other providers",
+    "builtinShort": "Built-in model",
+    "ownShort": "Configure",
+    "footnote": "Once set up, chat, devices, rules and dashboards all happen through conversation.",
+    "recommended": "Recommended",
+    "builtinTitleShort": "Built-in Model",
+    "builtinCta": "Download now",
+    "ownTitleShort": "Your Own Backend",
+    "ownCta": "Configure",
+    "downloadingTitle": "Built-in model downloading",
+    "downloading": "DL"
   }
 }

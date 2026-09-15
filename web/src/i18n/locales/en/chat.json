@@ -1,6 +1,7 @@
 {
   "openPanel": "Open AI Chat",
   "closePanel": "Close",
+  "resizePanel": "Drag to resize chat panel",
   "panelTitle": "AI Chat",
   "streamInProgress": "Stream in progress, closing after completion...",
   "title": "Smart IoT Assistant",
@@ -22,6 +23,7 @@
     "moreOptions": "More options",
     "newChat": "New chat",
     "startNewConversation": "Start typing to chat with AI assistant",
+    "fallbackHelpPrompt": "What can you do?",
     "skills": "Skills",
     "selectSkills": "Select skills",
     "noSkills": "No skills available",
@@ -76,7 +78,9 @@
     "retryAttempt": "Attempt {{count}}",
     "retryProgress": "Attempt {{retry}}/{{max}}{{seconds, string}}",
     "retrySeconds": " · {{seconds}}s",
-    "reconnect": "Reconnect"
+    "reconnect": "Reconnect",
+    "authFailed": "Connection lost (authentication failed)",
+    "interruptedSaved": "Connection lost — this reply still completes in the background and is saved to the session history; return to this session later to see it"
   },
   "quickActions": {
     "refreshDevices": "Refresh devices",
@@ -184,8 +188,9 @@
   },
   "notConfigured": {
     "title": "LLM Not Configured",
-    "description": "Please configure LLM backend to use chat feature",
-    "goToSettings": "Go to Settings"
+    "description": "Download the built-in model (~1.5GB, offline, no API key) — or configure your own LLM backend.",
+    "goToSettings": "Go to Settings",
+    "downloadBuiltin": "Download Built-in Model (Recommended)"
   },
   "build": {
     "view": "View",
@@ -219,7 +224,22 @@
     "typing": "Typing",
     "wait": "Wait"
   },
+  "code": {
+    "copy": "Copy",
+    "copied": "Copied"
+  },
+  "scrollToBottom": "Scroll to bottom",
+  "copyMessage": "Copy message",
   "footer": {
     "disclaimer": "Disclaimer"
+  },
+  "toolLoopProgress": "Working · tool round {{round}}",
+  "context": {
+    "title": "Context usage",
+    "systemPrompt": "System prompt",
+    "toolDefs": "Tool definitions",
+    "history": "Conversation history",
+    "estimatedHint": "Character-based estimate — updates after the next reply",
+    "msgCount": " · {{count}} msgs"
   }
 }

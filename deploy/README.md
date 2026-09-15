@@ -144,10 +144,10 @@ After starting the container, IoT devices can connect via:
 
 ### Connecting LLM Backends
 
-HeraMind supports multiple LLM backends. Configure them in the Web UI under **Settings > LLM**:
+HeraMind supports multiple LLM backends. Configure them in the Web UI under **Settings > LLM Backends**:
 
 - **Ollama** (local): If running Ollama on the same host, use `http://host.docker.internal:11434` or the host's IP
-- **Cloud APIs**: OpenAI, Anthropic, Google, Qwen, DeepSeek, GLM, etc.
+- **Cloud AI** (single card, two protocols): OpenAI-compatible covers OpenAI, Qwen, DeepSeek, GLM, xAI and any `/v1` endpoint; Anthropic covers Claude and Anthropic-compatible endpoints.
 
 ### Connecting to External Ollama
 
@@ -163,7 +163,7 @@ Ollama Endpoint: http://192.168.x.x:11434
 # Option 3: Add Ollama as a compose service
 ```
 
-To add Ollama as a companion service, create `docker-compose.override.yml`:
+To add Ollama as a companion service, edit the existing `docker-compose.override.yml` (the repo already ships one for the llama.cpp companion — don't replace it wholesale):
 
 ```yaml
 services:
@@ -189,6 +189,45 @@ volumes:
 ```
 
 Then in HeraMind Web UI, set Ollama endpoint to `http://ollama:11434`.
+
+### Local AI Companion: llama.cpp (optional but recommended)
+
+`docker-compose.override.yml` in the repo root is auto-loaded by `docker compose`.
+It adds a local llama.cpp server running **Gemma4-E2B (QAT)**, so `docker compose up -d`
+gives HeraMind a working local LLM with no external API keys:
+
+- **`llama-init`** — one-shot container that downloads the text GGUF (3.35 GB)
+  + vision mmproj (0.99 GB) into the `llama-models` named volume on first start;
+  resumable and idempotent.
+- **`llama`** — llama.cpp server exposing the model on `:8080`, reachable by the
+  HeraMind container at `http://llama:8080`. Vision enabled via `--mmproj`.
+- **Auto-registration** — on startup HeraMind probes the endpoint; if a llama.cpp
+  backend does not already exist and the server is reachable, it creates one and
+  (only if no active backend exists) makes it active. Idempotent and never
+  overrides a backend you configured.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLAMA_PORT` | `8080` | Host port for the llama.cpp server |
+| `LLAMA_CTX_SIZE` | `16384` | Context window in tokens (E2B Q4 + 16k ctx ≈ 3.6 GB RAM) |
+| `LLAMA_MODEL_URL` | HF `gemma-4-E2B_q4_0-it.gguf` | Text GGUF download URL |
+| `LLAMA_MODEL_FILE` | `gemma-4-E2B_q4_0-it.gguf` | Text model file name in the volume |
+| `LLAMA_MMPROJ_URL` | HF `gemma-4-E2B-it-mmproj.gguf` | Vision projector URL |
+| `LLAMA_MMPROJ_FILE` | `gemma-4-E2B-it-mmproj.gguf` | Vision projector file name |
+| `HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT` | `http://llama:8080` | Endpoint heramind probes; empty disables auto-registration |
+
+First run downloads the model (~4.3 GB), then starts the server. Later runs reuse
+the volume. **To disable local AI**, delete/rename `docker-compose.override.yml`;
+to keep the server but skip auto-registration, set an empty
+`HERAMIND_LLAMACPP_AUTOREGISTER_ENDPOINT` in `.env`.
+
+> **Note**: Gemma4-E2B reasons by default (thinking is streamed into
+> `reasoning_content`); HeraMind displays it. Context size is configurable via
+> `LLAMA_CTX_SIZE` — bump to 32768 for longer conversations if RAM allows.
+
+GPU: add an NVIDIA `deploy.resources.reservations.devices` block to the `llama`
+service and pass `--n-gpu-layers 999` in `command` to offload. If host port 8080
+is taken, set `LLAMA_PORT=18080` in `.env`.
 
 ### Troubleshooting
 
@@ -238,7 +277,7 @@ Download the installer for your platform:
 
 From the Release page, download:
 - `heramind-server-{os}-{arch}.tar.gz` - Backend server
-- `heramind-web-{version}.tar.gz` - Frontend static files
+- `heramind-web.tar.gz` - Frontend static files
 
 ### 2. Deploy Backend
 
@@ -249,18 +288,23 @@ tar xzf heramind-server-linux-amd64.tar.gz
 # Start service
 ./heramind serve
 
-# Or specify port and data directory
-./heramind serve --port 9375 --data-dir /var/lib/heramind
+# Or specify the port (data dir comes from HERAMIND_DATA_DIR, not a flag;
+# see "Data directory rules" below — the service's working directory must
+# also be stable, because the redb stores default to a cwd-relative data/)
+./heramind serve --port 9375
 ```
 
 ### 3. Deploy Frontend
 
 ```bash
+# Download the latest web bundle
+wget https://github.com/cvedix/HeraMind/releases/latest/download/heramind-web.tar.gz
+
 # Create web directory
 sudo mkdir -p /var/www/heramind
 
 # Extract frontend files
-tar xzf heramind-web-0.6.2.tar.gz -C /var/www/heramind
+tar xzf heramind-web.tar.gz -C /var/www/heramind
 ```
 
 ### 4. Configure Nginx
@@ -334,6 +378,8 @@ After=network.target
 Type=simple
 User=heramind
 Group=heramind
+# IMPORTANT: keep WorkingDirectory at the directory that contains data/ —
+# the redb stores resolve relative to the cwd unless HERAMIND_DATA_DIR is set.
 WorkingDirectory=/opt/heramind
 ExecStart=/opt/heramind/heramind serve
 Restart=on-failure

@@ -14,6 +14,31 @@ import { Check, Download, AlertCircle, Loader2, Rocket } from 'lucide-react'
 import { useUpdateCheck } from '@/hooks/useUpdateCheck'
 import { useAppStore } from '@/store'
 import { UnifiedFormDialog } from '@/components/dialog/UnifiedFormDialog'
+import { lazy, Suspense } from 'react'
+import type { Components } from 'react-markdown'
+
+// Lazy: keeps the markdown/highlight vendor chunk out of the initial graph
+const ReleaseNotes = lazy(() =>
+  import('./ReleaseNotes').then((m) => ({ default: m.ReleaseNotes }))
+)
+import { cn } from '@/lib/utils'
+
+// react-markdown overrides for the release-notes panel. Links open in a new
+// tab so the GitHub release page opens in the browser instead of navigating
+// the desktop webview.
+const releaseNotesComponents: Components = {
+  a: ({ node, className, children, href, ...props }) => (
+    <a
+      className={cn('text-primary underline underline-offset-2 hover:opacity-80', className)}
+      href={href as string}
+      target="_blank"
+      rel="noopener noreferrer"
+      {...(props as any)}
+    >
+      {children}
+    </a>
+  ),
+}
 
 export interface UpdateDialogProps {
   /** Whether the dialog is open */
@@ -115,7 +140,7 @@ export function UpdateDialog({ open, onClose }: UpdateDialogProps) {
   const getStatusColor = () => {
     switch (installStatus) {
       case 'done':
-        return 'bg-success-light dark:bg-success-light text-success dark:text-success'
+        return 'bg-success-light text-success'
       case 'error':
         return 'bg-error-light text-error'
       case 'downloading':
@@ -217,22 +242,33 @@ export function UpdateDialog({ open, onClose }: UpdateDialogProps) {
       footer={footerContent}
     >
       <div className="space-y-4">
-        {/* Version Badge */}
-        {currentUpdateInfo?.version && (
-          <div>
-            <Badge variant="secondary" className="text-sm">
-              v{updateInfo?.version}
-            </Badge>
-          </div>
-        )}
-
-        {/* Release Notes */}
+        {/* Version badge + release notes.
+            [density] The badge used to sit alone in a full block row and the
+            notes container carried its own border INSIDE the dialog content
+            (a visible second edge line) while reserving up to 40vh — together
+            they pushed the dialog toward its 85vh cap for medium-sized
+            notes. Badge now hugs the notes header row; the notes box uses a
+            muted wash instead of a border and a tighter 32vh cap. */}
         {currentUpdateInfo?.body && installStatus === 'idle' && (
-          <div className="max-h-60 overflow-y-auto rounded-md border p-3 text-sm">
-            <div className="prose prose-sm dark:prose-invert max-w-none">
-              {updateInfo?.body}
+          <div className="space-y-2">
+            {currentUpdateInfo?.version && (
+              <Badge variant="secondary" className="text-xs">
+                v{updateInfo?.version}
+              </Badge>
+            )}
+            <div className="max-h-[32vh] overflow-y-auto rounded-md bg-muted-30 p-3 text-sm">
+              <div className="prose prose-sm dark:prose-invert max-w-none">
+                <Suspense fallback={null}>
+                  <ReleaseNotes body={updateInfo?.body ?? ''} components={releaseNotesComponents} />
+                </Suspense>
+              </div>
             </div>
           </div>
+        )}
+        {!currentUpdateInfo?.body && currentUpdateInfo?.version && installStatus === 'idle' && (
+          <Badge variant="secondary" className="text-xs">
+            v{updateInfo?.version}
+          </Badge>
         )}
 
         {/* Progress Bar */}
@@ -252,8 +288,8 @@ export function UpdateDialog({ open, onClose }: UpdateDialogProps) {
 
         {/* Success Message */}
         {installStatus === 'done' && (
-          <div className="flex items-center gap-2 p-3 rounded-md bg-success-light dark:bg-success-light border border-success-light dark:border-success-light">
-            <Check className="w-5 h-5 text-success dark:text-success" />
+          <div className="flex items-center gap-2 p-3 rounded-md bg-success-light">
+            <Check className="w-5 h-5 text-success" />
             <p className="text-sm text-success">
               {t('settings:updateCompleteMessage')}
             </p>
@@ -262,7 +298,7 @@ export function UpdateDialog({ open, onClose }: UpdateDialogProps) {
 
         {/* Error Message */}
         {installStatus === 'error' && (
-          <div className="flex items-start gap-2 p-3 rounded-md bg-error-light border border-error">
+          <div className="flex items-start gap-2 p-3 rounded-md bg-error-light">
             <AlertCircle className="w-5 h-5 text-error mt-0.5" />
             <p className="text-sm text-error">
               {getStatusMessage()}

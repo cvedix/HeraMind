@@ -13,6 +13,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use heramind_agent::skills::types::SkillOrigin;
 use heramind_agent::skills::{
     match_skills, Skill, SkillCategory, SkillRegistry, TokenBudgetConfig,
 };
@@ -111,7 +112,7 @@ impl From<&Skill> for SkillSummary {
                 SkillCategory::General => "general",
             }
             .to_string(),
-            origin: "user".to_string(),
+            origin: skill.metadata.origin.as_str().to_string(),
             priority: skill.metadata.priority,
             token_budget: skill.metadata.token_budget,
             keywords: skill.metadata.triggers.keywords.clone(),
@@ -155,7 +156,7 @@ impl From<&Skill> for SkillDetail {
                 SkillCategory::General => "general",
             }
             .to_string(),
-            origin: "user".to_string(),
+            origin: skill.metadata.origin.as_str().to_string(),
             priority: skill.metadata.priority,
             token_budget: skill.metadata.token_budget,
             keywords: skill.metadata.triggers.keywords.clone(),
@@ -186,14 +187,14 @@ pub struct SkillListResponse {
 }
 
 /// Request to create or update a skill.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CreateSkillRequest {
     /// Full skill file content (YAML frontmatter + Markdown body).
     pub content: String,
 }
 
 /// Request to test skill matching.
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct MatchTestRequest {
     pub query: String,
     pub context_size: Option<usize>,
@@ -219,6 +220,19 @@ pub struct MatchResult {
 // ============================================================================
 
 /// List all skills with pagination and optional origin filter.
+#[utoipa::path(
+    get,
+    path = "/api/skills",
+    tag = "skills",
+    params(
+        ("page" = Option<u32>, Query, description = "1-indexed page"),
+        ("page_size" = Option<u32>, Query, description = "Items per page"),
+        ("origin" = Option<String>, Query, description = "Filter by origin (builtin | custom)"),
+    ),
+    responses(
+        (status = 200, description = "Installed skills"),
+    )
+)]
 pub async fn list_skills_handler(
     State(state): State<ServerState>,
     Query(params): Query<SkillListQuery>,
@@ -262,6 +276,18 @@ pub async fn list_skills_handler(
 }
 
 /// Get a single skill by ID.
+#[utoipa::path(
+    get,
+    path = "/api/skills/{id}",
+    tag = "skills",
+    params(
+        ("id" = String, Path, description = "Skill id"),
+    ),
+    responses(
+        (status = 200, description = "One skill with its prompt"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_skill_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -280,6 +306,15 @@ pub async fn get_skill_handler(
 }
 
 /// Create a new user skill.
+#[utoipa::path(
+    post,
+    path = "/api/skills",
+    tag = "skills",
+    request_body = CreateSkillRequest,
+    responses(
+        (status = 200, description = "Skill created"),
+    )
+)]
 pub async fn create_skill_handler(
     State(state): State<ServerState>,
     Json(req): Json<CreateSkillRequest>,
@@ -312,6 +347,19 @@ pub async fn create_skill_handler(
 }
 
 /// Update a user skill.
+#[utoipa::path(
+    put,
+    path = "/api/skills/{id}",
+    tag = "skills",
+    params(
+        ("id" = String, Path, description = "Skill id"),
+    ),
+    request_body = CreateSkillRequest,
+    responses(
+        (status = 200, description = "Skill updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_skill_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -319,6 +367,18 @@ pub async fn update_skill_handler(
 ) -> Response {
     let registry = state.agents.session_manager.skill_registry();
     let mut guard = registry.write().await;
+
+    // Builtin skills are read-only — a shadow overwrite here would persist
+    // forever and mask future builtin content shipped with HeraMind upgrades.
+    if let Some(skill) = guard.get(&id) {
+        if skill.metadata.origin == SkillOrigin::Builtin {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": format!("Skill '{}' is builtin and read-only", id) })),
+            )
+                .into_response();
+        }
+    }
 
     match guard.update_user_skill(&id, &req.content) {
         Ok(()) => {
@@ -346,12 +406,35 @@ pub async fn update_skill_handler(
 }
 
 /// Delete a user skill.
+#[utoipa::path(
+    delete,
+    path = "/api/skills/{id}",
+    tag = "skills",
+    params(
+        ("id" = String, Path, description = "Skill id"),
+    ),
+    responses(
+        (status = 200, description = "Skill deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_skill_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
 ) -> Response {
     let registry = state.agents.session_manager.skill_registry();
     let mut guard = registry.write().await;
+
+    // Builtin skills are read-only (see update handler).
+    if let Some(skill) = guard.get(&id) {
+        if skill.metadata.origin == SkillOrigin::Builtin {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": format!("Skill '{}' is builtin and read-only", id) })),
+            )
+                .into_response();
+        }
+    }
 
     match guard.delete_skill(&id) {
         Ok(_) => {
@@ -376,6 +459,14 @@ pub async fn delete_skill_handler(
 }
 
 /// Reload all skills from disk.
+#[utoipa::path(
+    post,
+    path = "/api/skills/reload",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Skills re-scanned from disk"),
+    )
+)]
 pub async fn reload_skills_handler(State(state): State<ServerState>) -> Response {
     let new_registry = SkillRegistry::load_all(Some(&state.data_dir));
 
@@ -396,6 +487,15 @@ pub async fn reload_skills_handler(State(state): State<ServerState>) -> Response
 }
 
 /// Test skill matching against a query.
+#[utoipa::path(
+    post,
+    path = "/api/skills/match",
+    tag = "skills",
+    request_body = MatchTestRequest,
+    responses(
+        (status = 200, description = "Dry-run match of a prompt against skills"),
+    )
+)]
 pub async fn match_skills_handler(
     State(state): State<ServerState>,
     Json(req): Json<MatchTestRequest>,

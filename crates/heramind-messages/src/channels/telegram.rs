@@ -22,11 +22,7 @@ pub struct TelegramChannel {
 #[cfg(feature = "telegram")]
 impl TelegramChannel {
     pub fn new(name: String, token: String, chat_id: String) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = super::channel_http_client();
         Self {
             name,
             enabled: true,
@@ -127,24 +123,7 @@ impl MessageChannel for TelegramChannel {
             "parse_mode": "HTML"
         });
 
-        let response = self
-            .client
-            .post(self.api_url())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::SendFailed(format!("Telegram request failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(Error::SendFailed(format!(
-                "Telegram API error {}: {}",
-                status, text
-            )));
-        }
-
-        Ok(())
+        super::post_json("Telegram", &self.client, &self.api_url(), &body).await
     }
 }
 

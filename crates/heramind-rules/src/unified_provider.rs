@@ -7,9 +7,9 @@
 //!
 //! Uses the unified DataSourceId format for all data sources.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 use crate::models::{RuleValue, ValueProvider};
 use heramind_core::datasource::{DataSourceId, DataSourceType};
@@ -40,6 +40,10 @@ impl CacheEntry {
     }
 }
 
+/// Hard cap on cached values — with TTL 0 (never expire) the map would grow
+/// forever on device/transform churn; evict the oldest entry past this.
+const MAX_CACHE_ENTRIES: usize = 4096;
+
 /// Unified value provider for rule engine.
 ///
 /// Supports querying metrics from:
@@ -65,7 +69,13 @@ impl UnifiedValueProvider {
     pub fn new() -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
-            default_ttl_ms: 5000, // 5 seconds default TTL
+            // TTL 0 = never expire. A source's cached value is its last-known
+            // truth until a new one arrives; expiring it after N seconds made
+            // cross-source AND rules flap (a slow source's value vanished,
+            // the AND condition went false, for_duration kept resetting).
+            // Staleness is expressed separately via the __last_seen_age_secs
+            // virtual metric + offline rules, not by evicting cached values.
+            default_ttl_ms: 0,
         }
     }
 
@@ -119,7 +129,7 @@ impl UnifiedValueProvider {
         value: RuleValue,
         ttl_ms: u64,
     ) {
-        let mut cache = self.cache.write().await;
+        let mut cache = self.cache.write();
         cache.insert(
             (
                 source_type.to_string(),
@@ -128,6 +138,17 @@ impl UnifiedValueProvider {
             ),
             CacheEntry::new(value, ttl_ms),
         );
+        if cache.len() > MAX_CACHE_ENTRIES {
+            // Evict the oldest entry (smallest timestamp) — last-known values
+            // for vanished sources are stale data, not worth keeping forever.
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, e)| e.timestamp)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
     }
 
     /// Parse and update from DataSourceId.
@@ -196,7 +217,7 @@ impl UnifiedValueProvider {
         source_type: &str,
         source_id: &str,
     ) -> HashMap<String, RuleValue> {
-        let cache = self.cache.read().await;
+        let cache = self.cache.read();
         cache
             .iter()
             .filter(|((t, id, _), _)| t == source_type && id == source_id)
@@ -223,16 +244,18 @@ impl ValueProvider for UnifiedValueProvider {
             DataSourceType::Extension => "extension",
             DataSourceType::Transform => "transform",
         };
-        if let Ok(cache) = self.cache.try_read() {
-            let key = (
-                source_type.to_string(),
-                source.source_id.clone(),
-                source.field_path.clone(),
-            );
-            if let Some(entry) = cache.get(&key) {
-                if !entry.is_expired() {
-                    return Some(entry.value.clone());
-                }
+        // [contention-safe] parking_lot read — the old tokio try_read treated
+        // lock contention as "no value", so rule conditions evaluated as
+        // false under load and `for_duration` accumulation spuriously reset.
+        let cache = self.cache.read();
+        let key = (
+            source_type.to_string(),
+            source.source_id.clone(),
+            source.field_path.clone(),
+        );
+        if let Some(entry) = cache.get(&key) {
+            if !entry.is_expired() {
+                return Some(entry.value.clone());
             }
         }
         None

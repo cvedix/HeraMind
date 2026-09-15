@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::agent::tokenizer::{estimate_tokens, truncate_to_tokens};
 use heramind_storage::{AgentMemory, ExecutionRecord};
 
 /// Hard cap on the number of knowledge files an agent may accumulate.
@@ -22,6 +23,7 @@ impl AgentExecutor {
         conclusion: &str,
         execution_id: &str,
         success: bool,
+        stop_reason: &str,
     ) -> AgentResult<AgentMemory> {
         // Reload the latest memory from the store rather than reusing the
         // in-memory snapshot on `agent`. The snapshot was taken when the agent
@@ -53,6 +55,7 @@ impl AgentExecutor {
             outcome,
             action_taken,
             success,
+            stop_reason: stop_reason.to_string(),
         });
 
         // FIFO — keep only max_records
@@ -135,6 +138,9 @@ impl AgentExecutor {
                 agent.schedule.cron_expression.as_deref().unwrap_or("?")
             ),
             heramind_storage::ScheduleType::Event => "Event-driven".to_string(),
+            heramind_storage::ScheduleType::Manual => {
+                "Manual task (runs on invoke/delegation, repeatable)".to_string()
+            }
         };
 
         let content = format!(
@@ -209,11 +215,18 @@ impl AgentExecutor {
     ///   (b) `compact_messages` will compact tool results before touching
     ///       system-prompt-embedded knowledge,
     ///   (c) the 5-minute execution timeout caps how much history accrues.
+    ///
+    /// Still, knowledge is inlined into the SYSTEM prompt, which
+    /// `compact_messages` never trims — so we also cap the cumulative inline
+    /// budget at a quarter of the context window and stop inlining once it's
+    /// exhausted (remaining files fall back to the index). Otherwise a single
+    /// oversized file (or many max-size files) could overflow an 8-32K model
+    /// before anything else gets a chance to run.
     pub(crate) fn prefetch_knowledge_files(
         &self,
         agent_id: &str,
         knowledge_files: &[heramind_storage::KnowledgeFileRef],
-        context_window_size: usize,
+        context_tokens: usize,
     ) -> Option<std::collections::HashMap<String, String>> {
         if knowledge_files.is_empty() {
             return None;
@@ -221,20 +234,34 @@ impl AgentExecutor {
 
         let store = self.memory_store.as_ref()?;
 
-        // Per-file cap (unchanged): bounds each individual file's contribution.
-        let per_file_limit = if context_window_size > 64000 {
-            20000
-        } else if context_window_size > 16000 {
-            16000
-        } else {
-            8000
-        };
+        // Per-file cap sized to the backend's real context length.
+        let per_file_limit = knowledge_per_file_limit(context_tokens);
+        // Cumulative inline budget — knowledge lives in the system prompt, so
+        // it must stay a bounded fraction of the window.
+        let total_budget = (context_tokens / 4).max(512);
+        let mut remaining_budget = total_budget;
 
         let mut content_map = std::collections::HashMap::new();
         for f in knowledge_files {
+            if remaining_budget == 0 {
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    file = %f.name,
+                    "Knowledge inline budget exhausted — relying on index for this file"
+                );
+                continue;
+            }
             match store.read_agent_custom_file(agent_id, &f.name) {
                 Ok(content) => {
-                    content_map.insert(f.name.clone(), truncate_to(&content, per_file_limit));
+                    // Cap each file to min(per_file_limit, what's left) so we
+                    // never overshoot the cumulative budget.
+                    let file_budget = per_file_limit.min(remaining_budget);
+                    let truncated = truncate_to_tokens(&content, file_budget);
+                    let used = estimate_tokens(&truncated);
+                    if used > 0 {
+                        remaining_budget = remaining_budget.saturating_sub(used);
+                        content_map.insert(f.name.clone(), truncated);
+                    }
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -252,5 +279,42 @@ impl AgentExecutor {
         } else {
             Some(content_map)
         }
+    }
+}
+
+/// Per-knowledge-file TOKEN cap, sized to the backend's real context length.
+///
+/// Larger context windows can afford larger per-file contributions; small ones
+/// stay conservative. Applied via `truncate_to_tokens`, so CJK content is bounded
+/// by tokens, not chars (a 20000-char Chinese file would otherwise be ~36K
+/// tokens). Callers MUST pass the live `max_context_length()`, not the agent's
+/// `context_window_size` knob — that knob is a 1-100 scale and never reaches
+/// these token tiers.
+pub(crate) fn knowledge_per_file_limit(context_tokens: usize) -> usize {
+    if context_tokens > 64000 {
+        20000
+    } else if context_tokens > 16000 {
+        16000
+    } else {
+        8000
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `prefetch_knowledge_files` receives the live backend's real context length
+    /// (in tokens), so these per-file tiers must actually be reachable. With the
+    /// old wiring the callers passed the 1-100 `context_window_size` knob, so the
+    /// 16K/64K branches were dead and every file was capped at 8000.
+    #[test]
+    fn knowledge_per_file_limit_scales_with_real_context_tokens() {
+        assert_eq!(knowledge_per_file_limit(0), 8000);
+        assert_eq!(knowledge_per_file_limit(8000), 8000);
+        assert_eq!(knowledge_per_file_limit(16000), 8000); // not > 16000
+        assert_eq!(knowledge_per_file_limit(20000), 16000);
+        assert_eq!(knowledge_per_file_limit(64000), 16000); // not > 64000
+        assert_eq!(knowledge_per_file_limit(128000), 20000);
     }
 }

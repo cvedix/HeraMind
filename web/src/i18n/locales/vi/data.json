@@ -61,5 +61,13 @@
     "6h": "6h",
     "24h": "24 giờ",
     "7d": "7 ngày"
+  },
+  "historyLoadFailed": "Không thể tải dữ liệu lịch sử",
+  "retry": "Thử lại",
+  "chartTruncated": "Hiển thị {{count}} điểm gần nhất",
+  "stats": {
+    "min": "Nhỏ nhất",
+    "max": "Lớn nhất",
+    "avg": "Trung bình"
   }
 }

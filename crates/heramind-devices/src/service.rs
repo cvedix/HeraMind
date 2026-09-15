@@ -394,8 +394,8 @@ impl DeviceService {
     /// This is the canonical resolution used by API handlers when building
     /// `DeviceDto.online` and any consumer-visible "online within" check.
     pub fn effective_offline_timeout(&self, device_id: &str) -> u64 {
-        // Global fallback
-        let global = self.heartbeat_config.offline_timeout;
+        // Global fallback: user-configured DeviceDefaults (live), or default 300s
+        let global = heramind_storage::DeviceDefaults::get().default_offline_timeout_secs;
 
         // Try per-device override
         if let Some(device) = self.registry.get_device(device_id) {
@@ -605,6 +605,7 @@ impl DeviceService {
         let event_bus = self.event_bus.clone();
         let heartbeat_config = self.heartbeat_config.clone();
         let heartbeat_running = self.heartbeat_running.clone();
+        let heartbeat_running_flag = self.heartbeat_running.clone();
         let registry = self.registry.clone();
 
         tokio::spawn(async move {
@@ -616,6 +617,15 @@ impl DeviceService {
 
             loop {
                 timer.tick().await;
+
+                // [stop-check] This flag was WRITE-ONLY (set true at start,
+                // false in stop_heartbeat_monitor, never read) — the monitor
+                // task could never actually be stopped. Read it here so
+                // stop_heartbeat_monitor takes effect at the next tick.
+                if !*heartbeat_running_flag.read().await {
+                    tracing::debug!("Heartbeat monitor stopping (flag cleared)");
+                    break;
+                }
 
                 let config = heartbeat_config.clone();
                 if !config.auto_mark_offline {
@@ -1144,7 +1154,14 @@ impl DeviceService {
                     );
                     // No `break`: notify ALL matching adapters so a device with a
                     // custom telemetry_topic is subscribed on every connected broker.
-                    let _ = adapter.subscribe_device(&device_id).await;
+                    if let Err(e) = adapter.subscribe_device(&device_id).await {
+                        tracing::warn!(
+                            device_id = %device_id,
+                            adapter = %adapter_id,
+                            error = %e,
+                            "Adapter failed to subscribe to device during register (continuing)"
+                        );
+                    }
                 }
             }
         } else {
@@ -1572,13 +1589,11 @@ impl DeviceService {
                             )));
                         }
                     }
-                    MetricValue::Float(f) => {
-                        if *f < min || *f > max {
-                            return Err(DeviceError::InvalidParameter(format!(
-                                "Parameter '{}' value {} out of range [{}, {}]",
-                                param_def.name, f, min, max
-                            )));
-                        }
+                    MetricValue::Float(f) if (*f < min || *f > max) => {
+                        return Err(DeviceError::InvalidParameter(format!(
+                            "Parameter '{}' value {} out of range [{}, {}]",
+                            param_def.name, f, min, max
+                        )));
                     }
                     _ => {}
                 }
@@ -2080,7 +2095,7 @@ impl DeviceService {
         if let Some(device_commands) = history.get(device_id) {
             let mut commands = device_commands.clone();
             // Sort by created_at descending (newest first)
-            commands.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            commands.sort_by_key(|c| std::cmp::Reverse(c.created_at));
             if let Some(limit) = limit {
                 commands.truncate(limit);
             }

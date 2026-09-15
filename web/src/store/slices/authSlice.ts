@@ -7,7 +7,7 @@
 import type { StateCreator } from 'zustand'
 import type { AuthState } from '../types'
 import type { UserInfo } from '@/types'
-import { tokenManager, api, getApiKey } from '@/lib/api'
+import { tokenManager, api, getApiKey, clearApiKey } from '@/lib/api'
 
 export interface AuthSlice extends AuthState {
   // UI state
@@ -56,8 +56,16 @@ export const createAuthSlice: StateCreator<
     } else if (apiKey) {
       // API key auth — no JWT token, but authenticated via service account
       set({ token: null, isAuthenticated: true, user: null })
-      // Fetch service account info (backend returns virtual user for API key)
-      get().getCurrentUser().catch(() => {})
+      // Fetch service account info (backend returns virtual user for API key).
+      // A 401/403 means the key is stale (e.g. the backend data was wiped) —
+      // clear it, otherwise isAuthenticated stays true and the app loops
+      // between rendering protected pages and bouncing off 401s.
+      get().getCurrentUser().catch((error) => {
+        if (error?.status === 401 || error?.status === 403) {
+          clearApiKey()
+          set({ isAuthenticated: false, user: null })
+        }
+      })
     } else {
       set({ isAuthenticated: false, user: null })
     }
@@ -102,6 +110,15 @@ export const createAuthSlice: StateCreator<
     } finally {
       tokenManager.clearToken()
       tokenManager.clearUser()
+      // Drop the previous user's dashboard cache, current-dashboard pointer,
+      // and local→server ID mapping so none of it leaks into the next
+      // account's session (dynamic import breaks the slice ↔ store cycle).
+      try {
+        const { useStore } = await import('@/store')
+        useStore.getState().clearDashboards()
+      } catch {
+        // Store not mounted yet — nothing cached to clear
+      }
       set({
         user: null,
         token: null,

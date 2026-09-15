@@ -18,13 +18,11 @@ fn metric_value_to_json(
 pub(crate) fn get_time_context() -> String {
     use heramind_storage::SettingsStore;
 
-    const SETTINGS_DB_PATH: &str = "data/settings.redb";
-
     // Try to load timezone from settings
-    let timezone = SettingsStore::open(SETTINGS_DB_PATH)
+    let timezone = SettingsStore::open_default()
         .ok()
         .map(|store| store.get_global_timezone())
-        .unwrap_or_else(|| "Asia/Shanghai".to_string());
+        .unwrap_or_else(|| heramind_storage::DEFAULT_GLOBAL_TIMEZONE.to_string());
 
     let now = chrono::Utc::now();
 
@@ -167,8 +165,8 @@ impl AgentExecutor {
         let mut data: Vec<DataCollected> = Vec::new();
         for item in metric_data
             .into_iter()
-            .chain(device_data.into_iter())
-            .chain(extension_data.into_iter())
+            .chain(device_data)
+            .chain(extension_data)
         {
             let key = (item.source.clone(), item.data_type.clone());
             if seen.insert(key) {
@@ -1512,7 +1510,7 @@ mod tests {
         for name in ["1234567890000.png", "1234567890001.jpg"] {
             let p = image_dir.join(name);
             let mut data = std::fs::read(&p).expect("fixture image");
-            data.extend(std::iter::repeat(0u8).take(1024));
+            data.extend(std::iter::repeat_n(0u8, 1024));
             std::fs::write(&p, data).expect("pad fixture");
         }
 

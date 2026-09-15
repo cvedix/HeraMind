@@ -704,7 +704,16 @@
     "stopped": "Đã dừng",
     "toggle": "Chuyển đổi",
     "nameRequired": "Tên bắt buộc",
-    "urlRequired": "Yêu cầu Url"
+    "urlRequired": "Yêu cầu Url",
+    "confirmStop": "Dừng đẩy dữ liệu đến đích này?",
+    "started": "Đã bắt đầu",
+    "stopFailed": "Không thể dừng",
+    "startFailed": "Không thể bắt đầu",
+    "batchFieldsHint": "Gửi khi đủ số mục trong lô hoặc đến thời gian chờ tối đa, tùy điều kiện nào đến trước",
+    "batchFormat": "Định dạng dữ liệu gửi",
+    "batchFormatFlat": "Phẳng (danh sách mục)",
+    "batchFormatNested": "Lồng nhau (theo thiết bị/nguồn)",
+    "topicRequired": "Phải nhập topic"
   },
   "active": "Đang hoạt động",
   "test": "Kiểm tra kết nối",
@@ -769,7 +778,9 @@
     "deviceCli": {
       "toggle": "Onboarding thiết bị nhanh bằng CLI",
       "note": "Gửi telemetry mô phỏng bằng POST tới webhook URL bên dưới. Hệ thống tự phát hiện thiết bị lạ và tạo bản nháp, không cần đăng ký trước hay công cụ bổ sung.",
-      "followup": "Sau khi gửi dữ liệu, hệ thống sẽ tự phát hiện thiết bị ở dạng nháp. Chạy các lệnh sau để xem và phê duyệt, hoàn tất onboarding:"
+      "followup": "Sau khi gửi dữ liệu, hệ thống sẽ tự phát hiện thiết bị ở dạng nháp. Chạy các lệnh sau để xem và phê duyệt, hoàn tất onboarding:",
+      "localhostHint": "Lệnh này sử dụng địa chỉ localhost. Thiết bị trong mạng LAN cần thay localhost bằng IP LAN của máy chủ.",
+      "unreachableHint": "Máy chủ chỉ lắng nghe trên loopback (127.0.0.1) — thiết bị LAN không thể kết nối. Khởi động lại với địa chỉ 0.0.0.0 (CLI: --host 0.0.0.0; desktop: HERAMIND_HOST=0.0.0.0)."
     },
     "stepLabels": {
       "setup": "Thiết lập cốt lõi",
@@ -788,13 +799,41 @@
         "title": "Cấu hình mô hình AI",
         "description": "Trọng tâm của HeraMind là trợ lý AI. Cấu hình LLM backend, có thể là Ollama cục bộ (miễn phí, riêng tư) hoặc cloud như OpenAI / Anthropic / Google, rồi bạn có thể vận hành toàn hệ thống bằng ngôn ngữ tự nhiên.",
         "purpose": "AI là cách tương tác chính với HeraMind. Sau khi thiết lập, việc kết nối thiết bị, tạo rule và dựng dashboard đều có thể thực hiện qua hội thoại, không cần cấu hình thủ công từng trang.",
-        "action": "Cấu hình mô hình AI"
+        "action": "Cấu hình mô hình AI",
+        "features": {
+          "builtin": {
+            "title": "Mô hình tích hợp",
+            "desc": "Tải bằng một lần nhấn, chạy ngoại tuyến, không cần API key"
+          },
+          "local": {
+            "title": "Backend cục bộ",
+            "desc": "Ollama, llama.cpp"
+          },
+          "cloud": {
+            "title": "Dịch vụ đám mây",
+            "desc": "OpenAI, Anthropic, GLM, DeepSeek và các nhà cung cấp khác"
+          }
+        }
       },
       "device": {
         "title": "Kết nối thiết bị",
         "description": "Kết nối thiết bị qua MQTT (broker tích hợp cổng 1883), hệ thống tự phát hiện và sẵn sàng để phê duyệt chỉ với một cú nhấp. Webhook, nhập thủ công và BLE provisioning cũng được hỗ trợ. Camera AI như NE101 / NE301 hoạt động ngay.",
         "purpose": "Thiết bị là nguồn của toàn bộ dữ liệu. Không có thiết bị thì không thể giám sát, cảnh báo hay phân tích, đây là điểm bắt đầu của hệ thống.",
-        "action": "Xem thiết bị"
+        "action": "Xem thiết bị",
+        "features": {
+          "mqtt": {
+            "title": "MQTT",
+            "desc": "Broker tích hợp trên cổng 1883 — tự phát hiện, phê duyệt bằng một lần nhấn"
+          },
+          "other": {
+            "title": "Lựa chọn khác",
+            "desc": "Webhook, thêm thủ công, cấu hình qua BLE"
+          },
+          "camera": {
+            "title": "Camera AI",
+            "desc": "NE101 / NE301 có thể sử dụng ngay"
+          }
+        }
       }
     },
     "ready": {
@@ -824,7 +863,8 @@
         "llm": "Mô hình AI",
         "device": "Thiết bị"
       }
-    }
+    },
+    "stepIndicator": "Bước {{current}}/{{total}}"
   },
   "notFound": {
     "title": "Không tìm thấy trang",
@@ -836,7 +876,8 @@
     "preferences": "Tùy chọn",
     "about": "Giới thiệu",
     "help": "Trợ giúp",
-    "role": "Vai trò"
+    "role": "Vai trò",
+    "language": "Ngôn ngữ"
   },
   "systemHealth": {
     "title": "Trạng thái hệ thống",
@@ -888,5 +929,36 @@
         "selectDevice": "Vui lòng chọn một thiết bị"
       }
     }
+  },
+  "skipToContent": "Chuyển đến nội dung",
+  "im": {
+    "platforms": {
+      "telegram": "Telegram",
+      "feishu": "Feishu"
+    }
+  },
+  "backendUnavailable": {
+    "title": "Dịch vụ backend không khả dụng",
+    "portConflict": "Cổng 9375 đang được một phiên HeraMind khác sử dụng. Đóng các phiên HeraMind đang chạy (kể cả 'heramind serve' khởi động thủ công), rồi mở lại ứng dụng.",
+    "message": "Không thể kết nối đến backend. Dịch vụ có thể chưa khởi động thành công — hãy mở lại ứng dụng. Nếu vẫn lỗi, kiểm tra xem phiên HeraMind khác có đang chiếm cổng không.",
+    "retry": "Thử kết nối lại"
+  },
+  "llmGuide": {
+    "title": "Thiết lập AI của bạn",
+    "desc": "AI là cách chính để tương tác với HeraMind — quản lý thiết bị, quy tắc và dashboard qua hội thoại. Chọn cách bắt đầu:",
+    "builtinTitle": "Tải mô hình tích hợp (khuyến nghị)",
+    "builtinDesc": "Mô hình chạy trên thiết bị — ngoại tuyến, không cần API key",
+    "ownTitle": "Sử dụng backend của bạn",
+    "ownDesc": "Ollama / llama.cpp / OpenAI và các nhà cung cấp khác",
+    "builtinShort": "Mô hình tích hợp",
+    "ownShort": "Cấu hình",
+    "footnote": "Sau khi thiết lập, bạn có thể chat và quản lý thiết bị, quy tắc, dashboard qua hội thoại.",
+    "recommended": "Khuyến nghị",
+    "builtinTitleShort": "Mô hình tích hợp",
+    "builtinCta": "Tải ngay",
+    "ownTitleShort": "Backend của bạn",
+    "ownCta": "Cấu hình",
+    "downloadingTitle": "Đang tải mô hình tích hợp",
+    "downloading": "Tải xuống"
   }
 }

@@ -19,7 +19,7 @@ exclude = ["web"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.11"
+version = "0.9.24"
 edition = "2021"
 rust-version = "1.85"
 authors = ["HeraMind Contributors"]
@@ -64,8 +64,20 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
 rand = "0.8"
-# Use rustls instead of OpenSSL for better cross-compilation support
+# Use rustls instead of OpenSSL for better cross-compilation support.
+# NOTE: aws-lc-sys (~12MB C build) is pulled in via hyper-rustls 0.27's *default*
+# features (which enable rustls/aws_lc_rs). reqwest 0.12 does NOT set
+# hyper-rustls default-features=false, so we cannot drop aws-lc-rs from this manifest
+# regardless of which rustls-tls-* feature we pick — it is an upstream constraint.
+# Fix path: wait for reqwest to adopt hyper-rustls 0.28 (default dropped aws-lc-rs),
+# or patch hyper-rustls. At runtime the process installs ring (start_server), so
+# aws-lc-rs is compiled-but-mostly-unused today.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2", "stream"] }
+# Feishu WS long-connection client. Default features (connect + handshake) stay
+# on; add rustls-tls-webpki-roots so `wss://` works without system cert probes
+# (bundles Mozilla roots statically — friendlier for aarch64 cross-compile, and
+# consistent with the project's rustls-not-openssl direction).
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "hostname", "builder", "tokio1-rustls", "ring", "rustls-native-certs"] }
 
 # Image processing (decode headers for dimensions + image_edit tool formats)
@@ -107,7 +119,18 @@ parking_lot = "0.12"
 dirs = "5"
 
 [profile.release]
+# Line tables only: zero runtime cost, restores stack traces/symbols in
+# perf/sample profiling — production was unprofilable without this
+# (fully-stripped binaries turned every profile into `???`). strip
+# downgraded none<-`true` accordingly.
+# SIZE WARNING: on this workspace that DWARF is ~200 MB per Linux binary
+# (v0.9.23 server tarballs ballooned 30→91 MB), NOT modest. CI therefore
+# splits it out at packaging time (build.yml: objcopy --only-keep-debug +
+# --strip-debug into a separate *-debug-symbols.tar.gz; .symtab is kept so
+# panic backtraces still name functions). Local `cargo build --release`
+# binaries stay fat on purpose — that's the profileable dev artifact.
+debug = "line-tables-only"
 lto = "thin"
 codegen-units = 1
-strip = true
+strip = "none"
 opt-level = 3

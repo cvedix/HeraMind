@@ -49,8 +49,40 @@ pub(crate) struct RoundData {
     pub(crate) tool_calls: Vec<ToolCallRecord>,
 }
 
+/// Why the tool-calling loop stopped. Set at every exit path in `run_tool_loop`
+/// and surfaced via `ToolLoopOutput::stop_reason`, so callers (journaling,
+/// metrics, debugging) know the reason without parsing sentinel strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopReason {
+    /// LLM produced a final text answer (no further tool calls).
+    NaturalCompletion,
+    /// Hit the round budget (`max_rounds`); Phase 2 synthesized a summary.
+    MaxRounds,
+    /// Every tool call this round was a cross-round duplicate (results in hand).
+    AllDuplicate,
+    /// LLM generation failed (after transient retries).
+    LlmError,
+    /// Runtime shutdown — tool-concurrency semaphore closed.
+    Cancelled,
+}
+
+impl StopReason {
+    /// Stable machine label for journaling / telemetry.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            StopReason::NaturalCompletion => "natural-completion",
+            StopReason::MaxRounds => "max-rounds",
+            StopReason::AllDuplicate => "all-duplicate",
+            StopReason::LlmError => "llm-error",
+            StopReason::Cancelled => "cancelled",
+        }
+    }
+}
+
 pub(crate) struct ToolLoopOutput {
     pub(crate) final_text: String,
+    /// Why the loop ended (replaces ad-hoc sentinel-string comparisons).
+    pub(crate) stop_reason: StopReason,
     pub(crate) all_tool_results: Vec<crate::toolkit::ToolResult>,
     /// (thought, tool_calls) per round
     pub(crate) round_data_list_raw: Vec<(Option<String>, Vec<ToolCallRecord>)>,
@@ -87,27 +119,29 @@ pub(crate) struct ToolLoopConfig {
 
 impl ToolLoopConfig {
     fn free() -> Self {
+        let max_rounds = heramind_storage::AgentDefaults::get().max_rounds as usize;
         Self {
-            max_rounds: 30,
+            max_rounds,
             recommended_tools: None,
             is_focused_plus: false,
         }
     }
 
     fn focused_plus(agent: &AiAgent) -> Self {
+        let ceiling = heramind_storage::AgentDefaults::get().max_rounds as usize;
         Self {
-            max_rounds: agent.max_chain_depth.clamp(1, 30),
+            max_rounds: agent.max_chain_depth.clamp(1, ceiling),
             recommended_tools: Some(Self::build_focused_recommended_tools(agent)),
             is_focused_plus: true,
         }
     }
 
     fn build_focused_recommended_tools(agent: &AiAgent) -> Vec<String> {
-        let mut tools = vec![
-            "device".to_string(),
-            "skill".to_string(),
-            "message".to_string(),
-        ];
+        // Only list REAL tools here. `device` and `message` are not tools —
+        // they are heramind CLI subcommands reached via `shell`. Naming them
+        // made weak models call a non-existent `device(...)` on round 1 and
+        // eat a NotFound + recovery round before the real work starts.
+        let mut tools = vec!["shell".to_string(), "skill".to_string()];
         for r in &agent.resources {
             if matches!(r.resource_type, ResourceType::Command) {
                 tools.push(format!("device:{}", r.resource_id));
@@ -133,7 +167,7 @@ mod memory;
 mod response_parser;
 mod tool_loop;
 mod tool_prompt;
-mod tool_result;
+pub(crate) mod tool_result; // pub(crate): hallucinated_tool_hint reused by chat streaming path
 
 // Re-export public types
 pub(crate) use analyzer::AnalysisResult;
@@ -231,6 +265,10 @@ pub struct AgentExecutorConfig {
     pub backend_semaphores: Option<crate::ai_agent::scheduler::BackendSemaphores>,
     /// Skill registry for querying operation guides
     pub skill_registry: Option<crate::skills::SharedSkillRegistry>,
+    /// Global execution-count semaphore shared from the scheduler (default
+    /// 10). Event-triggered executions acquire it too, so scheduled + event
+    /// executions share one global concurrency bound.
+    pub execution_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Context for agent execution.
@@ -300,6 +338,12 @@ pub struct AgentExecutor {
     pub(crate) backend_semaphores: Option<crate::ai_agent::scheduler::BackendSemaphores>,
     /// Semaphore limiting concurrent tool executions (default: 6)
     pub(crate) tool_concurrency: Arc<Semaphore>,
+    /// JoinHandles of event-triggered executions spawned by this executor.
+    /// Previously these were fully detached: `AgentScheduler::stop()` could
+    /// only abort scheduled tasks, so event executions kept running through
+    /// shutdown. Registered here so `abort_event_tasks()` can cancel them.
+    /// Finished handles are pruned on each registration.
+    pub(crate) event_task_handles: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// Parse the LLM's final text response to extract situation_analysis, conclusion, and confidence.
@@ -336,8 +380,25 @@ impl AgentExecutor {
             tool_registry: parking_lot::RwLock::new(config.tool_registry.clone()),
             memory_store: config.memory_store.clone(),
             backend_semaphores: config.backend_semaphores.clone(),
-            tool_concurrency: Arc::new(Semaphore::new(6)),
+            tool_concurrency: Arc::new(Semaphore::new(
+                heramind_storage::AgentDefaults::get().tool_concurrency,
+            )),
+            event_task_handles: parking_lot::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Abort all in-flight event-triggered executions spawned by this
+    /// executor. Called on shutdown so event agents don't keep running
+    /// (bounded only by their execution timeout) after the scheduler stops.
+    pub fn abort_event_tasks(&self) {
+        let mut handles = self.event_task_handles.lock();
+        let n = handles.len();
+        for h in handles.drain(..) {
+            h.abort();
+        }
+        if n > 0 {
+            tracing::info!(count = n, "Aborted in-flight event-triggered executions");
+        }
     }
 
     /// Set the LLM runtime for intent parsing.
@@ -415,6 +476,12 @@ impl AgentExecutor {
         // Both Focused and Free get the same tool set.
         // Focused JSON path: execute_decisions whitelist enforces scope.
         // Free mode (tool calling): all tools available, agent decides what to use.
+        // Tool mode explicitly disabled → no tools at all (text-only responses).
+        if let Some(config) = tool_config {
+            if !config.enabled {
+                return (Vec::new(), std::collections::HashMap::new());
+            }
+        }
         let filtered = match tool_config {
             Some(config) if !config.allowed_tools.is_empty() => {
                 let allowed: std::collections::HashSet<&str> =
@@ -505,7 +572,7 @@ impl AgentExecutor {
         let knowledge_content = self.prefetch_knowledge_files(
             &agent.id,
             &agent.memory.knowledge_files,
-            agent.context_window_size,
+            llm_runtime.max_context_length(),
         );
 
         let system_prompt = tool_prompt::build_tool_system_prompt(
@@ -517,6 +584,14 @@ impl AgentExecutor {
         );
         let mut messages = tool_prompt::build_tool_messages(&system_prompt, data_collected);
 
+        // The bound device image is injected into the multimodal user message
+        // above, so the LLM SEES it — but it cannot reproduce the base64 to
+        // pass it to an extension tool (YOLO / grounding). Seed the per-execution
+        // LargeDataCache with the real image so `resolve_cached_arguments`
+        // auto-injects it into image-shaped tool args instead of the LLM's
+        // truncated fragment (task #50: extensions returned `null`).
+        let bound_image = tool_prompt::bound_image_data_url(data_collected);
+
         let mut loop_output = self
             .run_tool_loop(
                 agent,
@@ -527,6 +602,7 @@ impl AgentExecutor {
                 execution_id,
                 tool_config.max_rounds,
                 &tool_name_map,
+                bound_image.as_deref(),
             )
             .await;
 
@@ -840,10 +916,11 @@ impl AgentExecutor {
         // silently disappearing.
         // Also enforce a global timeout (5 min) as a safety net against runaway
         // execution (e.g., 30 rounds × slow extension tools).
-        const GLOBAL_EXECUTION_TIMEOUT_SECS: u64 = 300;
+        let global_execution_timeout_secs =
+            heramind_storage::AgentDefaults::get().execution_timeout_secs;
         let execution_result: AgentResult<(DecisionProcess, StorageExecutionResult)> =
             match tokio::time::timeout(
-                std::time::Duration::from_secs(GLOBAL_EXECUTION_TIMEOUT_SECS),
+                std::time::Duration::from_secs(global_execution_timeout_secs),
                 std::panic::AssertUnwindSafe(self.execute_internal(
                     context,
                     event_data.clone(),
@@ -875,12 +952,12 @@ impl AgentExecutor {
                     tracing::error!(
                         agent_id = %agent_id,
                         execution_id = %execution_id,
-                        timeout_secs = GLOBAL_EXECUTION_TIMEOUT_SECS,
+                        timeout_secs = global_execution_timeout_secs,
                         "Agent execution timed out globally"
                     );
                     Err(HeraMindError::Llm(format!(
                         "Execution timed out after {}s",
-                        GLOBAL_EXECUTION_TIMEOUT_SECS
+                        global_execution_timeout_secs
                     )))
                 }
             };
@@ -940,6 +1017,7 @@ impl AgentExecutor {
                         outcome: error_msg,
                         action_taken: "execution failed".to_string(),
                         success: false,
+                        stop_reason: String::new(),
                     });
                     // FIFO — keep only max_records
                     while memory.journal.records.len() > memory.journal.max_records {
@@ -968,6 +1046,7 @@ impl AgentExecutor {
                         decisions: vec![],
                         conclusion: format!("Failed: {}", e),
                         confidence: 0.0,
+                        stop_reason: String::new(),
                     },
                     result: None,
                     duration_ms,
@@ -1086,7 +1165,7 @@ impl AgentExecutor {
 
         // Sort agents by priority (higher priority first)
         let mut sorted_agents = agents;
-        sorted_agents.sort_by(|a, b| b.priority.cmp(&a.priority));
+        sorted_agents.sort_by_key(|a| std::cmp::Reverse(a.priority));
 
         let executor_ref = self;
         let futures: Vec<_> = sorted_agents
@@ -1181,6 +1260,7 @@ impl AgentExecutor {
                 decisions: vec![],
                 conclusion: "Execution skipped: event data was recognized as an image metric but image extraction failed. Check device data format and field names.".to_string(),
                 confidence: 0.0,
+                stop_reason: String::new(),
             };
             let exec_result = heramind_storage::ExecutionResult {
                 actions_executed: vec![],
@@ -1202,6 +1282,7 @@ impl AgentExecutor {
                     "Event skipped: no usable data collected from event trigger",
                     &execution_id,
                     false,
+                    "",
                 )
                 .await
             {
@@ -1312,6 +1393,7 @@ impl AgentExecutor {
                         &decision_process.conclusion,
                         &execution_id,
                         overall_success,
+                        &decision_process.stop_reason,
                     )
                     .await?;
 
@@ -1354,16 +1436,18 @@ impl AgentExecutor {
                     })?;
 
                 // Extract learned patterns into system memory
-                // DISABLED: The memory scheduler already runs periodic extraction.
-                // Per-execution extraction is redundant, wastes tokens, and uses the wrong model.
-                // See: memory/scheduler.rs for the scheduled extraction path.
+                // DISABLED: per-execution memory extraction was turned off (token
+                // cost, wrong model). The memory scheduler (memory/scheduler.rs)
+                // does NOT compensate — it only does temp-file cleanup. So agents
+                // currently learn only via explicit memory-tool calls. Proper
+                // extraction is tracked as follow-up work (Mem0 single-pass).
 
                 tracing::debug!(
                     agent_id = %agent_id,
                     "[TOOL-CALLING] Returning direct results — skipped Focused JSON post-processing"
                 );
 
-                Ok((decision_process, execution_result))
+                Ok((*decision_process, *execution_result))
             }
 
             // ── Focused path ───────────────────────────────────────────────
@@ -1480,6 +1564,7 @@ impl AgentExecutor {
                         &conclusion,
                         &execution_id,
                         focused_success,
+                        "",
                     )
                     .await?;
 
@@ -1505,9 +1590,11 @@ impl AgentExecutor {
                     })?;
 
                 // Bridge: extract learned patterns into system memory
-                // DISABLED: The memory scheduler already runs periodic extraction.
-                // Per-execution extraction is redundant, wastes tokens, and uses the wrong model.
-                // See: memory/scheduler.rs for the scheduled extraction path.
+                // DISABLED: per-execution memory extraction was turned off (token
+                // cost, wrong model). The memory scheduler (memory/scheduler.rs)
+                // does NOT compensate — it only does temp-file cleanup. So agents
+                // currently learn only via explicit memory-tool calls. Proper
+                // extraction is tracked as follow-up work (Mem0 single-pass).
 
                 // Calculate confidence from reasoning
                 let confidence = if reasoning_steps.is_empty() {
@@ -1527,6 +1614,7 @@ impl AgentExecutor {
                     decisions,
                     conclusion,
                     confidence,
+                    stop_reason: String::new(),
                 };
 
                 let success_rate = if actions_executed.is_empty() {
@@ -1638,6 +1726,9 @@ fn is_transient_failure(error: Option<&str>) -> bool {
     // and could appear in device IDs / ports. Backends emit "Rate limited"
     // or "too many requests" as the human-readable message instead.
 }
+
+#[cfg(all(test, feature = "test-utils"))]
+mod behavior_tests;
 
 #[cfg(test)]
 mod tests {

@@ -17,14 +17,11 @@ use tracing::{info, warn};
 // Re-export types for convenience
 pub use heramind_devices::EmbeddedBrokerConfig;
 
-/// Path to the settings database.
-const SETTINGS_DB_PATH: &str = "data/settings.redb";
-
 /// Get or create the global settings store (cached).
 fn get_settings_store() -> Result<Arc<heramind_storage::SettingsStore>, Box<dyn std::error::Error>>
 {
     // SettingsStore::open already has internal caching via SETTINGS_STORE_SINGLETON
-    Ok(heramind_storage::SettingsStore::open(SETTINGS_DB_PATH)?)
+    Ok(heramind_storage::SettingsStore::open_default()?)
 }
 
 /// Configuration sources in priority order.
@@ -44,7 +41,7 @@ impl ConfigSource {
             if store.get_llm_settings().model != "default" {
                 info!(
                     category = "config",
-                    "Loading config from: {} (redb database)", SETTINGS_DB_PATH
+                    "Loading config from settings store (canonical data dir)"
                 );
                 return ConfigSource::Database;
             }
@@ -241,6 +238,19 @@ impl ConfigSource {
                     capabilities: None,
                 })
             }
+            "llamacpp" => {
+                // The served model is whatever llama-server loaded — the TOML
+                // model field is informational. Endpoint takes no /v1 (the
+                // client appends its own path).
+                let endpoint = llm_config
+                    .endpoint
+                    .unwrap_or_else(|| endpoints::LLAMACPP.to_string());
+                Some(LlmBackend::LlamaCpp {
+                    endpoint,
+                    model: llm_config.model.unwrap_or_default(),
+                    capabilities: None,
+                })
+            }
             _ => {
                 warn!(category = "config", backend = %llm_config.backend, "Unknown backend in TOML");
                 None
@@ -296,7 +306,7 @@ pub fn load_llm_config() -> Option<LlmBackend> {
 
 /// Save LLM settings to the database (called from Web UI).
 pub async fn save_llm_settings(settings: &LlmSettings) -> Result<(), Box<dyn std::error::Error>> {
-    let store = heramind_storage::SettingsStore::open(SETTINGS_DB_PATH)?;
+    let store = heramind_storage::SettingsStore::open_default()?;
     store.save_llm_settings(settings)?;
     info!(category = "ai", backend = format_args!("{:?}", settings.backend), model = %settings.model, "Saved LLM settings to database");
     Ok(())
@@ -438,6 +448,7 @@ pub fn load_embedded_broker_config() -> Option<EmbeddedBrokerConfig> {
         tls_cert_path: None,
         tls_key_path: None,
         tls_ca_path: None,
+        device_id_field: None,
     })
 }
 
@@ -446,7 +457,29 @@ pub fn load_embedded_broker_config() -> Option<EmbeddedBrokerConfig> {
 /// On first call, if no config exists in redb, the resolved config (from
 /// config.toml or defaults) is persisted to redb so that all subsequent
 /// reads — including the dynamic auth handler — return consistent values.
+///
+/// Session override: `HERAMIND_MQTT_BIND` (set by the desktop app's
+/// LAN-access toggle) overrides the listen address AFTER resolution and is
+/// deliberately NOT persisted — the env stays authoritative for the
+/// process, so the desktop can flip the binding per launch without
+/// fighting a value the server wrote to its own database. The standalone
+/// server never sets this var and is unaffected.
 pub fn get_embedded_broker_config() -> EmbeddedBrokerConfig {
+    let mut config = resolve_embedded_broker_config();
+    if let Ok(bind) = std::env::var("HERAMIND_MQTT_BIND") {
+        if !bind.is_empty() {
+            info!(
+                category = "mqtt",
+                bind = %bind,
+                "HERAMIND_MQTT_BIND override applied to broker listen address"
+            );
+            config.listen = bind;
+        }
+    }
+    config
+}
+
+fn resolve_embedded_broker_config() -> EmbeddedBrokerConfig {
     // Priority 1: redb database (set via API)
     if let Ok(store) = open_settings_store() {
         match store.load_embedded_broker_config() {
@@ -503,7 +536,30 @@ pub fn get_embedded_broker_config() -> EmbeddedBrokerConfig {
 /// Load server configuration (config.toml > env > default).
 ///
 /// Priority: config.toml > environment variables > default (0.0.0.0:9375)
+/// — with one carve-out: `HERAMIND_BIND_OVERRIDE` (set only by the desktop
+/// app's LAN-access toggle) WINS over config.toml. Without it the desktop's
+/// UI lied about the effective binding whenever a config.toml sat in the
+/// working directory: the toggle reported loopback while the server bound
+/// the toml's host (or vice versa). The standalone server never sets the
+/// override, so its precedence is unchanged.
 pub fn get_server_config() -> (String, u16) {
+    // 0. Desktop LAN-policy session override beats everything.
+    if let Ok(bind) = std::env::var("HERAMIND_BIND_OVERRIDE") {
+        if !bind.is_empty() {
+            let port = std::env::var("HERAMIND_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(9375);
+            info!(
+                category = "config",
+                host = %bind,
+                port,
+                "Loading server config from desktop bind override"
+            );
+            return (bind, port);
+        }
+    }
+
     // 1. Try config.toml
     if let Ok(content) = std::fs::read_to_string("config.toml") {
         if let Ok(config) = toml::from_str::<TomlConfig>(&content) {
@@ -552,6 +608,28 @@ endpoint = "http://localhost:11434"
 "#;
         let result = ConfigSource::Toml(toml_content.to_string()).parse();
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_toml_llamacpp_backend() {
+        // llamacpp via TOML: endpoint defaults to :8080 and takes no /v1;
+        // the model field is informational (whatever llama-server loaded).
+        let toml_content = r#"
+[llm]
+backend = "llamacpp"
+model = "qwen3.5-4b-q4_k_m"
+"#;
+        let result = ConfigSource::Toml(toml_content.to_string())
+            .parse()
+            .expect("llamacpp TOML must parse");
+        let LlmBackend::LlamaCpp {
+            endpoint, model, ..
+        } = result
+        else {
+            panic!("expected LlamaCpp backend");
+        };
+        assert_eq!(endpoint, "http://127.0.0.1:8080");
+        assert_eq!(model, "qwen3.5-4b-q4_k_m");
     }
 
     #[test]

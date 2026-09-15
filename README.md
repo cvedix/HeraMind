@@ -54,6 +54,10 @@
 
 <br/>
 
+## HeraMind 0.9.24
+
+This source update integrates [NeoMind v0.9.24](https://github.com/camthink-ai/NeoMind/releases/tag/v0.9.24): built-in local LLM support, IM bridges, OpenAPI, storage safeguards, and extension SDK 0.7.1. HeraMind keeps Vietnamese as the default language, its blue theme and logos, HeraCam/bodycam analytics, and its own data paths and update channel. See the [integration and validation notes](docs/upstream-sync-0.9.24.md). The source version does not imply a published HeraMind binary release.
+
 ## What is HeraMind?
 
 HeraMind is an **edge-deployed AI platform** that brings intelligence to IoT. It runs LLM-powered agents directly on your hardware, connecting to devices via MQTT/BLE/Webhook, automating responses through a rule engine, and visualizing everything on real-time dashboards — all without relying on cloud services.
@@ -134,7 +138,7 @@ HeraMind is a modular ecosystem with specialized resources for each concern:
 
 ### Available Extensions
 
-22 official extensions across vision, voice, IoT bridges, and utilities. Browse the full list in the [Extensions Marketplace](https://github.com/camthink-ai/HeraMind-Extensions).
+22 official extensions across vision, voice, IoT bridges, and utilities. Browse the full list in the [Extensions Marketplace](https://github.com/camthink-ai/NeoMind-Extensions).
 
 | Extension | Category | Description |
 |-----------|----------|-------------|
@@ -211,7 +215,7 @@ docker compose up -d
 
 **Specific version:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | VERSION=0.9.11 sh
+curl -fsSL https://raw.githubusercontent.com/CVEDIX/HeraMind/main/scripts/install.sh | sh
 ```
 
 **Custom directories:**
@@ -231,7 +235,7 @@ curl -fsSL ... | USE_NGINX=true sh
 
 **Manual installation:**
 ```bash
-VERSION=0.9.11
+VERSION=$(curl -fsSL https://api.github.com/repos/cvedix/HeraMind/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].removeprefix("v"))')
 wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-server-linux-amd64.tar.gz
 wget https://github.com/CVEDIX/HeraMind/releases/download/v${VERSION}/heramind-web-${VERSION}.tar.gz
 tar xzf heramind-server-linux-amd64.tar.gz
@@ -347,58 +351,6 @@ HeraMind/
 ├── docker-compose.yml           # Docker Compose configuration
 └── .env.example                 # Environment variable template
 ```
-
-## More Screenshots
-
-<details>
-<summary>Click to expand</summary>
-
-<br/>
-
-<table>
-  <tr>
-    <td><b>Login</b></td>
-    <td><b>AI Chat</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/login.png" width="480" /></td>
-    <td><img src="docs/img/chat.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>AI Agents</b></td>
-    <td><b>Rules Engine</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/agents.png" width="480" /></td>
-    <td><img src="docs/img/rules.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>Data Transforms</b></td>
-    <td><b>Messages</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/transforms.png" width="480" /></td>
-    <td><img src="docs/img/messages.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>Extensions</b></td>
-    <td><b>Data Push</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/extensions.png" width="480" /></td>
-    <td><img src="docs/img/data-push.png" width="480" /></td>
-  </tr>
-  <tr>
-    <td><b>LLM Backends</b></td>
-    <td><b>Mobile</b></td>
-  </tr>
-  <tr>
-    <td><img src="docs/img/llm-backends.png" width="480" /></td>
-    <td><img src="docs/img/mobile_web.png" width="200" /></td>
-  </tr>
-</table>
-
-</details>
 
 ## Configuration
 

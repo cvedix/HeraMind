@@ -229,7 +229,26 @@ impl RuleValidator {
                     });
                 }
             }
-            RuleCondition::Logical { conditions, .. } => {
+            RuleCondition::Logical {
+                operator,
+                conditions,
+            } => {
+                // NOT with multiple children evaluates as NOR (!any), not NAND —
+                // almost certainly not the author's intent. Warn (don't error,
+                // so existing multi-child NOT rules keep their current behavior).
+                if matches!(operator, crate::models::LogicalOperator::Not) && conditions.len() != 1
+                {
+                    issues.push(ValidationIssue {
+                        code: "not_multi_child".to_string(),
+                        message: format!(
+                            "NOT operator with {} conditions evaluates as NOR \
+                             (none-true), not NAND. Use exactly one condition.",
+                            conditions.len()
+                        ),
+                        field: None,
+                        severity: ValidationSeverity::Warning,
+                    });
+                }
                 for cond in conditions {
                     issues.extend(Self::validate_condition(cond, context)?);
                 }

@@ -29,6 +29,7 @@ import {
   type LucideIcon,
 } from "lucide-react"
 import { useStore } from "@/store"
+import { version as appVersion } from "../../package.json"
 import { cn } from "@/lib/utils"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Badge } from "@/components/ui/badge"
@@ -37,10 +38,10 @@ import { ThemeToggle } from "@/components/layout/ThemeToggle"
 import { SystemHealthButton } from "@/components/layout/SystemHealthButton"
 import { InstanceManagerDialog } from "@/components/instances/InstanceManagerDialog"
 import { OnboardingDialog } from "@/components/onboarding/OnboardingDialog"
+import { LanAccessSection } from "@/components/settings/LanAccessSection"
 import { useOnboarding } from "@/hooks/useOnboarding"
 import { useBrand } from "@/hooks/useBrand"
 import { MobilePageHeader } from "@/components/layout/MobilePageHeader"
-import { useIsMobile } from "@/hooks/useMobile"
 
 interface CardDef {
   id: string
@@ -73,7 +74,7 @@ function Card({ card }: { card: CardDef }) {
       <span className="min-w-0 flex-1">
         <span className="block truncate text-sm font-medium text-foreground">{t(card.titleKey)}</span>
         {card.descKey && (
-          <span className="block truncate text-[11px] text-muted-foreground">{t(card.descKey)}</span>
+          <span className="block truncate text-mini text-muted-foreground">{t(card.descKey)}</span>
         )}
       </span>
       {card.trailing ?? (
@@ -99,7 +100,7 @@ function CardWithDropdown({
       <span className="min-w-0 flex-1">
         <span className="block truncate text-sm font-medium text-foreground">{t(card.titleKey)}</span>
         {card.descKey && (
-          <span className="block truncate text-[11px] text-muted-foreground">{t(card.descKey)}</span>
+          <span className="block truncate text-mini text-muted-foreground">{t(card.descKey)}</span>
         )}
       </span>
       <span className="shrink-0">{children}</span>
@@ -109,7 +110,7 @@ function CardWithDropdown({
 
 function SectionLabel({ children }: { children: ReactNode }) {
   return (
-    <div className="px-4 pb-1.5 pt-4 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+    <div className="px-4 pb-1.5 pt-4 text-mini font-semibold uppercase tracking-wide text-muted-foreground">
       {children}
     </div>
   )
@@ -121,6 +122,7 @@ export default function SystemPage() {
   const navigate = useNavigate()
 
   const user = useStore((s) => s.user)
+  const openSettings = useStore((s) => s.openSettings)
   const logout = useStore((s) => s.logout)
   const alerts = useStore((s) => s.alerts)
   const { status: onboardingStatus, dismiss: dismissOnboarding } = useOnboarding()
@@ -228,7 +230,7 @@ export default function SystemPage() {
       iconTone: "bg-muted text-foreground",
       titleKey: "nav.settings",
       descKey: "system.cards.settings",
-      onClick: () => navigate("/settings"),
+      onClick: () => openSettings(),
     },
   ]
 
@@ -254,7 +256,7 @@ export default function SystemPage() {
       iconTone: "bg-muted text-foreground",
       titleKey: "system.about",
       descKey: "system.cards.about",
-      onClick: () => navigate("/settings?tab=about"),
+      onClick: () => openSettings("about"),
     },
     {
       id: "logout",
@@ -271,26 +273,26 @@ export default function SystemPage() {
     <div className="h-full overflow-y-auto overscroll-contain bg-background">
       <MobilePageHeader title={t("system.pageTitle")} />
       {/* Brand + user header (mobile ~70px) */}
-      <div className="border-b border-border bg-background px-4 pb-3 pt-3">
+      <div className=" bg-background px-4 pb-3 pt-3">
         <div className="flex items-center gap-2.5">
           <BrandLogoWithName logoClassName="h-8" />
           <div className="min-w-0 flex-1">
             <div className="truncate text-lg font-bold leading-tight text-foreground">{brandName}</div>
-            <div className="truncate text-[11px] text-muted-foreground">
-              {t("system.version", { version: "0.8.19" })}
+            <div className="truncate text-mini text-muted-foreground">
+              {t("system.version", { version: appVersion })}
             </div>
           </div>
         </div>
         {user && (
           <div className="mt-2 flex items-center gap-2 rounded-lg bg-muted-30 px-2.5 py-1.5">
             <Avatar className="h-6 w-6 rounded-full">
-              <AvatarFallback className="bg-muted text-[10px] font-medium text-foreground">
+              <AvatarFallback className="bg-muted text-nano font-medium text-foreground">
                 {userInitials}
               </AvatarFallback>
             </Avatar>
             <span className="truncate text-xs text-foreground">{user.username}</span>
             {user.role && (
-              <Badge variant="outline" className="ml-auto text-[10px]">
+              <Badge variant="outline" className="ml-auto text-nano">
                 {user.role}
               </Badge>
             )}
@@ -322,6 +324,11 @@ export default function SystemPage() {
             )}
           </div>
         ))}
+      </div>
+
+      {/* Desktop LAN access (renders nothing in web builds) */}
+      <div className="mt-4">
+        <LanAccessSection compact />
       </div>
 
       {/* Section 3 — About */}

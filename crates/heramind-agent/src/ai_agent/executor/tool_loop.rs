@@ -12,8 +12,8 @@ use heramind_storage::AiAgent;
 
 use super::super::AgentExecutor;
 use super::{
-    compact, summarize_tool_output, truncate_to, DedupOutcome, RoundData, ToolCallRecord,
-    ToolLoopOutput,
+    compact, summarize_tool_output, truncate_to, DedupOutcome, RoundData, StopReason,
+    ToolCallRecord, ToolLoopOutput,
 };
 use crate::agent::streaming::resolve_cached_arguments;
 use crate::agent::types::{LargeDataCache, ToolCall};
@@ -32,14 +32,12 @@ impl AgentExecutor {
         filtered_tools: &[heramind_core::llm::backend::ToolDefinition],
         messages: &mut Vec<Message>,
         execution_id: &str,
-        max_rounds: usize, // Made implicitly mutable by continuation mechanism below
+        max_rounds: usize,
         tool_name_map: &std::collections::HashMap<String, String>,
+        bound_image: Option<&str>,
     ) -> ToolLoopOutput {
         use crate::agent::tool_parser::parse_tool_calls;
         use heramind_core::llm::backend::{GenerationParams, LlmInput};
-
-        // max_rounds may be extended by the continuation mechanism
-        let mut max_rounds = max_rounds;
 
         // Build reverse map: original_name → sanitized_name
         // Used to convert tool result names back to what the LLM expects
@@ -51,6 +49,8 @@ impl AgentExecutor {
         let mut all_tool_results: Vec<crate::toolkit::ToolResult> = Vec::new();
         let mut round_data_list: Vec<RoundData> = Vec::new();
         let mut final_text = String::new();
+        // Why the loop ended — set at every break, surfaced via ToolLoopOutput.
+        let mut stop_reason = StopReason::NaturalCompletion;
         let mut last_llm_error: Option<LlmError> = None;
         let mut step_num = 1u32;
         // Accumulate skill tool results separately — inject as concise prompt, not full history
@@ -63,32 +63,55 @@ impl AgentExecutor {
         // full data so image-aware tools (vision/image_edit) receive it transparently.
         // Mirrors the chat-agent streaming layer (stream_core/stream_multimodal).
         let mut large_data_cache = LargeDataCache::new();
+        // Seed the cache with the agent's bound device image (if any) so the
+        // `$cached:` auto-inject path (`resolve_cached_arguments`) can hand the
+        // FULL image to image-shaped tool args — including extension tools
+        // (YOLO / grounding) whose `image` arg the LLM cannot fill with real
+        // bytes. Without this, extensions receive the LLM's truncated base64
+        // fragment and return `null` (task #50).
+        if let Some(url) = bound_image {
+            large_data_cache.seed_bound_image(url);
+        }
 
         // Cross-round tool deduplication: track tool signatures to avoid re-executing
         // the same tool with the same arguments across rounds.
         let mut all_executed_signatures: HashSet<String> = HashSet::new();
+        // Persistently-failing tool calls need a brake (dedup only records
+        // SUCCESSES, and StuckDetector is gone): a failed signature may fail up
+        // to FAILED_RETRY_BUDGET times total (budget 3 = the initial attempt +
+        // 2 retries), then is blacklisted so dedup skips it and the AllDuplicate
+        // path breaks the loop — instead of burning all max_rounds on the same
+        // broken call.
+        let mut failed_retries: HashMap<String, u32> = HashMap::new();
+        let mut failed_blacklist: HashSet<String> = HashSet::new();
+        const FAILED_RETRY_BUDGET: u32 = 3;
         // Duplicate round detection: track tool signatures per round to detect loops.
-        let mut prev_round_tool_names: String = String::new();
-        let mut consecutive_duplicate_rounds: usize = 0;
 
         // Get context window for token-aware compaction
         let context_window = llm_runtime.max_context_length();
 
-        // Continuation mechanism: when LLM is still making tool calls at
-        // max_rounds, allow extra rounds (up to MAX_CONTINUATION_ROUNDS)
-        // so the agent can finish its work instead of being cut off mid-task.
-        const MAX_CONTINUATION_ROUNDS: usize = 10;
         let mut round: usize = 0;
 
         loop {
+            // Agent defaults: read ONCE — AgentDefaults::get() opens the
+            // settings DB on every call and this loop used to do that twice
+            // per round (60 DB opens on a 30-round execution).
+            let agent_defaults = heramind_storage::AgentDefaults::get();
             if round >= max_rounds {
+                tracing::info!(
+                    agent_id = %agent.id,
+                    max_rounds,
+                    "Reached round budget — breaking to Phase 2 summary"
+                );
+                stop_reason = StopReason::MaxRounds;
                 break;
             }
+
             // Inject accumulated skill reference into system prompt once, after first tool round
             if round > 0 && !skill_reference.is_empty() && !skill_injected {
                 if let Some(sys_msg) = messages.first_mut() {
                     sys_msg.content = Content::text(format!(
-                        "{}\n\n## Skill Reference\n{}",
+                        "{}\n\n## Skill Reference\nCommands in this skill are canonical — use them exactly; don't guess subcommand names.\n\n{}",
                         sys_msg.content.as_text(),
                         skill_reference
                     ));
@@ -99,7 +122,11 @@ impl AgentExecutor {
             let input = LlmInput {
                 messages: messages.clone(),
                 params: GenerationParams {
-                    temperature: Some(0.7),
+                    // AgentDefaults is the /api/settings/agent surface — the
+                    // loop used to hardcode 0.7 and ignore it (config only
+                    // fed the chat path).
+                    temperature: Some(agent_defaults.default_temperature),
+                    top_p: Some(agent_defaults.default_top_p),
                     max_tokens: Some(4000),
                     ..Default::default()
                 },
@@ -131,6 +158,13 @@ impl AgentExecutor {
             let use_streaming = llm_runtime.capabilities().thinking_display;
             let output = {
                 let mut retries = 0u32;
+                // Context overflow is permanent per `is_permanent()`, but on
+                // local backends (llama.cpp/Ollama) a window SMALLER than the
+                // registry default means EVERY round overflows. One hard-
+                // compaction retry turns "small-model execution inevitably
+                // fails" into "completes"; only give up if even the halved
+                // window still overflows.
+                let mut overflow_retried = false;
                 let mut result: Option<heramind_core::llm::backend::LlmOutput> = None;
                 loop {
                     let generate_result = if use_streaming {
@@ -144,7 +178,9 @@ impl AgentExecutor {
                             break;
                         }
                         Err(e) => {
-                            let is_transient = !e.is_permanent();
+                            let is_overflow = matches!(&e, LlmError::ContextOverflow { .. });
+                            let is_transient =
+                                !e.is_permanent() || (is_overflow && !overflow_retried);
                             let round_num = round + 1;
                             let msg_count = messages.len();
                             let has_images = messages.iter().any(|m| {
@@ -153,6 +189,25 @@ impl AgentExecutor {
 
                             if is_transient && retries < MAX_TRANSIENT_RETRIES {
                                 retries += 1;
+                                if is_overflow {
+                                    overflow_retried = true;
+                                    // Shrink harder than the per-round pass:
+                                    // halve the effective window so
+                                    // CompactionConfig keeps fewer full-size
+                                    // results and evicts more aggressively.
+                                    let window =
+                                        if context_window == 0 || context_window > 1_000_000 {
+                                            8192
+                                        } else {
+                                            context_window
+                                        };
+                                    compact::compact_executor_messages(messages, window / 2);
+                                    tracing::warn!(
+                                        agent_id = %agent.id,
+                                        round = round_num,
+                                        "Context overflow — hard-compacting messages (halved window) and retrying once"
+                                    );
+                                }
                                 let delay_ms = 500u64 * 2u64.pow(retries); // 1s, then 2s
                                 tracing::warn!(
                                     agent_id = %agent.id,
@@ -182,6 +237,7 @@ impl AgentExecutor {
                             );
                             last_llm_error = Some(e);
                             final_text = "LLM generation failed during tool execution.".to_string();
+                            stop_reason = StopReason::LlmError;
                             break;
                         }
                     }
@@ -338,52 +394,47 @@ impl AgentExecutor {
 
             // --- Per-round tool call cap ---
             // Prevent single-round explosion (e.g. 17 parallel device queries).
-            // Keep only the first N calls and tell the LLM to defer the rest.
+            // Execute ALL calls the model asked for (the executor semaphore +
+            // per-batch concurrency below bound in-flight work) — truncating
+            // here would silently drop calls the model explicitly wanted. Only
+            // log the batch size for observability.
             const MAX_TOOL_CALLS_PER_ROUND: usize = 6;
             if tool_calls.len() > MAX_TOOL_CALLS_PER_ROUND {
-                let total = tool_calls.len();
-                let deferred_names: Vec<String> = tool_calls[MAX_TOOL_CALLS_PER_ROUND..]
-                    .iter()
-                    .map(|tc| {
-                        tc.arguments
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&tc.name)
-                            .split_whitespace()
-                            .take(4)
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .collect();
                 tracing::info!(
                     agent_id = %agent.id,
                     round = round + 1,
-                    total,
-                    kept = MAX_TOOL_CALLS_PER_ROUND,
-                    "Capping tool calls per round"
+                    total = tool_calls.len(),
+                    "Executing full tool-call batch"
                 );
-                tool_calls.truncate(MAX_TOOL_CALLS_PER_ROUND);
-                // Inject hint so LLM knows there's more work to do
-                messages.push(Message::new(
-                    MessageRole::User,
-                    Content::text(format!(
-                        "[System] {} tool call(s) were deferred to save time. Remaining tasks: {}. \
-                         Continue in the next round if needed.",
-                        total - MAX_TOOL_CALLS_PER_ROUND,
-                        deferred_names.join("; ")
-                    )),
-                ));
             }
 
             // --- Intra-round + Cross-round deduplication ---
             let dedup_outcome = deduplicate_tool_calls(
                 &mut tool_calls,
                 &mut all_executed_signatures,
+                &failed_blacklist,
                 &agent.id,
                 round,
             );
 
             if matches!(dedup_outcome, DedupOutcome::AllDuplicate) {
+                // If we already have tool results to reason over, stop looping —
+                // the model's tool vocabulary for this turn is exhausted and the
+                // nudged "do something different" call only burns an LLM round
+                // (the calls keep dedup-filtering back to empty). Break to the
+                // Phase 2 summary so the agent synthesizes from what it has.
+                // When we have NO results yet, give the model one more chance.
+                if !all_tool_results.is_empty() {
+                    self.send_thinking(
+                        &agent.id,
+                        execution_id,
+                        step_num,
+                        "All tool calls were duplicates — synthesizing from results so far",
+                    )
+                    .await;
+                    stop_reason = StopReason::AllDuplicate;
+                    break;
+                }
                 messages.push(Message::new(
                     MessageRole::Assistant,
                     Content::text(&output.text),
@@ -421,30 +472,9 @@ impl AgentExecutor {
                 }
             }
 
-            // --- Duplicate round detection ---
-            let should_break = detect_duplicate_round(
-                &tool_calls,
-                &mut prev_round_tool_names,
-                &mut consecutive_duplicate_rounds,
-                &agent.id,
-                round,
-            );
-            // We need &self for send_thinking, so handle the break here
-            let should_break = if should_break {
-                self.send_thinking(
-                    &agent.id,
-                    execution_id,
-                    step_num,
-                    "Stopping: detected repeated tool calling pattern, forcing text response",
-                )
-                .await;
-                true
-            } else {
-                false
-            };
-            if should_break {
-                break;
-            }
+            // Stuck-pattern detection is not a separate mechanism here: the
+            // cross-round dedup above IS the loop brake (a fully-duplicated
+            // round trips AllDuplicate below and exits via the Phase 2 summary).
 
             tracing::debug!(
                 agent_id = %agent.id, round = round + 1, tool_count = tool_calls.len(),
@@ -479,6 +509,16 @@ impl AgentExecutor {
             // Resolve `$cached:<key>` references in tool arguments against this
             // execution's LargeDataCache so image-aware tools receive the full
             // binary payload (the LLM only sees the slim summary in its prompt).
+            //
+            // Hallucinated CLI-domain tools → shell: weak models sometimes emit
+            // a whole `heramind ...` command or a CLI domain (e.g. `device(...)`,
+            // `rule(...)`) as the tool name instead of calling `shell`. The chat
+            // path auto-routes these to `shell` (tool_exec.rs) before executing;
+            // the scheduled path previously only emitted a text hint and burned
+            // an extra LLM round re-emitting the same call. Mirror the chat
+            // behavior here: resolve through the shared mapper, and when it maps
+            // to `shell`, convert the structured args into the CLI command string
+            // `ShellTool` expects ({"command": "heramind <domain> ..."}).
             let calls: Vec<_> = tool_calls
                 .iter()
                 .map(|tc| {
@@ -486,29 +526,179 @@ impl AgentExecutor {
                         .get(&tc.name)
                         .cloned()
                         .unwrap_or_else(|| tc.name.clone());
-                    let resolved_args =
-                        resolve_cached_arguments(&tc.arguments, &large_data_cache, &original_name);
+                    let (exec_name, exec_args) = if original_name == "shell" {
+                        // Real shell call — pass through, resolve $cached refs as-is.
+                        (
+                            original_name.clone(),
+                            resolve_cached_arguments(
+                                &tc.arguments,
+                                &large_data_cache,
+                                &original_name,
+                            ),
+                        )
+                    } else if crate::tools::resolve_tool_name(&original_name) == "shell"
+                        && original_name != "shell"
+                    {
+                        // Hallucinated CLI-domain tool → convert to a shell command.
+                        match crate::tools::mapper::build_cli_command(&original_name, &tc.arguments)
+                        {
+                            Some(args) => ("shell".to_string(), args),
+                            None => (
+                                original_name.clone(),
+                                resolve_cached_arguments(
+                                    &tc.arguments,
+                                    &large_data_cache,
+                                    &original_name,
+                                ),
+                            ),
+                        }
+                    } else {
+                        (
+                            original_name.clone(),
+                            resolve_cached_arguments(
+                                &tc.arguments,
+                                &large_data_cache,
+                                &original_name,
+                            ),
+                        )
+                    };
                     crate::toolkit::registry::ToolCall {
-                        name: original_name,
-                        args: resolved_args,
+                        name: exec_name,
+                        args: exec_args,
                         id: Some(tc.id.clone()),
                     }
                 })
                 .collect();
+            // Execute tools in batches of MAX_TOOL_CALLS_PER_ROUND so a large
+            // batch (e.g. 17 device queries) never runs unbounded-parallel
+            // (JoinSet spawns everything at once; the semaphore only bounds
+            // the batch, not per-tool work). All calls execute — nothing is
+            // dropped. Results are reassembled in original order (execute_parallel
+            // returns in input order, so positions line up).
             let results = if calls.is_empty() {
                 Vec::new()
             } else {
-                let _permit = match self.tool_concurrency.acquire().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("Tool concurrency semaphore closed: {}", e);
+                // Safety policy: block catastrophic shell commands (rm -rf /,
+                // dd to a device, mkfs, pipe-to-shell, fork bomb, destructive
+                // heramind CLI) BEFORE execution. Denied calls get a synthetic
+                // error result at their position; the rest execute normally.
+                let blocked: Vec<(usize, String)> = calls
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| {
+                        if c.name == "shell" {
+                            c.args
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .and_then(crate::toolkit::policy::deny_reason)
+                                .map(|r| (i, r))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Split into blocked + permitted so we can run only permitted calls.
+                let blocked_set: HashSet<usize> = blocked.iter().map(|(i, _)| *i).collect();
+                let mut assembled: Vec<Option<crate::toolkit::ToolResult>> =
+                    (0..calls.len()).map(|_| None).collect();
+                let permitted: Vec<(usize, crate::toolkit::registry::ToolCall)> = calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !blocked_set.contains(i))
+                    .map(|(i, c)| (i, c.clone()))
+                    .collect();
+
+                // Insert the policy-blocked synthetic errors first.
+                for (i, reason) in &blocked {
+                    assembled[*i] = Some(crate::toolkit::ToolResult {
+                        name: calls[*i].name.clone(),
+                        result: Err(crate::toolkit::error::ToolError::Execution(format!(
+                            "Blocked by safety policy: {}",
+                            reason
+                        ))),
+                    });
+                }
+
+                if !permitted.is_empty() {
+                    // Run permitted calls in bounded batches, preserving order.
+                    for batch in permitted.chunks(MAX_TOOL_CALLS_PER_ROUND) {
+                        // RAII: held for the duration of each batch.
+                        let _permit = match self.tool_concurrency.acquire().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::error!("Tool concurrency semaphore closed: {}", e);
+                                stop_reason = StopReason::Cancelled;
+                                // Give unexecuted calls a Cancelled result so the
+                                // loop below doesn't panic on missing slots.
+                                for (i, _) in batch {
+                                    assembled[*i] = Some(crate::toolkit::ToolResult {
+                                        name: calls[*i].name.clone(),
+                                        result: Err(crate::toolkit::error::ToolError::Canceled),
+                                    });
+                                }
+                                break;
+                            }
+                        };
+                        let batch_calls: Vec<crate::toolkit::registry::ToolCall> =
+                            batch.iter().map(|(_, c)| c.clone()).collect();
+                        let batch_results = registry.execute_parallel(batch_calls).await;
+                        for ((idx, _), res) in batch.iter().zip(batch_results) {
+                            assembled[*idx] = Some(res);
+                        }
+                    }
+                    // The semaphore being closed means shutdown — do NOT keep
+                    // burning LLM rounds; exit the whole round loop.
+                    if stop_reason == StopReason::Cancelled {
                         break;
                     }
-                };
-                registry.execute_parallel(calls).await
+                }
+
+                // Any slot still None (shouldn't happen) gets a placeholder.
+                assembled
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, opt)| {
+                        opt.unwrap_or_else(|| crate::toolkit::ToolResult {
+                            name: calls[i].name.clone(),
+                            result: Err(crate::toolkit::error::ToolError::Execution(
+                                "No result".to_string(),
+                            )),
+                        })
+                    })
+                    .collect()
             };
 
             let round_tool_calls = build_round_tool_calls(&tool_calls, &results, tool_name_map);
+
+            // Record SUCCESSFUL executions into the cross-round dedup set.
+            // (Failed ones stay out so the model can retry them — the dedup
+            // pass only consults the set, never pre-populates it.)
+            for (tc, result) in tool_calls.iter().zip(results.iter()) {
+                let sig = tool_signature(tc);
+                if matches!(&result.result, Ok(o) if o.success) {
+                    all_executed_signatures.insert(sig.clone());
+                    // A success resets the failure counter — only CONSECUTIVE
+                    // failures should blacklist (a flaky call that recovered is
+                    // not a persistently-broken one).
+                    failed_retries.remove(&sig);
+                } else {
+                    // Failed call: allow a bounded number of retries, then
+                    // blacklist so dedup skips it and AllDuplicate breaks the
+                    // loop (no unbounded retry of a persistently-broken call).
+                    let count = failed_retries.entry(sig.clone()).or_insert(0);
+                    *count += 1;
+                    if *count >= FAILED_RETRY_BUDGET {
+                        failed_blacklist.insert(sig.clone());
+                        tracing::debug!(
+                            agent_id = %agent.id,
+                            sig = %sig,
+                            retries = *count,
+                            "blacklisting persistently-failing tool call after retry budget"
+                        );
+                    }
+                }
+            }
 
             round_data_list.push(RoundData {
                 thought: if remaining_text.is_empty() {
@@ -530,6 +720,7 @@ impl AgentExecutor {
                     execution_id,
                     step_num,
                     &mut large_data_cache,
+                    context_window,
                 )
                 .await;
             step_num = new_step_num;
@@ -570,33 +761,41 @@ impl AgentExecutor {
                 }
             }
 
-            // --- Continuation check ---
-            // At the current max_rounds boundary, if the LLM was still making
-            // tool calls this round (didn't naturally finish), extend the loop
-            // so the agent can complete its work instead of being cut off mid-task.
-            let had_tool_calls = !round_data_list
-                .last()
-                .is_none_or(|rd| rd.tool_calls.is_empty());
-            if round + 1 == max_rounds && had_tool_calls {
-                let extension = MAX_CONTINUATION_ROUNDS;
-                max_rounds += extension;
-                tracing::info!(
-                    agent_id = %agent.id,
-                    new_limit = max_rounds,
-                    "LLM still executing tools at round limit — extending by {} rounds",
-                    extension,
-                );
+            // --- Remaining-round countdown ---
+            // Small models otherwise run to the budget and get force-summarized
+            // by Phase 2; telling them how much runway is left lets them wrap
+            // up themselves (synthesize an answer) instead of starting a new
+            // tool chain that the cap will cut off. Fires within the last 3
+            // rounds — early enough to affect behavior, late enough to not be
+            // a daily nag.
+            let remaining = max_rounds.saturating_sub(round + 1);
+            if remaining > 0 && remaining <= 3 {
+                messages.push(Message::new(
+                    MessageRole::System,
+                    Content::text(format!(
+                        "[System] You have {remaining} tool round(s) left in this run. \
+                         If your goal is complete or blocked, give your final answer NOW instead of starting new tool calls."
+                    )),
+                ));
             }
 
+            // The round budget is a hard cap. When the LLM is still tool-calling
+            // at the boundary, the post-loop Phase 2 summary synthesizes a final
+            // answer from accumulated results — instead of the old `max_rounds
+            // += 10` extension hack that masked the real cap and burned extra
+            // LLM calls on an already-stuck agent.
             round += 1;
         }
 
         // If all rounds exhausted without LLM producing final text, OR if LLM failed
         // mid-loop (error message in final_text), use Focused's Phase 2 pattern to
-        // generate a natural language conclusion.
-        let needs_summary = final_text.is_empty()
-            || final_text == "LLM generation failed during tool execution."
-            || final_text == "Completed tool execution rounds.";
+        // generate a natural language conclusion. Never on Cancelled — that's a
+        // shutdown signal; synthesizing would fire one more LLM call we're asked
+        // to avoid.
+        let needs_summary = stop_reason != StopReason::Cancelled
+            && (final_text.is_empty()
+                || final_text == "LLM generation failed during tool execution."
+                || final_text == "Completed tool execution rounds.");
         if needs_summary && !all_tool_results.is_empty() {
             final_text.clear();
             let summary = self
@@ -637,6 +836,7 @@ impl AgentExecutor {
 
         ToolLoopOutput {
             final_text,
+            stop_reason,
             all_tool_results,
             round_data_list_raw: round_data_list
                 .into_iter()
@@ -659,6 +859,7 @@ impl AgentExecutor {
 pub(crate) fn deduplicate_tool_calls(
     tool_calls: &mut Vec<ToolCall>,
     all_executed_signatures: &mut HashSet<String>,
+    failed_blacklist: &HashSet<String>,
     agent_id: &str,
     round: usize,
 ) -> DedupOutcome {
@@ -674,7 +875,7 @@ pub(crate) fn deduplicate_tool_calls(
     let mut skipped_cross_round: Vec<String> = Vec::new();
     tool_calls.retain(|tc| {
         let sig = tool_signature(tc);
-        if all_executed_signatures.contains(&sig) {
+        if all_executed_signatures.contains(&sig) || failed_blacklist.contains(&sig) {
             // Collect a human-readable summary for the hint
             if tc.name == "shell" {
                 if let Some(cmd) = tc.arguments.get("command").and_then(|v| v.as_str()) {
@@ -685,7 +886,11 @@ pub(crate) fn deduplicate_tool_calls(
             }
             false
         } else {
-            all_executed_signatures.insert(sig);
+            // NOTE: signatures are inserted only AFTER a successful execution
+            // (see the caller's record-successful pass). A failed call is NOT
+            // deduplicated — the model must be able to retry it (a transient
+            // MQTT/extension timeout used to be swallowed as a "duplicate",
+            // ending the loop via AllDuplicate with the error in hand).
             true
         }
     });
@@ -789,74 +994,6 @@ pub(crate) fn normalize_shell_command(cmd: &str) -> String {
         }
     }
     filtered.join(" ")
-}
-
-/// Detect duplicate rounds by comparing tool signatures.
-///
-/// Compares tool signatures (name + key arguments) to detect truly stuck loops.
-/// Only counts as duplicate when the FULL round's tool set AND arguments match
-/// the previous round — different arguments to the same tool are NOT duplicates.
-///
-/// Returns `true` if the LLM is stuck (3+ consecutive identical rounds).
-pub(crate) fn detect_duplicate_round(
-    tool_calls: &[ToolCall],
-    prev_round_tool_names: &mut String,
-    consecutive_duplicate_rounds: &mut usize,
-    agent_id: &str,
-    round: usize,
-) -> bool {
-    let current_round_sig = {
-        let mut sigs: Vec<String> = tool_calls
-            .iter()
-            .map(|tc| {
-                let action = tc
-                    .arguments
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let mut sig = format!("{}|{}", tc.name, action);
-                // Include shell command so different commands don't look identical
-                if let Some(cmd) = tc.arguments.get("command").and_then(|v| v.as_str()) {
-                    sig.push_str(&format!("|cmd:{}", cmd));
-                }
-                for param in &["device_id", "metric", "agent_id", "rule_id", "extension_id"] {
-                    if let Some(val) = tc.arguments.get(*param).and_then(|v| v.as_str()) {
-                        sig.push_str(&format!("|{}", val));
-                    }
-                }
-                sig
-            })
-            .collect();
-        sigs.sort();
-        sigs.join(";;")
-    };
-    if current_round_sig == *prev_round_tool_names {
-        *consecutive_duplicate_rounds += 1;
-        tracing::info!(
-            agent_id = %agent_id,
-            round = round + 1,
-            consecutive_duplicates = consecutive_duplicate_rounds,
-            "Duplicate tool round detected (same tools + args) — continuing, cross-round dedup handles re-execution"
-        );
-    } else {
-        *consecutive_duplicate_rounds = 0;
-    }
-    *prev_round_tool_names = current_round_sig;
-
-    // Stop after 3+ consecutive identical rounds — the LLM is stuck.
-    // Repeated tool calls in complex tasks are normal; cross-round dedup above
-    // already prevents actual re-execution.
-    if *consecutive_duplicate_rounds >= 3 {
-        tracing::warn!(
-            agent_id = %agent_id,
-            round = round + 1,
-            consecutive_duplicates = consecutive_duplicate_rounds,
-            "LLM stuck in loop (3+ consecutive duplicate rounds), forcing text response"
-        );
-        true
-    } else {
-        false
-    }
 }
 
 /// Build the list of ToolCallRecords from executed tool calls and their results.

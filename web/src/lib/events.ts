@@ -33,7 +33,20 @@ export type EventType =
   | 'ExtensionLifecycle'
   | 'FrontendComponentLifecycle'
   | 'DashboardUpdated'
+  | 'DataChanged'
+  | 'ModelDownloadProgress'
+  | 'SystemUpgradeProgress'
   | 'Custom'
+
+export interface DataChangedEvent extends HeraMindEvent {
+  type: 'DataChanged'
+  /** Data domain, from the mutating path segment (e.g. "devices", "automations") */
+  domain: string
+  /** HTTP method of the mutating request */
+  method: string
+  /** Full request path */
+  path: string
+}
 
 export interface CustomEvent extends HeraMindEvent {
   type: 'Custom'
@@ -90,6 +103,38 @@ export interface FrontendComponentLifecycleEvent extends HeraMindEvent {
   data: {
     component_id: string
     state: 'installed' | 'uninstalled'
+  }
+}
+
+// Builtin LLM model download progress events (WS/SSE → progress bar).
+// `total`/`error` are `Option` on the backend: `total` serializes as `null`
+// when unknown, and `error` is `null`/absent when there is no failure — the
+// handler must tolerate both null and missing fields.
+export interface ModelDownloadProgressEvent extends HeraMindEvent {
+  type: 'ModelDownloadProgress'
+  data: {
+    model_id: string
+    downloaded: number
+    total: number | null
+    status: 'downloading' | 'complete' | 'error' | 'cancelled'
+    error?: string | null
+  }
+}
+
+// Web-triggered server self-upgrade progress (About page dialog). Like
+// ModelDownloadProgress it belongs to no `is_*_event()` category on the
+// backend — subscribe on the unfiltered 'all' stream. Optional fields
+// (`skip_serializing_if` on the backend) may be absent or null.
+export interface SystemUpgradeProgressEvent extends HeraMindEvent {
+  type: 'SystemUpgradeProgress'
+  data: {
+    phase: 'checking' | 'downloading' | 'verifying' | 'staged' | 'applying' | 'restarting' | 'done' | 'error'
+    current_version: string
+    target_version?: string | null
+    downloaded?: number | null
+    total?: number | null
+    message?: string | null
+    error?: string | null
   }
 }
 
@@ -604,7 +649,7 @@ export class EventsWebSocket {
     }
 
     // Exponential backoff with jitter: 2^n * 1000ms, capped at 30s
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000)
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000) * (0.5 + Math.random() * 0.5)
     this.reconnectAttempts++
 
     this.reconnectTimer = setTimeout(() => {

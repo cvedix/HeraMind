@@ -16,13 +16,22 @@ import {
   FullScreenDialogMain,
 } from '@/components/automation/dialog/FullScreenDialog'
 import {
+  ResponsiveContainer,
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+} from 'recharts'
+import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Search, Database, Cpu, Puzzle, Workflow, Brain, History, Loader2, Eye, Download, Clock, Copy, Check, Send, Plus } from 'lucide-react'
+import { Search, Database, Cpu, Puzzle, Workflow, Brain, History, Loader2, Eye, Download, Clock, Copy, Check, Send, Plus, AlertTriangle, RefreshCw } from 'lucide-react'
 import { api } from '@/lib/api'
 import { isBase64Image, getImageDataUrl } from '@/pages/devices/utils'
 import { cn } from '@/lib/utils'
@@ -34,6 +43,7 @@ import { textNano, textMini } from "@/design-system/tokens/typography"
 import { ExportDataDialog } from '@/components/data/ExportDataDialog'
 import { formatTimestamp } from '@/lib/utils/format'
 import { PushTargetsTab } from '@/components/datapush/PushTargetsTab'
+import { copyToClipboard } from '@/lib/clipboard'
 
 type TabValue = 'data' | 'push'
 
@@ -107,10 +117,25 @@ export function DataExplorerPage() {
   const [selectedSource, setSelectedSource] = useState<UnifiedDataSourceInfo | null>(null)
   const [exportSource, setExportSource] = useState<UnifiedDataSourceInfo | null>(null)
   const [historyRange, setHistoryRange] = useState<string>('1h')
-  const [historyData, setHistoryData] = useState<Array<{ timestamp: number; value: unknown; quality: number | null }>>([])
+  // Chart rides a separate query from the table: the chart always wants the
+  // NEWEST N points regardless of pagination, while the table pages through
+  // the full range server-side (offset + total_count).
+  const [chartData, setChartData] = useState<Array<{ timestamp: number; value: unknown; quality: number | null }>>([])
+  const [chartTotal, setChartTotal] = useState<number | null>(null)
+  const CHART_POINT_CAP = 500
+  const [tableData, setTableData] = useState<Array<{ timestamp: number; value: unknown; quality: number | null }>>([])
+  const [tableTotal, setTableTotal] = useState(0)
+  // Range aggregates for the side pane — numeric metrics only, same gate as
+  // the trend chart; string/bool/image types get no min/max/avg block.
+  const [rangeStats, setRangeStats] = useState<{ min: number | null; max: number | null; avg: number | null } | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
+  // Distinguishes "query failed" from "genuinely no data" — collapsing the two
+  // made an unreachable backend look identical to an empty series.
+  const [historyError, setHistoryError] = useState(false)
+  const [historyRetryTick, setHistoryRetryTick] = useState(0)
   const [historyPage, setHistoryPage] = useState(1)
   const historyPageSize = 10
+  const lastFetchKeyRef = useRef('')
   const [copiedValue, setCopiedValue] = useState(false)
 
   // Abort controller for cancelling in-flight requests on unmount
@@ -132,7 +157,7 @@ export function DataExplorerPage() {
       if (selectedSourceName !== '__all__') params.source = selectedSourceName
       if (debouncedSearch.trim()) params.search = debouncedSearch.trim()
 
-      const res = await api.listUnifiedDataSources(params)
+      const res = await api.listUnifiedDataSources(params, controller.signal)
       if (controller.signal.aborted) return
       const newData = res?.data || []
       if (isMobile && page > 1) {
@@ -174,7 +199,9 @@ export function DataExplorerPage() {
     updateSearch(search)
   }, [search, updateSearch])
 
-  // Refresh on device events (debounced to avoid burst refetches)
+  // Refresh on device events (debounced to avoid burst refetches).
+  // Clear the pending timer on unmount — otherwise it fires a fetch and
+  // sets state on a gone page.
   const eventFetchRef = useRef<ReturnType<typeof setTimeout>>()
   useEvents({
     enabled: true,
@@ -184,11 +211,66 @@ export function DataExplorerPage() {
       eventFetchRef.current = setTimeout(fetchDataSources, 1000)
     },
   })
+  useEffect(() => () => clearTimeout(eventFetchRef.current), [])
 
-  // Fetch historical telemetry when a source is selected or range changes
+  // Range aggregates for the side pane — parallel streaming folds on the
+  // backend, cheap; skipped entirely for non-numeric metrics.
+  useEffect(() => {
+    const numeric = selectedSource?.data_type === 'integer' || selectedSource?.data_type === 'float'
+    if (!selectedSource || !numeric) {
+      setRangeStats(null)
+      return
+    }
+    const rangeSeconds: Record<string, number> = {
+      '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800,
+    }
+    const now = Math.floor(Date.now() / 1000)
+    const start = now - (rangeSeconds[historyRange] || 3600)
+    const parts = selectedSource.id.split(':')
+    if (parts.length < 3) return
+    const source = `${parts[0]}:${parts[1]}`
+    const metric = parts.slice(2).join(':')
+    let stale = false
+    Promise.all([
+      api.aggregateTelemetry(source, metric, start, now, 'min'),
+      api.aggregateTelemetry(source, metric, start, now, 'max'),
+      api.aggregateTelemetry(source, metric, start, now, 'avg'),
+    ]).then(([min, max, avg]) => {
+      if (stale) return
+      setRangeStats({ min: min?.value ?? null, max: max?.value ?? null, avg: avg?.value ?? null })
+    }).catch(() => {
+      if (!stale) setRangeStats(null)
+    })
+    return () => { stale = true }
+  }, [selectedSource, historyRange, historyRetryTick])
+
+  // Chart query — the NEWEST CHART_POINT_CAP points; independent of table
+  // pagination (flipping pages must not refetch the chart).
+  useEffect(() => {
+    if (!selectedSource) { setChartData([]); setChartTotal(null); return }
+    const rangeSeconds: Record<string, number> = {
+      '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800,
+    }
+    const now = Math.floor(Date.now() / 1000)
+    const start = now - (rangeSeconds[historyRange] || 3600)
+    const parts = selectedSource.id.split(':')
+    if (parts.length < 3) return
+    const source = `${parts[0]}:${parts[1]}`
+    const metric = parts.slice(2).join(':')
+    let stale = false
+    api.queryTelemetry(source, metric, start, now, CHART_POINT_CAP).then(res => {
+      if (stale) return
+      setChartData((res?.data || []).map(p => ({ timestamp: p.timestamp, value: p.value, quality: p.quality })))
+      setChartTotal(typeof res?.total_count === 'number' ? res.total_count : null)
+    }).catch(() => { if (!stale) { setChartData([]); setChartTotal(null) } })
+    return () => { stale = true }
+  }, [selectedSource, historyRange, historyRetryTick])
+
+  // Table query — one server-paged window (offset = (page-1) * pageSize).
   useEffect(() => {
     if (!selectedSource) {
-      setHistoryData([])
+      setTableData([])
+      setTableTotal(0)
       setHistoryLoading(false)
       setHistoryPage(1)
       return
@@ -198,31 +280,38 @@ export function DataExplorerPage() {
     }
     const now = Math.floor(Date.now() / 1000)
     const start = now - (rangeSeconds[historyRange] || 3600)
-
     const parts = selectedSource.id.split(':')
     if (parts.length < 3) return
     const source = `${parts[0]}:${parts[1]}`
     const metric = parts.slice(2).join(':')
-
     let stale = false
     setHistoryLoading(true)
-    setHistoryPage(1)
-    api.queryTelemetry(source, metric, start, now, 500).then(res => {
+    setHistoryError(false)
+    // Range/source/retry changes reset to page 1 — detected via a ref so the
+    // reset itself re-runs this effect exactly once with the settled page.
+    const fetchKey = `${selectedSource.id}|${historyRange}|${historyRetryTick}`
+    if (lastFetchKeyRef.current !== fetchKey) {
+      lastFetchKeyRef.current = fetchKey
+      if (historyPage !== 1) {
+        setHistoryPage(1)
+        return
+      }
+    }
+    api.queryTelemetry(source, metric, start, now, historyPageSize, false, (historyPage - 1) * historyPageSize).then(res => {
       if (stale) return
-      setHistoryData((res?.data || []).map(p => ({
-        timestamp: p.timestamp,
-        value: p.value,
-        quality: p.quality,
-      })))
+      setTableData((res?.data || []).map(p => ({ timestamp: p.timestamp, value: p.value, quality: p.quality })))
+      setTableTotal(typeof res?.total_count === 'number' ? res.total_count : (res?.data || []).length)
     }).catch(err => {
       if (stale) return
       console.error('[DataExplorer] Failed to fetch history:', err)
-      setHistoryData([])
+      setTableData([])
+      setTableTotal(0)
+      setHistoryError(true)
     }).finally(() => {
       if (!stale) setHistoryLoading(false)
     })
     return () => { stale = true }
-  }, [selectedSource, historyRange])
+  }, [selectedSource, historyRange, historyRetryTick, historyPage])
 
   const tabs = useMemo(() => [
     { value: 'data', label: t('data:tabs.all', 'Data'), icon: <Database className="h-4 w-4" /> },
@@ -349,7 +438,7 @@ export function DataExplorerPage() {
       onRowClick={(row) => setSelectedSource(row as unknown as UnifiedDataSourceInfo)}
       loading={loading}
       flexHeight
-      className={isSearchPending ? 'opacity-60 transition-opacity duration-200' : undefined}
+      className={isSearchPending ? 'opacity-60 transition-opacity duration-normal' : undefined}
       emptyState={
         <EmptyState
           icon={<Database className="h-12 w-12" />}
@@ -467,113 +556,151 @@ export function DataExplorerPage() {
           onClose={() => setSelectedSource(null)}
         />
         <FullScreenDialogContent>
-          <FullScreenDialogMain className="p-4 md:p-6 lg:p-8">
-            {selectedSource && (
-              <div className="max-w-4xl mx-auto space-y-6">
-                {/* Tier 1: Current Value (prominent) */}
-                <div className="rounded-xl border p-5">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 flex-1">
-                      {(() => {
-                        const v = selectedSource.current_value
-                        if (v === undefined || v === null) {
-                          return <span className="text-lg text-muted-foreground">{t('data:noData', 'No current data')}</span>
-                        }
-                        // Image base64
-                        if (typeof v === 'string' && isBase64Image(v)) {
-                          return <img src={getImageDataUrl(v) ?? undefined} alt="metric" className="max-h-32 rounded-lg object-contain" />
-                        }
-                        // Object/JSON: clamp to 5 lines + copy full value
-                        if (typeof v === 'object') {
-                          const jsonText = JSON.stringify(v, null, 2)
-                          const overflows = jsonText.split('\n').length > 5
-                          return (
-                            <div className="space-y-1">
-                              <div className="flex items-start gap-2">
-                                <pre className={cn(
-                                  "flex-1 min-w-0 font-mono text-sm whitespace-pre-wrap break-all",
-                                  overflows && "line-clamp-5"
-                                )}>
-                                  {jsonText}
-                                </pre>
-                                {overflows && (
-                                  <button
-                                    type="button"
-                                    onClick={async () => {
-                                      try { await navigator.clipboard.writeText(jsonText); setCopiedValue(true); setTimeout(() => setCopiedValue(false), 2000) } catch {}
-                                    }}
-                                    className="shrink-0 mt-0.5 text-muted-foreground hover:text-foreground"
-                                    title={t('common:copy', 'Copy')}
-                                  >
-                                    {copiedValue ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          )
-                        }
-                        // String scalar: short → prominent, long/base64 → clamped code block + copy
-                        const str = String(v)
-                        const isLong = str.length > 80 || str.includes('\n')
-                        if (isLong) {
-                          const overflows = str.length > 200 || str.split('\n').length > 3
-                          return (
-                            <div className="space-y-1">
-                              <div className="flex items-start gap-2">
-                                <pre className={cn(
-                                  "flex-1 min-w-0 font-mono text-sm whitespace-pre-wrap break-all",
-                                  overflows && "line-clamp-3"
-                                )}>
-                                  {str}
-                                </pre>
-                                {overflows && (
-                                  <button
-                                    type="button"
-                                    onClick={async () => {
-                                      try { await navigator.clipboard.writeText(str); setCopiedValue(true); setTimeout(() => setCopiedValue(false), 2000) } catch {}
-                                    }}
-                                    className="shrink-0 mt-0.5 text-muted-foreground hover:text-foreground"
-                                    title={t('common:copy', 'Copy')}
-                                  >
-                                    {copiedValue ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          )
-                        }
-                        // Short scalar: prominent display
-                        return (
-                          <div className="flex items-baseline gap-2 flex-wrap">
-                            <span className="font-mono text-2xl md:text-3xl font-semibold break-all">{str}</span>
-                            {selectedSource.unit && (
-                              <span className="font-mono text-lg text-muted-foreground">{selectedSource.unit}</span>
-                            )}
-                          </div>
-                        )
-                      })()}
-                    </div>
-                    {selectedSource.data_type && (
-                      <Badge variant="secondary" className={cn(textNano, "shrink-0")}>{selectedSource.data_type}</Badge>
+          {selectedSource && (() => {
+            // Value rendering is shared by the desktop side pane and the
+            // mobile top strip — one definition, two mounts.
+            const renderValue = () => (
+              (() => {
+            const v = selectedSource.current_value
+            if (v === undefined || v === null) {
+              return <span className="text-sm text-muted-foreground">{t('data:noData', 'No current data')}</span>
+            }
+            // Image base64
+            if (typeof v === 'string' && isBase64Image(v)) {
+              return <img src={getImageDataUrl(v) ?? undefined} alt="metric" className="max-h-32 rounded-lg object-contain" />
+            }
+            // Object/JSON: clamp to 5 lines + copy full value
+            if (typeof v === 'object') {
+              const jsonText = JSON.stringify(v, null, 2)
+              const overflows = jsonText.split('\n').length > 5
+              return (
+                <div className="space-y-1">
+                  <div className="flex items-start gap-2">
+                    <pre className={cn(
+                      "flex-1 min-w-0 font-mono text-sm whitespace-pre-wrap break-all",
+                      overflows && "line-clamp-5"
+                    )}>
+                      {jsonText}
+                    </pre>
+                    {overflows && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try { await copyToClipboard(jsonText); setCopiedValue(true); setTimeout(() => setCopiedValue(false), 2000) } catch { /* clipboard unavailable */ }
+                        }}
+                        className="shrink-0 mt-0.5 text-muted-foreground hover:text-foreground"
+                        title={t('common:copy', 'Copy')}
+                      >
+                        {copiedValue ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}
+                      </button>
                     )}
                   </div>
-                  <div className="mt-3 flex items-center gap-1.5 text-sm text-muted-foreground">
-                    <Clock className="h-3.5 w-3.5" />
-                    <span>{t('data:lastUpdate', 'Last Update')} · {formatTime(selectedSource.last_update)}</span>
-                  </div>
-                  {selectedSource.description && (
-                    <p className="mt-2 text-sm text-muted-foreground">{selectedSource.description}</p>
-                  )}
                 </div>
+              )
+            }
+            // String scalar: short → prominent, long/base64 → clamped code block + copy
+            const str = String(v)
+            const isLong = str.length > 80 || str.includes('\n')
+            if (isLong) {
+              const overflows = str.length > 200 || str.split('\n').length > 3
+              return (
+                <div className="space-y-1">
+                  <div className="flex items-start gap-2">
+                    <pre className={cn(
+                      "flex-1 min-w-0 font-mono text-sm whitespace-pre-wrap break-all",
+                      overflows && "line-clamp-3"
+                    )}>
+                      {str}
+                    </pre>
+                    {overflows && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try { await copyToClipboard(str); setCopiedValue(true); setTimeout(() => setCopiedValue(false), 2000) } catch { /* clipboard unavailable */ }
+                        }}
+                        className="shrink-0 mt-0.5 text-muted-foreground hover:text-foreground"
+                        title={t('common:copy', 'Copy')}
+                      >
+                        {copiedValue ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )
+            }
+            // Short scalar: prominent display
+            return (
+              <div className="flex items-baseline gap-2 flex-wrap">
+                <span className="font-mono text-2xl md:text-3xl font-semibold break-all">{str}</span>
+                {selectedSource.unit && (
+                  <span className="font-mono text-sm text-muted-foreground">{selectedSource.unit}</span>
+                )}
+              </div>
+            )
+              })()
+            )
+            const renderMeta = (compact: boolean) => (
+              <div className={cn('flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground', compact ? 'text-xs' : 'text-xs mt-1')}>
+                {selectedSource.data_type && <span className="font-mono">{selectedSource.data_type}</span>}
+                {selectedSource.data_type && <span aria-hidden>·</span>}
+                <Clock className="h-3.5 w-3.5" />
+                <span>{t('data:lastUpdate', 'Last Update')} · {formatTime(selectedSource.last_update)}</span>
+                {selectedSource.description && (
+                  <span className="basis-full text-muted-foreground/90 truncate" title={selectedSource.description}>
+                    {selectedSource.description}
+                  </span>
+                )}
+              </div>
+            )
+            return (
+              <>
+                {/* Desktop side pane — current state. The fullscreen shell
+                    makes room for it beside a much wider history chart. */}
+                <aside className="hidden md:flex w-80 shrink-0 flex-col gap-4 border-r p-6">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {t('data:currentValue', 'Current Value')}
+                    </p>
+                    <div className="mt-2 min-w-0">{renderValue()}</div>
+                  </div>
+                  {rangeStats && (rangeStats.min !== null || rangeStats.max !== null || rangeStats.avg !== null) && (() => {
+                    const fmt = (v: number | null) => {
+                      if (v === null) return '—'
+                      const r = Math.round(v * 100) / 100
+                      return `${r}${selectedSource.unit ? ' ' + selectedSource.unit : ''}`
+                    }
+                    const cell = (label: string, v: number | null) => (
+                      <div key={label} className="rounded-lg bg-muted-30 px-3 py-2">
+                        <p className="text-nano text-muted-foreground">{label}</p>
+                        <p className="mt-0.5 font-mono text-sm font-medium truncate">{fmt(v)}</p>
+                      </div>
+                    )
+                    return (
+                      <div className="grid grid-cols-3 gap-2">
+                        {cell(t('data:stats.min', 'Min'), rangeStats.min)}
+                        {cell(t('data:stats.max', 'Max'), rangeStats.max)}
+                        {cell(t('data:stats.avg', 'Avg'), rangeStats.avg)}
+                      </div>
+                    )
+                  })()}
+                  {renderMeta(false)}
+                </aside>
 
+                <FullScreenDialogMain className="p-4 md:p-6">
+                  {/* Mobile: value strip above history (side pane is hidden) */}
+                  <div className="md:hidden mb-4 rounded-xl border p-4">
+                    {renderValue()}
+                    {renderMeta(true)}
+                  </div>
+                  <div className="max-w-5xl mx-auto">
                 {/* Tier 2: History (main body) */}
                 <div>
                   <div className="flex items-center justify-between gap-2 mb-3">
                     <div className="flex items-center gap-2 text-sm font-medium">
                       <History className="h-4 w-4" />
                       {t('data:history', 'History')}
-                      {historyData.length > 0 && (
-                        <Badge variant="secondary" className={cn(textNano, "ml-1")}>{historyData.length}</Badge>
+                      {tableTotal > 0 && (
+                        <Badge variant="secondary" className={cn(textNano, "ml-1")}>{tableTotal}</Badge>
                       )}
                     </div>
                     <Select value={historyRange} onValueChange={setHistoryRange}>
@@ -589,25 +716,113 @@ export function DataExplorerPage() {
                     </Select>
                   </div>
 
+                  {(() => {
+                    // Numeric metrics get a trend chart first — the raw table
+                    // below stays for exact values. Theming follows the
+                    // dashboard chart conventions (muted grid/axis, no axis
+                    // lines) so the two surfaces read as one system.
+                    const numeric = (selectedSource.data_type === 'integer' || selectedSource.data_type === 'float')
+                    const points = numeric
+                      ? chartData
+                          .map(p => ({ ts: p.timestamp, v: typeof p.value === 'number' ? p.value : Number(p.value) }))
+                          .filter(p => Number.isFinite(p.v))
+                          .sort((a, b) => a.ts - b.ts)
+                      : []
+                    const chartTruncated = chartTotal !== null && chartTotal > chartData.length
+                    if (!historyLoading && !historyError && points.length >= 2) {
+                      const labelFmt = (ts: number) => {
+                        // Telemetry timestamps are unix seconds; the ×1000
+                        // heuristic matches formatTimestamp in this file.
+                        const d = new Date(ts < 1e12 ? ts * 1000 : ts)
+                        const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+                        return historyRange === '7d' || historyRange === '24h'
+                          ? `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${hm}`
+                          : hm
+                      }
+                      return (
+                        <div className="rounded-xl border p-4 mb-4">
+                          {chartTruncated && (
+                            <p className="text-xs text-muted-foreground mb-2">
+                              {t('data:chartTruncated', 'Showing the latest {{count}} points', { count: chartData.length })}
+                            </p>
+                          )}
+                          <ResponsiveContainer width="100%" height={280}>
+                            <AreaChart data={points} margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
+                              <defs>
+                                <linearGradient id="historyAreaGrad" x1="0" y1="0" x2="0" y2="1">
+                                  <stop offset="0%" stopColor="var(--primary)" stopOpacity={0.25} />
+                                  <stop offset="100%" stopColor="var(--primary)" stopOpacity={0.02} />
+                                </linearGradient>
+                              </defs>
+                              <CartesianGrid vertical={false} strokeDasharray="4 4" className="stroke-muted" />
+                              <XAxis
+                                dataKey="ts"
+                                type="number"
+                                domain={['dataMin', 'dataMax']}
+                                scale="time"
+                                tickFormatter={labelFmt}
+                                axisLine={false}
+                                tickLine={false}
+                                tickMargin={8}
+                                tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }}
+                                interval="preserveStartEnd"
+                                minTickGap={40}
+                              />
+                              <YAxis
+                                axisLine={false}
+                                tickLine={false}
+                                tickMargin={8}
+                                width={40}
+                                tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }}
+                                domain={['auto', 'auto']}
+                              />
+                              <Tooltip
+                                contentStyle={{
+                                  backgroundColor: 'var(--popover)',
+                                  border: '1px solid var(--border)',
+                                  borderRadius: 8,
+                                  fontSize: 12,
+                                  color: 'var(--foreground)',
+                                }}
+                                labelFormatter={(ts) => formatTimestamp(Number(ts))}
+                                formatter={(value) => [`${value}${selectedSource.unit ? ' ' + selectedSource.unit : ''}`, selectedSource.field_display_name || '']}
+                              />
+                              <Area
+                                type="monotone"
+                                dataKey="v"
+                                stroke="var(--primary)"
+                                strokeWidth={2}
+                                fill="url(#historyAreaGrad)"
+                                connectNulls
+                                isAnimationActive={false}
+                                dot={points.length <= 20}
+                              />
+                            </AreaChart>
+                          </ResponsiveContainer>
+                        </div>
+                      )
+                    }
+                    return null
+                  })()}
+
                   {historyLoading ? (
                     <div className="flex items-center justify-center h-32 text-muted-foreground">
                       <Loader2 className="h-4 w-4 animate-spin mr-2" />
                       <span className="text-xs">{t('common:loading', 'Loading...')}</span>
                     </div>
-                  ) : historyData.length > 0 ? (() => {
+                  ) : tableData.length > 0 ? (() => {
                     // Hide the Quality column when no row has a non-null value — it's
                     // usually empty in practice and wastes horizontal space.
-                    const hasQuality = historyData.some(p => p.quality !== null)
+                    const hasQuality = tableData.some(p => p.quality !== null)
                     const columns: TableColumn[] = [
                       { key: 'timestamp', label: t('data:timestamp', 'Timestamp'), width: '180px' },
                       { key: 'value', label: t('data:value', 'Value') },
                       ...(hasQuality ? [{ key: 'quality', label: t('data:quality', 'Quality'), width: '80px', align: 'right' as const }] : []),
                     ]
-                    // Backend returns telemetry ascending (oldest first) — reverse so
-                    // page 1 shows the newest records.
-                    const orderedHistory = [...historyData].sort((a, b) => b.timestamp - a.timestamp)
-                    const startIdx = (historyPage - 1) * historyPageSize
-                    const pagedHistoryData = orderedHistory.slice(startIdx, startIdx + historyPageSize)
+                    // The server already returns this page's window in ASC order
+                    // (newest-first pagination with offset) — reverse for display
+                    // so page 1 leads with the newest records.
+                    const pagedHistoryData = [...tableData].sort((a, b) => b.timestamp - a.timestamp)
                     return (
                       <>
                       <ResponsiveTable
@@ -652,10 +867,10 @@ export function DataExplorerPage() {
                           }
                         }}
                       />
-                      {historyData.length > historyPageSize && (
+                      {tableTotal > historyPageSize && (
                         <div className="mt-3 flex justify-center">
                           <Pagination
-                            total={historyData.length}
+                            total={tableTotal}
                             pageSize={historyPageSize}
                             currentPage={historyPage}
                             onPageChange={setHistoryPage}
@@ -666,16 +881,32 @@ export function DataExplorerPage() {
                       )}
                       </>
                     )
-                  })() : (
+                  })() : historyError ? (
                     <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
-                      <History className="h-8 w-8 mb-2 opacity-30" />
+                      <AlertTriangle className="h-8 w-8 mb-2 text-warning" />
+                      <p className="text-xs">{t('data:historyLoadFailed', 'Failed to load historical data')}</p>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="mt-3"
+                        onClick={() => setHistoryRetryTick(t => t + 1)}
+                      >
+                        <RefreshCw className="h-4 w-4 mr-1" />
+                        {t('data:retry', 'Retry')}
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center justify-center py-8 rounded-xl border border-dashed text-muted-foreground">
+                      <History className="h-6 w-6 mb-2 opacity-30" />
                       <p className="text-xs">{t('data:noHistory', 'No historical data available for this period')}</p>
                     </div>
                   )}
                 </div>
-              </div>
-            )}
-          </FullScreenDialogMain>
+                  </div>
+                </FullScreenDialogMain>
+              </>
+            )
+          })()}
         </FullScreenDialogContent>
       </FullScreenDialog>
 

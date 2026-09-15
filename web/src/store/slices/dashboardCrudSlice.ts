@@ -14,6 +14,7 @@ import type {
   DashboardLayout,
 } from '@/types/dashboard'
 import { createDashboardStorage, fromDashboardDTO, type DashboardStorage } from '../persistence'
+import { hasRecentServerSyncFailure } from '../persistence/implementations'
 import { logError } from '@/lib/errors'
 import {
   generateId,
@@ -45,6 +46,13 @@ function recordSelfSync(dashboardId: string): void {
     recentSelfSyncs.shift()
     recentSelfSyncTimestamps.shift()
   }
+}
+
+/** Any dashboard synced within the echo window? Used by the DataChanged
+ *  listener to skip refetches that would overwrite in-progress edits. */
+export function hasAnyRecentSelfSync(): boolean {
+  const now = Date.now()
+  return recentSelfSyncTimestamps.some((ts) => now - ts <= SELF_SYNC_ECHO_MS)
 }
 
 /** Should we ignore this DashboardUpdated SSE event (echo of our own sync)? */
@@ -122,8 +130,20 @@ export const createDashboardCrudSlice: StateCreator<
 > = (set, get) => {
   const storage: DashboardStorage = createDashboardStorage({ type: 'hybrid', cacheEnabled: true })
 
+  // [cross-tab] Another tab wrote the shared cache: refetch instead of
+  // clobbering it with this tab's stale array on the next save. Skipped
+  // while this tab holds unsynced edits (the debounced flush owns them).
+  storage.onRemoteCacheChange?.(() => {
+    if (hasUnflushedLocalEdits()) return
+    void get().fetchDashboards()
+  })
+
   // Debounced sync — captured in closure
   let syncDebounceTimer: ReturnType<typeof setTimeout> | null = null
+  // Bumped by clearDashboards (logout): in-flight syncs/flushes compare it
+  // after their awaits and skip handleIdChange — a late set() would
+  // resurrect the previous account's dashboard into the cleared store.
+  let dashboardEpoch = 0
   function handleIdChange(dash: Dashboard, result: { data: Dashboard | null }): void {
     if (result.data && result.data.id !== dash.id) {
       // Also record the server-assigned ID so the SSE echo is suppressed
@@ -154,11 +174,33 @@ export const createDashboardCrudSlice: StateCreator<
       // Only sync if no newer schedule call has been made
       if (version !== syncVersion) return
       recordSelfSync(dashboard.id)
+      const entryEpoch = dashboardEpoch
       try {
         const result = await storage.sync(dashboard)
+        if (entryEpoch !== dashboardEpoch) return // logged out mid-sync
+        // Clear AFTER the sync resolves: while the request is in flight
+        // hasUnflushedLocalEdits() must stay true, or a server refresh
+        // during a slow sync could flash the dashboard back to the
+        // pre-sync state (the old code cleared before sending — the exact
+        // window the guard existed to close).
+        if (version === syncVersion) {
+          pendingSyncDashboard = null
+        }
         handleIdChange(dashboard, result)
       } catch (err) {
+        // Keep pending set so the guard still protects the unsynced edits,
+        // but BOUNDED: if even the next schedule/flush can't clear it (e.g.
+        // localStorage quota full — common on embedded devices), release
+        // the guard after 30s so server refreshes aren't blocked forever
+        // (the old failure-window semantics in the persistence layer).
         console.warn('[DashboardCrudSlice] sync failed:', err)
+        const failVersion = version
+        setTimeout(() => {
+          if (pendingSyncDashboard?.id === dashboard.id && failVersion === syncVersion - 0) {
+            // Only release if nothing newer was scheduled meanwhile.
+            if (!syncDebounceTimer) pendingSyncDashboard = null
+          }
+        }, 30_000)
       }
     }, 500)
   }
@@ -167,20 +209,51 @@ export const createDashboardCrudSlice: StateCreator<
     if (syncDebounceTimer) {
       clearTimeout(syncDebounceTimer)
       syncDebounceTimer = null
-      // Execute the pending sync immediately instead of discarding it
+      // Execute the pending sync immediately instead of discarding it.
+      // pending stays set until the flush resolves — clearing before the
+      // await leaves the same unguarded in-flight window the debounce path
+      // used to have.
       const dashboard = pendingSyncDashboard
-      pendingSyncDashboard = null
       if (dashboard) {
-        syncVersion++
+        const flushVersion = ++syncVersion
+        const entryEpoch = dashboardEpoch
         recordSelfSync(dashboard.id)
         try {
           const result = await storage.sync(dashboard)
+          if (entryEpoch !== dashboardEpoch) return // logged out mid-flush
+          if (flushVersion === syncVersion) {
+            pendingSyncDashboard = null
+          }
           handleIdChange(dashboard, result)
         } catch (err) {
           console.warn('[DashboardCrudSlice] flush sync failed:', err)
         }
       }
     }
+  }
+
+  // Flush a pending debounced sync when the page is hidden or being unloaded.
+  // The 500ms debounce otherwise silently drops the last edit on close.
+  // visibilitychange(hidden) also covers mobile backgrounding, where pagehide
+  // is unreliable.
+  if (typeof window !== 'undefined') {
+    const flushOnLeave = () => { void flushSync() }
+    window.addEventListener('pagehide', flushOnLeave)
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flushOnLeave()
+    })
+  }
+
+  /**
+   * True while a local edit is still in flight: the debounce timer hasn't
+   * fired yet, or a previous sync attempt recently failed against the server
+   * (its retries are still running). Applying a server snapshot in either
+   * state would overwrite newer local edits.
+   */
+  function hasUnflushedLocalEdits(): boolean {
+    return syncDebounceTimer !== null ||
+      pendingSyncDashboard !== null ||
+      hasRecentServerSyncFailure()
   }
 
   return {
@@ -227,6 +300,17 @@ export const createDashboardCrudSlice: StateCreator<
           // was temporarily unavailable — this caused permanent data loss.
           // Instead, invalid data sources are handled at the UI layer (component shows
           // a "device unavailable" state) so user config is preserved.
+
+          // A pending (or recently failed) local sync means the in-memory state
+          // is newer than the snapshot the server just returned. Skip applying
+          // it — otherwise a DataChanged/SSE-triggered refresh would silently
+          // discard the user's edits ("change flashed back to old value").
+          if (hasUnflushedLocalEdits()) {
+            console.warn('[DashboardCrudSlice] Skipping server snapshot — local edits not yet synced')
+            if (get()._fetchId !== fetchId) return
+            set({ dashboardsLoading: false })
+            return
+          }
 
           if (get()._fetchId !== fetchId) return
           set({ dashboards: migrated })
@@ -375,6 +459,15 @@ export const createDashboardCrudSlice: StateCreator<
     clearDashboards: () => {
       const { dashboards } = get()
       dashboards.forEach((d: Dashboard) => (d.components as DashboardComponent[]).forEach(cleanupAgentForComponent))
+      // Cancel any pending debounced sync: firing ~500ms after logout it
+      // would re-persist the previous account's dashboard into localStorage,
+      // and the next login's local-only merge would adopt it as its own.
+      if (syncDebounceTimer !== null) {
+        clearTimeout(syncDebounceTimer)
+        syncDebounceTimer = null
+      }
+      pendingSyncDashboard = null
+      dashboardEpoch++
       storage.clear()
       set({
         dashboards: [],

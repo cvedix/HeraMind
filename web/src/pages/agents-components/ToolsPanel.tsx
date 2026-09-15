@@ -227,23 +227,23 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
             label: t("agents:detail.toolsColumnParams", "Parameters"),
           },
         ]}
-        data={tableData as unknown as Record<string, unknown>[]}
-        rowKey={(row) => (row as unknown as ToolRow).name}
+        data={tableData}
+        rowKey={(row: ToolRow) => row.name}
         loading={loading}
         onRowClick={(rowData) => {
-          const row = rowData as unknown as ToolRow
+          const row = rowData
           const tool = pagedTools.find((t2) => t2.name === row.name)
           if (tool) handleView(tool)
         }}
         getRowClassName={(rowData) => {
-          const row = rowData as unknown as ToolRow
+          const row = rowData
           // Locked/disabled row: muted bg tint + faded foreground text.
           // Badges with their own explicit text/bg colors (Disabled badge,
           // source badge) keep their accent so the state stays readable.
           return row.disabled ? "bg-muted-30 text-muted-foreground" : ""
         }}
         renderCell={(columnKey, rowData) => {
-          const row = rowData as unknown as ToolRow
+          const row = rowData
           const src = resolveSource(row.source)
           const SrcIcon = src.icon
 
@@ -265,12 +265,12 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
                         {row.name}
                       </span>
                       {row.deprecated && (
-                        <span className="text-[10px] uppercase tracking-wide text-error shrink-0">
+                        <span className="text-nano uppercase tracking-wide text-error shrink-0">
                           {t("agents:detail.toolsDeprecated")}
                         </span>
                       )}
                       {row.disabled && (
-                        <span className="text-[10px] uppercase tracking-wide text-warning shrink-0 bg-warning-light border border-warning-light rounded px-1">
+                        <span className="text-nano uppercase tracking-wide text-warning shrink-0 bg-warning-light border border-warning-light rounded px-1">
                           {t("agents:detail.toolsDisabled", { defaultValue: "Disabled" })}
                         </span>
                       )}
@@ -319,7 +319,7 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
                     <span
                       key={name}
                       className={cn(
-                        "text-[11px] font-mono px-1.5 py-0.5 rounded border",
+                        "text-mini font-mono px-1.5 py-0.5 rounded border",
                         requiredSet.has(name)
                           ? "bg-accent-orange-light text-accent-orange border-accent-orange-light"
                           : "bg-muted text-muted-foreground border-border"
@@ -330,7 +330,7 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
                     </span>
                   ))}
                   {row.param_names.length > 6 && (
-                    <span className="text-[11px] text-muted-foreground self-center">
+                    <span className="text-mini text-muted-foreground self-center">
                       +{row.param_names.length - 6}
                     </span>
                   )}
@@ -356,7 +356,7 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
             label: t("agents:detail.toolsActionView", "View"),
             icon: <Eye className="h-4 w-4" />,
             onClick: (rowData) => {
-              const row = rowData as unknown as ToolRow
+              const row = rowData
               const tool = pagedTools.find((t2) => t2.name === row.name)
               if (tool) handleView(tool)
             },
@@ -482,7 +482,7 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
 function MetaItem({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="flex flex-col gap-0.5">
-      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+      <span className="text-nano uppercase tracking-wide text-muted-foreground">
         {label}
       </span>
       <div className="text-sm">{children}</div>

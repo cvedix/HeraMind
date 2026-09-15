@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { api } from '@/lib/api'
+import { resolveImageSrc } from '@/lib/imageUtils'
 import { useEvents } from '@/hooks/useEvents'
 import { useVisiblePolling } from '@/hooks/useVisiblePolling'
 import type { ResourceRequest } from '@/types'
@@ -292,8 +293,11 @@ async function loadHistoryMessages(
         const allImages: string[] = []
         const allLines: string[] = []
         for (const dc of dataCollected) {
-          // Skip device_info — device metadata, not sensor data
-          if (dc.data_type === 'device_info') continue
+          // Skip device_info (device metadata) and summary entries (agent memory
+          // context: last_conclusion / recent_conclusions / total_executions —
+          // prior-execution context for the LLM, not sensor data; must not leak
+          // into the Data source bubble on history load).
+          if (dc.data_type === 'device_info' || dc.data_type === 'summary' || dc.source === 'memory') continue
 
           const values = dc.values
           const dataType = dc.data_type
@@ -309,11 +313,9 @@ async function loadHistoryMessages(
               || ('value' in record && '_is_event_data' in record)
             if (isStructuredData) {
               const val = record.value
-              if (typeof val === 'string' && val.length > 100 && (
-                val.startsWith('data:image/') || val.startsWith('/9j/') || val.startsWith('iVBOR')
-              )) {
-                const clean = val.replace(/[\s\r\n]+/g, '')
-                allImages.push(clean.startsWith('data:') ? clean : `data:image/png;base64,${clean}`)
+              const imgSrc = typeof val === 'string' ? resolveImageSrc(val) : null
+              if (imgSrc) {
+                allImages.push(imgSrc)
               } else {
                 const s = summarizeData(val)
                 if (s) allLines.push(dataType ? `${dataType}: ${s}` : s)
@@ -333,11 +335,9 @@ async function loadHistoryMessages(
             } else {
               // Generic object: iterate entries, filter metadata
               for (const [key, val] of Object.entries(record)) {
-                if (typeof val === 'string' && val.length > 100 && (
-                  val.startsWith('data:image/') || val.startsWith('/9j/') || val.startsWith('iVBOR')
-                )) {
-                  const clean = val.replace(/[\s\r\n]+/g, '')
-                  allImages.push(clean.startsWith('data:') ? clean : `data:image/png;base64,${clean}`)
+                const imgSrc = typeof val === 'string' ? resolveImageSrc(val) : null
+                if (imgSrc) {
+                  allImages.push(imgSrc)
                 } else if (!isMetaField(key)) {
                   const s = summarizeData(val)
                   if (s) allLines.push(`${key}: ${s}`)
@@ -379,7 +379,14 @@ async function loadHistoryMessages(
             id: `hist-user-${um.id}`,
             type: 'user',
             content: um.content,
-            timestamp: typeof um.timestamp === 'number' ? um.timestamp : new Date(um.timestamp).getTime(),
+            // [unit fix] the API returns SECONDS (UserMessageDto ← Utc::now().
+            // timestamp()); the renderer uses ms semantics — without ×1000
+            // historical user hints rendered as Jan-1970 and sorted to the
+            // timeline front. Same normalization AgentMonitorWidget applies.
+            timestamp:
+              typeof um.timestamp === 'number'
+                ? um.timestamp * 1000
+                : new Date(um.timestamp).getTime(),
           })
         }
         // Sort all messages by timestamp
@@ -1002,6 +1009,66 @@ export function useAnalystSession({
       api.invokeAgent(agentId, { input: text })
         .then((result) => {
           const duration = Date.now() - startTime
+
+          // Long run: the backend returned still_executing (past its 60s
+          // wait window) — the run continues server-side. Show a running
+          // notice and POLL the execution history so the real conclusion
+          // replaces it; without the poll (e.g. the WS event was missed)
+          // the answer was permanently lost.
+          if ((result as { still_executing?: boolean }).still_executing) {
+            if (streamingPollRef.current) {
+              clearInterval(streamingPollRef.current)
+              streamingPollRef.current = null
+            }
+            const placeholderId = streamingMsgIdRef.current ?? nextId()
+            streamingMsgIdRef.current = null
+            setStreamingMsgId(null)
+            const noticeId = placeholderId
+            setMessages((prev) => {
+              const withoutStreaming = prev.some((m) => m.id === placeholderId)
+                ? prev.filter((m) => m.id !== placeholderId)
+                : prev
+              return trimMessages([
+                ...withoutStreaming,
+                {
+                  id: noticeId,
+                  type: 'ai',
+                  content: result.message || 'Analysis is still running in the background…',
+                  timestamp: Date.now(),
+                  modelName: config.modelName,
+                  duration,
+                },
+              ])
+            })
+            setIsStreaming(false)
+            isStreamingRef.current = false
+
+            const pollAgentId = agentId
+            let tries = 0
+            const poll = setInterval(async () => {
+              tries += 1
+              try {
+                const data = await api.getAgentExecutions(pollAgentId, 1)
+                const latest = (data as unknown as { executions?: Array<Record<string, unknown>> }).executions?.[0]
+                const status = String(latest?.['status'] ?? '')
+                const running = status === 'Running' || status === 'Pending'
+                if (latest && !running) {
+                  clearInterval(poll)
+                  const dp = latest['decision_process'] as { conclusion?: string } | undefined
+                  const conclusion =
+                    dp?.conclusion || String(latest['result'] ?? '') || 'Analysis completed.'
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === noticeId ? { ...m, content: conclusion } : m,
+                    ),
+                  )
+                }
+              } catch { /* transient poll error — keep polling */ }
+              if (tries >= 24) clearInterval(poll) // ~4 min at 10s
+            }, 10_000)
+            return
+          }
+
           const execId = result.execution_id as string | undefined
 
           // Register for WS event dedup
@@ -1023,7 +1090,7 @@ export function useAnalystSession({
           const aiMsg: AnalystMessage = {
             id: dedupKey,
             type: result.has_error ? 'error' : 'ai',
-            content: result.conclusion || result.error || 'No result',
+            content: result.conclusion || result.message || result.error || 'No result',
             timestamp: Date.now(),
             modelName: config.modelName,
             duration,

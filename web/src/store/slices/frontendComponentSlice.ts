@@ -26,7 +26,7 @@ export interface FrontendComponentState {
   marketLoading: boolean
   loading: boolean
   error: string | null
-  fetchCache: Record<string, { timestamp: number }>
+  fetchCache: Record<string, { timestamp: number; fetching?: boolean }>
   /** Map of component id → { current, latest } when a newer version exists on the marketplace. */
   updatesAvailable: Record<string, { current: string; latest: string }>
 }
@@ -40,6 +40,8 @@ export interface FrontendComponentSlice extends FrontendComponentState {
   fetchMarket: () => Promise<void>
   installFromMarket: (componentId: string) => Promise<void>
   installManualZip: (zipFile: File) => Promise<FrontendComponentMeta>
+  /** Install from a .zip that already sits on the server, inside its data directory. */
+  installFromPath: (filePath: string) => Promise<FrontendComponentMeta>
   uninstall: (id: string) => Promise<void>
   refreshComponent: (id: string) => Promise<void>
   checkUpdates: () => Promise<void>
@@ -51,9 +53,10 @@ export interface FrontendComponentSlice extends FrontendComponentState {
 
 const CACHE_TTL = 10_000 // 10 seconds
 
-function shouldFetch(cache: Record<string, { timestamp: number }>, key: string): boolean {
+function shouldFetch(cache: Record<string, { timestamp: number; fetching?: boolean }>, key: string): boolean {
   const entry = cache[key]
   if (!entry) return true
+  if (entry.fetching) return false
   return Date.now() - entry.timestamp > CACHE_TTL
 }
 
@@ -86,7 +89,7 @@ export const createFrontendComponentSlice: StateCreator<
     const cache = get().fetchCache
     if (!shouldFetch(cache, 'installed')) return
 
-    set({ loading: true, error: null })
+    set({ loading: true, error: null, fetchCache: { ...cache, installed: { timestamp: cache.installed?.timestamp ?? 0, fetching: true } } })
     try {
       const res = await api.get<{ components: FrontendComponentMeta[] }>('/frontend-components')
       const components = res.components || []
@@ -104,6 +107,7 @@ export const createFrontendComponentSlice: StateCreator<
       set({
         installed: [],
         error: error instanceof Error ? error.message : 'Failed to fetch installed components',
+        fetchCache: { ...cache, installed: { timestamp: Date.now() } },
       })
     } finally {
       set({ loading: false })
@@ -137,7 +141,11 @@ export const createFrontendComponentSlice: StateCreator<
 
   /**
    * Install a component from the marketplace
-   * Backend: POST /frontend-components/market/install -> { component } or { success: false, error }
+   * Backend: POST /frontend-components/market/install -> { component };
+   * failures now surface as real non-2xx (fetchAPI throws with the
+   * envelope's error.message). The old success:false-in-200 shape is kept
+   * only as a defensive fallback for mixed-version deployments (old server,
+   * new UI).
    */
   installFromMarket: async (componentId) => {
     set({ loading: true, error: null })
@@ -147,7 +155,8 @@ export const createFrontendComponentSlice: StateCreator<
         { component_id: componentId }
       )
 
-      // Handle graceful error from backend (network issues etc.)
+      // Defensive fallback: mixed-version deployments (old server) still
+      // answer 200 with { success: false, error }.
       if (res.success === false || !res.component) {
         const errMsg = res.error || 'Failed to install component'
         throw new Error(errMsg)
@@ -222,6 +231,47 @@ export const createFrontendComponentSlice: StateCreator<
       return component
     } catch (error) {
       logError(error, { operation: 'Install ZIP component' })
+      set({
+        error: error instanceof Error ? error.message : 'Failed to install component',
+      })
+      throw error
+    } finally {
+      set({ loading: false })
+    }
+  },
+
+  /**
+   * Install a component from a ZIP package that already sits on the
+   * server (inside its data directory).
+   * Backend: POST /frontend-components/from-path
+   */
+  installFromPath: async (filePath) => {
+    set({ loading: true, error: null })
+    try {
+      const res = await api.post<{ component: FrontendComponentMeta }>(
+        '/frontend-components/from-path',
+        { file_path: filePath },
+      )
+      const component = res.component
+
+      // Add to installed list
+      set((state) => ({
+        installed: [...state.installed, component],
+      }))
+
+      // Sync with community registry
+      communityRegistry.syncFromApi([...get().installed, component])
+
+      // Clear cache to force refresh
+      set((state) => ({
+        fetchCache: Object.fromEntries(
+          Object.entries(state.fetchCache).filter(([key]) => key !== 'installed')
+        ),
+      }))
+
+      return component
+    } catch (error) {
+      logError(error, { operation: 'Install component from server path' })
       set({
         error: error instanceof Error ? error.message : 'Failed to install component',
       })

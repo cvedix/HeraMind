@@ -98,6 +98,12 @@ pub async fn acknowledge_message(client: &ApiClient, id: &str) -> Result<CliResp
     ))
 }
 
+/// Delete a message by ID
+pub async fn delete_message(client: &ApiClient, id: &str) -> Result<CliResponse> {
+    client.delete(&format!("/messages/{}", id)).await?;
+    Ok(CliResponse::success(json!({ "id": id }), "Message deleted"))
+}
+
 // ---- Message Channel operations ----
 
 /// List all message channels
@@ -137,12 +143,33 @@ pub async fn get_channel_type_schema(
     Ok(CliResponse::success(data, "Channel type schema retrieved"))
 }
 
+/// Merge `--config` JSON with repeated `--param key=value` overrides.
+///
+/// Either form works alone; when both are given, `--param` entries override
+/// matching keys of the JSON object. Returns the merged config as a JSON
+/// string for [`create_channel`].
+pub fn merge_channel_config(config: Option<&str>, param: &[String]) -> Result<String> {
+    let mut value: serde_json::Value = match config {
+        Some(c) => serde_json::from_str(c)?,
+        None => serde_json::json!({}),
+    };
+    if !param.is_empty() {
+        let overrides = crate::kv::parse_kv_params(param).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let Some(obj) = value.as_object_mut() else {
+            anyhow::bail!("--config JSON must be an object to combine with --param key=value");
+        };
+        obj.extend(overrides);
+    }
+    Ok(value.to_string())
+}
+
 /// Create a message channel
 pub async fn create_channel(
     client: &ApiClient,
     name: &str,
     channel_type: &str,
     config: &str,
+    enabled: bool,
 ) -> Result<CliResponse> {
     // 1. Validate name is non-empty
     if name.is_empty() {
@@ -225,7 +252,7 @@ pub async fn create_channel(
                         format!("Missing required config field(s): {}.", missing.join(", ")),
                         "MISSING_FIELDS",
                         format!(
-                            "Run `heramind message channel-type-schema {}` for field details.",
+                            "Pass each one as --param <field>=<value>, or run `heramind message channel-type-schema {}` for field details.",
                             channel_type
                         ),
                     ));
@@ -243,6 +270,11 @@ pub async fn create_channel(
     if let serde_json::Value::Object(mut map) = config_value {
         body.as_object_mut().unwrap().append(&mut map);
     }
+    // Explicit --enabled flag wins over any config.enabled (flattens into the
+    // request, which the factory reads via config.enabled).
+    body.as_object_mut()
+        .unwrap()
+        .insert("enabled".to_string(), json!(enabled));
     let data = client.post("/messages/channels", &body).await?;
     let data = extract_inner_data(data);
     let meta = BuildMeta {
@@ -292,4 +324,39 @@ pub async fn test_channel(client: &ApiClient, name: &str) -> Result<CliResponse>
         extract_inner_data(data),
         "Channel test completed",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_channel_config;
+
+    #[test]
+    fn param_only_builds_config() {
+        let out = merge_channel_config(None, &["url=https://x.io/h".into()]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["url"], "https://x.io/h");
+    }
+
+    #[test]
+    fn param_overrides_config_json() {
+        let out = merge_channel_config(
+            Some(r#"{"url":"https://old","timeout_secs":30}"#),
+            &["url=https://new".into()],
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["url"], "https://new");
+        assert_eq!(v["timeout_secs"], 30);
+    }
+
+    #[test]
+    fn empty_inputs_yield_empty_object() {
+        let out = merge_channel_config(None, &[]).unwrap();
+        assert_eq!(out, "{}");
+    }
+
+    #[test]
+    fn bad_kv_entry_errors() {
+        assert!(merge_channel_config(None, &["noequals".into()]).is_err());
+    }
 }

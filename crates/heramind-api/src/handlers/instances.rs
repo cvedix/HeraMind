@@ -17,7 +17,7 @@ use crate::models::ErrorResponse;
 use heramind_storage::InstanceRecord;
 
 /// Request to create a remote instance
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CreateInstanceRequest {
     /// Display name
     pub name: String,
@@ -28,7 +28,7 @@ pub struct CreateInstanceRequest {
 }
 
 /// Request to update a remote instance
-#[derive(Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct UpdateInstanceRequest {
     /// Display name
     pub name: Option<String>,
@@ -39,6 +39,14 @@ pub struct UpdateInstanceRequest {
 }
 
 /// List all instances (API keys masked, encrypted keys included)
+#[utoipa::path(
+    get,
+    path = "/api/instances",
+    tag = "instances",
+    responses(
+        (status = 200, description = "Remote HeraMind instances"),
+    )
+)]
 pub async fn list_instances_handler(
     State(state): State<ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -55,6 +63,18 @@ pub async fn list_instances_handler(
 }
 
 /// Get a single instance by ID (API key masked, encrypted key included)
+#[utoipa::path(
+    get,
+    path = "/api/instances/{id}",
+    tag = "instances",
+    params(
+        ("id" = String, Path, description = "Instance id"),
+    ),
+    responses(
+        (status = 200, description = "One remote instance"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_instance_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -68,6 +88,15 @@ pub async fn get_instance_handler(
 }
 
 /// Create a new remote instance
+#[utoipa::path(
+    post,
+    path = "/api/instances",
+    tag = "instances",
+    request_body = CreateInstanceRequest,
+    responses(
+        (status = 200, description = "Remote instance registered"),
+    )
+)]
 pub async fn create_instance_handler(
     State(state): State<ServerState>,
     Json(req): Json<CreateInstanceRequest>,
@@ -88,6 +117,19 @@ pub async fn create_instance_handler(
 }
 
 /// Update an existing instance
+#[utoipa::path(
+    put,
+    path = "/api/instances/{id}",
+    tag = "instances",
+    params(
+        ("id" = String, Path, description = "Instance id"),
+    ),
+    request_body = UpdateInstanceRequest,
+    responses(
+        (status = 200, description = "Remote instance updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_instance_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -120,6 +162,18 @@ pub async fn update_instance_handler(
 }
 
 /// Delete an instance
+#[utoipa::path(
+    delete,
+    path = "/api/instances/{id}",
+    tag = "instances",
+    params(
+        ("id" = String, Path, description = "Instance id"),
+    ),
+    responses(
+        (status = 200, description = "Remote instance deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_instance_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -136,6 +190,18 @@ pub async fn delete_instance_handler(
 }
 
 /// Test connectivity to a remote instance (health check proxy)
+#[utoipa::path(
+    post,
+    path = "/api/instances/{id}/test",
+    tag = "instances",
+    params(
+        ("id" = String, Path, description = "Instance id"),
+    ),
+    responses(
+        (status = 200, description = "Reachability test of a remote instance"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn test_instance_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -146,6 +212,26 @@ pub async fn test_instance_handler(
         .ok_or_else(|| ErrorResponse::not_found(format!("Instance {}", id)))?;
 
     let health_url = format!("{}/api/health", instance.url.trim_end_matches('/'));
+
+    // SSRF protection: reject loopback / link-local / cloud-metadata targets.
+    // Without this, an authenticated user can probe internal services.
+    let url_lower = instance.url.to_lowercase();
+    const SSRF_TARGETS: &[&str] = &[
+        "//localhost",
+        "//127.0.0.1",
+        "//[::1]",
+        "//0.0.0.0",
+        "169.254.169.254", // AWS/GCP/Azure cloud metadata
+    ];
+    for target in SSRF_TARGETS {
+        if url_lower.contains(target) {
+            return Err(ErrorResponse::bad_request(format!(
+                "Instance URL targets a blocked address ({}). \
+                 Use the local API for localhost instances.",
+                target
+            )));
+        }
+    }
 
     let start = std::time::Instant::now();
     let client = reqwest::Client::builder()

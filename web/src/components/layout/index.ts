@@ -1,4 +1,4 @@
 export { PageHeader } from './PageHeader'
 export { PageLayout } from './PageLayout'
-export { TopNav } from './TopNav'
+export { AppSidebar } from './AppSidebar'
 export { ThemeToggle } from './ThemeToggle'

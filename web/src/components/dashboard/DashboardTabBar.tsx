@@ -24,7 +24,6 @@ import { useTranslation } from 'react-i18next'
 import { useIsMobile } from '@/hooks/useMobile'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import {
   Tooltip,
   TooltipContent,
@@ -276,7 +275,7 @@ export function DashboardTabBar({
               <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="min-w-[14rem] max-w-[20rem] z-[200]">
+          <DropdownMenuContent align="start" className="min-w-[14rem] max-w-[20rem]">
             {dashboards.map((d) => {
               const active = d.id === currentDashboardId
               return (
@@ -392,11 +391,16 @@ export function DashboardTabBar({
       {/* Vertical separator */}
       <div className="h-5 w-px bg-border shrink-0" />
 
-      {/* MIDDLE: scrollable tabs (more menu renders inline after the active tab) */}
-      <ScrollArea className="flex-1 min-w-0 h-11">
+      {/* MIDDLE: scrollable tabs (more menu renders inline after the active tab).
+          Native overflow-x (scrollbar-none = no visible bar, matches PageTabs).
+          Radix ScrollArea WITHOUT a ScrollBar child disables scrolling entirely
+          (Radix gates the viewport's overflow on ScrollBar presence) — so we
+          use native scrolling instead. pr-7 keeps the rightmost tab's hover-
+          reveal ⋮ (28px) inside the padded region instead of clipping. */}
+      <div className="flex-1 min-w-0 h-11 overflow-x-auto scrollbar-none">
         <div
           ref={tabsViewportRef}
-          className="flex items-center gap-0.5 py-1.5"
+          className="flex items-center gap-0.5 py-1.5 pr-7"
         >
           {dashboards.flatMap((dashboard) => {
             const isActive = dashboard.id === currentDashboardId
@@ -447,7 +451,7 @@ export function DashboardTabBar({
                 <div
                   key={dashboard.id}
                   data-dashboard-id={dashboard.id}
-                  className="group flex items-center bg-muted text-foreground font-medium rounded-md shrink-0 h-8 overflow-hidden max-w-[200px]"
+                  className="group flex items-center bg-foreground text-background font-medium rounded-md shadow-sm shrink-0 h-8 overflow-hidden max-w-[200px]"
                 >
                   <button
                     type="button"
@@ -465,11 +469,13 @@ export function DashboardTabBar({
                     className={cn(
                       "flex items-center overflow-hidden",
                       "max-w-0 opacity-0",
-                      "transition-[max-width,opacity] duration-200",
+                      "transition-[max-width,opacity] duration-normal",
                       "[transition-timing-function:cubic-bezier(0.34,1.56,0.64,1)]",
-                      "group-hover:max-w-[28px] group-hover:opacity-100",
-                      "group-focus-within:max-w-[28px] group-focus-within:opacity-100",
-                      moreMenuOpen && "max-w-[28px] opacity-100"
+                      // 28px button + 4px right breathing room so the hover
+                      // background clears the tab's rounded right edge.
+                      "group-hover:max-w-[32px] group-hover:opacity-100",
+                      "group-focus-within:max-w-[32px] group-focus-within:opacity-100",
+                      moreMenuOpen && "max-w-[32px] opacity-100"
                     )}
                   >
                     <DropdownMenu open={moreMenuOpen} onOpenChange={setMoreMenuOpen}>
@@ -477,14 +483,14 @@ export function DashboardTabBar({
                         <Button
                           variant="ghost"
                           size="icon"
-                          className="h-7 w-7 rounded-md"
-                          aria-label={t('common.actions')}
+                          className="h-7 w-7 rounded-md mr-1"
+                          aria-label={t('sidebar.moreActions')}
                           onClick={(e) => e.stopPropagation()}
                         >
                           <MoreVertical className="h-3.5 w-3.5" />
                         </Button>
                       </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="z-[200]">
+                      <DropdownMenuContent align="end">
                         {canReorder && (
                           <>
                             <DropdownMenuItem
@@ -585,8 +591,7 @@ export function DashboardTabBar({
             </div>
           )}
         </div>
-        <ScrollBar orientation="horizontal" />
-      </ScrollArea>
+      </div>
     </div>
   )
 }

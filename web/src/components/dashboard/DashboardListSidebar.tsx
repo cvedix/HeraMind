@@ -7,6 +7,9 @@
  */
 
 import { useState, useRef, useEffect } from 'react'
+import { createPortal } from 'react-dom'
+import { getPortalRoot } from '@/lib/portal'
+import { handleWindowDragMouseDown } from "@/lib/windowDrag"
 import {
   LayoutDashboard,
   Plus,
@@ -140,8 +143,8 @@ function DashboardSidebarContent({
   return (
     <>
       {/* Header */}
-      <div className="flex items-center justify-between px-3 h-11 border-b border-border">
-        <h2 className="text-sm font-semibold">{t('sidebar.title')}</h2>
+      <div className="relative z-[1] flex items-center justify-between px-3 h-11" onMouseDown={handleWindowDragMouseDown}>
+        <h2 className="text-base font-semibold">{t('sidebar.title')}</h2>
         <div className="flex items-center gap-0.5">
           {isDesktop && onSwitchToTabs && (
             <TooltipProvider delayDuration={300}>
@@ -194,10 +197,11 @@ function DashboardSidebarContent({
                 }
               }}
               placeholder={t('sidebar.namePlaceholder')}
-              className="h-8 flex-1 rounded-lg placeholder:text-[11px]"
+              className="h-8 flex-1 rounded-lg placeholder:text-mini"
               autoFocus
             />
             <button
+              aria-label={t('common:confirm')}
               className="h-6 w-6 shrink-0 flex items-center justify-center rounded-md text-success hover:bg-success-light transition-colors"
               onClick={() => {
                 if (newDashboardName.trim()) {
@@ -210,6 +214,7 @@ function DashboardSidebarContent({
               <Check className="h-3.5 w-3.5" />
             </button>
             <button
+              aria-label={t('common:cancel')}
               className="h-6 w-6 shrink-0 flex items-center justify-center rounded-md hover:bg-muted transition-colors"
               onClick={() => { setShowCreateInput(false); setNewDashboardName('') }}
             >
@@ -250,7 +255,9 @@ function DashboardSidebarContent({
                   key={dashboard.id}
                   onClick={() => !isEditing && handleSwitch(dashboard.id)}
                   className={cn(
-                    "group relative flex items-start gap-2 p-2 rounded-lg cursor-pointer transition-all",
+                    // Flat list — same treatment as the session list:
+                    // selected = plain muted block, no raised card/shadow
+                    "group relative flex items-start gap-2 p-2 rounded-lg cursor-pointer transition-colors",
                     isActive
                       ? "bg-muted"
                       : "hover:bg-muted-50",
@@ -298,9 +305,9 @@ function DashboardSidebarContent({
                     </div>
                   ) : (
                     <>
-                      <div className="flex items-start gap-2 min-w-0 flex-1">
+                      <div className="flex items-center gap-2 min-w-0 flex-1">
                         <LayoutDashboard className={cn(
-                          "h-4 w-4 mt-0.5 shrink-0",
+                          "h-4 w-4 shrink-0",
                           isActive ? "text-foreground" : "text-muted-foreground"
                         )} />
                         <div className="min-w-0 flex-1">
@@ -317,7 +324,7 @@ function DashboardSidebarContent({
                       </div>
 
                       {/* Action menu */}
-                      <div className="absolute right-1.5 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 translate-x-1 transition-all duration-fast group-hover:translate-x-0 group-hover:opacity-100">
                         <DropdownMenu>
                           <DropdownMenuTrigger asChild>
                             <button
@@ -330,7 +337,7 @@ function DashboardSidebarContent({
                               <MoreVertical className="h-3 w-3" />
                             </button>
                           </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" className="z-[200]">
+                          <DropdownMenuContent align="end">
                             {canReorder && (
                               <>
                                 <DropdownMenuItem
@@ -380,13 +387,6 @@ function DashboardSidebarContent({
           )}
         </div>
       </ScrollArea>
-
-      {/* Footer */}
-      <div className="p-2 border-t border-border">
-        <p className={cn(textNano, "text-muted-foreground text-center")}>
-          {t('sidebar.dashboardCount', { count: dashboards.length })}
-        </p>
-      </div>
     </>
   )
 }
@@ -411,14 +411,26 @@ export function DashboardListSidebar({
     return (
       <div
         className={cn(
-          // bg-popover: opaque, unified with SessionSidebar and all other
-          // popups/drawers. Previously bg-bg-50 (translucent) which let
-          // aurora bleed through and produced a color split vs the opaque
-          // dashboard canvas to the right.
-          "h-full w-64 bg-popover border-r border-border flex flex-col",
+          // Chrome panel — one step brighter than the rail in BOTH themes,
+          // matching the session list's surface. Right border separates it
+          // from the white content area.
+          "relative h-full w-64 bg-background border-r border-border flex flex-col",
           className
         )}
+        style={{
+          // Safe top clearance: the drawer starts below the window chrome /
+          // traffic-light strip instead of touching the window edge
+          paddingTop: "calc(env(safe-area-inset-top, 0px) + 1rem)",
+        }}
       >
+        {/* Window drag strip — covers the top clearance zone + header row
+            behind it; the header content sits above (z-[1]) so its
+            buttons stay clickable */}
+        <div
+          className="absolute inset-x-0 top-0 z-0"
+          style={{ height: "calc(env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px) + 2.75rem)" }}
+          onMouseDown={handleWindowDragMouseDown}
+        />
         <DashboardSidebarContent
           dashboards={dashboards}
           currentDashboardId={currentDashboardId}
@@ -436,14 +448,16 @@ export function DashboardListSidebar({
     )
   }
 
-  // Mobile mode: drawer with backdrop
-  return (
+  // Mobile mode: drawer — portaled to the dialog root so the fixed overlay
+  // escapes any in-page stacking context and stacks at the base dialog tier
+  // (z-50) like every other drawer (MobileNav Sheet, SessionSidebar). Full
+  // height, covering the chrome, no --topnav-height geometric coupling.
+  return createPortal(
     <>
       {/* Backdrop */}
       {open && (
         <div
-          className="fixed inset-0 bg-overlay-light backdrop-blur-sm z-[55] transition-opacity lg:hidden"
-          style={{ top: 'var(--topnav-height, 56px)' }}
+          className="fixed inset-0 bg-overlay-light backdrop-blur-sm z-50 transition-opacity lg:hidden"
           onClick={() => onOpenChange?.(false)}
         />
       )}
@@ -451,16 +465,15 @@ export function DashboardListSidebar({
       {/* Sidebar Drawer */}
       <div
         className={cn(
-          'fixed left-0 bottom-0 w-72 z-[60] lg:hidden safe-top',
+          'fixed top-0 left-0 h-full w-72 z-50 lg:hidden safe-top',
           // bg-popover matches desktop persistent sidebar and all other
           // drawers. Previously bg-background (dark-mode /97% alpha) which
           // produced a visible dark tint vs the topnav chrome above.
           'bg-popover shadow-xl flex flex-col',
-          'transform transition-transform duration-300 ease-out',
+          'transform transition-transform duration-slow ease-out',
           open ? 'translate-x-0' : '-translate-x-full',
           className
         )}
-        style={{ top: 'var(--topnav-height, 56px)' }}
       >
         <DashboardSidebarContent
           dashboards={dashboards}
@@ -475,6 +488,7 @@ export function DashboardListSidebar({
           isDesktop={false}
         />
       </div>
-    </>
+    </>,
+    getPortalRoot()
   )
 }

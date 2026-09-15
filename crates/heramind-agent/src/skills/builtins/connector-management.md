@@ -1,6 +1,7 @@
 ---
 id: connector-management
 name: Connector Management & MQTT Configuration
+description: Use when the user wants to configure external MQTT brokers or connectors — adding/removing external brokers, subscriptions, testing connections, remote/cloud brokers. Covers connector create/list/update/enable/disable/test/subscriptions even without saying 'connector' (e.g. '连到远程 MQTT', '订阅一个外部主题'). Includes 连接器/外部 broker/远程 MQTT/订阅. NOT notification channels — use message-management for those.
 category: connector
 origin: builtin
 priority: 80
@@ -16,14 +17,33 @@ anti_triggers:
 
 # Connector Management & MQTT Configuration
 
+## Command Cheat-Sheet (run these via `shell`)
+
+Always RUN the command yourself and report the real output.
+
+| Command | Purpose |
+|---|---|
+| `heramind connector list` | List all data connectors |
+| `heramind connector get <id>` | Connector details + connection status |
+| `heramind connector create` | Create a new data connector |
+| `heramind connector update <id>` | Update connector configuration |
+| `heramind connector delete <id>` | Delete a connector |
+| `heramind connector enable <id>` | Enable a connector |
+| `heramind connector disable <id>` | Disable a connector |
+| `heramind connector test <id>` | Test connectivity (real MQTT handshake) |
+| `heramind connector subscriptions <id>` | List MQTT topic subscriptions |
+| `heramind connector subscribe <id>` | Subscribe to a custom MQTT topic |
+| `heramind connector unsubscribe <id>` | Unsubscribe from a topic |
+
 Connectors link HeraMind to external MQTT brokers and data sources. They allow subscribing to topics and bridging data from remote systems.
 
 ## CRITICAL Rules
 
-1. **Always test connection after creating** — use `connector test <ID>`
-2. **Default port is 1883** (non-TLS) or 8883 (TLS)
-3. **`broker` is a deprecated alias** — use `connector` instead
-4. **Topics are comma-separated** — e.g., `--topics "sensors/temp,sensors/humidity"`
+1. **Connectors are for EXTERNAL/remote brokers the user configures** — NOT for the built-in broker. If the user wants the **active broker address / port / network info** (e.g. to connect a device like ESP32 to HeraMind), run `heramind system info` (see `system-info` skill) — do NOT run `connector list` or OS commands (`ipconfig`/`ip a`) for that.
+2. **Always test connection after creating** — use `connector test <ID>`
+3. **Default port is 1883** (non-TLS) or 8883 (TLS)
+4. **`broker` is a deprecated alias** — use `connector` instead
+5. **Topics are comma-separated** — e.g., `--topics "sensors/temp,sensors/humidity"`
 
 ## Command Reference
 

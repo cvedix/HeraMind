@@ -47,6 +47,10 @@ struct ExternalBrokerDto {
     updated_at: i64,
     /// Topics to subscribe to
     subscribe_topics: Vec<String>,
+    /// Payload field used as device identity when the topic can't uniquely
+    /// identify the device (gateway forwarding many devices on one topic).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_id_field: Option<String>,
 }
 
 impl From<ExternalBroker> for ExternalBrokerDto {
@@ -81,12 +85,13 @@ impl From<ExternalBroker> for ExternalBrokerDto {
             last_error: b.last_error,
             updated_at: b.updated_at,
             subscribe_topics: b.subscribe_topics,
+            device_id_field: b.device_id_field,
         }
     }
 }
 
 /// Request body for creating/updating an external broker.
-#[derive(Debug, serde::Deserialize)]
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct ExternalBrokerRequest {
     pub id: Option<String>,
     pub name: String,
@@ -116,6 +121,11 @@ pub struct ExternalBrokerRequest {
     /// Topics to subscribe to. Defaults to ["#"] for all topics.
     #[serde(default)]
     pub subscribe_topics: Option<Vec<String>>,
+    /// Payload field used as device identity when the topic can't uniquely
+    /// identify the device (gateway forwarding many devices on one topic).
+    /// Empty/None → auto-detect common fields (device_id, sn, mac, ...).
+    #[serde(default)]
+    pub device_id_field: Option<String>,
 }
 
 fn default_external_broker_port() -> u16 {
@@ -215,6 +225,7 @@ pub async fn create_and_connect_broker(
         discovery_topic: None,
         discovery_prefix: "heramind".to_string(),
         auto_discovery: false,
+        device_id_field: broker.device_id_field.clone(),
         storage_dir: Some("data".to_string()),
     };
 
@@ -365,6 +376,14 @@ async fn update_broker_connection_status_no_store(
 /// List all external brokers.
 ///
 /// GET /api/brokers
+#[utoipa::path(
+    get,
+    path = "/api/brokers",
+    tag = "mqtt",
+    responses(
+        (status = 200, description = "Configured external MQTT brokers"),
+    )
+)]
 pub async fn list_brokers_handler(
     State(state): State<crate::server::types::ServerState>,
 ) -> HandlerResult<serde_json::Value> {
@@ -415,6 +434,18 @@ pub async fn list_brokers_handler(
 /// Get a specific external broker.
 ///
 /// GET /api/brokers/:id
+#[utoipa::path(
+    get,
+    path = "/api/brokers/{id}",
+    tag = "mqtt",
+    params(
+        ("id" = String, Path, description = "Broker id"),
+    ),
+    responses(
+        (status = 200, description = "One external broker"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn get_broker_handler(Path(id): Path<String>) -> HandlerResult<serde_json::Value> {
     let store = config::open_settings_store()
         .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
@@ -435,6 +466,15 @@ pub async fn get_broker_handler(Path(id): Path<String>) -> HandlerResult<serde_j
 /// Create a new external broker.
 ///
 /// POST /api/brokers
+#[utoipa::path(
+    post,
+    path = "/api/brokers",
+    tag = "mqtt",
+    request_body = ExternalBrokerRequest,
+    responses(
+        (status = 200, description = "External broker created"),
+    )
+)]
 pub async fn create_broker_handler(
     State(state): State<ServerState>,
     Json(req): Json<ExternalBrokerRequest>,
@@ -463,6 +503,7 @@ pub async fn create_broker_handler(
     broker.client_key = req.client_key.clone();
     broker.client_id = req.client_id.clone();
     broker.enabled = req.enabled;
+    broker.device_id_field = req.device_id_field.clone();
     // Use custom subscribe_topics if provided and non-empty, otherwise keep default.
     // An empty array is ignored so it isn't treated as an intentional "clear all".
     if let Some(topics) = &req.subscribe_topics {
@@ -581,6 +622,19 @@ pub async fn create_broker_handler(
 /// Update an existing external broker.
 ///
 /// PUT /api/brokers/:id
+#[utoipa::path(
+    put,
+    path = "/api/brokers/{id}",
+    tag = "mqtt",
+    params(
+        ("id" = String, Path, description = "Broker id"),
+    ),
+    request_body = ExternalBrokerRequest,
+    responses(
+        (status = 200, description = "External broker updated"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn update_broker_handler(
     Path(id): Path<String>,
     State(state): State<ServerState>,
@@ -636,6 +690,7 @@ pub async fn update_broker_handler(
             broker.subscribe_topics = topics;
         }
     }
+    broker.device_id_field = req.device_id_field.clone();
     broker.touch();
 
     store
@@ -700,6 +755,18 @@ pub async fn update_broker_handler(
 /// Delete an external broker.
 ///
 /// DELETE /api/brokers/:id
+#[utoipa::path(
+    delete,
+    path = "/api/brokers/{id}",
+    tag = "mqtt",
+    params(
+        ("id" = String, Path, description = "Broker id"),
+    ),
+    responses(
+        (status = 200, description = "External broker deleted"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn delete_broker_handler(
     Path(id): Path<String>,
     State(state): State<ServerState>,
@@ -733,6 +800,18 @@ pub async fn delete_broker_handler(
 /// Test connection to an external broker using real MQTT CONNECT/CONNACK.
 ///
 /// POST /api/brokers/:id/test
+#[utoipa::path(
+    post,
+    path = "/api/brokers/{id}/test",
+    tag = "mqtt",
+    params(
+        ("id" = String, Path, description = "Broker id"),
+    ),
+    responses(
+        (status = 200, description = "Connection test against the broker"),
+        (status = 404, description = "Not found"),
+    )
+)]
 pub async fn test_broker_handler(Path(id): Path<String>) -> HandlerResult<serde_json::Value> {
     let store = config::open_settings_store()
         .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;

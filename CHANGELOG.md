@@ -7,6 +7,1063 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## HeraMind integration — 2026-09-16 (source 0.9.24)
+
+- Port NeoMind v0.9.24 (`4c41362ad785b203e20cf49cc2dd3adb325d453e`) onto HeraMind while preserving its own Rust crate names, environment variables, app identifier, storage paths, logos, and release channel.
+- Keep Vietnamese as the default language and add 436 translations for the new UI. Adapt the new sidebar to HeraMind's blue theme. Default unset timezones to Asia/Ho_Chi_Minh while preserving saved choices.
+- Preserve HeraCam/bodycam examples, EventList dashboards, read-only analytics, relative time offsets, and server-side sum/count queries alongside upstream pagination and aggregation.
+- Accept both HeraMind and NeoMind native extension symbol namespaces (ABI checks still apply), and expose compatible browser SDK aliases.
+- Make `build:check` propagate compiler/bundler failures and reject circular output chunks; group the CodeMirror dependency family together.
+- Integration procedure, validation, and deployment limits: [upstream-sync-0.9.24.md](docs/upstream-sync-0.9.24.md).
+
+The version sections below are imported upstream change notes; their benchmark and acceptance figures are upstream reports, not local HeraMind measurements.
+
+## [0.9.24] - 2026-09-14
+
+### OpenAPI: every operation annotated, spec fully codegen-ready (final state)
+- **All 334/338 HTTP handlers carry `#[utoipa::path]` annotations** (354 operations, 278 unique paths, 37 tags); the 4 wildcard routes (`*path`-style) are deliberately unannotated — not expressible as OpenAPI templates. `GET /api/docs/openapi.json` now covers the entire surface, superseding the "first batch" scope noted further below. A live cross-check against the router-verified route index finds **zero coverage gaps**.
+- **The spec is now importable by code generators.** An acceptance sweep found 100 write operations carrying dangling `$ref`s — the annotations named their request types but the aggregator had no `components(schemas(...))` section, so Apifox/openapi-generator imports produced broken clients. All 136 schemas are now registered and every one of the 135 `$ref`s resolves (verified live: `dangling = 0`).
+- **`/api/docs` shipped a blank page** in the intermediate builds: the Scalar bootstrap inline script had an unbalanced quote (`url: '/api/docs/openapi.json` never closed) — a JS syntax error that every curl check stayed green through. Fixed; a new guard test renders the HTML and asserts balanced quotes, a closed spec-URL literal and the CDN runtime tag.
+- **19 route-index gaps closed and the drift guard made chain-aware.** Chained axum method routers (`.route(p, put(h).delete(h))`) register two operations but the index generator (and its drift test) only saw the first — every second method (DELETE/PATCH/PUT across skills, instances, memory, settings, extensions, llm-backends, dashboards) was silently missing from `/api/docs/routes.json`. The depth-aware extractor also compares per-route auth classes; it caught a wrong class during backfill.
+- **Not-found resources answer 404, not 500 — 20 endpoints fixed.** A scripted sweep fired every documented operation against a live scratch instance and exposed handlers reporting plain not-found as `500 INTERNAL_ERROR` ("Agent not found", "Target not found", "Session not found", …) across agents, data-push, devices (incl. drafts and the NotFound→400→404 correction to match the documented contract), sessions, llm-backends, channels, dashboards, builtin-llm; a "delete system memory" attempt is now 400, and an unknown data-push `target_type` is 400 instead of 500. Messages stay honest — status codes now match them.
+- **Final acceptance, measured not assumed:** 349/354 operations exercised live (downloads/uploads/BLE skipped): routing mismatches 0; 141 writes re-fired with schema-generated bodies → 41×2xx + 99×honest-4xx + 0 wrong codes (the single 500 is `llm/generate` against a machine with no LLM backend — a real infrastructure error). Real-resource CRUD lifecycles verified across 12 families (create → list → get → update → delete → 404), including dashboard component round-trips and channel enable/disable. The CLI was audited against the spec: all 115 operations it calls exist and are annotated — zero drift — and a live CLI smoke pass against the scratch server succeeded.
+- **The "flaky" builtin-llm bootstrap test suite was deterministically broken, not flaky:** four stacked bugs masqueraded as sandbox nondeterminism — an apostrophe inside a shell comment terminated the single-quoted `python3 -c` payload (python received imports + class def only and exited 0, so every fake server died in milliseconds), the FAST_FAIL gate read a nonexistent python global instead of the exported env var, the gate lived in python whose startup can exceed the 500ms health settle window (moved to the shell wrapper, ~10 ms), and the port-squat test relied on PATH leaked by a previously-run sibling test. Plus a leaked foreign-server child could hold the test binary's stdio pipes and hang the whole `cargo test` run — now kill-on-drop. The suite is deterministic: 5/5 green runs at ~2 s each.
+
+### CLI could not find a desktop install's data directory (password reset impossible)
+- **`heramind user reset-password admin` reported "User 'admin' not found in data/users.redb"** on a machine whose only live store was the desktop app's. The CLI resolver checked `./data/api_keys.redb` first — a stale leftover directory satisfied it — and then returned the literal relative string `"data"`, while the real store sat in the desktop app data dir (`~/Library/Application Support/com.heramind.heramind/data`), which no probe ever examined. All CLI data-dir resolution (`login`, `whoami`, `user *`, path helpers) now goes through one shared resolver whose precedence is: `--data-dir` → `HERAMIND_DATA_DIR` → **desktop app data dir** → `./data` → platform default; the not-found error lists every candidate it examined, and the success message names the store that was changed (several candidate dirs can coexist on one machine).
+- **No flag needed on server installs either:** the resolver also probes the systemd unit's `WorkingDirectory` (plus `/data`, as the installer lays it out) and the documented `/var/lib/heramind`, `/opt/heramind` defaults, so a plain `heramind user ...` works on a server host without `--data-dir`.
+- **Usernames resolve case-insensitively:** the setup wizard stores what was typed (`Admin`), people type `admin` — the exact-match lookup called that "not found", indistinguishable from a wrong data dir. Lookups (including the cross-store search) now match case-insensitively and write against the CANONICAL stored name, so the record is updated in place instead of duplicated under a second spelling; two accounts differing only in case are refused rather than guessed. The confirmation names the account that actually changed.
+- **Same class, two more commands fixed:** `heramind api-key create|list|delete` had `--data-dir` defaulting to the literal `"data"`, so running it from any other directory silently created a SECOND key store there (with its own `encryption_key`) and printed success for a key the running server would never accept — the most likely origin of stray `~/data/` directories. It now auto-detects like the rest (and prints which directory it used). `heramind health`'s database listing had the same `./data` assumption and reported "Data directory not found" for healthy installs started elsewhere.
+- **Workaround on older binaries** (0.9.23 and earlier): pass the store explicitly — `heramind user reset-password <user> --data-dir "$HOME/Library/Application Support/com.heramind.heramind/data"` (same for `api-key --data-dir`).
+
+### Upgrade notes (0.9.23 → 0.9.24)
+- **Hosts with a custom `HERAMIND_DATA_DIR` (Docker volumes, `deploy/heramind.service`) may need to re-create API keys.** 0.9.21–0.9.23 encrypted keys with a cwd-relative `data/encryption_key` while persisting them into `$HERAMIND_DATA_DIR`; 0.9.24 pairs both to the data dir (the actual fix), so the first boot sees rows it cannot decrypt — it logs `Skipping API key entry that fails to decrypt`, prunes them, and mints a fresh default key. CLI/agent auth then works again with the new key (`heramind login --force`), but keys you distributed to integrations must be re-created and re-distributed. Default `install.sh`/systemd installs are unaffected (both paths always resolved to the same directory).
+- **The desktop app's LAN toggle forces the server port to 9375** (with the host from the toggle). A `[server] port = X` in a desktop `config.toml` is no longer honored while the toggle is in play — the desktop's own probes are hardcoded to 9375.
+- **Batched data-push targets (`batch_size > 1`) still deliver inline**, so the stall-then-drop mode described above is fully removed only for `batch_size = 1` targets. Left as-is deliberately (a full spool/bounded-concurrency rework of the batched path is its own change); the drop is now logged with counts.
+- **Builtin llama-server moved to port 29375** — a custom backend you registered at `127.0.0.1:8081` keeps working only while the pre-upgrade process survives; the server logs a warning naming the fix at startup.
+
+### Release-readiness fixes (pre-tag)
+- **Cursor pagination: my earlier "fix" traded a loop for silent truncation — now actually correct.** The cursor was passed as the scan's LOWER bound while `end` stayed at "now", and storage scans newest-first within the range — so page 2 returned only points ≥ the cursor, every one of which the strictly-older filter then dropped: an empty page and a premature "end of data". The cursor is the page's UPPER bound (`[start, cursor)`), which is what makes the reverse scan return the newest points OLDER than the cursor. The pre-existing bug it replaces was an inclusive boundary that re-served the same page forever; both are gone. (External-consumer-only path — no in-repo caller sends `cursor=`.)
+- **Release notes were about to ship incomplete:** every `[Unreleased]` subsection (the /api/docs index, the unified error envelope, marketplace-install status codes, the explicit API-contract-changes list, the last_seen debounce, the thinking-flag move) sat ABOVE the `[0.9.24]` header, and the release-notes extractor only reads the version header — all of it would have been dropped from both the GitHub body and the OTA/Discord notes. Folded into `[0.9.24]`; the extractor now yields 124 lines for this release.
+- **`web/src-tauri/Cargo.lock` was still pinned to 0.9.23** while `Cargo.toml` said 0.9.24 — the `--locked` desktop compile check added earlier in this same iteration would have gone red on the first CI run (the previous release needed a dedicated repair commit for the same miss). Lock refreshed; `cargo check --locked` passes.
+- **Backpressure logging was self-defeating:** the window opened on the first drop and only warned if a LATER drop arrived ≥60 s on — a burst that ended within the minute logged NOTHING (contradicting the "visible, bounded loss" contract) — and the drop count was discarded before the message. The first drop of each window now warns immediately, and each window reports its total.
+- **`docs/edge-models.md` contradicted the shipped defaults:** the manual-server snippet still used `--port 8081 -c 8192` and a "Take 8K" mandate (against the new 29375 port and the 32K default), while the backends section presented 8081 as the registration address — it now distinguishes a user's own manual llama.cpp (any port) from the builtin server (29375).
+- **`thinking_is_integral` now refreshes on the already-running path** (it was stamped only at spawn, so a short-circuited restart kept a stale value) and is derived from the registry for imports whose id names a registry model — otherwise importing an LFM/Ling GGUF recreated the "toggle that does nothing" state the field exists to prevent.
+- RouteDoc's doc comment listed auth classes (`jwt`, `api-key`) that never appear in the table; corrected to the four real ones plus `jwt-only`.
+
+### Docs-correctness audit — the route table was incomplete, and the drift test shared the blind spot
+- **`/api/docs` was missing 14 routes** registered in `admin_routes` (12), `extension_upload_routes`, and `component_upload_routes`: the generator listed only five router variables, and the drift test used the SAME five — so the test passed while the published index silently omitted them. Both now cover all ten routers, and the test asserts full coverage (any `let X = Router::new()` absent from the map fails loudly with instructions). It also compares the **auth class** per route, not just method+path, so a wrong class can no longer ship. New class `jwt-only` distinguishes `admin_routes` (`jwt_auth_middleware` — API keys are NOT accepted there) from the hybrid routes. Mutation-verified: deleting a router from the map fails the test.
+- **Doc-vs-code limit mismatches fixed:** telemetry's `limit` was documented "max: 1000" while the code validates up to 5000; `/api/data/sources` documented "max 100" while its cap is mode-dependent (100 with telemetry values, 5000 when `skip_telemetry=true`) — both now state what the code does.
+
+### Live API verification pass — one more real bug found and fixed
+- **Client mistakes no longer answer 500:** an unregistered `device_type` on `POST/PUT /api/devices` came back as `500 INTERNAL_ERROR` ("template 'nope' not found") — integrators could not distinguish "I sent something wrong" from "the server broke". A `device_error_to_response` mapper now routes client-input variants to 400 (not-found references, invalid parameters, bad metric/command), `AlreadyExists` to 409, and keeps infrastructure failures (storage/IO/protocol) at 500. Unit-tested both directions.
+- **Silent device overwrite made visible:** `POST /api/devices` with an existing id REPLACED the previous device's name/config and still answered `added: true` (the service upserts by design for internal adapter/auto-onboard re-registration). The upsert stays — internal callers depend on it — but the response now carries an additive `updated_existing: true|false` so a client can tell created from overwritten.
+- **Verified live against a scratch server** (all previously-passing behavior re-checked after the 0.9.24 API changes): `/api/docs` HTML + `routes.json` (322 routes, grouped by auth class), unified 401 envelope, install 400 with `BAD_REQUEST`, 404 parity across `/devices/:id`, `/current`, `/telemetry`, `/telemetry/summary` (+ `?history=true` escape hatch returning 200), aggregate validation 400 on both endpoints, `next_cursor: null` termination, and the aggregate P0 fix (avg=20 / max=40 / min=10 / sum=60 / last=40 over the same window).
+
+### OpenAPI schema — first milestone (superseded by the full-surface section above)
+- **`GET /api/docs/openapi.json`** went live with utoipa-generated coverage for the domains third parties integrate against first: auth (login/register/keys), device CRUD (incl. the upsert `updated_existing` note and `offline_timeout_secs` tri-state), and the full telemetry contract (every query parameter — `hours`, `aggregate` with its valid set, exclusive `cursor`, `history=true` — documented with units and semantics). The Scalar console at `/api/docs` renders from the spec (parameters, response descriptions) instead of the bare route index; `routes.json` remains as the machine-readable route index. A CI drift test fails when an annotated path is not actually routed, so the spec cannot rot. (This milestone has since been extended to every handler — see the OpenAPI final-state section above.)
+
+### Business-contract audit (FE↔BE) + Swagger-style interactive docs
+- **Audited every 0.9.24 contract change against its actual frontend consumer** (3-state status, offline-timeout tri-state, aggregate validation, hours clamp, cursor semantics, marketplace status codes, unified error envelope): all handled correctly. Two failure-adjacent gaps found and fixed: telemetry polling of a device deleted by another client now 404s (the new contract) — dashboards poll every 30s and each failure fired a global error toast forever (`skipErrorToast` on that one path; charts already degrade to empty gracefully); and `POST /devices` with an existing id silently replaced the device while the UI said "added" — the add dialog now confirms before overwriting, and the api layer surfaces the backend's `updated_existing` flag for future consumers.
+- **`GET /api/docs` is now a Swagger-style interactive console** (Scalar UI, CDN-loaded single file) rendering all 339 routes with try-it-out, fed by the same CI-enforced routes.json the drift test locks. Not yet a full OpenAPI schema document (request/response types, parameter constraints stay in handler sources — the page says so), but third parties can now explore and execute every endpoint from the browser instead of reading Rust.
+
+### External-API batch 2 — consistency contracts + the promised /api/docs
+- **`GET /api/docs` now exists** (the CLI help has promised it since forever; it 404'd into static-file serving): a human-readable HTML route index grouped by auth class (public / jwt-or-api-key / webhook / ws) plus `GET /api/docs/routes.json` for client tooling — 322 routes from the router's own registrations. A CI drift test re-derives the route set from router.rs and fails the build when a route is added without refreshing the table, so the index cannot silently rot. (Full OpenAPI remains future work; this is the honest floor.)
+- **One existence rule per device:** unknown device IDs now 404 on `/telemetry` and `/telemetry/summary` exactly like `/devices/:id` (previously those answered 200 with `_raw` fallback queries — clients could not write one retry rule). Telemetry for a DELETED device stays reachable with `?history=true` (storage keys outlive the registry entry).
+- **`?aggregate=` validation parity:** `/api/telemetry` now rejects unknown aggregate values with the same 400 as the device endpoint (was a silent avg fallback); `count` remains that endpoint's own extra.
+- **Cursor termination signal:** `next_cursor` is `null` when a page is shorter than the limit (the standard cursor convention) — clients can stop paginating without probing for an empty page.
+- **Doc lie fixed:** `DataSource.last_update` documented as "Unix milliseconds" but emitted seconds since inception — the doc now states seconds (changing the emitted unit would break every existing consumer; the value was always consistent with telemetry timestamps).
+
+### External-API consumer fixes — error envelopes, honest status codes, contract-change notices
+- **Unified error envelope on EVERY failure path:** the auth middleware's 401/403 (i.e. every protected route) used to answer `{error:"<string>"}` — error as a plain string, no `success` field — and 429 had a third shape; a client's typed deserializer broke on exactly the failures integrators hit first. Both now emit `{success:false, error:{code,message,request_id}}` (`UNAUTHORIZED`/`FORBIDDEN`/`RATE_LIMITED`); the old numeric `status` mirror and `retry_after` stay as deprecated top-level conveniences for one release. Envelope shape is regression-tested (401 + 403 render).
+- **Marketplace install no longer lies with HTTP 200:** all 14 failure branches of `POST /frontend-components/market/install` (component not found, marketplace unreachable, bad manifest/UTF-8, download failures) returned 200 with outer `success:true` and `data.success:false` — status-code-branching clients reported install failures as successes. They now return real 4xx/5xx through the standard ErrorResponse; the web UI keeps a defensive fallback for mixed-version (old-server) deployments.
+- **API contract changes in this release that external clients must know about** (correctness fixes landing in 0.9.24 — listed here explicitly because there is no API versioning):
+  - `GET /api/devices/:id` and `/current`: `status` is now strictly `online|offline|disconnected` (previously the detail endpoints collapsed to two states; `connecting`/`error` no longer appear).
+  - `GET /api/devices/:id/telemetry`: `?hours=N` now derives the time window when `start` is absent (was accepted-and-ignored); `?aggregate=` now drives the `value` field (was always avg) and unknown values are a 400; cursor pagination no longer returns the boundary point (inclusive→exclusive).
+  - `PUT /api/devices/:id`: `offline_timeout_secs` distinguishes absent (keep) / `null` (clear) / value (set) — a partial update omitting the field no longer wipes the override.
+  - Builtin llama-server moved to port 29375; the builtin LLM downloads from the official openbmb repo.
+
+### Cleanup wave round 2 — shared channel send ladder + data-dir resolver
+- **`post_json` + `channel_http_client` in heramind-messages:** the five webhook-style channels (Slack/Telegram/DingTalk/WeCom/Feishu) carried byte-identical send ladders — post → transport-error map → non-2xx map → 200-with-error-body validation — and five copies of the 30s/10s client builder. One shared ladder + one shared client now; the IM-APIs-answer-200-with-error-bodies knowledge lives in exactly one place. All 189 message tests pass unchanged (the ladder was extracted, not altered).
+- **cli-ops data-dir resolution consolidated:** `device.rs`/`widget.rs` hand-rolled `env-or-"data"` and silently missed the platform-dir tier (hosts without `./data` resolved image/widget paths against a nonexistent cwd dir); both now use `auto_auth::data_dir_for_paths()` with env > platform-dir-with-store > "data" precedence.
+
+### Optimization + consistency wave (post-0.9.24 bump)
+- **Ingest hot path:** `update_last_seen` no longer writes a redb txn per metric per report (10-metric device @1Hz was 10 txns/s of whole-config read-modify-write) — in-memory updates every event (status semantics unchanged), persistence debounced to ≥15s advances (restart survival loses ≤15s, far inside the 30s offline-timeout floor).
+- **Query hot paths:** telemetry responses move-not-clone the JSON points arrays (three blocks deep-copied every metric's full series per request); the current-values batch endpoint and the summary endpoint now fan out per-device/per-metric work concurrently (were N×latency sequential); summary's per-request metric-list dumps demoted info→debug.
+- **~400 lines of dead weight removed:** six unrouted device/metric handlers (incl. the hours-ignored TimeRangeQuery trio), the LiquidAI `HF_REPO` const orphaned by the openbmb switch, phantom WebSocket union variants in chat.ts (ExecutionPlanCreated/PlanStepStarted/PlanStepCompleted/Intent/device_update — never emitted) plus their orphaned PlanningMode/PlanStep/ExecutionPlan interfaces, the unused `.cargo/config-ci.toml` profiles + vestigial `CARGO_PROFILE` env, and two bare tempfile pins aligned to `{ workspace = true }`.
+- **`thinking_is_integral` is now a registry field** (minicpm false, lfm/ling true, others false) — bootstrap and the restart path both read it, killing the magic-string `"lfm25-2.6b"` comparisons that had already caused one default-flip regression.
+
+### Builtin-model pipeline: end-to-end integration tests (chain, not just links)
+- New `builtin_llm_bootstrap` integration suite pins the full chain with REAL code paths and minimal fakes: a PATH-injected shell/python `heramind-llama-server` (serves /health + /props, real spawned child) drives discovery→spawn→health→is_alive→registration. Three scenarios: **(A) happy chain** — seeded model → bootstrap → `ServerReady` with the real port, instance registered with the registry's 32K ctx, set active, spawned server STAYS alive after bootstrap returns (kill_on_drop keeps the handle-released child alive), and `stop_all_llama_servers()` kills it (graceful registry path reaches this child); **(B) port-squat guard** — a foreign server pre-binding the port (our child dies on bind, health passes against the foreigner) → bootstrap `Failed`, NO instance registered pointing at the foreign server; **(C) idempotent restart** — stale instance record + healthy server short-circuits `ServerAlreadyRunning`, and the refresh stamps `cfg.effective_ctx` (a 64K override beats the 32K default — the regression where refresh rewrote it down is pinned). Env-mutating tests serialize on one lock and restore PATH.
+
+### Iteration regression audit — round 2 findings, all fixed
+- **[MEDIUM] Quant override dead download (introduced by the openbmb switch):** `resolve_quant` accepted `qad_q4_0` for the MiniCPM default — the download fetched the correct Q4_K_M file but verified it against the LFM QAD sha: a guaranteed 1.5 GB dead download per attempt. Worse, two layered `def.id == BUILTIN_MODEL_ID` gates meant quant override had been silently broken for LFM (and every catalog-only model) since the default moved to MiniCPM — the first test round caught the fake error path my earlier comment claimed existed. Gates restructured per-model (supported-set travels with the model: LFM keeps QAD, others Q4_K_M/Q8_0), override local file names follow the model's own prefix (MiniCPM overrides used to land as lfm-named files), and 4 regression tests pin official repo/sha/local-name per model.
+- **[MEDIUM] Desktop LAN toggle could lie when a config.toml exists:** the toggle drove binding via `HERAMIND_HOST`, but config resolution is toml > env — a config.toml in the app-data dir overrode the toggle while the UI reported the env value. A new `HERAMIND_BIND_OVERRIDE` env (desktop-only) is checked first in `get_server_config`; the standalone server's precedence is untouched.
+- **[LOW] `serve` + JSON logging branch still wrote to stdout** (the stderr sweep's commit message claimed all four branches) — fixed.
+- **[LOW] Immediate push deliveries are no longer strictly ordered per target** (up to 4 concurrent) — documented in-code: consumers must key state transitions on timestamps, not arrival order.
+- **[adjacent pre-existing] `thinking_is_integral` on the restart path** compared against `BUILTIN_MODEL_ID` — flipped to `false` for LFM installs the day the default moved to MiniCPM, contradicting bootstrap's hardcoded id. Now hardcodes the model id like bootstrap.
+
+### MiniCPM5-2B download source: third-party mirror → official openbmb repo
+- The default model downloaded from `Abiray/MiniCPM5-2B-GGUF` (a personal-account mirror) whose bytes are a **repack** — LFS pointer comparison: official 1,561,318,368 B / `ec2d58…02fd` vs mirror 1,561,320,448 B / `9252…7b50` (2,080-byte delta). Personal mirrors vanish and their re-uploads silently invalidate pinned hashes; `openbmb` is the model author's authoritative, durable source. Both the pinned sha256 (Q4_K_M) and the repo switched; already-downloaded installs keep their files (the hash only gates new downloads).
+- **Fixed the LFM leftover in `resolve_source`:** the quant-override special branch still hardcoded LiquidAI's repo from when LFM was the default — a MiniCPM quant override went looking for MiniCPM files in the LFM repo and 404'd. Per-quant sources now derive from the model's own registry entry (official openbmb file names + LFS-verified sha256s for Q4_K_M and Q8_0, captured from the repo pointers 2026-09-14).
+
+### llama-server lifecycle: deterministic cleanup on every exit path
+- **`kill_on_drop` on the spawn + a global handle registry**: every `systemctl restart` (and any crash / `kill -9` / desktop force-quit) used to orphan the model-loaded llama-server (~2 GB) — reclamation depended on the NEXT boot's port-conflict detection happening to match. The handle now lives in a process-global registry (`Arc<Mutex<Child>>`, both spawn sites register), so `kill_on_drop` guarantees the child dies with the server process on abnormal exits, and graceful paths stop it explicitly: the standalone serve shutdown calls `stop_all_llama_servers()` first, and the desktop `clean_shutdown` (previously dead code that never ran before runtime teardown) now stops the embedded llama-server before dropping the runtime.
+
+### CLI exit-code contract + clean stdout; data-push backpressure
+- **CLI failures now exit non-zero:** every `CliResponse` with `success:false` used to print "❌ …" and exit 0 — scripts and the agent's shell tool could not distinguish failure from success. Soft failures (the command ran, the operation failed) now exit **3**, distinct from anyhow's exit 1 (transport/usage) and 0 (success). Verified empirically: help→0, no-server→1, unreadable-key login→3.
+- **CLI logging routed to stderr (all four subscriber branches):** tracing defaulted to stdout, interleaving log lines into the `HERAMIND_JSON=1` machine stream and breaking `serde_json` parsing of piped output. The on-disk log layer is untouched. `HERAMIND_JSON=1 RUST_LOG=info heramind …` stdout now parses as pure JSON.
+- **data-push immediate deliveries no longer stall the event bus:** the immediate path (batch_size=1) awaited the full retry ladder inline — one dead endpoint (worst case ~12 min of timeouts+backoffs) blocked `rx.recv()`, the 1000-slot broadcast bus lagged, and the telemetry being pushed was silently dropped: the push subsystem lost data exactly while the endpoint was down. Deliveries now run in spawned tasks under a per-target in-flight cap (4); when the cap is exhausted the newest event is dropped with a rate-limited (once/minute) warning — visible, bounded loss, the same policy the EventBus applies under lag. The batched buffer also gained a hard 1000-entry cap independent of the configured batch_size (image-inlined values × burst rates used to grow it without bound).
+
+### Builtin llama-server default port 8081 → 29375 (collision with llama.cpp tooling)
+- The old default sat right next to llama-server's OWN default (8080) on one of the hottest dev ports — any user running llama.cpp tooling collided with our spawn, and the port-conflict guard would `kill_process_on_port` an innocent process. New default **29375**: deliberately obscure ("2" + the platform's 9375), clears every AI-tool default (llama.cpp 8080, Ollama 11434, LM Studio 1234, gradio 7860), no known registered service. `HERAMIND_BUILTIN_LLM_PORT` still overrides; the frontend reaches llama-server through the backend proxy, so the change is backend-contained.
+- **Upgrade reclaim:** machines upgrading from the old default can carry an orphaned llama-server on 8081 holding ~2 GB of model RAM. Bootstrap now reclaims it — but only when the listener's `/props.model_path` provably lives under OUR data dir (8081 is a common port; an innocent process is never touched). Decision logic unit-tested; free-port no-op covered.
+- **Legacy-endpoint advisory:** a custom (non-builtin) LLM backend pointing at the old `127.0.0.1:8081` keeps working only while the pre-upgrade orphan lives, then fails with connection-refused after the next reboot — a delayed, hard-to-trace breakage. Bootstrap now warns once per affected backend with the fix (no auto-rewrite: a loopback 8081 endpoint may be the user's own llama.cpp; loopback-only matching is unit-tested — LAN hosts and other ports never flag). The advisory runs before the already-running short-circuit, so every boot path covers it.
+
+### Self-review of this session's fixes — five regressions WE introduced, all fixed
+- **[CRITICAL] Offline-edit merge compared milliseconds against seconds** — the frontend writes `updatedAt` as `Date.now()` (ms) while the server persists `updated_at` as Unix seconds, so EVERY local copy compared "newer" than EVERY server copy: the merge "recovered" everything on every load, healing forever, and each heal silently reverted other clients' newer edits — the exact data loss the merge was meant to fix. Comparison sites now normalize units (threshold 1e12; the `Dashboard.updatedAt` contract elsewhere is untouched).
+- **A second message during a background-completing turn fell into a concurrent degraded path** — the detached turn holds the per-session stream mutex for its full duration; the streaming registration rejection ("already being generated") was caught by the generic error fallback, whose non-streaming path bypasses the mutex and ran CONCURRENTLY on the same session state (interleaved history writes, out-of-order replies). Mutex rejections now surface as an actionable error event instead of the fallback.
+- **Disconnect cleanup still cancelled the detached turn** — the product contract ("the reply completes in the background and lands in history") was only true for clean closes; the drop path (dead network, killed tab) called `cancel_session`. It no longer does — the consumer runs to End and the stream's own cleanup releases the registration (the original leak rationale died with the send-failure break).
+- **Credential scrubber missed path-form webhook keys** — feishu (`…/bot/v2/hook/<key>`) and Slack (`hooks.slack.com/services/T/B/X`) carry their secrets in the URL path, invisible to the query-param pass; both now masked (3 new tests). The query mask also ate reqwest's closing paren into the mask — `)` is now a terminator.
+- **Panel chat killed the stream UI on a 2-second reconnect blip** — the state-change handler fired on the first `reconnecting` tick (and on the subscription's stale-state replay): a queued message that would have streamed normally after reconnect instead got a scary "connection lost" notice mid-send. The kill now requires the bad state to persist 3 s (cleared on reconnect) and skips the immediate replay. Plus a missing margin above the System-page LAN card.
+
+### Desktop LAN access: on by default, one-toggle opt-out
+- The desktop app's embedded server keeps binding **0.0.0.0 by default — edge devices connect out of the box**, and the embedded MQTT broker follows the same binding via a new session-level `HERAMIND_MQTT_BIND` override (never persisted into the server's own settings — the desktop stays authoritative per launch). **Server deployments (`heramind serve` / install.sh) are completely unaffected.**
+- **Turning it off is one explicit, sticky toggle** (Settings → Preferences on desktop, the System page in the app): it rebinds HTTP + MQTT to 127.0.0.1 after an app restart, with a restart-required banner and a Restart-now button. (An earlier intra-iteration plan shipped loopback-by-default on fresh installs; the final call keeps LAN on everywhere — closing the loopback default was rejected before release.)
+
+### Review wave 4 — whole-project FE/BE sweep, first fix batch
+- **Offline dashboard edits survive reload (P0):** the hybrid store's reload merge never compared `updatedAt`, so a stale server version overwrote newer local edits made while the backend was down — "local-first" was only "local-until-reload". The merge is newest-write-wins (recovered versions re-sync in the background to heal the server), and `load()` now RETURNS the merged list instead of the raw server list (local-only dashboards no longer wait for a cold start to appear).
+- **Cross-tab coordination (P0):** localStorage `storage` events now refresh the other tabs' local↔server id mapping (the duplicate-server-create path) and trigger a store refetch (skipped while that tab holds unsynced edits) instead of the second tab clobbering the first's dashboards on its next save.
+- **CLI can no longer hang on prompts (P0):** `extension uninstall` gained `--yes` and a non-tty refusal (the y/N prompt used to block the agent's subprocess forever); `heramind upgrade`/`uninstall` prompts refuse with an actionable message when stdin is not a terminal; `user reset-password` refuses instead of hanging on its two hidden reads.
+- **Channel credentials scrubbed from error text (P1):** reqwest errors embed the request URL and notification tokens live in URLs — telegram bot tokens, dingtalk access_token+sign, wecom/slack/feishu webhook keys used to leak verbatim into logs, TestResult API responses, and rule-engine output. A pattern scrubber (query params, URL userinfo, telegram bot-token paths) runs on every send failure; 4 unit tests cover the credential shapes (and one livelock found in the first scrubber version — substring `token=` matching inside `access_token=***` — is guarded by word boundaries and an advancing cursor).
+- **Email title/source HTML-escaped (P1):** rule names and device names were interpolated raw into the email body — a name containing `<img onerror=…>` rendered as live HTML in recipients' clients.
+- Known follow-up (not in this batch): `list_info` still returns real config values because the edit dialog prefills from them — masking requires a masked-vs-real contract change across the editor.
+
+### Device/telemetry data-path fixes — the contract audit's P0/P1 batch
+- **Aggregate queries returned the average regardless of the requested function (P0):** `?aggregate=max|min|sum|last` all yielded `value: avg` — charts and agents silently got wrong data. `value` now reflects the requested function (unknown values are a 400, not a silent avg); raw fields stay alongside. Regression-tested.
+- **Cursor pagination returned every page-boundary point twice:** the cursor is the previous page's oldest timestamp and the storage range is inclusive, so page N+1 re-fetched that exact sample (duplicate chart points, inflated counts). Cursor mode now filters to strictly-older points on both query paths.
+- **`?hours=N` honored on `/api/devices/:id/telemetry`:** the parameter was accepted and silently ignored (defaulting to 24 h); it now derives the window when no explicit `start` is pinned (clamped 1 h–30 d).
+- **Device detail pages could never show "offline":** list emits three states but get/get-current collapsed to online|disconnected — a previously-seen timed-out device read "Never Connected" on its detail page while the list said "Offline". All four surfaces now share one `three_state_status` helper (tested).
+- **`PUT /devices/:id` absent-vs-null trap:** a partial update omitting `offline_timeout_secs` silently WIPED the override (serde read absent and explicit null identically). Double-option mapping now distinguishes absent (keep) / null (clear) / value (set) — tested on all three wire shapes. `POST /devices` also accepts the field the TS create type always declared (it was silently dropped).
+- **Webhook timestamps get unit detection:** raw ms/ns values were stored as-is (a ms epoch lands as year-58,000 seconds — invisible to every window query). Ingest now routes through the same magnitude normalizer + 5-min future guard the MQTT path uses; implausible values fall back to server time.
+- **Conversation summaries count against the history budget:** the injected `[Summary]` system message was exempt from budget enforcement and eviction, so long summary chains could push the context past the window it was derived from.
+- **data-push delivery-log persistence failures surfaced** (8 sites): every Success/Retrying/Failed transition was persisted best-effort with no trace — the audit trail now reports divergence.
+- **extension-stream pending queue bounded + evictions surfaced** (frontend): capability invocations queued during a disconnect were unbounded and silently droppable; now capped at 100 with error-channel notification, matching the chat websocket's discipline.
+
+### Regression sweep round 2 — siblings of the fixed bug classes + one WS contract gap
+- **Multimodal budget floor (twin of the 8K bug):** `stream_multimodal.rs` carried the exact unfixed clone of the streaming budget floor — every image chat turn could construct an overflowing prompt on 8K-class models. It now uses the same capped `effective_history_budget` helper as the text path.
+- **WS `cancelled` contract gap:** the backend's cancel acknowledgement (`{"type":"cancelled"}`) was absent from the TS `ServerMessage` union and unhandled by both chat views, and no trailing `end` is guaranteed on that path — after a cross-tab `__CANCEL__` the composer stayed locked and the bubble spun forever. Both views now reset stream state on `cancelled`.
+- **users.redb / .jwt_secret path pairing:** both bypassed `store_path()`'s legacy fallback (api_keys.redb already went through it) — on a legacy layout under `HERAMIND_DATA_DIR` the server could boot with an empty canonical users file (setup wizard reappears / lockout) or regenerate the JWT secret (every session invalidated). Both now resolve like every other store.
+- **Session commit siblings:** login persist, logout delete, and expired-session sweep discarded redb commit results silently — a failed logout commit meant the "logged out" token resurrected after a restart with no trace. All three now log the consequence explicitly.
+
+### Chat turns now survive page switches — the final reply always lands in history
+- **Frontend pair fix:** the side panel chat never subscribed to connection-state changes (only the full chat page did), and the WS layer silently cleared queued messages on auth rejection (close 4001) — an auth failure or mid-stream disconnect left the user's bubble looking delivered with the spinner running forever. The 4001 path now surfaces what was dropped through the state channel (count + previews, same pattern as the pending-limit eviction), and PanelChatView ends the stalled stream with a visible notice — on auth failure an error bubble, on a plain disconnect the honest message that the reply completes in the background and lands in history (matching the server-side detached-delivery fix below). zh/en strings included.
+- **Root cause:** the WS stream consumer (`process_stream_to_channel`) broke out of its loop the first time the event channel send failed — and the channel receiver dies with the socket, so navigating away (or any disconnect) cancelled the agent's turn mid-flight: the user's message sat in history with no answer, and stale pending-stream state lingered. A send failure now stops DELIVERY but never CONSUMPTION: the turn runs to completion, the final reply is persisted (`persist_history`), pending-stream state is cleaned up on End, and switching back to the session shows the conclusion. Explicit `__CANCEL__` is unaffected (it reaches the stream through an independent watch channel). Regression-tested with a consumed-events counter that fails against the pre-fix code.
+
+### Context window: MiniCPM5-2B default 8K → 32K (product decision 2026-09-12)
+- The 2026-09 eval's "8K optimum" was measured on the harness's lighter prompt; the production platform prompt (system + tool definitions + memory/skill context) weighs 4-6K tokens, which starves 8K (constructed overflows — fixed below) and leaves 16K merely adequate for long agent turns. MiniCPM5-2B scores flat across windows (older suite even peaked ~68 at 32K), its native ceiling is 128K, and 32K KV cache on a 2B model is negligible against the 3 GB install floor — so 32K buys agent headroom at no measured accuracy cost. Qwen3.5-4B stays at its measured 16K sweet spot; Ling-3.0-tiny stays 8K (cliff past 8K). `docs/edge-models.md` serve guidance updated.
+
+### Fixed: 8K-context models broke down in chat (budget floor constructed overflows)
+- **Root cause:** the streaming history budget computed `window − prompt_overhead − response_reserve`, then raised the result to a hard 20%-of-window floor (`stream_core.rs`). On 8K-class models the production platform prompt (system + tool definitions + memory/skill context) alone weighs 4-6K tokens, so whenever overhead crossed ~5.5K the floor re-inflated the history budget past what the window could hold — the code then constructed a prompt that overflowed EVERY turn: llama-server 400 → compact-retry ladder → tools stripped / "Context exceeds model limit". Symptom matched "8K 模型好像有 bug": fine right after install, degrading days later as accumulated memory pushed the overhead over the line. The floor is now capped at the real remaining budget (`effective_history_budget`, extracted + regression-tested: the constructed prompt can no longer exceed the window); starved budgets (<20%) log a warning instead.
+- **Summarization self-overflow:** the background conversation summarizer (the "auto-compaction" at 60% usage) embedded the first 50% of unsummarized messages verbatim into one user prompt — message count is not token count, so on small-context models the summary call itself overflowed at exactly the moment compression was needed, failed with a warn, and never recovered (context kept growing, every turn hit the retry ladder). Inputs are now per-message capped (300 chars) and bounded by a window-derived character budget; `summary_up_to_index` tracks what was actually included.
+- **Builtin refresh path:** the already-running bootstrap refresh stamped `max_context` from the bare per-model default, ignoring `HERAMIND_BUILTIN_LLM_CTX` / restart-API overrides — a raised context was silently rewritten down (and the history budget shrank to the phantom window). It now records `cfg.effective_ctx()`.
+- **(superseded — see the 32K entry above; kept for the reasoning trail) MiniCPM5-2B default context 8K → 16K:** the 2026-09 eval's "8K optimum" was measured on the harness's lighter prompt; against the production prompt weight 8K leaves ~2K of history (and triggered the floor bug above). Native ceiling is 128K and the KV-cache cost at 16K is negligible on a 2B model, so 16K restores usable headroom at a ~2.6-point harness score cost — the right trade for real deployments. `docs/edge-models.md` serve guidance updated. Ling-3.0-tiny stays 8K (measured cliff past 8K; protected by the floor fix instead).
+
+### Fixed: API-key auth dead under custom `HERAMIND_DATA_DIR` (regression since v0.9.21) — CLI and chat-agent tools all 401'd
+- **Root cause:** `AuthState::new()` resolved `api_keys.redb` through `store_path()` (honoring `HERAMIND_DATA_DIR`, since v0.9.21's storage unification) but kept loading the encryption key from the cwd-relative `data/` via the no-arg `CryptoService::from_env_or_generate()`. On any deployment where the two directories differ (Docker `HERAMIND_DATA_DIR` volumes, `deploy/heramind.service`, dev smoke envs), the server encrypted keys with one directory's key file and persisted them into another — so the CLI and the agent's shell tools (which read `{data_dir}/encryption_key`) could never decrypt any key. Symptom was maximally confusing: the web UI kept working (JWT sessions don't touch this path) while every `heramind` CLI call and every agent tool call 401'd, and the recovery hints dead-ended (`login` reports "already logged in" on file-existence alone). Default `install.sh` deployments (systemd `WorkingDirectory`, no env var) were **not** affected — both paths landed in the same directory. The crypto directory is now derived from the same resolved path as the db.
+- **Hardening:** `load_from_db` no longer aborts the whole table on a single undecryptable entry (the `?` dated back to the initial commit) — stale rows are skipped with a warning and cleared by the boot-time save, so a rotated/mismatched encryption key can no longer wipe every usable key from memory. A corrupt/missing metadata row degrades to the permissive default instead of failing the load.
+- **Hint chain:** 401 errors now route to a command that can make progress — a stored-but-rejected credential points at `heramind whoami` / `heramind login --force` instead of the `heramind login` → "already logged in" dead end; a rejected `HERAMIND_API_KEY` env var says so explicitly (it shadows every other source).
+- **Poisoned stores self-heal:** restarting a fixed server over a mismatched data dir logs `Skipping API key entry that fails to decrypt`, generates a fresh default key under the correct encryption key, and clears the dead rows — after which `heramind login --force` works with no manual surgery. Verified end-to-end (fresh deploy, poisoned restart, hint paths) plus two regression tests, one of which fails against the pre-fix code.
+
+### Server release tarballs back to ~30 MB — DWARF split into an optional sidecar
+- v0.9.23's Linux server packages ballooned (amd64 30→91 MB, arm64 26→78 MB): the line-tables-only release profile added in 9c67e474 keeps ~200 MB of DWARF per binary in the download, when the intent was only to make on-device perf sampling symbolizable. CI packaging now splits it out (`objcopy --only-keep-debug` / `--strip-debug` + `.gnu_debuglink`): the main `heramind-server-{os}-{arch}.tar.gz` ships small again (~30 MB, keeps `.symtab` so panic backtraces still name functions), and a separate `*-debug-symbols.tar.gz` carries the DWARF for perf/core-dump work — extract it next to the binaries and tools re-attach the symbols automatically. macOS tarballs are unaffected (rustc never links DWARF into darwin binaries). Local `cargo build --release` binaries keep full line tables on purpose.
+
+---
+
+## [0.9.23] - 2026-09-09 — binary push frames + platform perf pass, long-task agent fixes, onboarding wizard redesigned
+
+### Built-in model default → MiniCPM5-2B (2026-09 eval)
+- `BUILTIN_MODEL_ID` is now `minicpm5-2b` (Q4_K_M, 1.5 GB, Apache-2.0): 81% tool accuracy 8K, most robust across context windows, statistically ties cloud deepseek-v4-flash. The registry entries carry per-model tested windows — Qwen3.5-4B defaults to 16K (70/100 16K vs 38 starved 8K), Ling-3.0-tiny to 8K (cliffs past 8K, upstream `inclusionAI` repo), LFM2.5 demoted to recommended=false (native-128K niche). `thinking_is_integral` is now a per-model property (LFM) instead of "is default", so the default flip can't mis-flag LFM installs. Model catalog ([NeoMind-Runtimes](https://github.com/camthink-ai/NeoMind-Runtimes) v4) mirrors this guidance.
+
+### Agent platform fixes surfaced by the corrected eval harness
+- **Custom OpenAI-compatible endpoints no longer starve on a phantom 4096 context** — `CloudProvider::Custom` hardcoded 4096 collapsed the history budget to zero, silently killing cross-turn memory for every model behind a vLLM/llama.cpp proxy. Now configurable (`CloudConfig.max_context` / `with_max_context`) with a 32K floor; overflow degrades via the compact-retry ladder.
+- **Chat memory extraction runs on the core path**: `process_message` never triggered extraction (only the REST handler did), bare sessions defaulted memory OFF, and `MarkdownMemoryStore` never created its directory so extracted facts failed silently — cross-session memory was dead for CLI/embedded consumers. All three fixed; recall 0% → 60–80% in the eval R5 suite.
+- **`AgentResponse.tool_calls` now reports calls accumulated across every tool-loop round** (was first-round only) — metrics and API consumers no longer under-report investigative turns.
+- **Truncation pipelines run in-process**: `heramind … | head/tail` no longer falls back to an authenticated subprocess; `head`/`tail`/`cat` stages apply to the in-process dispatch output (faster, no auth dependency). Unsupported stages still fall back to the real shell.
+
+### SDK 0.7.0 — zero-serialization push (raw FFI) + segmented payload codec
+- **New FFI surface (backward compatible):** `PushOutputRawWriterFn` — a raw push writer that takes every field as ptr+len slices, so binary payloads (video access units, 35–300 KB) travel from the extension's `Vec<u8>` to the IPC segment **without any JSON serialization or base64 encoding**. Only the metadata (usually tiny) is JSON-encoded by the SDK. `heramind_export!` now emits an optional `heramind_extension_register_push_writer_raw` export automatically — new runners resolve it and register the raw path; old runners never look it up and extensions fall through to the legacy JSON writer. `send_push_output` prefers the raw writer when present.
+- **Segmented payload codec (public API):** `encode_segmented_payload` / `parse_response_payload` — `[u32 header_len LE][header JSON][binary segment]` format for runner→core push responses, eliminating base64 on that leg too. The discriminator (`hlen` plausibility + byte 4 = `{`) makes it impossible to confuse with legacy whole-JSON payloads.
+- Testkit: formatting cleanup + import ordering (no functional change).
+- All 105 tests pass; gym-tracker 2.11.0 (compiled against 0.6.6) verified running on the new runner.
+
+### Chat turn time budget is now configurable (default 1800s) — agent no longer stops halfway on long tasks
+- **Root cause of "agent 运行一半自己停下来":** the streaming tool loop carried a hardcoded 240-second wall-clock budget (`TURN_WALL_CLOCK_BUDGET`, added 2026-08-22 to guarantee a text reply on pathological loops). It covers ALL rounds of one turn — every thinking-model LLM round plus every tool execution — so a legitimate multi-step task (build pipeline/dashboard/bridge on a gateway) with a cloud reasoning model hit the 4-minute mark mid-task, exited the loop, and the forced-summary prompt explicitly forbade further tool calls. Tasks that fit under 4 minutes finished fine, which is why the failure looked intermittent; a user-side "long-task discipline" system prompt could only counter the model's *voluntary* early wrap-ups, never this forced exit.
+- The budget is now `AgentDefaults.chat_turn_timeout_secs`, default **1800s** (30 min), clamped 60–7200 via `PUT /api/settings/agent`, editable in Settings → Preferences (5 min–2 h presets; an API-set value outside the presets still renders). Read once per turn in `stream_core.rs` — applies from the next turn, never mid-flight. The safety intent survives: exhausting the budget still falls through to the forced summary so the user always gets a text reply.
+
+### Neutral "definition of done" in the platform prompts
+- The round-continuation prompt was one-sided: it told the model when to STOP ("give the final response NOW. Do NOT call them again") but never when NOT to — on long multi-step tasks this nudged models into premature wrap-ups ("I will now…" endings), the exact failure users were patching with custom "long-task discipline" system prompts. Both the slim system prompt (Tactical Rules) and the per-round message now carry a bidirectional completion criterion: *a multi-step task is complete only when verified end-to-end (expected data returned, created resource readable); verified → answer now with no more calls, not yet verified → continue with the next tool call — a plan alone is not a completed task.* Deliberately neutral wording: it defines "done" without banning stops, so it does not create the opposite failure (never-stopping loops the wall-clock budget exists to catch).
+
+### Preferences: Language row shows the truth; timezone list follows the UI language
+- The Language combobox displayed `heramind_preferences.language` (default zh) while the app's actual language lived in i18next's own storage (navigator-detected) — an English UI showed "简体中文" until you saved. The row now initializes from `i18n.language`, so it reflects reality no matter which of the six switchers (sidebar, global controls, mobile nav, login, system page, this row) last changed it. `<html lang>` also follows the active language now (was a static zh-CN — wrong for screen readers and translation tools in either direction).
+- The System Timezone dropdown listed names from `/api/settings/timezones`, whose backend list is fixed Chinese ("中国 (UTC+8)") regardless of UI language. The frontend already ships a fully localized zone catalog; display names are now remapped through it by id (server names survive only for zones the catalog lacks), so English shows "Shanghai (UTC+8)".
+
+### Binary push frames on `/api/extensions/:id/stream`
+- **Push outputs can now ride WS Binary frames instead of Text+base64.** Every `push_output` used to force-base64 the payload into a JSON string (`BASE64_STANDARD.encode(&output.data)` at four send sites) — for image/audio extensions (stream-player, yolo-video, voice-assistant, video-vlm) that pushed raw JPEG/PCM bytes the platform itself had just received as `Vec<u8>`, taxing every frame with a full encode plus a matching `atob` + string churn in the browser. A negotiated session now sends the same bytes verbatim inside one binary frame: `[kind u8=1][version u8=1][sequence u64 BE][meta_len u32 BE][meta JSON][payload]` — `meta` mirrors the Text envelope minus `data`/`sequence`. Control messages (`session_created`, `error`, …) stay on Text; the WebSocket frame type is the first-level discriminator, mirroring the long-standing inbound binary format.
+- **Negotiation is application-level and safe in every deploy quadrant.** The client opts in with `init` config `{"binary": true}` (config is free-form JSON, so old servers simply ignore the key) and the server acknowledges in `session_created.binary`. Old frontends never opt in → byte-identical legacy Text; new frontends against old servers get no ack → stay on the Text parser. No `Sec-WebSocket-Protocol` involvement: with subprotocols, a client offering a list to a server that echoes none fails the connection outright (RFC 6455) — exactly the trap a rolling deploy must avoid.
+- **All four push send paths share one encoder** (`encode_push_output`) so the two formats can never diverge; the outbound-only `watch` fast path and the Bidirectional mpsc path both now carry `WsMessage` (Text or Binary) through their channels. The stateless `Result` path deliberately stays Text — no session context, no negotiation, no change.
+- **First rider: gym-tracker 2.10.0** (Extensions repo) pushes an `application/x-heramind-frame` container — `[u32 meta_len BE][tracks/faces/ts meta JSON][JPEG bytes]` — killing both base64 layers on its leg (device-side `img_b64` is decoded once at ingest and stored as `Arc<Vec<u8>>`; the REST `get_frame` fallback still serves a re-encoded string for old frontends). Its Monitor frontend parses binary frames with `createImageBitmap` (async off-main-thread decode, no object-URL lifecycle) and keeps the legacy Text/REST paths for old servers.
+- Tests: header roundtrip + malformed-frame rejection + negotiation matrix (missing/false/wrong-typed flag all downgrade to Text) + legacy Text wire-format lock in `extension_stream.rs`; end-to-end smoke against a mock NE503 device feed verified all 15 checks (binary session, legacy session, REST fallback) on 2.10.0.
+
+### Text tool-calling teaching now reaches every backend
+- **Custom OpenAI-compatible endpoints can call tools again.** The request always carried the `tools` schema, but `CloudProvider::Custom` defaults to `function_calling=false` in the provider heuristic and the OpenAI-compatible backend never taught those models HOW to answer: the Ollama backend has always injected the JSON tool-call protocol into the system message for non-native models (`format_tools_for_text_calling`), while OpenAI-compatible and llama.cpp requests went out untaught — the model answered in plain prose, `tool_parser` found nothing, and every tool-aware turn silently degraded for anyone behind a custom endpoint (vLLM/llama.cpp servers or proxies without native function calling). All three backends now share one injection (`llm_backends::text_tool_calls`), gated on the effective capability so native providers (OpenAI/Qwen/DeepSeek/GLM/… and any endpoint whose stored override turns tools on) produce byte-identical requests; a `with_capabilities_override(..., true, ...)` suppresses the teaching. Anthropic keeps its native tool-use path. The eval harness (`comprehensive_agent_eval.rs`) drops its manual system-prompt suffix workaround — the platform now teaches the format itself.
+- Gate repairs found by the 1.92 clippy run (all pre-existing from the binary-push commit): `heramind-extension-sdk` re-exports `set_push_output_writer_raw` (macro-only references left it unreachable → dead-code error), the SSE endpoint doc comment orphaned by the envelope-cache insertion in `events.rs` is re-attached to `event_stream_handler`, and the test-only `decode_binary_push_frame` tuple grew a named alias. Plus `cargo fmt` catch-up on the drifted files.
+
+### Platform perf: shared event cache, zero-copy extension IPC, runner workers
+- **WS event fan-out no longer re-serializes per client.** The events path now shares one `Arc<str>` envelope per event_id behind a 1024-entry LRU — a burst fanned out to N subscribers costs one serialization instead of N.
+- **Extension IPC carries raw bytes without a codec.** `push_output` payloads ride a segmented binary frame (`[hlen][json][raw]`) over the SDK's new `PushOutputRawWriterFn` raw FFI writer (ABI 3 unchanged, legacy callers pass through); the runner consumes it across `HERAMIND_RUNNER_WORKERS` workers.
+- **Web first-load: bundled logos 1 MB → 84 KB (-92%)**; release builds keep line-tables-only debug info (a full strip was killing the tables).
+- New `bench/` harnesses (devices, telemetry, api, engine, frontend, concurrency) back the numbers.
+
+### DEF-001/002 — MQTT client timestamps honored; telemetry source/metric validated
+- **DEF-001:** the MQTT adapter overwrote device-reported timestamps with server receive time. Client ts is now honored with unit auto-detection and a 5-minute future guard; the event ts is aligned to the DataPoint ts with dual-write dedup.
+- **DEF-002:** telemetry `source`/`metric` identifiers are validated up front with self-describing errors instead of failing opaquely downstream.
+
+### Metric history honors the hours window
+- The metric history API now honors its `hours` parameter and keeps the newest points instead of trimming them.
+
+### Onboarding wizard redesigned
+- Every step opens with the same header — icon, "Step N of 4" counter, title, purpose subtitle — with a completed setup step showing an inline Done badge beside the title; previously only the first step carried a title and the later steps looked bare.
+- Setup cards replaced their dense description paragraph with a scannable feature list (built-in / local / cloud for the LLM step; MQTT / other options / AI cameras for devices) beside the CLI quick-start, and the Ready step lost its status-chips strip and Start Chatting CTA (the prompt cards and footer Finish already cover both).
+- All four steps center vertically as one block, headers left-aligned; render tests guard the step-header contract.
+
+### Edge-model leaderboard: corrected-harness re-run
+- The comprehensive agent eval gained resource-creation scoring and rounds r6–r12 (device/rule/agent management, cross-domain, memory stress, long horizon, tools breadth), run against a self-hosted seeded sandbox under identical conditions for every model (8K ctx, 5×15 turns). Ling-3.0-tiny tops the overall score (71.2, 77% resource creation) while MiniCPM5-2B keeps the recommended-default slot (81% tool accuracy, 1.5 GB, Apache-2.0); README and `docs/edge-models.md` updated.
+
+---
+
+## [0.9.22] - 2026-09-03 — dialogs rebuilt single-page, Data Explorer detail grows up, chat context ring
+
+### Pending-device registration — one honest page
+- **The approve dialog is now a single-page form.** The old layout buried the decision fields (device name, type selection) below three stacked review sections — a compact card opened a 2xl dialog and made you scroll past metrics + raw JSON before you could name the device. The new order: required fields first, device facts as a compact strip, metrics and raw samples collapsed by default (radix Collapsible) as reference for the type decision.
+- **The type combobox actually filters now.** The old dropdown looked searchable but rendered the full suggestion list regardless of input, closed on a `setTimeout(200)` blur race, and had no keyboard support. Rebuilt with: live filtering across name/id/description, ↑↓/Enter/Esc navigation, `role="combobox"`/`listbox`/`aria-activedescendant` semantics, a "create new type" entry when the typed id matches nothing, and a container-level `relatedTarget` blur check replacing the timeout hack.
+- **The metrics editor that lied is gone.** The dialog offered Edit/Save on the AI-inferred metrics table, but `approveDraftDeviceWithType` has no metrics parameter — edits were silently discarded, and the backend always rebuilt the type from the stored `gen_type.metrics`. Instead of duplicating the (more capable) type-manager editor, the table is read-only with a pointer: correct names/units/types after registration in Device Type management.
+- **Row-level 注册/拒绝 on the pending list** (desktop action column + mobile card buttons) — reject was previously reachable only from inside the approve dialog's footer, the least visible spot on the page.
+- **Inline validation** replaces destructive toasts — the fields are in front of you, errors belong under them.
+- **The result stays on screen.** Registration success used to evaporate into a 5-second toast (hardcoded English labels, no copy affordance) carrying the one output that matters — the recommended topic. The dialog now switches in place to a result panel: device ID (backend registers under the original id — `system == original` by contract, split rows only if that ever changes), type, and for MQTT-sourced devices the ingestion topic with copy buttons; webhook sources show no topic row (the backend's literal `"webhook"` fallback was pure noise).
+- **The "未配置设备连接来源" empty state is removed.** The server always runs its built-in MQTT broker + webhook ingest, so "no source" was unreachable in practice — the old probe only checked MQTT `connected` and misfired whenever the broker port was merely occupied, telling users to configure something that exists. The empty list now shows the honest "devices appear here once they report data" copy.
+- **"等待处理" is info-blue, not warning-orange.** Awaiting user approval is a calm todo state, not an alarm; orange stays for states that need attention (offline devices, failures). The row icon tile went neutral so the status badge is the single strong color signal — same principle the mobile card already documented.
+- **A latent dialog bug fixed on the way**: `UnifiedFormDialog`'s desktop branch silently dropped the `description` prop (only mobile rendered it), leaving the reject-confirm dialog visually empty — its whole message rode that prop. Desktop now renders it under the title; the reject dialog additionally carries its sentence in the body.
+
+### Add Device Type — the wizard finally becomes a form
+- **5-step fullscreen wizard → single-page 2xl dialog.** Basic/Data/Commands/Review/Finish with a sidebar stepper was ceremony for a name-plus-metrics entity; Review duplicated what you just typed and Finish was a celebration page. Now: basic info on top, data definition (mode cards + metric editor + JSON import) as the body, commands collapsed unless the edited type has some, inline validation, and a backend 校验定义 action with an inline result banner.
+- **The whole form spoke English inside a Chinese UI** — `Basic Information`, `e.g., Smart Temperature Sensor`, `Auto-generated from Device Type after you finish typing`, `Add category`, `Edit Device Type`… all hardcoded. Everything now rides `types.*` i18n keys (26 new, zh/en), and the four orphaned keys the old code left behind were swept.
+- **Categories became a real tag input**: chips + inline field in one bordered container — Enter/comma commits, Backspace on empty removes the last tag, blur commits, placeholder only in the empty state.
+- **Edit mode reuses the same form** (the old wrapper hardcoded its English title); `EditDeviceTypeDialog` inherits everything above unchanged.
+- **The AI sample generator is removed** — frontend dialog, wiring, API method, i18n tree (~1000 lines) and the backend endpoint (~340 lines). It had been unreachable dead UI since inception (no call site ever set its open state), its AI content was one category-inference call plus heuristics, uplink samples cannot imply commands, and its job is covered twice over: real devices flow through auto-onboard (same engine, real data) and manual definition through the in-dialog JSON import. The `DeviceTypeGenerator` engine itself stays — auto-onboard depends on it.
+
+### Data Explorer — the detail view grows up
+- **Fullscreen two-pane detail.** The old view put a value card and a bare table in a fullscreen shell (90% empty canvas) — then this version's content outgrew the interim 2xl dialog, so the shell earns its size now: left pane is current state (value, meta, and for numeric metrics a min/max/avg grid fed by the aggregate API), right pane is history — a ~990px trend chart plus the paged table. Mobile collapses to value-strip-then-history.
+- **Numeric history gets a trend chart** (recharts area, dashboard chart theming — muted grid, no axis lines, primary gradient fill). Gated to `integer`/`float` with ≥2 finite points; string/bool/image metrics keep the table (a string history has no curve to draw).
+- **Server-side pagination, end to end.** The table used to page through whatever the frontend happened to hold (limit=500 newest, client-side slices) — deeper history was silently unreachable with no hint it existed. `query_range_rev` gains an `offset` (skip-newest, exactly the newest-first pagination semantics), threaded through `query_with_limit`, the `GET /api/telemetry` handler (`offset` query param) and the frontend table fetch; the chart deliberately keeps newest-500 semantics with a "showing the latest N points" hint when truncated.
+- **A pagination-enabling bug fixed on the way**: `query_range_rev_impl` always counted the full range (so its `total_count` was exact) but then returned `None` whenever a limit was set — discarding the number the API type already promised. It now always reports the exact count.
+- History header shows the server-reported total; page turns fetch their window from the backend (verified: page 3 rendered records the client had never held).
+
+### Shared widget & dialog infrastructure
+- **Stale-data badge → corner dot.** "Last value — device offline" was a ~140px pill floating over compact cards' content (and its own `pointer-events-none` had disabled its tooltip since birth). Now an 8px dot: warning for truly offline, muted for connectedIdle — mirroring the 4-state model's calm-blue treatment — with data age and device names in the hover title (locale-aware via `Intl.RelativeTimeFormat`). `staleDevices` now carries per-device state + last-seen instead of bare ids.
+- **Empty/error/loading states actually center.** The shared `EmptyState`/`EmptyStateCompact`/`LoadingState` had `justify-center` against their own content height only — no width participation, no flex growth — so flex-row parents left them flush-left and tall parents flush-top. All now carry `flex-1 w-full` (harmless in non-flex parents), one component fix covering 44 usage sites; the dashboard `DefaultStates` pair gains `w-full` to match. Ad-hoc `text-center py-*` blocks were audited and left alone — they behave in normal flow.
+- **Tooltips moved to the popover surface.** The shared tooltip wore `bg-primary` (brand color, not a surface — and inverted between themes, which put muted text at wrong contrast in both). Now `bg-popover` + border + shadow: proper floating-surface layering in light and dark, fixing all 8 tooltip usages including the new context card.
+- **Onboarding wizard's top step indicator removed** — four stages with connectors duplicated the per-step titles and footer navigation it sat above; the wizard opens straight into content.
+- **Agent editor: advanced knobs collapsed, card style unified.** Priority / Max Chain Depth / History Depth sit under an "高级配置" collapsible (defaults suit most agents) so the required path — mode, name, requirements — keeps focus; the execution-mode and schedule cards dropped their heavy `border-2` for the light border used by the device-type dialog's pickers.
+
+### Context management — budget-first, configurable, and losing the right things
+- **Budget-first compaction.** The lossy pipeline (old user messages truncated, assistant turns squeezed to one-liners) ran on every conversation regardless of window headroom — a 32K model with a 15K conversation was being compressed for nothing. The agent now measures the (depth-capped) history against the effective window first and passes it through untouched when it fits; the lossy path only runs when it genuinely doesn't.
+- **Chat history depth is configurable** (Settings → Preferences → agent defaults, 5–200 turns, default 50) — previously chat had no knob at all while scheduled agents carried their own; the PUT keeps omitted fields at their current values instead of silently resetting.
+- **Sacrifice order corrected.** Under pressure the old compressor truncated USER messages to 200 chars in the same pass it summarized assistants — backwards: user intent is the most condensed, least-regenerable content in the window. The gradient is now tool outputs (cleared) → assistant summaries → user text verbatim, with user truncation (now 1000 chars) only as the last resort.
+- **First-question preservation is now a short-conversation heuristic** (≤12 messages): pinning the opening message forever served focused agent runs, but in a long multi-task chat it stole budget from the recent context the user actually needs.
+- **Focus entities no longer expire by turn count**: `current_device`/`current_location` were cleared after 5 turns un-mentioned, so "它的温度呢" broke after a few side exchanges — they now change only by replacement (a new device coming into focus). Mentioned-entity retention widened 5 → 10 turns.
+- **llama-server's "Loading model" 503 is waited out, not failed**: switching to the builtin backend mid-load used to surface a spurious error (the fast retry can't bridge a multi-second model load); both streaming and non-streaming paths now poll /health up to 60s and resend once.
+
+### Chat context visibility
+- **"Context 1.2K / 32K" plain text → progress ring + breakdown card.** The composer's context indicator is now a 20px ring (fill tracks usage; muted→warning→error at 70%/90%) with a compact number, and hovering opens a card: total used/window/percent plus a three-way split — system prompt, tool definitions, conversation history — each with a color dot. Units are card-wide (all-K once the window ≥1000; the old per-value threshold mixed "620 / 8.2K" in one line).
+- **The breakdown is real, not estimated** (when the backend reports usage): `AgentEvent::End` now carries `system_prompt_tokens`/`tool_tokens` alongside `prompt_tokens`, computed by splitting `estimate_prompt_overhead_tokens` into `estimate_prompt_breakdown` (system prompt measured after build; tools serialized to their actual API JSON shape before measuring). History is the remainder. Usage survives reloads and session switches (persisted per-session in localStorage — the context it measured is unchanged until the next reply). The fallback character estimator now uses the backend's CJK-aware weights (≈1.8 tokens/汉字 vs the old chars/3 that underestimated Chinese ~5x and made the ring look like it RESET on every send), and while streaming the displayed value never dips below the last real measurement. The history row also carries the live message count (`9.5K · 30 msgs`) so accumulation vs compaction is visible at a glance.
+
+### Also
+- **The Add Component dialog is now four sources, one per origin.** Components used to mix built-ins, extension widgets, imports and marketplace installs in one category list ("My Components" et al). The left rail now switches Components (pure built-ins with category navigation), Extensions (auto-grouped by the PROVIDING extension — registry truth, not the inconsistently-declared manifest category), Marketplace (browse/install/refresh; installed cards flip in place to add-to-dashboard + uninstall) and Custom (manual imports, with add/update/uninstall). Import lives on the Custom toolbar: ZIP upload — now with drag & drop and keyboard access — or the new server-path mode.
+- **Components can be installed from a path already on the server** (`POST /api/frontend-components/from-path`): edge boxes often receive packages via scp/USB, and a phone browser can't pick a file that lives on the box. Mirrors the extensions API's `file_path` pattern — confined to the data directory, `.zip` only, 10 MB cap (checked before reading; zip extraction bounds decompressed sizes) — and the manual-upload and path handlers share one install pipeline.
+- **SPA blank-page fix** (staged at the start of this cycle): the dedicated `/assets/*path` route is gone — axum's `Path<String>` extracts only the wildcard segment, so `/assets/index.js` resolved to `index.js` without the `assets/` prefix and every hashed asset 404'd into the SPA fallback. The single catch-all serves both correctly.
+- **Extension components with any manifest category no longer vanish from Add Component.** `groupComponentsByCategory` only returned groups matching the built-in category order, so extension widgets declaring e.g. `category: "other"` (or omitting it) silently disappeared. Arbitrary categories are tolerated end-to-end and never split the picker — the Extensions source groups by providing extension instead.
+- **Extension reload no longer wipes dashboard widgets.** The real deletion path was the frontend: `useExtensionLifecycle` listened for the backend's `unregistered` lifecycle event and removed every widget referencing the extension from the current dashboard, then persisted the deletion — so a reload/crash-reregister (7+ times a day for one user) kept clearing their panels. Widgets are now decoupled from the extension runtime, matching what the backend already does ("warn and persist"): unregistering only drops the component templates, existing widgets show a "component unavailable" placeholder (i18n, with the widget type shown), and re-registering auto-renders them again. The never-called `removeComponentsByExtension` store action is deleted with it.
+- **Pre-release audit repairs (3-way review, 6 P1 / 9 P2).** The headline: the configurable chat history depth only ran on the non-streaming path — server SSE/WS chat (i.e. every real conversation) never applied it; the cap now runs on all three chat paths. Older user messages survive context compaction verbatim instead of being squeezed to 200 chars even when the window had room. Also fixed: Data Explorer trend-chart X axis rendering 1970 dates, a Pending Devices suggestion race that could register a device under another draft's suggested type, Push Target error/port edge cases, orphaned per-session token-usage keys, uncancelled in-flight fetches, and 22 dead i18n keys — plus the first test coverage for the pagination primitive (page contents, boundary offsets, exact totals).
+
+## [0.9.21] - 2026-08-29 — security hardening, backups, observability, in-app server upgrade, agent CLI surfaces
+
+### Server self-upgrade — the About page can upgrade a server deployment
+- **Browser deployments finally have an upgrade button.** The check-for-updates entry in Settings → About was Tauri-only (double-gated on `isTauriEnv()` + `__TAURI_INTERNALS__`) — a browser session against `heramind serve` showed a version number and nothing else, and upgrading meant SSH + `heramind upgrade`. Non-Tauri access now checks the server's release state (`GET /api/system/upgrade/check`, admin-only): current → target with release notes, then `POST /api/system/upgrade` drives the whole thing with live progress (`SystemUpgradeProgress` WS events plus a 2s status poll — the poll is the only channel during the restart window, when the WS is down); once the server answers again on the new version the page reloads itself (index.html is no-cache, so the reload lands the new frontend too). Docker installs show a `docker compose pull && up -d` hint instead of a button; the existing 24h auto-check now also runs in browser mode and drives the About badge. Endpoints sit in the JWT-gated `admin_routes` group (same class as `/api/settings/backup` — API keys cannot trigger an upgrade).
+- **Two-phase apply across the privilege boundary.** The API runs as the sandboxed `heramind` user (`ProtectSystem=full` + `NoNewPrivileges=true`): it can neither write `/usr/local/bin` nor sudo (NoNewPrivileges keeps any child permanently non-root inside the unit — a sudoers rule would silently never work). So the API only STAGES: it streams the release into `data/upgrade/v<ver>/` (2GB cap, downloaded binary `--version`-verified before anything is touched) and writes `apply.trigger`. A new root `heramind-upgrade-apply.path` unit watches that file with inotify — no sudoers, no polkit, nothing relaxed in the main unit's sandbox — and starts `heramind-upgrade-apply.service`, which runs `heramind upgrade --apply-staged --yes` as root: back up `.bak` → `install -m 755` atomic swap → web-dir stage-swap → `systemctl restart heramind`. `scripts/install.sh` writes and enables both helper units; existing installs need ONE re-run of install.sh to gain the feature (the check endpoint detects the missing helper and says exactly that).
+- **One implementation, three callers.** The release/semver/download/apply primitives moved out of the CLI into `heramind-api/src/upgrade/` (the CLI depends on the API; hosting them there avoids a dependency cycle), shared by `heramind upgrade` (interactive), `--apply-staged` (the root helper) and the API's staging task. Two latent CLI bugs fixed in the move: the web-dir swap ignored `HERAMIND_WEB_DIR` (hardcoded `/var/www/heramind`), and it chowned the swapped dir to `heramind:heramind` unconditionally (install.sh prefers www-data — nginx reads broke on www-data-owned installs).
+- **A top-right quick entry appears while an update is available.** The update state used to be reachable only from Settings → About; now the floating cluster (theme/language/alerts) gains a pulsing update icon driven by the same updateInfo slice the 24h auto-check populates — one click from ANY page opens the environment's dialog (desktop OTA in Tauri, the server self-upgrade dialog in a browser). The server dialog moved from AboutTab to a global mount behind a shared store flag so the indicator and the About page open the same instance.
+- **Verified end-to-end on real hardware** (Jetson/arm64, Ubuntu 22.04, systemd 249, real GitHub artifacts): deployed the 0.9.21 build, `POST /api/system/upgrade {"version":"0.9.20"}` staged + verified + triggered + applied + swapped binaries and web dir + restarted — service healthy on the new version in ~10s wall clock, `.bak` rollback copies and the printed rollback command in place, staging dir cleaned. The test also caught (and this entry ships the fix for) the helper units initially resolving a data dir one level off the main unit's: the main service sets NO `HERAMIND_DATA_DIR`, so its store tree is `${DATA_DIR}/data` via cwd-relative resolution — the helper units must resolve the same way (WorkingDirectory only, no env override) and watch `${DATA_DIR}/data/upgrade/apply.trigger`, or the API stages under a tree nobody watches.
+
+### Wrap-up
+- **Zip-bomb caps are now one per-INSTALL budget** instead of one per extraction phase: the manifest, binary, bundled-library sweep and each directory (frontend/models/assets/config) each carried their own 500MB budget, so a crafted package could legally extract ~2.7GB; the cumulative budget (500MB / 10k files across the whole install) is charged by every phase (round-4 review: "narrowed but not capped").
+- **Logout invalidates in-flight dashboard syncs**: both the store slice and the persistence layer carry an epoch bumped on clear; a sync that was mid-await when the user logged out used to complete afterwards and re-persist the previous account's dashboard into localStorage, which the next account's local-only merge would adopt.
+- **Round-4 adversarial review fixes** (the round-3 fixes got their own review): the startup .nep cache scan now passes the extensions ROOT (it still passed `packages/`, so top-level .nep files remained invisible to the boot trigger — round 2's fix was half-applied); a failed Ping send cancels its own in-flight entry (a leaked entry pinned `pending_count ≥ 1` forever, permanently blinding hang detection for that extension); `flushSync` clears the pending-edits guard only after the flush resolves (the debounce path's in-flight window fix had an identical unguarded sibling here); a failed debounced sync releases the guard after 30s instead of pinning it for the session (localStorage quota failures on embedded devices would otherwise block server refreshes forever); one unused import that broke the committed tree's clippy (found by verifying HEAD in a clean worktree — round 2/3 each briefly shipped non-compiling trees via dangling `paths` references, closed by 21425d43).
+- **TCP_NODELAY on the listener** (from 5539c785): accepted connections inherit it — per-message WebSocket writes on the video-push path no longer interlock with delayed ACKs (~40-200ms stall per message on a fast link).
+- **TLS front proxy** (`HERAMIND_TLS_PORT/CERT/KEY`, from 5539c785): a rustls front forwarding to the loopback listener, for secure-context deployments. Known limitations in this release: the upstream target assumes the default 0.0.0.0 bind (loopback forward), and proxied clients share the 127.0.0.1 rate-limit/throttle buckets — run it behind a real reverse proxy if you need per-client limits.
+- **jemalloc is now a cargo feature** (from 5539c785): default on for server builds, disable with `--no-default-features` as a cross-compile escape hatch.
+- **Full post-0.9.20 review round 3 fixes**: the API-key reload-on-miss now also lives on `validate_key_info` — the entry point the main auth middleware actually uses (the original fix landed on the wrong function, so keys created after boot still 401'd on most routes until restart); GGUF array parsing caps nesting depth at 16 (a crafted header could drive unbounded recursion → stack overflow → SIGSEGV kills the whole process via upload-model); the model-download loop has a 60s per-chunk stall timeout (a wedged connection used to park the stream forever, holding the single-flight lock and defeating cancel); the upload temp sweep only deletes files older than 24h instead of every file (it unlinked concurrent uploads' temp copies); frontend: the extension grid counts/filters Crashed under error-class instead of dropping it from both tabs, the details-dialog badge turns destructive for Crashed, `crashed`/`crashedTooltip` gained zh/en strings, and the dangling `importLocalBadge` reference was removed; dashboard persistence: the unsynced-edits guard now holds for the whole in-flight sync (pending was cleared before sending — the exact window the guard existed to close) and logout cancels the pending debounced sync (it could re-persist the previous account's dashboard into the next account via the local-only merge).
+- **Pre-release review fixes** (all found by the pre-release audit of this very iteration):
+  - the liveness probe skipped counting failures while commands are in flight — a busy runner (single-task message pump, sync FFI command) legitimately can't answer Ping for the command's full duration (300s budget), and the probe used to kill healthy extensions mid-command, feeding a false crash → restart → circuit-break → alert chain;
+  - the bundled-library extraction loop got the same zip-bomb caps (count/total) as the other two extraction paths — it had slipped the caps during the unification, leaving a disk-fill path via the 512MB upload endpoint;
+  - backup creation is now process-serialized (scheduler + manual trigger) with millisecond-granularity ids, and a failure during the finalize phase (manifest write/rename) cleans the tmp dir — a manifest-less tmp leak was invisible to prune and sat forever;
+  - the extension card no longer shows "Crashed" for a RUNNING extension that merely has crash history;
+  - the .nep cache sync scans BOTH `extensions/` and `extensions/packages/` (the startup task and the manual trigger each saw only one of the two locations);
+  - the backup scheduler and the manual trigger read their schedule config from the SAME data directory they back up (a hardcoded `data/settings.redb` split the two when `HERAMIND_DATA_DIR` pointed elsewhere);
+  - marketplace detail/readme/install validate the extension id before building URLs (the raw id was interpolated into a path — `../..` turned the marketplace client into a limited arbitrary-GET against the market host);
+  - `POST /api/extensions` now persists the RESOLVED canonical path, not the raw request value, so `load_from_storage`'s verbatim replay can't resurrect an outside-data-dir path on every boot (the load-side confinement check itself rides the in-flight path-unification work).
+- **`heramind user set-role` (offline).**
+- **`heramind user set-role` (offline).** Recovers installations whose "admin" account was created through the old always-User self-registration (username ≠ role): promote/demote admin|user|viewer with shell access, e.g. `heramind user set-role admin admin`.
+- **The extension marketplace source is switchable.** It was hardcoded to `raw.githubusercontent.com` with NO override — unreachable from CN networks, while the component market and LLM catalog both had env overrides. Settings → Preferences (admin) now has an Extension Marketplace source field; precedence is saved value > `HERAMIND_EXTENSION_MARKET_URL` env > default, effective on the next marketplace request (no restart). The field warns that after switching, package integrity verifies against the mirror's artifacts.
+- **Crash alerts reach the user.** A circuit-broken extension (restart attempts exhausted) now sends a system message through the notification channels instead of only logging — previously a repeatedly-crashing extension just quietly stopped working.
+- **The Crashed state is visible in the UI.** Extension cards show an error-tinted "Crashed" chip with the crash reason and consecutive count on hover.
+- **The serve startup tests run in CI.** A test-only `HERAMIND_EXIT_AFTER_READY_MS` lets `heramind serve` exit gracefully after startup, so the three spawn-a-real-server tests assert a full boot (bind → stores → services → ready → clean exit) instead of "alive after 500ms", run with per-test temp data dirs, and no longer need the CI skip.
+
+### Extension system — hang detection and honest crash state
+- **Hung extensions are now detected.** A deadlock without exit never closes stdout, so the death monitor saw nothing and every subsequent command just burned its full timeout (produce_metrics didn't even kill). Each process now runs a liveness probe (Ping every 30s, 5s timeout, configurable: `health_check_*` on `IsolatedExtensionConfig`); after repeated failures the process is killed through the same path a command timeout takes, handing it to the existing crash/restart machinery. Wiring this up exposed a real protocol bug: **`Pong` carried no `request_id`**, so the host's receiver thread classified it as unroutable and silently dropped it — Ping/Pong now carry one like every other request/response.
+- **The API can now say "Crashed" instead of "Stopped".** Crash-loop counters (consecutive count + reason: exit status / signal / IPC failure / hang) flow from the process through the runtime info to the extension DTO (`consecutive_crashes`, `last_crash_reason`); a stopped extension with crash history reports state `Crashed`, so the UI can finally distinguish "stopped on purpose" from "died". Counters survive same-path reloads and are snapshotted into the info cache on death, before the restart decision reads them.
+
+### Extension system — per-call fixed costs removed
+- **The SDK no longer builds a fresh multi-thread tokio Runtime for every FFI call.** Extension commands run on FFI threads with no tokio context, and each `execute_command`/`produce_metrics` used to construct AND tear down a full CPU-count worker runtime — milliseconds of setup per call, the single biggest fixed tax on extension invocations. One 2-worker runtime is now cached per process.
+- **Binary IPC payloads travel as base64 instead of decimal number arrays.** `StreamDataChunk`/`StreamChunkResult`/`ChunkResult`/`PushOutput` carried `Vec<u8>` fields that serde_json encoded as `[104,116,116,112,…]` — ~4× wire size and an order of magnitude slower parsing, on the path that carries video frames (the push pipeline additionally transcoded base64→bytes→numbers). The existing `base64_vec` helper (which still deserializes the legacy number-array form) is now applied to all five fields. Host and runner ship in the same package, so the wire change is release-coupled on both ends by construction.
+
+### Extension system — security hardening (from the design review)
+- **The async package-extraction path now has the same zip-bomb/symlink defenses as the sync path.** `ExtensionPackage::install()` (used by `/api/extensions/upload`) had NO size/count caps while the sync installer did — same crate, two extract implementations, asymmetric defenses. Caps are now one shared set of constants, and both paths explicitly reject symlink entries.
+- **`file_path` request fields are confined to the data directory.** register/upload/validate used to accept any host path, making them a read-and-try-load primitive over arbitrary files for anyone holding credentials. Paths now resolve against (and must stay inside) the data dir, after canonicalization.
+- **`POST /api/extensions/sync` actually installs.** It reported `installed: N, upgraded: M` while doing nothing — `process_nep_file` classified packages and returned without touching the disk. It now installs (on the blocking pool — the async installer holds a non-Send `ZipFile` across awaits) and registers results with the runtime, carrying user config forward like the marketplace path. The scan dir is the data-dir extensions folder (it used to be a CWD-relative `extensions/` that had nothing to do with the data dir).
+- **Update checks use semver and only flag upgrades.** The string `!=` compared versions, so downgrades and build-suffix drift showed as "update available"; combined with extensions hardcoding `"2.0.0"` (weather/yolo), some entries showed a permanent false update.
+- **Package sha256 verification is now actually reachable.** The marketplace index carries no sha256, so the existing fail-closed verify branch never fired. The installer now falls back to the release-level `checksums.txt` (uploaded alongside the .nep assets starting with the next Extensions release), warns loudly when no integrity data exists, and `HERAMIND_STRICT_PACKAGE_SHA256=1` refuses unverified packages outright.
+- **The runner's resource-limit flags are wired** (`IsolatedExtensionConfig::rlimit_memory_mb`), though OFF by default: RLIMIT_AS caps *virtual* address space and CUDA/ONNX runtimes reserve multi-GB VA at init, so a naive cap kills exactly the heavy extensions it should protect. RSS polling remains the default enforcement.
+
+### Security
+- **Self-registration is closed by default.** `POST /api/auth/register` was a public, unconditionally-open account-creation endpoint on a server that binds 0.0.0.0 — any LAN client could mint a `UserRole::User` account. It now returns 403 unless an admin opens it via `PUT /api/settings/registration` (`GET` reads it; both admin-only, persisted in users.redb so the choice survives restarts). Nothing user-facing regresses: the first admin comes from the setup wizard and additional users from the admin-only `POST /api/users` (the web UI has no register form — the endpoint had no honest product caller). The Playwright e2e fixture now bootstraps its test account through the setup wizard instead of self-registering.
+- **LLM provider API keys are sealed at rest.** `LlmSettings.api_key` and `LlmBackendInstance.api_key` were stored as plaintext JSON in `settings.redb` while the platform's own API keys already went through AES-256-GCM — the asymmetry meant a copied data dir leaked every cloud key. Both stores now seal the key field with the shared `CryptoService` (same `data/encryption_key` the auth store uses; `HERAMIND_ENCRYPTION_KEY` still wins). Legacy plaintext rows load unchanged and get sealed on their next save, so upgrades are transparent. Config-change history records the sealed form too — it duplicated the plaintext key on every tracked save. Exports stay plaintext on purpose (users need their keys to migrate).
+- `CryptoService` moved from heramind-api to `heramind_core::crypto` (api re-exports it, so `crate::crypto::…` paths still work) so the storage layer can share one key instead of growing a second crypto implementation.
+
+### Data safety — backups
+- **The data directory can finally be backed up.** An edge box that loses power or corrupts a redb file previously lost everything — no backup mechanism existed anywhere. `heramind_storage::backup` copies every `*.redb` plus the two secret files (`encryption_key` — without it the sealed LLM keys in the backup are undecryptable — and `.jwt_secret`) into `data/backups/backup-<ts>/` (0700; secrets stay 0600), verifies each copied database opens (redb's crash-safe format means an online copy is equivalent to a post-power-cut file, and open-time recovery is exactly the check that matters), writes a `manifest.json`, and only then renames the `…​.tmp` dir into place — a crashed backup never masquerades as a restorable one. A verification failure discards the whole backup.
+- **Two triggers**: `POST /api/settings/backup` (admin, immediate, returns the manifest + how many old backups were pruned) and `GET /api/settings/backups` (admin, newest first). A scheduler runs the same path on the configured interval (first interval after boot skipped so a fresh start doesn't copy databases while services warm up).
+- **The schedule is runtime-configurable in Settings → Preferences** (`GET/PUT /api/settings/backup-config`): enable/disable, interval (6h–7d), retention count — the scheduler re-reads the config every minute so edits apply without a restart. Env vars (`HERAMIND_BACKUP_INTERVAL_SECS=0` disables, `HERAMIND_BACKUP_KEEP`) only seed the default until something is saved in the UI. The section also shows the last backup (time + size) and an admin-only "back up now" button.
+- Restoring is deliberately manual (stop server → copy files back → start): an automated restore-on-boot path could silently roll the platform back to stale data, which is worse than a documented procedure.
+
+### Observability — `/api/metrics`
+- **Prometheus text metrics endpoint** (public, like the health checks — counters only, nothing per-user/device): `heramind_http_requests_total` / `_responses_4xx_total` / `_responses_5xx_total` (global middleware counts every route), `heramind_uptime_seconds`, `heramind_build_info`. Edge-box triage previously meant grepping logs; a scraper alert on the 5xx rate beats that.
+- **EventBus silent event loss is finally measurable.** The bus now keeps a process-wide sum of every event dropped by any lagging subscriber (`heramind_eventbus_dropped_total`, plus `heramind_eventbus_subscribers`); receivers share the counter so drops are counted without holding bus handles. The lagged warn-log has literally said "surface this, don't let the system fail quietly" since it was written — now it is surfaced. Non-zero and growing = a rules/telemetry/automation subscriber is missing events and deserves investigation.
+
+### Storage — rollback guard (deliberately NOT a migration framework)
+- **Every storage database is now version-stamped.** The real corruption risk on edge boxes isn't old data meeting new code (serde defaults handle additive changes fine) — it's the reverse: a **rolled-back install opening newer data**. Unknown fields are silently dropped and new fields default-filled, so the first save-back would permanently destroy newer-format rows with no error anywhere. Each store's `open()` now stamps its database with the row-format version and refuses to open one stamped by a newer build, with an explicit "upgrade instead of rolling back" error.
+- This is ~100 lines, not a framework: `CURRENT_SCHEMA_VERSION` bumps only for changes older code cannot safely read; one-shot migrations hang off the version hook when such a change ever lands (none have yet). The device registry's pre-existing "tables missing → delete and recreate the database" path now sits behind the guard too — a newer-build database can no longer be silently deleted by an older binary. Engine swaps (the one-time sled→redb) remain out of scope by design: they need per-store export/import code, not version bookkeeping.
+
+### CI — the regression net finally catches Rust
+- **ci.yml now runs the full workspace test suite** (`cargo test --workspace --locked`): previously CI executed exactly two targeted test jobs while 3000+ tests ran only on whatever dev machine happened to remember. The three `serve` spawn tests are skipped in CI (`--skip commands::serve_test`) — they need ports 9375/1883 free and a clean data dir, and real-server startup is already smoke-gated in build.yml and docker.yml.
+- **clippy is a hard gate** (`--workspace --all-targets -- -D warnings`) and **rustfmt is checked**. Getting there from a standing start surfaced ~60 findings across 8 crates (the first clippy run had ever aborted early on a deny-by-default lint, hiding most of them): needless returns behind `spawn_blocking`, `let-else` → `?`, field-reassign-with-default in test builders, redundant closures/field names, two type-complexity aliases, a `large_enum_variant` boxed, a dead `&& false` left over from the asset-path traversal fix, a vacuous `len() > 0 || is_empty()` assertion, and ~16 files reformatted. The few intentional patterns (test-serialization guards held across awaits, const-boundary guards) carry explicit `#[allow]`s with reasons.
+
+### Eval-driven CLI ergonomics pass (fixes the top small-model failure mode)
+- **What the eval showed** (Qwen3.5-4B zh, 30-case regression, 2026-09-01 run `qwen35-4b-zh-cmd-20260831`): cmd_ok 81%, and of the failures not one was an unparseable command string — the dominant friction was *first-shot flag hallucination* (`channel-create --url` where the real surface is `--type/--config`), JSON-blob quoting inside `--body`/`--config`, and models reverse-engineering the surface at runtime via `--help | head` pipes. The model even invented a flat flag syntax for `rule create` (`--trigger-device/--operator/--threshold`) that didn't exist — this release ships that syntax.
+- **`--param key=value` repeatable flag** on `device control` and `message channel-create` (new `kv.rs`: first `=` splits so values may contain `=`; conservative type inference — `true/false`→bool, numbers only when they round-trip without leading zeros so `007` stays a string; JSON form still accepted, `--param` entries merge over it). The channel-create schema-validation error now suggests `--param <field>=<value>` directly, so a wrong first shot self-corrects in one retry instead of blind flag roulette.
+- **`rule create` flag fast path** for single-metric threshold rules — the shape both deploy eval cases actually needed: `--name --trigger-device --metric --operator --threshold --notify [--severity] [--cooldown]` (plus `--source extension:<id>:<metric>` / `transform:<id>:<field>` for non-device metrics). Operator aliases (`>`, `gte`, …) map to the canonical six; `--cooldown` defaults to 300000 so notify rules can't ship without storm protection; complex rules (range/logical/multi-action) still go through `--body`, mutually exclusive at the clap layer.
+- **`rule update` accepts `--id <ID>`** alongside the positional form (exactly one; clap-enforced). Eval traces showed models coming off a `rule create` response habitually write `rule update --id <uuid> --body ...` and burn a round-trip on the clap error before self-correcting — now the first shot parses. The same tolerance can be extended to other update-by-ID commands when traces justify it.
+- **Skill docs re-lead with the flag forms** (device-onboarding, message-management, rule-management): models copy the first example they see, so `--param k=v` and the rule fast path now come first, JSON demoted to "complex cases". Drift manifest unchanged (it validates domain/action shape only).
+- **Repair-path instrumentation** (two tracing lines): clap parse failures log argv at `heramind::cli_dispatch` (WARN), and the agent-side structured-call→command-string rewrite logs at `heramind::agent::mapper` (DEBUG) — per-command hit rates for these two lines are the "first-shot flag error rate" going forward.
+- **Validation** (Qwen3.5-4B @ Ollama): the 3-case surface micro-eval passes 3/3 HARD; traces show the designed converge-in-one-retry loop (`--url` guess → clap error → `--param url=...` success). On the full building deploy case, the model converged to six consecutive correct fast-path `rule create` calls (all `success:true`, rule_count 6/5) plus a `--param` channel-create — the case still HARD_FAILs only because the model omits the `device control` step entirely (multi-step planning, not flag friction). Two follow-up surface findings from the same traces: `rule update`'s `--id` temptation (fixed above), and flat-flag guesses on `device control` (`--valve-open true`) that self-correct via `--param` but could be pre-empted.
+- **Eval case library reorg verified + regression gate extended to 33 cases**: the bilingual suite is perfectly synced post-reorg (160 ids × en/zh after this change, zero dupes/parse failures, `validate-all` 320 cases 0 failed, skill-cli drift green). Three new `surface-micro` cases (micro-rule-create / micro-channel-create / micro-device-control, en+zh) isolate single-command surface accuracy from multi-step planning noise and join the regression set; cases absent from the committed baseline run without affecting the gate verdict until `--update-baseline`. Full 33-case gate ran clean end-to-end (4 improvements / 3 flagged, all three flagged cases re-verified PASS on rerun — single-round noise floor, consistent with the gate's own ~7pp guidance to use `--rounds 2`).
+- Also: `install_budget_tests` in heramind-core gained the missing `#[cfg(test)]` gate (its `use super::*` was warning-clean only in the test target, breaking the clippy hard gate for everyone downstream).
+
+### Release-blocker repairs (found by the first green-CI push since 2026-08-29)
+- **wasmtime 36.0.13 → 36.0.14** in the lock: fixes RUSTSEC-2026-0269 (filesystem sandbox escape via trailing slashes, high severity 8.8) that started failing cargo-audit the day the advisory published. The lock had also drifted from committed manifests (sdk 0.6.6 vs lock 0.6.5), making every `--locked` invocation on the committed tree fail before running a single test.
+- **rustfmt debt repaid**: ~35 sites in the upgrade/self-update/testkit files that landed after the last green fmt run; formatted with the repo-pinned toolchain (a Homebrew toolchain shadows rustup on PATH here and formats differently — use `~/.cargo/bin/cargo +1.92.0` for local gates).
+- **linux-only clippy fix**: two `&mut *process_guard` explicit derefs in the extension kill paths trip `explicit_auto_deref` only on the linux build (cfg-dependent code), invisible to every macOS check since the hang-detection commit.
+- **Docs sweep**: extension-ID examples drop the `-v2` suffix across skill guide, SDK readmes, verification script, DESIGN_SPEC.
+
+## [0.9.20] - 2026-08-26 — agent capability, open model catalog, Jetson
+
+### Agent execution core — the version's reliability spine
+- **Error-aware dedup**: the cross-round dedup set now records only SUCCESSFUL executions. Signatures were inserted before execution, so a transient tool failure (MQTT timeout, extension hiccup) made the model's retry a "duplicate", ending the loop via AllDuplicate with the error in hand. Failed calls can retry — and a failed signature that keeps failing (budget: 3 consecutive failures) is blacklisted so the loop brakes instead of burning all 30 rounds. (StuckDetector removed: its five OpenHands-style patterns were mathematically unreachable behind that same dedup — docs described a brake that never fired; the dedup IS the brake.)
+- **Context-overflow self-heal**: overflow is permanent per `is_permanent()`, but on local backends a window smaller than the registry default meant EVERY round overflows. One hard-compaction retry (halved effective window) turns "small-model execution inevitably fails" into "completes".
+- **Remaining-round countdown**: within the last 3 rounds a `[System]` note tells the model how much runway is left, so it wraps up instead of starting a chain the cap will cut off.
+- **Cancelled exits the loop**: the tool-concurrency semaphore closing only broke the batch loop; now the whole round loop stops and Phase 2 summary is skipped (no LLM calls during shutdown).
+- **Event-trigger retry un-deadened**: `execute_with_retry` treated `Ok(Failed-record)` as success — execute_agent reports LLM/tool failures as Ok records, so the 5s inline retry and the cooldown-clear never fired. Failed status now retries, then errors so the cooldown clears.
+- **Honest success metrics**: tool results returning `Ok{success:false}` counted as success (success_rate pinned to 1.0); the journal now reflects real outcomes — the learning signal agents train on.
+- **Sampling config wired**: the scheduled-agent loop hardcoded temperature 0.7 and ignored `/api/settings/agent`; the setting now feeds both chat and scheduled paths.
+- **A bad schedule could silently kill the whole scheduler** (found by the agent-module design review): the frontend's "on-demand" option encodes manual-only as `interval_seconds: 0`, but that value made the agent due on the very next tick and then hit a **division by zero** in `update_next_execution` — a panic inside the unguarded scheduler loop that stopped EVERY agent on the platform (process alive, no restart, one panic line in the logs). And creating an on-demand agent 400'd anyway (create rejected 0 while the update path and the read path both honored it). Three-layer fix: `0` is now a first-class "manual-only" value (schedules to a never-due time, create accepts it — the UI option works again), the reschedule math guards against 0 defensively for legacy rows, and the tick's reservation phase runs in its own spawned task so any future panic there is logged and skipped instead of unwinding the loop.
+
+### Cross-session memory actually works
+Chat had NO automatic memory write — only what the model chose to write via the memory tool, which small models almost never do, so USER.md/KNOWLEDGE.md stayed empty. After a completed chat turn, a thinking-disabled LLM call extracts durable `[user]`/`[knowledge]` facts, merges them deduped + budget-capped, and invalidates the frozen snapshot so the next turn sees them. Verified live on an Orin-class board: LFM's integral thinking consumes ~5700 chars of reasoning, so the extraction budget is 2000 tokens (300/800 ended empty), and the parser tolerates the model's tag-separator variants (`[user]:` vs `[user] fact`). The scheduled-agent journal injection is now failure-prioritized (failed runs surfaced first, recency preserved within each group) with the retained window grown 10→20.
+
+### Rules become observable — and correct on strings
+- **`RuleEvaluated`/`RuleTriggered`/`RuleExecuted` now actually publish** on the EventBus (they existed in the event enum with zero producers — the frontend and extension subscriptions had to poll the history API).
+- **String rules substitute `{value}`**: extract_trigger_value only surfaced numbers, so a contains/regex rule on a Text field rendered the literal placeholder in its alert.
+- **Cross-source AND no longer flaps**: the value cache's 5s TTL made a slow source's value vanish between updates → the AND went false → for_duration kept resetting. Values are now the last-known truth until replaced (cache capped at 4096 entries with oldest-eviction); staleness is the job of `__last_seen_age_secs`, not time-based eviction.
+- **`heramind data sources list`**: the authoritative source inventory (devices ∪ extensions ∪ transforms) for rule/dashboard/push bindings — the agent had to guess DataSourceId strings.
+
+### Open model catalog — three channels
+- **Local import** (`POST /api/builtin-llm/import-local` + a wizard card): bring any GGUF. Magic + zero-tensor validation, header-parsed name/ctx/quant, SHA256-pinned manifest, and it participates in the single-model switch exactly like a curated model. Failure-safe by construction: a same-id re-import back the existing dir aside and restores it; a failed spawn rolls back the import, RESTARTS the previous model's server, and reports an error; a slug colliding with a curated builtin id is rejected upfront. Context is capped at 128K (a header claiming 1M would OOM the KV allocation).
+- **Remote catalog** (edit the JSON, clients pick it up): the picker serves `models/catalog.json` from camthink-ai/NeoMind-Runtimes; a new model ships as a catalog edit, no product release. Graceful degradation is the contract: offline/timeout/parse error falls back to the compiled-in curated three (+ any local imports) — never an empty list. 3s timeout, 1h TTL cache, `HERAMIND_CATALOG_URL` override for mirrors.
+- **Custom-backend context window**: `max_context` on LLM create/update (merged into capabilities, user value wins over name detection) + a Cloud AI dialog field — an RKLLM3-class backend running `-c 16384` no longer receives 128K-budgeted prompts.
+- **Diagnosable empty-response errors**: "Sorry, the model could not produce a response" now carries the reason (the LLM error string, or an explicit empty-content hint naming likely causes) instead of a bare "Please retry".
+
+### Jetson runtime — self-bootstrapping CUDA
+Jetson hosts (Orin, sm_87) auto-detect via `/etc/nv_tegra-release` and fetch OUR gcc-11 CUDA runtime from camthink-ai/NeoMind-Runtimes (SHA-256-pinned — executable downloads get no slack; exec-checked at download and again before trusting a PATH-found binary that the official ubuntu-arm64 build shadows). Verified end-to-end on a real Orin Nano 8GB: the official llama.cpp arm64 build requires gcc-13 libstdc++ which JetPack 6 (gcc-11) lacks — our build fills exactly that gap.
+
+### The AI-facing CLI tells the truth (recovery edition)
+- **recovery_hint taught wrong syntax in five places** (device create `--type` vs `--device-type`, control `--command` flag vs positional, agent `--action` vs positional, transform `value` vs `input`, dashboard steering into the full-array replace) — the failure-recovery hint is what the model sees right after a failed command, so wrong syntax steered the retry into a second failure.
+- **Piped commands route to the real shell**: `heramind x | grep y` was intercepted in-process with `|` passed to clap as a literal argument → guaranteed "unexpected argument". The tokenizer now bails on shell constructs outside quotes.
+- **Receipts teach the next step**: agent create (paused — activate with…), connector create (test with…), transform create (check executions) — multi-step truncation was a top eval failure class.
+- **`heramind config export|import|validate`** wired (the handlers existed as dead code) and **`message delete`** added — the undo command previously pointed at a subcommand that didn't parse.
+
+### Skills: builtin is actually read-only, BM25 ranks the real path
+- "Builtin skills are read-only" was documented but not enforced — PUT/DELETE persisted a shadow file that permanently masked the builtin content across upgrades. Both the API handlers and the LLM skill tool now return teaching errors for builtin ids; the `origin` field (hardcoded "user" in every response, so `?origin=builtin` filters were dead) is serialized from metadata.
+- **BM25 ranks the production skill tool search** (it only served the debug endpoint): IDF-weighted lexical ranking rides the flat signals with a two-tier gate — ranking lift for already-positive candidates, strong rare-term rescue (≥2.5 raw) for zero-flat queries, garbage queries still find nothing. Regression test on the real 15-skill corpus locks both properties.
+
+### Notification channels survive restarts + six silent failures
+- **telegram/wecom/dingtalk/slack/feishu channels died on every server restart** (`load_persisted_channels` only had factory branches for webhook/email) — rule alerts silently stopped until each channel was manually recreated.
+- Cleanup batch: agent `--resources`/`--metrics`/`--commands` malformed JSON now errors instead of silently dropping the binding; `device create --adapter-type` defaults to the documented `mqtt`; the dashboard full-replace path runs the same known-type gate as add-components; IM bridge re-registration stops the superseded bridge instead of leaving twin polling loops; market extension upgrades carry the user's config forward (and push it to the running process); `init_llm` prefers the DB's active instance over a stale config.toml (a leftover TOML resurrected a dead backend over the user's activated builtin).
+
+### Four one-liners that were each silent failures
+share-proxy hardcoded port 127.0.0.1:9375 (non-default-port installs served broken shared dashboards — now resolves the real bind port); deleting ANY dashboard cleared the global default pointer (only the deleted one should); updating a channel wiped its routing filter (register persisted `ChannelFilter::default()` over the user's); `selectedSkills: []` couldn't clear pinned skills (the guard treated "explicitly emptied" as "not provided").
+
+### Security hygiene
+- **Deleting a user or changing a password now revokes that user's sessions immediately** — both the in-memory whitelist and every persisted row in `sessions.redb`. Previously a JWT minted before the change kept working for up to `session_duration` (7 days): a leaked token survived a password rotation, and a deleted user's token kept authenticating. Logout-level revocation existed; user-level did not.
+- **The public auth endpoints are brute-force throttled.** The global HTTP limiter sits at flood scale (thousands of req/min) — no defense against password guessing. Login now counts only *credential* failures (5 per 15 min, keyed per username AND per client IP — either over the cap blocks, so distributed guessing at one account and one host spraying many accounts are both stopped; a successful login clears the counters, so mistyping a few times never locks an honest user out). Register and first-run setup count every attempt per IP (10 per 15 min). 429 + `Retry-After` on block. The client IP honors `X-Forwarded-For`/`X-Real-IP` (production sits behind nginx); a direct-connection attacker forging those headers defeats only the IP key — the per-username key is the load-bearing half.
+- **API key `permissions` documented as informational** — the field was accepted, stored, and echoed but never enforced (every key authenticates as a full administrator). The API docs now say so explicitly at every surface that mentions it, so nobody scopes a key down and assumes it limits anything.
+- **Remote-instance API keys are no longer handed back by the API.** The instance list previously returned every instance's full key XOR-"encrypted" with a cipher hardcoded in the open-source repo — anyone who could list instances recovered every credential. The backend now returns only the masked key; the frontend keeps its own copy in a per-browser key store from the moment the user entered it (existing setups migrate transparently from the old cache on first read), so instance switching works exactly as before.
+- **Two pre-existing security holes closed in the share/asset chain** (found by the cross-domain review): (1) the share proxy could be traversed with dot-segments — `/share/{token}/proxy/devices/../../auth/keys` passed the first-segment allowlist and the loopback forwarder normalized the path away, giving an anonymous share viewer ANY authenticated route via the internal-proxy header; dot-segments are rejected outright now. (2) The extension asset server joined an attacker-controlled path onto the extension dir — an absolute path (`/etc/passwd`) REPLACED the base with no `..` needed, an arbitrary-file read also reachable through the share proxy; absolute paths are rejected and a canonicalized containment check backstops every join trick.
+- **Interactive dashboard share links no longer mean "full write inside the allowlist".** An `allow_interactive` share token previously skipped the method check entirely — an anonymous holder could POST/PUT/DELETE anything under the proxied path prefixes (install extensions, delete agents, rewrite notification channels). Both share modes now pass the same method gate: GET plus a whitelist of read-like POSTs, with interactive adding exactly one write — `devices/:id/command/:command` (the dashboard's control buttons). PUT/DELETE stay blocked for both modes: interactive means actuating devices, never editing configuration.
+
+### Agents: one-shot tasks become a first-class form (design-review follow-ups)
+- **`ScheduleType::Manual`**: a manual-only agent the scheduler never auto-triggers — runs any number of times via invoke/execute (or chat delegation) and idles as the new **`AgentStatus::Completed`** between runs (a ready-state, not terminal — re-invoking always works). Previously unrepresentable: the frontend's "on-demand" option was an `interval_seconds: 0` encoding, rejected by create and never Completing. The editor's on-demand option now sends `manual` (legacy `0` rows still read correctly), and the agent card renders Completed with its own badge. The building block for chat-side delegation.
+- **`invoke` no longer kills long runs at 60s**: the handler used to await the execution inline, so the 60s timeout DROPPED the future — the run died mid-flight with no execution record and no journal entry (a ghost execution the agent could never learn from). The execution now runs in its own task; past the wait window the caller gets `still_executing` with poll pointers (API path + CLI command) while the run completes in the background and writes its record + journal as usual.
+- **`enable_tool_chaining` removed from the API surface** — it was a dead field end to end: the executor decides tool-calling by LLM capability (`should_use_tools` never read it), no UI ever set it. Kept in storage only for bincode compatibility with existing rows, marked deprecated.
+
+### Frontend
+- First entry into a chat session no longer flashes the "start a new conversation" default for a frame before the real messages load.
+- **Memory and auto-onboarding configuration moved into Settings** — both were platform-level policies hiding in page-local dialogs (the agents-page memory panel and the devices-page pending-drafts toolbar). Memory config now lives in Settings → Preferences (instant-save rows, same fields), auto-onboarding in Settings → Preferences; the original entry points jump straight to the right section. The memory panel keeps content management (view/edit files) and only reads the char limits.
+- "Add your own API backend" opens the Cloud AI dialog (protocol chooser) — it built an inline OpenAI type and bypassed the protocol path.
+- The builtin model wizard gains the **import-your-own-GGUF card** + a `Custom` badge on imported models. The card is upload-first: drag-and-drop or pick a GGUF (multipart, streamed server-side — GGUFs run to ~5 GB and are never buffered in memory), with the server-path input folded behind an "advanced" toggle for desktop/remote-deployment use.
+- "Add your own API backend" in the empty-backends state did nothing — the early-return branch never mounted the Cloud AI dialog it opens. (Fixed together with the upload work; the click now opens the protocol chooser as on the populated state.)
+- **Per-model sampling defaults** — the four built-in models each carry their own best-known sampling point now, applied both as llama-server startup defaults (`--temp/--top-p/--top-k`) and on the request side (the backend instance): Qwen 3.5 non-thinking **0.7/0.8/20** (official), Gemma 4 **1.0/0.95/64** (official model card), Ling-3.0-tiny **1.0/0.95/20** (official), LFM keeps the measured-best **0.6/0.85/20** (beat the official card values in a 154-case A/B). Previously all four shared one global legacy point — Gemma was running 0.6 where Google recommends 1.0. The catalog schema carries the fields (`temperature/top_p/top_k`, absent → legacy default), custom-imported GGUFs keep the global default, and registry tests lock all four values.
+- **Ling-3.0-tiny joins the model catalog** — the remote catalog entry went live in camthink-ai/NeoMind-Runtimes (4.8 GB Q4_K_M, 128K ctx, min 6 GB RAM). Our bundled runtime already carries the BailingMoe3 architecture support merged upstream on 08-17, so the download runs out of the box.
+
+### Eval & docs
+- Ling-3.0-tiny Q4_K_M validated on the same 30-case agent suite: **77% — ties Qwen 3.5 4B** while generating ~45% faster (~110-116 tok/s on M4-class); joins the README's model table as the community-import example.
+- Remote catalog notes kept language-neutral (English) in the public HeraMind-Runtimes repo.
+
+## [0.9.19] - 2026-08-21
+
+### Built-in AI, out of the box — the version's theme
+HeraMind now ships its own brain. The built-in LLM became a choice of three models with a self-bootstrapping runtime — download once, everything runs offline with zero configuration:
+
+- **Multi-model registry**: pick **LFM2.5-2.6B** (QAD Q4_0 — small, native 128K context, default), **Qwen3.5-4B** (the strongest edge agent in our 30-case evals at 76% cmd_ok, runs non-thinking by default for speed), or **Gemma4-E2B** (official Google QAT quant, mmproj-ready for vision). The wizard is a bilingual three-tile picker; each model carries its own context window and thinking defaults (LFM's thinking is integral; Qwen/Gemma's is optional).
+- **Self-bootstrapping llama-server runtime**: the bundled binary is used when present (desktop/Docker); otherwise the server downloads the official llama.cpp prebuilt for its platform (macOS arm64/x64, Linux x64/arm64, Windows x64/arm64) into a versioned cache. The whole release archive is extracted — the binary is a thin wrapper that dlopens sibling libraries, and a single-file extract dies on exec. Platforms without an official prebuilt get a clear source-build pointer. `HERAMIND_BUILTIN_RUNTIME_VARIANT=cuda` opts Windows x64 into the official CUDA build — the cudart DLL bundle downloads alongside, so hosts need only an NVIDIA driver — and `CUDA=1 scripts/build-llama-server.sh` builds a GPU runtime on-device for Jetson/Linux (arch=native, nvcc checked before the clone); the wizard shows platform-matched guidance for both.
+- **Hardened download chain**: resumable downloads with SHA-256 verification, a resumed response's progress total now counts already-downloaded bytes (the bar used to clamp to a false 100%), WS progress events throttled to ~250ms (per-chunk events re-render-stormed the UI), a "starting local model…" phase while the server spawns, and auto-activation when no other backend is active. A persistent top-right indicator reopens the wizard after you close it mid-download.
+- **Honest capability reporting**: the builtin instance registers with its real context window (LFM 128K / Qwen·Gemma 32K — a storage default of 4096 previously surfaced as a tiny chat window), streaming, tool support, and per-model thinking flags.
+- **One-click model switch**: replacing the serving model no longer leaves a stale llama-server answering for the old one.
+- **Engine settings dialog**: the context size is finally adjustable — an Engine Settings dialog on the builtin card offers 32K/64K/128K presets (the config field existed all along but both spawn sites hard-used the per-model default). Changing it respawns the server immediately (only when the requested value differs from the live `/props` n_ctx), updates the instance capabilities, re-pushes the backend to every active session, and the chat header's Context X/Y reflects the new size without a refocus. `HERAMIND_BUILTIN_LLM_CTX` covers scripted deployments; passing the model's own default resets the override.
+- **Memory feasibility before install**: each model declares its minimum available RAM (LFM 3G / Qwen 4G / Gemma 4.5G); the wizard's picker shows an amber warning per infeasible model BEFORE anything downloads, and the installed card keeps a persistent warning with the available-memory numbers.
+
+### Protocol-first LLM backends — two cloud protocols, one card
+The vendor grid is gone: settings now offers **Ollama / llama.cpp / Cloud AI**, where Cloud AI is a single card with an inline protocol chooser (**OpenAI-compatible / Anthropic**) — every other vendor (Qwen, DeepSeek, GLM, xAI, OpenRouter, vLLM…) rides the OpenAI-compatible path through its endpoint. Legacy vendor-typed instances keep rendering (folded into the Cloud AI detail view) and remain editable, including switching their protocol.
+
+- **Vendor params survive the protocol path**: backends created as plain OpenAI-compatible with a DashScope/DeepSeek endpoint keep their vendor-specific wiring — `enable_thinking` for DashScope hybrid models (both cn and intl regions), DeepSeek's `thinking` on/off toggle — and stop receiving `reasoning_effort`, which those APIs reject. The runtime sniffs the endpoint (`param_provider()`), so how a backend was typed no longer changes its request behavior; the persisted reasoning-control report (Boolean vs Effort — what the settings UI renders) follows it. Without this, every DashScope/DeepSeek backend created after the aggregation silently lost thinking control (the gotcha #7 non-chat token burn).
+- **DeepSeek's thinking toggle now honors `thinking_enabled: Some(false)`** — the flag analyzer/intent/compression actually set; previously only an explicit effort level disabled it, so non-chat calls kept thinking on.
+- **Anthropic base URLs**: `/v1` auto-appended when missing (SDK/Claude Code convention — `https://api.anthropic.com` and GLM's `/api/anthropic` both land correctly), and responses containing `thinking`/`redacted_thinking` content blocks no longer fail deserialization.
+- **Sampling is protocol-aware**: temperature everywhere, `top_p` hidden for Anthropic (not in the Messages API). Editing supports switching a backend's protocol without clobbering endpoint/model fields; a stored API key prefills as a mask sentinel (blank keeps it).
+- **Fresh default models**: gpt-4.1-mini, claude-sonnet-4-5, gemini-2.5-flash, grok-3-mini, glm-4.5-flash, qwen3.5:4b (schema defaults + onboarding CLI list).
+
+### The AI-facing CLI tells the truth again
+A full audit of everything the agent reads and runs for LLM backend management:
+- The clap help (injected into context by the shell tool's domain-help channel) and the llm-management skill taught `--type custom` — a value the API rejects with 400. Both now teach the four-type story (`ollama` / `llamacpp` / `openai` / `anthropic`), with legacy vendor values noted as back-compat and every vendor reachable via `--type openai` + its endpoint.
+- `llm models --endpoint` was silently discarded by the dispatcher — the skill's remote-Ollama example queried localhost regardless of the flag. The endpoint now reaches the API.
+- The onboarding CLI quick-setup's xAI endpoint lacked `/v1` (URL joins base + `/chat/completions`; only Anthropic auto-appends) — the command as printed 404'd.
+- Endpoint conventions documented once, everywhere they're taught: llamacpp without `/v1`, OpenAI-compatible with `/v1`, Anthropic either way.
+- Verified end-to-end on a live server through the exact commands the skill teaches: create (openai-typed DeepSeek + DashScope) / list / get / activate / test (reached the real vendor API) / delete; `custom` fails cleanly with a teaching error.
+
+### Critical fix: llamacpp agents crashed the server
+The agent-runtime builder had no arm for `LlmBackend::LlamaCpp` — any llamacpp backend hit `unreachable!()` during agent creation/execution, crashing the server. This silently broke agent workloads on llamacpp backends and had been contaminating cross-model eval comparisons (Qwen's real score was 76%, not the polluted 37%; Gemma doubled to 60%). Post-fix baselines are committed for Qwen, LFM QAD (67%, tool_ok 100%), and Gemma QAT.
+
+### Deployment: the LLM backend is optional everywhere
+- **Docker**: `HERAMIND_BUNDLE_MODEL=lfm25-2.6b | qwen3.5-4b | gemma4-e2b | none` build arg — `none` produces a 221MB image (vs 1.81GB with a model) for deployments that bring their own backend. Also fixed: the runtime stage was missing `libgomp1`, so the bundled llama-server couldn't exec; and CI now **smoke-gates every image before pushing** (`/api/health` green + "Builtin LLM ready" in logs) — build-green ≠ runnable.
+- **install.sh**: `WITH_LLM` (default true) downloads the llama.cpp runtime from official prebuilt binaries; `BUILTIN_MODEL` pre-downloads a chosen model. Both opt out cleanly. A post-install exec check flags a broken runtime with baseline guidance for old-libstdc++ systems.
+- **Desktop**: llama-server is NOT bundled — the installer stays lean and the runtime downloads on demand the moment a user actually installs a builtin model (official prebuilt per platform; CUDA via `HERAMIND_BUILTIN_RUNTIME_VARIANT=cuda` with auto-fallback to CPU). Hosts without any model never fetch anything.
+
+### Device quick-start tells the truth about your network
+The onboarding curl example printed a URL that only worked from the same machine when the server binds loopback — it now shows the LAN IP when reachable, survives rebinding, and a 503 mid-flow explains the rebind instead of failing raw.
+
+### MQTT: gateways no longer merge devices
+Auto-discovery derived device identity from the topic alone — a gateway forwarding many devices on one topic collapsed them into one device. Payload identity now wins: an explicit `device_id_field` (internal and external broker, one fallback field per line in the UI, comma also accepted) or auto-detection of ~30 common fields (device_id/sn/mac/eui/imei…).
+
+### First-run polish — driven by a real 0-to-1 walkthrough
+A full fresh-install walkthrough (wipe → register → download → chat) surfaced and fixed a chain of paper cuts:
+- **Window drag on setup/login**: the overlay titlebar left those two pages with no drag region at all.
+- **Theme**: fresh installs now follow the system theme correctly (WKWebView reports `prefers-color-scheme` from the app's effective appearance — now explicitly set), and desktop defaults to dark when unspecified.
+- **Newsletter opt-in actually works in packaged builds** — the Mailchimp JSONP was blocked by CSP; the domain is allow-listed and success now toasts.
+- **Guided empty states**: chat, agents, and dashboards each teach instead of block — one story (built-in model recommended, bring-your-own second) across four surfaces, with the agents page branching its empty state on backend presence.
+- **Onboarding dialog opens manually only** (sidebar button); step checkmarks reflect real completion, not UI position; the setup-complete page is a clean success + one CTA into chat.
+- **Sidebar**: 224px expanded width, explicit collapse button, nav rows stretch full-width, status/badge markers anchor to icon corners, instance liveness follows the WebSocket.
+- **Three flicker roots fixed**: a stale API key's 401s were swallowed while `isAuthenticated` stayed true, bouncing routes between / and /setup (each revealing the other beneath); focus-triggered backend refetches flipped the chat empty state through the real UI for a frame; a whole-store subscription re-rendered the setup page on any state change.
+- **Confirm-password mismatch** shows inline immediately and disables submit while fields disagree.
+
+### Onboarding wizard — four steps that ARE the journey
+The progress stages now map 1:1 onto wizard steps: welcome (platform intro + docs cards) → LLM backend → devices → ready. The welcome content moved out of the LLM step so the two setup steps share one structure; the built-in model wizard stays mounted across step navigation (mid-download too); completed items show a success strip with actions still reachable instead of a dead-end banner; the stage indicator stacks icon above label and every stage jumps directly; opening lands on the first incomplete step.
+
+### Dashboard AI tool chain — tweak one widget without a full rebuild
+- **`update-component`**: deep-merge patch for a single widget (`--set '{"data_source":{"timeWindow":{...}}}'`) — previously a one-field change meant remove + re-add of the full component JSON (one incident burned 11 rounds on exactly that). `id`/`type` immutable; 404s carry a get-command hint.
+- **`update --components` is gated behind `--replace-all`**: models kept reaching for full-array replace when they meant add or tweak — without the flag it now fails with a teaching error naming the right command. `create --components` offers one-shot create-with-widgets; `dashboard get` falls back to a name match; malformed `--components`/`--ids` JSON propagates instead of silently acting on an empty array; duplicate component ids are rejected.
+- **Inline expression data sources**: a component binds a computed KPI directly (`avg(device:s1:values.battery, device:s2:values.battery)`) — no pre-created transform. Ref parsing + whitelisted-function evaluation with injection rejection (10 vitest cases), forward-filled aligned timeseries.
+- **`transform executions`**: every transform run has been recorded all along but nothing surfaced it — the CLI subcommand + skill debugging section now expose status/error/output, including the "completed with metric_count 0 = code ran but returned nothing" diagnosis.
+- **Unknown types are rejected at the door**: a typo'd type (`value_card`) used to persist silently and render as an UnknownComponent placeholder while the agent claimed success — add-components now validates against builtin ∪ community ∪ extension types and 400s with the `widget list` hint.
+- **Uniform name resolution**: `dashboard get` accepted names but mutations 404'd on them — the model's correct-looking get-then-mutate-by-name pattern died mid-chain (and small models papered over the 404 with a success claim). Every `:id` route now resolves id-first-then-name identically.
+- **Receipts that end the verification loop**: `add-components` replies with the added component ids, a types-verified confirmation, and the next free grid row; `dashboard get` ends with an occupied-rows summary and an explicit next-free-row placement hint — adding N widgets needs exactly one `get`.
+
+### Agent reliability & chat
+- **List-only dead-end detector**: a diagnostic question containing the noun 绑定 triggered the "execute now" injection every round — 17 tool calls, no answer, still grinding 16 minutes later. Now it fires only on nameable actions, at most once per turn, and recognizes component-level mutations.
+- **Chat panel converges to server truth**: a send landing mid-generation duplicated bubbles in the floating panel; after every stream the panel refetches the session history and replaces its local assembly.
+- **Failure-honesty guard**: when any earlier command exited non-zero, the round context now forbids claiming failed operations successful and points at the recovery path — the "404 → 已成功添加" hallucination pattern.
+- **No more completion snaps**: the tool block auto-collapsed the instant a stream ended (whole bubble relaid out mid-view) and the post-end history reconcile changed every React key (full list remount). Expansion is now decided at mount; reconcile keeps local ids when the shape already matches.
+- **Panel conversations survive refreshes**: the per-page session pointer was validated by a fingerprint that baked in the dashboard's component snapshot — editing the board via the panel (its main job), or the dashboards store not having loaded yet at restore time, flipped the fingerprint and the mismatch path DELETED the pointer. The fingerprint now derives from URL + language only, and the per-dashboard bucket key comes from the route param — conversations persist across refreshes, board edits, and store timing.
+- **Page panels that stay current and know where they are**: panel sessions rebuild when their page profile drifts (new SOP/tools/language — the config was previously frozen at first creation forever); opening the panel on a specific dashboard gets a per-dashboard session whose prompt names the board and its components; the quick-action sets are refreshed (dashboard: create board / tweak widget / computed metric; automation: transform debugging).
+
+### Smaller fixes
+- IM router no longer errors on fresh systems (default agent resolution moved from boot-time to message-time; an agent created later works without restart).
+- Subcommand-level `--help` injection on shell failures; thinking-override ignored for integral-thinking models.
+- Broker-config dialog opened beneath the z-[100] settings layer (invisible) — now z-[110].
+- `docker build` fetches llama.cpp via curl tarball (Docker networks commonly block git).
+- `cargo fmt` across five crates; behavior_tests compile again under `test-utils`.
+- Staleness sweep across docs/build configs/deploy files; 7 dead frontend files and 88 stale i18n keys removed; stale LLM model/endpoint defaults refreshed backend-wide; llamacpp documented in the TOML config example.
+
+### Eval
+- Post-panic-fix regression baselines: Qwen3.5-4B **76%** cmd_ok (strongest), LFM2.5 QAD **67%** with 100% tool_ok, Gemma4-E2B QAT **60%** — the 30-case gate now compares against clean references.
+- LFM2.5-2.6B defaults to the official QAD quant (verified sha); llama.cpp pinned to b10545 for runtime downloads (b10524 has no release binaries).
+
+---
+
+## [0.9.18] - 2026-08-19
+
+### Small-model agent reliability — the version's theme
+The failure post-mortem from the full bilingual eval (the 154-case LFM2.5 run) pinned two dominant causes — 27 "detour succeeds but never learns the subcommand" cases and 19 low-temperature loop cases. All of the reliability trio ships:
+- **Shell tool index cards**: each of the 14 CLI domains now carries a one-line-per-subcommand index plus a one-line "what it is / isn't" note (~40 lines total). Subcommand help previously injected only on the failure path, so agents that succeeded by detour never learned the direct subcommand. The index rides the description — recall without scaring small models off the tool.
+- **Loop-steering hint, never an abort**: when consecutive rounds issue similar commands without reaching the goal, a hint is injected (try a different subcommand / `--help` / reread the task). Chat stays user-driven — no forced abort (per the standing 2026-07-29 decision).
+- **Bounded `max_tokens`**: chat requests had no ceiling; a production Qwen3.5-4B runaway emitted 22,177 tokens over 7.4 minutes, and llama-server doesn't cancel work on client disconnect. Requests are now capped at 8192.
+- **Runtime context probing**: Ollama (`/api/show`) and llamacpp (`/props`) are probed when a local backend is created instead of trusting the registry default (128,000). A registered default that overstates the real context made every turn overflow and burn retry-prefills (13/13 turns); with probing, overflow went 13 → 0, the budget dropped to the real value, and the turn-1 fact survived via the memory system. Detected values win over registry values (there is no user-override channel); on probe failure the fallback is a conservative 8192 rather than the over-claiming default.
+
+### Skill matching: BM25 ranking
+Skill retrieval moved from description-based matching to a dependency-free hand-written **BM25** (~150 lines; tantivy dropped — a corpus of tens of documents doesn't warrant a dependency tree) with CJK-bigram tokenization. In-matcher gating (raw score > 1.0 × 0.3) keeps auto-injection from over-triggering; rare-term hits (LoRaWAN-class vocabulary) get a +0.6 boost toward their owning skill. The ranking is locked in by an A/B guard on the real corpus (9/10 top-1 vs 7/10 legacy), and the system-info skill gained the resource-usage vocabulary that closed the last A/B miss.
+
+### Eval infrastructure & production stability
+- **Parallel sharded full-eval**: 4 workers, each with its own private MQTT broker — the full suite runs in roughly a quarter of the wall-clock; shard runners default case-timeout to 600×workers.
+- **Timeout trace salvage**: before SIGALRM kills a hung case, its turn records are dumped to disk — previously all 19 loop-timeout cases lost their trajectories and had to be reverse-engineered from llama logs.
+- **Config snapshot per run**: each eval run stores the `AGENT_LLM_*` environment at start, so parameter choices (temp 0.6 etc.) are provable from the archive instead of circumstantial.
+- **Negative-control baseline archived**: the official-parameters run is frozen into `eval/baselines/`, giving the regression gate a hard reference to block silent sampling drift.
+
+### Edge models & the agent UI
+- **`docs/edge-models.md`**: official-parameter sampling comparison table + the "thinking cannot be disabled" findings from the 154-case LFM2.5 run.
+- **Tool-loop round indicator**: the chat input area now shows "round N of tool calling", derived from the last tool call's round — zero new state.
+- **Image-cache fix for small uploads**: user-uploaded images below 32KB never entered the tool cache, so `$cached:user_image` resolution failed and vision tools received a literal marker instead of the image. Fixed and verified end-to-end with a logging proxy; residual VL-3B failures are tool-selection/argument quality (the capability floor), not the pipeline.
+
+### Chat panel: docked column + page-scoped assistant
+The floating chat matured into a real second surface:
+- **Wide-screen docked panel**: ≥1280px viewports get a full-height docked right column; main content squeezes via the `--dock-chat-width` var. Narrower viewports keep the floating window.
+- **Page-scoped assistant**: the panel session is created with the current page's real backend context — system-prompt suffix, tool allowlist, and matching skill pinning; switching pages switches to that page's persisted session.
+- **Model switch reaches the wire**: the active LLM backend is synced to the WebSocket singleton, so switching models inside the panel actually takes effect.
+- **Resizable width**: drag the panel's left edge to widen/narrow it (320–720px, persisted across reloads). Wide markdown tables now scroll within the message instead of pushing the whole panel into horizontal scroll.
+- **Lazy markdown stack**: the ~325KB vendor-markdown/highlight stack is split out of the initial bundle and only loads when the panel opens; container queries let card grids reflow when the dock squeezes them.
+- **Chat message presentation**: thinking/tool blocks become unified process cards that blend into the bubble; scroll-to-bottom is a circular icon button in the message action row.
+
+### Pages stay fresh — DataChanged events
+AI and external mutations now publish `DataChanged`, and pages refresh automatically — no manual reload after the assistant creates a rule, changes a device, or runs an action.
+
+### Device assistant: simulated-device SOP
+The device assistant gained a simulated-device standard operating procedure that covers any scenario, not just temperature/humidity sensors.
+
+### Settings dialog opens on the right page
+The sidebar's Settings row passed `openSettings` directly as its click handler, so the click event itself became the `section` argument — the dialog opened with an invalid active section and an empty content pane. The row now calls `openSettings()` with no argument, landing on the current (Preferences) section.
+
+### UI polish & small fixes
+- **Sidebar footer stability on expand/collapse**: the rail's bottom rows (instance / onboarding / settings / avatar) kept mixed heights (36/32/44px) and gaps across states, so expanding made the Settings button jump from 32×32 to 159×44. All footer rows are now uniform 44px with a uniform gap — expanding only reveals labels, positions don't move. (The global `button { min-height: 44px }` rule with a h-6..h-9 exception was the mechanism.)
+- **Alert pill → real action**: the "N alerts" pill is now a real button that jumps to /messages; PushTargetDialog's icon buttons gained proper hit targets.
+- **Update dialog height cap**: the OTA release-notes area is capped at 40vh (was 60vh), so long update notes keep the dialog compact instead of pushing it near full-screen.
+- Extension metrics get sparklines + summary stats; extension cards get category icons + error summary; the dashboard tab bar's horizontal scroll is restored with an invisible bar; PageLayout's footer shrinks to content width.
+
+### Style refresh toward the reference design language
+- **White canvas + gray sidebar rail** (reference palette): content sits directly on white and separates via subtle borders; the sidebar (`--sidebar-bg`, ~#F8F9FA light / below-canvas dark) is the gray chrome layer, borderless — color contrast does the separating.
+- **Fewer lines**: page sidebars (chat sessions, dashboard list) join the same gray rail tone and drop their border-r; the app sidebar footer drops its border-t. Chrome layers now have zero decorative lines.
+- **Mono accent**: brand orange is OUT of UI accents — active nav rows and icons, mobile drawer, chat bot avatars/send button, FAB (now an ink circle), LLM tab tiles and About tiles are all neutral black/white. Orange survives only in the logo mark, semantic/data colors (charts, intent classification), and the login/setup brand washes.
+- **Radius ladder tightened**: base `--radius` 12px → 8px (lg 8 / md 6 / sm 4 / xl 12 / 2xl 16) — a denser, more professional feel across cards, buttons and inputs.
+
+### Desktop navigation: top menu → sidebar
+The desktop top nav is replaced by a persistent **AppSidebar** that is the entire desktop chrome — navigation + utilities, full-height. It collapses to a 72px icon rail (tooltips carry the names) and expands to 176px with labels on logo click; it always starts collapsed on launch. PRIMARY (Chat/Agents/Devices/Visual Dashboard) and SYSTEM (Automation/Data/Messages/Extensions) groups use the same split as the mobile drawer. Utilities split: instance/onboarding/settings/avatar live in the rail footer; theme/language/alerts float top-right (`GlobalControlsFloating`). Nav definitions are single-sourced in `navItems.ts`. The mobile navigation is untouched. Fixed full-bleed surfaces (chat's keyboard-aware container, PageLayout's footer) offset past the sidebar via the `--app-sidebar-width` CSS var. DESIGN_SPEC §28 rewritten.
+
+### Element layering audit — 16 findings fixed
+A full z-index/stacking audit surfaced and fixed: mobile nested dialogs losing their scrim above z-[100] fullscreen layers (overlay z now extracted from `className` in both `dialog.tsx` branches); Toaster/Confirmer double-mounted on protected routes (every toast painted twice); `<main>`'s `z-10` forming a page-wide stacking context that capped in-page fixed overlays below the chrome; three incompatible drawer conventions unified to Sheet-tier z-50 + `#dialog-root` portal (SessionSidebar, DashboardListSidebar — which also loses its `--topnav-height` geometric dodge); widget fullscreen viewers aligned to z-[110] (ImageDisplay was z-50, three image overlays z-200); MobileItemSelector portaled out of `document.body`; toast lifted to z-[210] so confirm-dialog toasts stay visible; GlobalChatFab panel re-tiered z-[90] (was tying with fullscreen layers); BackendUnavailableOverlay to the new z-[300] system tier; dead `.mobile-edit-bar` CSS and TopNav's unreachable mobile tab bar deleted; `shadow-2xl`/inline-rgba shadows converged onto the token ladder. DESIGN_SPEC §8 is now a complete 13-tier ladder with a portal policy.
+
+### Style consistency & token refresh
+- The below-`text-xs` type scale is now first-class Tailwind fontSize utilities (`text-micro/nano/mini/code/body/heading`, each with a tuned line-height); every `text-[Npx]` literal across ~40 files replaced — sizes tune in one place.
+- Chart colors single-sourced: `design-system/tokens/color.ts` mirrors `--chart-1..6` exactly (was a silently diverging palette) with accurate sRGB hexes.
+- `--brand` expanded to a full scale (`-hover/-active/-bg/-foreground`, light darkens / dark brightens on engage).
+- Light theme canvas deepened for clearer card elevation; dark theme gets an explicit surface ladder (`background < card < popover < chrome`), crisper borders and layered shadows.
+- Fixed the never-working `dark:brand-icon-stroke` (Tailwind can't variant a custom class — rule is now `.dark`-scoped, active nav icons get the gradient stroke as intended); `error-foreground` naming unified into `destructive-foreground`; dead `dashboard-components.css` deleted; chrome ghost-button repaints consolidated to one `.chrome-ghost` class.
+
+### Frontend tests
+UI smoke tests + a tailwind-merge regression guard (`tw-merge`) protecting the custom font-size tokens from being silently dropped.
+
+### CLI & accounts
+- **Offline admin password recovery**: an operator who is locked out of a forgotten admin password can reset it directly on the server — no running instance needed, no password-recovery loop over the network. Recovery authority deliberately stays at the machine (shell + data-directory access required), not in the HTTP API.
+
+### Docs
+- README: refreshed screenshots to match the current UI (English).
+
+### Desktop
+- Lockfile synced for the new CLI dependency.
+
+## [0.9.17] - 2026-08-16
+
+### REST ingestion joins the event spine
+`POST /api/devices/:id/metrics` wrote telemetry storage only — the MQTT and webhook paths both publish `DeviceMetric`, the REST path did not, so REST-ingested data silently bypassed the platform: rules never fired, dashboards didn't live-update, event-driven push never delivered, and REST-fed devices showed offline despite fresh data. The write now publishes the event (regression-tested).
+
+### Security
+- **SSRF guard on the transform engine's device-controlled URL fetch**: `url_to_base64` fetched URLs arriving in device data and embedded the response as base64 into transform outputs — a compromised device could direct the server at cloud-metadata endpoints (credentials), the HeraMind API itself, or internal admin panels and the base64 would surface in dashboards/push targets. The private-address rules moved to a shared `heramind_core::net` guard (unit-tested: IPv4 private/CGNAT/link-local/multicast, IPv6 ULA/loopback, IPv4-mapped, `.local` names); the transform fetch enforces them plus an http(s)-only scheme check; `web_fetch` delegates to the same rules.
+
+### Timestamp-unit alignment (end-to-end audit)
+Every timestamp field was audited across backend emission → API JSON → frontend consumption. Six verified mismatches fixed, including two user-visible bugs and two data-corrupting external API contracts:
+- **AI-Analyst history rendered Jan-1970** (seconds consumed with ms semantics); fixed with the same normalization AgentMonitorWidget already used.
+- **`POST /api/devices/:id/metrics` wrote millis into the seconds telemetry store** — default-written points were invisible to range queries and rendered year ~58000. The documented millis API contract is honored but converted at the store boundary.
+- **`POST /api/extensions/:id/push-metrics`** had the same millis-into-seconds corruption.
+- **Extension-registered devices showed last_seen ≈ year 58000** (millis in the seconds registry field) until first telemetry.
+- **`HeraMindEvent::ExtensionCommand*` carried millis** while every other event variant carries seconds — the WS/SSE envelope timestamp switched units by event type.
+- **SDK session math was unit-broken**: `age_secs()` always 0, `age_ms()` 1000× inflated, and `SessionStats::last_activity` mixed seconds/durations against millis consumers (session durations came out ≈1.75e12 ms). All millis timestamps now.
+
+### TimeSeriesAggregation works for the first time
+The window-aggregation transform read an in-RAM cache that nothing ever populated (its feeding API had zero callers) — every aggregation failed with "No data points found" while recording `Completed`; users could configure a silently-dead transform. It now queries the persistent telemetry store (full history, restart-safe) via new `with_time_series_storage()` wiring, emits second-unit timestamps aligned with the store and sibling outputs (the old "milliseconds for consistency" comment was backwards — device metrics storage writes seconds), and the ~80 lines of dead cache machinery are deleted.
+
+### Unbounded-growth closeout & hardening
+- **All per-device maps bounded**: data-push `DataSourceMatcher::last_values` (4096 cap), the transform event service's raw-data/timestamp/debounce-timer maps (1024-device cap, oldest-timestamp pruning, and debounce tasks now self-remove their handles on completion — dynamic MQTT client ids previously grew all of these forever).
+- **`metrics_info` orphan entries pruned by retention**: a metric whose points had all aged out kept its entry for the process lifetime; retention now probes for remaining points and drops empty entries.
+- **Transform output registry evicts stale names on re-register** — data-varying metric names (GroupBy's `output_{group}`) used to leave phantom data sources forever.
+- **User JS transforms get a loop watchdog** (Boa runtime loop-iteration limit, 10M): a `while(true)` script used to hang the executor thread forever.
+- **WS chat stream creation no longer blocks the socket**: creation ran inline in the select loop — during the initial LLM request (tens of seconds on local models) no pings were sent and Stop was unresponsive. Creation + fallback now run in a spawned task with the fallback delivered through the event channel.
+- **Remaining warm blocking reads off the executor**: `query_latest_uncached`, `query_range_bucketed`, system-memory `read_file`/`write_file`.
+- Frontend spec compliance: the last two raw-palette gradients swapped for tokens; two hand-rolled delete confirms converted to AlertDialog.
+
+### Frontend type-safety
+- **`ResponsiveTable<T>` is generic** — the table's non-generic `Record<string, unknown>` surface forced ~100 typed→Record→typed double-casts across 11 table-driven pages; all migrated (project-wide `as unknown as`: 121 → 21; the remainder is non-table code). `TableRowAction.onClick`'s rowData is now required and row actions are per-row only.
+- **Device status fragment typed** in deviceSlice (10 per-field `as any` → one `Partial<DeviceStatusFragment>` per block — backend field renames now surface at compile time) and stale API-response casts dropped in main.tsx (the automation endpoints were already typed).
+- **Rule builder at zero `as any`** (was 30): the persisted source-blob UI fields (triggerType/cronExpression/cooldown\*) are declared in `types/rule.ts`, the transient React-key is a declared `UIAction` type instead of smuggled, saved actions discriminate the `RuleAction` union properly, and condition removal flows through a nullable `onChange`.
+
+### System reliability
+- **Lock contention no longer silently misbehaves in the rule engine**: the rules map and the value cache used tokio `try_read` in sync consumers — under trigger-path contention the subscription-index rebuild kept a STALE index (a rule added in that window was silently never evaluated), and the value cache reported metrics as absent (conditions false; `for_duration` accumulation spuriously reset). Both switched to parking_lot with blocking reads of short critical sections.
+- **MQTT eventloops survive handler panics**: a panic in the notification handler (arbitrary device payloads) used to kill the poll task — the adapter stayed "running" but never polled again until restart.
+- **Event-triggered executions count against the global concurrency bound** (they previously held only the per-backend permit, so bursts could stack past the scheduler's global limit).
+- **Conversation-summary fixes**: `clear_history` resets the summary (a ghost summary of the deleted conversation used to be injected into every subsequent turn); summary chains are capped at 4 segments (folded beyond); the context window enforces a hard token budget even for priority-kept system/user messages (oldest non-system messages evicted instead of failing the LLM request).
+- **Two more hot storage reads off the executor**: `query_range_rev` and `aggregate_range` (dashboard desc-order series and chart aggregates) join `write_batch`/`query_range`/`query_agents` on the blocking pool.
+- **Heartbeat monitor can actually be stopped** (its running flag was write-only); the message-cleanup task no longer runs a full scan during startup (first tick consumed); the retention task warns instead of silently no-oping forever when its redb reopens fail.
+
+### Chat/session streaming hardening
+- **One active stream per session**: a second concurrent stream on the same session silently overwrote the first's cancel sender (making it uncancellable) and interleaved history writes into the same session state. A second stream now gets a clear rejection instead.
+- **Fixed a latent permanent deadlock** in `remove_subscriber` (re-acquiring a non-reentrant write lock through the `if let` scrutinee's guard) — would have wedged the subscriber map globally the moment the subscriber feature shipped.
+- **Tool-call detection recovers past leading data arrays**: the detector anchored on the first `[` forever, so any innocuous JSON array before the real tool call (e.g. `trend: [1,2,3]`) made the call stream as visible text and never execute.
+- **Tool-call parsing is string-aware**: `]`/`}` inside string arguments (shell globs like `ls foo[1].txt`, regexes) broke bracket matching and silently swallowed the extracted call.
+- **Stored tool results are base64-sanitized** (previously only the display copy): 4–64KB data URLs stopped flowing verbatim into every subsequent LLM round and into session storage.
+- **Background summarization no longer mutates the global thinking flag** (per-call override; was: user turns could silently run with thinking off, user toggles clobbered, aborts left thinking disabled).
+
+### Correctness & Safety (fresh subsystem sweep)
+- **Chat no longer sends the user message twice per turn**: the text path pushed the current user message into history before streaming AND the LLM layer appended it again — every prompt carried `[…, user(current), user(current)]` (double tokens, back-to-back duplicate user turns). The multimodal path never had this.
+- **Rule `TriggerAgent` no longer blocks all rule processing**: the action awaited the full agent run inline, so one rule with an agent action stalled every other rule's evaluation platform-wide for up to the 5-minute cap. The callback now spawns.
+- **Multimodal chat is cancellable** (image chats' Stop button was dead — zero interrupt checks in the multimodal stream).
+- **MQTT push targets fail honestly**: `send()` discarded the eventloop poll result — deliveries to an unreachable broker were logged Success and never retried, and `client.publish()` awaited channel capacity unboundedly (dead broker → target task wedged → `stop()`/update/delete hung the API). Publish is timeout-bounded and poll errors propagate; all final-flush teardown sites are capped at 30s.
+- **`POST /api/automations/transforms/process` is side-effect free** (it published test output to the live bus, which could fire REAL rules from test data; `/test` already behaved correctly).
+- **Transform template engine**: `render_template` could loop forever on self-referential device data (`{"a": "{{a}}"}`) — the scan cursor now advances past each replacement plus an iteration cap. The engine's fetch clients (used for device-URL → base64) gained 30s/10s timeouts and a 10MB body cap (was: no timeout, unbounded body, SSRF surface).
+- **Automation executions**: the last unbounded-growth table now has 30-day retention; `delete_automation` no longer orphans its execution rows; execution history returns the most recent records instead of a random sample over randomly-ordered keys.
+- **JS transform identifiers sanitized**: extension ids containing a dot (the docs' own `weather.ext` example) produced a JS syntax error that failed the whole transform.
+- **Data-push virtual-metric dedup key includes source_id** (two distinct metrics publishing the same value in the same second no longer collide).
+- **Cron templates are i18n'd** (11 hardcoded Chinese labels showed to English users); dead Chinese-only `getStatusLabel` removed.
+
+### Reliability & Performance
+- **Event-triggered executions are cancellable at shutdown**: they spawned fully detached (the scheduler's `stop()` only aborts scheduled tasks), so event agents kept running through shutdown bounded only by their execution timeout. The executor now registers spawned handles and shutdown aborts them.
+- **Multimodal chat gets the tool-execution heartbeat** (same `select!` fix `stream_core` received): long tool phases no longer look like a dead stream to WS listeners.
+- **The three hottest storage paths no longer block tokio workers**: `write_batch` (every device metric), `query_range` (every dashboard read) and `query_agents` (full scan + sort per call) were `async fn` bodies doing blocking redb I/O with zero awaits — each now runs on the blocking pool via `spawn_blocking` with an `Arc<Database>` clone.
+
+### Platform trust
+- **`data/encryption_key` is now written 0600** (was 0644 via `std::fs::write`, the lone world-readable straggler among secrets — this key encrypts every API key and unlocks the default admin key via auto_auth). Existing 0644 files are chmod-hardened on rewrite.
+- **JWT-secret persistence failures are logged** (were `let _ =`-swallowed; a failed write silently meant session-invalidating secret rotation on the next restart with no trace).
+- Removed the verified-dead `create_capability_services`/`init_capability_providers`.
+- **Logins survive server restarts**: the session-revocation allowlist was an in-memory map rebuilt empty on every boot, so `validate_token` rejected every pre-restart token (`SessionRevoked`) — defeating the persisted JWT secret and logging everyone out on every restart. Sessions now persist to a `user_sessions` table in `users.redb` (write-through on login, delete-through on logout; keys are SHA-256(token) so raw tokens are never written at rest; boot load drops and purges expired rows). Logout stays revoked across restarts.
+- **`/health/ready` tells the truth**: every dependency was hardcoded `true` and `all_ready()` used `||`. Now: `database` = a real redb open+read; `llm` = an active backend configured; `mqtt` = the embedded broker actually running (absent → `false` plus an explanatory note covering external-broker mode vs failed-to-start); `ready = database && llm`, with `notes[]` explaining every unready gate. A full MQTT outage (stale process squatting port 1883) previously stayed invisible to readiness.
+- **Storage `NotFound` maps to 404** (was 500 for every storage variant): the blanket `From<storage::Error>` now maps NotFound → 404 and InvalidInput → 400, fixing paths that returned INTERNAL_ERROR for a plain missing resource.
+- **Extension handlers use the shared `ExtensionStore`**: 19 call sites in the extension handlers opened `ExtensionStore::open("data/extensions.redb")` per request, ~15 of them via `if let Ok(store) = …` — an open failure (corruption / disk full / perms) silently degraded to empty lists or no-op writes with no error anywhere. All sites now use the pre-opened shared `state.extensions.store` (the handle `ExtensionState` has held all along); this also removes the per-request redb open and makes read-modify-write sequences consistent on one handle.
+
+### Docs
+- **Edge model deployment guide** (`docs/edge-models.md`): the measured LFM2.5 dual-model recipe — 2.6B (text) as the active agent backend + VL-3B as a non-active perception backend, with the load-bearing llama.cpp flags (`--jinja` for LFM function calling, `--repeat-penalty 1.0`, 128k context), the vision tool's automatic dedicated-VLM preference, and the `lfm1.0` licensing constraint.
+- **Recommended local models in README**: Gemma 4 E2B (official QAT-Q4_0), Qwen 3.5 4B, LFM 2.5 2.6B — all validated on the bilingual agent eval suite, with llama.cpp as the recommended serving backend (README-wide: Ollama references switched to llama.cpp-first).
+
+### Agent (small-model friendliness + reliability)
+- **Concise `shell` tool description + on-demand command guidance**: the shell description had grown to 6510 chars of per-domain "Command Choice" rules, which suppressed tool *selection* on models at/below the 3B tool-calling floor (they avoided the huge description and grabbed the shorter `skill` tool instead — LFM2.5-VL-3B scored 0% cmd_ok purely from this). The description is now a ~1400-char skeleton; exact subcommand syntax is delivered contextually instead: on a FAILED `heramind <domain> …` dispatch the domain's `--help` subcommand table is appended to the tool result (+8pp cmd_ok on the 30-case regression), and on the FIRST successful dispatch per domain it is appended as a reference for multi-step flows (deterministic, fires only after the model already chose `shell` — no intent-detection overtrigger). The "COMPLETE THE FULL FLOW" directive (multi-step requests need every step) is restored in the skeleton.
+- **`web_fetch` boundary clarified**: external web content (docs, reference, search-result URLs) vs HeraMind platform data which must use `shell` (was grabbed as a wrong tool in 9/118 eval cases).
+- **Heartbeat during tool execution**: the keep-alive heartbeat only fired between stream chunks, so a long single tool execution (extension build/install, async agent-exec waits) emitted no events — WS listeners killed turns the agent would have completed (~13% of LFM2.5-2.6B full-eval cases died this way with an empty error string). The tool batch is now wrapped in a `select!` with an independent 10s heartbeat timer.
+- **Chat stream bound 1200s → 2400s** (`StreamConfig` default + the synced chat safeguards): slow local models (60–90 tok/s) legitimately need 20+ minutes for multi-round deploy scenarios.
+
+### Fixes
+- **Log export no longer ships ANSI color codes**: the CLI and desktop file layers wrote `tracing` SGR escapes (`ESC[2m` / `ESC[32m` / …) into every line of the daily `heramind.log.*` files because `fmt::layer()` defaults `with_ansi` to true (it does no TTY detection, unlike `fmt()`). Both appenders now set `.with_ansi(false)`, and `/api/logs/download` strips residual ANSI sequences from archived files so logs produced by older server builds export as readable plain text too.
+
+### Eval / Test
+- **Time budgets retuned for slow local models**: four eval-side/agent-side limits were each tuned for cloud endpoints and collectively killed every legitimately-slow local run (a 20-round deploy case on a 60–90 tok/s model needs 10–20+ min): WS event gap 240s → 600s; chat outer timeout 900s → env-tunable (`EVAL_CHAT_TIMEOUT`, default 1400); per-case `--case-timeout` for heavyweight cases; deadline-exit now sets a real error instead of propagating `None`.
+- **Turn-failure messages include the exception class**: bare `asyncio.TimeoutError()`-style exceptions `str()` to an empty string, which left `turn failed (…): ` with no diagnosis; the class name identified the hidden per-case SIGALRM limit in one shot.
+
+## [0.9.16] - 2026-08-11
+
+LLM capability detection consolidated to a single track (registry + name heuristic) + unified thinking-effort control + slim prompt for small local models + built-in local AI (Docker llama.cpp).
+Focus: collapse the duplicated capability detection (manual table + CapabilityDetector + audio pipeline) onto the LiteLLM registry as the single source of truth, unify reasoning/effort control across backends, and ship a slim prompt + built-in local AI for edge deployment.
+
+### LLM Capability Detection — Single Track (registry + heuristic)
+- **Removed** the hand-curated manual table (`models.rs`, 72 entries / 865 lines) and `CapabilityDetector` with its heuristic suite (~1300 lines net). Vision / reasoning / max-context now come solely from the LiteLLM registry (2988 entries); audio removed entirely (was informational only — the agent pipeline never emitted audio content parts).
+- **Unified `supports_tools`**: the 4 copies of the "exclude tiny" name heuristic (`llm_backends.rs` ×3 + `ollama.rs`) collapsed into one `detect_tools_capability` — registry `supports_function_calling` first (a field that previously sat unread), name fallback for local/Ollama models.
+- `detect_vision_capability` / `detect_thinking` now call the registry directly (no `CapabilityDetector` wrapper).
+- Storage `BackendCapabilities.supports_audio` dropped (`#[serde(default)]` — legacy redb rows deserialize cleanly, no migration).
+- Fixed flaky `test_config_env_var_parsing_*` (env-var tests serialized via `ENV_LOCK` mutex — parallel pollution surfaced after the removal shifted test scheduling).
+
+### Thinking-Effort Control (unified across backends)
+- Single `ThinkingEffort` enum (none / low / medium / high / xhigh / max) in `GenerationParams`, supersedes the legacy `thinking_enabled` bool.
+- Per-backend translation: Ollama (`think` level), OpenAI / Custom / GLM / Google (`reasoning_effort`), DeepSeek / Anthropic (`thinking` boolean), Qwen (`enable_thinking`), llama.cpp (read-only `reasoning_content`).
+- `ReasoningCapabilities` declaration drives the frontend dropdown — read-only backends show a badge, level/effort backends show the full selector.
+- Frontend: capability panel redesigned as a spec-row layout (was `FormField` rows, read as a "weird half-form"); multimodal switch now syncs to the selected model when editing an existing backend.
+
+### Slim Prompt + Tool Descriptions (for small local models)
+- Slim system prompt is now the default (`HERAMIND_FULL_PROMPT=1` opts back into the verbose one); adds Device Onboarding guidance.
+- Tool descriptions slimmed (image_edit / memory / skill / file_write / file_edit); shell tool gained command-choice disambiguation hints (device read-vs-write, set-vs-check, enable-activate) and sequence directives (read the entity before a write, complete every step of a multi-step flow).
+- ~45% prompt token reduction with no eval regression (verified across the 154-case bilingual sweep using a stable-case yardstick).
+
+### Built-in Local AI (Docker)
+- Docker image now ships llama.cpp + Gemma4-E2B and auto-registers an Ollama-style backend on first boot.
+- Python3 added to the image (agents + python-sidecar extensions).
+
+### Agent Reliability
+- **Local-backend stream idle timeout**: the openai/anthropic streaming read-idle timeout (0.9.15) is extended to llama.cpp and Ollama. A stalled upstream SSE connection (bytes stop, socket open — e.g. llama-server mid-thinking-loop) now force-completes the round instead of blocking `bytes_stream().next()` forever and hanging the turn. Shared `next_bytes_or_end` helper mirrors the agent-layer `next_chunk_or_timeout`.
+
+### Eval / Test
+- 23 en capability-dimension cases + 20 en scenario cases (full bilingual parity with the zh set).
+- Fixed: data-push `targets` collection key in state_query, `latest_telemetry` None crash, telemetry-history expectation, widget-full-lifecycle negative sq.
+- **Regression gate** (`run_eval.py regression`): curated 30-case stable set vs a committed baseline, flagging only confirmed PASS→FAIL regressions; multi-round verdicts absorb the ~7pp run-to-run noise floor; per-case SIGALRM timeout so a wedged agent can't hang the gate.
+- **LLM endpoint pre-flight**: `run`/`regression` probe the agent's LLM backend before the first case — dead server / wrong port / doubly-pathed `/v1` / non-JSON proxy fails fast with a clear message instead of reading as a model-capability regression.
+
+### Web
+- **Chat UI overhaul**: code blocks gain syntax highlighting (rehype-highlight) + copy button + language label (borderless immersed block, slim header); whole-message copy button (desktop hover / mobile always); scroll-to-bottom button; both chat surfaces unified (Sparkles avatar, `--msg-user-bg` token, fade-in-up); body 14px desktop (13px mobile); heading hierarchy + table booktabs + blockquote background + muted list markers; `--background` 0.985 + `--syn-*` dual-theme syntax tokens; Brain thinking icon; tool expand as full-row hover; `web/docs/MARKDOWN_STYLE.md` spec.
+- PWA status-bar color syncs with full-screen dialogs; chat model-select scrollbar hidden; CSS keyframe dedupe + prose consolidation; mostly-hidden aurora background removed.
+
+---
+
+## [0.9.15] - 2026-08-04
+
+Agent streaming reliability (stall hang fixes) + skill matching (description-based) + system-level test layer + eval coverage.
+Focus: fix a class of agent stream hangs that could freeze chat/eval for hours, make skill discovery semantic, and add a deterministic real-server test layer.
+
+### Agent Streaming Reliability (hang fixes — three layers)
+- **Stream consumer timeout**: `stream_core`/`stream_multimodal` LLM `next()` loops now bound each `next()` with `tokio::time::timeout` (`next_chunk_or_timeout`). A zero-chunk upstream stall force-completes the round instead of hanging forever.
+- **Backend read idle timeout**: openai/anthropic streaming `bytes_stream().next()` bounded by a 60s chunk-interval idle timeout — the upstream HTTP read itself can no longer block indefinitely.
+- **Backend header-wait bound**: streaming `send()` (waiting for response headers) bounded by a 30s header timeout via `tokio::time` (NOT reqwest's whole-request `.timeout()`, which would kill long healthy generations).
+- **Hold-back fragment fix**: the no-tool-call round-end now uses the full `buffer`, not a `content_before_tools` fragment left by the JSON-hold-back heuristic (was corrupting responses to `":`).
+- **eval harness**: LLM "Network error: error sending request" now treated as a transient stall and retried (was silently recording empty turns as failures).
+
+### Skill Matching (description-based, agentskills.io)
+- 15 builtin skills now carry an intent-based `description`; `SkillMetadata` + parser support it (1024-char cap).
+- Matcher scores description intent phrases (quoted synonyms + `Includes`/`e.g.` clauses) — semantically-equivalent phrasing ("turn off the pump", "把泵停掉") triggers without a literal keyword.
+- On-demand `skill` tool search is description-driven and surfaces the frontmatter description (was a body-first-line slice). Device-control trigger coverage expanded; preserve user-specified device ID on create.
+
+### System-Level Test Layer (`eval/system/`)
+- New deterministic, LLM-free test layer driving a real `heramind serve`: real MQTT device → telemetry store → live WS event; rule-on-real-mqtt; downlink command delivery; dashboard live binding; offline detection; data-push outbound delivery (local HTTP receiver verifies the payload actually arrives).
+- `TestServer.wait_for_log()` — deterministic adapter/broker readiness gate.
+
+### Eval Coverage
+- Assertion types now include `latest_telemetry` (agent read-back), `push_enabled` (with name fallback), `response_contains` (hard signal for answer content / cross-turn recall), and per-turn `turn_index` assertions.
+- New `device-control` probe cases (zh+en), `deep-memory` 10-turn case exposing small-model recall decay (~8-turn limit on Gemma4-E2B).
+
+### Device/Web
+- Seed built-in device templates via the registry's own storage handle (fixes intermittent "template not found" boot race).
+- Settings dialog mobile header bar aligned to MobilePageHeader.
+
+---
+
+## [0.9.14] - 2026-07-31
+
+IM bridge system (Telegram + Feishu) + OTA release notes + extension log UX.
+Focus: first release of two-way IM (chat-platform) integration — invite-gated
+access, per-platform bridges, persistence, and real-bot debugging lessons.
+
+### IM Bridges (new subsystem)
+- **Two-way IM integration**: HeraMind agents reply on chat platforms.
+  Inbound message → ImRouter → agent → reply. Architecture mirrors openclaw
+  (Gateway + channel adapter); IM is positioned as a lightweight conversation
+  entry + output channel (web chat remains core).
+- **Telegram bridge**: getUpdates long-polling (35s client > 30s window) +
+  sendMessage (4000-char chunking) + getMe → bot username → deep-link QR.
+- **Feishu (飞书) bridge**: hand-written pbbp2 protobuf frame codec (field
+  numbers from larksuite/node-sdk, byte-level verified) + WebSocket
+  long-connection (endpoint/ping/shard-merge/per-frame ack/reconnect) + REST
+  send-message (tenant_access_token single-flight cache). No official Rust
+  SDK → ported from Node SDK (MIT). No deep-link → invite via `/start <token>`.
+- **Invite-gated access**: admin generates invite → user `/start <token>` →
+  atomic consume → allowlist. Bridge boots invite-gated (rejects all until
+  bound). `/start` runs before allowlist + dedup.
+- **Bridge persistence + restart reload**: `im_bridges` redb table; create/
+  delete sync; `start_im_router` reloads persisted bridges on restart (was
+  in-memory only).
+- **IM sessions**: per `(platform, chat_id)` session mapping (redb) + expiry
+  cleanup; Messages → IM Sessions tab.
+
+### IM UX
+- **Settings → IM channels**: all-platform card list (Telegram + Feishu) with
+  configured/not-configured status; bridge CRUD + invite management (QR for
+  Telegram, `/start <token>` hint for Feishu) + allowlist.
+- **Messages → IM Sessions**: session table (chat_id / agent / last-active) +
+  reset; "Configure IM bridge" CTA when no bridge.
+- Per-platform icons (Settings gear for manage; platform-specific tint).
+
+### IM Reliability (real-bot debugging lessons)
+- Removed fixed Chinese "🤔 思考中…" ack (inappropriate for multilingual;
+  replies go straight to result).
+- 10-min agent timeout + English error/timeout reply (was silent hang on
+  LLM stall, e.g. thinking-model runaways).
+- Telegram: api_base normalize + reply() tracing.
+- Feishu: WS endpoint path, domain normalize, REST /open-apis/ prefix,
+  event/reply tracing.
+
+### OTA Updates
+- **Update notes as markdown**: OTA update dialog renders release notes as
+  markdown (was plain text).
+
+### CI
+- **CHANGELOG as release notes**: GitHub release / Discord / OTA now surface
+  CHANGELOG.md sections. Short mode: clean headlines, no truncation.
+
+### Extensions
+- **Stderr capture refactor**: extracted `capture_stderr_loop` (testable) +
+  non-UTF8 byte survival test. Extension details dialog log auto-scroll
+  sticks to bottom only when already there (scrolling up to read history
+  isn't yanked back down on every 3s poll).
+
+## [0.9.13] - 2026-07-30
+
+Skills overhaul + user-configurable system preferences + About resource panel.
+Focus: make small/edge models more reliable at tool use, and expose
+previously-hardcoded operational knobs as user-facing settings.
+
+### Skills System
+- **4 new built-in skills**: `settings-management`, `system-info`,
+  `extension-management`, `widget-management`. Previously these CLI domains
+  had no skill (settings/system) or were buried in 500-line dev guides
+  (extension/widget). Each has a concise command cheat-sheet at the top.
+- **Unified command cheat-sheets** across all 13 management skills — every
+  CLI domain now has a top-of-file table with exact subcommands, so small
+  models see the precise command first instead of prose.
+- Eval impact: settings 0% → 66%; tool-selection wrong-cmd failures reduced
+  across device/rule/agent/message/push/transform/dashboard/connector/llm.
+
+### Agent Loop
+- **Hallucinated tool-name redirect** (chat path): when a weak model emits
+  a full `heramind <command>` as the tool name (e.g. "heramind device list"),
+  the chat path now appends a "use `shell(command=...)`" hint so the model
+  recovers next round instead of looping. Guidance only — no early-stop.
+
+### System Preferences (new)
+- **Agent defaults** (`GET/PUT /api/settings/agent`): `max_rounds` (was
+  const 30), `execution_timeout_secs` (was 300), `tool_concurrency` (was 6),
+  `default_temperature` (was 0.3), `default_top_p` (was 0.7),
+  `default_thinking_enabled`. All configurable via Preferences UI with
+  range-clamped Selects. Priority: env > UI > hardcoded.
+- **Device defaults** (`GET/PUT /api/settings/device`):
+  `default_offline_timeout_secs` (was 300, now **live** via
+  `effective_offline_timeout`) and `auto_onboard_enabled` (was true,
+  applies on restart).
+
+### About Resource Panel
+- **Live system metrics** in the About tab: CPU usage gauge + memory gauge
+  + per-disk usage gauges (deduped macOS APFS duplicates) + network
+  interfaces (IPv4, loopback/virtual filtered) with rx/tx bytes.
+- Polls `/api/stats/system` every 5s (aligned with backend cache).
+- Threshold colors use `info` (blue) mid-tier instead of `warning` (orange).
+- Reusable `UsageGauge` component (parameterized icon/label/sub/right).
+
+### Backend Stats Expansion
+- `/api/stats/system` now returns `cpu_usage` (sysinfo 2-sample),
+  `disks` (per-disk total/used/available), and `networks` (per-interface
+  name/IP/MAC/rx/tx). Flattened to top-level `data.*` for frontend access.
+
+### UI Fixes
+- **Portal dialog click bubbling**: UnifiedFormDialog now stops click
+  propagation on portal content + overlay, preventing dialog taps (✕, Close)
+  from reaching ancestor handlers like table row onRowClick.
+- Card style consistency: Agent + Device preference cards match the standard
+  pattern (icon, space-y-4, SelectTrigger width).
+- About tab: removed redundant instance-manager entry (duplicated TopNav's
+  InstanceSelector).
+
+---
+
+## [0.9.12] - 2026-07-27
+
+Agent hardening + security fixes + data integrity + test infrastructure.
+50+ commits across all subsystems, informed by a systematic audit of
+HeraMind against mainstream agent frameworks (OpenHands, LangGraph,
+smolagents, Letta, Mem0, OpenClaw, Hermes) and a full codebase scan
+(devices, rules, core, API, storage, frontend).
+
+### Agent Loop
+- **StopReason enum** — every loop exit now carries a typed reason
+  (NaturalCompletion / MaxRounds / Stuck / AllDuplicate / LlmError /
+  Cancelled). The journal records it so the agent learns why it stopped.
+- **StuckDetector** (OpenHands-inspired, 5 patterns) — catches repeated
+  action+observation, repeated errors, A-B-A-B ping-pong, monologue loops,
+  and context-overflow loops. Wired into both Loop A (scheduled) and Loop B
+  (chat).
+- **Graceful exit** — removed the `max_rounds += 10` continuation hack;
+  the post-loop Phase 2 summary now synthesizes a final answer at the real
+  round cap.
+- **AllDuplicate break** — when all tool calls are cross-round duplicates
+  and results already exist, breaks to Phase 2 instead of burning rounds.
+- **MockLlmRuntime** (`test-utils` feature) — scripted per-call responses,
+  call recording, usable from integration tests. Closes the gap that forced
+  pure-logic-only testing.
+- **Behavior tests** — deterministic end-to-end loop tests (natural
+  completion, AllDuplicate, max-rounds graceful exit) without a real LLM.
+
+### Security
+- **Logout actually invalidates sessions** — was a no-op (returned 200 but
+  left the token valid for 7 days). Now extracts the bearer token from the
+  Authorization header and calls `logout()`.
+- **Password changes + user deletions persist to redb** — were in-memory
+  only; silently reverted on restart. Deleted admins resurrected from disk.
+- **JWT secret persisted** — was regenerated on every restart (all users
+  logged out). Now: env var > file (`data/.jwt_secret`) > generate + persist.
+- **Extension manifest id path-traversal** — `id: "../../etc/cron.d/x"`
+  could write outside the install dir. Now rejects `..`, `/`, `\`, NUL.
+- **Extension zip-bomb defense** — caps per-file (200MB), total (500MB),
+  and file count (10K) on `.nep` extraction.
+- **Shell policy deny-list** (both loops) — `rm -rf /`, `dd of=/dev/`,
+  `mkfs`, `curl|sh`, fork bomb, destructive `heramind` CLI commands blocked
+  before execution. Code-enforced (not just prompt advisory).
+- **SSRF protection** — instance test endpoint blocks loopback / cloud
+  metadata IPs.
+
+### Data Integrity
+- **Transform non-numeric outputs** — string values (OCR text, labels,
+  decoded payloads) were hashed to a bogus float (`chars().sum() % 10000`)
+  and stored as `MetricValue::Float`, indistinguishable from real readings.
+  Now stored as `MetricValue::String`.
+- **Stubbed Pipeline/Fork/If** — returned `Ok(0.0)` placeholder metrics,
+  silently reporting success. Now return `AutomationError::TransformError`.
+- **Rules `condition_since` persisted** — `for_duration` elapsed accumulation
+  was lost on restart, causing premature/missed triggering. Now persists on
+  every state transition.
+- **Rules cooldown refund** — if ALL actions fail, the cooldown is refunded
+  so the rule retries on the next match instead of waiting the full window.
+
+### Reliability
+- **EventBus HOL blocking fixed** — extension event dispatch used
+  `sender.send().await` sequentially; one slow subscriber stalled all.
+  Now `try_send` (non-blocking, drops on full with warn).
+- **block_in_place panic on Tauri** — extension registration used
+  `block_in_place(Handle::current().block_on(...))` which panics on
+  current-thread runtimes. Now `tokio::spawn` (fire-and-forget).
+- **MemorySnapshot mutable** — agent memory writes were invisible until next
+  session (OnceLock frozen). Now re-reads on each user message.
+- **Scheduler priority** — agent priority field (0-255) was stored but
+  ignored (FIFO scheduling). Now sorted by priority at the concurrency limit.
+- **Webhook rate-limit lock** — write lock + full `retain()` scan on every
+  request. Now: retain only when map >1000 entries; per-entry staleness
+  check for expiry.
+- **Device telemetry routing** — `find_device_by_telemetry_topic` was O(N)
+  linear scan on every MQTT publish. Now O(1) via `topic_index` DashMap
+  with fallback scan (auto-repairs stale entries).
+- **metric_cache sweep** — unbounded growth from phantom devices on
+  long-running edge boxes. Periodic sweep every 5 min drops entries >30 min.
+- **client_id_cache cleanup** — rotating MQTT client_ids leaked forever.
+  Now removed on ClientDisconnected.
+- **Mutex poison recovery** — `device_status_emitter` used
+  `.lock().expect("poisoned")`; now `unwrap_or_else(|e| e.into_inner())`.
+- **Sessions reaper** — expired JWT sessions accumulated in the in-memory
+  HashMap. Now piggyback `retain()` sweep on each login.
+- **Device storage write failures** — `let _ = storage.save_device(...)`
+  silently swallowed errors. Now logs at `error!` level.
+
+### Performance
+- **Regex cached** — `ComparisonOperator::evaluate_str` recompiled regex on
+  every condition evaluation. Now cached via `OnceLock<RwLock<HashMap>>`.
+- **Dashboard `.shallow`** — two large object selectors in VisualDashboard
+  were missing the `shallow` equality fn, causing re-renders on every store
+  mutation.
+- **Prompt cache-friendly** — `{{CURRENT_TIME}}` moved from prompt top to
+  end, so the entire stable prefix is reusable by prefix-caching backends.
+
+### Frontend
+- **Stale API_BASE** — `useExtensionLifecycle` captured `getApiBase()` at
+  module load; remote-instance switch still hit the old backend. Now dynamic.
+- **WS reconnect jitter** — pure `2^n` backoff → multi-tab thundering herd.
+  Now `× (0.5 + Math.random() × 0.5)`.
+- **sessionSlice race** — `loadSessions` didn't set `sessionsLoading: true`
+  at start; `loadMoreSessions` could fire concurrently.
+- **JWT error handling** — removed aggressive `window.location.reload()`;
+  aligned with `events.ts` (disconnect, let 401 interceptor handle redirect).
+- **dataPushSlice dedup** — no loading guard → concurrent double-fetches.
+- **frontendComponentSlice fetching flag** — `shouldFetch` ignored in-flight
+  state → concurrent `fetchInstalled` calls.
+
+### Tool Configuration
+- **`allowed_tools` exposed end-to-end** — `AgentToolConfig` existed in
+  storage and `filter_tools` honored it, but the API hardcoded `None` and
+  the UI didn't expose it → every agent saw all ~12 tools. Now wired
+  through create/update handlers + `AgentDetailDto`.
+- **`enabled` defaults to true** — was a required field (400 on partial
+  payloads); now `#[serde(default = "default_true")]` + honored in
+  `filter_tools` (`enabled: false` → no tools).
+
+### Documentation
+- **CLAUDE.md gotcha #8 corrected** — read-side truncation was 300+800, not
+  "600 total".
+- **Stale MemoryScheduler comment removed** — claimed "periodic extraction"
+  that doesn't exist.
+
+### Pre-release regression sweep
+A full `v0.9.11..HEAD` regression audit (fan-out review + manual verification)
+surfaced and fixed eight issues before tagging:
+- **BMP/TIFF image decode** — the base64 magic-prefix fast-reject whitelisted
+  only JPEG/PNG/GIF/WebP, so BMP/TIFF images were rejected before decode and
+  stored as raw base64 (never rendered). Prefix list now matches
+  `detect_extension`.
+- **Stale telemetry-topic routing** — the `topic_index` reverse-index wasn't
+  invalidated when a device's `telemetry_topic` changed, so orphan messages on
+  an old topic were routed to a device that no longer subscribed. The read path
+  now verifies the device's current topic still matches.
+- **Image retention disk leak** — CLI-materialized images named by content hash
+  had no parseable timestamp, so retention skipped them forever. Falls back to
+  mtime for unparseable filenames.
+- **JWT secret file permissions** — persisted `data/.jwt_secret` was world-
+  readable (0644); now 0600.
+- **delete_user atomicity** — mutated memory before the DB write; on DB failure
+  the user vanished from the list only to resurrect on restart. Now persists DB
+  first (mirrors `change_password`).
+- **Sessions reaper grace** — evicted sessions at `expires_at` with no grace,
+  while JWT validation grants 30s skew; a login-triggered reap could revoke a
+  still-valid token. Now honors the same skew.
+- **Cooldown retry flood** — the all-actions-failed cooldown refund had no
+  backoff, so an Execute-only rule on a high-rate stream re-fired on every data
+  point. Now refunds only on the first consecutive failure (transient failures
+  still retry immediately); repeat failures pace at the cooldown window.
+- **Backend-unavailable overlay UX** — the WebSocket gave up permanently after
+  ~140s when never connected (false-positive on a slow-booting edge box,
+  contradicting the slow-startup patience added earlier) and the overlay
+  flashed on every transient error. Now never gives up (keeps slow-polling) and
+  surfaces never-connected via a `gaveUp` flag.
+
+---
+
 ## [0.9.11] - 2026-07-22
 
 Security hardening + edge (aarch64 / RK3576) readiness + the reliability

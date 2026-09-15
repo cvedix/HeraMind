@@ -16,6 +16,36 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  frontend-checks:
+    name: Frontend lint / typecheck / unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Errors are fatal; the ~1100 pre-existing warnings are tracked for a
+      # dedicated cleanup — tighten to `npm run lint` (--max-warnings 0) once
+      # that lands.
+      - name: Lint (error-level only)
+        run: npm run lint:ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npx vitest run
+
   skill-cli-drift:
     name: Skill ↔ CLI drift check
     runs-on: ubuntu-latest
@@ -72,6 +102,106 @@ jobs:
 
       - name: Run skill tests
         run: "cargo test -p heramind-agent --lib skills::"
+
+  rust-lint:
+    name: Rust fmt / clippy (deny warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: lint-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            lint-${{ runner.os }}-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  rust-tests:
+    name: Rust workspace tests (full)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: tests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            tests-${{ runner.os }}-
+
+      - name: Run all workspace tests
+        # The serve tests run the real binary with HERAMIND_EXIT_AFTER_READY_MS
+        # (graceful exit after startup) + a per-test temp data dir, so they
+        # need no special environment beyond free ports on a fresh runner.
+        run: cargo test --workspace --locked
+
+  desktop-checks:
+    name: Desktop (web/src-tauri) compile check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # web/ is excluded from the root workspace, so `cargo test --workspace`
+      # above never reaches the Tauri app — refactor breakage there (e.g. a
+      # heramind-api re-export rename) only surfaced at release-packaging time.
+      # This job closes that gap with a plain compile check. System deps
+      # mirror build.yml's desktop job (same GLIBC baseline pin to 22.04).
+      - name: Install system dependencies (Ubuntu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev \
+            build-essential \
+            cmake \
+            git \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            xdg-utils \
+            liblzma-dev
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            web/src-tauri/target/
+          key: tauri-check-${{ runner.os }}-${{ hashFiles('web/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            tauri-check-${{ runner.os }}-
+
+      # tauri.conf's frontendDist points at web/dist; plain `cargo check`
+      # never bundles, but create the dir so any build-script probe finds a
+      # well-formed tree.
+      - name: Placeholder frontend dist
+        run: mkdir -p web/dist
+
+      - name: Compile check (locked)
+        working-directory: web/src-tauri
+        run: cargo check --locked
 
   cargo-audit:
     name: Security advisory scan (cargo audit)

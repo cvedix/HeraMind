@@ -5,6 +5,8 @@ export interface Message {
   role: 'user' | 'assistant' | 'system' | 'tool'
   content: string
   timestamp: number
+  /** Reply wall time (first streamed event → end), ms — assistant messages. */
+  generationMs?: number
   thinking?: string // Legacy: combined thinking across all rounds
   tool_calls?: ToolCall[]
   images?: ChatImage[]  // Images sent with user messages (multimodal)
@@ -89,25 +91,6 @@ export interface SessionHistoryResponse {
   count: number
 }
 
-/** Planning mode - how the plan was generated */
-export type PlanningMode = 'keyword' | 'llm'
-
-/** A single step in an execution plan */
-export interface PlanStep {
-  id: number
-  tool_name: string
-  action: string
-  params: Record<string, unknown>
-  depends_on: number[]
-  description: string
-}
-
-/** An execution plan produced by the planner */
-export interface ExecutionPlan {
-  steps: PlanStep[]
-  mode: PlanningMode
-}
-
 // Server WebSocket message types (matching backend)
 //
 // NOTE: These types must match the AgentEvent serialization in crates/agent/src/agent/types.rs
@@ -131,16 +114,8 @@ export type ServerMessage =
   | { type: 'Progress'; elapsed: number; stage?: string; message?: string; remainingTime?: number; sessionId: string }
   // Warning event when approaching timeout
   | { type: 'Warning'; message: string; elapsed?: number; remainingTime?: number; sessionId: string }
-  // Intent classification result (informational, not displayed in current UI)
-  | { type: 'Intent'; category: string; displayName: string; confidence?: number; keywords?: string[]; sessionId: string }
   // Execution plan step (informational, not displayed in current UI)
   | { type: 'Plan'; step: string; stage: string; sessionId: string }
-  // Execution plan created - full plan with all steps
-  | { type: 'ExecutionPlanCreated'; plan: ExecutionPlan; sessionId: string }
-  // A plan step has started executing
-  | { type: 'PlanStepStarted'; stepId: number; description: string; sessionId: string }
-  // A plan step has completed
-  | { type: 'PlanStepCompleted'; stepId: number; success: boolean; summary: string; sessionId: string }
   // Heartbeat to keep connection alive (not displayed)
   | { type: 'Heartbeat'; timestamp: number; sessionId: string }
   // Ping from server - client auto-responds with pong
@@ -148,13 +123,18 @@ export type ServerMessage =
   // Error occurred - sessionId is always included when sent from backend
   | { type: 'Error'; message: string; sessionId: string }
   // Stream ended
-  | { type: 'end'; sessionId: string; tokenUsage?: { promptTokens: number } }
+  | { type: 'end'; sessionId: string; tokenUsage?: {
+      promptTokens: number
+      systemPromptTokens?: number
+      toolTokens?: number
+    } }
+  // Cancel acknowledged (server-side reply to __CANCEL__); no trailing
+  // 'end' is guaranteed on this path, so stream state must reset HERE.
+  | { type: 'cancelled'; message?: string; sessionId?: string }
   // Intermediate end for multi-round tool calling (indicates more content coming)
   | { type: 'intermediate_end'; sessionId: string }
   // Non-streaming response (fallback)
   | { type: 'response'; content: string; sessionId: string; toolsUsed?: string[]; processingTimeMs?: number }
-  // Device status update
-  | { type: 'device_update'; updateType: string; deviceId: string; status?: string; lastSeen?: number }
 
 // Stream configuration types (matching backend StreamConfig)
 export interface StreamConfig {

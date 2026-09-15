@@ -12,9 +12,11 @@ import { Server } from 'lucide-react'
 
 interface InstanceSelectorProps {
   onManageInstances: () => void
+  /** Icon-only square for the sidebar rail (no name/status text) */
+  compact?: boolean
 }
 
-export function InstanceSelector({ onManageInstances }: InstanceSelectorProps) {
+export function InstanceSelector({ onManageInstances, compact = false }: InstanceSelectorProps) {
   const { t } = useTranslation('instances')
   const instances = useStore((s) => s.instances)
   const currentInstanceId = useStore((s) => s.currentInstanceId)
@@ -28,29 +30,45 @@ export function InstanceSelector({ onManageInstances }: InstanceSelectorProps) {
 
   const currentInstance = instances.find((i) => i.id === currentInstanceId)
   const isSwitching = switchingState === 'switching'
-  // Remote instances: rely solely on wsConnected (last_status is from cache, may be stale)
-  // Local instance: check both wsConnected and last_status
-  const isOnline = isConnected && (!currentInstance || currentInstance.is_local ? (currentInstance?.last_status === 'online' || !currentInstance) : true)
+  // Liveness = the WebSocket to the current backend. last_status is a legacy
+  // field (defaults to "unknown", no health loop refreshes it) — gating on it
+  // made the local instance permanently red while the dialog showed it green.
+  const isOnline = isConnected
 
   return (
     <button
       disabled={isSwitching}
       onClick={onManageInstances}
       className={cn(
-        "flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors",
-        "cursor-pointer hover:opacity-80 disabled:opacity-50",
+        "rounded-lg text-sm font-medium transition-colors cursor-pointer hover:opacity-80 disabled:opacity-50",
+        compact
+          ? "flex items-center justify-center h-10 w-10"
+          // Expanded: full-width row matching the other sidebar footer rows
+          // (w-full h-10 px-3 text-sm) so the rail doesn't reflow per
+          // instance-name length; name truncates, status shows as a dot.
+          : "w-full flex items-center px-3 h-10",
         isOnline
-          ? "bg-success-light text-success border border-success-light"
-          : "text-error bg-muted"
+          ? cn("bg-success-light text-success", !compact && "border border-success-light")
+          : cn("bg-error-light text-error", !compact && "border border-error-light")
       )}
     >
-      <Server className="h-4 w-4 shrink-0" />
-      <span className="hidden sm:inline max-w-[120px] truncate">
-        {currentInstance?.name || t('local')}
-      </span>
-      <span className="sm:hidden">
-        {isOnline ? t('status.online') : t('status.offline')}
-      </span>
+      <div className="relative shrink-0">
+        <Server className="h-5 w-5" />
+        {/* Status dot on the icon's top-right corner — same anchor as the
+            Setup Guide badge, so both markers align across rows. */}
+        <span
+          className={cn(
+            'absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full ring-2 ring-background',
+            isOnline ? 'bg-success' : 'bg-error'
+          )}
+          aria-label={isOnline ? t('status.online') : t('status.offline')}
+        />
+      </div>
+      {!compact && (
+        <span className="ml-3 flex-1 min-w-0 truncate text-left">
+          {currentInstance?.name || t('local')}
+        </span>
+      )}
     </button>
   )
 }

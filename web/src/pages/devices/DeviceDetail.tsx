@@ -401,19 +401,30 @@ export function DeviceDetail({
 
   return (
     <>
-      <div className="flex flex-col flex-1 h-full overflow-hidden bg-gradient-to-b from-background to-muted">
-        {/* Header */}
-        <div className={cn("flex items-center justify-between shrink-0 gap-2", isMobile ? "px-3 py-3" : "px-6 py-5")}>
+      <div className="flex flex-col flex-1 h-full overflow-hidden bg-background">
+        {/* Header — relative z-20: sits above the app's window-drag strip
+            (z-10, top 56px) so the back/edit/delete buttons stay clickable.
+            Top padding adds the traffic-light / safe-area clearance (the
+            detail view is full-bleed with no page title row). */}
+        <div
+          className={cn("relative z-[15] flex items-center justify-between shrink-0 gap-2", isMobile ? "px-3 py-3" : "px-4 sm:px-6 md:px-8 py-5")}
+          style={{ paddingTop: "calc(env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px) + 2.75rem)" }}
+        >
           <div className="flex items-center gap-3 min-w-0 flex-1">
-            <Button variant="ghost" size="icon" onClick={onBack} className="rounded-full shrink-0 hidden md:inline-flex">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={onBack}
+              className="rounded-full shrink-0 bg-background hidden md:inline-flex"
+            >
               <ChevronLeft className="h-5 w-5" />
             </Button>
             <div className="flex items-center gap-2 sm:gap-3 min-w-0">
               <div className={cn(
                 "w-10 h-10 sm:w-12 sm:h-12 rounded-xl flex items-center justify-center shrink-0",
                 device.status === 'online'
-                  ? "bg-gradient-to-br from-success-light to-accent-emerald-light"
-                  : "bg-gradient-to-br from-card to-muted"
+                  ? "bg-success-light text-success"
+                  : "bg-muted text-muted-foreground"
               )}>
                 <Zap className={cn(
                   "h-5 w-5 sm:h-6 sm:w-6",
@@ -438,7 +449,7 @@ export function DeviceDetail({
           <div className="max-w-6xl mx-auto space-y-5">
 
             {/* Device Info Card */}
-            <div className={cn("bg-gradient-to-br from-card to-muted rounded-lg shadow-sm", isMobile ? "p-4" : "p-6")}>
+            <div className={cn("bg-card border border-border rounded-lg shadow-sm", isMobile ? "p-4" : "p-6")}>
               <div className="flex items-center gap-2 mb-3 sm:mb-4">
                 <Info className="h-5 w-5 text-muted-foreground" />
                 <h2 className="font-semibold">{t('devices:detailPage.deviceInfo')}</h2>
@@ -541,7 +552,7 @@ export function DeviceDetail({
 
             {/* Raw Data Section - for Simple Mode devices */}
             {deviceType?.mode === 'simple' && (
-              <div className={cn("bg-gradient-to-br from-card to-muted rounded-lg shadow-sm", isMobile ? "p-4" : "p-6")}>
+              <div className={cn("bg-card border border-border rounded-lg shadow-sm", isMobile ? "p-4" : "p-6")}>
                 <div className="flex items-center gap-2 mb-3 sm:mb-4">
                   <Database className="h-5 w-5 text-muted-foreground" />
                   <h2 className="font-semibold">{t('devices:detailPage.rawDataTitle')}</h2>
@@ -598,11 +609,11 @@ export function DeviceDetail({
                         key={metricDef.name}
                         onClick={() => handleMetricCardClick(metricDef.name)}
                         className={cn(
-                          "group rounded-lg text-left transition-all duration-200 hover:shadow-md",
+                          "group rounded-lg text-left shadow-sm transition-all duration-normal hover:shadow-md",
                           isMobile ? "p-3 active:scale-[0.99]" : "p-6 hover:scale-[1.02]",
                           isVirtual
-                            ? "bg-gradient-to-br from-accent-purple-light to-blue-500/5 border-accent-purple-light hover:border-accent-purple"
-                            : "bg-gradient-to-br from-card to-muted border-border hover:border-border"
+                            ? "bg-muted border-border hover:border-border"
+                            : "bg-card border-border hover:border-border"
                         )}
                       >
                         <div className="flex items-start justify-between">
@@ -653,7 +664,7 @@ export function DeviceDetail({
                       key={cmd.name}
                       onClick={() => handleCommandClick(cmd)}
                       className={cn(
-                        "group bg-gradient-to-br from-card to-muted rounded-lg text-left transition-all duration-200 hover:shadow-md border border-border hover:border-border",
+                        "group bg-card rounded-lg text-left transition-all duration-normal hover:shadow-md border border-border hover:border-border",
                         isMobile ? "p-3 active:scale-[0.99]" : "p-6 hover:scale-[1.02]"
                       )}
                     >

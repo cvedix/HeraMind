@@ -235,11 +235,15 @@ export function UnifiedFormDialog({
     return createPortal(
       open ? (
         <div
-          className={cn("fixed inset-0 animate-in fade-in duration-200", overlayZIndex)}
+          className={cn("fixed inset-0 animate-in fade-in duration-normal", overlayZIndex)}
           // Use opaque --chrome (matches MobilePageHeader) instead of
           // bg-background which has /97% alpha in dark mode and lets the
           // previous layer bleed through, creating a visible color split.
           style={{ backgroundColor: 'var(--chrome)' }}
+          // Portal content bubbles through the React tree (not the DOM tree).
+          // Without this, every tap inside the dialog — including the close
+          // button — reaches ancestor handlers like a table row's onRowClick.
+          onClick={(e) => e.stopPropagation()}
         >
           <div className="flex h-full w-full flex-col">
             {/* Header */}
@@ -327,8 +331,8 @@ export function UnifiedFormDialog({
       {/* Backdrop */}
       {open && (
         <div
-          className={cn("fixed inset-0 bg-overlay-heavy backdrop-blur-sm animate-in fade-in duration-200", overlayZIndex)}
-          onClick={() => !isDisabled && handleClose()}
+          className={cn("fixed inset-0 bg-overlay-heavy backdrop-blur-sm animate-in fade-in duration-normal", overlayZIndex)}
+          onClick={(e) => { e.stopPropagation(); if (!isDisabled) handleClose() }}
         />
       )}
 
@@ -340,7 +344,7 @@ export function UnifiedFormDialog({
             dialogZIndex,
             'grid w-full gap-0',
             'bg-popover border shadow-lg',
-            'duration-200',
+            'duration-normal',
             'animate-in fade-in zoom-in-95 slide-in-from-left-1/2 slide-in-from-top-[48%]',
             'rounded-lg sm:rounded-xl',
             'overflow-hidden',
@@ -351,12 +355,24 @@ export function UnifiedFormDialog({
             className
           )}
           style={{ maxHeight: '85vh' }}
+          // Portal content bubbles through the React tree. Stop clicks (incl.
+          // the header ✕ and footer Close) from reaching ancestor handlers
+          // such as a table row's onRowClick.
+          onClick={(e) => e.stopPropagation()}
         >
           {/* Header */}
           <div className="flex items-center justify-between gap-2 px-6 py-4 border-b shrink-0">
             <div className="flex items-center gap-2 flex-1 min-w-0">
               {icon && <span className="text-muted-foreground shrink-0">{icon}</span>}
-              <h2 className="text-lg font-semibold leading-none truncate">{title}</h2>
+              <div className="min-w-0 flex-1">
+                <h2 className="text-lg font-semibold leading-none truncate">{title}</h2>
+                {/* Desktop used to drop the description entirely (only the
+                    mobile branch rendered it) — confirm dialogs that put
+                    their whole message here showed an empty body. */}
+                {description && (
+                  <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{description}</p>
+                )}
+              </div>
             </div>
             <button
               onClick={handleClose}

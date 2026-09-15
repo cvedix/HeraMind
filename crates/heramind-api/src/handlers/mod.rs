@@ -1,6 +1,7 @@
 //! API handlers organized by domain.
 
 pub mod agents;
+pub mod api_docs;
 pub mod auth;
 pub mod auth_users;
 pub mod automations;
@@ -16,6 +17,7 @@ pub mod events;
 pub mod extension_stream;
 pub mod extensions;
 pub mod frontend_components;
+pub mod im_bridges;
 pub mod images;
 pub mod instances;
 pub mod llm_backends;
@@ -25,6 +27,7 @@ pub mod message_channels;
 pub mod messages;
 pub mod mqtt;
 pub mod onboarding;
+pub mod openapi;
 pub mod rules;
 pub mod sessions;
 pub mod settings;
@@ -33,6 +36,7 @@ pub mod skills;
 pub mod stats;
 pub mod suggestions;
 pub mod summarization;
+pub mod system;
 pub mod tools;
 pub mod ws;
 
@@ -42,14 +46,12 @@ pub use crate::server::ServerState;
 // Re-export commonly used handler functions
 pub use basic::health_handler;
 pub use devices::{
-    add_device_handler, aggregate_metric_handler, analyze_metric_timestamps_handler,
-    delete_device_handler, delete_device_type_handler, generate_mdl_handler,
-    get_device_command_history_handler, get_device_handler, get_device_telemetry_handler,
-    get_device_telemetry_summary_handler, get_device_type_handler,
-    import_cloud_device_types_handler, list_cloud_device_types_handler,
+    add_device_handler, analyze_metric_timestamps_handler, delete_device_handler,
+    delete_device_type_handler, generate_mdl_handler, get_device_command_history_handler,
+    get_device_handler, get_device_telemetry_handler, get_device_telemetry_summary_handler,
+    get_device_type_handler, import_cloud_device_types_handler, list_cloud_device_types_handler,
     list_device_metrics_debug_handler, list_device_types_handler, list_devices_handler,
-    query_metric_handler, read_metric_handler, register_device_type_handler, send_command_handler,
-    validate_device_type_handler,
+    register_device_type_handler, send_command_handler, validate_device_type_handler,
 };
 pub use events::{event_stream_handler, event_websocket_handler};
 pub use rules::{create_rule_handler, list_rules_handler};

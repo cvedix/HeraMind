@@ -260,7 +260,14 @@
     "add": "Thêm",
     "loadingDashboard": "Đang tải trang tổng quan...",
     "device": "Thiết bị",
-    "command": "Lệnh"
+    "command": "Lệnh",
+    "duplicated": "Đã nhân bản dashboard",
+    "duplicateFailed": "Không thể nhân bản dashboard",
+    "emptyGuideDesc": "Tạo màn hình giám sát trực tiếp từ các widget — biểu đồ, đồng hồ, bản đồ — sử dụng dữ liệu thiết bị.",
+    "emptyAskAi": "Nhờ AI tạo dashboard",
+    "emptyStep1": "Tạo dashboard",
+    "emptyStep2": "Thêm widget",
+    "emptyStep3": "Liên kết dữ liệu thiết bị"
   },
   "mobileEditBar": {
     "component": "thành phần",
@@ -452,7 +459,28 @@
     "contextWindow": "Kích thước cửa sổ ngữ cảnh",
     "selectModel": "Mô hình phân tích",
     "selectModelPlaceholder": "Chọn mô hình phân tích",
-    "noModels": "Không có mô hình phân tích nào"
+    "noModels": "Không có mô hình phân tích nào",
+    "contextWindowHelp": "Số cặp dữ liệu và phản hồi gần nhất hiển thị trên dòng thời gian",
+    "configTitle": "Cấu hình phân tích AI",
+    "dataSource": "Nguồn dữ liệu",
+    "dataSourceNotSet": "Chưa cấu hình (mở cài đặt thành phần)",
+    "loadingModels": "Đang tải mô hình...",
+    "noLlmBackends": "Chưa có backend LLM. Hãy cấu hình backend trước.",
+    "autoDefault": "Tự động (mặc định)",
+    "emptyState": "Cấu hình nguồn dữ liệu để bắt đầu",
+    "defaultTitle": "Phân tích AI",
+    "analyzing": "Đang phân tích",
+    "live": "Trực tiếp",
+    "offline": "Ngoại tuyến",
+    "messagesCount": "{{count}} tin nhắn",
+    "avgDuration": "Trung bình {{count}} giây",
+    "settingsAriaLabel": "Cài đặt phân tích",
+    "retry": "Thử lại",
+    "noActivity": "Chưa có hoạt động",
+    "dataSourceFallback": "Nguồn dữ liệu",
+    "aiFallback": "AI",
+    "user": "Người dùng",
+    "waitingForResponse": "Đang chờ phản hồi..."
   },
   "ledIndicator": {
     "on": "Bật",
@@ -692,7 +720,8 @@
     "commandSetValue": "Đặt giá trị",
     "boundTo": "Liên kết với {{source}}",
     "selectMetrics": "Chọn chỉ số",
-    "selectCommands": "Chọn lệnh"
+    "selectCommands": "Chọn lệnh",
+    "deviceRemoved": "Thiết bị đã liên kết không còn tồn tại"
   },
   "systemDataSource": {
     "title": "Hệ thống",
@@ -940,7 +969,23 @@
     "preview": "Xem trước",
     "installConfirm": "Xác nhận cài đặt",
     "uninstallConfirm": "Bạn có chắc chắn muốn gỡ cài đặt thành phần này không?",
-    "by": "bởi"
+    "by": "bởi",
+    "tabExtensions": "Tiện ích mở rộng",
+    "extensionsEmptyTitle": "Chưa có thành phần từ tiện ích",
+    "extensionsEmptyDesc": "Cài tiện ích có cung cấp thành phần giao diện; chúng sẽ xuất hiện ở đây theo danh mục đã khai báo",
+    "tabCustom": "Tùy chỉnh",
+    "customEmptyTitle": "Chưa có thành phần tùy chỉnh",
+    "customEmptyDesc": "Nhập gói .zip (tải lên hoặc dùng đường dẫn máy chủ); thành phần đã cài sẽ xuất hiện ở đây để thêm vào dashboard",
+    "refreshMarket": "Làm mới kho",
+    "all": "Tất cả",
+    "importTypeUpload": "Tải ZIP lên",
+    "importTypeServerPath": "Đường dẫn máy chủ",
+    "dropOrSelect": "Kéo tệp .zip vào đây hoặc nhấn để chọn",
+    "dropHere": "Thả để sử dụng tệp này",
+    "replaceFileHint": "Nhấn hoặc thả tệp để thay thế",
+    "invalidZipType": "Vui lòng chọn tệp .zip",
+    "serverPathPlaceholder": "components/my-widget.zip",
+    "serverPathHint": "Dành cho gói đã có trên máy chủ (ví dụ chép qua scp/USB). Đường dẫn phải nằm trong thư mục dữ liệu máy chủ, có thể là đường dẫn tương đối hoặc tuyệt đối."
   },
   "common": {
     "cancel": "Hủy bỏ",
@@ -1074,7 +1119,9 @@
     "switchToTabs": "Chuyển sang thanh tab",
     "moveUp": "Di chuyển lên",
     "moveDown": "Di chuyển xuống",
-    "dragHint": "Kéo để sắp xếp lại"
+    "dragHint": "Kéo để sắp xếp lại",
+    "moreActions": "Thao tác khác",
+    "duplicateDashboard": "Nhân bản"
   },
   "tabBar": {
     "newDashboard": "Trang tổng quan mới",
@@ -1248,5 +1295,15 @@
     "showFilters": "Hiển thị bộ lọc",
     "showImage": "Hiển thị ảnh event"
   },
-  "installConfirm": "Xác nhận cài đặt"
+  "installConfirm": "Xác nhận cài đặt",
+  "bindingDeviceRemoved": "Thiết bị đã liên kết bị xóa",
+  "bindingDeviceRemovedHint": "Liên kết lại thành phần này với thiết bị hiện có",
+  "staleData": "Giá trị cuối — thiết bị ngoại tuyến",
+  "staleDataIdle": "Giá trị cuối — đang chờ dữ liệu",
+  "staleDataLastSeen": "Báo cáo gần nhất {{age}}",
+  "staleDataDevices": "Thiết bị: {{names}}",
+  "renderer": {
+    "componentUnavailable": "Thành phần không khả dụng",
+    "componentUnavailableHint": "Tiện ích cung cấp thành phần này chưa chạy; thành phần sẽ xuất hiện lại khi tiện ích hoạt động"
+  }
 }

@@ -201,8 +201,26 @@ macro_rules! heramind_export_with_constructor {
                         handle.block_on(async { future.await.map_err(|e| e.to_string()) })
                     }),
                     Err(_) => {
-                        let runtime = tokio::runtime::Runtime::new()
-                            .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+                        // FFI threads have no tokio context. Building a fresh
+                        // multi-thread Runtime PER CALL (the old behavior)
+                        // cost milliseconds of setup plus CPU-count worker
+                        // threads created and torn down for every
+                        // execute_command/produce_metrics — the single biggest
+                        // fixed tax on extension calls. Cache one shared
+                        // runtime per process instead (2 workers: enough to
+                        // drive IO futures and spawned tasks without paying
+                        // CPU-count threads).
+                        static CACHED_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+                            std::sync::OnceLock::new();
+                        let runtime = CACHED_RUNTIME.get_or_init(|| {
+                            tokio::runtime::Builder::new_multi_thread()
+                                .worker_threads(2)
+                                .enable_all()
+                                .build()
+                                .unwrap_or_else(|e| {
+                                    panic!("failed to build cached tokio runtime: {e}")
+                                })
+                        });
                         runtime.block_on(async { future.await.map_err(|e| e.to_string()) })
                     }
                 }
@@ -573,6 +591,20 @@ macro_rules! heramind_export_with_constructor {
                 writer: $crate::PushOutputWriterFn,
             ) -> i32 {
                 $crate::set_push_output_writer(writer);
+                0
+            }
+
+            /// Raw (zero-serialization) variant — runners that support it
+            /// resolve this OPTIONAL export and register a
+            /// PushOutputRawWriterFn; the SDK's send_push_output then
+            /// bypasses JSON/base64 entirely. Old runners never look this
+            /// symbol up; new runners treat its absence as "legacy
+            /// extension, use the JSON path".
+            #[no_mangle]
+            pub extern "C" fn heramind_extension_register_push_writer_raw(
+                writer: $crate::PushOutputRawWriterFn,
+            ) -> i32 {
+                $crate::set_push_output_writer_raw(writer);
                 0
             }
         }
