@@ -42,6 +42,8 @@ use crate::extension::types::ExtensionError;
 
 /// Extension package format identifier
 pub const PACKAGE_FORMAT: &str = "heramind-extension-package";
+/// Official NeoMind marketplace packages share the same archive and ABI contract.
+const NEOMIND_PACKAGE_FORMAT: &str = "neomind-extension-package";
 /// Current supported ABI version (determines package format compatibility)
 /// This single version number controls:
 /// - Package format compatibility
@@ -451,10 +453,13 @@ impl ExtensionPackage {
 
     /// Validate the manifest
     fn validate_manifest(manifest: &ExtensionPackageManifest) -> Result<(), PackageError> {
-        if manifest.format != PACKAGE_FORMAT {
+        if !matches!(
+            manifest.format.as_str(),
+            PACKAGE_FORMAT | NEOMIND_PACKAGE_FORMAT
+        ) {
             return Err(PackageError::InvalidFormat(format!(
-                "Expected format '{}', got '{}'",
-                PACKAGE_FORMAT, manifest.format
+                "Expected format '{}' or '{}', got '{}'",
+                PACKAGE_FORMAT, NEOMIND_PACKAGE_FORMAT, manifest.format
             )));
         }
 
@@ -1788,6 +1793,10 @@ mod tests {
     /// Build a minimal valid .nep (in-memory) for the current platform, so
     /// install tests don't depend on a real extension package.
     fn build_test_nep() -> Vec<u8> {
+        build_test_nep_with_manifest(PACKAGE_FORMAT, CURRENT_ABI_VERSION, "test-install-file")
+    }
+
+    fn build_test_nep_with_manifest(format: &str, abi_version: u32, id: &str) -> Vec<u8> {
         use std::io::Write;
         let platform = detect_platform();
         let lib_ext = if platform.starts_with("windows") {
@@ -1798,10 +1807,16 @@ mod tests {
             "so"
         };
         let binary_entry = format!("binaries/{}/extension.{}", platform, lib_ext);
-        let manifest = format!(
-            r#"{{"format":"heramind-extension-package","abi_version":3,"id":"test-install-file","name":"Test","version":"9.9.9","binaries":{{"{}":"{}"}},"type":"native"}}"#,
-            platform, binary_entry
-        );
+        let manifest = serde_json::json!({
+            "format": format,
+            "abi_version": abi_version,
+            "id": id,
+            "name": "Test",
+            "version": "9.9.9",
+            "binaries": {platform: binary_entry},
+            "type": "native"
+        })
+        .to_string();
         let buf = std::io::Cursor::new(Vec::new());
         let mut zw = zip::ZipWriter::new(buf);
         let opts = zip::write::SimpleFileOptions::default();
@@ -1810,6 +1825,78 @@ mod tests {
         zw.start_file(&binary_entry, opts).unwrap();
         zw.write_all(b"fake binary").unwrap();
         zw.finish().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn test_supported_package_formats_load_and_install() {
+        let root = std::env::temp_dir().join(format!(
+            "heramind-package-formats-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = scopeguard::guard(root, |path| {
+            let _ = std::fs::remove_dir_all(path);
+        });
+
+        for (index, format) in [PACKAGE_FORMAT, NEOMIND_PACKAGE_FORMAT].iter().enumerate() {
+            let data = build_test_nep_with_manifest(format, CURRENT_ABI_VERSION, "test-formats");
+            let path = root.join(format!("{index}.nep"));
+            std::fs::write(&path, &data).unwrap();
+
+            let from_bytes = ExtensionPackage::from_bytes(data.clone()).unwrap();
+            let from_file = ExtensionPackage::load(&path).await.unwrap();
+            assert_eq!(from_bytes.manifest.format, *format);
+            assert_eq!(from_file.manifest.format, *format);
+            assert_eq!(from_bytes.checksum, from_file.checksum);
+
+            for result in [
+                ExtensionPackage::install_sync(&data, &root.join(format!("{index}-bytes"))),
+                ExtensionPackage::install_from_file(&path, &root.join(format!("{index}-file"))),
+            ] {
+                let installed = result.unwrap();
+                assert_eq!(installed.extension_id, "test-formats");
+                assert_eq!(
+                    std::fs::read(installed.binary_path).unwrap(),
+                    b"fake binary"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_unknown_package_formats_are_rejected() {
+        for format in [
+            "",
+            "other-extension-package",
+            "neomind-extension-package-v2",
+        ] {
+            let data = build_test_nep_with_manifest(format, CURRENT_ABI_VERSION, "test-format");
+            assert!(matches!(
+                ExtensionPackage::from_bytes(data),
+                Err(PackageError::InvalidFormat(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_neomind_packages_keep_abi_and_id_validation() {
+        for abi_version in [MIN_ABI_VERSION - 1, CURRENT_ABI_VERSION + 1] {
+            let data =
+                build_test_nep_with_manifest(NEOMIND_PACKAGE_FORMAT, abi_version, "test-abi");
+            assert!(matches!(
+                ExtensionPackage::from_bytes(data),
+                Err(PackageError::IncompatibleVersion { .. })
+            ));
+        }
+        for id in ["", "../escape", "/absolute", "nested/name", "nested\\name"] {
+            let data =
+                build_test_nep_with_manifest(NEOMIND_PACKAGE_FORMAT, CURRENT_ABI_VERSION, id);
+            assert!(matches!(
+                ExtensionPackage::from_bytes(data),
+                Err(PackageError::InvalidManifest(_))
+            ));
+        }
     }
 
     #[test]
