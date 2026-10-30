@@ -172,6 +172,10 @@ pub struct ConnectionTestResult {
     /// Error message if failed
     pub error: Option<String>,
 
+    /// Text returned by the model for the connection probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+
     /// Test timestamp
     pub tested_at: i64,
 }
@@ -183,6 +187,7 @@ impl ConnectionTestResult {
             success: true,
             latency_ms: Some(latency_ms),
             error: None,
+            response: None,
             tested_at: Utc::now().timestamp(),
         }
     }
@@ -193,6 +198,7 @@ impl ConnectionTestResult {
             success: false,
             latency_ms: None,
             error: Some(error),
+            response: None,
             tested_at: Utc::now().timestamp(),
         }
     }

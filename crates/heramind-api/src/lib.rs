@@ -2,6 +2,7 @@
 //!
 //! This crate provides the HTTP/WebSocket API server for the Edge AI Agent system.
 
+pub mod agentrouter_service;
 pub mod auth;
 pub mod auth_users;
 pub mod automation;

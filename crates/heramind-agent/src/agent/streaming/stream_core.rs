@@ -893,7 +893,9 @@ pub async fn process_stream_events_with_safeguards(
                                     partial_content.len(), thinking_content.len());
                             }
                         }
-                        break;
+                        // The error has already been surfaced. Do not turn a
+                        // rejected request into an empty-content recovery call.
+                        break 'multi_round_loop;
                     }
                 }
             }
@@ -1591,18 +1593,14 @@ pub async fn process_stream_events_with_safeguards(
                     };
                     drop(state_guard);
 
-                    // Get original user message from the first message in history
-                    let retry_user_msg = retry_history.iter()
-                        .find(|m| m.role == heramind_core::MessageRole::User)
-                        .map(|m| m.content.as_text())
-                        .unwrap_or_default();
-
-                    let retry_prompt = if retry_user_msg.is_empty() {
+                    // Retry the current turn, not the oldest user message in
+                    // the compacted history (which may be an earlier greeting).
+                    let retry_prompt = if user_message.is_empty() {
                         "Please provide a response.".to_string()
                     } else {
                         format!(
                             "Please respond to the user's message directly and concisely.\n\nUser: {}",
-                            retry_user_msg
+                            user_message
                         )
                     };
 
@@ -1626,7 +1624,8 @@ pub async fn process_stream_events_with_safeguards(
                                     }
                                     Err(e) => {
                                         tracing::error!("Retry stream error: {}", e);
-                                        break;
+                                        yield AgentEvent::error(format!("Stream error: {}", e));
+                                        break 'multi_round_loop;
                                     }
                                 }
                             }

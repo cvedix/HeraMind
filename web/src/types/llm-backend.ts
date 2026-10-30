@@ -166,6 +166,23 @@ export interface BackendTestResult {
   success: boolean
   latency_ms?: number
   error?: string
+  response?: string
+}
+
+export interface AgentRouterServiceStatus {
+  supported: boolean
+  installed: boolean
+  running: boolean
+  managed: boolean
+  enabled: boolean
+  configured: boolean
+  model: string
+  protocol: 'openai-responses' | 'openai-completions' | 'anthropic-messages'
+  backend_id?: string | null
+  endpoint: string
+  node_version: string
+  openclaw_version: string
+  progress: { busy: boolean; phase: string; error?: string | null }
 }
 
 export interface LlmBackendStats {

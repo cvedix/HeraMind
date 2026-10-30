@@ -1,0 +1,44 @@
+{
+  "models": {
+    "mode": "replace",
+    "providers": {
+      "agentrouter": {
+        "baseUrl": "https://agentrouter.org/v1",
+        "api": "openai-responses",
+        "apiKey": {
+          "source": "env",
+          "provider": "default",
+          "id": "HERAMIND_AGENTROUTER_KEY"
+        },
+        "models": [{
+          "id": "gpt-6.1-sol",
+          "name": "GPT-6.1 Sol",
+          "contextWindow": 128000,
+          "maxTokens": 4096,
+          "input": ["text"],
+          "reasoning": false
+        }]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "agentrouter/gpt-6.1-sol" },
+      "workspace": "${HERAMIND_AGENTROUTER_WORKSPACE}",
+      "contextInjection": "never",
+      "skipBootstrap": true,
+      "heartbeat": { "every": "0m" }
+    }
+  },
+  "tools": { "profile": "minimal", "deny": ["*"] },
+  "plugins": { "enabled": false },
+  "secrets": { "providers": { "default": { "source": "env" } } },
+  "discovery": { "mdns": { "mode": "off" } },
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback",
+    "port": 19376,
+    "auth": { "mode": "token", "token": "${HERAMIND_OPENCLAW_GATEWAY_TOKEN}" },
+    "http": { "endpoints": { "chatCompletions": { "enabled": true } } }
+  }
+}

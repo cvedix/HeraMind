@@ -7,6 +7,7 @@ pub mod auth_users;
 pub mod automations;
 pub mod basic;
 pub mod capabilities;
+pub mod cloud_models;
 pub mod common;
 pub mod config;
 pub mod dashboards;

@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use dashmap::DashMap;
-use heramind_core::llm::backend::{LlmError, LlmInput, LlmRuntime};
+use heramind_core::llm::backend::{FinishReason, LlmError, LlmInput, LlmOutput, LlmRuntime};
 use heramind_core::llm::detect_vision_capability;
 use heramind_storage::{ConnectionTestResult, LlmBackendInstance, LlmBackendStore, LlmBackendType};
 
@@ -16,6 +16,26 @@ use super::backends::create_backend;
 #[cfg(feature = "llamacpp")]
 use super::backends::llamacpp::{LlamaCppConfig, LlamaCppRuntime};
 use super::backends::ollama::{detect_model_context, OllamaConfig, OllamaRuntime};
+
+fn generation_test_result(output: LlmOutput, latency_ms: u64) -> ConnectionTestResult {
+    if matches!(
+        output.finish_reason,
+        FinishReason::Error | FinishReason::ContentFilter
+    ) {
+        return ConnectionTestResult::failed(
+            "The model could not complete the test response".into(),
+        );
+    }
+    if output.text.trim().is_empty() {
+        return ConnectionTestResult::failed(
+            "The model returned no text response. Check the model and its generation settings."
+                .into(),
+        );
+    }
+    let mut result = ConnectionTestResult::success(latency_ms);
+    result.response = Some(output.text.chars().take(2048).collect());
+    result
+}
 
 /// Ensure an instance has correct capabilities.
 ///
@@ -672,27 +692,20 @@ impl LlmBackendInstanceManager {
         // Try to create runtime and test with a simple request
         match self.create_runtime(&instance).await {
             Ok(runtime) => {
-                // Test with a minimal input using the new() helper
-                let test_input = LlmInput::new("OK");
+                // A short, real generation verifies more than an HTTP connection.
+                let mut test_input = LlmInput::new("Reply with only the word OK.");
+                test_input.params.max_tokens = Some(256);
+                test_input.params.thinking_enabled = Some(false);
 
-                match runtime.generate(test_input).await {
-                    Ok(_) => {
-                        let latency = start.elapsed().as_millis() as u64;
-
-                        // Cache health result - DashMap insert is lock-free
-                        self.health_cache
-                            .insert(id.to_string(), (true, Instant::now()));
-
-                        Ok(ConnectionTestResult::success(latency))
+                let result = match runtime.generate(test_input).await {
+                    Ok(output) => {
+                        generation_test_result(output, start.elapsed().as_millis() as u64)
                     }
-                    Err(e) => {
-                        // Cache health result
-                        self.health_cache
-                            .insert(id.to_string(), (false, Instant::now()));
-
-                        Ok(ConnectionTestResult::failed(e.to_string()))
-                    }
-                }
+                    Err(e) => ConnectionTestResult::failed(e.to_string()),
+                };
+                self.health_cache
+                    .insert(id.to_string(), (result.success, Instant::now()));
+                Ok(result)
             }
             Err(e) => {
                 // Cache health result
@@ -1417,6 +1430,32 @@ pub fn set_instance_manager(manager: Arc<LlmBackendInstanceManager>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_probe_reports_actual_text_and_rejects_empty_or_failed_generation() {
+        let output = |text: &str, finish_reason| LlmOutput {
+            text: text.into(),
+            finish_reason,
+            usage: None,
+            thinking: None,
+            tool_calls: None,
+        };
+        let result = generation_test_result(output("OK", FinishReason::Stop), 123);
+        assert!(result.success);
+        assert_eq!(result.response.as_deref(), Some("OK"));
+        assert_eq!(result.latency_ms, Some(123));
+        for result in [
+            generation_test_result(output("  ", FinishReason::Stop), 123),
+            generation_test_result(output("provider error", FinishReason::Error), 123),
+            generation_test_result(output("filtered", FinishReason::ContentFilter), 123),
+        ] {
+            assert!(!result.success);
+            assert!(result.response.is_none());
+        }
+        let long_text = "đ".repeat(3000);
+        let bounded = generation_test_result(output(&long_text, FinishReason::Stop), 123);
+        assert_eq!(bounded.response.unwrap().chars().count(), 2048);
+    }
 
     #[test]
     fn test_backend_type_definition() {

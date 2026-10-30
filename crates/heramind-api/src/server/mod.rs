@@ -93,6 +93,8 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
 
     // Initialize LLM
     state.init_llm().await;
+    // Optional OpenClaw bridge: opt-in only; install is a separate admin action.
+    crate::agentrouter_service::start_supervisor();
 
     // Initialize transform event service
     state.init_transform_event_service().await;

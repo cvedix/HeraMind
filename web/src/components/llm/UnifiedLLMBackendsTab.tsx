@@ -7,7 +7,6 @@ import {
   Server,
   CheckCircle2,
   Loader2,
-  TestTube,
   Edit,
   Trash2,
   Eye,
@@ -38,6 +37,7 @@ import { useStore } from '@/store'
 import { UniversalPluginConfigDialog, API_KEY_MASK, type PluginInstance, type UnifiedPluginType } from '@/components/plugins/UniversalPluginConfigDialog'
 import { BuiltinModelWizard } from '@/components/llm/BuiltinModelWizard'
 import { CloudAiAddDialog, type CloudAiEditTarget } from '@/components/llm/CloudAiAddDialog'
+import { BackendConnectionTest } from '@/components/llm/BackendConnectionTest'
 import type {
   LlmBackendInstance,
   BackendTypeDefinition,
@@ -283,6 +283,7 @@ function toUnifiedPluginType(type: BackendTypeDefinition, t: (key: string) => st
 function toPluginInstance(instance: LlmBackendInstance, activeId: string | null): PluginInstance {
   return {
     id: instance.id,
+    updated_at: instance.updated_at,
     name: instance.name,
     plugin_type: instance.backend_type,
     enabled: true,
@@ -506,6 +507,13 @@ export function UnifiedLLMBackendsTab({
       await onCreateBackend(data)
     }
     await loadData(true)
+  }
+
+  const handleServiceConfigured = async () => {
+    const { fetchCache } = await import('@/lib/utils/async')
+    fetchCache.invalidate('llmBackends')
+    await loadData(true)
+    await useStore.getState().loadBackends()
   }
 
   // Handle create instance
@@ -813,6 +821,7 @@ export function UnifiedLLMBackendsTab({
             if (!open) setCloudEditTarget(null)
           }}
           onSubmit={handleCloudAiSubmit}
+          onConfigured={handleServiceConfigured}
           editing={cloudEditTarget}
         />
         </>
@@ -1146,7 +1155,6 @@ export function UnifiedLLMBackendsTab({
           <div className="grid gap-4 grid-cols-[minmax(0,1fr)] md:grid-cols-2">
             {pluginInstances.map((instance) => {
               const isActive = instance.id === activeBackendId
-              const testResult = testResults[instance.id]
               // Cloud AI groups multiple protocols — label each card with
               // its concrete one (protocol key first, legacy vendor name as
               // fallback). The type is immutable after creation (backend
@@ -1214,14 +1222,6 @@ export function UnifiedLLMBackendsTab({
                           variant="ghost"
                           size="sm"
                           className="h-8 w-8 p-0"
-                          onClick={() => handleTest(instance.id)}
-                        >
-                          <TestTube className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-8 w-8 p-0"
                           onClick={() => {
                             if (isCloudAi) {
                               // Cloud AI edits go through the add dialog in
@@ -1264,16 +1264,7 @@ export function UnifiedLLMBackendsTab({
                           <span className="font-mono text-xs truncate min-w-0">{String(instance.config.endpoint)}</span>
                         </div>
                       )}
-                      {testResult && (
-                        <div className={cn(
-                          "text-xs p-2 rounded",
-                          testResult.success
-                            ? "bg-success-light text-success dark:bg-success-light dark:text-success"
-                            : "bg-error-light text-error"
-                        )}>
-                          {testResult.message}
-                        </div>
-                      )}
+                      <BackendConnectionTest key={String(instance.updated_at)} onTest={() => onTestBackend(instance.id)} />
                     </div>
                   </CardContent>
                 </Card>
@@ -1304,6 +1295,7 @@ export function UnifiedLLMBackendsTab({
             if (!open) setCloudEditTarget(null)
           }}
           onSubmit={handleCloudAiSubmit}
+          onConfigured={handleServiceConfigured}
           editing={cloudEditTarget}
         />
         <UniversalPluginConfigDialog

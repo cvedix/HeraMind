@@ -1411,6 +1411,16 @@ impl CloudRuntime {
                                         if let Ok(evt) =
                                             serde_json::from_str::<StreamChunkEvent>(json)
                                         {
+                                            // Gateways can fail after sending HTTP 200 and
+                                            // report the failure inside the SSE stream.
+                                            if let Some(error) = evt.error {
+                                                let _ = tx
+                                                    .send(Err(LlmError::Generation(format!(
+                                                        "Streaming API error: {error}"
+                                                    ))))
+                                                    .await;
+                                                return;
+                                            }
                                             // Check for usage data in final chunk (stream_options.include_usage=true)
                                             if let Some(ref usage) = evt.usage {
                                                 if usage.prompt_tokens > 0 {
@@ -2205,6 +2215,8 @@ struct AccumulatedToolCall {
 
 #[derive(Debug, Deserialize)]
 struct StreamChunkEvent {
+    #[serde(default)]
+    error: Option<serde_json::Value>,
     #[serde(default)]
     choices: Vec<StreamChoice>,
     /// Usage data - only present in the final chunk when stream_options.include_usage=true

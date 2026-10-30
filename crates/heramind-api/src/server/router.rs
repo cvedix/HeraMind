@@ -1093,6 +1093,10 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         )
         // LLM Backends API (write operations - protected)
         .route(
+            "/api/llm-backends/providers/agentrouter/models",
+            post(crate::handlers::cloud_models::list_agentrouter_models_handler),
+        )
+        .route(
             "/api/llm-backends",
             post(llm_backends::create_backend_handler),
         )
@@ -1206,6 +1210,11 @@ pub fn create_router_with_state(state: ServerState) -> Router {
 
     // Admin routes (require JWT + Admin role)
     let admin_routes = Router::new()
+        .route("/api/agentrouter-service", get(crate::agentrouter_service::status_handler))
+        .route("/api/agentrouter-service/install", post(crate::agentrouter_service::install_handler))
+        .route("/api/agentrouter-service/configure", post(crate::agentrouter_service::configure_handler))
+        .route("/api/agentrouter-service/start", post(crate::agentrouter_service::start_handler))
+        .route("/api/agentrouter-service/stop", post(crate::agentrouter_service::stop_handler))
         // User management (admin only)
         .route("/api/users", get(auth_users::list_users_handler))
         .route("/api/users", post(auth_users::create_user_handler))
