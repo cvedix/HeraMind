@@ -1,0 +1,4 @@
+[submodule "thirdparty/engine"]
+	path = thirdparty/engine
+	url = https://github.com/cvedix/engine.git
+	branch = main
