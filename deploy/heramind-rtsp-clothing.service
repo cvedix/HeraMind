@@ -1,0 +1,15 @@
+[Unit]
+Description=HeraMind RTSP clothing colors and events
+After=network-online.target heramind-rtsp-clothing-feed.service
+StartLimitIntervalSec=0
+ConditionPathExists=/home/radxa/Documents/HeraMind/.local/usb-face-feed/token
+
+[Service]
+WorkingDirectory=/home/radxa/Documents/HeraMind
+ExecStart=/usr/bin/python3 /home/radxa/Documents/HeraMind/scripts/usb-clothing-events.py --device-id cam2-clothing-rtsp --token-file /home/radxa/Documents/HeraMind/.local/usb-face-feed/token
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

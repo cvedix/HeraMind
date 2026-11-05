@@ -629,6 +629,10 @@ impl IsolatedExtension {
             .arg(&extension_path_absolute)
             .env("HERAMIND_EXTENSION_DIR", &extension_dir_absolute)
             .env("HERAMIND_EXTENSION_DATA_DIR", &extension_data_dir)
+            // Official NeoMind packages still use these names to locate
+            // models and persist registered face embeddings/configuration.
+            .env("NEOMIND_EXTENSION_DIR", &extension_dir_absolute)
+            .env("NEOMIND_EXTENSION_DATA_DIR", &extension_data_dir)
             .current_dir(&extension_dir_absolute) // Set working directory to extension root
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

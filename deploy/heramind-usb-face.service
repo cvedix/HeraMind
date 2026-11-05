@@ -1,0 +1,18 @@
+[Unit]
+Description=HeraMind USB webcam face recognition feed
+After=network-online.target
+StartLimitIntervalSec=0
+ConditionPathExists=/home/radxa/Documents/HeraMind/.local/usb-face-feed/token
+
+[Service]
+Type=simple
+WorkingDirectory=/home/radxa/Documents/HeraMind
+ExecStart=/usr/bin/python3 /home/radxa/Documents/HeraMind/scripts/rtsp-face-feed.py --usb-device /dev/v4l/by-id/usb-046d_0825_1B70F150-video-index0 --device-id cam2-rtsp --token-file /home/radxa/Documents/HeraMind/.local/usb-face-feed/token --interval 1 --minimum-interval 0.5 --interval-metric image_update_interval
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target

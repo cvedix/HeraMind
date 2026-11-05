@@ -1,0 +1,16 @@
+[Unit]
+Description=HeraMind RTSP camera image feed for clothing analysis
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+WorkingDirectory=/home/radxa/Documents/HeraMind
+ExecStart=/usr/bin/python3 /home/radxa/Documents/HeraMind/scripts/rtsp-face-feed.py --device-id cam2-clothing-rtsp --rtsp-file /home/radxa/Documents/HeraMind/.local/camera-smoke/source --token-file /home/radxa/Documents/HeraMind/.local/usb-face-feed/token --interval 2 --skip-face-binding
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target

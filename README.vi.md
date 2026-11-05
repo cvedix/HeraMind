@@ -271,6 +271,10 @@ cd web && npm install && npm run dev
 cd web && npm run tauri:build
 ```
 
+### Dashboard RTSP bằng component có sẵn
+
+Xem [hướng dẫn tạo dashboard YOLO Video](docs/rtsp-dashboard.vi.md) để ghép luồng camera và các thẻ số liệu ngay trong trình chỉnh sửa dashboard.
+
 ## Kiến trúc
 
 ```
@@ -377,6 +381,8 @@ heramind api-key create                # Tạo API key
 ## Phát triển extension
 
 Xây dựng extension bằng Rust SDK với cô lập tiến trình. Xem [Hướng dẫn lập trình viên](https://docs.cvedix.com/heramind) và [tài liệu HeraMind](https://docs.cvedix.com/heramind) để có ví dụ đầy đủ.
+
+Bộ cài `.nep` hỗ trợ cả `heramind-extension-package` và `neomind-extension-package` trong trường `format` của `manifest.json`. Các gói NeoMind không cần đổi tên định dạng; vẫn phải dùng ABI 3 và có binary phù hợp với nền tảng đang chạy. Trường yêu cầu phiên bản `neomind` cũng được chấp nhận như `heramind`.
 
 <details>
 <summary>Ví dụ nhanh</summary>

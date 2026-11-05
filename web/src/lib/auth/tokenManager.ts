@@ -12,6 +12,9 @@ import type { UserInfo } from '@/types'
 
 const TOKEN_KEY = 'heramind_token'
 const TOKEN_KEY_SESSION = 'heramind_token_session'
+// Marketplace components built with the NeoMind SDK read these names directly.
+const LEGACY_TOKEN_KEY = 'neomind_token'
+const LEGACY_TOKEN_KEY_SESSION = 'neomind_token_session'
 const USER_KEY = 'heramind_user'
 const USER_KEY_SESSION = 'heramind_user_session'
 
@@ -51,12 +54,24 @@ class TokenManagerClass {
    */
   getToken(): string | null {
     const token = localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY_SESSION)
-    if (!token) return null
+    if (!token) {
+      this.clearToken()
+      return null
+    }
     if (this.isTokenExpired(token)) {
       this.clearToken()
       return null
     }
+    this.syncExtensionToken(token, !!localStorage.getItem(TOKEN_KEY))
     return token
+  }
+
+  private syncExtensionToken(token: string, remember: boolean): void {
+    const storage = remember ? localStorage : sessionStorage
+    const key = remember ? LEGACY_TOKEN_KEY : LEGACY_TOKEN_KEY_SESSION
+    if (storage.getItem(key) !== token) storage.setItem(key, token)
+    if (remember) sessionStorage.removeItem(LEGACY_TOKEN_KEY_SESSION)
+    else localStorage.removeItem(LEGACY_TOKEN_KEY)
   }
 
   /**
@@ -73,6 +88,7 @@ class TokenManagerClass {
       sessionStorage.setItem(TOKEN_KEY_SESSION, token)
       localStorage.removeItem(TOKEN_KEY)
     }
+    this.syncExtensionToken(token, remember)
   }
 
   /**
@@ -81,6 +97,8 @@ class TokenManagerClass {
   clearToken(): void {
     localStorage.removeItem(TOKEN_KEY)
     sessionStorage.removeItem(TOKEN_KEY_SESSION)
+    localStorage.removeItem(LEGACY_TOKEN_KEY)
+    sessionStorage.removeItem(LEGACY_TOKEN_KEY_SESSION)
   }
 
   /**

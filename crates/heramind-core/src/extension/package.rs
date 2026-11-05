@@ -42,6 +42,8 @@ use crate::extension::types::ExtensionError;
 
 /// Extension package format identifier
 pub const PACKAGE_FORMAT: &str = "heramind-extension-package";
+/// Legacy identifier still used by official marketplace packages.
+const LEGACY_PACKAGE_FORMAT: &str = "neomind-extension-package";
 /// Current supported ABI version (determines package format compatibility)
 /// This single version number controls:
 /// - Package format compatibility
@@ -95,7 +97,7 @@ pub struct ExtensionPackageManifest {
     pub repository: Option<String>,
 
     /// Minimum HeraMind version required
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "neomind", skip_serializing_if = "Option::is_none")]
     pub heramind: Option<NeomindRequirements>,
 
     /// Binary files for different platforms
@@ -451,7 +453,7 @@ impl ExtensionPackage {
 
     /// Validate the manifest
     fn validate_manifest(manifest: &ExtensionPackageManifest) -> Result<(), PackageError> {
-        if manifest.format != PACKAGE_FORMAT {
+        if manifest.format != PACKAGE_FORMAT && manifest.format != LEGACY_PACKAGE_FORMAT {
             return Err(PackageError::InvalidFormat(format!(
                 "Expected format '{}', got '{}'",
                 PACKAGE_FORMAT, manifest.format
@@ -1707,6 +1709,88 @@ mod tests {
     }
 
     #[test]
+    fn test_neomind_requirements_alias() {
+        let manifest: ExtensionPackageManifest = serde_json::from_value(serde_json::json!({
+            "format": LEGACY_PACKAGE_FORMAT,
+            "abi_version": 3,
+            "id": "legacy-extension",
+            "name": "Legacy Extension",
+            "version": "1.0.0",
+            "neomind": { "min_version": "0.9.0" }
+        }))
+        .unwrap();
+        assert_eq!(
+            manifest.heramind.as_ref().unwrap().min_version.as_deref(),
+            Some("0.9.0")
+        );
+        let serialized = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(serialized["heramind"]["min_version"], "0.9.0");
+        assert!(serialized.get("neomind").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_package_format_compatibility() {
+        use std::io::Write;
+
+        // Exercise the ZIP upload and file-loading paths used by installers.
+        for (format, abi_version, id, expected_error) in [
+            (PACKAGE_FORMAT, 3, "test-extension", None),
+            (LEGACY_PACKAGE_FORMAT, 3, "test-extension", None),
+            (
+                "unknown-extension-package",
+                3,
+                "test-extension",
+                Some("format"),
+            ),
+            (LEGACY_PACKAGE_FORMAT, 2, "test-extension", Some("abi")),
+            (LEGACY_PACKAGE_FORMAT, 4, "test-extension", Some("abi")),
+            (LEGACY_PACKAGE_FORMAT, 3, "../escape", Some("manifest")),
+        ] {
+            let manifest = serde_json::json!({
+                "format": format,
+                "abi_version": abi_version,
+                "id": id,
+                "name": "Test Extension",
+                "version": "1.0.0"
+            });
+            let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            archive
+                .start_file("manifest.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(manifest.to_string().as_bytes()).unwrap();
+            let bytes = archive.finish().unwrap().into_inner();
+            let path = std::env::temp_dir().join(format!(
+                "heramind-format-{}-{}.nep",
+                std::process::id(),
+                unique_nonce()
+            ));
+            std::fs::write(&path, &bytes).unwrap();
+            let results = [
+                ExtensionPackage::from_bytes(bytes),
+                ExtensionPackage::load(&path).await,
+            ];
+            std::fs::remove_file(path).unwrap();
+
+            for result in results {
+                match expected_error {
+                    None => assert_eq!(result.unwrap().manifest.format, format),
+                    Some("format") => {
+                        assert!(matches!(result, Err(PackageError::InvalidFormat(_))))
+                    }
+                    Some("abi") => assert!(matches!(
+                        result,
+                        Err(PackageError::IncompatibleVersion { .. })
+                    )),
+                    Some("manifest") => {
+                        assert!(matches!(result, Err(PackageError::InvalidManifest(_))))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_frontend_string_format() {
         // Test that frontend field accepts string format (backward compatibility)
         let json = r#"{
@@ -1787,7 +1871,7 @@ mod tests {
 
     /// Build a minimal valid .nep (in-memory) for the current platform, so
     /// install tests don't depend on a real extension package.
-    fn build_test_nep() -> Vec<u8> {
+    fn build_test_nep_with_format(format: &str) -> Vec<u8> {
         use std::io::Write;
         let platform = detect_platform();
         let lib_ext = if platform.starts_with("windows") {
@@ -1799,8 +1883,8 @@ mod tests {
         };
         let binary_entry = format!("binaries/{}/extension.{}", platform, lib_ext);
         let manifest = format!(
-            r#"{{"format":"heramind-extension-package","abi_version":3,"id":"test-install-file","name":"Test","version":"9.9.9","binaries":{{"{}":"{}"}},"type":"native"}}"#,
-            platform, binary_entry
+            r#"{{"format":"{}","abi_version":3,"id":"test-install-file","name":"Test","version":"9.9.9","binaries":{{"{}":"{}"}},"type":"native"}}"#,
+            format, platform, binary_entry
         );
         let buf = std::io::Cursor::new(Vec::new());
         let mut zw = zip::ZipWriter::new(buf);
@@ -1814,10 +1898,19 @@ mod tests {
 
     #[test]
     fn test_install_from_file_streams_archive() {
+        assert_install_from_file_streams_archive(PACKAGE_FORMAT);
+    }
+
+    #[test]
+    fn test_install_legacy_neomind_package() {
+        assert_install_from_file_streams_archive(LEGACY_PACKAGE_FORMAT);
+    }
+
+    fn assert_install_from_file_streams_archive(format: &str) {
         // install_from_file must match install_sync for identical package
         // data (both share install_from_archive) — proves the file-backed
         // path works end-to-end without buffering the archive in memory.
-        let zip_bytes = build_test_nep();
+        let zip_bytes = build_test_nep_with_format(format);
         let tmp =
             std::env::temp_dir().join(format!("heramind-test-install-{}.nep", unique_nonce()));
         std::fs::write(&tmp, &zip_bytes).unwrap();
