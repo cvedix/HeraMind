@@ -1,0 +1,31 @@
+{
+  "format": "heramind-extension-package",
+  "format_version": "2.0",
+  "abi_version": 3,
+  "id": "engine-bridge",
+  "name": "HeraMind Engine Bridge",
+  "version": "0.1.0",
+  "sdk_version": "0.7.1",
+  "type": "native",
+  "description": "Dedicated CVEDIX worker for HeraMind image metrics, image preprocessing and optional SeetaFace",
+  "binaries": {"linux_arm64": "binaries/linux_arm64/extension.so"},
+  "frontend": {
+    "components": [{
+      "type": "engine-seetaface-demo",
+      "name": "SeetaFace · Engine Demo",
+      "description": "Ảnh mẫu, phát hiện khuôn mặt và đăng ký danh tính bằng engine SeetaFace",
+      "category": "custom",
+      "icon": "scan-face",
+      "bundle_path": "frontend/engine-seetaface.umd.cjs",
+      "export_name": "EngineSeetaFaceDemo",
+      "global_name": "HeraMindEngineFaces",
+      "size_constraints": {"min_w": 360, "min_h": 500, "default_w": 750, "default_h": 800, "max_w": 1800, "max_h": 1600},
+      "has_data_source": false,
+      "has_display_config": true,
+      "has_actions": false,
+      "config_schema": {"type": "object", "properties": {"deviceId": {"type": "string", "title": "Thiết bị ảnh demo", "default": "seetaface-demo"}}},
+      "default_config": {"deviceId": "seetaface-demo"}
+    }]
+  },
+  "models": "models/"
+}

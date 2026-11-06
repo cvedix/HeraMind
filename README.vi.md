@@ -438,6 +438,7 @@ Tài liệu tham khảo cục bộ trong repo (dành cho người đóng góp):
 | [CLAUDE.md](CLAUDE.md) | Hướng dẫn phát triển và quy ước code |
 | [CHANGELOG.md](CHANGELOG.md) | Lịch sử phiên bản và ghi chú phát hành |
 | [Frontend Spec](web/DESIGN_SPEC.md) | Design system UI và tiêu chuẩn component |
+| [REST API cho từng extension](docs/extension-rest-api.vi.md) | Xác thực, gọi command, gửi ảnh và hướng dẫn sáu extension hiện có |
 
 ## Tech stack
 

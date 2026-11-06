@@ -1,5 +1,9 @@
 # Dashboard RTSP bằng các tính năng có sẵn
 
+Ứng dụng bên ngoài có thể dùng [REST API YOLO Video](../extensions/yolo-video/API.vi.md)
+để tạo/dừng luồng, lấy frame và thống kê; xem
+[REST API ONVIF](../extensions/onvif-bridge/API.vi.md) để làm việc với camera.
+
 Dashboard này dùng `yolo-video-card`, bốn `value-card` và một `markdown-display`.
 Không cần thêm trang hay component mới. Extension `yolo-video` phải được cài và đang chạy.
 
