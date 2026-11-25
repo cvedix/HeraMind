@@ -12,6 +12,49 @@ use super::types::ServerState;
 
 /// Hard char limit for system resource inventory (KNOWLEDGE.md marker section).
 const SYSTEM_CONTEXT_CHAR_LIMIT: usize = 800;
+
+/// Input fingerprints for the two LLM summary jobs. Assembly is cheap; the
+/// LLM call is the expensive part — on an idle box the same sessions and
+/// journals produce byte-identical input every cycle, and re-summarizing it
+/// burns edge compute to write the same marker section back.
+static LAST_CHAT_SUMMARY_INPUT: std::sync::OnceLock<std::sync::Mutex<u64>> =
+    std::sync::OnceLock::new();
+static LAST_AGENT_SUMMARY_INPUT: std::sync::OnceLock<std::sync::Mutex<u64>> =
+    std::sync::OnceLock::new();
+
+fn fingerprint(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// When `input` differs from the last ACCEPTED input for this slot, return
+/// the new fingerprint — WITHOUT marking. The caller commits it via
+/// [`summary_mark_done`] only after the LLM run SUCCEEDED: the previous
+/// mark-on-check version wrote the fingerprint before the generate() call,
+/// so one transient LLM failure permanently skipped the job (every later
+/// cycle saw identical input and never retried).
+fn summary_input_fingerprint(
+    slot: &'static std::sync::OnceLock<std::sync::Mutex<u64>>,
+    input: &str,
+) -> Option<u64> {
+    let guard = slot.get_or_init(|| std::sync::Mutex::new(0));
+    let last = guard.lock().unwrap();
+    let fp = fingerprint(input);
+    if *last == fp {
+        None
+    } else {
+        Some(fp)
+    }
+}
+
+/// Commit a fingerprint returned by [`summary_input_fingerprint`] — call
+/// only once the summary the fingerprint stands for is durably written.
+fn summary_mark_done(slot: &'static std::sync::OnceLock<std::sync::Mutex<u64>>, fp: u64) {
+    let guard = slot.get_or_init(|| std::sync::Mutex::new(0));
+    *guard.lock().unwrap() = fp;
+}
 /// Max chars for LLM chat summary (USER.md marker section).
 const CHAT_SUMMARY_CHAR_LIMIT: usize = 200;
 /// Max chars for LLM agent summary (KNOWLEDGE.md marker section).
@@ -165,7 +208,10 @@ pub async fn summarize_chat_context(
     llm: &Arc<dyn LlmRuntime>,
     memory_store: &MarkdownMemoryStore,
 ) -> Result<(), String> {
-    // Get last 5 session IDs
+    // Get last 5 session IDs. list_sessions sorts by the session stamp,
+    // newest first — with UUID session IDs the old redb key order was a
+    // random-but-fixed permutation, so this take(5) kept summarizing the
+    // same arbitrary subset forever and never picked up new conversations.
     let session_ids = session_store
         .list_sessions()
         .map_err(|e| format!("Failed to list sessions: {}", e))?;
@@ -197,9 +243,22 @@ pub async fn summarize_chat_context(
         return Ok(());
     }
 
+    let chat_fp = match summary_input_fingerprint(&LAST_CHAT_SUMMARY_INPUT, &all_messages) {
+        Some(fp) => fp,
+        None => {
+            tracing::debug!("chat summary input unchanged since last cycle — skipping LLM run");
+            return Ok(());
+        }
+    };
+
+    // English prompt with an explicit language-follow instruction: the
+    // summary lands in USER.md/KNOWLEDGE.md regardless of deployment
+    // locale, and a hard-coded Chinese prompt forced Chinese output on
+    // English-only deployments.
     let prompt = format!(
-        "分析以下对话记录，用2-3条要点总结用户关注的主题和使用偏好。\
-         每条以\"- \"开头。总长度不超过200字符。不要有额外解释。\n\n{}",
+        "Analyze the conversation logs below. Summarize in 2-3 bullet points (each starting with \"- \") \
+         the topics the user focuses on and their usage preferences. Total length must stay under 200 \
+         characters. Write in the same language as the user's messages. No extra explanations.\n\n{}",
         all_messages
     );
 
@@ -217,11 +276,22 @@ pub async fn summarize_chat_context(
                 summary = summary.chars().take(CHAT_SUMMARY_CHAR_LIMIT).collect();
             }
 
-            if let Err(e) = memory_store
+            match memory_store
                 .replace_marker_section("user", "chat-summary", &summary)
                 .await
             {
-                tracing::warn!(error = %e, "Failed to write chat summary");
+                // Written durably — NOW the input counts as summarized. On a
+                // write failure the fingerprint stays uncommitted so the
+                // next cycle retries (a warn-and-mark here made a failing
+                // disk permanently skip this input — same trap the LLM
+                // failure path had).
+                Ok(true) => summary_mark_done(&LAST_CHAT_SUMMARY_INPUT, chat_fp),
+                // Ok(false) = marker section absent (marker file not yet
+                // materialized) — treat as unwritten so the next cycle retries.
+                Ok(false) => {
+                    tracing::debug!("chat-summary marker section absent — not marking done")
+                }
+                Err(e) => tracing::warn!(error = %e, "Failed to write chat summary"),
             }
         }
         Err(e) => {
@@ -285,9 +355,18 @@ pub async fn summarize_agent_context(
         return Ok(());
     }
 
+    let agent_fp = match summary_input_fingerprint(&LAST_AGENT_SUMMARY_INPUT, &agent_data) {
+        Some(fp) => fp,
+        None => {
+            tracing::debug!("agent summary input unchanged since last cycle — skipping LLM run");
+            return Ok(());
+        }
+    };
+
     let prompt = format!(
-        "分析以下AI Agent执行记录，总结关键发现和异常模式。\
-         每条以\"- \"开头。总长度不超过300字符。不要有额外解释。\n\n{}",
+        "Analyze the AI agent execution records below. Summarize in 2-3 bullet points (each starting \
+         with \"- \") the key findings and anomaly patterns across the agents. Total length must stay \
+         under 300 characters. Write in the same language as the outcome texts. No extra explanations.\n\n{}",
         agent_data
     );
 
@@ -305,11 +384,15 @@ pub async fn summarize_agent_context(
                 summary = summary.chars().take(AGENT_SUMMARY_CHAR_LIMIT).collect();
             }
 
-            if let Err(e) = memory_store
+            match memory_store
                 .replace_marker_section("knowledge", "agent-summary", &summary)
                 .await
             {
-                tracing::warn!(error = %e, "Failed to write agent summary");
+                Ok(true) => summary_mark_done(&LAST_AGENT_SUMMARY_INPUT, agent_fp),
+                Ok(false) => {
+                    tracing::debug!("agent-summary marker section absent — not marking done")
+                }
+                Err(e) => tracing::warn!(error = %e, "Failed to write agent summary"),
             }
         }
         Err(e) => {
@@ -318,4 +401,34 @@ pub async fn summarize_agent_context(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dirty-check fingerprint: identical input skips, changed input
+    /// re-runs. This is what stops the 2-hourly LLM summary from firing on
+    /// an idle box.
+    #[test]
+    fn summary_input_fingerprint_commits_only_explicitly() {
+        let slot: &'static std::sync::OnceLock<std::sync::Mutex<u64>> =
+            Box::leak(Box::new(std::sync::OnceLock::new()));
+        let fp1 = summary_input_fingerprint(slot, "sessions: a b c");
+        assert!(fp1.is_some(), "first run always runs");
+        // A FAILED run never commits — the same input must re-run next cycle.
+        assert!(
+            summary_input_fingerprint(slot, "sessions: a b c").is_some(),
+            "uncommitted fingerprint must not skip"
+        );
+        summary_mark_done(slot, fp1.unwrap());
+        assert!(
+            summary_input_fingerprint(slot, "sessions: a b c").is_none(),
+            "identical input skips only after commit"
+        );
+        let fp2 = summary_input_fingerprint(slot, "sessions: a b d");
+        assert!(fp2.is_some(), "changed input re-runs");
+        summary_mark_done(slot, fp2.unwrap());
+        assert!(summary_input_fingerprint(slot, "sessions: a b d").is_none());
+    }
 }

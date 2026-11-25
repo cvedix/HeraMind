@@ -572,7 +572,8 @@
     "actionType": {
       "execute": "Thực thi lệnh",
       "notify": "Gửi thông báo",
-      "triggerAgent": "Tác nhân AI kích hoạt"
+      "triggerAgent": "Tác nhân AI kích hoạt",
+      "runOperator": "Chạy điều phối viên"
     },
     "logContentPlaceholder": "Nội dung nhật ký",
     "propertyNamePlaceholder": "Tên tài sản",
@@ -644,7 +645,11 @@
       "monthlyFirstDesc": "Ngày 1 mỗi tháng lúc 00:00",
       "workdaysMorningLabel": "Ngày làm việc lúc 8 giờ sáng",
       "workdaysMorningDesc": "Thứ Hai đến thứ Sáu lúc 08:00"
-    }
+    },
+    "runOperator": "Chạy điều phối viên",
+    "operator": "Toán tử",
+    "name": "(không tên)",
+    "noPreview": "Chưa thấy trước — DSL xuất hiện ở đây một khi quy tắc đã hoàn tất"
   },
   "transformBuilder": {
     "title": "Tạo chuyển đổi dữ liệu",
@@ -1116,5 +1121,68 @@
   "emptyRules": {
     "title": "Không có quy tắc",
     "description": "Mô tả"
-  }
+  },
+  "ruleExplain": {
+    "outcome": {
+      "unknown": "Không xác định",
+      "true": "Đúng",
+      "false": "Sai"
+    },
+    "execFailed": "thất bại",
+    "title": "Sao không kích hoạt?",
+    "loading": "Đang nạp tình trạng hiện thời...",
+    "loadFailed": "Không thể tải lời giải thích",
+    "retry": "Thử lại",
+    "snapshotAt": "Chụp ảnh tại {{time}}",
+    "wouldFireHint": "Bây giờ cửa đã rõ ràng; lửa thật sự vẫn còn phụ thuộc vào đường dẫn kích hoạt (sự thay đổi dữ liệu / lịch/ hướng dẫn).",
+    "conditionTree": "Điều kiện sống",
+    "conditionMet": "Tổng cộng",
+    "source": "Nguồn",
+    "value": "Giá trị",
+    "age": "Tuổi",
+    "result": "kết quả",
+    "ageSecs": "{{secs}} s",
+    "ageMins": "{{mins}} m",
+    "ageHours": "{{hours}} h",
+    "forDuration": "Tạm dừng",
+    "cooldown": "Thời gian hồi chiêu",
+    "lastExecution": "Thực hiện lần cuối",
+    "noLastExecution": "Vẫn chưa thực hiện tiếp",
+    "notes": "Ghi chú",
+    "elapsed": "{{elapsed}} s / {{configured}} s",
+    "remaining": "{{secs}} còn lại",
+    "satisfied": "Thỏa mãn",
+    "notSatisfied": "Không thỏa mãn",
+    "inCooldown": "Trong mát mẻ",
+    "block": {
+      "cooldownUnknown": "Trong mát mẻ",
+      "disabled": "Quy tắc bị tắt",
+      "cooldown": "Trong mát mẻ (còn lại {{secs}})",
+      "condition_false": "Tình trạng là sai trái.",
+      "condition_unknown": "Chưa xác định được điều kiện ({{reason}})",
+      "condition_unknownGeneric": "Tình trạng không rõ — không có giá trị lưu tạm",
+      "for_duration": "Điều kiện chưa duy trì đủ lâu ({{progress}})",
+      "for_durationGeneric": "Giữ thời gian chưa được thỏa mãn",
+      "ready": "Sẵn sàng bắn vào kíp nổ tiếp theo"
+    },
+    "notInCooldown": "Không phải trong mát mẻ",
+    "execSuccess": "Thành công",
+    "unknownReason": {
+      "no_value_cached": "Không có bộ nhớ tạm giá trị",
+      "value_not_numeric": "Giá trị không phải là số",
+      "operator_value_mismatch": "Tổng hợp không khớp với kiểu giá trị"
+    }
+  },
+  "unverified": "Chưa chứng minh",
+  "unverifiedDeps": "Các phụ thuộc chưa được sửa chữa",
+  "testVerdict": {
+    "verified_success": "Thành công vượt trội",
+    "partial_success": "Một phần thành công",
+    "unverified": "Không mã hoá (giới hạn sấy khô)",
+    "no_output": "Không có kết xuất",
+    "failed": "thất bại",
+    "unverifiedHint": "Máy sấy đã chặn các cuộc gọi phụ. Các số đo dưới đây không được xác nhận là thành công cuối cùng."
+  },
+  "searchRules": "Quy tắc tìm kiếm...",
+  "searchTransforms": "Tìm kiếm biến đổi..."
 }

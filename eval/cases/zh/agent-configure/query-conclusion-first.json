@@ -1,0 +1,48 @@
+{
+  "id": "agent-query-conclusion-first",
+  "lang": "zh",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "边界规则 v2(任务分类协议):对于「X 还好吗 / agent 盯的东西现在什么状态」类问题,先读 agent 已有的最近结论(`heramind agent latest-execution`,即时、免费)——不要为状态问题触发一次新执行(`heramind agent invoke`)。",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "agents": [
+        {
+          "name": "coldroom-watch",
+          "user_prompt": "检查冷库温度并总结",
+          "schedule": {
+            "schedule_type": "interval",
+            "interval_seconds": 60
+          },
+          "execution_mode": "free"
+        }
+      ]
+    }
+  },
+  "turns": [
+    {
+      "user": "冷库现在还好吗?"
+    }
+  ],
+  "applies": [
+    "tool_accuracy",
+    "task_completion",
+    "language_adherence"
+  ],
+  "expectations": {
+    "per_turn": [
+      "T1: 把「冷库」对应到 coldroom-watch 这个 agent,用 `heramind agent latest-execution` 读取最近一次执行的结论(或明确说明还没有跑过);只有用户明确要求重新检查时才 invoke"
+    ],
+    "overall": "状态回答必须落在 agent 最近一次执行的结论上(或明确说还没有结论/尚未运行),绝不能凭空编造"
+  },
+  "expect": {
+    "tools": [
+      "shell"
+    ],
+    "commands": [
+      "heramind agent latest-execution"
+    ]
+  }
+}

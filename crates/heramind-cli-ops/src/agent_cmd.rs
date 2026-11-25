@@ -1,4 +1,4 @@
-use crate::types::{BuildMeta, CliResponse};
+use crate::types::CliResponse;
 use crate::ApiClient;
 use anyhow::Result;
 use serde_json::json;
@@ -72,16 +72,32 @@ pub async fn list_agents(client: &ApiClient) -> Result<CliResponse> {
     let summary: Vec<serde_json::Value> = agents
         .iter()
         .map(|a| {
+            // No optimistic defaults — missing fields stay null / absent.
+            let schedule_type = a
+                .get("schedule")
+                .and_then(|s| s.get("schedule_type"))
+                .cloned()
+                .or_else(|| a.get("schedule_type").cloned())
+                .unwrap_or(serde_json::Value::Null);
+            let last_error = a
+                .get("last_error")
+                .cloned()
+                .or_else(|| a.get("error_message").cloned())
+                .unwrap_or(serde_json::Value::Null);
             json!({
                 "id": a.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
                 "name": a.get("name").and_then(|v| v.as_str()).unwrap_or("(unnamed)"),
                 "status": a.get("status").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                "execution_mode": a.get("execution_mode").and_then(|v| v.as_str()).unwrap_or("focused"),
-                "schedule_type": a.get("schedule").and_then(|s| s.get("schedule_type")).and_then(|v| v.as_str()).unwrap_or("event"),
-                "execution_count": a.get("execution_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                "success_count": a.get("success_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                "error_count": a.get("error_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                "avg_duration_ms": a.get("avg_duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+                "execution_mode": a.get("execution_mode").cloned().unwrap_or(serde_json::Value::Null),
+                "schedule_type": schedule_type,
+                "llm_backend_id": a.get("llm_backend_id").cloned().unwrap_or(serde_json::Value::Null),
+                "notify": a.get("notify").cloned().unwrap_or(serde_json::Value::Null),
+                "last_error": last_error,
+                "last_execution_at": a.get("last_execution_at").cloned().unwrap_or(serde_json::Value::Null),
+                "execution_count": a.get("execution_count").cloned().unwrap_or(serde_json::Value::Null),
+                "success_count": a.get("success_count").cloned().unwrap_or(serde_json::Value::Null),
+                "error_count": a.get("error_count").cloned().unwrap_or(serde_json::Value::Null),
+                "avg_duration_ms": a.get("avg_duration_ms").cloned().unwrap_or(serde_json::Value::Null),
             })
         })
         .collect();
@@ -113,11 +129,13 @@ pub async fn create_agent(
     llm_backend: Option<&str>,
     system_prompt: Option<&str>,
     execution_mode: Option<&str>,
+    output_schema: Option<&str>,
+    memory_mode: Option<&str>,
+    notify: Option<&str>,
     device_ids: Option<&str>,
     resources: Option<&str>,
     metrics: Option<&str>,
     commands: Option<&str>,
-    enable_tool_chaining: Option<bool>,
     max_chain_depth: Option<usize>,
     priority: Option<u8>,
     context_window_size: Option<usize>,
@@ -129,8 +147,22 @@ pub async fn create_agent(
     match schedule_type_val {
         "interval" => {
             if let Some(config) = schedule_config {
-                if let Ok(secs) = config.parse::<u64>() {
-                    schedule["interval_seconds"] = json!(secs);
+                // Parse failure must ERROR, not silently drop: the dropped
+                // field made the API reject with "interval_seconds is
+                // required" while the caller DID pass --schedule-config —
+                // an unexplainable error (same silent-drop family as the
+                // update-component id/type strip).
+                match config.parse::<u64>() {
+                    Ok(secs) => schedule["interval_seconds"] = json!(secs),
+                    Err(_) => {
+                        return Ok(CliResponse::error(
+                            format!(
+                                "--schedule-config '{}' is not a plain number of SECONDS — pass e.g. --schedule-config 300 for a 5-minute interval",
+                                config
+                            ),
+                            "INVALID_SCHEDULE_CONFIG",
+                        ))
+                    }
                 }
             }
         }
@@ -148,7 +180,9 @@ pub async fn create_agent(
         schedule["timezone"] = json!(tz);
     }
 
-    let exec_mode = execution_mode.unwrap_or("free");
+    // Default aligned with the API's (focused = the plainest agent); the
+    // editor, CLI and API now agree on one default.
+    let exec_mode = execution_mode.unwrap_or("focused");
     let has_resources = resources.is_some() || device_ids.map(|d| !d.is_empty()).unwrap_or(false);
 
     let mut body = json!({
@@ -157,6 +191,36 @@ pub async fn create_agent(
         "schedule": schedule,
         "execution_mode": exec_mode,
     });
+    if let Some(schema_json) = output_schema {
+        let parsed: serde_json::Value = crate::json_arg::parse_json_arg(schema_json).map_err(|e| {
+            anyhow::anyhow!(
+                "--output-schema is not valid JSON: {} — expected an array of fields, e.g. a status enum field",
+                e
+            )
+        })?;
+        body["output_schema"] = parsed;
+    }
+    if let Some(mm) = memory_mode {
+        anyhow::ensure!(
+            mm == "tool" || mm == "assistant",
+            "--memory-mode must be 'tool' or 'assistant' (got '{}')",
+            mm
+        );
+        body["memory_mode"] = json!(mm);
+    }
+    if let Some(notify_json) = notify {
+        let parsed: serde_json::Value =
+            crate::json_arg::parse_json_arg(notify_json).map_err(|e| {
+                anyhow::anyhow!(
+                    "--notify is not valid JSON: {} — expected an object like \
+                 {{\"channels\":[\"IM\"],\"on\":\"failure|always|judgment\"}}. \"judgment\" routes \
+                 nothing and lets the task decide whether to speak.",
+                    e
+                )
+            })?;
+        body["notify"] = parsed;
+    }
+
     if let Some(desc) = description {
         body["description"] = json!(desc);
     }
@@ -180,7 +244,7 @@ pub async fn create_agent(
         // Malformed JSON must FAIL, not silently drop the binding — the agent
         // would be created without its resources while the caller believes it
         // succeeded (focused-validation bypass / free-mode degradation).
-        let parsed: serde_json::Value = match serde_json::from_str(res_str) {
+        let parsed: serde_json::Value = match crate::json_arg::parse_json_arg(res_str) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CliResponse::error_with_suggestion(
@@ -191,9 +255,6 @@ pub async fn create_agent(
             }
         };
         body["resources"] = parsed;
-    }
-    if let Some(etc) = enable_tool_chaining {
-        body["enable_tool_chaining"] = json!(etc);
     }
     if let Some(mcd) = max_chain_depth {
         body["max_chain_depth"] = json!(mcd);
@@ -208,7 +269,7 @@ pub async fn create_agent(
         // Malformed JSON must FAIL, not silently drop the binding — the agent
         // would be created without its resources while the caller believes it
         // succeeded (focused-validation bypass / free-mode degradation).
-        let parsed: serde_json::Value = match serde_json::from_str(metrics_str) {
+        let parsed: serde_json::Value = match crate::json_arg::parse_json_arg(metrics_str) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CliResponse::error_with_suggestion(
@@ -224,7 +285,7 @@ pub async fn create_agent(
         // Malformed JSON must FAIL, not silently drop the binding — the agent
         // would be created without its resources while the caller believes it
         // succeeded (focused-validation bypass / free-mode degradation).
-        let parsed: serde_json::Value = match serde_json::from_str(commands_str) {
+        let parsed: serde_json::Value = match crate::json_arg::parse_json_arg(commands_str) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CliResponse::error_with_suggestion(
@@ -245,39 +306,54 @@ pub async fn create_agent(
         return Ok(CliResponse::error_with_suggestion(
             "Focused mode requires --resources or --device-ids to bind at least one resource.",
             "FOCUSED_REQUIRES_RESOURCES",
-            "Example: --device-ids device-001,device-002  (binds the focused agent to those devices; or pass --resources with a JSON array)",
+            "Either bind devices (`--device-ids sensor-001` or `--resources '[…]'`) OR switch \
+             off focused with `--execution-mode free` (multi-round) / `manual` schedule for \
+             create→invoke→delete lifecycles. Default execution-mode is focused.",
         ));
     }
 
     let data = client.post("/agents", &body).await?;
     let agent_id = data
-        .get("data")
-        .and_then(|d| d.get("id"))
+        .get("id")
+        .or_else(|| data.get("data").and_then(|d| d.get("id")))
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
 
-    let meta = BuildMeta {
-        r#type: "agent".to_string(),
-        action: "create".to_string(),
-        entity_id: agent_id.clone(),
-        entity_name: Some(name.to_string()),
-        undo_command: format!("heramind agent delete {}", agent_id),
-    };
-
-    Ok(CliResponse::success_with_meta(
+    Ok(CliResponse::success(
         data,
-        // Agents are created Paused — they never run until activated. The
-        // follow-up command is the difference between a finished workflow
-        // and a "created it but nothing happened" failure mode (a top eval
-        // failure class), so the receipt teaches it explicitly.
         format!(
-            "Agent created (status: paused — it will NOT run until activated). \
-             Next: heramind agent control {} active",
-            agent_id
+            "Agent created and active (id: {agent_id}). {}",
+            create_next_step(&agent_id, schedule_type)
         ),
-        meta,
     ))
+}
+
+/// What to do after creating an agent, given how it is scheduled.
+///
+/// Split out from the receipt so it can be asserted. The receipt used to read
+/// "created paused — it will NOT run until activated", which was never true:
+/// `create_agent` sets `AgentStatus::Active`, and has since the field existed.
+/// A model that believed it issued a redundant `control active` and carried a
+/// wrong picture of the state into everything it told the user afterwards.
+///
+/// The line that actually closes the loop depends on the schedule. A `manual`
+/// agent never runs on its own, so "here is how to start it" is the useful
+/// sentence there — and for everything else it is "here is how to see it ran".
+fn create_next_step(agent_id: &str, schedule_type: Option<&str>) -> String {
+    match schedule_type.unwrap_or("event") {
+        "manual" => {
+            format!("It never runs on its own — start it with `heramind agent invoke {agent_id}`.")
+        }
+        "event" => format!(
+            "It runs when its bound sources report; `heramind agent latest-execution {agent_id}` \
+             shows the last run."
+        ),
+        _ => format!(
+            "It runs on its schedule; `heramind agent latest-execution {agent_id}` shows the last \
+             run, and `heramind agent invoke {agent_id}` runs it now."
+        ),
+    }
 }
 
 /// Update agent
@@ -293,11 +369,13 @@ pub async fn update_agent(
     schedule_type: Option<&str>,
     schedule_config: Option<&str>,
     execution_mode: Option<&str>,
+    output_schema: Option<&str>,
+    memory_mode: Option<&str>,
+    notify: Option<&str>,
     device_ids: Option<&str>,
     resources: Option<&str>,
     metrics: Option<&str>,
     commands: Option<&str>,
-    enable_tool_chaining: Option<bool>,
     max_chain_depth: Option<usize>,
     priority: Option<u8>,
     context_window_size: Option<usize>,
@@ -319,13 +397,29 @@ pub async fn update_agent(
     if let Some(prompt) = user_prompt {
         body["user_prompt"] = json!(prompt);
     }
+    if schedule_config.is_some() && schedule_type.is_none() {
+        return Ok(CliResponse::error_with_suggestion(
+            "--schedule-config requires --schedule-type (interval|cron|event|manual)",
+            "MISSING_SCHEDULE_TYPE",
+            "Pass both flags together, e.g. --schedule-type interval --schedule-config 300",
+        ));
+    }
     if let Some(st) = schedule_type {
         let mut schedule = json!({"schedule_type": st});
         match st {
             "interval" => {
                 if let Some(config) = schedule_config {
-                    if let Ok(secs) = config.parse::<u64>() {
-                        schedule["interval_seconds"] = json!(secs);
+                    match config.parse::<u64>() {
+                        Ok(secs) => schedule["interval_seconds"] = json!(secs),
+                        Err(_) => {
+                            return Ok(CliResponse::error(
+                                format!(
+                                    "--schedule-config '{}' is not a plain number of SECONDS — pass e.g. --schedule-config 300",
+                                    config
+                                ),
+                                "INVALID_SCHEDULE_CONFIG",
+                            ))
+                        }
                     }
                 }
             }
@@ -341,6 +435,17 @@ pub async fn update_agent(
     if let Some(em) = execution_mode {
         body["execution_mode"] = json!(em);
     }
+    if let Some(schema_json) = output_schema {
+        body["output_schema"] = crate::json_arg::parse_json_arg(schema_json)
+            .map_err(|e| anyhow::anyhow!("--output-schema is not valid JSON: {}", e))?;
+    }
+    if let Some(mm) = memory_mode {
+        body["memory_mode"] = json!(mm);
+    }
+    if let Some(notify_json) = notify {
+        body["notify"] = crate::json_arg::parse_json_arg(notify_json)
+            .map_err(|e| anyhow::anyhow!("--notify is not valid JSON: {}", e))?;
+    }
     if let Some(ids) = device_ids {
         let id_list: Vec<&str> = ids
             .split(',')
@@ -353,7 +458,7 @@ pub async fn update_agent(
         // Malformed JSON must FAIL, not silently drop the binding — the agent
         // would be created without its resources while the caller believes it
         // succeeded (focused-validation bypass / free-mode degradation).
-        let parsed: serde_json::Value = match serde_json::from_str(res_str) {
+        let parsed: serde_json::Value = match crate::json_arg::parse_json_arg(res_str) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CliResponse::error_with_suggestion(
@@ -364,9 +469,6 @@ pub async fn update_agent(
             }
         };
         body["resources"] = parsed;
-    }
-    if let Some(etc) = enable_tool_chaining {
-        body["enable_tool_chaining"] = json!(etc);
     }
     if let Some(mcd) = max_chain_depth {
         body["max_chain_depth"] = json!(mcd);
@@ -381,7 +483,7 @@ pub async fn update_agent(
         // Malformed JSON must FAIL, not silently drop the binding — the agent
         // would be created without its resources while the caller believes it
         // succeeded (focused-validation bypass / free-mode degradation).
-        let parsed: serde_json::Value = match serde_json::from_str(metrics_str) {
+        let parsed: serde_json::Value = match crate::json_arg::parse_json_arg(metrics_str) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CliResponse::error_with_suggestion(
@@ -397,7 +499,7 @@ pub async fn update_agent(
         // Malformed JSON must FAIL, not silently drop the binding — the agent
         // would be created without its resources while the caller believes it
         // succeeded (focused-validation bypass / free-mode degradation).
-        let parsed: serde_json::Value = match serde_json::from_str(commands_str) {
+        let parsed: serde_json::Value = match crate::json_arg::parse_json_arg(commands_str) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CliResponse::error_with_suggestion(
@@ -431,14 +533,41 @@ pub async fn control_agent(client: &ApiClient, id: &str, status: &str) -> Result
     Ok(CliResponse::success(data, "Agent status updated"))
 }
 
-/// Invoke agent with input
-pub async fn invoke_agent(client: &ApiClient, id: &str, input: &str) -> Result<CliResponse> {
+/// Invoke agent with optional input.
+///
+/// The endpoint waits up to 60s; this call waits up to 70s so it always
+/// receives the endpoint's structured answer — a finished run's conclusion,
+/// or `status: "Executing"` for a run that continues in the background. A
+/// client-side timeout must never read as "the execution failed".
+pub async fn invoke_agent(
+    client: &ApiClient,
+    id: &str,
+    input: Option<&str>,
+) -> Result<CliResponse> {
     let id = resolve_agent_id(client, id).await?;
-    let body = json!({ "input": input });
+    let body = match input {
+        Some(text) => json!({ "input": text }),
+        None => json!({}),
+    };
     let data = client
-        .post(&format!("/agents/{}/invoke", id), &body)
+        .post_timeout(&format!("/agents/{}/invoke", id), &body, 70)
         .await?;
-    Ok(CliResponse::success(data, "Agent invoked"))
+    let message = invoke_outcome_message(&data, &id);
+    Ok(CliResponse::success(data, &message))
+}
+
+/// Render the invoke outcome for the caller. "Still executing" is a
+/// lifecycle fact, NOT a business failure — the message says the run
+/// continues and names the poll command instead of reading as an error.
+pub fn invoke_outcome_message(data: &serde_json::Value, agent_id: &str) -> String {
+    if data.get("still_executing").and_then(|v| v.as_bool()) == Some(true) {
+        format!(
+            "Agent run started and still executing in the background — it will finish and record \
+             its result. Poll with: heramind agent latest-execution {agent_id}"
+        )
+    } else {
+        "Agent invoked".to_string()
+    }
 }
 
 /// Get agent memory
@@ -503,6 +632,21 @@ pub async fn get_conversation(
     Ok(CliResponse::success(data, "Agent conversation retrieved"))
 }
 
+/// The body `POST /agents/{id}/messages` expects.
+///
+/// The key is `message_type`, not `type`: `AddUserMessageRequest` declares the
+/// former, and the API has no `deny_unknown_fields` — so a wrong key is
+/// accepted and silently dropped, and the tag never reaches storage. It was
+/// `type` until this was noticed; the assertion below is the only thing that
+/// catches that class of mistake, since nothing else reads the body.
+fn user_message_body(message: &str, message_type: Option<&str>) -> serde_json::Value {
+    let mut body = json!({ "content": message });
+    if let Some(mt) = message_type {
+        body["message_type"] = json!(mt);
+    }
+    body
+}
+
 /// Send message to agent
 pub async fn send_message(
     client: &ApiClient,
@@ -511,14 +655,110 @@ pub async fn send_message(
     message_type: Option<&str>,
 ) -> Result<CliResponse> {
     let id = resolve_agent_id(client, id).await?;
-    let mut body = json!({
-        "content": message,
-    });
-    if let Some(mt) = message_type {
-        body["type"] = json!(mt);
-    }
+    let body = user_message_body(message, message_type);
     let data = client
         .post(&format!("/agents/{}/messages", id), &body)
         .await?;
     Ok(CliResponse::success(data, "Message sent"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The field name is the whole point — a wrong one is dropped in silence,
+    /// because `AddUserMessageRequest` has no `deny_unknown_fields` to catch it.
+    #[test]
+    fn the_message_body_uses_the_key_the_api_declares() {
+        let body = user_message_body("hello", Some("note"));
+        assert_eq!(body["content"], json!("hello"));
+        assert_eq!(
+            body["message_type"],
+            json!("note"),
+            "must match AddUserMessageRequest::message_type"
+        );
+        assert!(
+            body.get("type").is_none(),
+            "the old key would be silently discarded by the API"
+        );
+    }
+
+    #[test]
+    fn the_type_key_is_omitted_when_there_is_none() {
+        let body = user_message_body("hello", None);
+        assert_eq!(body, json!({ "content": "hello" }));
+    }
+
+    /// The receipt must match what the API actually does: `create_agent` sets
+    /// `AgentStatus::Active`. It used to tell the model the agent was created
+    /// paused — which sent it into a redundant `control active` and left it
+    /// holding a wrong picture of the state for everything it said afterwards.
+    #[test]
+    fn the_next_step_never_claims_the_agent_was_created_paused() {
+        for schedule in [
+            None,
+            Some("interval"),
+            Some("cron"),
+            Some("event"),
+            Some("manual"),
+        ] {
+            let step = super::create_next_step("agent-1", schedule);
+            assert!(
+                !step.to_lowercase().contains("paused"),
+                "the receipt for {schedule:?} still talks about paused: {step}"
+            );
+        }
+    }
+
+    /// A manual agent never runs on its own, so the useful sentence is how to
+    /// start it — not how to look at a run that will not happen.
+    #[test]
+    fn manual_agents_are_told_to_be_started_by_hand() {
+        let step = super::create_next_step("agent-7", Some("manual"));
+        assert!(step.contains("never runs on its own"), "{step}");
+        assert!(step.contains("agent invoke agent-7"), "{step}");
+    }
+
+    /// Everything else runs on its own; point at the evidence.
+    #[test]
+    fn scheduled_agents_are_pointed_at_their_last_run() {
+        for schedule in [Some("interval"), Some("cron"), Some("event"), None] {
+            let step = super::create_next_step("agent-7", schedule);
+            assert!(
+                step.contains("agent latest-execution agent-7"),
+                "{schedule:?}: {step}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod invoke_outcome_tests {
+    use super::invoke_outcome_message;
+    use serde_json::json;
+
+    #[test]
+    fn executing_renders_as_lifecycle_not_failure() {
+        let msg = invoke_outcome_message(
+            &json!({"status": "Executing", "still_executing": true}),
+            "agent-7",
+        );
+        assert!(msg.contains("still executing"), "{msg}");
+        assert!(
+            msg.contains("heramind agent latest-execution agent-7"),
+            "{msg}"
+        );
+        // Not phrased as an error the model would retry or apologize for.
+        assert!(!msg.to_lowercase().contains("failed"));
+        assert!(!msg.to_lowercase().contains("error"));
+    }
+
+    #[test]
+    fn finished_renders_neutral_message() {
+        let msg = invoke_outcome_message(
+            &json!({"status": "Completed", "conclusion": "ok", "still_executing": false}),
+            "agent-7",
+        );
+        assert_eq!(msg, "Agent invoked");
+    }
 }

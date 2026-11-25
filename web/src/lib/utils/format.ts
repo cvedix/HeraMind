@@ -1,24 +1,39 @@
 /**
+ * Normalize a timestamp to milliseconds — the canonical unit for in-store
+ * Message.timestamp and any arithmetic on it.
+ *
+ * Server history carries Unix SECONDS (AgentMessage.timestamp =
+ * chrono::Utc::now().timestamp()), while locally created messages use
+ * Date.now() MILLISECONDS. Display helpers tolerate both via a magnitude
+ * heuristic, but arithmetic does not: `Date.now() - serverSecondsTs` once
+ * produced a 497,289-hour generation time (2026-10-15). Normalize BEFORE
+ * computing, never after.
+ */
+export function normalizeTimestampMs(timestamp: string | number | undefined): number | undefined {
+  if (timestamp == null) return undefined
+  let ms: number
+  if (typeof timestamp === 'string') {
+    ms = Date.parse(timestamp)
+  } else if (typeof timestamp === 'number') {
+    // < 1e10 can only be seconds for any date after 1970-11 (2.3e9 now);
+    // ms timestamps are already ≥ 1e12.
+    ms = timestamp < 10_000_000_000 ? timestamp * 1000 : timestamp
+  } else {
+    return undefined
+  }
+  return Number.isFinite(ms) ? ms : undefined
+}
+
+/**
  * Format timestamp to human readable string
  * @param timestamp - Unix timestamp in seconds, ISO 8601 string, or undefined
  * @param includeSeconds - Whether to include seconds (default: true)
  * @returns Formatted date string in format "YYYY-MM-DD HH:mm:ss"
  */
 export function formatTimestamp(timestamp: string | number | undefined, includeSeconds: boolean = true): string {
-  if (!timestamp) return '-'
-
-  let date: Date
-
-  // Handle ISO 8601 string from backend
-  if (typeof timestamp === 'string') {
-    date = new Date(timestamp)
-  } else if (typeof timestamp === 'number') {
-    // Handle Unix timestamp (in seconds or milliseconds)
-    // If timestamp is less than 10000000000, it's in seconds
-    date = new Date(timestamp < 10000000000 ? timestamp * 1000 : timestamp)
-  } else {
-    return '-'
-  }
+  const ms = normalizeTimestampMs(timestamp)
+  if (ms == null) return '-'
+  const date = new Date(ms)
 
   // Check if date is valid
   if (isNaN(date.getTime())) return '-'
@@ -42,19 +57,9 @@ export function formatTimestamp(timestamp: string | number | undefined, includeS
  * @returns Relative time string like "刚刚", "5分钟前", etc.
  */
 export function formatRelativeTime(timestamp: string | number | undefined): string {
-  if (!timestamp) return '-'
-
-  let date: Date
-
-  if (typeof timestamp === 'string') {
-    date = new Date(timestamp)
-  } else if (typeof timestamp === 'number') {
-    date = new Date(timestamp < 10000000000 ? timestamp * 1000 : timestamp)
-  } else {
-    return '-'
-  }
-
-  if (isNaN(date.getTime())) return '-'
+  const ms = normalizeTimestampMs(timestamp)
+  if (ms == null) return '-'
+  const date = new Date(ms)
 
   const now = Date.now()
   const diff = now - date.getTime()
@@ -173,6 +178,27 @@ export function formatDuration(seconds: number): string {
   const days = Math.floor(seconds / 86400)
   const hours = Math.floor((seconds % 86400) / 3600)
   return hours > 0 ? `${days}天${hours}h` : `${days}天`
+}
+
+/**
+ * Format an elapsed/generation time (ms) with adaptive units — chat reply
+ * stats, tool durations. Unit-styled and locale-independent (unlike
+ * formatDuration's Chinese prose): 850ms, 12.3s, 2m 05s, 1h 30m.
+ */
+export function formatElapsedMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '-'
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  const secs = ms / 1000
+  // 59.95s boundary: toFixed(1) would otherwise print "60.0s"
+  if (secs < 59.95) return `${secs.toFixed(1)}s`
+  const totalSecs = Math.round(secs)
+  if (totalSecs < 3600) {
+    const mins = Math.floor(totalSecs / 60)
+    return `${mins}m ${String(totalSecs % 60).padStart(2, '0')}s`
+  }
+  const hours = Math.floor(totalSecs / 3600)
+  const mins = Math.floor((totalSecs % 3600) / 60)
+  return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`
 }
 
 /**

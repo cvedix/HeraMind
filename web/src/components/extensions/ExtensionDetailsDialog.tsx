@@ -52,6 +52,7 @@ import { useIsMobile } from "@/hooks/useMobile"
 import { cn } from "@/lib/utils"
 import { FormSection, FormSectionGroup } from "@/components/ui/form-section"
 import { Sparkline } from '@/components/dashboard/generic/Sparkline'
+import { MobileTabStrip } from '@/components/shared/MobileTabStrip'
 
 interface ExtensionDetailsDialogProps {
   extension: Extension | null
@@ -307,7 +308,7 @@ export function ExtensionDetailsDialog({
   const runMasterToggle = async (checked: boolean) => {
     if (!extension) return
     try {
-      await api.setExtensionEnabled(extension.id, checked)
+      await api.setExtensionAiEnabled(extension.id, checked)
       toast({
         title: checked
           ? t("extensions:tools.enableMasterDone", { defaultValue: "AI tools enabled" })
@@ -429,7 +430,7 @@ export function ExtensionDetailsDialog({
               </Label>
               <Select value={value as string ?? ""} onValueChange={(v) => updateConfigValue(paramName, v)}>
                 <SelectTrigger id={paramName}>
-                  <SelectValue placeholder="Select..." />
+                  <SelectValue placeholder={t("common:selectPlaceholder")} />
                 </SelectTrigger>
                 <SelectContent>
                   {param.enum.map((opt: string) => (
@@ -500,7 +501,7 @@ export function ExtensionDetailsDialog({
               <Label className="text-sm">{param.title || paramName}</Label>
               <Select value={value as string ?? ""} onValueChange={(v) => updateCommandArg(commandId, paramName, v)}>
                 <SelectTrigger>
-                  <SelectValue placeholder="Select..." />
+                  <SelectValue placeholder={t("common:selectPlaceholder")} />
                 </SelectTrigger>
                 <SelectContent>
                   {param.enum.map((opt: string) => (
@@ -686,7 +687,7 @@ export function ExtensionDetailsDialog({
       )
     }
 
-    const masterEnabled = extension.enabled !== false
+    const masterEnabled = extension.ai_enabled !== false
 
     // Turning OFF asks for confirmation; ON is immediate.
     const handleMasterToggle = (checked: boolean) => {
@@ -755,10 +756,18 @@ export function ExtensionDetailsDialog({
                     )}
                   />
                 </button>
-                {/* Per-command tool toggle */}
+                {/* Per-command tool toggle. Author-declared ai_exposed=false
+                    locks the toggle: the command never reaches the LLM. */}
                 <Switch
                   checked={command.disabled ? false : masterEnabled}
-                  disabled={!masterEnabled}
+                  disabled={!masterEnabled || command.ai_exposed === false}
+                  title={
+                    command.ai_exposed === false
+                      ? t("extensions:tools.authorHidden", {
+                          defaultValue: "Not AI-exposed (declared by extension)",
+                        })
+                      : undefined
+                  }
                   onCheckedChange={(checked) => handleCmdToggle(command.id, checked)}
                   onClick={(e) => e.stopPropagation()}
                   aria-label={t("extensions:tools.cmdToggleAria", {
@@ -898,7 +907,7 @@ export function ExtensionDetailsDialog({
                           key={range}
                           variant={timeRange === range ? "default" : "outline"}
                           size="sm"
-                          className="h-6 text-xs px-2"
+                          className="h-6 text-xs px-2 sm:h-6"
                           onClick={() => {
                             setMetricTimeRange(prev => ({ ...prev, [metric.name]: range }))
                             setMetricHistoryData(prev => ({ ...prev, [metric.name]: [] }))
@@ -949,7 +958,7 @@ export function ExtensionDetailsDialog({
                             <Sparkline data={numeric} height={48} fill colorMode="primary" />
                           </div>
                           {/* Summary stats */}
-                          <div className="grid grid-cols-4 gap-2">
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
                             {[
                               [t("extensions:metrics.latest", { defaultValue: "Latest" }), fmt(latest)],
                               [t("extensions:metrics.min", { defaultValue: "Min" }), fmt(min)],
@@ -1106,29 +1115,14 @@ export function ExtensionDetailsDialog({
     </div>
   )
 
-  // Mobile tabs renderer — 5-column grid, single row, no scroll, no divider
+  // Mobile uses the same underline strip as every other full-screen detail.
   const mobileTabs = (
-    <div className="shrink-0 px-2 pt-3 pb-2">
-      <div className="grid grid-cols-5 gap-1">
-        {sections.map((s) => (
-          <button
-            key={s.id}
-            onClick={() => handleSectionChange(s.id)}
-            className={cn(
-              "flex flex-col items-center justify-center gap-1 py-1.5 min-w-0 rounded-lg transition-colors",
-              activeSection === s.id
-                ? "bg-primary text-primary-foreground"
-                : "bg-muted-30 text-muted-foreground"
-            )}
-          >
-            <s.icon className="h-4 w-4 shrink-0" />
-            <span className="text-mini font-medium leading-none truncate w-full text-center">
-              {s.label}
-            </span>
-          </button>
-        ))}
-      </div>
-    </div>
+    <MobileTabStrip
+      items={sections.map((section) => ({ value: section.id, label: section.label }))}
+      value={activeSection}
+      onValueChange={handleSectionChange}
+      ariaLabel={extension.name}
+    />
   )
 
   return (

@@ -15,7 +15,8 @@
     "description": "Quản lý thông báo, cảnh báo và đẩy dữ liệu",
     "tabs": {
       "messages": "Tin nhắn",
-      "channels": "Kênh"
+      "channels": "Kênh",
+      "im": "Phiên nhắn tin"
     },
     "create": "Tạo tin nhắn",
     "createTitle": "Tạo tin nhắn mới",
@@ -230,7 +231,9 @@
       "emailConfigDesc": "Định cấu hình máy chủ SMTP và người nhận email",
       "addRecipient": "Thêm người nhận",
       "categoriesHint": "Chọn danh mục cảnh báo để chuyển tiếp",
-      "minSeverityHint": "Mức độ nghiêm trọng tối thiểu để chuyển tiếp"
+      "minSeverityHint": "Mức độ nghiêm trọng tối thiểu để chuyển tiếp",
+      "howToGet": "Xem cách lấy các giá trị này trong hướng dẫn chính thức",
+      "pasteAddressHint": "Dán toàn bộ URL webhook hiển thị ở trang đó. Hệ thống sẽ lấy phần thông tin cần thiết."
     },
     "confirmBulkDelete": "Xóa tin nhắn",
     "confirmBulkDeleteDesc": "Bạn có chắc chắn muốn xóa (các) tin nhắn {{count}} không?",
@@ -289,7 +292,36 @@
     "messageDetails": "Chi tiết tin nhắn",
     "basicInfo": "Thông tin cơ bản",
     "basicInfoDesc": "Thông tin kênh cơ bản",
-    "metadataDesc": "Siêu dữ liệu kênh bổ sung"
+    "metadataDesc": "Siêu dữ liệu kênh bổ sung",
+    "falsePositiveError": "Không thể đánh dấu cảnh báo",
+    "chain": {
+      "noActions": "không có",
+      "title": "Lý do phát cảnh báo",
+      "description": "Lần thực thi quy tắc đã tạo cảnh báo và dữ liệu liên quan",
+      "rule": "Quy tắc",
+      "evidence": "Bằng chứng",
+      "firedAt": "Đã kích hoạt",
+      "actions": "Hành động",
+      "expired": "Bản ghi của lần thực thi quy tắc đã hết hạn. Lịch sử quy tắc được lưu trong 30 ngày.",
+      "trackRecord": "Lịch sử cảnh báo",
+      "dismissedOf": "Đã loại {{fp}} trên {{total}} cảnh báo sai",
+      "thresholdAdvice": "Quy tắc này có thể kích hoạt quá dễ. Hãy xem lại điều kiện kích hoạt."
+    },
+    "markFalsePositive": "Đánh dấu cảnh báo sai",
+    "falsePositiveSuccess": "Đã đánh dấu là cảnh báo sai",
+    "im": {
+      "chatId": "ID trò chuyện",
+      "boundAgent": "Tác tử",
+      "lastActive": "Hoạt động gần nhất",
+      "reset": "Đặt lại",
+      "resetSuccess": "Đã đặt lại phiên",
+      "confirmReset": "Đặt lại liên kết của phiên này?",
+      "goToSettings": "Cấu hình cầu nối nhắn tin",
+      "noBridge": "Chưa cấu hình cầu nối nhắn tin",
+      "noBridgeDesc": "Cấu hình cầu nối nhắn tin trong Cài đặt để quản lý các phiên trò chuyện.",
+      "noSessions": "Chưa có phiên trò chuyện",
+      "noSessionsDesc": "Bắt đầu trò chuyện với bot để tạo phiên mới."
+    }
   },
   "connection": {
     "connected": "Đã kết nối",
@@ -309,7 +341,9 @@
     "decisions": "Quyết định",
     "messages": "Tin nhắn",
     "extensions": "Extension",
-    "settings": "Cài đặt"
+    "settings": "Cài đặt",
+    "dashboardShort": "Bảng điều khiển",
+    "mobilePrimary": "Điều hướng chính"
   },
   "navShort": {
     "dashboard": "Trò chuyện",
@@ -452,12 +486,23 @@
       "checkDevices": "Kiểm tra trạng thái thiết bị trực tuyến hiện tại",
       "createRule": "Giúp tôi tạo quy tắc theo dõi nhiệt độ",
       "checkAlerts": "Những cảnh báo nào cần chú ý?",
-      "showLogs": "Hiển thị nhật ký hoạt động của thiết bị ngày hôm nay"
+      "showLogs": "Hiển thị nhật ký hoạt động của thiết bị ngày hôm nay",
+      "createAgent": "Tạo tác tử giám sát theo lịch cho tôi",
+      "checkAgents": "Các tác tử AI của tôi đang làm gì?",
+      "addLlmBackend": "Giúp tôi thêm một backend LLM",
+      "createVirtualDevice": "Tạo một thiết bị ảo với dữ liệu mô phỏng"
     },
     "quickActions": {
       "devices": "Thiết bị",
       "automation": "Tự động hóa",
       "settings": "Cài đặt"
+    },
+    "askLine": "{{greeting}}. Bạn cần tôi hỗ trợ gì?",
+    "mobileSuggestions": {
+      "devices": "Thiết bị",
+      "alerts": "Cảnh báo",
+      "rules": "Quy tắc",
+      "agent": "Tác tử AI"
     }
   },
   "llm": {
@@ -605,7 +650,11 @@
     "resumeResponseTitle": "Tiếp tục phản hồi không đầy đủ?",
     "resumeResponseDesc": "Đã phát hiện phản hồi đang diễn ra từ lần ngắt kết nối trước đó",
     "discard": "Loại bỏ",
-    "resume": "Tiếp tục"
+    "resume": "Tiếp tục",
+    "recent": "Cuộc trò chuyện gần đây",
+    "openDrawer": "Mở trình đơn",
+    "generating": "Đang tạo câu trả lời",
+    "rename": "Đổi tên"
   },
   "language": {
     "switchToEnglish": "Chuyển sang tiếng Anh",
@@ -713,7 +762,10 @@
     "batchFormat": "Định dạng dữ liệu gửi",
     "batchFormatFlat": "Phẳng (danh sách mục)",
     "batchFormatNested": "Lồng nhau (theo thiết bị/nguồn)",
-    "topicRequired": "Phải nhập topic"
+    "topicRequired": "Phải nhập topic",
+    "source": "Nguồn",
+    "payload": "Dữ liệu gửi đi",
+    "searchTargets": "Tìm đích nhận dữ liệu…"
   },
   "active": "Đang hoạt động",
   "test": "Kiểm tra kết nối",
@@ -909,8 +961,21 @@
       "settings": "LLM / kết nối / tùy chọn",
       "health": "Backend, thiết bị, cảnh báo",
       "onboarding": "Hướng dẫn thiết lập ban đầu",
-      "about": "Phiên bản và tài liệu"
-    }
+      "about": "Phiên bản và tài liệu",
+      "devices": "Thiết bị và loại thiết bị",
+      "agents": "Tác tử AI và khả năng",
+      "dashboard": "Bảng điều khiển trực quan"
+    },
+    "openWorkspace": "Hệ thống",
+    "moreEntries": "Tất cả mục điều hướng",
+    "workspaceHint": "Thiết bị, tác tử, bảng điều khiển và cài đặt",
+    "localInstance": "Phiên bản cục bộ",
+    "connected": "Đã kết nối",
+    "disconnected": "Đã ngắt kết nối",
+    "mobileSummary": "{{online}} / {{total}} thiết bị trực tuyến · {{alerts}} cảnh báo chưa xử lý",
+    "extensionPage": "Trang tiện ích mở rộng",
+    "preferences": "Tùy chọn và tài khoản",
+    "account": "Tài khoản"
   },
   "rules": {
     "templates": {
@@ -960,5 +1025,11 @@
     "ownCta": "Cấu hình",
     "downloadingTitle": "Đang tải mô hình tích hợp",
     "downloading": "Tải xuống"
-  }
+  },
+  "opacity": "Độ mờ",
+  "size": "Kích thước",
+  "saveChanges": "Lưu thay đổi",
+  "priority": "Ưu tiên",
+  "send": "Gửi",
+  "selectPlaceholder": "Chọn..."
 }

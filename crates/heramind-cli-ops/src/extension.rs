@@ -1,12 +1,14 @@
-use crate::types::{BuildMeta, CliResponse};
+use crate::types::CliResponse;
 use crate::ApiClient;
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// List all extensions with compact summary.
 ///
-/// Returns id, name, version, status, and enabled flag per extension.
-/// Full config is available via `heramind extension get <id>`.
+/// Returns id, name, version, runtime status, run `enabled`, and AI
+/// `ai_enabled`; next-step discovery guidance is emitted once at the top-level
+/// `CliResponse.suggestion`.
+/// `ai_enabled` is the Chat/Agent master switch; `enabled` is run/load.
 pub async fn list_extensions(client: &ApiClient) -> Result<CliResponse> {
     let data = client.get("/extensions").await?;
 
@@ -25,25 +27,77 @@ pub async fn list_extensions(client: &ApiClient) -> Result<CliResponse> {
         return Ok(CliResponse::success(data, "Extensions listed"));
     };
 
+    // Bound large catalogs so Chat context stays usable; full dump via get.
+    const LIST_CAP: usize = 50;
     let total = extensions.len();
+    let truncated = total > LIST_CAP;
     let summary: Vec<serde_json::Value> = extensions
         .iter()
+        .take(LIST_CAP)
         .map(|e| {
+            let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let status = e
+                .get("status")
+                .and_then(|v| v.as_str())
+                .or_else(|| e.get("state").and_then(|v| v.as_str()))
+                .unwrap_or("unknown");
+            // Missing enabled/ai_enabled must stay null — never optimistic true.
+            let enabled = e.get("enabled").cloned().unwrap_or(serde_json::Value::Null);
+            let ai_enabled = e
+                .get("ai_enabled")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let status_l = status.to_ascii_lowercase();
+            let running = e
+                .get("running")
+                .and_then(|v| v.as_bool())
+                .or_else(|| e.get("is_running").and_then(|v| v.as_bool()))
+                .unwrap_or_else(|| {
+                    // API may return "Running (Isolated)" / "running" / health ok.
+                    status_l.contains("running")
+                        || status_l == "active"
+                        || status_l == "ok"
+                        || status_l == "healthy"
+                });
             json!({
-                "id": e.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+                "id": id,
                 "name": e.get("name").and_then(|v| v.as_str()).unwrap_or("(unnamed)"),
                 "version": e.get("version").and_then(|v| v.as_str()).unwrap_or("?"),
-                "status": e.get("status").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                "enabled": e.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                "status": status,
+                "running": running,
+                "enabled": enabled,
+                "ai_enabled": ai_enabled,
+                "health_status": e.get("health_status").cloned().unwrap_or(serde_json::Value::Null),
+                "last_error": e.get("last_error").cloned().unwrap_or(serde_json::Value::Null),
+                "last_crash_reason": e.get("last_crash_reason").cloned().unwrap_or(serde_json::Value::Null),
+                "consecutive_crashes": e.get("consecutive_crashes").cloned().unwrap_or(json!(0)),
+                "disabled_commands": e.get("disabled_commands").cloned().unwrap_or(json!([])),
                 "description": e.get("description").and_then(|v| v.as_str()).unwrap_or(""),
             })
         })
         .collect();
 
-    Ok(CliResponse::success(
-        json!({ "total": total, "extensions": summary }),
+    // RO success with a non-empty complete list: no suggestion (facts only).
+    // Empty / truncated keep a recovery tip so callers know why the view is limited.
+    let mut resp = CliResponse::success(
+        json!({
+            "total": total,
+            "returned": summary.len(),
+            "truncated": truncated,
+            "extensions": summary,
+        }),
         format!("{} extension(s) listed", total),
-    ))
+    );
+    if total == 0 {
+        resp = resp.with_suggestion(
+            "No extensions installed. Install from the marketplace or a .nep file, then re-list.",
+        );
+    } else if truncated {
+        resp = resp.with_suggestion(format!(
+            "Showing first {LIST_CAP} of {total}. Narrow with: heramind extension commands --search \"<task>\"."
+        ));
+    }
+    Ok(resp)
 }
 
 /// Percent-encode a URL path segment. A raw `/` inside an extension ID
@@ -73,11 +127,9 @@ pub async fn get_extension(client: &ApiClient, id: &str) -> Result<CliResponse> 
 
 /// Get extension health status
 pub async fn get_extension_status(client: &ApiClient, id: &str) -> Result<CliResponse> {
-    let resp = client
+    let data = client
         .get(&format!("/extensions/{}/health", encode_segment(id)))
         .await?;
-    // Extract inner data to avoid double-wrapping (API already has success/data structure)
-    let data = resp.get("data").cloned().unwrap_or(resp);
     Ok(CliResponse::success(data, "Extension status retrieved"))
 }
 
@@ -98,6 +150,10 @@ pub async fn get_extension_logs(
 
 /// Install extension from file
 pub async fn install_extension_file(client: &ApiClient, file_path: &str) -> Result<CliResponse> {
+    if !std::path::Path::new(file_path).exists() {
+        anyhow::bail!("Package file not found: {}", file_path);
+    }
+
     // Extension upload API expects JSON body with base64-encoded file data
     use std::io::Read;
     let mut file = std::fs::File::open(file_path)?;
@@ -115,26 +171,8 @@ pub async fn install_extension_file(client: &ApiClient, file_path: &str) -> Resu
         "filename": filename,
     });
     let data = client.post("/extensions/upload/file", &body).await?;
-    let ext_id = data
-        .get("data")
-        .and_then(|d| d.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
 
-    let meta = BuildMeta {
-        r#type: "extension".to_string(),
-        action: "install".to_string(),
-        entity_id: ext_id.clone(),
-        entity_name: ext_id.clone().into(),
-        undo_command: format!("heramind extension uninstall {}", ext_id),
-    };
-
-    Ok(CliResponse::success_with_meta(
-        data,
-        "Extension installed",
-        meta,
-    ))
+    Ok(CliResponse::success(data, "Extension installed"))
 }
 
 /// Install extension from marketplace
@@ -143,64 +181,475 @@ pub async fn install_extension_market(
     extension_id: &str,
     version: Option<&str>,
 ) -> Result<CliResponse> {
+    // Field is `id` — the handler's MarketplaceInstallRequest. This sent
+    // `extension_id` since inception, so every CLI market-install failed
+    // with "missing field `id`" before the request reached any install
+    // logic (found 2026-10-15 verifying the chat-driven install path).
     let mut body = json!({
-        "extension_id": extension_id,
+        "id": extension_id,
     });
     if let Some(v) = version {
         body["version"] = json!(v);
     }
 
+    // ApiClient::unwrap_api_envelope already intercepts HTTP 200 responses
+    // whose inner payload carries `"success": false` (the 17 marketplace
+    // failure paths) and surfaces the real error message.
     let data = client.post("/extensions/market/install", &body).await?;
-    let ext_id = data
-        .get("data")
-        .and_then(|d| d.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(extension_id)
-        .to_string();
 
-    let meta = BuildMeta {
-        r#type: "extension".to_string(),
-        action: "install".to_string(),
-        entity_id: ext_id.clone(),
-        entity_name: ext_id.clone().into(),
-        undo_command: format!("heramind extension uninstall {}", ext_id),
-    };
-
-    Ok(CliResponse::success_with_meta(
+    Ok(CliResponse::success(
         data,
         "Extension installed from marketplace",
-        meta,
     ))
 }
 
 /// Uninstall extension
 pub async fn uninstall_extension(client: &ApiClient, id: &str) -> Result<CliResponse> {
-    client
-        .delete(&format!("/extensions/{}/uninstall", id))
+    let data = client
+        .delete(&format!("/extensions/{}/uninstall", encode_segment(id)))
         .await?;
-    Ok(CliResponse::success(
-        json!({ "id": id }),
-        "Extension uninstalled",
-    ))
+    let payload = if data.is_null() {
+        json!({ "id": id })
+    } else {
+        data
+    };
+    Ok(CliResponse::success(payload, "Extension uninstalled"))
 }
 
 /// Reload an extension (restart from file)
 pub async fn reload_extension(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client
-        .post_raw(&format!("/extensions/{}/reload", id))
+        .post_raw(&format!("/extensions/{}/reload", encode_segment(id)))
         .await?;
     Ok(CliResponse::success(data, "Extension reloaded"))
 }
 
 /// List marketplace extensions
-pub async fn list_marketplace(client: &ApiClient) -> Result<CliResponse> {
+pub async fn list_marketplace(
+    client: &ApiClient,
+    filter: Option<&str>,
+    verbose: bool,
+) -> Result<CliResponse> {
     let data = client.get("/extensions/market/list").await?;
-    Ok(CliResponse::success(data, "Marketplace extensions listed"))
+    if verbose {
+        return Ok(CliResponse::success(data, "Marketplace extensions listed"));
+    }
+    // Compact by default: the raw registry is ~48 KB (26 extensions × full
+    // metadata + URLs) and drowned small models' context when the agent ran
+    // it — twice in one turn (2026-10-15). One line per extension is what
+    // both a human and a 2B model actually need to pick an id to install;
+    // `-v` keeps the full dump one flag away.
+    let compact = compact_market_list(&data, filter);
+    Ok(CliResponse::success(
+        compact,
+        "Marketplace extensions listed (compact; -v for full metadata)",
+    ))
+}
+
+/// Project the raw market registry into {total, matched, extensions:[{id,
+/// name, version, description}]}, optionally filtered by a case-insensitive
+/// substring over id/name/description. Pure — unit-tested.
+pub fn compact_market_list(raw: &serde_json::Value, filter: Option<&str>) -> serde_json::Value {
+    // The registry nests: {success, data:{extensions:[...]}} — unwrap both.
+    let list = raw
+        .pointer("/data/extensions")
+        .or_else(|| raw.pointer("/extensions"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let needle = filter.map(str::to_lowercase);
+    let mut out = Vec::new();
+    for e in &list {
+        let desc = e
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let entry = json!({
+            "id": e.get("id").cloned().unwrap_or(serde_json::Value::Null),
+            "name": e.get("name").cloned().unwrap_or(serde_json::Value::Null),
+            "version": e.get("version").cloned().unwrap_or(serde_json::Value::Null),
+            "description": desc,
+        });
+        if let Some(n) = &needle {
+            let hay = format!(
+                "{} {} {}",
+                entry["id"].as_str().unwrap_or_default(),
+                entry["name"].as_str().unwrap_or_default(),
+                entry["description"].as_str().unwrap_or_default(),
+            )
+            .to_lowercase();
+            if !hay.contains(n) {
+                continue;
+            }
+        }
+        out.push(entry);
+    }
+    json!({
+        "total": list.len(),
+        "matched": out.len(),
+        "extensions": out,
+    })
+}
+
+/// Search AI-visible extension commands by task text (NM-252).
+///
+/// Hits the host registry snapshot via
+/// `GET /extensions/commands/search` — same visibility as invoke
+/// (`ai_enabled` / `disabled_commands` / `ai_exposed`). Host ranks and
+/// truncates; zero hits are a valid outcome.
+pub async fn search_extension_commands(
+    client: &ApiClient,
+    query: &str,
+    scope_extension_id: Option<&str>,
+) -> Result<CliResponse> {
+    let mut path = format!(
+        "/extensions/commands/search?q={}",
+        urlencoding_encode(query)
+    );
+    if let Some(id) = scope_extension_id {
+        path.push_str(&format!("&extension={}", urlencoding_encode(id)));
+    }
+    let data = client.get(&path).await?;
+    let hits = data
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let n = hits.len();
+    let needs_schema = hits.iter().any(|h| {
+        h.get("requires_schema_lookup")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    });
+    // RO success with complete hits: no suggestion (shell_example already in data).
+    // Empty / schema-incomplete keep recovery tips only.
+    let mut resp = CliResponse::success(
+        data,
+        if n == 0 {
+            "No matching AI-visible extension commands".into()
+        } else {
+            format!("{n} matching command(s)")
+        },
+    );
+    if n == 0 {
+        resp = resp.with_suggestion(
+            "No matching AI-visible command. Try a clearer task phrase, or confirm the \
+needed extension is installed: heramind extension list.",
+        );
+    } else if needs_schema {
+        resp = resp.with_suggestion(
+            "Some hits need full schema first: heramind extension commands <id>. \
+Then use hits[].shell_example `{command, params}` (replace <placeholders>).",
+        );
+    }
+    Ok(resp)
+}
+
+/// Minimal query-string encoder (enough for search text / extension ids).
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// List unified business command defs for an installed extension.
+///
+/// Includes schema, capability, AI visibility, and a concrete invoke example
+/// so the model can go list → commands → invoke without re-scanning help.
+pub async fn list_extension_commands(client: &ApiClient, id: &str) -> Result<CliResponse> {
+    let data = client
+        .get(&format!("/extensions/{}/commands", encode_segment(id)))
+        .await?;
+    // API may wrap as {success,data:[...]} or return the array directly.
+    let commands = data
+        .as_array()
+        .cloned()
+        .or_else(|| data.get("data").and_then(|d| d.as_array()).cloned())
+        .unwrap_or_default();
+
+    let summary: Vec<serde_json::Value> = commands
+        .iter()
+        .map(|c| {
+            // API CommandDef uses `id` for the short command name.
+            let name = c
+                .get("id")
+                .and_then(|v| v.as_str())
+                .or_else(|| c.get("command").and_then(|v| v.as_str()))
+                .unwrap_or("?");
+            let disabled = c.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let ai_exposed = c
+                .get("ai_exposed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let schema = c.get("input_schema").cloned().unwrap_or(json!({}));
+            // Prefer server-validated params_example; fall back to schema-derived.
+            let example_val = c
+                .get("params_example")
+                .cloned()
+                .filter(|v| v.is_object())
+                .or_else(|| example_params_value_from_schema(&schema));
+            // Model-facing: single canonical structured `{command, params}` example
+            // matching `extension commands --search` and `device get` (no pseudo-syntax
+            // or conflicting string-quoted CLI forms).
+            let shell_example = match &example_val {
+                Some(ex) => json!({
+                    "command": format!("heramind extension invoke {id} {name}"),
+                    "params": ex,
+                }),
+                None => json!({
+                    "command": format!("heramind extension invoke {id} {name}"),
+                }),
+            };
+            let mut entry = json!({
+                "id": c.get("command_id").cloned().unwrap_or_else(|| {
+                    json!(format!(
+                        "extension.type/{}/{name}",
+                        heramind_core::extension::type_base_of(id)
+                    ))
+                }),
+                "command": name,
+                "contract_version": c.get("contract_version").cloned()
+                    .unwrap_or(json!(heramind_core::extension::CONTRACT_VERSION)),
+                "description": c.get("description").cloned().unwrap_or(json!("")),
+                "input_schema": schema,
+                "effect": c.get("effect").cloned().unwrap_or(json!("mutating")),
+                "replay_safety": c.get("replay_safety").cloned().unwrap_or(json!("unsafe")),
+                "execution": c.get("execution").cloned().unwrap_or(json!("immediate")),
+                "capability_source": c.get("capability_source").cloned()
+                    .unwrap_or(json!({"kind":"conservative_default"})),
+                "ai_exposed": ai_exposed,
+                "disabled": disabled,
+                "ai_invokable": ai_exposed && !disabled,
+                "shell_example": shell_example,
+            });
+            if let Some(ex) = example_val {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("params_example".into(), ex);
+                }
+            }
+            entry
+        })
+        .collect();
+
+    let invokable: Vec<&str> = summary
+        .iter()
+        .filter(|c| c.get("ai_invokable").and_then(|v| v.as_bool()) == Some(true))
+        .filter_map(|c| c.get("command").and_then(|v| v.as_str()))
+        .collect();
+
+    // RO success with invokable commands: no write-leading suggestion.
+    // Empty / all-disabled keep recovery tips; shell_example stays in data.
+    let mut resp = CliResponse::success(
+        json!({
+            "extension_id": id,
+            "total": summary.len(),
+            "ai_invokable_count": invokable.len(),
+            "commands": summary,
+        }),
+        format!("{} command(s) for extension {}", summary.len(), id),
+    );
+    if summary.is_empty() {
+        resp = resp.with_suggestion(format!(
+            "No commands registered for '{id}'. Confirm it is installed and running: heramind extension status {id}"
+        ));
+    } else if invokable.is_empty() {
+        resp = resp.with_suggestion(
+            "All commands are AI-disabled or author-hidden (ai_exposed=false). Re-enable in extension settings if AI should call them.",
+        );
+    }
+    Ok(resp)
+}
+
+/// Build a minimal example JSON object from a JSON Schema for invoke hints.
+///
+/// Empty string is never invented for required free-form strings (NM-247).
+/// Prefer enum/default; omit unreliable keys (returns None when incomplete).
+fn example_params_value_from_schema(schema: &serde_json::Value) -> Option<serde_json::Value> {
+    let props = schema.get("properties")?.as_object()?;
+    let required: std::collections::HashSet<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut obj = serde_json::Map::new();
+    for (key, prop) in props {
+        if !required.is_empty() && !required.contains(key.as_str()) {
+            continue;
+        }
+        let sample = if let Some(d) = prop.get("default") {
+            d.clone()
+        } else if let Some(en) = prop.get("enum").and_then(|e| e.as_array()) {
+            en.first()?.clone()
+        } else {
+            match prop.get("type").and_then(|t| t.as_str()) {
+                Some("string") => {
+                    // Do not invent "" or non-empty literals.
+                    continue;
+                }
+                Some("number") | Some("integer") => json!(0),
+                Some("boolean") => json!(false),
+                Some("array") => json!([]),
+                Some("object") => json!({}),
+                _ => continue,
+            }
+        };
+        obj.insert(key.clone(), sample);
+        if obj.len() >= 6 {
+            break;
+        }
+    }
+    for req in &required {
+        if !obj.contains_key(*req) {
+            return None;
+        }
+    }
+    // Validate against the same schema the server uses.
+    if heramind_core::extension::validate_and_normalize(schema, &Value::Object(obj.clone()))
+        .is_err()
+    {
+        return None;
+    }
+    Some(Value::Object(obj))
+}
+
+/// Invoke an extension command via the shared HTTP execute path.
+///
+/// Prefers `--params` / `--params-file` JSON so small models avoid shell
+/// quoting. Params are validated server-side against the same schema that
+/// `extension commands` returns.
+pub async fn invoke_extension_command(
+    client: &ApiClient,
+    extension_id: &str,
+    command: &str,
+    params_json: Option<&str>,
+    params_file: Option<&std::path::Path>,
+    prepared_operation_id: Option<&str>,
+    structured_params: Option<serde_json::Value>,
+) -> Result<CliResponse> {
+    // Prefer host-managed object (NM-247) — never re-stringify through --params.
+    let params = if let Some(v) = structured_params {
+        if !v.is_object() && !v.is_null() {
+            anyhow::bail!("shell params must be a JSON object");
+        }
+        if v.is_null() {
+            json!({})
+        } else {
+            v
+        }
+    } else {
+        load_invoke_params(params_json, params_file)?
+    };
+
+    // Client-side required-field check against the live command schema when
+    // reachable — fail fast before the round-trip when possible. Server still
+    // validates (source of truth).
+    if let Ok(listed) = client
+        .get(&format!(
+            "/extensions/{}/commands",
+            encode_segment(extension_id)
+        ))
+        .await
+    {
+        let commands = listed
+            .as_array()
+            .cloned()
+            .or_else(|| listed.get("data").and_then(|d| d.as_array()).cloned())
+            .unwrap_or_default();
+        if let Some(cmd) = commands
+            .iter()
+            .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(command))
+        {
+            if let Some(schema) = cmd.get("input_schema") {
+                // Same validate+normalize as the server; discard canonical
+                // here — server re-prepares as source of truth (or consumes
+                // the Chat-authorized PreparedInvoke when provided).
+                if let Err(msg) = heramind_core::extension::validate_and_normalize(schema, &params)
+                {
+                    anyhow::bail!("{msg}");
+                }
+            }
+        } else if !commands.is_empty() {
+            let names: Vec<&str> = commands
+                .iter()
+                .filter_map(|c| c.get("id").and_then(|v| v.as_str()))
+                .collect();
+            anyhow::bail!(
+                "command '{command}' not found on extension '{extension_id}'. Available: {}",
+                names.join(", ")
+            );
+        }
+    }
+
+    let mut body = json!({
+        "command": command,
+        "params": params,
+    });
+    if let Some(op) = prepared_operation_id {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "prepared_operation_id".into(),
+                serde_json::Value::String(op.to_string()),
+            );
+        }
+    }
+    let data = client
+        .post(
+            &format!("/extensions/{}/invoke", encode_segment(extension_id)),
+            &body,
+        )
+        .await?;
+
+    Ok(CliResponse::success(
+        data,
+        format!("Invoked {extension_id}/{command}"),
+    ))
+}
+
+fn load_invoke_params(
+    params_json: Option<&str>,
+    params_file: Option<&std::path::Path>,
+) -> Result<serde_json::Value> {
+    if let Some(path) = params_file {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read --params-file {}: {e}", path.display()))?;
+        let v = crate::json_arg::parse_json_arg(text.trim())
+            .map_err(|e| anyhow::anyhow!("--params-file must contain a JSON object: {e}"))?;
+        if !v.is_object() && !v.is_null() {
+            anyhow::bail!("--params-file must contain a JSON object");
+        }
+        return Ok(if v.is_null() { json!({}) } else { v });
+    }
+    match params_json {
+        None => Ok(json!({})),
+        Some(s) => {
+            let v = crate::json_arg::parse_json_arg(s.trim())
+                .map_err(|e| anyhow::anyhow!("--params must be a JSON object: {e}"))?;
+            if !v.is_object() && !v.is_null() {
+                anyhow::bail!("--params must be a JSON object");
+            }
+            Ok(if v.is_null() { json!({}) } else { v })
+        }
+    }
 }
 
 /// Get extension configuration
 pub async fn get_extension_config(client: &ApiClient, id: &str) -> Result<CliResponse> {
-    let data = client.get(&format!("/extensions/{}/config", id)).await?;
+    let data = client
+        .get(&format!("/extensions/{}/config", encode_segment(id)))
+        .await?;
     Ok(CliResponse::success(data, "Extension config retrieved"))
 }
 
@@ -211,7 +660,337 @@ pub async fn update_extension_config(
     config: serde_json::Value,
 ) -> Result<CliResponse> {
     let data = client
-        .put(&format!("/extensions/{}/config", id), &config)
+        .put(
+            &format!("/extensions/{}/config", encode_segment(id)),
+            &config,
+        )
         .await?;
     Ok(CliResponse::success(data, "Extension config updated"))
+}
+
+#[cfg(test)]
+mod invoke_params_tests {
+    use super::{example_params_value_from_schema, load_invoke_params};
+    use serde_json::json;
+    use std::io::Write;
+
+    #[test]
+    fn example_params_omit_unreliable_freeform_string() {
+        let schema = json!({
+            "type": "object",
+            "required": ["city"],
+            "properties": {
+                "city": {"type": "string"},
+                "lang": {"type": "string", "default": "en"},
+                "units": {"type": "string"}
+            }
+        });
+        // Required free-form string without enum/default → no invented "".
+        assert!(example_params_value_from_schema(&schema).is_none());
+    }
+
+    #[test]
+    fn example_params_prefer_enum_and_defaults() {
+        let schema = json!({
+            "type": "object",
+            "required": ["city"],
+            "properties": {
+                "city": {"type": "string", "enum": ["Beijing", "Shanghai"]},
+                "lang": {"type": "string", "default": "en"},
+                "units": {"type": "string"}
+            }
+        });
+        let v = example_params_value_from_schema(&schema).expect("reliable example");
+        assert_eq!(v.get("city").and_then(|c| c.as_str()), Some("Beijing"));
+        assert!(v.get("units").is_none(), "{v}");
+    }
+
+    #[test]
+    fn default_empty_object() {
+        assert_eq!(load_invoke_params(None, None).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn params_json_object() {
+        assert_eq!(
+            load_invoke_params(Some(r#"{"city":"Xiamen"}"#), None).unwrap(),
+            json!({"city": "Xiamen"})
+        );
+    }
+
+    #[test]
+    fn params_file_wins_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"city":"Shanghai"}"#)
+            .unwrap();
+        assert_eq!(
+            load_invoke_params(None, Some(&path)).unwrap(),
+            json!({"city": "Shanghai"})
+        );
+    }
+
+    #[test]
+    fn rejects_non_object() {
+        assert!(load_invoke_params(Some("[1,2]"), None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod market_list_tests {
+    use super::compact_market_list;
+    use serde_json::json;
+
+    fn raw() -> serde_json::Value {
+        json!({
+            "success": true,
+            "data": { "extensions": [
+                { "id": "weather-forecast", "name": "Weather Forecast", "version": "2.14.0",
+                  "description": "Real-time weather", "metadata_url": "https://long.url/..." },
+                { "id": "yolo-video", "name": "YOLO Video", "version": "2.0.0",
+                  "description": "Object detection", "metadata_url": "https://long.url/..." },
+            ]}
+        })
+    }
+
+    #[test]
+    fn compact_keeps_one_line_fields_only() {
+        let out = compact_market_list(&raw(), None);
+        assert_eq!(out["total"], 2);
+        assert_eq!(out["matched"], 2);
+        let e = &out["extensions"][0];
+        assert_eq!(e["id"], "weather-forecast");
+        assert_eq!(e["version"], "2.14.0");
+        assert!(
+            e.get("metadata_url").is_none(),
+            "URLs and bulk must be dropped"
+        );
+    }
+
+    #[test]
+    fn filter_matches_case_insensitively_across_fields() {
+        // By id fragment, by name word, by description word.
+        assert_eq!(compact_market_list(&raw(), Some("weather"))["matched"], 1);
+        assert_eq!(compact_market_list(&raw(), Some("Forecast"))["matched"], 1);
+        assert_eq!(compact_market_list(&raw(), Some("detection"))["matched"], 1);
+        assert_eq!(compact_market_list(&raw(), Some("nomatch"))["matched"], 0);
+    }
+
+    #[test]
+    fn tolerates_flat_shape_and_missing_fields() {
+        let flat = json!({ "extensions": [ { "id": "x" } ] });
+        let out = compact_market_list(&flat, None);
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["extensions"][0]["id"], "x");
+    }
+}
+
+#[cfg(test)]
+mod market_install_verdict_tests {
+    use serde_json::json;
+
+    #[test]
+    fn failure_envelope_is_recognized() {
+        // The handler's failure shape: HTTP 200, outer success:true, inner
+        // verdict success:false — ApiClient::unwrap_api_envelope intercepts it
+        // uniformly.
+        let body = json!({
+            "success": true,
+            "data": {
+                "success": false,
+                "extension_id": "bogus-ext-xyz",
+                "downloaded": false,
+                "installed": false,
+                "error": "Extension not found: 404 Not Found"
+            }
+        });
+        let err = crate::api_client::unwrap_api_envelope(body)
+            .expect_err("inner success:false must be intercepted")
+            .to_string();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_extensions_keeps_null_enabled_and_exposes_failure_fields() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = json!({
+                "success": true,
+                "data": [
+                    {
+                        "id": "broken",
+                        "name": "Broken",
+                        "version": "1.0.0",
+                        "status": "Failed",
+                        "last_error": "dlopen failed",
+                        "last_crash_reason": "segfault",
+                        "consecutive_crashes": 3,
+                        "disabled_commands": ["x"],
+                        "ai_enabled": false,
+                        "health_status": "error"
+                    }
+                ]
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let client = crate::ApiClient::with_base_url(&format!("http://{addr}/api"));
+        let out = super::list_extensions(&client).await.unwrap();
+        let item = &out.data.as_ref().unwrap()["extensions"][0];
+        assert!(
+            item["enabled"].is_null(),
+            "missing enabled must stay null, got {:?}",
+            item["enabled"]
+        );
+        assert_eq!(item["ai_enabled"], false);
+        assert_eq!(item["last_error"], "dlopen failed");
+        assert_eq!(item["consecutive_crashes"], 3);
+        assert_eq!(item["disabled_commands"], json!(["x"]));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_extensions_ro_success_has_no_write_leading_suggestion() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let body = json!({
+                "success": true,
+                "data": [
+                    {"id": "weather", "name": "Weather", "version": "1.0.0", "status": "Running", "enabled": true, "ai_enabled": true, "description": "Forecast"},
+                    {"id": "yolo", "name": "YOLO", "version": "2.0.0", "status": "Running", "enabled": true, "ai_enabled": true, "description": "Detection"},
+                ],
+                "meta": {"timestamp": 1}
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let client = crate::ApiClient::with_base_url(&format!("http://{addr}/api"));
+        let out = super::list_extensions(&client).await.unwrap();
+        assert!(out.success);
+        let data = out.data.expect("list data");
+        let items = data["extensions"].as_array().expect("extensions array");
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert!(
+                item.get("next").is_none(),
+                "per-item `next` must be removed to avoid repeated noise: {item}"
+            );
+        }
+        assert!(
+            out.suggestion.is_none(),
+            "non-empty RO list must not carry a write-leading suggestion: {:?}",
+            out.suggestion
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_extension_commands_ro_success_has_no_next_call_suggestion() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = json!({
+                "success": true,
+                "data": [
+                    {
+                        "id": "get_weather",
+                        "description": "Fetch weather",
+                        "ai_exposed": true,
+                        "effect": "read",
+                        "input_schema": {"type":"object","properties":{}}
+                    }
+                ]
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let client = crate::ApiClient::with_base_url(&format!("http://{addr}/api"));
+        let out = super::list_extension_commands(&client, "weather")
+            .await
+            .unwrap();
+        assert!(out.success);
+        assert!(
+            out.suggestion.is_none(),
+            "RO commands list with invokable cmds must not suggest Next: call: {:?}",
+            out.suggestion
+        );
+        let msg = format!("{:?}{:?}", out.message, out.data);
+        assert!(
+            !msg.contains("Next: call"),
+            "response must not contain Next: call: {msg}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_extension_market_rejects_http_200_embedded_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let body = json!({
+                "success": true,
+                "data": {
+                    "success": false,
+                    "extension_id": "bogus",
+                    "downloaded": false,
+                    "installed": false,
+                    "error": "Extension not found: 404 Not Found"
+                }
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let client = crate::ApiClient::with_base_url(&format!("http://{addr}/api"));
+        let err = super::install_extension_market(&client, "bogus", None)
+            .await
+            .expect_err("HTTP 200 marketplace failure must return Err")
+            .to_string();
+        assert!(err.contains("Extension not found"), "got: {err}");
+        server.await.unwrap();
+    }
 }

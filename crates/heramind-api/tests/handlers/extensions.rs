@@ -28,6 +28,7 @@ mod tests {
             metrics: vec![],
             config_parameters: None,
             enabled: true,
+            ai_enabled: true,
             disabled_commands: vec![],
         }
     }
@@ -64,6 +65,7 @@ mod tests {
             metrics: vec![],
             config_parameters: None,
             enabled: true,
+            ai_enabled: true,
             disabled_commands: vec![],
         };
 
@@ -137,6 +139,14 @@ mod tests {
                 expected_duration_ms: None,
             },
             disabled: false,
+            ai_exposed: true,
+            effect: Default::default(),
+            replay_safety: Default::default(),
+            execution: Default::default(),
+            command_id: None,
+            contract_version: None,
+            capability_source: None,
+            params_example: None,
         };
 
         assert_eq!(command.id, "turn_on");
@@ -224,6 +234,7 @@ mod tests {
                 last_crash_reason: None,
                 config_parameters: None,
                 enabled: true,
+                ai_enabled: true,
                 disabled_commands: vec![],
             };
             assert_eq!(dto.state, state);
@@ -259,6 +270,14 @@ mod tests {
                     expected_duration_ms: None,
                 },
                 disabled: false,
+                ai_exposed: true,
+                effect: Default::default(),
+                replay_safety: Default::default(),
+                execution: Default::default(),
+                command_id: None,
+                contract_version: None,
+                capability_source: None,
+                params_example: None,
             }],
             metrics: vec![MetricDescriptorDto {
                 name: "temperature".to_string(),
@@ -272,6 +291,7 @@ mod tests {
             }],
             config_parameters: None,
             enabled: true,
+            ai_enabled: true,
             disabled_commands: vec![],
         };
 
@@ -310,6 +330,14 @@ mod tests {
                     expected_duration_ms: None,
                 },
                 disabled: false,
+                ai_exposed: true,
+                effect: Default::default(),
+                replay_safety: Default::default(),
+                execution: Default::default(),
+                command_id: None,
+                contract_version: None,
+                capability_source: None,
+                params_example: None,
             }],
             metrics: vec![MetricDescriptorDto {
                 name: "metric1".to_string(),
@@ -323,6 +351,7 @@ mod tests {
             }],
             config_parameters: None,
             enabled: true,
+            ai_enabled: true,
             disabled_commands: vec![],
         };
 
@@ -389,6 +418,7 @@ mod tests {
                 last_crash_reason: None,
                 config_parameters: None,
                 enabled: true,
+                ai_enabled: true,
                 disabled_commands: vec![],
             };
             assert_eq!(dto.version, version);

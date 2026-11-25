@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 heramind-core = { path = "../heramind-core" }
+heramind-devices = { path = "../heramind-devices" }
 reqwest = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -25,4 +26,7 @@ base64 = { workspace = true }
 dirs = { workspace = true }
 
 [dev-dependencies]
+serial_test = "3"
+heramind-storage = { path = "../heramind-storage" }
+heramind-data-push = { path = "../heramind-data-push" }
 tempfile = { workspace = true }

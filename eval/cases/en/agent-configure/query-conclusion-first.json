@@ -1,0 +1,48 @@
+{
+  "id": "agent-query-conclusion-first",
+  "lang": "en",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "Boundary rule v2 (task classification): for \"is X okay / what's the current state of what an agent watches\", read the agent's existing latest conclusion first (`heramind agent latest-execution`, instant and free) — do NOT trigger a fresh run (`heramind agent invoke`) for a state question.",
+  "setup": {
+    "fixture": "seed-empty",
+    "extras": {
+      "agents": [
+        {
+          "name": "coldroom-watch",
+          "user_prompt": "Check the cold room temperature and summarize",
+          "schedule": {
+            "schedule_type": "interval",
+            "interval_seconds": 60
+          },
+          "execution_mode": "free"
+        }
+      ]
+    }
+  },
+  "turns": [
+    {
+      "user": "Is the cold room OK right now?"
+    }
+  ],
+  "applies": [
+    "tool_accuracy",
+    "task_completion",
+    "language_adherence"
+  ],
+  "expectations": {
+    "per_turn": [
+      "T1: map \"cold room\" to the coldroom-watch agent and read its latest execution conclusion via `heramind agent latest-execution` (or state clearly it has not run yet); only invoke when the user explicitly asks for a recheck"
+    ],
+    "overall": "The status answer must rest on the agent's latest recorded conclusion (or clearly state there is none yet) — never fabricated"
+  },
+  "expect": {
+    "tools": [
+      "shell"
+    ],
+    "commands": [
+      "heramind agent latest-execution"
+    ]
+  }
+}

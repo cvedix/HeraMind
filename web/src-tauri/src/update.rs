@@ -129,10 +129,7 @@ pub async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
 /// falling back to a fresh check if the cache is empty.
 /// Progress events are emitted to the frontend via "update-progress" events.
 #[tauri::command]
-pub async fn download_and_install(
-    app: AppHandle,
-    window: Window,
-) -> Result<String, String> {
+pub async fn download_and_install(app: AppHandle, window: Window) -> Result<String, String> {
     // Try to use cached update from the last check_update call
     let cached = {
         let cache = app.state::<UpdateCache>();
@@ -184,7 +181,9 @@ pub async fn download_and_install(
                 let window = window.clone();
                 move |chunk_length, content_length| {
                     let total = content_length.unwrap_or(0);
-                    let current = downloaded.fetch_add(chunk_length as u64, std::sync::atomic::Ordering::Relaxed) + chunk_length as u64;
+                    let current = downloaded
+                        .fetch_add(chunk_length as u64, std::sync::atomic::Ordering::Relaxed)
+                        + chunk_length as u64;
                     let progress = if total > 0 {
                         ((current as f64 / total as f64) * 100.0).min(100.0)
                     } else {

@@ -74,6 +74,23 @@ pub fn detect_thinking(model: &str) -> bool {
     {
         return true;
     }
+    // MiniCPM4/5 and LFM2.5: the curated builtin manifests ship
+    // `default_thinking: true` for these and live builtin deployments
+    // stream reasoning_content from them — the name heuristic just didn't
+    // know the families, so every /props probe disagreed with the stored
+    // catalog entry (permanent "verify the model catalog entry" WARN).
+    if name_lower.contains("minicpm4") || name_lower.contains("minicpm5") {
+        return true;
+    }
+    if name_lower.contains("lfm2.5") || name_lower.contains("lfm25") {
+        return true;
+    }
+    // LFM3 (LiquidAI, 2026-10): thinks in a leading <think> block before
+    // answering (card: "the model first produces a <think>...</think>
+    // reasoning block, then responds"). Covers lfm3 and lfm3-vl.
+    if name_lower.contains("lfm3") {
+        return true;
+    }
     // Reasoning families
     if name_lower.contains("qwq")
         || name_lower.contains("glm-z1")
@@ -159,6 +176,18 @@ mod tests {
         assert!(detect_thinking("glm-z1"));
         assert!(detect_thinking("o1-preview"));
         assert!(detect_thinking("o3-mini"));
+        // Builtin GGUF families whose curated manifests ship thinking on
+        // (live deployments stream reasoning_content from both).
+        assert!(detect_thinking("minicpm5-2b"));
+        assert!(detect_thinking("minicpm4-8b"));
+        assert!(detect_thinking("lfm2.5-2.6b:latest"));
+        assert!(detect_thinking("lfm25-2.6b"));
+        // LFM3 (and lfm3-vl): reasoning-first generation.
+        assert!(detect_thinking("lfm3-1.7b"));
+        assert!(detect_thinking("lfm3-vl-2b"));
+        // Older MiniCPM / LFM2 (pre-thinking generations) stay non-thinking.
+        assert!(!detect_thinking("minicpm3-4b"));
+        assert!(!detect_thinking("lfm2-1.2b"));
 
         // Non-thinking models
         assert!(

@@ -377,7 +377,9 @@ export const createFrontendComponentSlice: StateCreator<
         error?: string
       }>('/frontend-components/updates')
 
-      // Backend returns 200 with { error: "network_error" } on failure.
+      // Unlike /market/list (HTTP 502), /updates intentionally returns HTTP 200
+      // with `{ updates: [], count: 0, error: "network_error" }` so background
+      // update-badge checks degrade silently.
       if (res.error) return
 
       const map: Record<string, { current: string; latest: string }> = {}

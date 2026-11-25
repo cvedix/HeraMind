@@ -5,23 +5,47 @@
 
 use super::*;
 
+/// Burst-merge window for Free/Focused event agents — see the debounce
+/// comment in `check_and_trigger_data_event`. Structured agents use their
+/// OperatorConfig value instead.
+const DEFAULT_FREE_EVENT_DEBOUNCE_SECS: i64 = 30;
+
+/// Floor for the Free/Focused burst-merge window. One physical report often
+/// fans out to N per-metric events on the bus; with an on-demand cooldown
+/// (0s) and no floor, each of those would spawn its own admission task and
+/// race the in-flight guard. One second collapses the fan-out into the run
+/// that actually processes it.
+const MIN_BURST_MERGE_SECS: i64 = 1;
+
+/// How long an admission timestamp stays in the event dedup map. Must exceed
+/// any cooldown a user can configure for the cooldown check to see it — 1h
+/// covers practical values (beyond that the entry ages out and the window
+/// degrades to "no cooldown", the fail-open direction).
+const EVENT_DEDUP_RETENTION_SECS: i64 = 3600;
+
 impl AgentExecutor {
-    /// Prune stale entries from the event dedup map.
-    /// Entries older than 360 s (6× the 60 s cooldown) are removed.
+    /// Prune stale entries from the event dedup map. Entries older than
+    /// `EVENT_DEDUP_RETENTION_SECS` are removed. Also prunes recovery-probe
+    /// state untouched for a day (deleted agents, long-recovered ones the
+    /// success path already removed).
     async fn cleanup_stale_dedup_entries(&self) {
         let now = chrono::Utc::now().timestamp();
         let mut recent = self.recent_executions.write().await;
-        recent.retain(|_, &mut ts| now - ts < 360);
+        recent.retain(|_, &mut ts| now - ts < EVENT_DEDUP_RETENTION_SECS);
+        drop(recent);
+        super::global_error_probe_state()
+            .write()
+            .retain(|_, e| now - e.last_attempt < 86_400);
     }
 
     /// Mark a manual execution of an event-type agent in the dedup map.
     ///
     /// Without this, `execute_agent_now` runs without registering in
     /// `recent_executions`, so the next real event for any of the agent's
-    /// bound sources can fire within the 60 s cooldown window — yielding a
+    /// bound sources can fire inside the cooldown window — yielding a
     /// duplicate execution (duplicate journal entry, potential duplicate
-    /// notification, wasted LLM tokens). Manual execution should cool the
-    /// same window.
+    /// notification, wasted LLM tokens). Manual execution cools the same
+    /// window.
     ///
     /// For non-event agents this is a no-op (the dedup key is only
     /// consulted by the event-trigger path).
@@ -37,221 +61,20 @@ impl AgentExecutor {
             return;
         }
 
-        // Cool every bound source so any incoming event for one of them
-        // is deduped. The event-trigger path keys on
-        // `{agent_id}:{source_type}:{source_id}` (line 265), so we
-        // pre-insert entries for each candidate the agent would match.
-        // This is symmetric with how the event path itself behaves after
-        // a successful firing.
-        let candidates = Self::extract_trigger_candidates(&agent);
+        // The event-trigger path keys its cooldown on the bare agent id,
+        // so a manual run simply occupies that same key — symmetric with
+        // how the event path records a successful firing.
         let now = chrono::Utc::now().timestamp();
         let mut recent = self.recent_executions.write().await;
-
-        // If the agent has no concrete candidates (e.g. only `"all"` wildcards
-        // in its event_filter), fall back to a synthetic agent-scoped key.
-        // This doesn't prevent a real event from firing (no matching key to
-        // consult), but at least records that a manual run happened — useful
-        // for debugging and gives the cleanup pass something to prune.
-        if candidates.is_empty() {
-            let key = format!("{}:manual:wildcard", agent_id);
-            recent.insert(key, now);
-        } else {
-            for (s_type, s_id, _field) in &candidates {
-                // Field is intentionally NOT in the dedup key — matches
-                // the event-trigger path's keying convention, so a real
-                // event firing on the same `(agent, source)` is properly
-                // deduped regardless of which specific field triggered it.
-                let key = format!("{}:{}:{}", agent_id, s_type, s_id);
-                recent.insert(key, now);
-            }
-        }
+        recent.insert(agent_id.to_string(), now);
 
         // Opportunistic cleanup — mirrors the event-trigger entry path.
-        recent.retain(|_, &mut ts| now - ts < 360);
+        recent.retain(|_, &mut ts| now - ts < EVENT_DEDUP_RETENTION_SECS);
 
         tracing::debug!(
             agent_id = %agent_id,
-            candidate_count = candidates.len(),
             "Marked manual execution in event dedup map"
         );
-    }
-
-    /// Check if an event should trigger any agent and execute it (legacy device-only entry point).
-    pub async fn check_and_trigger_event(
-        &self,
-        device_id: String,
-        metric: &str,
-        value: &MetricValue,
-    ) -> AgentResult<()> {
-        // Refresh event-triggered agents cache
-        self.refresh_event_agents().await;
-
-        let event_agents = self.event_agents.read().await;
-
-        tracing::debug!(
-            device_id = %device_id,
-            metric = %metric,
-            event_agent_count = event_agents.len(),
-            "[EVENT] Checking device event against {} event-triggered agents",
-            event_agents.len()
-        );
-
-        // Clone device_id for use in spawned tasks
-        let device_id_for_spawn = device_id.clone();
-
-        // Clean up old entries from recent_executions (older than cooldown window)
-        self.cleanup_stale_dedup_entries().await;
-        let now = chrono::Utc::now().timestamp();
-
-        for agent in event_agents.values() {
-            // Check if this agent has event-based schedule
-            if matches!(
-                agent.schedule.schedule_type,
-                heramind_storage::ScheduleType::Event
-            ) {
-                // Check if agent's event filter matches this event
-                if self
-                    .matches_data_source_filter(agent, "device", &device_id, metric)
-                    .await
-                {
-                    // Cooldown: one execution per (agent, source) per 60s window
-                    const COOLDOWN_SECS: i64 = 60;
-                    let dedup_key = format!("{}:device:{}", agent.id, device_id);
-                    let recent = self.recent_executions.read().await;
-                    let is_duplicate = recent
-                        .get(&dedup_key)
-                        .map(|&timestamp| now - timestamp < COOLDOWN_SECS)
-                        .unwrap_or(false);
-                    drop(recent);
-
-                    if is_duplicate {
-                        tracing::info!(
-                            agent_name = %agent.name,
-                            device_id = %device_id,
-                            metric = %metric,
-                            "Skipping event-triggered execution (cooldown: {}s)",
-                            COOLDOWN_SECS
-                        );
-                        continue;
-                    }
-
-                    // Clone dedup_key before it's moved into the recent_executions map;
-                    // the spawned task needs a copy to clear the cooldown on failure.
-                    let dedup_key_clone = dedup_key.clone();
-
-                    // Mark this execution as recent
-                    {
-                        let mut recent = self.recent_executions.write().await;
-                        recent.insert(dedup_key, now);
-                    }
-
-                    tracing::debug!(
-                        agent_name = %agent.name,
-                        device_id = %device_id,
-                        metric = %metric,
-                        "Event-triggered agent execution"
-                    );
-
-                    // Clone the agent and event data for execution
-                    let agent_clone = agent.clone();
-                    let metric_clone = metric.to_string();
-                    let value_clone = value.clone();
-                    let device_id_for_task = device_id_for_spawn.clone();
-                    let timestamp = chrono::Utc::now().timestamp();
-
-                    // Build executor config for spawned task
-                    let executor_config = self.build_spawn_config(agent);
-                    let agent_id_for_log = agent.id.clone();
-                    let recent_executions_clone = self.recent_executions.clone();
-
-                    let handle = tokio::spawn(async move {
-                        // Acquire the GLOBAL execution semaphore first (WAIT):
-                        // scheduled executions hold this same permit, and event
-                        // bursts used to stack past the global bound because
-                        // only the per-backend permit was held. Held for the
-                        // whole run (dropped when this task ends).
-                        let _global_permit = match executor_config.execution_semaphore.clone() {
-                            Some(sem) => sem.acquire_owned().await.ok(),
-                            None => None,
-                        };
-                        // Acquire per-backend semaphore (WAIT, not fail)
-                        Self::acquire_backend_permit(
-                            &executor_config.backend_semaphores,
-                            &agent_id_for_log,
-                            &agent_clone
-                                .llm_backend_id
-                                .clone()
-                                .unwrap_or_else(|| "default".to_string()),
-                        )
-                        .await;
-
-                        // Create event trigger data
-                        let event_trigger_data = EventTriggerData {
-                            source: DataSourceRef {
-                                source_type: "device".to_string(),
-                                source_id: device_id_for_task,
-                                field: metric_clone,
-                            },
-                            value: value_clone,
-                            timestamp,
-                        };
-
-                        match AgentExecutor::new(executor_config).await {
-                            Ok(executor) => {
-                                tracing::debug!(
-                                    agent_id = %agent_id_for_log,
-                                    trigger_device = %event_trigger_data.source.source_id,
-                                    trigger_metric = %event_trigger_data.source.field,
-                                    "Executing event-triggered agent with event data"
-                                );
-
-                                // Execute the agent with event data (includes the triggering metric value directly).
-                                // On failure, perform one inline retry with a short backoff; if the retry
-                                // also fails, clear the cooldown marker so transient errors (API hiccups,
-                                // network blips) don't lock out subsequent events for 60 seconds.
-                                let result = Self::execute_with_retry(
-                                    &executor,
-                                    agent_clone,
-                                    event_trigger_data,
-                                    1,
-                                    &agent_id_for_log,
-                                )
-                                .await;
-
-                                if result.is_err() {
-                                    let mut recent = recent_executions_clone.write().await;
-                                    recent.remove(&dedup_key_clone);
-                                    tracing::info!(
-                                        agent_id = %agent_id_for_log,
-                                        dedup_key = %dedup_key_clone,
-                                        "Cleared event cooldown after failed execution"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    agent_id = %agent_id_for_log,
-                                    error = %e,
-                                    "Failed to create executor for event-triggered agent"
-                                );
-                                // Executor creation failed — clear cooldown so the next event can retry.
-                                let mut recent = recent_executions_clone.write().await;
-                                recent.remove(&dedup_key_clone);
-                            }
-                        }
-                    });
-                    // [cancellation] register the handle so shutdown can abort it;
-                    // prune finished entries to keep the registry bounded.
-                    {
-                        let mut handles = self.event_task_handles.lock();
-                        handles.retain(|h| !h.is_finished());
-                        handles.push(handle);
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Unified entry point for triggering agents on any data source update.
@@ -292,21 +115,81 @@ impl AgentExecutor {
                 continue;
             }
 
-            // Check if agent's data source filter matches this event
+            // Does this event fire the agent? With an `all` filter this folds
+            // the event into the agent's window and answers `true` only on the
+            // one that completes it.
             if !self
-                .matches_data_source_filter(agent, source_type, &source_id, &field)
+                .event_fires(agent, source_type, &source_id, &field, now)
                 .await
             {
                 continue;
             }
 
-            // Cooldown: one execution per (agent, source) per 60s window
-            const COOLDOWN_SECS: i64 = 60;
-            let dedup_key = format!("{}:{}:{}", agent.id, source_type, source_id);
+            // Resolve this agent's operator config once: both pacing knobs
+            // (debounce below, cooldown after) read from it.
+            let op_cfg = agent
+                .operator_config
+                .clone()
+                .unwrap_or_else(super::structured::default_operator_config);
+
+            // Burst-merge guardrail for EVERY mode. One physical event can
+            // match several of this agent's sources, and N sources reporting
+            // in the same instant used to fire N CONCURRENT runs for
+            // Free/Focused agents (debounce was Structured-only) — concurrent
+            // runs of one agent race its journal read-modify-write and burn
+            // the concurrency budget. Free/Focused track the cooldown,
+            // floored at 1s. Structured keeps its OperatorConfig window —
+            // EXCEPT when an explicit cooldown is set: the user who set
+            // event_cooldown_secs stated their pacing intent, and a stale
+            // debounce default must not silently override it (cooldown 0 +
+            // the default 30s debounce kept image agents on a 30s cadence
+            // while their UI said "on-demand"). The cap only fires on an
+            // explicit cooldown, and no pre-existing agent can have one —
+            // the field shipped with the cooldown feature itself.
+            let cooldown_secs = op_cfg.effective_event_cooldown_secs();
+            let debounce_secs = match agent.execution_mode {
+                heramind_storage::agents::ExecutionMode::Structured => {
+                    match op_cfg.event_cooldown_secs {
+                        None => op_cfg.debounce_secs as i64,
+                        Some(cooldown) => (op_cfg.debounce_secs as i64)
+                            .min(cooldown.max(MIN_BURST_MERGE_SECS as u32) as i64),
+                    }
+                }
+                _ => DEFAULT_FREE_EVENT_DEBOUNCE_SECS
+                    .min(cooldown_secs)
+                    .max(MIN_BURST_MERGE_SECS),
+            };
+            if debounce_secs > 0 {
+                let last = self
+                    .last_event_inference
+                    .read()
+                    .get(&agent.id)
+                    .copied()
+                    .unwrap_or(0);
+                if now - last < debounce_secs {
+                    tracing::info!(
+                        agent_name = %agent.name,
+                        source_id = %source_id,
+                        field = %field,
+                        debounce_secs,
+                        "Merged into the debounce window — skipping data event execution"
+                    );
+                    continue;
+                }
+            }
+
+            // Cooldown: minimum spacing between two ADMITTED runs of this
+            // agent, measured from the previous admission — per-agent via
+            // `OperatorConfig::event_cooldown_secs` (default 60s, 0 =
+            // on-demand). The old hard-coded 60s floor idled fast agents:
+            // a 5s run spent 55s dropping events that had arrived after it
+            // finished. On-demand setups rely on execute_agent's
+            // one-run-at-a-time guard as their only backpressure.
+            let dedup_key = agent.id.clone();
             let recent = self.recent_executions.read().await;
             let is_duplicate = recent
                 .get(&dedup_key)
-                .map(|&timestamp| now - timestamp < COOLDOWN_SECS)
+                .map(|&timestamp| now - timestamp < cooldown_secs)
                 .unwrap_or(false);
             drop(recent);
 
@@ -317,19 +200,72 @@ impl AgentExecutor {
                     source_id = %source_id,
                     field = %field,
                     "Skipping data event-triggered execution (cooldown: {}s)",
-                    COOLDOWN_SECS
+                    cooldown_secs
                 );
                 continue;
+            }
+
+            // Recovery probe gate for demoted (Error) agents. A matching
+            // event is a probe OPPORTUNITY, but probes run at backoff
+            // intervals — a broken agent must not burn an LLM call per
+            // event. Placed after the debounce/cooldown gates so only a run
+            // that will actually spawn claims the probe slot; the spawn
+            // records the outcome (recovered → entry cleared, still broken →
+            // next probe one rung further up the backoff ladder).
+            let was_probe = agent.status == heramind_storage::AgentStatus::Error;
+            if was_probe {
+                let backoff_elapsed = {
+                    let probes = super::global_error_probe_state().read();
+                    match probes.get(&agent.id) {
+                        None => true,
+                        Some(entry) => {
+                            now - entry.last_attempt
+                                >= super::error_probe_backoff_secs(entry.consecutive_failures)
+                        }
+                    }
+                };
+                if !backoff_elapsed {
+                    tracing::trace!(
+                        agent_name = %agent.name,
+                        source_id = %source_id,
+                        field = %field,
+                        "Error agent probe still in backoff — skipping"
+                    );
+                    continue;
+                }
+                super::global_error_probe_state()
+                    .write()
+                    .entry(agent.id.clone())
+                    .and_modify(|e| e.last_attempt = now)
+                    .or_insert(super::ErrorProbeEntry {
+                        last_attempt: now,
+                        consecutive_failures: 0,
+                    });
+                tracing::info!(
+                    agent_name = %agent.name,
+                    source_id = %source_id,
+                    field = %field,
+                    "Error agent — admitting recovery probe"
+                );
             }
 
             // Clone dedup_key before it's moved into the recent_executions map;
             // the spawned task needs a copy to clear the cooldown on failure.
             let dedup_key_clone = dedup_key.clone();
 
-            // Mark this execution as recent
+            // Mark this execution as recent. The AND window (if any) is
+            // consumed HERE — past the debounce merge and the cooldown, the
+            // run is admitted and a retained complete window must not
+            // re-fire duplicates after the run finishes.
             {
                 let mut recent = self.recent_executions.write().await;
                 recent.insert(dedup_key, now);
+                self.clear_event_window(&agent.id);
+            }
+            if debounce_secs > 0 {
+                self.last_event_inference
+                    .write()
+                    .insert(agent.id.clone(), now);
             }
 
             tracing::debug!(
@@ -360,8 +296,11 @@ impl AgentExecutor {
                     Some(sem) => sem.acquire_owned().await.ok(),
                     None => None,
                 };
-                // Acquire per-backend semaphore (WAIT, not fail)
-                Self::acquire_backend_permit(
+                // Acquire per-backend semaphore (WAIT, not fail). BIND the
+                // permit — the return used to be discarded, so the guard
+                // released the instant acquire returned and the per-backend
+                // limit never actually held on this path.
+                let _backend_permit = Self::acquire_backend_permit(
                     &executor_config.backend_semaphores,
                     &agent_id_for_log,
                     &agent_clone
@@ -413,6 +352,46 @@ impl AgentExecutor {
                                 "Cleared event cooldown after failed execution"
                             );
                         }
+
+                        // Recovery-probe outcome: the agent's stored status is
+                        // the ground truth — execute_agent resets Error →
+                        // Active only on a completed run. Recovered clears
+                        // the ladder; still broken climbs one backoff rung.
+                        if was_probe {
+                            let recovered = executor
+                                .store()
+                                .get_agent(&agent_id_for_log)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|a| a.status == heramind_storage::AgentStatus::Active)
+                                .unwrap_or(false);
+                            if recovered {
+                                super::global_error_probe_state()
+                                    .write()
+                                    .remove(&agent_id_for_log);
+                                tracing::info!(
+                                    agent_id = %agent_id_for_log,
+                                    "Recovery probe SUCCEEDED — agent back to Active"
+                                );
+                            } else {
+                                super::global_error_probe_state()
+                                    .write()
+                                    .entry(agent_id_for_log.clone())
+                                    .and_modify(|e| {
+                                        e.consecutive_failures =
+                                            e.consecutive_failures.saturating_add(1)
+                                    })
+                                    .or_insert(super::ErrorProbeEntry {
+                                        last_attempt: timestamp,
+                                        consecutive_failures: 1,
+                                    });
+                                tracing::info!(
+                                    agent_id = %agent_id_for_log,
+                                    "Recovery probe failed — backoff ladder stepped up"
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::error!(
@@ -422,6 +401,15 @@ impl AgentExecutor {
                         );
                         let mut recent = recent_executions_clone.write().await;
                         recent.remove(&dedup_key_clone);
+                        if was_probe {
+                            super::global_error_probe_state()
+                                .write()
+                                .entry(agent_id_for_log.clone())
+                                .and_modify(|e| {
+                                    e.consecutive_failures =
+                                        e.consecutive_failures.saturating_add(1)
+                                });
+                        }
                     }
                 }
             });
@@ -457,6 +445,17 @@ impl AgentExecutor {
             skill_registry: self._config.skill_registry.clone(),
             execution_semaphore: self._config.execution_semaphore.clone(),
         }
+    }
+
+    /// Acquire a per-backend semaphore permit (WAIT, not fail). Shared by
+    /// the event path and the manual-invoke path so both are accounted
+    /// against the same per-backend limits as the scheduler.
+    pub(crate) async fn acquire_backend_permit_public(
+        semaphores: &Option<crate::ai_agent::scheduler::BackendSemaphores>,
+        agent_id: &str,
+        backend_id: &str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Self::acquire_backend_permit(semaphores, agent_id, backend_id).await
     }
 
     /// Acquire a per-backend semaphore permit for event-triggered execution.
@@ -618,7 +617,7 @@ impl AgentExecutor {
     /// execution record), or `Err` if all attempts fail — callers should clear
     /// the event cooldown marker on `Err` so transient failures don't lock out
     /// subsequent events.
-    async fn execute_with_retry(
+    pub(super) async fn execute_with_retry(
         executor: &AgentExecutor,
         agent: AiAgent,
         event_data: EventTriggerData,
@@ -646,6 +645,57 @@ impl AgentExecutor {
                     // cooldown-clear dead code — transient LLM faults got no
                     // retry and the 60s window stayed locked.
                     if record.status == heramind_storage::ExecutionStatus::Failed {
+                        // Daily-cap refusals arrive as Failed records (the
+                        // budget check lives inside execute_agent). Retrying a
+                        // midnight-resetting cap from a 5s backoff ladder just
+                        // burns attempts — skip cleanly; tomorrow's first
+                        // event proceeds under a fresh budget.
+                        if record
+                            .error
+                            .as_deref()
+                            .map(|e| e.to_lowercase().contains("daily run cap"))
+                            .unwrap_or(false)
+                        {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                execution_id = %record.id,
+                                "Event trigger refused by daily run cap — skipping (not a failure)"
+                            );
+                            return Ok(());
+                        }
+                        // Empty-event skips are Completed in execute_agent; if a
+                        // Failed record still carries the skip marker, do not
+                        // 5s×N replay / breaker-storm it.
+                        if record
+                            .result
+                            .as_ref()
+                            .is_some_and(super::is_empty_event_skip)
+                        {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                execution_id = %record.id,
+                                "Event trigger empty-data skip — not retrying"
+                            );
+                            return Ok(());
+                        }
+                        // Vision reject / partial business failure after a
+                        // successful message send / device control must not be
+                        // replayed — that would duplicate side effects.
+                        if record
+                            .result
+                            .as_ref()
+                            .is_some_and(|r| r.actions_executed.iter().any(|a| a.success))
+                        {
+                            tracing::warn!(
+                                agent_id = %agent_id,
+                                execution_id = %record.id,
+                                "Event-triggered execution Failed after successful side effects — not retrying"
+                            );
+                            return Err(crate::error::HeraMindError::Llm(format!(
+                                "event-triggered execution failed after successful side effects (execution_id={})",
+                                record.id
+                            )));
+                        }
                         if attempt <= retries {
                             tracing::warn!(
                                 agent_id = %agent_id,
@@ -671,6 +721,34 @@ impl AgentExecutor {
                     return Ok(());
                 }
                 Err(e) => {
+                    // Daily-cap refusals are a budget pause, not a fault:
+                    // retrying within the backoff window just burns 5s per
+                    // attempt against a cap that resets at midnight. The
+                    // listener's cooldown still applies, so tomorrow's first
+                    // event proceeds normally.
+                    if e.to_string().to_lowercase().contains("daily run cap") {
+                        tracing::info!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "Event trigger refused by daily run cap — skipping (not a failure)"
+                        );
+                        return Ok(());
+                    }
+                    // Busy, not broken: "already executing" means another run
+                    // (an earlier admission from the same burst, or a manual
+                    // invoke) holds the agent. Retrying after the 5s backoff
+                    // queued a phantom second run behind it — with an
+                    // on-demand cooldown (0s) every burst turned into a
+                    // back-to-back run queue. Drop instead: the next event
+                    // after the in-flight run finishes re-triggers
+                    // naturally. Mirrors the scheduler's treatment.
+                    if e.to_string().to_lowercase().contains("already executing") {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            "Event admission found the agent busy — dropping (in-flight run owns it)"
+                        );
+                        return Ok(());
+                    }
                     if attempt <= retries {
                         tracing::warn!(
                             agent_id = %agent_id,
@@ -692,6 +770,75 @@ impl AgentExecutor {
                 }
             }
         }
+    }
+
+    /// Decide whether one event fires `agent`, folding it into the agent's
+    /// `all` window when the filter has one (M2-1).
+    ///
+    /// `any` keeps the pre-M2 behaviour exactly — the first matching source
+    /// fires immediately. `all` fires only on the event that completes the
+    /// window. A filter the parser does not recognise falls back to the
+    /// resource bindings, which is what it has always done.
+    async fn event_fires(
+        &self,
+        agent: &AiAgent,
+        source_type: &str,
+        source_id: &str,
+        field: &str,
+        now: i64,
+    ) -> bool {
+        let filter = match agent.schedule.parsed_event_filter() {
+            Some(filter) => filter,
+            None => {
+                return self
+                    .matches_data_source_filter(agent, source_type, source_id, field)
+                    .await
+            }
+        };
+
+        if filter
+            .any
+            .iter()
+            .any(|spec| spec.matches_event(source_type, source_id, field))
+        {
+            self.clear_event_window(&agent.id);
+            return true;
+        }
+
+        if filter.all.is_empty() {
+            return false;
+        }
+
+        let state = self.event_windows.read().get(&agent.id).cloned();
+        match filter.observe(state.as_ref(), source_type, source_id, field, now) {
+            heramind_storage::agents::WindowOutcome::Fire => {
+                // The window is NOT consumed here: the caller may still skip
+                // this firing (debounce merge, cooldown, spawn failure), and
+                // clearing up front silently discarded a genuinely-completed
+                // AND — the aggregation held, but no run ever happened and no
+                // later event could re-complete the window. The caller clears
+                // once the run is actually admitted.
+                true
+            }
+            heramind_storage::agents::WindowOutcome::Pending(next) => {
+                match next {
+                    Some(window) => {
+                        self.event_windows.write().insert(agent.id.clone(), window);
+                    }
+                    // Nothing to carry forward — make sure no stale window is
+                    // left behind to be completed by some later event.
+                    None => self.clear_event_window(&agent.id),
+                }
+                false
+            }
+        }
+    }
+
+    /// Drop an agent's open `all` window. Called whenever the agent fires, so a
+    /// half-collected window cannot complete straight after a run and produce
+    /// a duplicate execution.
+    fn clear_event_window(&self, agent_id: &str) {
+        self.event_windows.write().remove(agent_id);
     }
 
     /// Check if a data source update matches an agent's trigger conditions.
@@ -842,21 +989,28 @@ impl AgentExecutor {
         false
     }
 
-    /// Refresh the cache of event-triggered agents.
+    /// Refresh the cache of event-triggered agents. Loads Active AND Error
+    /// agents: Error agents are invisible to every scheduled probe (their
+    /// `next_execution` is `i64::MAX`), so without loading them here the
+    /// breaker would be a silent death sentence for event agents — the
+    /// probe gate in `check_and_trigger_data_event` is their only way back.
     async fn refresh_event_agents(&self) {
-        let filter = heramind_storage::AgentFilter {
-            status: Some(heramind_storage::AgentStatus::Active),
-            ..Default::default()
-        };
+        // No status filter: paused/stopped are excluded below. Agent counts
+        // are small; the in-memory filter is equivalent to two queries.
+        let filter = heramind_storage::AgentFilter::default();
 
         if let Ok(agents) = self.store.query_agents(filter).await {
-            let total_active = agents.len();
+            let total_loaded = agents.len();
             let event_agents: HashMap<String, AiAgent> = agents
                 .into_iter()
                 .filter(|a| {
                     matches!(
                         a.schedule.schedule_type,
                         heramind_storage::ScheduleType::Event
+                    ) && matches!(
+                        a.status,
+                        heramind_storage::AgentStatus::Active
+                            | heramind_storage::AgentStatus::Error
                     )
                 })
                 .map(|a| (a.id.clone(), a))
@@ -867,7 +1021,7 @@ impl AgentExecutor {
             *cache = event_agents;
 
             tracing::debug!(
-                total_active_agents = total_active,
+                total_loaded_agents = total_loaded,
                 event_triggered_agents = cache.len(),
                 previous_count = previous_count,
                 "[EVENT] Refreshed event-triggered agents cache"

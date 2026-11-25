@@ -11,10 +11,15 @@
 #   NO_SERVICE     - Skip service installation (default: false)
 #   WITH_LLM      - Install the llama.cpp runtime (heramind-llama-server) from
 #                   official prebuilt binaries (default: true)
-#   LLAMA_VERSION - llama.cpp release tag for the runtime (default: b10545)
+#   LLAMA_VERSION - llama.cpp release tag for the runtime (default: b12359 =
+#                   official v1.0.0 binaries). Must stay in sync with
+#                   LLAMA_CPP_VERSION in
+#                   crates/heramind-core/src/builtin_llm/runtime.rs — enforced
+#                   by scripts/check_llama_pin_sync.py in CI.
 #   BUILTIN_MODEL - Pre-download a builtin model GGUF + manifest into DATA_DIR:
-#                   lfm25-2.6b | qwen3.5-4b | gemma4-e2b | none (default: none —
-#                   the in-app wizard offers the same choices)
+#                   sparkx2.6-1.7b (recommended) | lfm25-2.6b | qwen3.5-4b |
+#                   gemma4-e2b | none (default: none — the in-app wizard
+#                   offers the same choices)
 #   USE_NGINX      - Configure nginx reverse proxy (default: false)
 #   PORT           - Backend API port (default: 9375)
 
@@ -39,7 +44,7 @@ NO_SERVICE="${NO_SERVICE:-false}"
 USE_NGINX="${USE_NGINX:-false}"
 PORT="${PORT:-9375}"
 WITH_LLM="${WITH_LLM:-true}"
-LLAMA_VERSION="${LLAMA_VERSION:-b10545}"
+LLAMA_VERSION="${LLAMA_VERSION:-b12359}"
 BUILTIN_MODEL="${BUILTIN_MODEL:-none}"
 
 status() { echo "${BLUE}[INFO]${NC} $*"; }
@@ -280,8 +285,23 @@ EOF
     # Configure nginx (optional, for frontend-backend separation)
     if [ "$USE_NGINX" = "true" ]; then
         if available nginx; then
-            status "Configuring nginx..."
-            $SUDO tee /etc/nginx/sites-available/heramind >/dev/null <<'EOF'
+            # Debian-family nginx loads vhosts from sites-enabled (symlinked
+            # from sites-available); RHEL-family (RHEL/Rocky/Alma/openEuler/
+            # Kylin/UOS) only auto-loads /etc/nginx/conf.d/*.conf. Detect the
+            # layout and place the server block where this distro's nginx
+            # will actually load it.
+            if [ -d /etc/nginx/sites-available ] && [ -d /etc/nginx/sites-enabled ]; then
+                NGINX_SITE_CONF=/etc/nginx/sites-available/heramind
+                NGINX_DEBIAN_LAYOUT=true
+            else
+                NGINX_SITE_CONF=/etc/nginx/conf.d/heramind.conf
+                NGINX_DEBIAN_LAYOUT=false
+            fi
+            status "Configuring nginx (${NGINX_SITE_CONF})..."
+            # Source-built nginx may have neither layout dir — create the one
+            # we write into so tee doesn't abort the install (set -e).
+            $SUDO mkdir -p "$(dirname "$NGINX_SITE_CONF")"
+            $SUDO tee "$NGINX_SITE_CONF" >/dev/null <<'EOF'
 server {
     listen 80;
     server_name _;
@@ -345,17 +365,23 @@ server {
 }
 EOF
             # Replace placeholders with actual values
-            $SUDO sed -i "s|WEB_DIR_PLACEHOLDER|${WEB_DIR}|g" /etc/nginx/sites-available/heramind
-            $SUDO sed -i "s|PORT_PLACEHOLDER|${PORT}|g" /etc/nginx/sites-available/heramind
+            $SUDO sed -i "s|WEB_DIR_PLACEHOLDER|${WEB_DIR}|g" "$NGINX_SITE_CONF"
+            $SUDO sed -i "s|PORT_PLACEHOLDER|${PORT}|g" "$NGINX_SITE_CONF"
 
-            # Enable site
-            if [ ! -L /etc/nginx/sites-enabled/heramind ]; then
-                $SUDO ln -sf /etc/nginx/sites-available/heramind /etc/nginx/sites-enabled/heramind
-            fi
+            if [ "$NGINX_DEBIAN_LAYOUT" = "true" ]; then
+                # Enable site
+                if [ ! -L /etc/nginx/sites-enabled/heramind ]; then
+                    $SUDO ln -sf /etc/nginx/sites-available/heramind /etc/nginx/sites-enabled/heramind
+                fi
 
-            # Remove default site if it exists and heramind is the only site
-            if [ -L /etc/nginx/sites-enabled/default ]; then
-                $SUDO rm -f /etc/nginx/sites-enabled/default
+                # Remove default site if it exists and heramind is the only site
+                if [ -L /etc/nginx/sites-enabled/default ]; then
+                    $SUDO rm -f /etc/nginx/sites-enabled/default
+                fi
+            elif [ -f /etc/nginx/conf.d/default.conf ]; then
+                # RHEL-family ships a default.conf server on :80 — move it
+                # aside so it doesn't conflict with our server block.
+                $SUDO mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled 2>/dev/null || true
             fi
 
             # Test and reload nginx
@@ -363,7 +389,7 @@ EOF
                 $SUDO systemctl reload nginx 2>/dev/null || $SUDO systemctl restart nginx 2>/dev/null || true
                 success "Nginx configured and reloaded"
             else
-                warning "Nginx config test failed. Please check /etc/nginx/sites-available/heramind"
+                warning "Nginx config test failed. Please check ${NGINX_SITE_CONF}"
             fi
         else
             warning "nginx not found. Skipping nginx configuration."
@@ -594,13 +620,28 @@ llama_asset() {
 # official prebuilt binaries so the built-in LLM works out of the box.
 install_llm_runtime() {
     [ "$WITH_LLM" = "true" ] || return 0
-    # The prebuilt binaries link OpenMP — on glibc Linux they need libgomp1
+    # The prebuilt binaries link OpenMP — on glibc Linux they need libgomp
     # (identical to the Docker runtime stage's libgomp1 fix). Missing → the
     # binary fails to exec with "libgomp.so.1: cannot open shared object".
-    if command -v apt-get >/dev/null 2>&1; then
-        if ! ldconfig -p 2>/dev/null | grep -q 'libgomp.so.1'; then
-            status "Installing libgomp1 (llama.cpp OpenMP dependency)..."
-            apt-get install -y -qq libgomp1 >/dev/null 2>&1 ||                 warning "Could not install libgomp1 — heramind-llama-server may fail to start"
+    # Linux-only: darwin has no ldconfig/libgomp and the macos prebuilts
+    # don't need this.
+    if [ "$OS" = "linux" ] && ! ldconfig -p 2>/dev/null | grep -q 'libgomp.so.1'; then
+        status "Installing libgomp (llama.cpp OpenMP dependency)..."
+        if available apt-get; then
+            $SUDO apt-get install -y -qq libgomp1 >/dev/null 2>&1 || \
+                warning "Could not install libgomp1 — heramind-llama-server may fail to start"
+        elif available dnf; then
+            $SUDO dnf install -y -q libgomp >/dev/null 2>&1 || \
+                warning "Could not install libgomp — heramind-llama-server may fail to start"
+        elif available yum; then
+            $SUDO yum install -y -q libgomp >/dev/null 2>&1 || \
+                warning "Could not install libgomp — heramind-llama-server may fail to start"
+        elif available zypper; then
+            $SUDO zypper --non-interactive install libgomp1 >/dev/null 2>&1 || \
+                warning "Could not install libgomp1 — heramind-llama-server may fail to start"
+        else
+            warning "No supported package manager found (apt/dnf/yum/zypper)."
+            warning "Install libgomp manually or heramind-llama-server may fail to start."
         fi
     fi
     local asset url tmp bin
@@ -653,6 +694,10 @@ install_builtin_model() {
     [ "$BUILTIN_MODEL" = "none" ] && return 0
     local id="$BUILTIN_MODEL" repo file local sha quant dir
     case "$id" in
+        sparkx2.6-1.7b)
+            repo="XHToken/Spark-X2.6-1.7B-GGUF"; file="Spark-X2.6-1.7B-Q4_K_M.gguf"
+            local="sparkx2.6-1.7b-q4_k_m.gguf"
+            sha="7abd9859c10924be3c583945456fa9b25d0569484876105a7b7376f7938fffb7"; quant="q4_k_m" ;;
         lfm25-2.6b)
             repo="LiquidAI/LFM2.5-2.6B-GGUF"; file="LFM2.5-2.6B-QAD-Q4_0.gguf"
             local="lfm25-2.6b-qad_q4_0.gguf"
@@ -665,7 +710,7 @@ install_builtin_model() {
             repo="google/gemma-4-E2B-it-qat-q4_0-gguf"; file="gemma-4-E2B_q4_0-it.gguf"
             local="gemma-4-E2B_q4_0-it.qat.gguf"
             sha="fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634"; quant="qat_q4_0" ;;
-        *) error "Unknown BUILTIN_MODEL: ${id} (lfm25-2.6b | qwen3.5-4b | gemma4-e2b | none)" ;;
+        *) error "Unknown BUILTIN_MODEL: ${id} (sparkx2.6-1.7b | lfm25-2.6b | qwen3.5-4b | gemma4-e2b | none)" ;;
     esac
     dir="${DATA_DIR}/models/${id}"
     $SUDO mkdir -p "$dir"

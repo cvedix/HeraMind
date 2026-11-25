@@ -1,4 +1,5 @@
 import { Button } from '@/components/ui/button'
+import { Card } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 import {
   Server,
@@ -31,32 +32,38 @@ export type EmptyStateIconType =
   | 'custom'
 
 const iconMap: Record<Exclude<EmptyStateIconType, 'custom'>, React.ReactNode> = {
-  device: <Server className="h-12 w-12" />,
-  deviceType: <FileJson className="h-12 w-12" />,
-  rule: <Zap className="h-12 w-12" />,
-  workflow: <Workflow className="h-12 w-12" />,
-  alert: <Bell className="h-12 w-12" />,
-  command: <Terminal className="h-12 w-12" />,
-  scenario: <Home className="h-12 w-12" />,
-  plugin: <Package className="h-12 w-12" />,
-  user: <Users className="h-12 w-12" />,
-  settings: <Settings className="h-12 w-12" />,
-  search: <Search className="h-12 w-12" />,
-  inbox: <Inbox className="h-12 w-12" />,
+  device: <Server />,
+  deviceType: <FileJson />,
+  rule: <Zap />,
+  workflow: <Workflow />,
+  alert: <Bell />,
+  command: <Terminal />,
+  scenario: <Home />,
+  plugin: <Package />,
+  user: <Users />,
+  settings: <Settings />,
+  search: <Search />,
+  inbox: <Inbox />,
 }
 
-export interface EmptyStateProps {
-  icon?: React.ReactNode | EmptyStateIconType
+interface EmptyStateBaseProps {
   title: string
   description?: string
-  action?: {
-    label: string
-    onClick: () => void
-    variant?: 'default' | 'outline' | 'secondary' | 'ghost' | 'destructive'
-    icon?: React.ReactNode
-  }
   className?: string
 }
+
+interface EmptyStateAction {
+  label: string
+  onClick: () => void
+  variant?: 'default' | 'outline' | 'secondary' | 'ghost' | 'destructive'
+  icon?: React.ReactNode
+}
+
+/** A visual is reserved for states with a concrete recovery or creation action. */
+export type EmptyStateProps = EmptyStateBaseProps & (
+  | { icon?: undefined; action?: EmptyStateAction }
+  | { icon: React.ReactNode | EmptyStateIconType; action: EmptyStateAction }
+)
 
 /**
  * Empty state component for when there's no data to display
@@ -74,20 +81,20 @@ export function EmptyState({ icon, title, description, action, className }: Empt
 
   return (
     <div className={cn('flex flex-col flex-1 w-full items-center justify-center py-12 px-4 text-center animate-fade-in-up', className)}>
-      {iconContent && (
-        <div className="mb-4 flex h-20 w-20 items-center justify-center rounded-xl bg-primary-light text-primary border border-primary-light">
+      {iconContent && action && (
+        <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-xl bg-muted text-muted-foreground [&>svg]:h-7 [&>svg]:w-7">
           {iconContent}
         </div>
       )}
-      <h3 className="text-lg font-semibold">{title}</h3>
+      <h3 className="text-base font-medium text-foreground">{title}</h3>
       {description && (
-        <p className="mt-2 text-sm text-muted-foreground max-w-sm leading-relaxed">{description}</p>
+        <p className="mt-1.5 max-w-sm text-sm leading-relaxed text-muted-foreground">{description}</p>
       )}
       {action && (
         <Button
           onClick={action.onClick}
           variant={action.variant || 'default'}
-          className="mt-6"
+          className="mt-4"
         >
           {action.icon && <span className="mr-2">{action.icon}</span>}
           {action.label}
@@ -98,24 +105,35 @@ export function EmptyState({ icon, title, description, action, className }: Empt
 }
 
 /**
+ * Card-framed empty state — the page-level convention. An <EmptyState> left
+ * floating in whitespace breaks the page rhythm next to the carded table /
+ * list chrome (ResponsiveTable wraps its mobile empty in exactly this Card,
+ * and agents.tsx made the same call), so custom mobile list branches should
+ * render their empties through this wrapper. ResponsiveTable passes its
+ * emptyState prop ALREADY framed on mobile — do not double-wrap there.
+ */
+export function EmptyStateCard({ children, className }: { children: React.ReactNode; className?: string }) {
+  return (
+    <Card className={cn('overflow-hidden border-0 bg-transparent shadow-none md:border md:border-border md:bg-card', className)}>
+      <div className="p-8">{children}</div>
+    </Card>
+  )
+}
+
+/**
  * Compact empty state for smaller spaces
  */
 export function EmptyStateCompact({
   title,
   description,
-  icon,
 }: {
   title: string
   description?: string
+  /** Compact renders title only; kept for caller compatibility. */
   icon?: React.ReactNode
 }) {
   return (
     <div className="flex flex-col flex-1 w-full items-center justify-center py-6 text-center">
-      {icon && (
-        <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-xl bg-primary-light text-primary border border-primary-light">
-          {icon}
-        </div>
-      )}
       {/* explicit size: compact used to silently inherit whatever the parent set */}
       <p className="text-base font-medium text-muted-foreground">{title}</p>
       {description && (
@@ -140,8 +158,7 @@ export function EmptyStateInline({
   return (
     <tr>
       <td colSpan={colSpan} className={cn('py-8', className)}>
-        <div className="flex flex-col items-center justify-center text-center">
-          <Inbox className="h-10 w-10 text-muted-foreground mb-2" />
+        <div className="flex items-center justify-center text-center">
           <p className="text-sm text-muted-foreground">{title}</p>
         </div>
       </td>

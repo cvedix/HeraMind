@@ -21,5 +21,8 @@
   "minPasswordLength": "Độ dài mật khẩu tối thiểu",
   "minUsernameLength": "Độ dài tên người dùng tối thiểu",
   "passwordNeedsLetter": "Thư cần mật khẩu",
-  "passwordNeedsNumber": "Số cần mật khẩu"
+  "passwordNeedsNumber": "Số cần mật khẩu",
+  "nameRequired": "Hãy nhập tên",
+  "urlRequired": "Hãy nhập một URL",
+  "urlInvalid": "Nhập một URL hợp lệ"
 }

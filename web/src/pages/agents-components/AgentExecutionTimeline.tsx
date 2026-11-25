@@ -1,18 +1,19 @@
-import { useState, useCallback, useEffect, useMemo } from "react"
+import { useState } from "react"
 import { useTranslation } from "react-i18next"
+import { useIsMobile } from "@/hooks/useMobile"
+import { resolveImageSrc } from "@/lib/imageUtils"
 import { LoadingState } from "@/components/shared/LoadingState"
 import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import { Card } from "@/components/ui/card"
 import {
+  History,
   Clock,
   CheckCircle2,
   XCircle,
   AlertCircle,
   Brain,
   Database,
-  Play,
+
   FileText,
   ChevronDown,
   ChevronRight,
@@ -22,14 +23,15 @@ import {
   ChevronUp,
   Wrench,
   Sparkles,
-  Image as ImageIcon,
+  Image as _ImageIcon,
   Maximize2,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { textNano, textMini } from "@/design-system/tokens/typography"
 import { formatTimestamp } from "@/lib/utils/format"
 import { api } from "@/lib/api"
-import { MarkdownMessage } from "@/components/chat/MarkdownMessage"
+import { ConclusionContent } from "./ConclusionContent"
+import { AgentExecutionEvidencePanel } from "@/components/agents/AgentExecutionEvidencePanel"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
 import type { AgentExecution, AgentExecutionDetail, DataCollected, ReasoningStep, Decision } from "@/types"
 
@@ -100,7 +102,8 @@ function extractImagesFromData(data: DataCollected[]): Array<{ source: string; i
         for (const key of ['image_url', 'url', 'src']) {
           const val = obj[key]
           if (typeof val === 'string' && (val.startsWith('http://') || val.startsWith('https://') || val.startsWith('/'))) {
-            images.push({ source: `${item.source}.${key}`, image: val })
+            // /api/images/ paths need the server origin outside same-origin builds
+            images.push({ source: `${item.source}.${key}`, image: resolveImageSrc(val) ?? val })
             break
           }
         }
@@ -164,7 +167,7 @@ export function AgentExecutionTimeline({
   executions,
   loading,
   agentId,
-  onViewExecutionDetail,
+  onViewExecutionDetail: _onViewExecutionDetail,
 }: AgentExecutionTimelineProps) {
   const { t } = useTranslation(['common', 'agents'])
   const { handleError } = useErrorHandler()
@@ -226,26 +229,20 @@ export function AgentExecutionTimeline({
   }
 
   return (
-    <div className="h-full flex flex-col">
-      <ScrollArea className="flex-1">
-        <div className="p-4">
+    <div>
+        <div>
           {loading ? (
             <LoadingState size="md" className="py-12" />
           ) : executions.length === 0 ? (
-            <div className="text-center py-12 text-muted-foreground">
-              <Clock className="h-12 w-12 mx-auto mb-3 opacity-20" />
-              <p>{t('agents:noExecutions')}</p>
+            <div className="flex flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed border-border py-12 text-center">
+              <History className="h-8 w-8 text-muted-foreground opacity-40" />
+              <p className="text-sm text-muted-foreground">{t('agents:noExecutions')}</p>
             </div>
           ) : (
-            <div className="relative">
-              {/* Timeline Line - center-aligned to dots: the line is 2px wide
-                  (w-0.5), so left-[15px] puts its CENTER at 16px — matching the
-                  16px dot's center (left-2 = 8px + 8px half). left-[16px] would
-                  center the line at 17px (1px off, visible at this scale). */}
-              <div className="absolute left-[15px] top-2 bottom-2 w-0.5 bg-border" />
-
-              {/* Timeline Items */}
-              <div className="space-y-4">
+            <div>
+              {/* Execution list — quiet cards; the old rail+dot timeline spent
+                  48px on decoration and double-encoded status. */}
+              <div className="space-y-2">
                 {executions.map((execution, index) => {
                   const isExpanded = expandedExecutions.has(execution.id)
                   const detail = executionDetails[execution.id]
@@ -254,66 +251,45 @@ export function AgentExecutionTimeline({
                   const StatusIcon = statusConfig.icon
 
                   return (
-                    <div key={execution.id} className="relative pl-12">
-                      {/* Timeline Node - position at left-2 (8px) with w-4 (16px) so center is at 16px */}
-                      <div className={cn(
-                        "absolute left-2 top-3 w-4 h-4 rounded-full border-2 flex items-center justify-center bg-background",
-                        statusConfig.bg.replace('/10', '/30'),
-                        statusConfig.color.replace('text-', 'border-')
-                      )}>
-                        <div className={cn("w-2 h-2 rounded-full", statusConfig.color.replace('text-', 'bg-'))} />
-                      </div>
-
-                      {/* Timeline Card */}
+                    <div key={execution.id}>
+                      {/* Execution card */}
                       <div
                         className={cn(
-                          "border rounded-lg overflow-hidden transition-all",
-                          isExpanded && statusConfig.bg,
-                          !isExpanded && "hover:bg-muted-30"
+                          "rounded-lg border bg-card overflow-hidden transition-colors",
+                          // Status color stays on the dot/badge; the card body
+                          // is a neutral surface (large success-green fills read
+                          // as "everything is fine" noise).
+                          isExpanded ? "border-foreground/20" : "border-border hover:bg-muted-30"
                         )}
                       >
-                        {/* Header - Always Visible */}
+                        {/* Header - Always Visible. Status only — a failure
+                            reason runs long and already fills the Situation
+                            Analysis and Conclusion sections below. */}
                         <button
                           type="button"
                           onClick={() => void toggleExecution(execution.id)}
-                          className="w-full p-3 flex items-start gap-3 text-left"
+                          className="flex w-full items-center gap-2.5 p-3 text-left"
                         >
-                          <StatusIcon className={cn("h-5 w-5 mt-0.5 shrink-0", execution.status === 'Running' && "animate-spin")} />
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 flex-wrap mb-1">
-                              <Badge variant="outline" className="text-xs">
-                                #{executions.length - index}
-                              </Badge>
-                              <Badge className={cn("text-xs", statusConfig.bg, statusConfig.color)}>
-                                {statusConfig.label}
-                              </Badge>
-                            </div>
-                            <div className="flex items-center gap-3 text-sm text-muted-foreground">
-                              <span className="flex items-center gap-1">
-                                <Clock className="h-4 w-4" />
-                                {formatTimestamp(execution.timestamp, false)}
-                              </span>
-                              {execution.duration_ms > 0 && (
-                                <span className="flex items-center gap-1">
-                                  <Zap className="h-4 w-4" />
-                                  {formatDuration(execution.duration_ms)}
-                                </span>
-                              )}
-                              {execution.error && (
-                                <span className="flex items-center gap-1 text-error">
-                                  <AlertCircle className="h-4 w-4" />
-                                  <span className="truncate max-w-[200px]">{execution.error}</span>
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                          <div className="shrink-0 mt-1">
-                            {isExpanded ? (
-                              <ChevronDown className="h-4 w-4 text-muted-foreground" />
-                            ) : (
-                              <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                            )}
-                          </div>
+                          <StatusIcon className={cn("h-4 w-4 shrink-0", statusConfig.color, execution.status === 'Running' && "animate-spin")} />
+                          <span className="shrink-0 text-sm font-medium tabular-nums">
+                            #{executions.length - index}
+                          </span>
+                          <span className="min-w-0 truncate text-sm text-muted-foreground tabular-nums">
+                            {formatTimestamp(execution.timestamp, false)}
+                          </span>
+                          {execution.duration_ms > 0 && (
+                            <span className="shrink-0 text-xs text-muted-foreground">
+                              {formatDuration(execution.duration_ms)}
+                            </span>
+                          )}
+                          <span className={cn("ml-auto shrink-0 text-xs", statusConfig.color)}>
+                            {statusConfig.label}
+                          </span>
+                          {isExpanded ? (
+                            <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+                          ) : (
+                            <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                          )}
                         </button>
 
                         {/* Expanded Details */}
@@ -325,6 +301,7 @@ export function AgentExecutionTimeline({
                               </div>
                             ) : detail ? (
                               <>
+                                <AgentExecutionEvidencePanel detail={detail} compact />
                                 {/* ⓪ Input Data — images & metrics from data_collected */}
                                 {(() => {
                                   const dc = detail.decision_process?.data_collected || []
@@ -427,9 +404,9 @@ export function AgentExecutionTimeline({
                                     >
                                       <div className="space-y-2">
                                         {hasConclusion && (
-                                          <Card className="p-4 bg-muted border-border shadow-sm">
-                                            <MarkdownMessage content={dp!.conclusion} />
-                                          </Card>
+                                          <div className="rounded-lg border border-border bg-card p-3">
+                                            <ConclusionContent content={dp!.conclusion} />
+                                          </div>
                                         )}
                                         {hasConfidence && (
                                           <div className="flex items-center justify-between text-sm p-2 bg-muted rounded-lg">
@@ -571,7 +548,6 @@ export function AgentExecutionTimeline({
             </div>
           )}
         </div>
-      </ScrollArea>
     </div>
   )
 }
@@ -602,7 +578,7 @@ function TimelineSection({ icon, title, subtitle, children }: TimelineSectionPro
   )
 }
 
-function DataCollectedItem({ data }: { data: DataCollected }) {
+function _DataCollectedItem({ data }: { data: DataCollected }) {
   const { t } = useTranslation(['common', 'agents'])
   const [expanded, setExpanded] = useState(false)
 
@@ -767,7 +743,7 @@ function ReasoningStepItem({ step, showRoundSeparator, roundNumber }: { step: Re
 
   const numberBg = isError ? 'bg-error text-primary-foreground' :
                     'bg-primary text-primary-foreground'
-  const borderColor = isError ? 'border-error' :
+  const _borderColor = isError ? 'border-error' :
                       'border-border'
 
   return (
@@ -839,7 +815,7 @@ function ReasoningStepItem({ step, showRoundSeparator, roundNumber }: { step: Re
   )
 }
 
-function DecisionItem({ decision }: { decision: Decision }) {
+function _DecisionItem({ decision }: { decision: Decision }) {
   const { t } = useTranslation(['common', 'agents'])
   return (
     <Card className="p-2 min-w-0">
@@ -976,6 +952,10 @@ function ToolCallStep({ step }: { step: ReasoningStep }) {
 /// Clickable image thumbnail from data_collected
 function InputDataImage({ source, image }: { source: string; image: string }) {
   const [fullscreen, setFullscreen] = useState(false)
+  // Hover reveals the caption + expand affordance on desktop; touch has no
+  // hover, so mobile shows them pinned so the image reads as tappable.
+  const isMobile = useIsMobile()
+  const reveal = isMobile ? "opacity-100" : "opacity-0 group-hover:opacity-100"
   return (
     <>
       <div
@@ -983,11 +963,11 @@ function InputDataImage({ source, image }: { source: string; image: string }) {
         onClick={() => setFullscreen(true)}
       >
         <img src={image} alt={source} className="w-full h-full object-cover" />
-        <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
-        <div className="absolute bottom-0 left-0 right-0 p-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div className={cn("absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent transition-opacity", reveal)} />
+        <div className={cn("absolute bottom-0 left-0 right-0 p-1.5 transition-opacity", reveal)}>
           <span className="text-xs text-white/90 truncate block">{source}</span>
         </div>
-        <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity bg-overlay-medium rounded p-0.5">
+        <div className={cn("absolute top-1 right-1 transition-opacity bg-overlay-medium rounded p-0.5", reveal)}>
           <Maximize2 className="h-3.5 w-3.5 text-white" />
         </div>
       </div>

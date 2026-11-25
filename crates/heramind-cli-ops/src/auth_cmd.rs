@@ -11,9 +11,15 @@ use anyhow::Result;
 /// Mask an API key for display: `nmk_a1b2...x9y8`.
 fn mask_key(key: &str) -> String {
     if key.len() <= 12 {
-        return format!("{}...", &key[..key.len().min(8)]);
+        // `get` throughout: a key is normally ASCII, but slicing a `&str` by
+        // byte index panics the moment one is not, and this masks whatever the
+        // store holds.
+        let head = key.get(..key.len().min(8)).unwrap_or(key);
+        return format!("{head}...");
     }
-    format!("{}...{}", &key[..8], &key[key.len() - 4..])
+    let head = key.get(..8).unwrap_or(key);
+    let tail = key.get(key.len().saturating_sub(4)..).unwrap_or_default();
+    format!("{head}...{tail}")
 }
 
 /// Resolve the server data directory for login.
@@ -115,9 +121,18 @@ pub async fn run_logout() -> Result<CliResponse> {
 
 /// `heramind whoami` — validate the current key against the server.
 pub async fn run_whoami() -> Result<CliResponse> {
+    run_whoami_with_context(&crate::dispatch::DispatchContext::default()).await
+}
+
+/// `heramind whoami` using an explicit [`crate::dispatch::DispatchContext`].
+pub async fn run_whoami_with_context(
+    ctx: &crate::dispatch::DispatchContext,
+) -> Result<CliResponse> {
+    let explicit_key = ctx.api_key.clone();
     // Determine current key (same resolution as ApiClient)
-    let key = std::env::var("HERAMIND_API_KEY")
-        .ok()
+    let key = explicit_key
+        .clone()
+        .or_else(|| std::env::var("HERAMIND_API_KEY").ok())
         .or_else(auto_auth::read_logged_in_key)
         .or_else(|| auto_auth::read_default_api_key_from(&auto_auth::resolve_data_dir()));
 
@@ -133,9 +148,14 @@ pub async fn run_whoami() -> Result<CliResponse> {
     };
 
     let masked = mask_key(&key);
+    let source = if explicit_key.is_some() {
+        "dispatch context"
+    } else {
+        key_source()
+    };
 
     // Validate against the server via a lightweight authed endpoint
-    let client = crate::ApiClient::new();
+    let client = ctx.api_client();
     let base_url = client.base_url().to_string();
 
     match client.get("/settings/timezone").await {
@@ -143,7 +163,7 @@ pub async fn run_whoami() -> Result<CliResponse> {
             serde_json::json!({
                 "key_preview": masked,
                 "server": base_url,
-                "source": key_source(),
+                "source": source,
             }),
             format!("Authenticated as {} @ {}", masked, base_url),
         )),
@@ -208,7 +228,7 @@ mod tests {
     /// a module-local lock still raced against auto_auth's env tests (the
     /// CI flake in test_resolve_data_dir_env_override).
     use crate::auto_auth::DATA_DIR_ENV_LOCK;
-
+    #[serial_test::serial]
     #[test]
     fn test_resolve_login_data_dir_env() {
         let _lock = DATA_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -221,7 +241,7 @@ mod tests {
         assert_eq!(dir, "/tmp/env-data-dir-test");
         std::env::remove_var("HERAMIND_DATA_DIR");
     }
-
+    #[serial_test::serial]
     #[test]
     fn test_resolve_login_data_dir_not_found() {
         let _lock = DATA_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -1,0 +1,367 @@
+//! `write` — split from the former timeseries.rs monolith.
+
+use super::*;
+
+impl TimeSeriesStore {
+    /// Write a data point (buffered).
+    ///
+    /// The point is pushed into an in-memory buffer and flushed to redb either:
+    /// - When the buffer reaches `write_buffer_size` entries (immediate flush)
+    /// - On the periodic background flush interval
+    /// - When `flush()` is called explicitly
+    ///
+    /// This amortizes transaction overhead across many data points, significantly
+    /// improving throughput for high-frequency device telemetry.
+    pub async fn write(
+        self: &Arc<Self>,
+        source_id: &str,
+        metric: &str,
+        point: DataPoint,
+    ) -> Result<(), Error> {
+        // Update cache immediately (reads need latest value)
+        self.update_cache(source_id, metric, point.clone()).await;
+
+        let should_flush = self.write_buffer.push(BufferedWrite {
+            source_id: source_id.to_string(),
+            metric: metric.to_string(),
+            point,
+        });
+
+        if should_flush {
+            let store = Arc::clone(self);
+            tokio::task::spawn_blocking(move || store.flush_buffer())
+                .await
+                .map_err(|e| Error::Storage(format!("spawn_blocking flush: {}", e)))?;
+        }
+
+        Ok(())
+    }
+}
+impl TimeSeriesStore {
+    /// Flush all buffered writes to redb in batched transactions.
+    ///
+    /// Groups buffered points by (source_id, metric) and writes each group
+    /// as a single transaction. Called automatically by the background task
+    /// and when the buffer is full.
+    pub(crate) fn flush_buffer(&self) {
+        let drained = self.write_buffer.drain();
+        if drained.is_empty() {
+            return;
+        }
+
+        let start = Instant::now();
+
+        // Group by (source_id, metric)
+        let mut groups: std::collections::HashMap<(String, String), Vec<DataPoint>> =
+            std::collections::HashMap::new();
+        for bw in drained {
+            groups
+                .entry((bw.source_id, bw.metric))
+                .or_default()
+                .push(bw.point);
+        }
+
+        let total_count: usize = groups.values().map(|v| v.len()).sum();
+
+        // Fast path: write ALL groups in a single redb transaction (one fsync)
+        // on the common no-poison path. If it fails for any reason — e.g. a
+        // poison payload in any group (redb 2.x accepts values up to 3 GiB,
+        // so "exceeds max_value_size" is no longer the trigger; think
+        // serialization/IO failures and genuinely malformed entries) —
+        // the whole transaction rolls back and we fall through to the per-group
+        // isolation loop below, so a single bad point still only affects its
+        // own group. Worst case (fast path always fails) behaves exactly like
+        // the previous per-group-only implementation.
+        if self.write_all_groups_sync(&groups).is_ok() {
+            if let Ok(mut stats) = self.stats.try_write() {
+                stats.write_count += total_count as u64;
+                stats.total_write_ns += start.elapsed().as_nanos() as u64;
+            }
+            return;
+        }
+
+        // Write each group in a single transaction. On failure, isolate the
+        // offending point by retrying per-point in its own transaction —
+        // otherwise a single poison payload (e.g. a value exceeding redb's
+        // unwritable payload) aborts the whole (source, metric) batch every flush
+        // and blocks fresh writes for that metric forever. Only the genuinely
+        // unwritable points are re-queued.
+        let mut requeue: Vec<BufferedWrite> = Vec::new();
+        for ((source_id, metric), points) in groups {
+            if let Err(e) = self.write_batch_sync(&source_id, &metric, &points) {
+                if let Ok(mut stats) = self.stats.try_write() {
+                    stats.write_failures += 1;
+                }
+                // The optimistic cache entry for this key may describe a
+                // value that never landed — retire it so latest reads fall
+                // back to disk instead of serving a phantom.
+                self.invalidate_latest(&source_id, &metric);
+                tracing::error!(
+                    "Failed to flush batch for {}/{}: {} — isolating per-point",
+                    source_id,
+                    metric,
+                    e
+                );
+                let failed = self.write_points_isolated(&source_id, &metric, points);
+                if !failed.is_empty() {
+                    tracing::error!(
+                        "Per-point isolation {}/{}: {} poison point(s) failed and were re-queued",
+                        source_id,
+                        metric,
+                        failed.len()
+                    );
+                    for point in failed {
+                        requeue.push(BufferedWrite {
+                            source_id: source_id.clone(),
+                            metric: metric.clone(),
+                            point,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Re-queue failed points (bounded — drops once at the hard cap).
+        let mut requeued_count: usize = 0;
+        if !requeue.is_empty() {
+            requeued_count = requeue.len();
+            // Dedupe the affected keys first — needed for cache
+            // invalidation after the requeue call consumes the vector.
+            let requeued_keys: Vec<(String, String)> = {
+                let mut keys: Vec<(String, String)> = Vec::new();
+                for w in &requeue {
+                    let key = (w.source_id.clone(), w.metric.clone());
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+                keys
+            };
+            let dropped = self.write_buffer.requeue(std::mem::take(&mut requeue));
+            if dropped > 0 {
+                if let Ok(mut stats) = self.stats.try_write() {
+                    stats.points_dropped += dropped as u64;
+                }
+                // Hard-cap drops are permanent data loss for these keys;
+                // their cached "latest" may be one of the dropped points.
+                for (source_id, metric) in requeued_keys {
+                    self.invalidate_latest(&source_id, &metric);
+                }
+                tracing::error!(
+                    "Write buffer at hard cap under persistent flush failure — {} points re-queued, {} dropped",
+                    requeued_count - dropped,
+                    dropped
+                );
+            }
+        }
+
+        // Record stats — count only points that actually landed. Counting the
+        // full drained set would double-count re-queued points on every retry.
+        if let Ok(mut stats) = self.stats.try_write() {
+            stats.write_count += (total_count - requeued_count) as u64;
+            stats.total_write_ns += start.elapsed().as_nanos() as u64;
+        }
+    }
+}
+impl TimeSeriesStore {
+    /// Write each point in its OWN transaction, returning only the points that
+    /// failed. Used after a batch write fails to isolate a poison point: the
+    /// good points in the group land, only the genuinely unwritable ones come
+    /// back for (bounded) re-queue.
+    fn write_points_isolated(
+        &self,
+        source_id: &str,
+        metric: &str,
+        points: Vec<DataPoint>,
+    ) -> Vec<DataPoint> {
+        let mut failed = Vec::new();
+        for point in points {
+            if let Err(e) = self.write_batch_sync(source_id, metric, std::slice::from_ref(&point)) {
+                tracing::error!(
+                    "Per-point write failed for {}/{} @{} (poison): {}",
+                    source_id,
+                    metric,
+                    point.timestamp,
+                    e
+                );
+                failed.push(point);
+            }
+        }
+        failed
+    }
+}
+impl TimeSeriesStore {
+    /// Write ALL buffered groups in a single redb transaction — the fast path
+    /// used by `flush_buffer` to turn N per-group fsyncs into one. Updates
+    /// `metrics_info` for every group exactly like `write_batch_sync` would.
+    /// On any error the caller falls back to per-group (then per-point)
+    /// isolation, so poison payloads are still contained to their own group.
+    fn write_all_groups_sync(
+        &self,
+        groups: &std::collections::HashMap<(String, String), Vec<DataPoint>>,
+    ) -> Result<(), Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(TIMESERIES_TABLE)?;
+            for ((source_id, metric), points) in groups.iter() {
+                for point in points.iter() {
+                    let key = (source_id.as_str(), metric.as_str(), point.timestamp);
+                    let value = serde_json::to_vec(point)?;
+                    table.insert(key, value.as_slice())?;
+                }
+            }
+        }
+        write_txn.commit()?;
+
+        // Update metrics info for every group (mirrors write_batch_sync).
+        for ((source_id, metric), points) in groups.iter() {
+            let metric_key = format!("{}:{}", source_id, metric);
+            let last_ts = points.last().map(|p| p.timestamp).unwrap_or(0);
+            let n = points.len() as u64;
+            self.metrics_info
+                .entry(metric_key)
+                .and_modify(|entry| {
+                    entry.last_update = last_ts;
+                    entry.point_count += n;
+                })
+                .or_insert_with(|| MetricInfo {
+                    last_update: last_ts,
+                    point_count: n,
+                });
+        }
+        self.metrics_initialized.store(true, Ordering::Release);
+
+        Ok(())
+    }
+}
+impl TimeSeriesStore {
+    /// Synchronous batch write (used by flush_buffer).
+    fn write_batch_sync(
+        &self,
+        source_id: &str,
+        metric: &str,
+        points: &[DataPoint],
+    ) -> Result<(), Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(TIMESERIES_TABLE)?;
+            for point in points {
+                let key = (source_id, metric, point.timestamp);
+                let value = serde_json::to_vec(point)?;
+                table.insert(key, value.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+
+        // Update metrics info
+        let metric_key = format!("{}:{}", source_id, metric);
+        let last_ts = points.last().map(|p| p.timestamp).unwrap_or(0);
+        self.metrics_info
+            .entry(metric_key)
+            .and_modify(|entry| {
+                entry.last_update = last_ts;
+                entry.point_count += points.len() as u64;
+            })
+            .or_insert_with(|| MetricInfo {
+                last_update: last_ts,
+                point_count: points.len() as u64,
+            });
+
+        // Mark metrics_info as populated (prevents cold-start full scan in list_metrics)
+        self.metrics_initialized.store(true, Ordering::Release);
+
+        Ok(())
+    }
+}
+impl TimeSeriesStore {
+    /// Update the latest value cache.
+    /// Drop the cached "latest" value for a key. Called when a buffered
+    /// write FAILED to persist: update_cache had optimistically published
+    /// the new value before the flush, so query_latest (which prefers the
+    /// cache absolutely) kept serving a value that does not exist on disk
+    /// — until the cache TTL expired and the reading jumped BACK to the
+    /// older persisted value. Invalidating makes query_latest fall through
+    /// to disk, where the truth is.
+    pub(crate) fn invalidate_latest(&self, source_id: &str, metric: &str) {
+        self.latest_cache
+            .invalidate(&(source_id.to_string(), metric.to_string()));
+    }
+
+    pub(crate) async fn update_cache(&self, source_id: &str, metric: &str, point: DataPoint) {
+        let key = (source_id.to_string(), metric.to_string());
+
+        // "latest" means max(timestamp), not last-arrived: replayed or
+        // clock-skewed backfills used to overwrite the cache with an OLDER
+        // point, and monitoring/rules read the regression for the cache TTL
+        // (query_latest prefers the cache absolutely). Refuse to regress;
+        // the disk write itself is unaffected.
+        if let Some(existing) = self.latest_cache.get(&key) {
+            if existing.point.timestamp > point.timestamp {
+                return;
+            }
+        }
+
+        // moka handles LRU eviction automatically when capacity is reached
+        self.latest_cache.insert(key, CacheEntry::new(point));
+    }
+}
+impl TimeSeriesStore {
+    /// Write multiple data points in batch.
+    pub async fn write_batch(
+        &self,
+        source_id: &str,
+        metric: &str,
+        points: Vec<DataPoint>,
+    ) -> Result<(), Error> {
+        // [fake-async fix] The redb write transaction blocks the executor
+        // thread — every device metric write used to stall a tokio worker.
+        // Run the transaction on the blocking pool; the lock-free in-memory
+        // cache updates below stay on the async side.
+        let now = Utc::now().timestamp();
+        // max-by-timestamp, not points.last(): backfill batches arrive in
+        // arbitrary order, and the cache must hold the LATEST point.
+        let newest = points.iter().max_by_key(|p| p.timestamp).cloned();
+        let last_ts = newest.as_ref().map(|p| p.timestamp).unwrap_or(now);
+        let count = points.len();
+        let (src, met) = (source_id.to_string(), metric.to_string());
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let write_txn = db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(TIMESERIES_TABLE)?;
+                for point in &points {
+                    let key = (src.as_str(), met.as_str(), point.timestamp);
+                    let value = serde_json::to_vec(point)?;
+                    table.insert(key, value.as_slice())?;
+                }
+            }
+            write_txn.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("write_batch join error: {}", e)))??;
+
+        // Update metrics info - DashMap entry API is lock-free
+        let metric_key = format!("{}:{}", source_id, metric);
+
+        self.metrics_info
+            .entry(metric_key)
+            .and_modify(|entry| {
+                entry.last_update = last_ts;
+                entry.point_count += count as u64;
+            })
+            .or_insert_with(|| MetricInfo {
+                last_update: last_ts,
+                point_count: count as u64,
+            });
+
+        // Mark metrics_info as populated (prevents cold-start full scan in list_metrics)
+        self.metrics_initialized.store(true, Ordering::Release);
+
+        if let Some(point) = newest {
+            self.update_cache(source_id, metric, point).await;
+        }
+
+        Ok(())
+    }
+}

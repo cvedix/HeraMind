@@ -15,6 +15,9 @@ jemalloc = ["dep:tikv-jemallocator"]
 static = ["heramind-api/static"]
 
 [dependencies]
+# Only for the SDK VERSION constant (extension-create scaffolds it into
+# fresh projects' Cargo.toml).
+heramind-extension-sdk = { path = "../heramind-extension-sdk" }
 heramind-core = { path = "../heramind-core" }
 heramind-agent = { path = "../heramind-agent" }
 heramind-api = { path = "../heramind-api" }
@@ -30,7 +33,10 @@ tracing-appender = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
-zip = "2.1"
+# default-features = false drops zstd/bzip2/lzma/aes (deflate-only usage,
+# matching heramind-core/heramind-api; the zstd family carried 4 open
+# advisories — RUSTSEC-2026-0391/0398/0403/0410 — as dead code).
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # CLI
 clap = { workspace = true }

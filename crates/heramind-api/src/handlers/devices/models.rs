@@ -76,6 +76,13 @@ pub struct DeviceTypeDto {
     /// Command count (for backward compatibility)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_count: Option<usize>,
+    /// Origin marker: Some(version) for built-in seeded types, None for
+    /// user-created / imported ones
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin_version: Option<String>,
+    /// Optional CamThink CT-Prov discovery/provision metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ct_prov: Option<heramind_storage::device_registry::CtProvMetadata>,
 }
 
 /// Metric definition for API responses

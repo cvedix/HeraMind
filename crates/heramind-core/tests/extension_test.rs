@@ -154,6 +154,10 @@ fn test_extension_command() {
         fixed_values,
         samples: vec![],
         parameter_groups: vec![],
+        ai_exposed: true,
+        effect: Default::default(),
+        replay_safety: Default::default(),
+        execution: Default::default(),
     };
 
     assert_eq!(cmd.name, "detect_objects");
@@ -172,6 +176,10 @@ fn test_extension_command_serialization() {
         fixed_values: HashMap::new(),
         samples: vec![],
         parameter_groups: vec![],
+        ai_exposed: true,
+        effect: Default::default(),
+        replay_safety: Default::default(),
+        execution: Default::default(),
     };
 
     let json = serde_json::to_string(&cmd).unwrap();

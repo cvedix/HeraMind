@@ -14,7 +14,7 @@ import { useLocation, useNavigate } from "react-router-dom"
 import { useTranslation } from "react-i18next"
 import { PageLayout } from "@/components/layout/PageLayout"
 import { BuiltinModelWizard } from "@/components/llm/BuiltinModelWizard"
-import { PageTabsBar, PageTabsContent, PageTabsBottomNav, Pagination } from "@/components/shared"
+import { PageTabsBar, PageTabsContent, Pagination, SearchInput } from "@/components/shared"
 import { LoadingState } from "@/components/shared/LoadingState"
 import { api } from "@/lib/api"
 import { useToast } from "@/hooks/use-toast"
@@ -23,9 +23,8 @@ import { useEvents } from "@/hooks/useEvents"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
 import { showErrorToast } from "@/lib/error-messages"
 import { useIsMobile } from "@/hooks/useMobile"
-import { Bot, Plus, Brain, Cpu, Settings, BookOpen, Edit, Play, FileText, Wrench, Search, Download, Server } from "lucide-react"
+import { Bot, Plus, Brain, Cpu, Settings, BookOpen, Edit, Play, FileText, Wrench, Download, Server } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import {
   Select,
   SelectContent,
@@ -115,7 +114,7 @@ export function AgentsPage() {
   // Data state
   const [agents, setAgents] = useState<AiAgent[]>([])
   const [loading, setLoading] = useState(false)
-  const [memoryRefreshKey, setMemoryRefreshKey] = useState(0)
+  const [memoryRefreshKey, _setMemoryRefreshKey] = useState(0)
   const memoryPanelRef = useRef<MemoryPanelRef>(null)
   const skillsPanelRef = useRef<SkillsPanelHandle>(null)
 
@@ -172,7 +171,7 @@ export function AgentsPage() {
   const [devices, setDevices] = useState<Device[]>([])
   const [deviceTypes, setDeviceTypes] = useState<DeviceType[]>([])
   const [extensions, setExtensions] = useState<Extension[]>([])
-  const [unifiedDataSources, setUnifiedDataSources] = useState<UnifiedDataSourceInfo[]>([])
+  const [unifiedDataSources, _setUnifiedDataSources] = useState<UnifiedDataSourceInfo[]>([])
 
   // Fetch agents list only (fast)
   const loadItems = useCallback(async () => {
@@ -247,7 +246,7 @@ export function AgentsPage() {
       }
     },
     onEvent: (event) => {
-      const eventData = event.data as { agent_id?: string }
+      const _eventData = event.data as { agent_id?: string }
 
       switch (event.type) {
         case 'AgentExecutionStarted': {
@@ -293,6 +292,11 @@ export function AgentsPage() {
               ? { ...agent, status: newStatus }
               : agent
           ))
+          // Silent refresh — stats/freshness catch up without a full reload
+          api.getAgent(completedData.agent_id).then((fresh) => {
+            setAgents(prev => prev.map(a => a.id === fresh.id ? { ...a, ...fresh } : a))
+            setSelectedAgent(prev => prev?.id === fresh.id ? { ...prev, ...fresh } : prev)
+          }).catch(() => {})
 
           // Update selected agent if it's the same one
           if (selectedAgent?.id === completedData.agent_id) {
@@ -559,9 +563,9 @@ export function AgentsPage() {
     : []
 
   const skillsActionsExtra = activeTab === 'tools' ? (
-    <div className="flex items-center gap-2">
+    <div className="flex w-full min-w-0 items-center gap-2">
       <Select value={toolsSourceFilter} onValueChange={(v) => setToolsSourceFilter(v as ToolSourceFilter)}>
-        <SelectTrigger className="h-9 w-[140px]">
+        <SelectTrigger className="h-10 w-32 shrink-0 md:h-9 md:w-[140px]">
           <SelectValue placeholder={tAgent('detail.toolsFilterAllSources', 'All sources')} />
         </SelectTrigger>
         <SelectContent>
@@ -570,24 +574,19 @@ export function AgentsPage() {
           <SelectItem value="extension">{tAgent('detail.toolsSourceExtension')}</SelectItem>
         </SelectContent>
       </Select>
-      <div className="relative">
-        <span className="absolute left-2.5 top-0 bottom-0 flex items-center">
-          <Search className="h-4 w-4 text-muted-foreground pointer-events-none" />
-        </span>
-        <Input
-          placeholder={tAgent('detail.toolsSearchPlaceholder', 'Search tools…')}
-          value={toolsSearch}
-          onChange={(e) => setToolsSearch(e.target.value)}
-          className="pl-9 w-[180px] md:w-[240px] h-9"
-        />
-      </div>
+      <SearchInput
+        value={toolsSearch}
+        onChange={setToolsSearch}
+        placeholder={tAgent('detail.toolsSearchPlaceholder', 'Search tools…')}
+        aria-label={tAgent('detail.toolsSearchPlaceholder', 'Search tools…')}
+        className="min-w-0 flex-1 md:w-[240px] md:flex-none"
+      />
     </div>
   ) : undefined
 
   return (
     <PageLayout
       title={tAgent('title')}
-      subtitle={tAgent('description')}
       headerContent={
         <PageTabsBar
           tabs={tabs}
@@ -598,7 +597,6 @@ export function AgentsPage() {
         />
       }
       hideFooterOnMobile
-      hasBottomNav
       footer={
         activeTab === 'agents' && agents.length > AGENTS_PER_PAGE ? (
           <Pagination
@@ -630,7 +628,9 @@ export function AgentsPage() {
         {agents.length === 0 && loading ? (
           <LoadingState variant="page" />
         ) : agents.length === 0 ? (
-          <div className="flex min-h-[500px] items-center justify-center">
+          /* Card container matching the table pages' empty state — the
+             floating-in-whitespace variant broke the page rhythm. */
+          <div className="flex min-h-[420px] items-center justify-center rounded-lg border bg-card">
             {llmBackends.length === 0 && !llmBackendLoading ? (
               /* No backend — same empty-state visual, but the guidance swaps:
                  agents are inert without a model, so the CTAs lead with model
@@ -672,12 +672,15 @@ export function AgentsPage() {
             )}
           </div>
         ) : (
-          <div className="grid grid-cols-1 @md:grid-cols-2 @lg:grid-cols-3 @xl:grid-cols-4 gap-4">
+          <div className={isMobile
+            ? "grid grid-cols-1 gap-2"
+            : "grid grid-cols-[repeat(auto-fill,minmax(max(25%_-_1rem,280px),1fr))] gap-5"
+          }>
             {paginatedAgents.map((agent, index) => (
               <div
                 key={agent.id}
-                className="animate-fade-in-up"
-                style={{ animationDelay: `${index * 50}ms`, animationFillMode: 'both' }}
+                className="animate-fade-in-up motion-reduce:animate-none"
+                style={{ animationDelay: `${Math.min(index, 12) * 40}ms`, animationFillMode: 'both' }}
               >
                 <AgentCard
                   agent={agent}
@@ -709,13 +712,6 @@ export function AgentsPage() {
         />
       </PageTabsContent>
 
-      {/* Mobile: Bottom navigation bar */}
-      <PageTabsBottomNav
-        tabs={tabs}
-        activeTab={activeTab}
-        onTabChange={handleTabChange}
-      />
-
       {/* Agent Editor Full Screen */}
       <AgentEditorFullScreen
         open={showAgentDialog}
@@ -735,7 +731,6 @@ export function AgentsPage() {
           iconBg="bg-accent-purple-light"
           iconColor="text-accent-purple"
           title={selectedAgent?.name || tAgent('detailTitle')}
-          subtitle={selectedAgent?.description}
           onClose={() => setDetailDialogOpen(false)}
           actions={
             <>
@@ -751,7 +746,7 @@ export function AgentsPage() {
           }
         />
         <FullScreenDialogContent>
-          <FullScreenDialogMain className="overflow-auto">
+          <FullScreenDialogMain className="flex min-h-0 flex-col overflow-hidden">
             {selectedAgent && (
               <AgentDetailPanel
                 agent={selectedAgent}

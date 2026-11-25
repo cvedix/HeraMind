@@ -15,11 +15,12 @@ import { cn } from '@/lib/utils'
 import { ErrorBoundary } from '@/components/shared/ErrorBoundary'
 import { findDevice } from '@/lib/deviceUtils'
 import type { DataSource } from '@/types/dashboard'
-import { normalizeDataSource } from '@/types/dashboard'
 import { resolveComponentData } from '@/lib/componentDataApi'
 import type { DashboardComponent, GenericComponentType } from '@/types/dashboard'
-import type { Device, DeviceType } from '@/types'
+import type { DeviceType } from '@/types'
 import { useStore } from '@/store'
+import type { HeraMindStore } from '@/store'
+import type { HeraMindEvent } from '@/lib/events'
 import { useEvents } from '@/hooks/useEvents'
 import { getComponentMeta } from './registry'
 import { dynamicRegistry, dtoToComponentMeta } from './DynamicRegistry'
@@ -50,17 +51,26 @@ import { ImageHistory } from '../generic/ImageHistory'
 import { EventList } from '../generic/EventList'
 import { WebDisplay } from '../generic/WebDisplay'
 import { MarkdownDisplay } from '../generic/MarkdownDisplay'
+import { useCompactCard } from '@/components/dashboard/shared/DefaultStates'
 
 // Spatial & Media
 import { MapDisplay } from '../generic/MapDisplay'
 import { VideoDisplay } from '../generic/VideoDisplay'
 import { CustomLayer } from '../generic/CustomLayer'
 
+/** A dashboard component as persisted — the config/dataSource/display
+ *  extras the renderer reads (not modeled on the canonical type). */
+type RuntimeComponent = DashboardComponent & {
+  config?: Record<string, unknown>
+  dataSource?: unknown
+  display?: Record<string, unknown>
+}
+
 // ============================================================================
 // Component Map
 // ============================================================================
 
-const componentMap: Record<GenericComponentType, React.ComponentType<any>> = {
+const componentMap: Record<GenericComponentType, React.ComponentType<Record<string, unknown>>> = {
   // Indicators
   'value-card': ValueCard,
   'led-indicator': LEDIndicator,
@@ -96,7 +106,7 @@ const componentMap: Record<GenericComponentType, React.ComponentType<any>> = {
 const AgentMonitorWidget = lazy(() => import('../generic/AgentMonitorWidget').then(m => ({ default: m.AgentMonitorWidget })))
 const AiAnalyst = lazy(() => import('../generic/AiAnalyst').then(m => ({ default: m.AiAnalyst })))
 
-const businessComponentMap: Record<string, React.ComponentType<any>> = {
+const businessComponentMap: Record<string, React.ComponentType<Record<string, unknown>>> = {
   'agent-monitor-widget': AgentMonitorWidget,
   'ai-analyst': AiAnalyst,
 } as const
@@ -133,19 +143,30 @@ interface UnknownComponentProps {
 
 function UnknownComponent({ type, className }: UnknownComponentProps) {
   const { t } = useTranslation('dashboardComponents')
+  const { ref, compact } = useCompactCard<HTMLDivElement>()
+  const hint = t('renderer.componentUnavailableHint')
+
   return (
     <Card className={cn('border-dashed border-2', className)}>
-      <div className="flex items-center justify-center h-full min-h-[120px] p-4 text-center">
-        <div className="text-muted-foreground">
-          <Puzzle className="h-5 w-5 mx-auto mb-2 opacity-70" />
-          <p className="font-medium">{t('renderer.componentUnavailable')}</p>
-          <p className="text-sm text-muted-foreground mt-1">
-            {t('renderer.componentUnavailableHint')}
-          </p>
-          <p className="text-xs text-muted-foreground/70 mt-2">
-            <code className="bg-muted px-1 py-0.5 rounded">{type}</code>
-          </p>
-        </div>
+      <div ref={ref} title={compact ? hint : undefined} className="flex items-center justify-center h-full min-h-[64px] p-4 text-center">
+        {compact ? (
+          // Short card: one line — icon + label + the type id; the hint
+          // survives as the hover title.
+          <div className="flex items-center justify-center gap-2 text-muted-foreground min-w-0">
+            <Puzzle className="h-4 w-4 shrink-0 opacity-70" />
+            <p className="font-medium text-xs truncate">{t('renderer.componentUnavailable')}</p>
+            <code className="shrink-0 text-xs bg-muted px-1 py-0.5 rounded">{type}</code>
+          </div>
+        ) : (
+          <div className="text-muted-foreground">
+            <Puzzle className="h-5 w-5 mx-auto mb-2 opacity-70" />
+            <p className="font-medium">{t('renderer.componentUnavailable')}</p>
+            <p className="text-sm text-muted-foreground mt-1">{hint}</p>
+            <p className="text-xs text-muted-foreground opacity-70 mt-2">
+              <code className="bg-muted px-1 py-0.5 rounded">{type}</code>
+            </p>
+          </div>
+        )}
       </div>
     </Card>
   )
@@ -165,14 +186,30 @@ interface ComponentErrorFallbackProps {
 // no per-card boundary of its own (ComponentRenderer only covers dynamic,
 // community, and business components).
 export function ComponentErrorFallback({ className }: ComponentErrorFallbackProps) {
+  const { ref, compact } = useCompactCard<HTMLDivElement>()
   return (
     <Card className={cn('border-error-light', className)}>
-      <div className="flex flex-col items-center justify-center h-full min-h-[120px] p-4 text-center">
-        <div className="w-8 h-8 rounded-full bg-destructive-light flex items-center justify-center mb-2">
-          <AlertTriangle className="h-4 w-4 text-error" />
-        </div>
-        <p className="text-xs font-medium text-error">Component Error</p>
-        <p className="text-nano text-muted-foreground mt-1">Check config or remove this component</p>
+      <div
+        ref={ref}
+        title={compact ? 'Check config or remove this component' : undefined}
+        className="flex items-center justify-center h-full min-h-[64px] p-4 text-center"
+      >
+        {compact ? (
+          <div className="flex items-center justify-center gap-2 min-w-0">
+            <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-destructive-light">
+              <AlertTriangle className="h-3 w-3 text-error" />
+            </span>
+            <p className="text-xs font-medium text-error truncate">Component Error</p>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center">
+            <div className="w-8 h-8 rounded-full bg-destructive-light flex items-center justify-center mb-2">
+              <AlertTriangle className="h-4 w-4 text-error" />
+            </div>
+            <p className="text-xs font-medium text-error">Component Error</p>
+            <p className="text-nano text-muted-foreground mt-1">Check config or remove this component</p>
+          </div>
+        )}
       </div>
     </Card>
   )
@@ -264,12 +301,13 @@ const ComponentRenderer = memo(function ComponentRenderer({
   component,
   className,
   style,
-  onError,
+  onError: _onError,
   onDataSourceChange,
   onConfigChange,
   openFullscreen,
   closeFullscreen,
 }: RenderComponentProps) {
+  const { t } = useTranslation('dashboardComponents')
   const componentType = component.type
   // Built-in types take priority — community components may share the same ID
   // (e.g., a community "toggle-switch" should NOT override the built-in one)
@@ -278,7 +316,7 @@ const ComponentRenderer = memo(function ComponentRenderer({
   const isCommunity = !isBuiltIn && communityRegistry.isCommunity(componentType)
 
   // State for dynamic component loading
-  const [DynamicComponent, setDynamicComponent] = useState<React.ComponentType<any> | null>(null)
+  const [DynamicComponent, setDynamicComponent] = useState<React.ComponentType<Record<string, unknown>> | null>(null)
   const [loading, setLoading] = useState(false)
   const [loadError, setLoadError] = useState<Error | null>(null)
   const [attemptCount, setAttemptCount] = useState(0)
@@ -318,19 +356,19 @@ const ComponentRenderer = memo(function ComponentRenderer({
         : await dynamicRegistry.loadComponent(componentType)
 
       if (module) {
-        let Component: React.ComponentType<any> | null = null
+        let Component: React.ComponentType<Record<string, unknown>> | null = null
 
         if (typeof module === 'function') {
           Component = module as React.ComponentType
         } else if (typeof module === 'object' && module !== null) {
-          if ((module as any).$$typeof || typeof (module as any).render === 'function') {
+          if ((module as { $$typeof?: unknown; render?: unknown }).$$typeof || typeof (module as { render?: unknown }).render === 'function') {
             Component = module as React.ComponentType
           } else if ('default' in module) {
             const defaultExport = (module as { default: unknown }).default
             if (typeof defaultExport === 'function') {
               Component = defaultExport as React.ComponentType
             } else if (typeof defaultExport === 'object' && defaultExport !== null) {
-              if ((defaultExport as any).$$typeof || typeof (defaultExport as any).render === 'function') {
+              if ((defaultExport as { $$typeof?: unknown; render?: unknown }).$$typeof || typeof (defaultExport as { render?: unknown }).render === 'function') {
                 Component = defaultExport as React.ComponentType
               }
             }
@@ -351,7 +389,7 @@ const ComponentRenderer = memo(function ComponentRenderer({
 
       // Auto-retry if we haven't exceeded max attempts
       if (attempt < MAX_LOAD_RETRIES) {
-        const retryType = componentType // capture current type
+        const _retryType = componentType // capture current type
         retryTimerRef.current = setTimeout(() => {
           // Only retry if the component type hasn't changed during the delay
           setAttemptCount(prev => prev === attempt ? attempt + 1 : prev)
@@ -405,7 +443,7 @@ const ComponentRenderer = memo(function ComponentRenderer({
   // Subscribe to installed community component count to detect when
   // communityRegistry gets populated after async fetchInstalled().
   // This breaks through the memo boundary so isCommunity is re-evaluated.
-  const communityRevision = useStore(useCallback((s: any) =>
+  const communityRevision = useStore(useCallback((s: HeraMindStore) =>
     (s.installed?.length ?? 0) + (s.loading ? 0.5 : 0)
   , []))
 
@@ -450,12 +488,12 @@ const ComponentRenderer = memo(function ComponentRenderer({
   // Use individual properties instead of entire component object to prevent unnecessary re-creates
   const componentId = component.id
   const componentTitle = component.title
-  const componentConfig = (component as any).config || {}
-  const componentDataSource = (component as any).dataSource
-  const componentDisplay = (component as any).display
+  const componentConfig = ((component as RuntimeComponent).config) || {}
+  const componentDataSource = (component as RuntimeComponent).dataSource
+  const componentDisplay = (component as RuntimeComponent).display
 
   // Device binding: check if component has device binding config
-  const boundDeviceId = componentConfig.deviceBinding?.deviceId as string | undefined
+  const boundDeviceId = (componentConfig.deviceBinding as { deviceId?: string } | undefined)?.deviceId as string | undefined
   const communityMetaForDevice = isCommunity ? communityRegistry.getMeta(componentType) : null
   const dynamicMetaForDevice = isDynamic ? dynamicRegistry.getMeta(componentType) : null
   const hasDeviceBinding = !!(
@@ -463,16 +501,16 @@ const ComponentRenderer = memo(function ComponentRenderer({
   )
 
   // Subscribe to bound device from store (static config only — does NOT change on telemetry updates)
-  const boundDevice = useStore(useCallback((s: any) =>
+  const boundDevice = useStore(useCallback((s: HeraMindStore) =>
     hasDeviceBinding ? findDevice(s.devices, boundDeviceId) : null
   , [hasDeviceBinding, boundDeviceId]))
 
   // Subscribe to bound device's telemetry independently (high-frequency updates)
-  const boundDeviceTelemetry = useStore(useCallback((s: any) =>
+  const boundDeviceTelemetry = useStore(useCallback((s: HeraMindStore) =>
     hasDeviceBinding && boundDeviceId ? s.deviceTelemetry[boundDeviceId] : undefined
   , [hasDeviceBinding, boundDeviceId]))
 
-  const boundDeviceType = useStore(useCallback((s: any) =>
+  const boundDeviceType = useStore(useCallback((s: HeraMindStore) =>
     hasDeviceBinding && boundDevice
       ? s.deviceTypes.find((dt: DeviceType) => dt.device_type === boundDevice.device_type)
       : null
@@ -523,9 +561,11 @@ const ComponentRenderer = memo(function ComponentRenderer({
   useEvents({
     enabled: hasDeviceBinding && !!boundDeviceId,
     category: 'device',
-    onEvent: useCallback((event: any) => {
+    onEvent: useCallback((event: HeraMindEvent) => {
       if (!hasDeviceBinding || !boundDeviceId) return
-      const eventData = event.data || event
+      const eventData = (event.data ?? event) as {
+        type?: string; device_id?: string; id?: string; timestamp?: number | string
+      }
       const eventType = event.type || eventData.type || ''
       const deviceId = eventData.device_id
 
@@ -533,7 +573,7 @@ const ComponentRenderer = memo(function ComponentRenderer({
       if (deviceId !== boundDeviceId) return
 
       // Deduplicate
-      const eventId = eventData.id || `${eventType}-${eventData.timestamp}-${deviceId}`
+      const eventId = eventData.id || `${eventType}-${eventData.timestamp ?? ''}-${deviceId}`
       if (processedEventsRef.current.has(eventId)) return
       processedEventsRef.current.add(eventId)
       if (processedEventsRef.current.size > 100) {
@@ -582,7 +622,7 @@ const ComponentRenderer = memo(function ComponentRenderer({
     const { editMode, key: _key, ref: _ref, children: _children, ...restConfig } = componentConfig
 
     // Build props for the component (NOT including key - key must be passed directly)
-    const builtProps: Record<string, any> = {
+    const builtProps: Record<string, unknown> = {
       dataSource: componentDataSource,
       editMode, // Pass editMode as a separate prop for components that need it
       config: componentConfig, // Pass full config object for community/extension components that read props.config
@@ -603,8 +643,9 @@ const ComponentRenderer = memo(function ComponentRenderer({
     }
 
     // Special handling for agent-monitor-widget: extract agentId from dataSource
-    if (componentType === 'agent-monitor-widget' && componentDataSource?.agentId) {
-      builtProps.agentId = componentDataSource.agentId
+    const dsAgentId = (componentDataSource as { agentId?: string } | undefined)?.agentId
+    if (componentType === 'agent-monitor-widget' && dsAgentId) {
+      builtProps.agentId = dsAgentId
     }
 
     // ai-analyst: agentId comes from config (restConfig), no special handling needed
@@ -644,7 +685,7 @@ const ComponentRenderer = memo(function ComponentRenderer({
       <Card className={cn('border-error', className)}>
         <div className="flex items-center justify-center h-full min-h-[120px] p-4 text-center">
           <div className="text-error">
-            <p className="font-medium">Component Load Failed</p>
+            <p className="font-medium">{t('renderer.componentLoadFailed')}</p>
             <p className="text-sm text-muted-foreground mt-1">
               {loadError.message}
             </p>
@@ -653,9 +694,9 @@ const ComponentRenderer = memo(function ComponentRenderer({
                 setLoadError(null)
                 setAttemptCount(0)
               }}
-              className="mt-2 px-3 py-1 text-xs hover:bg-muted rounded hover:bg-muted transition-colors"
+              className="mt-2 px-3 py-1 text-xs hover:bg-muted rounded transition-colors"
             >
-              Retry
+              {t('defaultStates.retry')}
             </button>
           </div>
         </div>
@@ -675,7 +716,7 @@ const ComponentRenderer = memo(function ComponentRenderer({
 
   // ErrorBoundary resetKey: when config (e.g., deviceBinding) or component identity changes,
   // reset the error state so the component gets a fresh retry.
-  const errorResetKey = component.id + ':' + component.type + ':' + (componentConfig.deviceBinding?.deviceId || '')
+  const errorResetKey = component.id + ':' + component.type + ':' + ((componentConfig.deviceBinding as { deviceId?: string } | undefined)?.deviceId || '')
 
   // Built-in components: render directly without Suspense (they're statically imported)
   if (isBuiltIn) {
@@ -695,8 +736,8 @@ const ComponentRenderer = memo(function ComponentRenderer({
   )
 }, (prevProps, nextProps) => {
   // Custom comparison for more precise re-render control
-  const prevComp = prevProps.component as any
-  const nextComp = nextProps.component as any
+  const prevComp = prevProps.component as RuntimeComponent
+  const nextComp = nextProps.component as RuntimeComponent
 
   // Quick primitive checks
   if (prevProps.component.id !== nextProps.component.id) return false

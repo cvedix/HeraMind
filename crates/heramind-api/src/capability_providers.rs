@@ -143,6 +143,7 @@ impl DeviceCapabilityProvider {
             timestamp: timestamp_secs,
             value: metric_value.clone(),
             quality: Some(1.0),
+            metadata: None,
         };
 
         let write_source_id = format!("device:{}", device_id);
@@ -300,6 +301,8 @@ impl DeviceCapabilityProvider {
             commands,
             default_offline_timeout_secs: None,
             store_raw: None,
+            builtin_version: None,
+            ct_prov: None,
         };
 
         device_service
@@ -561,7 +564,7 @@ impl EventCapabilityProvider {
 
             // Register the subscription with the dispatcher
             // Note: For in-process extensions, they should use event_subscriptions() method
-            // This dynamic subscription is mainly for isolated/WASM extensions
+            // This dynamic subscription is mainly for isolated extensions
             dispatcher.register_isolated_extension(
                 format!("dynamic:{}", subscription_id),
                 event_types.clone(),
@@ -1488,6 +1491,15 @@ impl ChatStreamCapabilityProvider {
             }
         };
 
+        // Optional per-call backend/model override. When present, the session's
+        // agent is reconfigured to that backend before the turn runs (the same
+        // path the chat UI's model picker uses). Absent ⇒ platform default.
+        let model_override: Option<String> = params
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from);
+
         // Spawn background task that drives the stream and publishes each chunk.
         let mgr = session_manager.clone();
         let bus = self.event_bus.clone();
@@ -1496,11 +1508,21 @@ impl ChatStreamCapabilityProvider {
         let imgs = images;
         tokio::spawn(async move {
             let result = async {
+                // Both branches honor the per-call model override — a
+                // text-only `model` param silently ignored while the
+                // multimodal branch honored it would be a caller trap.
+                // `None` skips backend configuration (platform default).
                 let stream_result = if imgs.is_empty() {
-                    mgr.process_message_events(&sid, &msg).await
-                } else {
-                    mgr.process_message_multimodal_with_backend_stream(&sid, &msg, imgs, None)
+                    mgr.process_message_events_with_backend(&sid, &msg, model_override.as_deref())
                         .await
+                } else {
+                    mgr.process_message_multimodal_with_backend_stream(
+                        &sid,
+                        &msg,
+                        imgs,
+                        model_override.as_deref(),
+                    )
+                    .await
                 };
                 let stream = match stream_result {
                     Ok(s) => s,
@@ -1738,6 +1760,16 @@ impl ChatSessionCapabilityProvider {
         if let Some(et) = params.get("enable_tools").and_then(|v| v.as_bool()) {
             opts.enable_tools = Some(et);
         }
+        // Optional per-session tool allowlist. A name that matches nothing
+        // (e.g. "__none__") effectively runs the session with ZERO tools —
+        // used by headless VLM callers that must not let the model call
+        // tools mid-description.
+        if let Some(at) = params.get("allowed_tools").and_then(|v| v.as_array()) {
+            opts.allowed_tools = at
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
 
         let session_id = mgr
             .get_or_create_session_with_options(existing.map(|s| s.to_string()), opts)
@@ -1893,6 +1925,15 @@ impl ChatSessionCapabilityProvider {
 /// this here means subscribers consume the exact same schema as the browser.
 fn agent_event_to_json(event: &AgentEvent) -> Value {
     match event {
+        AgentEvent::ContextUsage {
+            prompt_tokens,
+            system_prompt_tokens,
+            tool_tokens,
+            max_context_tokens,
+        } => json!({
+            "type":"ContextUsage", "tokenUsage":{"promptTokens":prompt_tokens,
+                "systemPromptTokens":system_prompt_tokens,"toolTokens":tool_tokens,"maxContextTokens":max_context_tokens}
+        }),
         AgentEvent::Thinking { content } => json!({ "type": "Thinking", "content": content }),
         AgentEvent::Content { content } => json!({ "type": "Content", "content": content }),
         AgentEvent::ToolCallStart {
@@ -1946,6 +1987,33 @@ fn agent_event_to_json(event: &AgentEvent) -> Value {
             }
             v
         }
+        AgentEvent::SystemNote { note } => json!({ "type": "SystemNote", "note": note }),
+        AgentEvent::AuthorizeConfirmRequest {
+            request_id,
+            prior_operation_id,
+            write_fingerprint,
+            tool_name,
+            target,
+            valid_until_ms,
+        } => {
+            let mut json = json!({
+                "type": "AuthorizeConfirmRequest",
+                "requestId": request_id,
+                "priorOperationId": prior_operation_id,
+                "writeFingerprint": write_fingerprint,
+                "toolName": tool_name,
+                "validUntilMs": valid_until_ms,
+            });
+            if let Some(t) = target {
+                json["target"] = json!(t);
+            }
+            json
+        }
+        AgentEvent::AuthorizeConfirmRemoved { request_id, reason } => json!({
+            "type": "AuthorizeConfirmRemoved",
+            "requestId": request_id,
+            "reason": reason,
+        }),
         AgentEvent::Progress {
             message,
             stage,
@@ -1959,6 +2027,233 @@ fn agent_event_to_json(event: &AgentEvent) -> Value {
         }),
         AgentEvent::Heartbeat { timestamp } => {
             json!({ "type": "Heartbeat", "timestamp": timestamp })
+        }
+    }
+}
+
+// ============================================================================
+// One-shot LLM completion (no chat session, no tools)
+// ============================================================================
+
+/// `llm_complete`: one `LlmRuntime::generate` call.
+///
+/// Extensions that need a picture described (tuyun watermark) use this instead
+/// of `chat_session_open`. Nothing is written to the chat session store.
+#[derive(Default)]
+pub struct LlmCompleteCapabilityProvider;
+
+impl LlmCompleteCapabilityProvider {
+    pub fn new() -> Self {
+        Self
+    }
+
+    async fn handle(&self, params: &Value) -> Result<Value, CapabilityError> {
+        let message = params
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                CapabilityError::InvalidParameters("Missing non-empty 'message'".to_string())
+            })?;
+        let system_prompt = params
+            .get("system_prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let model = params
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let temperature = params
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .map(|t| t as f32);
+        let max_tokens = params
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.clamp(1, 4096) as usize)
+            .unwrap_or(512);
+        let images = image_parts(params.get("images"))?;
+        let has_images = !images.is_empty();
+
+        let manager = heramind_agent::llm_backends::get_instance_manager().map_err(|e| {
+            CapabilityError::ProviderError(format!("LLM instance manager unavailable: {e}"))
+        })?;
+        let (backend_id, runtime) =
+            resolve_completion_runtime(&manager, model.as_deref(), has_images).await?;
+
+        let messages = build_completion_messages(&system_prompt, message, images);
+        let input = heramind_core::llm::backend::LlmInput {
+            messages,
+            params: heramind_core::llm::backend::GenerationParams {
+                temperature,
+                max_tokens: Some(max_tokens),
+                // Non-chat completion: disable thinking so qwen3/deepseek-r1
+                // style models do not burn the 512-token cap on a chain of
+                // thought (same rule as memory extract / compression).
+                thinking_enabled: Some(false),
+                ..Default::default()
+            },
+            model: None,
+            stream: false,
+            tools: None,
+        };
+
+        tracing::info!(
+            model = %backend_id,
+            has_images,
+            max_tokens,
+            "llm_complete: generating without a chat session"
+        );
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(120), runtime.generate(input))
+                .await
+                .map_err(|_| {
+                    CapabilityError::ProviderError("llm_complete timed out after 120s".into())
+                })?
+                .map_err(|e| CapabilityError::ProviderError(format!("llm_complete failed: {e}")))?;
+        let text = output.text.trim().to_string();
+        if text.is_empty() {
+            return Err(CapabilityError::ProviderError(
+                "llm_complete returned empty text".into(),
+            ));
+        }
+        Ok(json!({ "text": text, "model": backend_id }))
+    }
+}
+
+fn image_parts(
+    value: Option<&Value>,
+) -> Result<Vec<heramind_core::message::ContentPart>, CapabilityError> {
+    use heramind_core::message::ContentPart;
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value.as_array().ok_or_else(|| {
+        CapabilityError::InvalidParameters("'images' must be an array of data URLs".into())
+    })?;
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items {
+        let src = item.as_str().ok_or_else(|| {
+            CapabilityError::InvalidParameters("each image must be a string".into())
+        })?;
+        let src = src.trim();
+        if src.is_empty() {
+            return Err(CapabilityError::InvalidParameters(
+                "image entry is empty".into(),
+            ));
+        }
+        if let Some(rest) = src.strip_prefix("data:") {
+            let (meta, data) = rest.split_once(',').ok_or_else(|| {
+                CapabilityError::InvalidParameters("image data URL is missing a comma".into())
+            })?;
+            let mime = meta.strip_suffix(";base64").unwrap_or(meta);
+            if data.is_empty() || mime.is_empty() {
+                return Err(CapabilityError::InvalidParameters(
+                    "image data URL is incomplete".into(),
+                ));
+            }
+            parts.push(ContentPart::image_base64(data, mime));
+        } else {
+            parts.push(ContentPart::image_url(src));
+        }
+    }
+    Ok(parts)
+}
+
+fn build_completion_messages(
+    system_prompt: &str,
+    message: &str,
+    images: Vec<heramind_core::message::ContentPart>,
+) -> Vec<heramind_core::message::Message> {
+    use heramind_core::message::{Content, ContentPart, Message, MessageRole};
+    let mut messages = Vec::new();
+    if !system_prompt.is_empty() {
+        messages.push(Message::system(system_prompt));
+    }
+    if images.is_empty() {
+        messages.push(Message::user(message));
+    } else {
+        let mut parts = vec![ContentPart::text(message)];
+        parts.extend(images);
+        messages.push(Message::new(MessageRole::User, Content::Parts(parts)));
+    }
+    messages
+}
+
+async fn resolve_completion_runtime(
+    manager: &heramind_agent::llm_backends::LlmBackendInstanceManager,
+    model: Option<&str>,
+    has_images: bool,
+) -> Result<
+    (
+        String,
+        std::sync::Arc<dyn heramind_core::llm::backend::LlmRuntime>,
+    ),
+    CapabilityError,
+> {
+    if let Some(id) = model {
+        let runtime = manager.get_runtime(id).await.map_err(|e| {
+            CapabilityError::ProviderError(format!("model '{id}' is not available: {e}"))
+        })?;
+        return Ok((id.to_string(), runtime));
+    }
+    if has_images {
+        let instances = manager.list_instances();
+        let id = instances
+            .iter()
+            .find(|i| i.capabilities.supports_multimodal && i.id.starts_with("builtin-vlm-"))
+            .or_else(|| {
+                instances
+                    .iter()
+                    .find(|i| i.capabilities.supports_multimodal)
+            })
+            .map(|i| i.id.clone())
+            .ok_or_else(|| {
+                CapabilityError::ProviderError(
+                    "no multimodal model is configured for llm_complete".into(),
+                )
+            })?;
+        let runtime = manager.get_runtime(&id).await.map_err(|e| {
+            CapabilityError::ProviderError(format!("vision model '{id}' failed to start: {e}"))
+        })?;
+        return Ok((id, runtime));
+    }
+    let active = manager.get_active_runtime().await.map_err(|e| {
+        CapabilityError::ProviderError(format!("no active text model for llm_complete: {e}"))
+    })?;
+    let id = manager
+        .list_instances()
+        .into_iter()
+        .find(|i| i.is_active)
+        .map(|i| i.id)
+        .unwrap_or_else(|| "active".to_string());
+    Ok((id, active))
+}
+
+#[async_trait]
+impl ExtensionCapabilityProvider for LlmCompleteCapabilityProvider {
+    fn capability_manifest(&self) -> CapabilityManifest {
+        CapabilityManifest {
+            capabilities: vec![ExtensionCapability::LlmComplete],
+            api_version: "v1".to_string(),
+            min_core_version: env!("CARGO_PKG_VERSION").to_string(),
+            package_name: "heramind-api::llm".to_string(),
+        }
+    }
+
+    async fn invoke_capability(
+        &self,
+        capability: ExtensionCapability,
+        params: &Value,
+    ) -> Result<Value, CapabilityError> {
+        match capability {
+            ExtensionCapability::LlmComplete => self.handle(params).await,
+            _ => Err(CapabilityError::NotAvailable(capability)),
         }
     }
 }
@@ -2061,7 +2356,12 @@ pub async fn register_builtin_providers_with_dispatcher(
         )
         .await;
 
-    tracing::info!("Registered all built-in capability providers (9 providers, 20 capabilities)");
+    let llm_provider = Arc::new(LlmCompleteCapabilityProvider::new());
+    context
+        .register_provider("heramind-api::llm".to_string(), llm_provider)
+        .await;
+
+    tracing::info!("Registered all built-in capability providers (10 providers, 21 capabilities)");
 }
 
 // ============================================================================
@@ -2177,6 +2477,11 @@ impl CompositeCapabilityProvider {
             chat_session_provider,
         );
 
+        let llm_provider = Arc::new(LlmCompleteCapabilityProvider::new());
+        composite
+            .providers
+            .insert("heramind-api::llm".to_string(), llm_provider);
+
         composite
     }
 }
@@ -2249,6 +2554,8 @@ fn capability_to_provider(capability: &ExtensionCapability) -> &'static str {
         | ExtensionCapability::ChatSessionSend
         | ExtensionCapability::ChatSessionClose
         | ExtensionCapability::ChatStreamCancelTurn => "heramind-api::chat_session",
+
+        ExtensionCapability::LlmComplete => "heramind-api::llm",
 
         ExtensionCapability::Custom(_) => "heramind-api::custom",
     }

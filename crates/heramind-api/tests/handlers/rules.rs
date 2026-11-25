@@ -104,4 +104,349 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.message.contains("Missing 'name' field"));
     }
+
+    async fn seed_sensor_rule(state: &ServerState) -> heramind_rules::RuleId {
+        // Rule shape from the T4 552 acceptance trace
+        // full--multi-turn-correction--en--r0: created via `heramind rule create
+        // --trigger-device sensor-001 --metric values.battery ...`.
+        let rule: heramind_rules::CompiledRule = serde_json::from_value(json!({
+            "id": "0defb220-a8fc-45e7-8705-ca0753f72bc1",
+            "name": "ctx-correct-rule",
+            "enabled": true,
+            "trigger_count": 0,
+            "created_at": "2026-11-03T10:07:46.137716968+00:00",
+            "updated_at": "2026-11-03T10:07:46.137726241+00:00",
+            "trigger": {
+                "trigger_type": "data_change",
+                "sources": ["device:sensor-001:values.battery"]
+            },
+            "condition": {
+                "condition_type": "comparison",
+                "source": "device:sensor-001:values.battery",
+                "source_type": "device",
+                "source_id": "sensor-001",
+                "operator": "less_than",
+                "threshold": 20.0
+            },
+            "actions": [
+                {"type": "notify", "message": "Battery below 20: {value}%", "severity": "warning"}
+            ]
+        }))
+        .expect("valid CompiledRule");
+        let id = rule.id.clone();
+        state
+            .automation
+            .rule_engine
+            .update_rule(rule)
+            .await
+            .unwrap();
+        id
+    }
+
+    // Regression pinned from the raw trace full--multi-turn-correction--en--r0
+    // (2026-11-03, T4 552 acceptance): `heramind rule update <id> --body
+    // '{"name":"ctx-correct-rule","trigger_device":"sensor-002","metric":...,
+    // "operator":...,"threshold":20,"notify":...}' returned success=true with
+    // the rule STILL pointing at sensor-001 (only updated_at changed) — the
+    // update endpoint silently dropped unknown fields and reported the no-op
+    // partial update as "updated". Contract (user-spec 2026-11-04): unknown
+    // fields — even mixed with valid ones — reject the WHOLE request with a
+    // structured 400; nothing is written, rule and updated_at unchanged.
+    #[tokio::test]
+    async fn test_update_rule_rejects_unknown_field_noop_body() {
+        let state = create_test_server_state().await;
+        let id = seed_sensor_rule(&state).await;
+        let before = state.automation.rule_engine.get_rule(&id).await.unwrap();
+
+        // EXACT body from the raw trace (create-style flag names; the request
+        // also carries a valid `name`, which must NOT let it through).
+        let req = json!({
+            "name": "ctx-correct-rule",
+            "trigger_device": "sensor-002",
+            "metric": "values.battery",
+            "operator": "less_than",
+            "threshold": 20,
+            "notify": "Battery below 20: {value}%"
+        });
+        let result =
+            update_rule_handler(State(state.clone()), Path(id.to_string()), Json(req)).await;
+        assert!(
+            result.is_err(),
+            "unknown-field no-op update must not report success"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("trigger_device"),
+            "error must list the unknown fields"
+        );
+
+        // The whole request must not be written: rule content AND updated_at
+        // stay exactly as before.
+        let after = state.automation.rule_engine.get_rule(&id).await.unwrap();
+        let source_of = |r: &heramind_rules::CompiledRule| {
+            r.condition
+                .as_ref()
+                .and_then(|c| serde_json::to_value(c).ok())
+                .and_then(|v| v.get("source_id").cloned())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        assert_eq!(
+            source_of(&after),
+            source_of(&before),
+            "condition must be untouched after rejected update"
+        );
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "updated_at must not move on a rejected update"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_rule_rejects_empty_body() {
+        let state = create_test_server_state().await;
+        let id = seed_sensor_rule(&state).await;
+        let result = update_rule_handler(State(state), Path(id.to_string()), Json(json!({}))).await;
+        assert!(result.is_err(), "empty body must be rejected");
+        assert_eq!(
+            result.unwrap_err().status,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_rule_rejects_wrong_field_type() {
+        let state = create_test_server_state().await;
+        let id = seed_sensor_rule(&state).await;
+        let result = update_rule_handler(
+            State(state),
+            Path(id.to_string()),
+            Json(json!({ "name": 123 })),
+        )
+        .await;
+        assert!(result.is_err(), "wrong-typed field must be rejected");
+        assert_eq!(
+            result.unwrap_err().status,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    // Idempotent updates (same value) are legal and must succeed with
+    // changed=false, without moving updated_at.
+    #[tokio::test]
+    async fn test_update_rule_idempotent_same_value_succeeds_changed_false() {
+        let state = create_test_server_state().await;
+        let id = seed_sensor_rule(&state).await;
+        let before = state.automation.rule_engine.get_rule(&id).await.unwrap();
+
+        let req = json!({ "name": "ctx-correct-rule" });
+        let result =
+            update_rule_handler(State(state.clone()), Path(id.to_string()), Json(req)).await;
+        assert!(result.is_ok(), "idempotent same-value update must succeed");
+        let rule = result.unwrap().0.data.unwrap();
+        assert_eq!(rule["changed"], false);
+
+        let after = state.automation.rule_engine.get_rule(&id).await.unwrap();
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    // Metadata keys (tags/cooldown/…) in a PARTIAL body must be rejected:
+    // they would be accepted-but-ignored, recreating the silent no-op
+    // success defect under a different shape.
+    #[tokio::test]
+    async fn test_update_rule_rejects_metadata_keys_without_full_definition() {
+        let state = create_test_server_state().await;
+        let id = seed_sensor_rule(&state).await;
+        let req = json!({
+            "name": "ctx-correct-rule",
+            "enabled": true,
+            "tags": [],
+            "cooldown": 60000
+        });
+        let result = update_rule_handler(State(state), Path(id.to_string()), Json(req)).await;
+        assert!(
+            result.is_err(),
+            "metadata keys without a full definition must be rejected"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("tags"),
+            "error must name the metadata fields"
+        );
+    }
+
+    // On the full-definition path, metadata keys must actually be APPLIED —
+    // whitelisting them is not enough. Also verifies the idempotent
+    // full-definition update reports changed=false without rewriting.
+    #[tokio::test]
+    async fn test_update_rule_full_definition_applies_metadata_and_idempotent() {
+        let state = create_test_server_state().await;
+        // Seed a schedule rule (no device references -> passes validation).
+        let rule: heramind_rules::CompiledRule = serde_json::from_value(json!({
+            "id": "11111111-2222-3333-4444-555555555555",
+            "name": "schedule-probe",
+            "enabled": true,
+            "trigger": {"trigger_type": "schedule", "cron": "*/5 * * * *"},
+            "actions": [{"type": "notify", "message": "tick", "severity": "info"}],
+            "cooldown": 60000
+        }))
+        .expect("valid CompiledRule");
+        let id = rule.id.clone();
+        state
+            .automation
+            .rule_engine
+            .update_rule(rule)
+            .await
+            .unwrap();
+
+        let req = json!({
+            "name": "schedule-probe",
+            "trigger": {"trigger_type": "schedule", "cron": "*/5 * * * *"},
+            "actions": [{"type": "notify", "message": "tick", "severity": "info"}],
+            "tags": ["prod"],
+            "cooldown": 120000
+        });
+        let result = update_rule_handler(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(req.clone()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "full-definition update with metadata should succeed"
+        );
+        let body = result.unwrap().0.data.unwrap();
+        assert_eq!(
+            body["changed"], true,
+            "adding tags/cooldown is a real change"
+        );
+
+        let stored = state.automation.rule_engine.get_rule(&id).await.unwrap();
+        assert_eq!(
+            stored.tags,
+            vec!["prod".to_string()],
+            "tags must be applied"
+        );
+        assert_eq!(
+            stored.cooldown.as_millis(),
+            120000,
+            "cooldown must be applied"
+        );
+
+        // Identical full body again: legal idempotent update, changed=false.
+        let again = update_rule_handler(State(state), Path(id.to_string()), Json(req)).await;
+        assert!(again.is_ok());
+        assert_eq!(again.unwrap().0.data.unwrap()["changed"], false);
+    }
+
+    // changed=false must hold for every writable partial field, not only name.
+    #[tokio::test]
+    async fn test_update_rule_idempotent_enabled_changed_false() {
+        let state = create_test_server_state().await;
+        let id = seed_sensor_rule(&state).await;
+        let result = update_rule_handler(
+            State(state),
+            Path(id.to_string()),
+            Json(json!({ "enabled": true })),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0.data.unwrap()["changed"], false);
+    }
+
+    // Positive control for the same contract: a recognized partial field must
+    // keep working and must not disturb the rest of the rule.
+    #[tokio::test]
+    async fn test_update_rule_partial_rename_preserves_condition() {
+        let state = create_test_server_state().await;
+        let id = seed_sensor_rule(&state).await;
+
+        let req = json!({ "name": "ctx-correct-rule-renamed" });
+        let result = update_rule_handler(State(state), Path(id.to_string()), Json(req)).await;
+        assert!(result.is_ok(), "recognized partial update should succeed");
+        let response = result.unwrap();
+        let rule = response.0.data.unwrap();
+        assert_eq!(rule["rule"]["name"], "ctx-correct-rule-renamed");
+        assert_eq!(rule["rule"]["condition"]["source_id"], "sensor-001");
+        assert_eq!(rule["changed"], true);
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+    use axum::extract::Path;
+    use heramind_core::datasource::DataSourceId;
+    use heramind_rules::models::*;
+
+    async fn seed_rule_with_value(state: &ServerState, value: Option<f64>) -> RuleId {
+        let engine = &state.automation.rule_engine;
+        // Feed the value cache the condition reads.
+        let provider = state.automation.value_provider.clone();
+        if let Some(v) = value {
+            provider
+                .update_value("device", "sensor-explain", "temperature", v)
+                .await;
+        }
+        let mut rule = CompiledRule::new("Explain handler rule");
+        rule.condition = Some(RuleCondition::Comparison {
+            source: DataSourceId::device("sensor-explain", "temperature"),
+            operator: ComparisonOperator::GreaterThan,
+            threshold: 30.0,
+            threshold_value: None,
+        });
+        rule.trigger = RuleTrigger::Manual;
+        rule.actions = vec![RuleAction::Notify {
+            message: "hot".into(),
+            severity: NotifySeverity::Warning,
+        }];
+        rule.finalize();
+        let id = rule.id.clone();
+        engine.add_rule(rule).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn explain_handler_returns_unknown_for_missing_value() {
+        let state = create_test_server_state().await;
+        let id = seed_rule_with_value(&state, None).await;
+        let result = get_rule_explain_handler(State(state), Path(id.to_string())).await;
+        assert!(result.is_ok());
+        let value = result.unwrap().0.data.unwrap();
+        assert_eq!(value["condition"]["result"], "unknown");
+        assert_eq!(value["condition"]["unknown_reason"], "no_value_cached");
+        assert!(value["notes"].as_array().unwrap().iter().any(|n| n
+            .as_str()
+            .unwrap_or_default()
+            .contains("cooldown state is engine memory")));
+    }
+
+    #[tokio::test]
+    async fn explain_handler_returns_true_with_fresh_value() {
+        let state = create_test_server_state().await;
+        let id = seed_rule_with_value(&state, Some(35.0)).await;
+        let result = get_rule_explain_handler(State(state), Path(id.to_string())).await;
+        assert!(result.is_ok());
+        let value = result.unwrap().0.data.unwrap();
+        assert_eq!(value["condition"]["result"], "true");
+        assert_eq!(
+            value["condition"]["source"],
+            "device:sensor-explain:temperature"
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_handler_invalid_and_missing_ids() {
+        let state = create_test_server_state().await;
+        let bad = get_rule_explain_handler(State(state.clone()), Path("not-a-uuid".into())).await;
+        assert!(bad.is_err());
+        let ghost = get_rule_explain_handler(
+            State(state),
+            Path("00000000-0000-4000-8000-000000000000".into()),
+        )
+        .await;
+        assert!(ghost.is_err());
+    }
 }

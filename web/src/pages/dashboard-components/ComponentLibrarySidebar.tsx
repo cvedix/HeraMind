@@ -19,7 +19,7 @@ import {
 import { cn } from '@/lib/utils'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { MobileTabStrip } from '@/components/shared/MobileTabStrip'
 import { dynamicRegistry } from '@/components/dashboard/registry/DynamicRegistry'
 import {
   FullScreenDialog, FullScreenDialogHeader, FullScreenDialogContent,
@@ -197,7 +197,7 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
     <Button
       variant="outline"
       size="sm"
-      className={cn('h-9 gap-1.5 text-xs', fullWidth && 'w-full justify-start')}
+      className={cn('h-9 gap-1.5 text-xs', fullWidth && 'w-full justify-start', "sm:h-9")}
       onClick={() => onImportDialogOpenChange(true)}
     >
       <PackagePlus className="w-3.5 h-3.5" />
@@ -238,7 +238,7 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
               <category.categoryIcon className="h-3.5 w-3.5" />
             </span>
             <span className="text-sm font-medium text-foreground">{category.categoryLabel}</span>
-            <span className="text-[10px] tabular-nums text-muted-foreground bg-muted rounded-full px-1.5 py-0.5 leading-none">
+            <span className="text-nano tabular-nums text-muted-foreground bg-muted rounded-full px-1.5 py-0.5 leading-none">
               {category.items.length}
             </span>
           </div>
@@ -252,13 +252,13 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
                 key={item.id}
                 type="button"
                 onClick={() => onAddComponent(item.id)}
-                className={`w-full h-[76px] flex items-center gap-3 py-2 px-3 rounded-lg border hover:shadow-sm transition-all duration-normal cursor-pointer active:scale-[0.98] text-left ${isHighlighted ? 'border-primary shadow-sm ring-2 ring-primary animate-[fadeHighlight_2s_ease-out_forwards]' : 'border-border'}`}
+                className={`w-full h-[76px] flex items-start gap-3 py-2 px-3 rounded-lg border overflow-hidden hover:shadow-sm transition-all duration-normal cursor-pointer active:scale-[0.98] text-left ${isHighlighted ? 'border-primary shadow-sm ring-2 ring-primary animate-[fadeHighlight_2s_ease-out_forwards]' : 'border-border'}`}
               >
                 <span className="w-9 h-9 rounded-lg bg-muted text-foreground flex items-center justify-center shrink-0">
                   <Icon className="h-4 w-4 shrink-0" />
                 </span>
-                <div className="flex-1 min-w-0">
-                  <span className="text-sm font-medium block truncate">{item.name}</span>
+                <div className="flex-1 min-w-0 flex flex-col">
+                  <span className="text-sm font-medium block truncate shrink-0">{item.name}</span>
                   <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2 leading-snug">{item.description}</p>
                 </div>
               </button>
@@ -271,7 +271,6 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
   const noResultsPane = (
     <div className="flex h-full min-h-[320px]">
       <EmptyState
-        icon="search"
         title={t('componentLibrary.noResults')}
         description={t('componentLibrary.noResultsHint')}
       />
@@ -294,7 +293,6 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
         {extensionGroups.length === 0 ? (
           <div className="flex h-full min-h-[320px]">
             <EmptyState
-              icon={<Puzzle className="h-12 w-12" />}
               title={searching ? t('componentLibrary.noResults') : t('componentLibrary.extensionsEmptyTitle')}
               description={searching ? t('componentLibrary.noResultsHint') : t('componentLibrary.extensionsEmptyDesc')}
             />
@@ -328,7 +326,6 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
         ) : marketComponents.length === 0 ? (
           <div className="flex h-full min-h-[320px]">
             <EmptyState
-              icon="plugin"
               title={t('componentLibrary.marketplaceEmpty')}
             />
           </div>
@@ -355,7 +352,7 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
                         <span className="text-sm font-medium text-foreground truncate">{mcName}</span>
                         {isInstalled && <Check className="w-3.5 h-3.5 text-success shrink-0" />}
                       </div>
-                      <p className="text-xs text-muted-foreground">{t('componentLibrary.version')}: {mc.version}{mc.author ? ` · ${mc.author}` : ''}</p>
+                      <p className="text-xs text-muted-foreground truncate">{t('componentLibrary.version')}: {mc.version}{mc.author ? ` · ${mc.author}` : ''}</p>
                     </div>
                   </div>
                   <p className="text-xs text-muted-foreground line-clamp-2 flex-1 min-h-0">{mcDesc}</p>
@@ -365,7 +362,7 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
                       <Button
                         variant="outline"
                         size="sm"
-                        className="flex-1 h-7 text-xs"
+                        className="flex-1 h-7 text-xs sm:h-7"
                         onClick={() => onAddComponent(mc.id)}
                       >
                         <Plus className="w-3.5 h-3.5" />
@@ -374,7 +371,7 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
                       <Button
                         variant="ghost"
                         size="icon"
-                        className="h-7 w-7 text-muted-foreground hover:text-error shrink-0"
+                        className="h-7 w-7 text-muted-foreground hover:text-error shrink-0 sm:h-7 sm:w-7"
                         disabled={installingId === mc.id}
                         aria-label={t('componentLibrary.uninstall')}
                         onClick={async () => {
@@ -398,7 +395,7 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
                     <Button
                       variant="outline"
                       size="sm"
-                      className="w-full h-7 text-xs"
+                      className="w-full h-7 text-xs sm:h-7"
                       disabled={installingId === mc.id}
                       onClick={async () => {
                         onSetInstalling(mc.id)
@@ -453,7 +450,7 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
             />
           </div>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3 pt-1">
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
             {manualImports.map((c) => {
               const Icon = dynamicIconMap[c.icon || 'Box'] || Box
               const name = localized(c.name, i18n.language, c.id)
@@ -461,46 +458,43 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
               const update = updatesAvailable[c.id]
               const isHighlighted = highlightedId === c.id
               return (
+                // Same anatomy as an installed marketplace card: header
+                // (icon + name/version) over a 2-line description and a
+                // footer of explicit actions — nothing hidden behind hover.
                 <div
                   key={c.id}
                   ref={isHighlighted ? highlightedRef : undefined}
-                  className="relative group"
+                  className={`rounded-lg border bg-card p-3.5 flex flex-col gap-2 ${isHighlighted ? 'border-primary shadow-sm ring-2 ring-primary animate-[fadeHighlight_2s_ease-out_forwards]' : 'border-border'}`}
                 >
-                  {update && (
-                    <span
-                      className="absolute top-2 right-2 z-10 h-2 w-2 rounded-full bg-info ring-2 ring-background transition-opacity duration-normal group-hover:opacity-0"
-                      title={t('componentLibrary.updateAvailable', { version: update.latest })}
-                    />
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => onAddComponent(c.id)}
-                    className={`w-full h-[88px] flex items-center gap-3 py-2 px-3 rounded-lg border bg-card hover:shadow-sm transition-all duration-normal cursor-pointer active:scale-[0.98] text-left ${isHighlighted ? 'border-primary shadow-sm ring-2 ring-primary animate-[fadeHighlight_2s_ease-out_forwards]' : 'border-border'}`}
-                  >
-                    <span className="w-9 h-9 rounded-lg bg-muted text-foreground flex items-center justify-center shrink-0">
-                      <Icon className="h-4 w-4 shrink-0" />
-                    </span>
-                    <span className="flex-1 min-w-0">
+                  <div className="flex items-start gap-2.5">
+                    <div className="w-9 h-9 rounded-lg bg-muted text-foreground flex items-center justify-center shrink-0">
+                      <Icon className="w-4 h-4" />
+                    </div>
+                    <div className="flex-1 min-w-0">
                       <span className="text-sm font-medium text-foreground truncate block">{name}</span>
-                      <span className="block text-xs text-muted-foreground mt-0.5">
-                        {t('componentLibrary.version')}: {c.version}
-                      </span>
-                      <span className="block text-xs text-muted-foreground mt-0.5 line-clamp-1 leading-snug">{desc}</span>
-                    </span>
-                  </button>
-                  <div className="absolute top-1 right-1 flex gap-0.5 rounded-md bg-background/90 backdrop-blur-sm p-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <p className="text-xs text-muted-foreground truncate">{t('componentLibrary.version')}: {c.version}</p>
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground line-clamp-2 flex-1 min-h-0">{desc}</p>
+                  <div className="flex items-center gap-1.5">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="flex-1 h-7 text-xs sm:h-7"
+                      onClick={() => onAddComponent(c.id)}
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      {t('visualDashboard.addComponent')}
+                    </Button>
                     {update && (
                       <Button
                         variant="ghost"
                         size="icon"
-                        className="h-6 w-6 text-info"
+                        className="h-7 w-7 text-info shrink-0 sm:h-7 sm:w-7"
                         disabled={installingId === c.id}
                         title={t('componentLibrary.updateAvailable', { version: update.latest })}
                         aria-label={t('componentLibrary.updateAvailable', { version: update.latest })}
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          handleRefresh(c.id)
-                        }}
+                        onClick={() => handleRefresh(c.id)}
                       >
                         {installingId === c.id
                           ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -510,13 +504,10 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-6 w-6 text-muted-foreground hover:text-error"
+                      className="h-7 w-7 text-muted-foreground hover:text-error shrink-0 sm:h-7 sm:w-7"
                       disabled={installingId === c.id}
                       aria-label={t('componentLibrary.uninstall')}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        handleUninstall(c.id)
-                      }}
+                      onClick={() => handleUninstall(c.id)}
                     >
                       {installingId === c.id
                         ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -566,25 +557,36 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
           `}</style>
 
           {isMobile ? (
-            /* Mobile: no room for a rail — compact tab strip + contextual
+            /* Mobile: no room for a rail — standard tab strip + contextual
                action + inline search above the shared scroll content. */
             <div className="flex-1 flex flex-col overflow-hidden">
-              <div className="px-4 pt-3 pb-3 shrink-0 space-y-3">
-                <div className="flex items-center gap-3">
-                  <Tabs value={libraryTab} onValueChange={(v) => onLibraryTabChange(v as ComponentLibraryTab)}>
-                    <TabsList className="h-9">
-                      {sourceButtons.map(({ id, icon: Icon, label }) => (
-                        <TabsTrigger key={id} value={id} className="gap-1.5 text-xs px-3">
-                          <Icon className="w-3.5 h-3.5" />
-                          {label}
-                        </TabsTrigger>
-                      ))}
-                    </TabsList>
-                  </Tabs>
-                  {libraryTab === 'custom' && importButton()}
+              <MobileTabStrip
+                items={sourceButtons.map(({ id, label }) => ({ value: id, label }))}
+                value={libraryTab}
+                onValueChange={onLibraryTabChange}
+                ariaLabel={t('visualDashboard.componentLibrary')}
+              />
+              {(libraryTab === 'components' || libraryTab === 'custom') && (
+                <div className="shrink-0 px-4 py-2">
+                  {libraryTab === 'components' ? searchInput : importButton()}
                 </div>
-                {libraryTab === 'components' && searchInput}
-              </div>
+              )}
+              {libraryTab === 'marketplace' && (
+                <div className="shrink-0 px-4 py-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-10 gap-1.5 text-xs sm:h-10"
+                    disabled={marketLoading}
+                    onClick={() => onRefreshMarket()}
+                  >
+                    {marketLoading
+                      ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      : <RefreshCw className="w-3.5 h-3.5" />}
+                    {t('componentLibrary.refreshMarket')}
+                  </Button>
+                </div>
+              )}
               {paneFor(libraryTab)}
             </div>
           ) : (
@@ -674,7 +676,7 @@ export const ComponentLibrarySidebar = memo(function ComponentLibrarySidebar({
                       <Button
                         variant="outline"
                         size="sm"
-                        className="h-9 gap-1.5 text-xs"
+                        className="h-9 gap-1.5 text-xs sm:h-9"
                         disabled={marketLoading}
                         onClick={() => onRefreshMarket()}
                       >

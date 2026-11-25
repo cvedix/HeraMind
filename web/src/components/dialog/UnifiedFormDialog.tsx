@@ -16,10 +16,10 @@
  */
 
 import { getPortalRoot } from '@/lib/portal'
-import { ReactNode, useEffect, useRef, useCallback } from 'react'
+import { ReactNode, useEffect, useRef, useCallback, useId } from 'react'
 import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
-import { X, Loader2, AlertCircle } from 'lucide-react'
+import { ChevronLeft, X, Loader2, AlertCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { dialogHeader } from '@/design-system/tokens/size'
@@ -65,6 +65,9 @@ export interface UnifiedFormDialogProps {
   contentClassName?: string
   /** Custom footer content (replaces default buttons) */
   footer?: ReactNode
+  /** Extra content rendered in the DEFAULT footer, between Cancel and
+   *  Submit (ignored when a custom `footer` is provided). */
+  footerPrefix?: ReactNode
   /** Whether to hide the footer entirely */
   hideFooter?: boolean
   /** Whether to prevent closing during submission */
@@ -100,6 +103,7 @@ export function UnifiedFormDialog({
   className,
   contentClassName,
   footer,
+  footerPrefix,
   hideFooter = false,
   preventCloseOnSubmit = true,
 }: UnifiedFormDialogProps) {
@@ -107,6 +111,7 @@ export function UnifiedFormDialog({
   const isMobile = useIsMobile()
   const insets = useSafeAreaInsets()
   const contentRef = useRef<HTMLDivElement>(null)
+  const titleId = useId()
 
   // Default labels
   const submitText = submitLabel || t('save', 'Save')
@@ -210,6 +215,7 @@ export function UnifiedFormDialog({
           {cancelText}
         </Button>
       )}
+      {footerPrefix}
       {onSubmit && (
         <Button
           onClick={handleSubmit}
@@ -235,40 +241,43 @@ export function UnifiedFormDialog({
     return createPortal(
       open ? (
         <div
-          className={cn("fixed inset-0 animate-in fade-in duration-normal", overlayZIndex)}
-          // Use opaque --chrome (matches MobilePageHeader) instead of
-          // bg-background which has /97% alpha in dark mode and lets the
-          // previous layer bleed through, creating a visible color split.
-          style={{ backgroundColor: 'var(--chrome)' }}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={titleId}
+          className={cn(
+            "fixed inset-0 animate-in fade-in duration-normal bg-overlay-light",
+            overlayZIndex,
+          )}
           // Portal content bubbles through the React tree (not the DOM tree).
           // Without this, every tap inside the dialog — including the close
           // button — reaches ancestor handlers like a table row's onRowClick.
           onClick={(e) => e.stopPropagation()}
         >
-          <div className="flex h-full w-full flex-col">
-            {/* Header */}
+          {/* Inner surface uses bg-background over the overlay (same contract
+              as FullScreenDialog mobile) so the notch/status strip matches
+              MobilePageHeader / ThemeColorSync without --chrome tint. */}
+          <div className="flex h-full w-full flex-col bg-background">
+            {/* Header owns safe-top — MobilePageHeader pattern. */}
             <div
-              className={dialogHeader}
-              style={{ paddingTop: `calc(1rem + ${insets.top}px)` }}
+              className={cn(
+                dialogHeader,
+                "safe-top sticky top-0 z-30 grid grid-cols-[1fr_auto_1fr] border-b-0 bg-background px-3",
+              )}
+              style={{
+                height: "calc(4rem + env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px))",
+              }}
             >
-              <div className="flex items-center gap-3 min-w-0 flex-1">
-                {icon && <div className="text-muted-foreground shrink-0">{icon}</div>}
-                <div className="min-w-0 flex-1">
-                  <h1 className="text-base font-semibold truncate">{title}</h1>
-                  {description && (
-                    <p className="text-xs text-muted-foreground truncate">{description}</p>
-                  )}
-                </div>
-              </div>
-              <Button
-                variant="ghost"
-                size="icon"
+              <button
+                type="button"
                 onClick={handleClose}
                 disabled={isSubmitting && preventCloseOnSubmit}
-                className="shrink-0"
+                className="flex h-11 w-11 items-center justify-center justify-self-start rounded-full text-foreground active:bg-muted disabled:opacity-50"
+                aria-label={cancelText}
               >
-                <X className="h-5 w-5" />
-              </Button>
+                <ChevronLeft className="h-5 w-5" />
+              </button>
+              <h1 id={titleId} className="max-w-[56vw] truncate text-center text-base font-semibold">{title}</h1>
+              <div aria-hidden="true" />
             </div>
 
             {/* Content */}
@@ -276,7 +285,10 @@ export function UnifiedFormDialog({
               ref={contentRef}
               className={cn("flex-1 overflow-y-auto overflow-x-hidden", contentClassName)}
             >
-              <div className="p-4 space-y-4">
+              <div className="space-y-4 p-4">
+                {description && (
+                  <p className="text-sm leading-6 text-muted-foreground">{description}</p>
+                )}
                 {loading ? (
                   <div className="flex items-center justify-center py-8">
                     <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
@@ -300,14 +312,12 @@ export function UnifiedFormDialog({
             {/* Footer */}
             {footerContent && (
               <div
-                // No bg class — footer inherits the container's chrome bg
-                // (set on the outer mobile portal). Adding bg-background here
-                // re-introduces the dark-mode /97% alpha see-through that
-                // makes the footer read as a different color from the body
-                // of the dialog. The border-t alone provides enough visual
-                // separation between content and actions.
-                className="flex items-center justify-end gap-3 px-4 py-4 border-t shrink-0"
-                style={{ paddingBottom: `calc(1rem + ${insets.bottom}px)` }}
+                // No bg class — footer inherits the container's bg-background
+                // (set on the inner mobile surface). The underlay overlay
+                // behind that surface prevents dark-mode alpha bleed.
+                // border-t alone separates content from actions.
+                className="flex shrink-0 items-center gap-3 border-t px-4 py-3 [&>button]:min-h-11 [&>button]:flex-1 [&>button]:rounded-xl"
+                style={{ paddingBottom: `calc(0.75rem + ${insets.bottom}px)` }}
               >
                 {footerContent}
               </div>
@@ -315,7 +325,7 @@ export function UnifiedFormDialog({
 
             {/* Loading overlay */}
             {loading && (
-              <div className="absolute inset-0 flex items-center justify-center bg-bg-80">
+              <div className="absolute inset-0 flex items-center justify-center bg-glass-heavy">
                 <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
               </div>
             )}
@@ -339,6 +349,9 @@ export function UnifiedFormDialog({
       {/* Dialog */}
       {open && (
         <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={titleId}
           className={cn(
             'fixed left-1/2 top-1/2',
             dialogZIndex,
@@ -365,7 +378,7 @@ export function UnifiedFormDialog({
             <div className="flex items-center gap-2 flex-1 min-w-0">
               {icon && <span className="text-muted-foreground shrink-0">{icon}</span>}
               <div className="min-w-0 flex-1">
-                <h2 className="text-lg font-semibold leading-none truncate">{title}</h2>
+                <h2 id={titleId} className="text-lg font-semibold leading-none truncate">{title}</h2>
                 {/* Desktop used to drop the description entirely (only the
                     mobile branch rendered it) — confirm dialogs that put
                     their whole message here showed an empty body. */}

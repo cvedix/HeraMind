@@ -15,7 +15,7 @@
  * it reserves `--titlebar-inset` (set here) and is the window drag region.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useState } from "react"
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { useLocation, useNavigate } from "react-router-dom"
 import { startTransition } from "react"
@@ -49,18 +49,19 @@ import {
   DropdownMenuRadioItem,
 } from "@/components/ui/dropdown-menu"
 import {
-  navItems,
+  navItems as baseNavItems,
   isNavItemActive,
+  mergeExtensionNavItems,
   type NavItem,
 } from "./navItems"
+import { useExtensionPages } from "@/hooks/useExtensionPages"
 import { InstanceSelector } from "./InstanceSelector"
 import { OnboardingDialog } from "@/components/onboarding/OnboardingDialog"
 import { useOnboarding } from "@/hooks/useOnboarding"
 import { InstanceManagerDialog } from "@/components/instances/InstanceManagerDialog"
 
-// 72px — still clears the macOS traffic lights (~14–66px from the window
-// edge) while keeping the rail visually tight.
-const SIDEBAR_WIDTH_PX = 72
+// Compact rail; the titlebar inset keeps its logo below the macOS traffic lights.
+const SIDEBAR_WIDTH_PX = 64
 // Expanded (logo click / collapse toggle): 224px — fits icon + label +
 // padding with room for i18n labels and instance names.
 const SIDEBAR_EXPANDED_PX = 224
@@ -78,6 +79,11 @@ export function AppSidebar() {
   const { t, i18n } = useTranslation("common")
   const location = useLocation()
   const navigate = useNavigate()
+  const { pages: extensionPages } = useExtensionPages()
+  const navItems = useMemo(
+    () => mergeExtensionNavItems(baseNavItems, extensionPages),
+    [extensionPages],
+  )
   const openSettings = useStore((s) => s.openSettings)
   const user = useStore((s) => s.user)
   const logout = useStore((s) => s.logout)
@@ -138,8 +144,11 @@ export function AppSidebar() {
             aria-current={isActive ? "page" : undefined}
             className={cn(
               "w-full h-10 px-3 justify-start font-normal no-press-scale",
+              // Active = elevated card chip: bg-card is white on the gray
+              // rail (light) and a clear step above it (dark) — bg-muted
+              // was invisible in light (0.962 vs rail 0.97).
               isActive
-                ? "bg-muted text-foreground hover:bg-muted"
+                ? "bg-[var(--sidebar-active)] text-foreground hover:bg-[var(--sidebar-active)]"
                 : "text-muted-foreground hover:text-foreground hover:bg-muted-50"
             )}
             onClick={() => handleNavigate(item.path)}
@@ -160,8 +169,10 @@ export function AppSidebar() {
             aria-current={isActive ? "page" : undefined}
             className={cn(
               "h-10 w-10 px-0 justify-center font-normal no-press-scale",
+              // Same elevated-card active chip as the expanded row —
+              // bg-muted vanished against the light rail gray.
               isActive
-                ? "bg-muted text-foreground hover:bg-muted"
+                ? "bg-[var(--sidebar-active)] text-foreground hover:bg-[var(--sidebar-active)]"
                 : "text-muted-foreground hover:text-foreground hover:bg-muted-50"
             )}
             onClick={() => handleNavigate(item.path)}
@@ -228,7 +239,7 @@ export function AppSidebar() {
             expanded ? "w-full px-3 justify-start gap-3" : "w-10 px-0 justify-center"
           )}
         >
-          <Avatar className="h-7 w-7 shrink-0 cursor-pointer rounded-full ring-2 ring-background">
+          <Avatar className="h-8 w-8 shrink-0 cursor-pointer rounded-full">
             <AvatarFallback className="bg-primary text-primary-foreground text-xs font-semibold">
               {getUserInitials(user.username)}
             </AvatarFallback>
@@ -319,12 +330,12 @@ export function AppSidebar() {
             onClick={() => setExpanded((e) => !e)}
             aria-label={t("nav.toggleSidebar", { defaultValue: "Toggle navigation" })}
             aria-expanded={expanded}
-            className={cn("flex items-center justify-center rounded-lg hover:bg-muted-50 transition-colors no-press-scale", expanded ? "h-8 px-1" : "px-2")}
+            className={cn("flex items-center justify-center rounded-lg hover:bg-muted-50 transition-colors no-press-scale", expanded ? "h-8 px-1" : "h-9 w-9")}
           >
             {expanded ? (
               <BrandLogoHorizontal className="h-8" />
             ) : (
-              <BrandLogo className="h-9 w-9 rounded-lg" />
+              <BrandLogo className="h-6 w-6" />
             )}
           </button>
           {/* Explicit collapse affordance — the logo also toggles, but a

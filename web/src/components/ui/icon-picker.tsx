@@ -7,7 +7,7 @@
 
 import { useState, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Search, X, Check } from 'lucide-react'
+import { Search, X } from 'lucide-react'
 import { dynamicIconMap } from '@/lib/dynamicIcons'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -20,7 +20,7 @@ import {
 } from '@/components/ui/popover'
 import { cn } from '@/lib/utils'
 // Icon categories with their icons (no duplicates across categories)
-export const ICON_CATEGORIES = {
+const ICON_CATEGORIES = {
   common: [
     'Settings', 'Home', 'User', 'Users', 'Search', 'Bell', 'Heart',
     'Star', 'Check', 'X', 'Plus', 'Minus', 'Filter', 'Menu',
@@ -178,10 +178,11 @@ export function IconPicker({
                   type="button"
                   onClick={() => setActiveCategory('all')}
                   className={cn(
-                    'flex items-center gap-1.5 px-3 py-2 text-xs font-medium border-b-2 transition-colors whitespace-nowrap',
+                    'relative flex items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap',
+                    'after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:rounded-full after:transition-colors',
                     activeCategory === 'all'
-                      ? 'border-primary text-primary'
-                      : 'border-transparent text-muted-foreground hover:text-foreground'
+                      ? 'text-primary after:bg-primary'
+                      : 'text-muted-foreground hover:text-foreground'
                   )}
                 >
                   {CATEGORY_LABELS.all}
@@ -192,10 +193,11 @@ export function IconPicker({
                     type="button"
                     onClick={() => setActiveCategory(cat)}
                     className={cn(
-                      'flex items-center gap-1.5 px-3 py-2 text-xs font-medium border-b-2 transition-colors whitespace-nowrap',
+                      'relative flex items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap',
+                      'after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:rounded-full after:transition-colors',
                       activeCategory === cat
-                        ? 'border-primary text-primary'
-                        : 'border-transparent text-muted-foreground hover:text-foreground'
+                        ? 'text-primary after:bg-primary'
+                        : 'text-muted-foreground hover:text-foreground'
                     )}
                   >
                     {CATEGORY_LABELS[cat]}
@@ -248,7 +250,7 @@ export function IconPicker({
                   variant="ghost"
                   size="sm"
                   onClick={handleClear}
-                  className="h-7 px-2 text-xs"
+                  className="h-7 px-2 text-xs sm:h-7"
                 >
                   <X className="h-4 w-4 mr-1" />
                   {t('common.clear', 'Clear')}
@@ -265,7 +267,7 @@ export function IconPicker({
             size="sm"
             onClick={handleClear}
             disabled={disabled}
-            className="h-10 w-10 p-0"
+            className="h-10 w-10 p-0 sm:h-10 sm:w-10"
           >
             <X className="h-4 w-4" />
           </Button>

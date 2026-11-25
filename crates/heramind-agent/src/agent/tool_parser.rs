@@ -15,7 +15,12 @@ use crate::error::Result;
 fn code_block_array_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"```(?:json)?\s*\n?\s*(\[\s*\{[\s\S]*?"name"[\s\S]*?\}\s*\])\s*\n?\s*```"#)
+        // "name" AND "arguments" both required (same class of over-broad
+        // match as the 2026-10-20 narration incident): a fenced DATA array
+        // — e.g. a device list ```json [{"id","name","online"}] ``` quoted
+        // in an answer — carries "name" fields but no "arguments"; the old
+        // name-only pattern deleted the entire data block from the reply.
+        Regex::new(r#"```(?:json)?\s*\n?\s*(\[\s*\{[\s\S]*?"name"[\s\S]*?"arguments"[\s\S]*?\}\s*\])\s*\n?\s*```"#)
             .expect("code block tool call regex is a compile-time constant")
     })
 }
@@ -55,7 +60,18 @@ pub fn parse_tool_calls(text: &str) -> Result<(String, Vec<ToolCall>)> {
         return result;
     }
 
-    // === PRIORITY 4: Hermes format ===
+    // === PRIORITY 4: qwen3_coder-style XML ===
+    // LFM3's native protocol (LiquidAI, 0.8.x era): singular `<tool_call>`
+    // blocks with attribute-less `<function=name>` / `<parameter=key>` tags —
+    // a superset of the qwen3_coder shape. MUST run before Hermes: the
+    // Hermes matcher's fast path keys on `<function` and would silently
+    // strip these spans without emitting a call (its name extraction
+    // requires `name="`). See try_parse_qwen_coder.
+    if let Some(result) = try_parse_qwen_coder(text) {
+        return result;
+    }
+
+    // === PRIORITY 5: Hermes format ===
     // Fallback for Hermes-finetuned models (e.g. MiniCPM5-1B-Agentic-Tooluse) that
     // write the tool call into the response text instead of producing structured
     // `tool_calls`. Without this the call is shown to the user as plain text.
@@ -63,7 +79,7 @@ pub fn parse_tool_calls(text: &str) -> Result<(String, Vec<ToolCall>)> {
         return result;
     }
 
-    // === PRIORITY 5: Pythonic format ===
+    // === PRIORITY 6: Pythonic format ===
     // LFM2.5's native protocol (LiquidAI): `[tool_name(key='value', ...)]` —
     // a Python-style call list, emitted after the model's <think> block.
     // rkNN-converted LFM deployments reply in exactly this shape.
@@ -459,6 +475,117 @@ fn try_parse_xml(text: &str) -> Option<Result<(String, Vec<ToolCall>)>> {
     Some(Ok((content.trim().to_string(), tool_calls)))
 }
 
+/// Try to parse qwen3_coder-style XML tool calls (LFM3 native protocol).
+///
+/// Format (LiquidAI LFM3 card):
+/// ```text
+/// <tool_call>
+/// <function=get_weather>
+/// <parameter=city>
+/// Paris
+/// </parameter>
+/// </function>
+/// </tool_call>
+/// ```
+///
+/// Differences from the plural-`<tool_calls>` XML format above: singular
+/// wrapper, `=` attribute syntax without quotes, `</parameter>` closers
+/// optional-tolerant multiline values. Several `<tool_call>` blocks are
+/// parallel calls; text outside the blocks is preserved as content.
+fn try_parse_qwen_coder(text: &str) -> Option<Result<(String, Vec<ToolCall>)>> {
+    if !text.contains("<tool_call>") {
+        return None;
+    }
+
+    let mut tool_calls = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < text.len() {
+        let Some(rel) = text[cursor..].find("<tool_call>") else {
+            break;
+        };
+        let block_start = cursor + rel;
+        let body_start = block_start + "<tool_call>".len();
+        let Some(close_rel) = text[body_start..].find("</tool_call>") else {
+            break;
+        };
+        let block_end = body_start + close_rel + "</tool_call>".len();
+        let block = &text[body_start..body_start + close_rel];
+        spans.push((block_start, block_end));
+
+        // Tool name: `<function=NAME>` (whitespace/newline tolerant).
+        if let Some(func_rel) = block.find("<function=") {
+            let name_start = func_rel + "<function=".len();
+            let name_end_rel = block[name_start..].find('>')?;
+            let name = block[name_start..name_start + name_end_rel]
+                .trim()
+                .to_string();
+            if !name.is_empty() {
+                let args = parse_qwen_coder_params(&block[name_start + name_end_rel + 1..]);
+                tool_calls.push(ToolCall {
+                    name,
+                    id: Uuid::new_v4().to_string(),
+                    arguments: Value::Object(args),
+                    result: None,
+                    round: None,
+                });
+            }
+        }
+
+        cursor = block_end;
+    }
+
+    if tool_calls.is_empty() {
+        return None;
+    }
+
+    let mut content = String::with_capacity(text.len());
+    let mut prev = 0usize;
+    for (start, end) in &spans {
+        content.push_str(&text[prev..*start]);
+        prev = *end;
+    }
+    content.push_str(&text[prev..]);
+
+    Some(Ok((content.trim().to_string(), tool_calls)))
+}
+
+/// `<parameter=KEY>value</parameter>` pairs of one qwen3_coder block.
+/// Values are kept as strings (trimmed) — same policy as Hermes params.
+/// A missing `</parameter>` closer ends the value at the block end.
+fn parse_qwen_coder_params(body: &str) -> serde_json::Map<String, Value> {
+    let mut args = serde_json::Map::new();
+    let mut cursor = 0usize;
+
+    while cursor < body.len() {
+        let Some(rel) = body[cursor..].find("<parameter=") else {
+            break;
+        };
+        let key_start = cursor + rel + "<parameter=".len();
+        let Some(key_end_rel) = body[key_start..].find('>') else {
+            break;
+        };
+        let key = body[key_start..key_start + key_end_rel].trim().to_string();
+        if key.is_empty() {
+            break;
+        }
+        let val_start = key_start + key_end_rel + 1;
+        let close_rel = body[val_start..].find("</parameter>");
+        let (value, next) = match close_rel {
+            Some(r) => (
+                body[val_start..val_start + r].trim().to_string(),
+                val_start + r + "</parameter>".len(),
+            ),
+            None => (body[val_start..].trim().to_string(), body.len()),
+        };
+        args.insert(key, Value::String(value));
+        cursor = next;
+    }
+
+    args
+}
+
 /// Try to parse Hermes-style tool calls emitted as *text* (rather than
 /// structured `tool_calls`) by Hermes-finetuned models such as
 /// MiniCPM5-1B-Agentic-Tooluse or Mistral-Nemo.
@@ -656,6 +783,65 @@ fn parse_invoke_element(invoke_section: &str) -> Option<ToolCall> {
     })
 }
 
+/// A JSON object shaped like a tool call: a string `name`/`tool`/`function`
+/// PLUS an `arguments`/`params`/`parameters` field. Data objects — a device
+/// row `{"id","name","online"}`, a push target `{"name","url"}` — carry
+/// "name" but no arguments; they are ANSWERS, not calls (same over-broad
+/// pattern-match family as the 2026-10-20 narration incident).
+fn is_tool_call_shaped(value: &Value) -> bool {
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+    let named = obj
+        .get("name")
+        .or_else(|| obj.get("tool"))
+        .or_else(|| obj.get("function"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_args = obj.contains_key("arguments")
+        || obj.contains_key("params")
+        || obj.contains_key("parameters");
+    named && has_args
+}
+
+/// Byte offset just past the bracket that closes the one at `start`.
+/// STRING-AWARE: a bracket inside a JSON string argument — `ls foo[1].txt`,
+/// a regex, or `grep 'a]b'` — must not close the span. Mirrors the scanners
+/// in [`try_parse_json_array`] and the streaming detector (`tool_detect.rs`)
+/// which were fixed for the same class; this cleanup pass was the remaining
+/// non-string-aware copy. `None` when the span never balances.
+fn matching_close(text: &str, start: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in text[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+        } else if c == open {
+            depth += 1;
+        } else if c == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(start + i + close.len_utf8());
+            }
+        }
+    }
+    None
+}
+
 /// Remove tool call markers from response for memory storage.
 pub fn remove_tool_calls_from_response(response: &str) -> String {
     let mut result = response.to_string();
@@ -666,38 +852,42 @@ pub fn remove_tool_calls_from_response(response: &str) -> String {
     // Also remove ```json ... ``` with single object tool calls
     result = code_block_obj_re().replace_all(&result, "").to_string();
 
-    // Remove JSON array format
-    while let Some(start) = result.find('[') {
-        let mut bracket_count = 0;
-        let mut end = start;
+    // Remove JSON array format. Scan-advance: an EARLIER span that parses
+    // but isn't a tool call is data ("trend: [1,2,3]") and must not blind
+    // the pass to a LATER real call array — the same first-'['-anchor
+    // disease the detector's scan-advance fix addressed (see tool_detect).
+    let mut search_from = 0usize;
+    while let Some(rel) = result[search_from..].find('[') {
+        let start = search_from + rel;
 
-        for (i, c) in result[start..].char_indices() {
-            match c {
-                '[' => bracket_count += 1,
-                ']' => {
-                    bracket_count -= 1;
-                    if bracket_count == 0 {
-                        end = start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
+        let Some(end) = matching_close(&result, start, '[', ']') else {
+            // No balanced close in the remainder — nothing further can close.
+            break;
+        };
 
-        if end > start {
-            let json_str = &result[start..end];
-            if let Ok(array) = serde_json::from_str::<Vec<Value>>(json_str) {
-                if array
-                    .iter()
-                    .any(|v| v.get("name").is_some() || v.get("tool").is_some())
-                {
-                    result.replace_range(start..end, "");
-                    continue;
-                }
-            }
+        let json_str = &result[start..end];
+        // A span INSIDE a ``` code fence is display-formatted content: the
+        // regex pass above already handles fenced tool-call JSON (it now
+        // requires "arguments"), so a fenced name-only array here is DATA
+        // the model formatted for the user (device list, widget list) —
+        // keep it. Unfenced name-only arrays keep the legacy strip.
+        let inside_fence = result[..start].matches("```").count() % 2 == 1;
+        let is_call_array = !inside_fence
+            && serde_json::from_str::<Vec<Value>>(json_str)
+                .ok()
+                .map(|array| {
+                    array
+                        .iter()
+                        .any(|v| v.get("name").is_some() || v.get("tool").is_some())
+                })
+                .unwrap_or(false);
+
+        if is_call_array {
+            result.replace_range(start..end, "");
+            // Bytes before `start` are untouched, so `search_from` stays valid.
+        } else {
+            search_from = end;
         }
-        break;
     }
 
     // Remove JSON object format
@@ -710,30 +900,20 @@ pub fn remove_tool_calls_from_response(response: &str) -> String {
         if !result[..start].trim().is_empty() {
             break;
         }
-        let mut brace_count = 0;
-        let mut end = start;
 
-        for (i, c) in result[start..].char_indices() {
-            match c {
-                '{' => brace_count += 1,
-                '}' => {
-                    brace_count -= 1;
-                    if brace_count == 0 {
-                        end = start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
+        let Some(end) = matching_close(&result, start, '{', '}') else {
+            break;
+        };
 
-        if end > start {
-            let json_str = &result[start..end];
-            if let Ok(value) = serde_json::from_str::<Value>(json_str) {
-                if value.get("name").is_some() || value.get("tool").is_some() {
-                    result.replace_range(start..end, "");
-                    continue;
-                }
+        let json_str = &result[start..end];
+        if let Ok(value) = serde_json::from_str::<Value>(json_str) {
+            // Tool-call SHAPED only (name AND arguments — see
+            // [`is_tool_call_shaped`]). A leading {"name","url"} data
+            // object with no arguments is an answer, not a call: the old
+            // name-only check deleted it and left an empty reply.
+            if is_tool_call_shaped(&value) {
+                result.replace_range(start..end, "");
+                continue;
             }
         }
         break;
@@ -793,9 +973,91 @@ pub fn is_degenerate_fence_only_output(content: &str) -> bool {
     saw_fence
 }
 
+/// True when `content` carries no user-facing value as a final chat reply:
+/// empty/whitespace, fence-only output (see [`is_degenerate_fence_only_output`]),
+/// or a bare EMPTY JSON array/object (`[]` / `{}`).
+///
+/// The `[]` shape is what a small model emits when the narration nudge
+/// demands "output the tool calls as a JSON array" but no tool is actually
+/// needed — it complies literally with an empty array, and
+/// [`remove_tool_calls_from_response`] lets it through (an empty array
+/// contains no name/tool objects to strip). Left alone it becomes the
+/// persisted final answer (live 2026-10-20: a complete 920-byte answer was
+/// replaced by a 2-char `[]`). A NON-empty array stays legitimate — the user
+/// may have asked for JSON data.
+pub fn is_degenerate_final_output(content: &str) -> bool {
+    let trimmed = content.trim();
+    if is_degenerate_fence_only_output(trimmed) {
+        return true;
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(v) => match v {
+            serde_json::Value::Array(a) => a.is_empty(),
+            serde_json::Value::Object(o) => o.is_empty(),
+            // A literal `null` reply is as empty as an empty string.
+            serde_json::Value::Null => true,
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- qwen3_coder XML (LFM3 native protocol) ----
+
+    #[test]
+    fn qwen_coder_parses_the_lfm3_card_sample() {
+        // Verbatim shape from the LiquidAI LFM3 tool-calling docs.
+        let text = "Let me check the weather.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        let (content, calls) = parse_tool_calls(text).expect("parses");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments["city"], "Paris");
+        assert_eq!(content, "Let me check the weather.");
+    }
+
+    #[test]
+    fn qwen_coder_parses_multiple_calls_and_inline_values() {
+        let text = "<tool_call>\n<function=a>\n<parameter=x>1</parameter>\n<parameter=y>two words</parameter>\n</function>\n</tool_call>\nmiddle\n<tool_call>\n<function=b>\n<parameter=z>\nmulti\nline\n</parameter>\n</function>\n</tool_call>";
+        let (content, calls) = parse_tool_calls(text).expect("parses");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[0].arguments["x"], "1");
+        assert_eq!(calls[0].arguments["y"], "two words");
+        assert_eq!(calls[1].name, "b");
+        assert_eq!(calls[1].arguments["z"], "multi\nline");
+        assert!(content.contains("middle"));
+        assert!(!content.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn hermes_quoted_attr_format_still_parses_after_the_new_arm() {
+        // The Hermes shape keys on name="..." — the qwen_coder arm must NOT
+        // claim it (fast path is singular <tool_call> only).
+        let text = "<function name=\"get_weather\"><param name=\"city\">Paris</param></function>";
+        let (_, calls) = parse_tool_calls(text).expect("parses");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments["city"], "Paris");
+    }
+
+    #[test]
+    fn plural_tool_calls_xml_still_parses_after_the_new_arm() {
+        let text = "<tool_calls><invoke name=\"t\"><parameter name=\"k\">v</parameter></invoke></tool_calls>";
+        let (_, calls) = parse_tool_calls(text).expect("parses");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "t");
+    }
+
+    #[test]
+    fn plain_text_never_yields_qwen_coder_calls() {
+        let (_, calls) =
+            parse_tool_calls("Just talking about <function=x> shapes.").expect("parses");
+        assert!(calls.is_empty());
+    }
 
     #[test]
     fn test_degenerate_fence_only_single_marker() {
@@ -835,6 +1097,35 @@ mod tests {
         // Empty input is the only overlap — treated as degenerate so recovery runs.
         assert!(is_degenerate_fence_only_output(""));
         assert!(is_degenerate_fence_only_output("   \n  "));
+    }
+
+    #[test]
+    fn test_degenerate_final_empty_json_containers() {
+        // The narration-nudge `[]` failure (live 2026-10-20).
+        assert!(is_degenerate_final_output("[]"));
+        assert!(is_degenerate_final_output("  []  "));
+        assert!(is_degenerate_final_output("[\n]"));
+        assert!(is_degenerate_final_output("{}"));
+        assert!(is_degenerate_final_output("null"));
+        // Empty / fence-only supersets still caught.
+        assert!(is_degenerate_final_output(""));
+        assert!(is_degenerate_final_output("```"));
+        assert!(is_degenerate_final_output("```json\n```"));
+    }
+
+    #[test]
+    fn test_degenerate_final_not_triggered_for_real_content() {
+        // A non-empty array is a legitimate data answer ("give me the list as JSON").
+        assert!(!is_degenerate_final_output(
+            r#"[{"id":"demo-001","online":true}]"#
+        ));
+        assert!(!is_degenerate_final_output(r#"{"status":"ok"}"#));
+        assert!(!is_degenerate_final_output("设备在线，温度 23.5°C。"));
+        assert!(!is_degenerate_final_output("null pointer? No — prose."));
+        // Prose that merely CONTAINS brackets/braces is not a bare container.
+        assert!(!is_degenerate_final_output(
+            "Result: [] (no devices matched) — done."
+        ));
     }
 
     #[test]
@@ -1109,6 +1400,69 @@ mod tests {
         assert!(cleaned.contains("Checking..."));
         assert!(cleaned.contains("done"));
         assert!(!cleaned.contains("call_1"));
+    }
+
+    /// Same over-broad-match family as the 2026-10-20 narration incident: a
+    /// fenced DATA array (device list) carries "name" fields but no
+    /// "arguments" — the old name-only patterns deleted the whole block from
+    /// the reply.
+    #[test]
+    fn fenced_data_array_with_name_fields_is_preserved() {
+        let reply = "设备列表：\n```json\n[{\"id\":\"demo-001\",\"name\":\"Demo\",\"online\":true}]\n```\n以上共 1 台。";
+        let cleaned = remove_tool_calls_from_response(reply);
+        assert!(
+            cleaned.contains("demo-001"),
+            "fenced device-list data must survive cleanup: {cleaned}"
+        );
+        assert!(cleaned.contains("以上共 1 台"));
+    }
+
+    /// A leading data OBJECT without arguments is an answer, not a call.
+    #[test]
+    fn leading_name_only_object_is_data_not_stripped() {
+        let reply = "{\"name\":\"obs-target\",\"url\":\"https://example.com/hook\"}";
+        let cleaned = remove_tool_calls_from_response(reply);
+        assert_eq!(cleaned, reply, "data object with no arguments must survive");
+    }
+
+    /// An early DATA array must not blind the pass to a later real call
+    /// array (scan-advance, mirroring the detector fix in tool_detect).
+    #[test]
+    fn early_data_array_does_not_block_later_tool_call_strip() {
+        let reply = "趋势 [1, 2, 3]，现在调用：[{\"name\":\"echo\",\"arguments\":{}}]";
+        let cleaned = remove_tool_calls_from_response(reply);
+        assert!(
+            cleaned.contains("[1, 2, 3]"),
+            "data array preserved: {cleaned}"
+        );
+        assert!(!cleaned.contains("echo"), "later real call array stripped");
+    }
+
+    /// Real call arrays (name + arguments) still stripped, fenced and bare.
+    #[test]
+    fn fenced_and_bare_call_arrays_still_stripped() {
+        let fenced =
+            "调用如下：\n```json\n[{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}]\n```";
+        assert!(!remove_tool_calls_from_response(fenced).contains("shell"));
+        let bare = "好的。[{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}]";
+        assert!(!remove_tool_calls_from_response(bare).contains("shell"));
+    }
+
+    /// String-aware span matching in the CLEANUP pass: an UNBALANCED bracket
+    /// inside a string argument (`grep 'a]b'`) used to close the span early,
+    /// fail the JSON parse, and leak the whole call as visible text.
+    #[test]
+    fn cleanup_span_ignores_brackets_inside_string_arguments() {
+        let reply = r#"运行 [{"name":"shell","arguments":{"command":"grep 'a]b' f"}}] 完成"#;
+        let cleaned = remove_tool_calls_from_response(reply);
+        assert!(
+            !cleaned.contains("shell"),
+            "call must be stripped: {cleaned}"
+        );
+        assert!(cleaned.contains("完成"));
+        // Same for a brace inside a string in the leading-object form.
+        let obj = r#"{"name":"shell","arguments":{"command":"awk '{print $1}' f"}}"#;
+        assert_eq!(remove_tool_calls_from_response(obj), "");
     }
 }
 

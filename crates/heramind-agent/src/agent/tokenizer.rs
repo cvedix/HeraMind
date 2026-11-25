@@ -4,10 +4,16 @@
 
 /// Estimate token count for a text string.
 ///
-/// This uses a heuristic approach that's more accurate than simple character division:
+/// Heuristic rates. NOTE (2026-11-11): the earlier "accurate" calibration
+/// (CJK 1.0/char, digits 1.5/char) regressed the 138-case gate to 88/138
+/// from 99/138 — inflated CLI-output estimates over-compacted history and
+/// caused re-work. These conservative rates are load-bearing as compaction
+/// headroom; don't re-calibrate without real trial wire data + a gate run.
 /// - Chinese characters: ~1.8 tokens each
-/// - English words: ~0.8 tokens each
-/// - Special characters/punctuation: ~1.2 tokens each
+/// - English: ~0.25 tokens per character
+/// - Digits: ~0.3 tokens each
+/// - Other: ~0.5 tokens each
+/// - Global ×1.1 safety margin
 pub fn estimate_tokens(text: &str) -> usize {
     let mut tokens = 0f64;
 
@@ -17,21 +23,36 @@ pub fn estimate_tokens(text: &str) -> usize {
         let number_count = line.chars().filter(|c| c.is_ascii_digit()).count() as f64;
         let special_count = line.chars().filter(|c| !c.is_alphanumeric()).count() as f64;
 
-        // Chinese characters (CJK Unified Ideographs)
         tokens += chinese_count * 1.8;
-
-        // English words (rough estimate: 4 chars = 1 word = 0.8 tokens)
         tokens += english_count * 0.25;
-
-        // Numbers (similar to English)
         tokens += number_count * 0.3;
-
-        // Special characters and punctuation
         tokens += special_count * 0.5;
     }
 
-    // Add a small buffer for safety
     (tokens * 1.1).ceil() as usize
+}
+
+/// Calibrated token estimator for compact JSON tool-definition schemas.
+///
+/// The general `estimate_tokens` prices every punctuation/whitespace char at
+/// `0.5 * 1.1 = 0.55` tokens, which inflates dense JSON schemas (`":"`, `","`,
+/// `{"type":"string"}`) by ~40% vs real BPE tokenizers (Qwen/Llama/MiniCPM),
+/// tripping the 8K `prompt_overhead >= max_context` gate and making frontend
+/// context-usage breakdowns exceed measured `prompt_tokens`.
+///
+/// Do NOT reuse this for history compression — keep [`estimate_tokens`] there.
+pub fn estimate_json_schema_tokens(json_str: &str) -> usize {
+    let mut tokens = 0f64;
+    for ch in json_str.chars() {
+        if is_chinese(ch) {
+            tokens += 1.6;
+        } else if ch.is_ascii_alphanumeric() {
+            tokens += 0.25;
+        } else {
+            tokens += 0.22;
+        }
+    }
+    (tokens * 1.08).ceil() as usize
 }
 
 /// Check if a character is a Chinese/Japanese/Korean character.
@@ -69,6 +90,18 @@ pub fn estimate_message_tokens(message: &crate::agent::AgentMessage) -> usize {
             // Tool name + arguments roughly (convert JSON to string for estimation)
             let args_str = tool_call.arguments.to_string();
             tokens += 10 + estimate_tokens(&args_str);
+            // A stored result reaches the model only as the preview
+            // `to_core()` renders ("… and received: …"); its full body
+            // travels in the paired role=tool message and is counted as that
+            // message's content. Priced in full here, one 310K-char
+            // `device history` output — already slimmed to a `$cached:`
+            // pointer in its tool message — added ~140K phantom tokens: a
+            // ~28K-token history read as 180K, the hard budget evicted all
+            // of it, and the turn went out without its tools (T4 2026-11-23,
+            // session ebc333d4).
+            if let Some(result) = &tool_call.result {
+                tokens += estimate_tokens(&crate::agent::types::tool_result_preview(result));
+            }
         }
     }
 
@@ -84,7 +117,29 @@ pub fn estimate_message_tokens(message: &crate::agent::AgentMessage) -> usize {
 
 /// Per-image token cost used by every prompt-size estimate, so the chat
 /// thinking-guard and the per-message tally always agree.
-const IMAGE_TOKEN_ESTIMATE: usize = 85;
+///
+/// Real vision backends charge roughly 700–2000+ tokens per image
+/// (GPT-4o ~765 low-res, Qwen-VL ~1–2K, llama.cpp vision 1K+). The old value
+/// of 85 under-counted ~10–20×, so the budget math "fit" prompts that
+/// actually overflowed — precisely on image chats, the platform's flagship
+/// scenario. 1024 is a conservative midpoint; history images are additionally
+/// stripped after a couple of turns (see `strip_stale_images`), so sustained
+/// conversations don't accrue this cost forever.
+const IMAGE_TOKEN_ESTIMATE: usize = 1024;
+
+/// Context-scaled per-image estimate. A single flat 1024 under-counts
+/// 2K-token vision payloads by 2× exactly where it hurts most — an 8–16K
+/// window, where two mispriced images eat a quarter of the budget the
+/// compactor thinks it still has. Larger windows keep the 1024 midpoint:
+/// the absolute error matters less and over-pricing images there would
+/// evict history unnecessarily.
+pub fn image_token_estimate(max_context: usize) -> usize {
+    if max_context <= 16_000 {
+        1600
+    } else {
+        IMAGE_TOKEN_ESTIMATE
+    }
+}
 
 /// Estimate total prompt tokens for an outbound chat request.
 ///
@@ -104,6 +159,24 @@ pub fn estimate_prompt_tokens(
     system_prompt: &str,
     user_message: &str,
 ) -> usize {
+    estimate_prompt_tokens_with_image_cost(
+        history,
+        system_prompt,
+        user_message,
+        IMAGE_TOKEN_ESTIMATE,
+    )
+}
+
+/// [`estimate_prompt_tokens`] with a caller-supplied per-image cost — pass
+/// [`image_token_estimate(max_context)`] where the backend's real window is
+/// known, so small windows price images at their true 2K-token weight
+/// instead of the 1024 midpoint.
+pub fn estimate_prompt_tokens_with_image_cost(
+    history: &[heramind_core::message::Message],
+    system_prompt: &str,
+    user_message: &str,
+    image_cost: usize,
+) -> usize {
     let mut tokens = estimate_tokens(system_prompt) + estimate_tokens(user_message);
     let mut images = 0usize;
 
@@ -122,7 +195,7 @@ pub fn estimate_prompt_tokens(
         }
     }
 
-    tokens + images * IMAGE_TOKEN_ESTIMATE
+    tokens + images * image_cost
 }
 
 /// Truncate to the longest prefix whose `estimate_tokens` is ≤ `max_tokens`.
@@ -318,15 +391,116 @@ pub fn select_messages_with_importance(
 }
 
 #[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    /// The window tier flips at 16K INCLUSIVE: a 16000-token backend prices
+    /// images at the conservative 1600; 16001 keeps the 1024 midpoint.
+    #[test]
+    fn image_estimate_tier_boundary_at_16k() {
+        assert_eq!(image_token_estimate(16_000), 1600);
+        assert_eq!(image_token_estimate(16_001), 1024);
+        assert_eq!(image_token_estimate(8_000), 1600);
+        assert_eq!(image_token_estimate(128_000), 1024);
+        assert!(
+            image_token_estimate(0) >= 1024,
+            "degenerate window still prices sanely"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_estimate_chinese() {
-        // Chinese text: ~1.8 tokens per character
+        // Conservative rate (reverted calibration): 4 chars × 1.8 × 1.1 ≈ 8.
         let tokens = estimate_tokens("你好世界");
         assert!(tokens > 4, "Chinese should count more than char count");
         assert!(tokens < 15, "Should be reasonable");
+    }
+
+    /// Rate guard (2026-11-11, reverted calibration): the conservative
+    /// rates ARE compaction headroom. A "more accurate" CJK/digit rate
+    /// regressed the gate (99 -> 88/138). Assert the shipped rates so a
+    /// future calibration attempt must consciously update this test.
+    #[test]
+    fn test_token_rates_are_the_conservative_ones() {
+        // 100 CJK chars: 1.8 × 100 × 1.1 = 198
+        let cjk = "知".repeat(100);
+        let t = estimate_tokens(&cjk);
+        assert!(
+            (190..=205).contains(&t),
+            "CJK rate drifted: {t} (expect ~198)"
+        );
+        // 100 digits: 0.3 × 100 × 1.1 = 33
+        let digits = "1".repeat(100);
+        let d = estimate_tokens(&digits);
+        assert!(
+            (30..=36).contains(&d),
+            "digit rate drifted: {d} (expect ~33)"
+        );
+        // 100 ascii letters: 0.25 × 100 × 1.1 = 28
+        let alpha = "a".repeat(100);
+        let a = estimate_tokens(&alpha);
+        assert!(
+            (25..=31).contains(&a),
+            "alpha rate drifted: {a} (expect ~28)"
+        );
+    }
+
+    /// A stored result is priced exactly as far as it ships — the preview
+    /// `to_core()` renders. The 2026-11-09 A2 replay overflow was pinned on
+    /// "results invisible to the estimator", so the stored copy was priced in
+    /// full; but `to_core()` never sent more than the preview, and the body
+    /// was already counted in its role=tool message. On T4 (2026-11-23) that
+    /// double count turned one 310K-char output into ~140K phantom tokens and
+    /// cost a conversation its tools.
+    #[test]
+    fn tool_call_results_are_priced_only_as_far_as_they_ship() {
+        fn message_with_result(result: Option<serde_json::Value>) -> crate::agent::AgentMessage {
+            crate::agent::AgentMessage {
+                tool_calls: Some(vec![crate::agent::types::ToolCall {
+                    name: "file_read".to_string(),
+                    id: String::new(),
+                    arguments: serde_json::json!({"path": "$cached:shell.stdout#ab12cd34"}),
+                    result,
+                    round: None,
+                }]),
+                ..crate::agent::AgentMessage::assistant("done")
+            }
+        }
+        let args_only = estimate_message_tokens(&message_with_result(None));
+        let eight_k = estimate_message_tokens(&message_with_result(Some(
+            serde_json::json!({"content": "x".repeat(8_000)}),
+        )));
+        let huge = estimate_message_tokens(&message_with_result(Some(serde_json::json!(
+            "x".repeat(309_819)
+        ))));
+
+        // The preview is part of the prompt, so it is still counted…
+        assert!(eight_k > args_only, "{args_only} vs {eight_k}");
+        // …and nothing beyond the 120 characters that ship ever is.
+        assert!(
+            eight_k - args_only <= 120,
+            "an 8K-char result must cost no more than its preview: {args_only} vs {eight_k}"
+        );
+        assert!(
+            huge - args_only <= 120,
+            "a 310K-char result must cost no more than its preview: {args_only} vs {huge}"
+        );
+
+        // The estimate and the rendered prompt agree on how much that is.
+        // (The preview is rendered for a tool-call message with no prose.)
+        let result = serde_json::json!("x".repeat(8_000));
+        let preview = crate::agent::types::tool_result_preview(&result);
+        assert_eq!(preview.chars().count(), 120);
+        let mut prose_free = message_with_result(Some(result));
+        prose_free.content = "".into();
+        let shipped = prose_free.to_core();
+        assert!(shipped.content.as_text().contains(&preview));
+        assert!(!shipped.content.as_text().contains(&format!("{preview}x")));
     }
 
     #[test]
@@ -396,19 +570,26 @@ mod tests {
 
         let tokens = estimate_prompt_tokens(&[msg], "", "");
 
-        // 100 KB of base64 treated as text would be thousands of tokens; a fixed
-        // image cost plus a few tokens of text must stay small.
+        // 100 KB of base64 treated as text would be thousands of tokens; a
+        // fixed image cost plus a few tokens of text must stay bounded —
+        // and the fixed cost must be a REALISTIC one (≥500): vision backends
+        // charge hundreds to thousands of tokens per image, and under-counting
+        // made the budget math "fit" prompts that actually overflowed.
         assert!(
-            tokens < 500,
+            tokens < 2_000,
             "image base64 bytes leaked into the estimate: got {tokens}",
+        );
+        assert!(
+            tokens >= 500 + 3,
+            "per-image cost unrealistically low (got {tokens}); \
+             IMAGE_TOKEN_ESTIMATE must stay ≥ 500",
         );
     }
 
     #[test]
     fn truncate_to_tokens_caps_cjk_under_budget() {
-        // 5000 Chinese chars ≈ 9900 tokens — over an 8000-token budget. The
-        // char-based truncate_to would leave all 5000 chars (5000 < 8000),
-        // injecting ~9900 tokens; token-based truncation must cap under budget.
+        // Conservative rate: 5000 CJK chars ≈ 9900 tokens — over an
+        // 8000-token budget, so truncation must fire.
         let big = "知".repeat(5000);
         let capped = truncate_to_tokens(&big, 8000);
         assert!(
@@ -422,5 +603,130 @@ mod tests {
     #[test]
     fn truncate_to_tokens_preserves_under_budget_content() {
         assert_eq!(truncate_to_tokens("hello world", 100), "hello world");
+    }
+
+    #[test]
+    fn builtin_tool_definitions_fit_within_8k_budget() {
+        use crate::llm_backends::LlmBackendInstanceManager;
+        use crate::skills::SkillRegistry;
+        use crate::toolkit::{
+            shell::ShellTool, skill_tool::SkillTool, FileEditTool, FileReadTool, FileWriteTool,
+            ImageEditTool, MemoryTool, ShellConfig, Tool, VisionConfig, VisionTool, WebFetchTool,
+            WebSearchTool,
+        };
+        use heramind_storage::{LlmBackendStore, MarkdownMemoryStore};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill_reg = Arc::new(RwLock::new(SkillRegistry::load_all(None)));
+        let llm_mgr = Arc::new(LlmBackendInstanceManager::new(
+            LlmBackendStore::open(dir.path().join("backends.redb")).expect("backend store"),
+        ));
+        let mem_store = Arc::new(RwLock::new(MarkdownMemoryStore::new(
+            dir.path().join("mem_budget_test"),
+        )));
+
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ShellTool::new(ShellConfig::default())),
+            Box::new(SkillTool::new(skill_reg)),
+            Box::new(MemoryTool::new(mem_store)),
+            Box::new(VisionTool::new(VisionConfig::default(), llm_mgr)),
+            Box::new(ImageEditTool::new(dir.path().to_path_buf())),
+            Box::new(WebSearchTool::new()),
+            Box::new(WebFetchTool::new()),
+            Box::new(FileReadTool::new(dir.path().to_path_buf())),
+            Box::new(FileWriteTool::new(dir.path().to_path_buf())),
+            Box::new(FileEditTool::new(dir.path().to_path_buf())),
+        ];
+
+        let mut total_tokens = 0usize;
+        let mut image_edit_tokens = 0usize;
+        for t in &tools {
+            let payload = serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name(),
+                    "description": t.description(),
+                    "parameters": t.parameters(),
+                }
+            });
+            let toks = estimate_json_schema_tokens(&payload.to_string());
+            if t.name() == "image_edit" {
+                image_edit_tokens = toks;
+            }
+            total_tokens += toks;
+        }
+        assert!(
+            image_edit_tokens <= 450,
+            "image_edit schema regressed to {image_edit_tokens} tokens (budget <= 450)"
+        );
+        assert!(
+            total_tokens <= 3_200,
+            "10 builtin tools regressed to {total_tokens} tokens (budget <= 3200 so 8K models stay usable)"
+        );
+    }
+
+    /// S3-2: Light profile (≤16K / 8K) must keep first-round toolTokens under
+    /// 1800 by deferring `image_edit` + `file_edit` exposure.
+    #[test]
+    fn light_profile_tool_tokens_under_1800() {
+        use crate::agent::tool_profile::{
+            select_tool_profile, tool_exposed_in_profile, ToolProfile,
+        };
+        use crate::llm_backends::LlmBackendInstanceManager;
+        use crate::skills::SkillRegistry;
+        use crate::toolkit::{
+            shell::ShellTool, skill_tool::SkillTool, FileEditTool, FileReadTool, FileWriteTool,
+            ImageEditTool, MemoryTool, ShellConfig, Tool, VisionConfig, VisionTool, WebFetchTool,
+            WebSearchTool,
+        };
+        use heramind_storage::{LlmBackendStore, MarkdownMemoryStore};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        assert_eq!(select_tool_profile(8_192), ToolProfile::Light);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill_reg = Arc::new(RwLock::new(SkillRegistry::load_all(None)));
+        let llm_mgr = Arc::new(LlmBackendInstanceManager::new(
+            LlmBackendStore::open(dir.path().join("backends.redb")).expect("backend store"),
+        ));
+        let mem_store = Arc::new(RwLock::new(MarkdownMemoryStore::new(
+            dir.path().join("mem_light_profile"),
+        )));
+
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ShellTool::new(ShellConfig::default())),
+            Box::new(SkillTool::new(skill_reg)),
+            Box::new(MemoryTool::new(mem_store)),
+            Box::new(VisionTool::new(VisionConfig::default(), llm_mgr)),
+            Box::new(ImageEditTool::new(dir.path().to_path_buf())),
+            Box::new(WebSearchTool::new()),
+            Box::new(WebFetchTool::new()),
+            Box::new(FileReadTool::new(dir.path().to_path_buf())),
+            Box::new(FileWriteTool::new(dir.path().to_path_buf())),
+            Box::new(FileEditTool::new(dir.path().to_path_buf())),
+        ];
+
+        let mut light_tokens = 0usize;
+        for t in &tools {
+            if !tool_exposed_in_profile(t.name(), ToolProfile::Light, false, true) {
+                continue;
+            }
+            let payload = serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name(),
+                    "description": t.description(),
+                    "parameters": t.parameters(),
+                }
+            });
+            light_tokens += estimate_json_schema_tokens(&payload.to_string());
+        }
+        assert!(
+            light_tokens < 1_800,
+            "Light profile first-round toolTokens={light_tokens} (aim <1800 for 8K models)"
+        );
     }
 }

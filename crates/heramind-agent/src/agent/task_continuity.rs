@@ -1,0 +1,10765 @@
+//! Cross-turn task continuity (G2), execution-state Round 3, and loop-halt
+//! honesty (G3).
+//!
+//! ## Execution-state Round 3
+//! - Stable model context pack: current user (+ structured @ refs upstream),
+//!   relevant ops with proven status, recent complete tool call/result,
+//!   older history summary, needed skills — under
+//!   [`budget_pressure_order`].
+//! - Full tool bodies stay on [`OperationRecord`]; the model sees a
+//!   structured [`StructuredResult::summary`] plus optional
+//!   [`StructuredResult::details_ref`] for large payloads (never “first 120
+//!   chars” as fact).
+//! - Progress-based loop policy: identical no-progress → limit; status
+//!   polling with changing evidence → timed allow; write fail →
+//!   [`RetryPolicy`]; write unknown → inquire, no blind replay.
+//! - Tool capability declarations: [`ToolCapability`]
+//!   (`read_only` / `idempotent` / `retry_policy`), including CLI-derived
+//!   shell classification.
+//!
+//! ## Round 2 (kept)
+//! - Real [`OperationRecord`]s + status lifecycle
+//!   `prepared → running → succeeded | failed | unknown` (+ `cancelled`).
+//! - Same-op resume prefers known result; authorized re-run →
+//!   [`TaskState::begin_new_operation`].
+//! - Timeout / unknown ≠ success; no auto-replay.
+//!
+//! ## G2 — lightweight task state
+//! Tracks goal / object / content / confirmed steps / next action from
+//! **evidence** (tool results), not from assistant self-narration. User
+//! directives (explicit control words only):
+//! - **Correct** updates goal fields; cancels Prepared ops; does **not** lift
+//!   anti-replay on executed facts.
+//! - **Cancel** stops the task; further writes are refused.
+//! - **Continue** resumes without replaying writes already recorded on the
+//!   current operation.
+//! - **AuthorizeNewOperation** grants a one-shot, **operation-scoped** user
+//!   re-run after Unknown (bound to the **confirmed** prior Operation ID +
+//!   business fingerprint + confirming Turn). Every entry **consumes a
+//!   confirm request** first (button by `request_id`; phrase only when
+//!   exactly one valid pending confirm exists). No request / expired /
+//!   consumed / incomplete structured fields → refuse — never an op-level
+//!   Unique-Unknown grant fallback. Consume compares the immutable
+//!   call-site Turn ID (not a shared `turn_count` hop). The model must
+//!   still set `_new_operation` via the registered tool schema.
+//!
+//! ## Transient skills vs TaskState (plan §12 P1)
+//! Each **new user turn** clears temporary skill bodies on the LLM interface
+//! ([`begin_user_turn_clear_transient_skills`]) so 15+ guides cannot ride into
+//! the next turn. [`TaskState`] is **not** cleared by that call — it lives on
+//! `AgentInternalState` and is updated only via [`TaskDirective`] when the user
+//! message is pushed. Order of operations:
+//! 1. `accept_user_message(user, auth?, content_nodes?)` → note Turn + apply auth/nodes under one lock; return local TurnContext
+//! 2. Stream entry → clear transient skills
+//! 3. Within the turn, the skill tool may reload guides under the total body budget
+//!
+//! ## G3 — loop halt ≠ success
+//! Classifies rounds as progress vs no-progress repeat (identical tool result
+//! sets). A forced stop after repeated no-progress rounds is recorded as a
+//! halt with `counts_as_task_success = false`.
+
+use serde::{Deserialize, Serialize};
+
+/// Stable Operation ID (UUID string).
+pub type OperationId = String;
+
+/// How a confirmed step was evidenced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StepSource {
+    ToolResult {
+        tool: String,
+        /// Stable call fingerprint: `tool|canonical_args`.
+        call_fingerprint: String,
+    },
+}
+
+/// A step that has tool-result evidence (never from model prose alone).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmedStep {
+    pub id: String,
+    pub summary: String,
+    pub evidence_fingerprint: String,
+    pub source: StepSource,
+}
+
+/// Suggested next action with provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextAction {
+    pub description: String,
+    pub source: String,
+}
+
+/// Task lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TaskStatus {
+    #[default]
+    Idle,
+    Active,
+    Cancelled,
+    /// Halted by loop guard / budget — not a successful completion.
+    Halted {
+        reason: String,
+    },
+    /// Completed only when evidence_id is present.
+    Completed {
+        evidence_id: String,
+    },
+}
+
+/// One successful mutating write kept as an execution fact (ledger).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteFact {
+    pub operation_id: OperationId,
+    pub fingerprint: String,
+}
+
+/// Operation lifecycle status (Round 2).
+///
+/// Device delivery / physical ACK stay in [`OperationRecord::evidence`] and
+/// must not be inferred from `Succeeded` alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    Prepared,
+    Running,
+    Succeeded,
+    Failed,
+    /// Pre-submission client/parse/validation rejection or connect refuse
+    /// before reaching backend side effects. Terminal for this attempt, but
+    /// does not lock behind PreferKnown or require `_new_operation` to retry.
+    Rejected,
+    /// Timeout / indeterminate outcome — not success; do not auto-replay.
+    Unknown,
+    /// Cancelled before execution (e.g. Correct of a not-yet-executed op).
+    Cancelled,
+}
+
+impl OperationStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Rejected | Self::Unknown | Self::Cancelled
+        )
+    }
+
+    /// Terminal outcomes that must not be auto-replayed.
+    pub fn blocks_auto_replay(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Unknown | Self::Cancelled
+        )
+    }
+
+    /// Canonical status string exposed by the operations HTTP API / CLI.
+    pub fn as_api_str(&self) -> &'static str {
+        match self {
+            Self::Prepared | Self::Running => "in_progress",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
+            Self::Unknown => "unknown",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// How a tool may be retried after a terminal outcome (Round 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryPolicy {
+    /// Read-only / replay-safe: interrupt retry is harmless.
+    AlwaysSafe,
+    /// Failed writes may retry up to `max_attempts` (via new Operation).
+    OnFailure { max_attempts: u32 },
+    /// Unknown / unsafe after interrupt — inquire only; never blind replay.
+    Never,
+}
+
+/// Declared tool capabilities for loop / retry policy (Round 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCapability {
+    pub read_only: bool,
+    pub idempotent: bool,
+    pub retry_policy: RetryPolicy,
+    /// NM-240: classify-time PreparedInvoke id for this dispatch (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_operation_id: Option<String>,
+}
+
+impl ToolCapability {
+    pub fn read_query() -> Self {
+        Self {
+            read_only: true,
+            idempotent: true,
+            retry_policy: RetryPolicy::AlwaysSafe,
+            prepared_operation_id: None,
+        }
+    }
+
+    pub fn mutating_write() -> Self {
+        Self {
+            read_only: false,
+            idempotent: false,
+            // One automatic retry after a clear failure (not after Unknown).
+            retry_policy: RetryPolicy::OnFailure { max_attempts: 2 },
+            prepared_operation_id: None,
+        }
+    }
+
+    pub fn mutating_unknown_sensitive() -> Self {
+        Self {
+            read_only: false,
+            idempotent: false,
+            retry_policy: RetryPolicy::Never,
+            prepared_operation_id: None,
+        }
+    }
+
+    pub fn with_prepared_operation_id(mut self, operation_id: Option<String>) -> Self {
+        self.prepared_operation_id = operation_id;
+        self
+    }
+}
+
+/// Structured tool/operation result (Round 2/3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredResult {
+    /// Effective tool success (never true for timeout / unknown).
+    pub success: bool,
+    /// Short structured summary — **not** a raw body prefix.
+    pub summary: String,
+    /// Full body kept on the execution record (length-capped).
+    pub body: String,
+    /// Large-payload handle for the model (`$cached:op:<id>`). Full body
+    /// remains on the record; model must not treat a char prefix as fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details_ref: Option<String>,
+}
+
+impl StructuredResult {
+    pub fn with_body(
+        success: bool,
+        summary: impl Into<String>,
+        body: impl Into<String>,
+        details_ref: Option<String>,
+    ) -> Self {
+        Self {
+            success,
+            summary: summary.into(),
+            body: body.into(),
+            details_ref,
+        }
+    }
+}
+
+/// Immutable owner of a stream/batch that acquires mutating leases.
+///
+/// Interrupt / timeout / Drop cleanup must only abandon operations tagged
+/// with this id — never sibling streams or newer turns on the same session.
+pub type StreamOwnerId = String;
+
+/// Allocate a fresh stream owner token.
+pub fn new_stream_owner() -> StreamOwnerId {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// One tool invocation attempt with stable Operation ID (Round 2/3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationRecord {
+    pub operation_id: OperationId,
+    pub origin_turn_id: u64,
+    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    pub target: Option<String>,
+    pub arguments: String,
+    pub status: OperationStatus,
+    pub result: Option<StructuredResult>,
+    pub evidence: Vec<String>,
+    /// Mutating write fingerprint when applicable (ties to [`WriteFact`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_fingerprint: Option<String>,
+    /// Round 3 capability snapshot at begin time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<ToolCapability>,
+    /// Stream/batch that began this operation (owner-scoped teardown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<StreamOwnerId>,
+    /// Creation timestamp (epoch milliseconds).
+    #[serde(default)]
+    pub created_at_ms: u64,
+    /// Last status transition timestamp (epoch milliseconds).
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
+impl OperationRecord {
+    /// Convert this ledger entry into a storage/API-facing [`heramind_storage::PersistedOperationRecord`].
+    pub fn to_persisted_record(
+        &self,
+        session_id: &str,
+    ) -> heramind_storage::PersistedOperationRecord {
+        let (domain, action) = if self.domain.is_some() || self.action.is_some() {
+            (self.domain.clone(), self.action.clone())
+        } else {
+            let parsed_args =
+                serde_json::from_str::<serde_json::Value>(&self.arguments).unwrap_or_default();
+            extract_operation_domain_action(&self.tool_name, &parsed_args)
+        };
+        let (result_summary, error_summary) = match (&self.status, &self.result) {
+            (OperationStatus::Succeeded, Some(r)) => (Some(r.summary.clone()), None),
+            (
+                OperationStatus::Failed
+                | OperationStatus::Rejected
+                | OperationStatus::Unknown
+                | OperationStatus::Cancelled,
+                Some(r),
+            ) => (None, Some(r.summary.clone())),
+            (_, Some(r)) if r.success => (Some(r.summary.clone()), None),
+            (_, Some(r)) => (None, Some(r.summary.clone())),
+            (_, None) => (None, None),
+        };
+        heramind_storage::PersistedOperationRecord {
+            operation_id: self.operation_id.clone(),
+            session_id: session_id.to_string(),
+            domain,
+            action,
+            tool_name: self.tool_name.clone(),
+            target: self.target.clone(),
+            status: self.status.as_api_str().to_string(),
+            result_summary,
+            error_summary,
+            evidence: self.evidence.clone(),
+            origin_turn_id: self.origin_turn_id,
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+        }
+    }
+}
+
+/// Compact per-target receipt aggregated by `(target, operation_id)` for
+/// multi-target / multi-step write tasks (E4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetReceipt {
+    pub target: String,
+    pub operation_id: OperationId,
+    pub status: OperationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl TargetReceipt {
+    /// Compact one-item summary, e.g. `device_a: adapter_accepted` or
+    /// `device_b: failed(offline)`.
+    pub fn format_compact(&self) -> String {
+        match self.status {
+            OperationStatus::Succeeded => {
+                if let Some(delivery) = self.delivery.as_deref().filter(|s| !s.is_empty()) {
+                    format!("{}: {}", self.target, delivery)
+                } else {
+                    format!("{}: succeeded", self.target)
+                }
+            }
+            OperationStatus::Failed => match self.detail.as_deref().filter(|s| !s.is_empty()) {
+                Some(d) => format!("{}: failed({d})", self.target),
+                None => format!("{}: failed", self.target),
+            },
+            OperationStatus::Unknown => match self.detail.as_deref().filter(|s| !s.is_empty()) {
+                Some(d) => format!("{}: unknown({d})", self.target),
+                None => format!("{}: unknown", self.target),
+            },
+            OperationStatus::Rejected => match self.detail.as_deref().filter(|s| !s.is_empty()) {
+                Some(d) => format!("{}: rejected({d})", self.target),
+                None => format!("{}: rejected", self.target),
+            },
+            OperationStatus::Prepared | OperationStatus::Running => {
+                format!("{}: in_progress", self.target)
+            }
+            OperationStatus::Cancelled => format!("{}: cancelled", self.target),
+        }
+    }
+}
+
+/// How the stream path should treat a mutating write (Round 2 + prod lease).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteDispatch {
+    /// Prepared op ready for the atomic execution lease (Prepared → Running).
+    Execute { operation_id: OperationId },
+    /// Another caller already holds the Running lease — wait / in-progress;
+    /// do **not** execute the tool again.
+    InProgress { operation_id: OperationId },
+    /// Same-op resume: return the known structured result; do not re-exec.
+    PreferKnown {
+        operation_id: OperationId,
+        result: StructuredResult,
+    },
+    /// Outcome unknown (e.g. timeout): inquire status; do not auto-replay;
+    /// do not pretend success.
+    InquireStatus { operation_id: OperationId },
+    /// Task cancelled — all writes refused.
+    BlockedCancelled,
+    /// Prior success on this fingerprint without a reusable body — blocked.
+    BlockedSucceeded { operation_id: OperationId },
+}
+
+/// Tool-arg key for the production new-op protocol (not a phrase whitelist).
+///
+/// Exposed on mutating tool schemas via [`inject_new_operation_protocol`].
+/// When `true` on a mutating call whose latest same-args Operation is a
+/// **known** terminal (Succeeded/Failed), [`evaluate_mutating_gate`] calls
+/// [`TaskState::begin_new_operation_for_owner`] so the same args may re-run
+/// under a fresh Operation ID. Absent / false → resume PreferKnown / block —
+/// never auto-replay.
+///
+/// After **Unknown**, a model-added boolean alone is **not** sufficient —
+/// a confirm request must be consumed and an operation-scoped
+/// [`NewOpAuthorization`] granted for that prior Operation + fingerprint
+/// (host button by `request_id`, or unique-pending phrase via
+/// [`TaskState::consume_unique_pending_confirm`]).
+pub const NEW_OPERATION_ARG: &str = "_new_operation";
+
+/// Chat-bound PreparedInvoke id injected into extension-tool args (NM-240).
+/// Stripped before the extension process sees parameters.
+pub const PREPARED_OPERATION_ARG: &str = "_prepared_operation_id";
+
+/// Host-managed PreparedInvoke id on shell args (NM-247).
+/// Not model-visible: stripped before history / prompt persistence.
+pub const HOST_PREPARED_OPERATION_ARG: &str = "_host_prepared_operation_id";
+
+/// Host-only attach failure reason (NM-302): when `extension invoke` cannot
+/// resolve business params at classify, Shell must surface this tip instead of
+/// a misleading "PreparedInvoke missing (case-c)" bind error.
+pub const HOST_ATTACH_ERROR_ARG: &str = "_host_attach_error";
+
+/// Host-only marker: classify minted a ticket that execute canonicalize
+/// dropped without restore (NM-247 case-c diagnostics for Shell bind).
+pub const HOST_TICKET_STRIPPED_ARG: &str = "_host_ticket_stripped";
+
+/// One-shot user grant to begin a new same-args Operation after Unknown.
+///
+/// Bound to the **confirmed** prior Unknown Operation, its business write
+/// fingerprint, and the confirming Turn. Not a session-global sticky flag —
+/// cross-op / cross-Turn / concurrent consumers cannot reuse another op's
+/// grant. Consume must pass the call-site Turn ID captured when that stream
+/// started — never re-read shared [`TaskState::turn_count`]. Runtime-only
+/// (not persisted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewOpAuthorization {
+    /// Prior Unknown [`OperationRecord::operation_id`] this grant re-runs.
+    pub prior_operation_id: OperationId,
+    /// Business write fingerprint that must match on consume.
+    pub write_fingerprint: String,
+    /// Confirming Turn ID at grant time (immutable binding).
+    pub confirming_turn: u64,
+}
+
+/// Host/UI submit payload for an Unknown re-run confirm (request-id keyed).
+///
+/// Fingerprints travel as **JSON fields** on this struct / WS events — never
+/// via whitespace-splitting text parse (`\\S+` / `split_whitespace`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizeNewOpSubmit {
+    pub request_id: String,
+    pub prior_operation_id: OperationId,
+    pub write_fingerprint: String,
+}
+
+/// Server-side confirm-request lifecycle record (runtime-only).
+///
+/// Issued (or reused) when a mutating gate returns InquireStatus. Host/UI
+/// submits [`AuthorizeNewOpSubmit::request_id`]; the server atomically
+/// validates + consumes before granting [`NewOpAuthorization`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmRequest {
+    pub request_id: String,
+    pub prior_operation_id: OperationId,
+    pub write_fingerprint: String,
+    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub valid_until_ms: u64,
+}
+
+/// Why a pending confirm was removed (emitted to the host/UI).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmRemoveReason {
+    Consumed,
+    Expired,
+    Cancelled,
+    /// Structured authorize submit was refused (expired already emitted
+    /// separately; use for not-found / incomplete visibility).
+    Rejected,
+}
+
+/// Queued confirm-lifecycle notice for the next stream emission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmLifecycleNotice {
+    Requested(ConfirmRequest),
+    Removed {
+        request_id: String,
+        reason: ConfirmRemoveReason,
+    },
+}
+
+/// Mutating tools that advertise [`NEW_OPERATION_ARG`] in the LLM schema.
+pub const NEW_OPERATION_PROTOCOL_TOOLS: &[&str] = &[
+    "shell",
+    "run_now",
+    "device_command",
+    "file_write",
+    "file_edit",
+    "image_edit",
+];
+
+/// Whether tool args request a fresh same-args Operation (model protocol bit).
+pub fn wants_new_operation(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get(NEW_OPERATION_ARG)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Strip the production new-op flag before the tool actually executes.
+pub fn strip_new_operation_flag(arguments: &mut serde_json::Value) {
+    if let Some(obj) = arguments.as_object_mut() {
+        obj.remove(NEW_OPERATION_ARG);
+    }
+}
+
+/// Inject the discoverable `{NEW_OPERATION_ARG}` boolean into mutating tool
+/// schemas so models can find “run again / new execution” without a hidden
+/// manual flag. Idempotent.
+pub fn inject_new_operation_protocol(defs: &mut [crate::toolkit::tool::ToolDefinition]) {
+    let all: std::collections::HashSet<String> = NEW_OPERATION_PROTOCOL_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    inject_new_operation_protocol_filtered(defs, &all);
+}
+
+/// Inject `{NEW_OPERATION_ARG}` only into the subset of `NEW_OPERATION_PROTOCOL_TOOLS`
+/// present in `active_tools`. Used to expose the lifecycle flag only when a
+/// session actually has a terminal mutating operation (Succeeded/Failed/Unknown)
+/// that may require an explicit re-run, keeping clean schemas free of noise.
+pub fn inject_new_operation_protocol_filtered(
+    defs: &mut [crate::toolkit::tool::ToolDefinition],
+    active_tools: &std::collections::HashSet<String>,
+) {
+    if active_tools.is_empty() {
+        return;
+    }
+    let desc = new_operation_arg_description();
+    for def in defs.iter_mut() {
+        if !NEW_OPERATION_PROTOCOL_TOOLS.contains(&def.name.as_str())
+            || !active_tools.contains(def.name.as_str())
+        {
+            continue;
+        }
+        inject_new_operation_into_schema(&mut def.parameters, &mut def.description, desc);
+    }
+}
+
+/// Core-LLM variant of [`inject_new_operation_protocol_filtered`] applied at
+/// the LLM request boundary so `_new_operation` appears only on tools that have
+/// a terminal write operation in `TaskState`.
+pub fn inject_new_operation_protocol_for_llm_tools(
+    defs: &mut [heramind_core::llm::backend::ToolDefinition],
+    active_tools: &std::collections::HashSet<String>,
+) {
+    if active_tools.is_empty() {
+        return;
+    }
+    let desc = new_operation_arg_description();
+    for def in defs.iter_mut() {
+        if !NEW_OPERATION_PROTOCOL_TOOLS.contains(&def.name.as_str())
+            || !active_tools.contains(def.name.as_str())
+        {
+            continue;
+        }
+        inject_new_operation_into_schema(&mut def.parameters, &mut def.description, desc);
+    }
+}
+
+fn new_operation_arg_description() -> &'static str {
+    "Set true to begin a NEW Operation with the same business args after a \
+     prior known terminal result (Succeeded/Failed). After Unknown outcome, \
+     this flag alone is not enough — the user must authorize a re-run \
+     (confirm re-run). Default false = resume PreferKnown / block; never \
+     auto-replay. Lifecycle-only; stripped before tool execution."
+}
+
+fn inject_new_operation_into_schema(
+    parameters: &mut serde_json::Value,
+    description: &mut String,
+    arg_desc: &str,
+) {
+    let Some(obj) = parameters.as_object_mut() else {
+        return;
+    };
+    let props = obj
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(props) = props.as_object_mut() else {
+        return;
+    };
+    props
+        .entry(NEW_OPERATION_ARG.to_string())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "type": "boolean",
+                "description": arg_desc,
+            })
+        });
+    if !description.contains(NEW_OPERATION_ARG) {
+        description.push_str(&format!(
+            " Lifecycle: optional `{NEW_OPERATION_ARG}` starts a fresh same-args \
+             Operation after a known terminal result; after Unknown, user \
+             authorization is required."
+        ));
+    }
+}
+
+/// Set `{NEW_OPERATION_ARG}=true` only when the registered tool schema exposes it.
+///
+/// Tests and hosts must use this (or equivalent schema lookup) instead of
+/// injecting the flag as a stand-in for model entry discovery.
+pub fn apply_new_operation_from_tool_schema(
+    def: &crate::toolkit::tool::ToolDefinition,
+    mut args: serde_json::Value,
+) -> Result<serde_json::Value, &'static str> {
+    let exposed = def
+        .parameters
+        .get("properties")
+        .and_then(|p| p.get(NEW_OPERATION_ARG))
+        .is_some();
+    if !exposed {
+        return Err("tool schema does not expose _new_operation");
+    }
+    let obj = args
+        .as_object_mut()
+        .ok_or("arguments must be a JSON object")?;
+    obj.insert(NEW_OPERATION_ARG.into(), serde_json::json!(true));
+    Ok(args)
+}
+
+/// Minimal Operation + write ledger persisted across process restart.
+///
+/// Auth grants, pending confirm requests, and stream owner leases are
+/// **never** part of this snapshot — they are runtime-only. On restore,
+/// [`TaskState::restore_op_ledger`] maps `Running → Unknown` and cancels
+/// orphaned `Prepared` ops so a cold start cannot auto-replay side effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedOpLedger {
+    /// Monotonic commit generation. `save_op_ledger` rejects writes whose
+    /// version is not strictly newer than the bytes already on disk, so a
+    /// stale `persist_history` snapshot cannot clobber a newer write intent.
+    #[serde(default)]
+    pub version: u64,
+    #[serde(default)]
+    pub operations: Vec<OperationRecord>,
+    #[serde(default)]
+    pub write_ledger: Vec<WriteFact>,
+    #[serde(default)]
+    pub current_operation_id: OperationId,
+    #[serde(default)]
+    pub turn_count: u64,
+}
+
+/// Durable commit sink for [`PersistedOpLedger`] bytes (session store, test
+/// memory, …). Side-effect tools must not run unless a configured sink
+/// accepts the pre-tool write-intent snapshot (`fail closed`).
+pub trait OpLedgerCommit: Send + Sync {
+    fn commit(&self, ledger_json: &[u8]) -> Result<(), String>;
+}
+
+/// Message when restore deserialize/load fails — mutating writes refuse.
+pub const OP_LEDGER_UNTRUSTED_MESSAGE: &str = "Write blocked: op ledger restore failed — \
+    mutating tools refuse until the session ledger is repaired (fail closed; \
+    empty in-memory ledger is not treated as authoritative)";
+
+/// Message when pre-tool intent commit fails — tool must not run.
+pub const WRITE_INTENT_COMMIT_FAILED_PREFIX: &str =
+    "Write blocked: durable write-intent commit failed — side-effect tool not executed";
+
+/// How the user wants the goal delivered (structured; not product keywords).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMethod {
+    /// Use a command the target device's type template supports
+    /// (`device_command` / `heramind device control`), not notify/push/webhook.
+    DeviceNativeCommand,
+}
+
+/// Delivery routes the user rejected for the current task.
+///
+/// General classes only — never product-specific (eink / weather / …).
+/// Negation is scoped to the **rejected** side of an explicit relation
+/// (“don’t use X, use Y”) — preferring webhook must not ban webhook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExcludedRoute {
+    /// Notification, data-push, or webhook configuration/delivery paths.
+    NotificationOrWebhook,
+    /// Device-native command path (`device_command` / device control).
+    DeviceNativeCommand,
+}
+
+/// Provenance ladder for goal results (config ≠ dispatch ≠ ACK ≠ physical).
+///
+/// Ordered: higher means stronger proof. `queued` / adapter accept stop at
+/// [`CommandDispatched`]; they never imply physical effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalEvidenceLevel {
+    #[default]
+    None = 0,
+    /// Webhook / push / channel config succeeded — not a device command.
+    ConfigSuccess = 1,
+    /// Target device command accepted by adapter/extension (broker publish /
+    /// extension Ok). Device ACK and physical effect still unverified.
+    CommandDispatched = 2,
+    /// Device explicitly acknowledged receipt.
+    DeviceAcknowledged = 3,
+    /// Physical effect verified via state feedback.
+    PhysicalEffectVerified = 4,
+}
+
+/// Structured claim kinds checked against per-operation goal evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalClaimKind {
+    /// "sent" / "command issued" / "dispatched to device".
+    CommandSent,
+    /// "screen refreshed" / "device updated" / physical effect done.
+    PhysicalEffect,
+    /// Mark the task Completed.
+    TaskComplete,
+}
+
+/// Why the stream ended (orthogonal to [`SystemGoalStatus`] evidence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamEndReason {
+    /// Normal final reply after tools / text.
+    Normal,
+    /// User interrupt / cancel mid-stream.
+    Interrupted,
+    /// Wall-clock / stream timeout.
+    Timeout,
+    /// Fatal error path (still emits End after Error).
+    Error,
+    /// Explicit cancel acknowledgement path.
+    Cancelled,
+    /// Loop / budget / cannot-continue forced summary.
+    CannotContinue,
+}
+
+impl StreamEndReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Interrupted => "interrupted",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+            Self::CannotContinue => "cannot_continue",
+        }
+    }
+}
+
+/// System-judged goal status for the final response (not model NL).
+///
+/// Structured completion is decided only from execution evidence via
+/// [`TaskState::evaluate_goal_claim`] / [`TaskState::complete_with_evidence`].
+/// Assistant prose is display-only within this limit — never scanned for
+/// success keywords. [`Self::NotApplicable`] is **not** verified success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SystemGoalStatus {
+    /// No device-native / constrained goal — system does not gate completion.
+    NotApplicable,
+    /// Constrained goal; evidence for the bound operation is insufficient.
+    Incomplete {
+        reason: String,
+        level: GoalEvidenceLevel,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        task_complete_ok: bool,
+        physical_ok: bool,
+    },
+    /// Bound operation has enough evidence for structured TaskComplete.
+    /// Physical claims still require [`GoalEvidenceLevel::PhysicalEffectVerified`].
+    CompleteEligible {
+        level: GoalEvidenceLevel,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<String>,
+        task_complete_ok: bool,
+        physical_ok: bool,
+    },
+    /// Already marked Completed via [`TaskState::complete_with_evidence`].
+    Completed {
+        evidence_id: String,
+    },
+    Halted {
+        reason: String,
+    },
+    Cancelled,
+}
+
+/// Goal-relevant evidence from one Operation's tool results (not model prose).
+///
+/// Level is derived **only** from a structured exact `delivery` enum
+/// (plus config-route classification). `delivery_note` / free text is
+/// display-only and must never raise the level. Entries are keyed by
+/// [`Self::operation_id`] — a later queued op must not inherit an earlier
+/// physical-verified level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalEvidence {
+    pub level: GoalEvidenceLevel,
+    pub device_id: Option<String>,
+    pub command: Option<String>,
+    /// Exact delivery enum tag when known (`adapter_accepted`, …).
+    pub delivery: Option<String>,
+    /// Bound Operation id for this observation (required for claim matching).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// Human-readable note (display-only; not used for level).
+    pub summary: String,
+}
+
+/// Lightweight cross-turn task state (G2) + Round 2 operation ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskState {
+    pub goal: Option<String>,
+    pub object: Option<String>,
+    pub content: Option<String>,
+    /// Preferred execution method after a user correction (kept across Continue).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<ExecutionMethod>,
+    /// Routes the user rejected; additive across corrections; kept on Continue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_routes: Vec<ExcludedRoute>,
+    /// Per-operation tool-proven goal evidence (not a global max across ops).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub goal_evidences: Vec<GoalEvidence>,
+    pub confirmed_steps: Vec<ConfirmedStep>,
+    pub next_action: Option<NextAction>,
+    pub status: TaskStatus,
+    /// Active Operation ID (UUID). Empty until the first
+    /// [`Self::begin_new_operation`].
+    pub current_operation_id: OperationId,
+    /// Full Operation history — never wiped to authorize re-run.
+    pub operations: Vec<OperationRecord>,
+    /// Full write ledger — never wiped to authorize re-run.
+    pub write_ledger: Vec<WriteFact>,
+    /// Count of user Turns observed (each user message).
+    pub turn_count: u64,
+    /// One-shot, operation-scoped user authorization after Unknown.
+    /// Runtime-only — not persisted. Consumed by
+    /// [`Self::take_user_authorized_new_op`].
+    #[serde(skip)]
+    pub user_authorized_new_op: Option<NewOpAuthorization>,
+    /// Pending Unknown re-run confirm requests (runtime-only).
+    #[serde(skip)]
+    pub pending_confirm_requests: Vec<ConfirmRequest>,
+    /// Notices to emit on the next stream (requested / removed).
+    #[serde(skip)]
+    pub confirm_lifecycle_notices: Vec<ConfirmLifecycleNotice>,
+    /// User-visible SystemNote bodies queued for the next stream (e.g.
+    /// malformed authorize — never silent downgrade).
+    #[serde(skip)]
+    pub pending_system_notes: Vec<String>,
+}
+
+impl Default for TaskState {
+    fn default() -> Self {
+        Self {
+            goal: None,
+            object: None,
+            content: None,
+            method: None,
+            excluded_routes: Vec::new(),
+            goal_evidences: Vec::new(),
+            confirmed_steps: Vec::new(),
+            next_action: None,
+            status: TaskStatus::Idle,
+            current_operation_id: String::new(),
+            operations: Vec::new(),
+            write_ledger: Vec::new(),
+            turn_count: 0,
+            user_authorized_new_op: None,
+            pending_confirm_requests: Vec::new(),
+            confirm_lifecycle_notices: Vec::new(),
+            pending_system_notes: Vec::new(),
+        }
+    }
+}
+
+/// User / system directives that mutate [`TaskState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskDirective {
+    /// Establish or replace the working goal fields (does **not** change
+    /// operation scope or wipe write facts). Clears prior method /
+    /// excluded-route constraints (new charter).
+    SetGoal {
+        goal: String,
+        object: Option<String>,
+        content: Option<String>,
+    },
+    /// Correction overwrites the prior goal (and optional fields). Keeps
+    /// prior facts when a field is omitted. Does **not** lift anti-replay.
+    /// May bind [`ExecutionMethod`] / [`ExcludedRoute`] from the correction.
+    Correct {
+        goal: String,
+        object: Option<String>,
+        content: Option<String>,
+        method: Option<ExecutionMethod>,
+        /// Additive exclusions (union with existing); empty = leave as-is.
+        exclude_routes: Vec<ExcludedRoute>,
+    },
+    Cancel,
+    /// Resume without replaying writes recorded on the current operation.
+    Continue,
+    /// Grant one-shot, operation-scoped user authorization for a new
+    /// same-args Operation after Unknown. Both `prior_operation_id` +
+    /// `write_fingerprint` **must** be set (from a consumed confirm
+    /// request) — binds **exactly** that Unknown op. `None`/`None` is
+    /// refused (`confirm_request_required`); there is no Unique-Unknown
+    /// op-level fallback. Does **not** begin the Operation — the model
+    /// must still set [`NEW_OPERATION_ARG`] via the registered tool schema.
+    AuthorizeNewOperation {
+        prior_operation_id: Option<OperationId>,
+        write_fingerprint: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    Ignored { reason: &'static str },
+}
+
+impl TaskState {
+    /// Record a user Turn. Does **not** advance the operation or lift
+    /// anti-replay — the model interprets the utterance from context.
+    ///
+    /// Returns the **immutable** Turn ID allocated for this user message.
+    /// Callers must capture and pass that ID into the stream / tool gate —
+    /// never re-read shared [`Self::turn_count`] inside a lazy stream.
+    ///
+    /// Expires any outstanding new-op grant from a prior Turn (confirming
+    /// Turn binding). A directive on *this* message may grant again after.
+    pub fn note_user_turn(&mut self) -> u64 {
+        self.turn_count = self.turn_count.saturating_add(1);
+        if let Some(grant) = &self.user_authorized_new_op {
+            if grant.confirming_turn < self.turn_count {
+                self.user_authorized_new_op = None;
+            }
+        }
+        self.turn_count
+    }
+
+    /// Open a **new** Operation with a fresh UUID (no stream owner).
+    ///
+    /// Prefer [`Self::begin_new_operation_for_owner`] on stream paths so the
+    /// owner is an explicit parameter — never a session-level shared hop.
+    pub fn begin_new_operation(
+        &mut self,
+        tool_name: impl Into<String>,
+        target: Option<String>,
+        arguments: impl Into<String>,
+        write_fingerprint: Option<String>,
+    ) -> OperationId {
+        self.begin_new_operation_for_owner(tool_name, target, arguments, write_fingerprint, None)
+    }
+
+    /// Open a **new** Operation tagged with the current stream's owner.
+    ///
+    /// Keeps write ledger + confirmed steps + prior Operation records.
+    /// `owner` must come from the active stream token — do not read a
+    /// shared session variable.
+    pub fn begin_new_operation_for_owner(
+        &mut self,
+        tool_name: impl Into<String>,
+        target: Option<String>,
+        arguments: impl Into<String>,
+        write_fingerprint: Option<String>,
+        owner: Option<&str>,
+    ) -> OperationId {
+        let tool_name = tool_name.into();
+        let arguments = arguments.into();
+        let parsed_args =
+            serde_json::from_str::<serde_json::Value>(&arguments).unwrap_or(serde_json::json!({}));
+        let capability = Some(derive_tool_capability(&tool_name, &parsed_args));
+        let (domain, action) = extract_operation_domain_action(&tool_name, &parsed_args);
+        let now = Self::now_ms();
+        let id = uuid::Uuid::new_v4().to_string();
+        self.current_operation_id = id.clone();
+        self.operations.push(OperationRecord {
+            operation_id: id.clone(),
+            origin_turn_id: self.turn_count,
+            tool_name,
+            domain,
+            action,
+            target,
+            arguments,
+            status: OperationStatus::Prepared,
+            result: None,
+            evidence: Vec::new(),
+            write_fingerprint,
+            capability,
+            owner_id: owner.map(|o| o.to_string()),
+            created_at_ms: now,
+            updated_at_ms: now,
+        });
+        if !matches!(
+            self.status,
+            TaskStatus::Cancelled | TaskStatus::Completed { .. }
+        ) {
+            self.status = TaskStatus::Active;
+        }
+        id
+    }
+
+    /// Resolve and grant one-shot authorization for a confirmed Unknown op.
+    ///
+    /// Both `prior_operation_id` + `write_fingerprint` must be set (from a
+    /// consumed confirm request). Missing either / both → refuse
+    /// (`confirm_request_required` / `incomplete_authorization_target`) —
+    /// there is **no** Unique-Unknown op-level grant fallback.
+    pub fn grant_user_authorized_new_op(
+        &mut self,
+        prior_operation_id: Option<&str>,
+        write_fingerprint: Option<&str>,
+    ) -> Result<(), &'static str> {
+        let bound = match (prior_operation_id, write_fingerprint) {
+            (Some(op_id), Some(fp)) => {
+                let Some(op) = self.operation(op_id) else {
+                    self.user_authorized_new_op = None;
+                    return Err("no_matching_unknown_operation");
+                };
+                if op.status != OperationStatus::Unknown {
+                    self.user_authorized_new_op = None;
+                    return Err("no_matching_unknown_operation");
+                }
+                let Some(op_fp) = op.write_fingerprint.as_deref() else {
+                    self.user_authorized_new_op = None;
+                    return Err("no_matching_unknown_operation");
+                };
+                if op_fp != fp {
+                    self.user_authorized_new_op = None;
+                    return Err("fingerprint_mismatch");
+                }
+                (op.operation_id.clone(), op_fp.to_string())
+            }
+            (None, None) => {
+                self.user_authorized_new_op = None;
+                return Err("confirm_request_required");
+            }
+            _ => {
+                self.user_authorized_new_op = None;
+                return Err("incomplete_authorization_target");
+            }
+        };
+        self.user_authorized_new_op = Some(NewOpAuthorization {
+            prior_operation_id: bound.0,
+            write_fingerprint: bound.1,
+            confirming_turn: self.turn_count,
+        });
+        Ok(())
+    }
+
+    /// Clear any outstanding new-op grant (cancel / target change / expiry).
+    pub fn clear_user_authorized_new_op(&mut self) {
+        self.user_authorized_new_op = None;
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Drain queued confirm lifecycle notices for stream emission.
+    pub fn drain_pending_system_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_system_notes)
+    }
+
+    pub fn drain_confirm_lifecycle_notices(&mut self) -> Vec<ConfirmLifecycleNotice> {
+        std::mem::take(&mut self.confirm_lifecycle_notices)
+    }
+
+    /// Drop expired pending confirms (wall-clock) and queue Removed notices.
+    pub fn expire_confirm_requests(&mut self, now_ms: u64) {
+        let (keep, expired): (Vec<_>, Vec<_>) = self
+            .pending_confirm_requests
+            .drain(..)
+            .partition(|c| c.valid_until_ms > now_ms);
+        self.pending_confirm_requests = keep;
+        for c in expired {
+            self.confirm_lifecycle_notices
+                .push(ConfirmLifecycleNotice::Removed {
+                    request_id: c.request_id,
+                    reason: ConfirmRemoveReason::Expired,
+                });
+        }
+    }
+
+    /// Cancel all pending confirms (Cancel / Correct / SetGoal).
+    pub fn cancel_all_confirm_requests(&mut self) {
+        for c in self.pending_confirm_requests.drain(..) {
+            self.confirm_lifecycle_notices
+                .push(ConfirmLifecycleNotice::Removed {
+                    request_id: c.request_id,
+                    reason: ConfirmRemoveReason::Cancelled,
+                });
+        }
+    }
+
+    /// Issue or reuse a confirm request for an Unknown Operation.
+    ///
+    /// Same Unknown op + fingerprint → reuse the existing pending request
+    /// (duplicate gate hits do not mint a new id). Fingerprint / target /
+    /// tool travel as structured fields — not text KV.
+    pub fn issue_or_reuse_confirm_request(
+        &mut self,
+        prior_operation_id: &str,
+        write_fingerprint: &str,
+        tool_name: &str,
+        target: Option<String>,
+    ) -> ConfirmRequest {
+        let now = Self::now_ms();
+        self.expire_confirm_requests(now);
+        if let Some(existing) = self.pending_confirm_requests.iter_mut().find(|c| {
+            c.prior_operation_id == prior_operation_id && c.write_fingerprint == write_fingerprint
+        }) {
+            // Refresh validity on reuse so repeat gate hits don't leave a
+            // near-expiry chip that the UI cannot extend.
+            existing.valid_until_ms = now.saturating_add(UNKNOWN_RERUN_CONFIRM_VALIDITY_MS);
+            let refreshed = existing.clone();
+            self.confirm_lifecycle_notices
+                .push(ConfirmLifecycleNotice::Requested(refreshed.clone()));
+            return refreshed;
+        }
+        let req = ConfirmRequest {
+            request_id: format!("req-{}", uuid::Uuid::new_v4()),
+            prior_operation_id: prior_operation_id.to_string(),
+            write_fingerprint: write_fingerprint.to_string(),
+            tool_name: tool_name.to_string(),
+            target,
+            valid_until_ms: now.saturating_add(UNKNOWN_RERUN_CONFIRM_VALIDITY_MS),
+        };
+        self.pending_confirm_requests.push(req.clone());
+        self.confirm_lifecycle_notices
+            .push(ConfirmLifecycleNotice::Requested(req.clone()));
+        req
+    }
+
+    /// Atomically validate + consume a confirm request by id.
+    ///
+    /// Verifies the request exists, is not expired, the Operation is still
+    /// Unknown, and the submitted op/fingerprint match the server record.
+    /// On success removes the pending request and returns the bound pair for
+    /// [`Self::grant_user_authorized_new_op`].
+    pub fn submit_confirm_request(
+        &mut self,
+        submit: &AuthorizeNewOpSubmit,
+        now_ms: Option<u64>,
+    ) -> Result<(OperationId, String), &'static str> {
+        let now = now_ms.unwrap_or_else(Self::now_ms);
+        // Look up this id before sweeping others so an expired click gets
+        // `confirm_request_expired` (not a generic not_found).
+        let idx = self
+            .pending_confirm_requests
+            .iter()
+            .position(|c| c.request_id == submit.request_id);
+        let Some(idx) = idx else {
+            self.expire_confirm_requests(now);
+            return Err("confirm_request_not_found");
+        };
+        let req = self.pending_confirm_requests.remove(idx);
+        if req.valid_until_ms <= now {
+            self.confirm_lifecycle_notices
+                .push(ConfirmLifecycleNotice::Removed {
+                    request_id: req.request_id,
+                    reason: ConfirmRemoveReason::Expired,
+                });
+            self.expire_confirm_requests(now);
+            return Err("confirm_request_expired");
+        }
+        self.expire_confirm_requests(now);
+        if req.prior_operation_id != submit.prior_operation_id
+            || req.write_fingerprint != submit.write_fingerprint
+        {
+            // Restore — client must not mutate bound fields.
+            self.pending_confirm_requests.push(req);
+            return Err("confirm_request_mismatch");
+        }
+        let Some(op) = self.operation(&req.prior_operation_id) else {
+            self.confirm_lifecycle_notices
+                .push(ConfirmLifecycleNotice::Removed {
+                    request_id: req.request_id,
+                    reason: ConfirmRemoveReason::Cancelled,
+                });
+            return Err("no_matching_unknown_operation");
+        };
+        if op.status != OperationStatus::Unknown {
+            self.confirm_lifecycle_notices
+                .push(ConfirmLifecycleNotice::Removed {
+                    request_id: req.request_id,
+                    reason: ConfirmRemoveReason::Cancelled,
+                });
+            return Err("no_matching_unknown_operation");
+        }
+        let Some(op_fp) = op.write_fingerprint.as_deref() else {
+            self.confirm_lifecycle_notices
+                .push(ConfirmLifecycleNotice::Removed {
+                    request_id: req.request_id,
+                    reason: ConfirmRemoveReason::Cancelled,
+                });
+            return Err("no_matching_unknown_operation");
+        };
+        if op_fp != req.write_fingerprint {
+            self.confirm_lifecycle_notices
+                .push(ConfirmLifecycleNotice::Removed {
+                    request_id: req.request_id,
+                    reason: ConfirmRemoveReason::Cancelled,
+                });
+            return Err("fingerprint_mismatch");
+        }
+        let bound = (
+            req.prior_operation_id.clone(),
+            req.write_fingerprint.clone(),
+        );
+        self.confirm_lifecycle_notices
+            .push(ConfirmLifecycleNotice::Removed {
+                request_id: req.request_id,
+                reason: ConfirmRemoveReason::Consumed,
+            });
+        Ok(bound)
+    }
+
+    /// Look up a pending confirm (tests / UI helpers).
+    pub fn pending_confirm(&self, request_id: &str) -> Option<&ConfirmRequest> {
+        self.pending_confirm_requests
+            .iter()
+            .find(|c| c.request_id == request_id)
+    }
+
+    /// Phrase shortcut: consume the unique valid pending confirm request.
+    ///
+    /// Zero / expired / ambiguous pending → refuse. Never grants from
+    /// Unique-Unknown ops alone — the request lifecycle is mandatory.
+    pub fn consume_unique_pending_confirm(
+        &mut self,
+        now_ms: Option<u64>,
+    ) -> Result<(OperationId, String), &'static str> {
+        let now = now_ms.unwrap_or_else(Self::now_ms);
+        self.expire_confirm_requests(now);
+        let active: Vec<ConfirmRequest> = self
+            .pending_confirm_requests
+            .iter()
+            .filter(|c| c.valid_until_ms > now)
+            .cloned()
+            .collect();
+        match active.as_slice() {
+            [] => Err("confirm_request_not_found"),
+            [only] => {
+                let submit = AuthorizeNewOpSubmit {
+                    request_id: only.request_id.clone(),
+                    prior_operation_id: only.prior_operation_id.clone(),
+                    write_fingerprint: only.write_fingerprint.clone(),
+                };
+                self.submit_confirm_request(&submit, Some(now))
+            }
+            _ => Err("ambiguous_confirm_requests"),
+        }
+    }
+
+    /// Atomically consume a grant for `prior_operation_id` + `write_fingerprint`
+    /// on the **call-site** Turn.
+    ///
+    /// `call_site_turn` is the immutable Turn ID captured when the consuming
+    /// stream/tool loop started — **not** a re-read of shared
+    /// [`Self::turn_count`]. Returns true only when the grant's confirming
+    /// Turn matches that call-site Turn and the op/fingerprint bind. A
+    /// mismatched consumer (wrong op, wrong fingerprint, or stale stream
+    /// Turn) does **not** steal the grant (restored for the bound op).
+    pub fn take_user_authorized_new_op(
+        &mut self,
+        prior_operation_id: &str,
+        write_fingerprint: &str,
+        call_site_turn: u64,
+    ) -> bool {
+        let Some(grant) = self.user_authorized_new_op.take() else {
+            return false;
+        };
+        // Call-site Turn must be the confirming Turn — old streams cannot
+        // consume a grant issued on a later user Turn (and vice versa).
+        if grant.confirming_turn != call_site_turn {
+            self.user_authorized_new_op = Some(grant);
+            return false;
+        }
+        if grant.prior_operation_id == prior_operation_id
+            && grant.write_fingerprint == write_fingerprint
+        {
+            return true;
+        }
+        // Cross-op / wrong fingerprint: restore so the bound op can still use it.
+        self.user_authorized_new_op = Some(grant);
+        false
+    }
+
+    /// Cancel Prepared (not-yet-executed) operations; keep executed facts.
+    ///
+    /// Session-wide (Correct / Cancel directives). Stream teardown must use
+    /// [`Self::abandon_owned_operations_on_interrupt`] instead.
+    pub fn cancel_prepared_operations(&mut self) {
+        for op in &mut self.operations {
+            if op.status == OperationStatus::Prepared {
+                op.status = OperationStatus::Cancelled;
+            }
+        }
+    }
+
+    /// Owner-scoped cleanup when a stream/batch is interrupted mid-flight.
+    ///
+    /// Only Prepared/Running operations tagged with `owner` are touched.
+    /// Sibling streams / newer turns keep their leases. Running → Unknown
+    /// (honest terminal — effect may already have applied; do not auto-replay).
+    pub fn abandon_owned_operations_on_interrupt(
+        &mut self,
+        owner: &str,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        for op in &mut self.operations {
+            if op.owner_id.as_deref() != Some(owner) {
+                continue;
+            }
+            match op.status {
+                OperationStatus::Prepared => {
+                    op.status = OperationStatus::Cancelled;
+                }
+                OperationStatus::Running => {
+                    let prior = op.evidence.clone();
+                    op.status = OperationStatus::Unknown;
+                    op.result = Some(StructuredResult {
+                        success: false,
+                        summary: format!("interrupted — outcome unknown ({reason})"),
+                        body: reason.clone(),
+                        details_ref: None,
+                    });
+                    op.evidence = prior;
+                    if !op
+                        .evidence
+                        .iter()
+                        .any(|e| e.contains("interrupted") || e.contains("OUTCOME UNKNOWN"))
+                    {
+                        op.evidence.push(format!("interrupted: {reason}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// RAII guard: when a stream consumer aborts / drops / times out without an
+/// explicit interrupt signal, **this stream's** Running leases become Unknown
+/// so a later `_new_operation` is not stuck on InProgress — without touching
+/// sibling streams' leases.
+///
+/// Held inside `async_stream::stream!` so generator Drop (consumer.abort,
+/// HTTP outer-timeout dropping the stream) triggers cleanup. `Drop` cannot
+/// await `RwLock`, so cleanup is spawned when try_write contends.
+pub struct StreamLeaseGuard {
+    state: std::sync::Arc<tokio::sync::RwLock<crate::agent::types::AgentInternalState>>,
+    owner_id: StreamOwnerId,
+    reason: &'static str,
+}
+
+impl StreamLeaseGuard {
+    pub fn new(
+        state: std::sync::Arc<tokio::sync::RwLock<crate::agent::types::AgentInternalState>>,
+        owner_id: StreamOwnerId,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            state,
+            owner_id,
+            reason,
+        }
+    }
+
+    pub fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+}
+
+impl Drop for StreamLeaseGuard {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        let owner = self.owner_id.clone();
+        let reason = self.reason;
+        // Prefer synchronous try_write so probes that abort then immediately
+        // inspect task_state see Unknown without waiting on a spawned task.
+        if let Ok(mut guard) = state.try_write() {
+            guard
+                .task_state
+                .abandon_owned_operations_on_interrupt(&owner, reason);
+            return;
+        }
+        // Contended: defer to a spawned task — but only when a Tokio runtime
+        // exists. Dropping outside a runtime (shutdown teardown, sync test
+        // harnesses holding the last Arc) would panic inside Drop and abort
+        // the process; instead leave the op Running — the restore path
+        // already sanitizes stale Running ops to Unknown on next load.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let mut guard = state.write().await;
+                    guard
+                        .task_state
+                        .abandon_owned_operations_on_interrupt(&owner, reason);
+                });
+            }
+            Err(extracted) => {
+                tracing::error!(
+                    error = %extracted,
+                    owner = %owner,
+                    "StreamLeaseGuard dropped outside a Tokio runtime — deferring abandon \
+                     to restore-time Running→Unknown sanitization"
+                );
+            }
+        }
+    }
+}
+
+// Re-open TaskState impl block for methods that follow abandon helper.
+impl TaskState {
+    /// Sanitize in-flight ops for durable storage / cold restore.
+    ///
+    /// - `Running` → `Unknown` (effect may already have applied; never auto-replay)
+    /// - `Prepared` → `Cancelled` (no live executor after restart)
+    /// - Strip `owner_id` leases (stream tokens die with the process)
+    fn sanitize_ops_for_persist(ops: &mut [OperationRecord]) {
+        for op in ops.iter_mut() {
+            match op.status {
+                OperationStatus::Running => {
+                    let prior = op.evidence.clone();
+                    op.status = OperationStatus::Unknown;
+                    op.result = Some(StructuredResult {
+                        success: false,
+                        summary: "process restart — outcome unknown".into(),
+                        body: "restored while Running; treated as Unknown".into(),
+                        details_ref: None,
+                    });
+                    op.evidence = prior;
+                    if !op.evidence.iter().any(|e| e.contains("process restart")) {
+                        op.evidence
+                            .push("process restart: Running → Unknown".into());
+                    }
+                }
+                OperationStatus::Prepared => {
+                    op.status = OperationStatus::Cancelled;
+                }
+                _ => {}
+            }
+            op.owner_id = None;
+        }
+    }
+
+    /// Snapshot the minimal op ledger for persistence (no auth / leases).
+    ///
+    /// `version` is filled by [`crate::agent::types::AgentInternalState`] on
+    /// durable commit (monotonic generation). Snapshots default to 0.
+    pub fn snapshot_op_ledger(&self) -> PersistedOpLedger {
+        let mut operations = self.operations.clone();
+        Self::sanitize_ops_for_persist(&mut operations);
+        PersistedOpLedger {
+            version: 0,
+            operations,
+            write_ledger: self.write_ledger.clone(),
+            current_operation_id: self.current_operation_id.clone(),
+            turn_count: self.turn_count,
+        }
+    }
+
+    /// After cold restore the in-process large-data cache is gone — drop
+    /// stale `$cached:op:…` handles and mark details unavailable (no new
+    /// cache system).
+    fn sanitize_details_ref_after_restore(ops: &mut [OperationRecord]) {
+        for op in ops.iter_mut() {
+            let Some(result) = op.result.as_mut() else {
+                continue;
+            };
+            let Some(details) = result.details_ref.as_deref() else {
+                continue;
+            };
+            if !details.starts_with("$cached:op:") {
+                continue;
+            }
+            result.details_ref = None;
+            if !result.summary.contains("details unavailable") {
+                result.summary = format!("{} (details unavailable after restore)", result.summary);
+            }
+            if !op
+                .evidence
+                .iter()
+                .any(|e| e.contains("details unavailable after restore"))
+            {
+                op.evidence
+                    .push("details unavailable after restore ($cached:op cleared)".into());
+            }
+        }
+    }
+
+    /// Restore a persisted op ledger after process restart / session reload.
+    ///
+    /// Re-sanitizes Running→Unknown / Prepared→Cancelled, strips leases,
+    /// drops stale `$cached:op` details_ref handles, and **never** restores
+    /// auth grants or pending confirm requests.
+    pub fn restore_op_ledger(&mut self, ledger: PersistedOpLedger) {
+        self.user_authorized_new_op = None;
+        self.pending_confirm_requests.clear();
+        self.confirm_lifecycle_notices.clear();
+
+        let mut operations = ledger.operations;
+        Self::sanitize_ops_for_persist(&mut operations);
+        Self::sanitize_details_ref_after_restore(&mut operations);
+        let mut write_ledger = ledger.write_ledger;
+        Self::migrate_fingerprints_to_sorted(&mut operations, &mut write_ledger);
+        self.operations = operations;
+        self.write_ledger = write_ledger;
+        self.current_operation_id = ledger.current_operation_id;
+        self.turn_count = ledger.turn_count;
+    }
+
+    /// One-time upgrade seam for the sorted-fingerprint format.
+    ///
+    /// Fingerprints persisted before key-sorting (`stable_json_string`) were
+    /// serialized in JSON insertion order, so a post-upgrade live lookup for
+    /// the same logical call would MISS the persisted op — turning a durable
+    /// Unknown/Failed into "no prior op" and re-executing it without the
+    /// Unknown-inquire user gate. Recompute every op's fingerprint from its
+    /// stored arguments through the canonicalizer, then rewrite ledger facts
+    /// via the op-id → new-fingerprint map so `WriteFact`s stay aligned.
+    /// Idempotent: already-sorted fingerprints recompute to themselves.
+    fn migrate_fingerprints_to_sorted(
+        operations: &mut [OperationRecord],
+        write_ledger: &mut [WriteFact],
+    ) {
+        let mut remap: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for op in operations.iter_mut() {
+            if op.write_fingerprint.as_deref().unwrap_or("").is_empty() {
+                continue;
+            }
+            let Some(args) = serde_json::from_str::<serde_json::Value>(&op.arguments).ok() else {
+                // Unparseable stored args: keep the old fingerprint rather
+                // than dropping the record's replay protection entirely.
+                continue;
+            };
+            let Some(new) =
+                crate::agent::streaming::mutating_write_fingerprint(&op.tool_name, &args)
+            else {
+                continue;
+            };
+            if new != op.write_fingerprint.as_deref().unwrap_or("") {
+                remap.insert(op.operation_id.clone(), new.clone());
+                op.write_fingerprint = Some(new);
+            }
+        }
+        if remap.is_empty() {
+            return;
+        }
+        for fact in write_ledger.iter_mut() {
+            if let Some(new) = remap.get(&fact.operation_id) {
+                if &fact.fingerprint != new {
+                    fact.fingerprint = new.clone();
+                }
+            }
+        }
+    }
+
+    /// Latest operation whose write fingerprint matches (if any).
+    pub fn latest_op_for_fingerprint(&self, write_fingerprint: &str) -> Option<&OperationRecord> {
+        self.operations
+            .iter()
+            .rev()
+            .find(|op| op.write_fingerprint.as_deref() == Some(write_fingerprint))
+    }
+
+    pub fn operation(&self, operation_id: &str) -> Option<&OperationRecord> {
+        self.operations
+            .iter()
+            .find(|op| op.operation_id == operation_id)
+    }
+
+    pub fn operation_mut(&mut self, operation_id: &str) -> Option<&mut OperationRecord> {
+        self.operations
+            .iter_mut()
+            .find(|op| op.operation_id == operation_id)
+    }
+
+    /// Same-op resume: prefer a known structured result when the latest op
+    /// for this fingerprint already terminated (incl. Unknown).
+    pub fn prefer_known_result(&self, write_fingerprint: &str) -> Option<&StructuredResult> {
+        let op = self.latest_op_for_fingerprint(write_fingerprint)?;
+        if op.status.blocks_auto_replay() {
+            op.result.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Decide how the tool path should treat a mutating write.
+    pub fn dispatch_mutating_write(&self, write_fingerprint: &str) -> WriteDispatch {
+        if matches!(self.status, TaskStatus::Cancelled) {
+            return WriteDispatch::BlockedCancelled;
+        }
+        match self.latest_op_for_fingerprint(write_fingerprint) {
+            None => {
+                // No op yet — caller should begin_new_operation then Execute.
+                // Without an id we cannot Execute; treat as blocked-succeeded
+                // only if ledger has a fact on the current scope (legacy).
+                if !self.current_operation_id.is_empty()
+                    && self.write_ledger.iter().any(|w| {
+                        w.operation_id == self.current_operation_id
+                            && w.fingerprint == write_fingerprint
+                    })
+                {
+                    WriteDispatch::BlockedSucceeded {
+                        operation_id: self.current_operation_id.clone(),
+                    }
+                } else {
+                    // Signal: need begin_new_operation. Use empty Execute id
+                    // is wrong — return BlockedSucceeded with empty only as
+                    // "caller must begin". Prefer a dedicated path in stream:
+                    // if may_execute_write, begin then mark_running.
+                    WriteDispatch::Execute {
+                        operation_id: String::new(),
+                    }
+                }
+            }
+            Some(op) => match op.status {
+                // Only Prepared may take the execution lease. Running means
+                // another concurrent caller already holds it.
+                OperationStatus::Prepared => WriteDispatch::Execute {
+                    operation_id: op.operation_id.clone(),
+                },
+                OperationStatus::Running => WriteDispatch::InProgress {
+                    operation_id: op.operation_id.clone(),
+                },
+                OperationStatus::Unknown => WriteDispatch::InquireStatus {
+                    operation_id: op.operation_id.clone(),
+                },
+                OperationStatus::Succeeded | OperationStatus::Cancelled => {
+                    if let Some(result) = op.result.clone() {
+                        WriteDispatch::PreferKnown {
+                            operation_id: op.operation_id.clone(),
+                            result,
+                        }
+                    } else {
+                        WriteDispatch::BlockedSucceeded {
+                            operation_id: op.operation_id.clone(),
+                        }
+                    }
+                }
+                OperationStatus::Failed => {
+                    if let Some(result) = op.result.clone() {
+                        WriteDispatch::PreferKnown {
+                            operation_id: op.operation_id.clone(),
+                            result,
+                        }
+                    } else {
+                        WriteDispatch::BlockedSucceeded {
+                            operation_id: op.operation_id.clone(),
+                        }
+                    }
+                }
+                OperationStatus::Rejected => {
+                    // Never bypass a prior Unknown on the same fingerprint.
+                    if let Some(prev_unknown) = self
+                        .operations
+                        .iter()
+                        .rev()
+                        .find(|o| {
+                            o.write_fingerprint.as_deref() == Some(write_fingerprint)
+                                && o.status != OperationStatus::Rejected
+                        })
+                        .filter(|o| o.status == OperationStatus::Unknown)
+                    {
+                        WriteDispatch::InquireStatus {
+                            operation_id: prev_unknown.operation_id.clone(),
+                        }
+                    } else {
+                        WriteDispatch::Execute {
+                            operation_id: String::new(),
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    /// Atomic Prepared → Running lease. Only the holder may run the tool.
+    /// Returns `false` if missing, already Running, or terminal.
+    pub fn try_acquire_execution_lease(&mut self, operation_id: &str) -> bool {
+        let now = Self::now_ms();
+        let Some(op) = self.operation_mut(operation_id) else {
+            return false;
+        };
+        if op.status == OperationStatus::Prepared {
+            op.status = OperationStatus::Running;
+            op.updated_at_ms = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark Prepared → Running. Prefer [`Self::try_acquire_execution_lease`]
+    /// for concurrent-safe dispatch (Running is not re-acquired).
+    pub fn mark_operation_running(&mut self, operation_id: &str) -> bool {
+        self.try_acquire_execution_lease(operation_id)
+    }
+
+    /// Record Succeeded + structured result; append write ledger when fingerprint set.
+    pub fn complete_operation_succeeded(
+        &mut self,
+        operation_id: &str,
+        result: StructuredResult,
+        evidence: impl IntoIterator<Item = String>,
+    ) {
+        let now = Self::now_ms();
+        let fp = {
+            let Some(op) = self.operation_mut(operation_id) else {
+                return;
+            };
+            if op.status.is_terminal() {
+                return;
+            }
+            op.status = OperationStatus::Succeeded;
+            op.result = Some(result);
+            op.evidence.extend(evidence);
+            op.updated_at_ms = now;
+            op.write_fingerprint.clone()
+        };
+        if let Some(fp) = fp {
+            // Attribute the write fact to the COMPLETING operation, not the
+            // shared current_operation_id pointer (concurrent sibling writes
+            // in one batch would otherwise mis-file facts).
+            self.record_successful_write(operation_id, fp);
+        }
+    }
+
+    pub fn complete_operation_failed(&mut self, operation_id: &str, result: StructuredResult) {
+        let now = Self::now_ms();
+        let Some(op) = self.operation_mut(operation_id) else {
+            return;
+        };
+        if op.status.is_terminal() {
+            return;
+        }
+        op.status = OperationStatus::Failed;
+        op.updated_at_ms = now;
+        op.result = Some(StructuredResult {
+            success: false,
+            summary: result.summary,
+            body: result.body,
+            details_ref: result.details_ref,
+        });
+    }
+
+    /// Pre-submission rejection (parse/validation/connect-refuse) — terminal
+    /// for this attempt without recording a write fact or locking PreferKnown.
+    pub fn complete_operation_rejected(&mut self, operation_id: &str, result: StructuredResult) {
+        let now = Self::now_ms();
+        let Some(op) = self.operation_mut(operation_id) else {
+            return;
+        };
+        if op.status.is_terminal() {
+            return;
+        }
+        op.status = OperationStatus::Rejected;
+        op.updated_at_ms = now;
+        op.result = Some(StructuredResult {
+            success: false,
+            summary: result.summary,
+            body: result.body,
+            details_ref: result.details_ref,
+        });
+    }
+
+    /// Timeout / indeterminate — not success; do not ledger a write fact.
+    pub fn complete_operation_unknown(&mut self, operation_id: &str, result: StructuredResult) {
+        let now = Self::now_ms();
+        let Some(op) = self.operation_mut(operation_id) else {
+            return;
+        };
+        if op.status.is_terminal() {
+            return;
+        }
+        op.status = OperationStatus::Unknown;
+        op.updated_at_ms = now;
+        op.result = Some(StructuredResult {
+            success: false,
+            summary: result.summary,
+            body: result.body,
+            details_ref: result.details_ref,
+        });
+    }
+
+    /// Reconcile a previously `Unknown` (or still `Running`/`Prepared`)
+    /// operation when `heramind operation get <op_id>` confirms a terminal
+    /// server outcome (`succeeded` or `failed`).
+    ///
+    /// Returns `true` if `TaskState` was updated (so callers can persist the
+    /// ledger and refresh `llm_interface.set_new_operation_protocol_tools`).
+    pub fn reconcile_operation_from_lookup(
+        &mut self,
+        operation_id: &str,
+        remote_status: &str,
+        result_summary: Option<&str>,
+        error_summary: Option<&str>,
+        extra_evidence: Vec<String>,
+    ) -> bool {
+        let normalized = remote_status.trim().to_ascii_lowercase();
+        let target_status = match normalized.as_str() {
+            "succeeded" => OperationStatus::Succeeded,
+            "failed" => OperationStatus::Failed,
+            _ => return false,
+        };
+        let now = Self::now_ms();
+        let (changed, fp_to_record) = {
+            let Some(op) = self.operation_mut(operation_id) else {
+                return false;
+            };
+            if !matches!(
+                op.status,
+                OperationStatus::Unknown | OperationStatus::Running | OperationStatus::Prepared
+            ) {
+                return false;
+            }
+            let prev = op.status.as_api_str();
+            op.status = target_status.clone();
+            op.updated_at_ms = now;
+            let summary = match target_status {
+                OperationStatus::Succeeded => result_summary
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("confirmed succeeded via operation get")
+                    .to_string(),
+                OperationStatus::Failed => error_summary
+                    .or(result_summary)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("confirmed failed via operation get")
+                    .to_string(),
+                _ => unreachable!(),
+            };
+            op.result = Some(StructuredResult::with_body(
+                target_status == OperationStatus::Succeeded,
+                summary.clone(),
+                summary,
+                None,
+            ));
+            op.evidence.push(format!(
+                "reconciled via operation get: {prev} -> {}",
+                op.status.as_api_str()
+            ));
+            for ev in extra_evidence {
+                if !ev.is_empty() && !op.evidence.contains(&ev) {
+                    op.evidence.push(ev);
+                }
+            }
+            let fp = if target_status == OperationStatus::Succeeded {
+                op.write_fingerprint.clone()
+            } else {
+                None
+            };
+            (true, fp)
+        };
+        if !changed {
+            return false;
+        }
+        if let Some(fp) = fp_to_record {
+            self.record_successful_write(operation_id, fp);
+        }
+        // Clear any pending Unknown-re-run confirm request bound to this op.
+        let (keep, removed): (Vec<_>, Vec<_>) = self
+            .pending_confirm_requests
+            .drain(..)
+            .partition(|c| c.prior_operation_id != operation_id);
+        self.pending_confirm_requests = keep;
+        for c in removed {
+            self.confirm_lifecycle_notices
+                .push(ConfirmLifecycleNotice::Removed {
+                    request_id: c.request_id,
+                    reason: ConfirmRemoveReason::Cancelled,
+                });
+        }
+        true
+    }
+
+    /// Inspect a successful `shell` tool result for `heramind operation get <id>`
+    /// and reconcile any matching `Unknown` operation in this [`TaskState`].
+    pub fn reconcile_operation_lookup_tool_result(
+        &mut self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        result_data: &serde_json::Value,
+    ) -> bool {
+        if crate::tools::resolve_tool_name(tool_name) != "shell" {
+            return false;
+        }
+        let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let argv = crate::toolkit::shell::tokenize_heramind_command(cmd.trim())
+            .unwrap_or_else(|_| cmd.split_whitespace().map(str::to_string).collect());
+        let argv = crate::toolkit::shell::strip_host_meta_from_argv(argv);
+        let argv = heramind_cli_ops::json_arg::strip_global_cli_flags(&argv);
+        if argv.first().map(String::as_str) != Some("heramind")
+            || argv.get(1).map(String::as_str) != Some("operation")
+            || argv.get(2).map(String::as_str) != Some("get")
+        {
+            return false;
+        }
+        let payload = extract_cli_stdout_json(result_data);
+        let root = payload
+            .as_ref()
+            .and_then(|v| v.get("data"))
+            .or(payload.as_ref())
+            .unwrap_or(result_data);
+        let Some(op_id) = root
+            .get("operation_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| argv.get(3).map(String::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return false;
+        };
+        let Some(status) = root.get("status").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let result_summary = root.get("result_summary").and_then(|v| v.as_str());
+        let error_summary = root.get("error_summary").and_then(|v| v.as_str());
+        let evidence = root
+            .get("evidence")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.reconcile_operation_from_lookup(op_id, status, result_summary, error_summary, evidence)
+    }
+
+    /// Whether a failed write may open a new Operation under its capability.
+    pub fn write_failure_may_retry(&self, write_fingerprint: &str) -> bool {
+        let Some(op) = self.latest_op_for_fingerprint(write_fingerprint) else {
+            return true;
+        };
+        if op.status != OperationStatus::Failed {
+            return false;
+        }
+        match op
+            .capability
+            .as_ref()
+            .map(|c| &c.retry_policy)
+            .unwrap_or(&RetryPolicy::Never)
+        {
+            RetryPolicy::AlwaysSafe => true,
+            RetryPolicy::OnFailure { max_attempts } => {
+                let fails = self
+                    .operations
+                    .iter()
+                    .filter(|o| {
+                        o.write_fingerprint.as_deref() == Some(write_fingerprint)
+                            && o.status == OperationStatus::Failed
+                    })
+                    .count() as u32;
+                fails < *max_attempts
+            }
+            RetryPolicy::Never => false,
+        }
+    }
+
+    pub fn apply_directive(&mut self, directive: TaskDirective) -> ApplyOutcome {
+        match directive {
+            TaskDirective::SetGoal {
+                goal,
+                object,
+                content,
+            } => {
+                self.goal = Some(goal);
+                if let Some(o) = object {
+                    // Keep caller form; verdicts compare via goal_objects_equivalent.
+                    self.object = Some(o);
+                }
+                if content.is_some() {
+                    self.content = content;
+                }
+                // New charter — drop prior method / route exclusions / evidence.
+                self.method = None;
+                self.excluded_routes.clear();
+                self.goal_evidences.clear();
+                self.next_action = None;
+                // Target / goal change invalidates a pending Unknown re-run grant.
+                self.clear_user_authorized_new_op();
+                self.cancel_all_confirm_requests();
+                self.status = TaskStatus::Active;
+                ApplyOutcome::Applied
+            }
+            TaskDirective::Correct {
+                goal,
+                object,
+                content,
+                method,
+                exclude_routes,
+            } => {
+                // Correction updates the charter; write ledger + executed
+                // operation anti-replay stay. Cancel not-yet-executed ops.
+                // Omitted fields keep prior facts (object / content / method).
+                let prior_object = self.object.clone();
+                self.goal = Some(goal);
+                if let Some(o) = object {
+                    self.object = Some(o);
+                }
+                if let Some(c) = content {
+                    self.content = Some(c);
+                }
+                if let Some(m) = method {
+                    self.method = Some(m);
+                }
+                for route in exclude_routes {
+                    if !self.excluded_routes.contains(&route) {
+                        self.excluded_routes.push(route);
+                    }
+                }
+                // Target device change invalidates prior goal evidence
+                // (compare canonical type+id, not display wrappers).
+                let object_changed = match (&prior_object, &self.object) {
+                    (Some(a), Some(b)) => !goal_objects_equivalent(a, b),
+                    (None, Some(_)) | (Some(_), None) => true,
+                    (None, None) => false,
+                };
+                if object_changed {
+                    self.goal_evidences.clear();
+                }
+                self.next_action = None;
+                self.cancel_prepared_operations();
+                // Target change invalidates a pending Unknown re-run grant.
+                self.clear_user_authorized_new_op();
+                self.cancel_all_confirm_requests();
+                if !matches!(self.status, TaskStatus::Cancelled) {
+                    self.status = TaskStatus::Active;
+                }
+                ApplyOutcome::Applied
+            }
+            TaskDirective::Cancel => {
+                self.status = TaskStatus::Cancelled;
+                self.next_action = None;
+                self.method = None;
+                self.excluded_routes.clear();
+                self.goal_evidences.clear();
+                self.clear_user_authorized_new_op();
+                self.cancel_all_confirm_requests();
+                ApplyOutcome::Applied
+            }
+            TaskDirective::Continue => {
+                if matches!(self.status, TaskStatus::Cancelled) {
+                    return ApplyOutcome::Ignored {
+                        reason: "cancelled",
+                    };
+                }
+                if matches!(self.status, TaskStatus::Completed { .. }) {
+                    return ApplyOutcome::Ignored {
+                        reason: "already_completed",
+                    };
+                }
+                // Resume same operation: keep ledger + confirmed steps.
+                if self.goal.is_some() {
+                    self.status = TaskStatus::Active;
+                }
+                ApplyOutcome::Applied
+            }
+            TaskDirective::AuthorizeNewOperation {
+                prior_operation_id,
+                write_fingerprint,
+            } => {
+                if matches!(self.status, TaskStatus::Cancelled) {
+                    return ApplyOutcome::Ignored {
+                        reason: "cancelled",
+                    };
+                }
+                // One-shot op-scoped grant only — does not begin an Operation
+                // or wipe gates. Model must still pass `_new_operation` via
+                // schema. Requires op+fp from a consumed confirm request.
+                if let Err(reason) = self.grant_user_authorized_new_op(
+                    prior_operation_id.as_deref(),
+                    write_fingerprint.as_deref(),
+                ) {
+                    return ApplyOutcome::Ignored { reason };
+                }
+                if !matches!(self.status, TaskStatus::Completed { .. }) {
+                    self.status = TaskStatus::Active;
+                }
+                ApplyOutcome::Applied
+            }
+        }
+    }
+
+    /// Prompt block for the production assemble path (goal / done / next).
+    /// Returns `None` when there is nothing useful to inject.
+    pub fn to_prompt_section(&self) -> Option<String> {
+        if matches!(self.status, TaskStatus::Idle | TaskStatus::Cancelled) && self.goal.is_none() {
+            return None;
+        }
+        if self.goal.is_none()
+            && self.confirmed_steps.is_empty()
+            && self.next_action.is_none()
+            && self.write_ledger.is_empty()
+            && self.operations.is_empty()
+            && !matches!(
+                self.status,
+                TaskStatus::Halted { .. } | TaskStatus::Completed { .. }
+            )
+        {
+            return None;
+        }
+        let mut out = String::from("## Active Task State\n");
+        out.push_str(&format!("- Status: {:?}\n", self.status));
+        let op_label = if self.current_operation_id.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.current_operation_id.clone()
+        };
+        out.push_str(&format!(
+            "- Operation: {op_label} (turn {})\n",
+            self.turn_count
+        ));
+        if let Some(g) = &self.goal {
+            out.push_str(&format!("- Goal: {g}\n"));
+        }
+        if let Some(o) = &self.object {
+            out.push_str(&format!("- Object: {o}\n"));
+        }
+        if let Some(c) = &self.content {
+            out.push_str(&format!("- Content: {c}\n"));
+        }
+        if self.method.is_some() || !self.excluded_routes.is_empty() {
+            out.push_str("- Constraints (user corrections; binding):\n");
+            if let Some(m) = &self.method {
+                let method_line = match m {
+                    ExecutionMethod::DeviceNativeCommand => {
+                        "method=device_native_command (device type template command \
+                         via `heramind device control` — not notification/push/webhook)"
+                    }
+                };
+                out.push_str(&format!("  - {method_line}\n"));
+            }
+            for route in &self.excluded_routes {
+                let line = match route {
+                    ExcludedRoute::NotificationOrWebhook => {
+                        "excluded=notification_or_webhook (do not configure or send via \
+                         push/message/webhook for this goal)"
+                    }
+                    ExcludedRoute::DeviceNativeCommand => {
+                        "excluded=device_native_command (do not use \
+                         `heramind device control` for this goal — prefer the allowed route)"
+                    }
+                };
+                out.push_str(&format!("  - {line}\n"));
+            }
+            if let (Some(o), Some(c)) = (&self.object, &self.content) {
+                out.push_str(&format!(
+                    "  - relation: deliver content `{c}` to device `{o}` using the constrained method\n"
+                ));
+            } else if let Some(o) = &self.object {
+                out.push_str(&format!(
+                    "  - relation: act on device `{o}` using the constrained method\n"
+                ));
+            }
+        }
+        if self.goal_needs_device_command_evidence() || !self.goal_evidences.is_empty() {
+            out.push_str("- Goal verification (tool evidence only; do not invent):\n");
+            out.push_str(
+                "  - ladder: config_success < command_dispatched < device_ack < physical_effect\n",
+            );
+            out.push_str(
+                "  - scope: evidence is per Operation — a later op does not inherit \
+                 an earlier physical/ACK level\n",
+            );
+            match self.current_goal_evidence() {
+                Some(ev) => {
+                    out.push_str(&format!(
+                        "  - proven (current op): level={:?} device={} command={} delivery={} op={}\n",
+                        ev.level,
+                        ev.device_id.as_deref().unwrap_or("-"),
+                        ev.command.as_deref().unwrap_or("-"),
+                        ev.delivery.as_deref().unwrap_or("-"),
+                        ev.operation_id.as_deref().unwrap_or("-"),
+                    ));
+                    out.push_str(&format!("  - note (display-only): {}\n", ev.summary));
+                }
+                None => {
+                    out.push_str(
+                        "  - proven (current op): none — no target device command on this Operation\n",
+                    );
+                }
+            }
+            out.push_str(
+                "  - claims: do NOT say sent/updated without command_dispatched to the \
+                 goal device on the current Operation; queued/adapter_accepted/\
+                 extension_accepted ≠ device ACK ≠ physical effect (screen refresh unproven)\n",
+            );
+            out.push_str(
+                "  - completion: structured status is system-judged from evidence; \
+                 your prose is display-only and cannot raise completion\n",
+            );
+            if self.goal_needs_device_command_evidence() {
+                if self
+                    .evaluate_goal_claim(GoalClaimKind::CommandSent)
+                    .is_err()
+                {
+                    out.push_str(
+                        "  - status: CommandSent NOT allowed yet (need device command to goal object on this op)\n",
+                    );
+                }
+                if self
+                    .evaluate_goal_claim(GoalClaimKind::PhysicalEffect)
+                    .is_err()
+                {
+                    out.push_str(
+                        "  - status: PhysicalEffect NOT allowed (need physical_effect_verified on this op)\n",
+                    );
+                }
+            }
+        }
+        if !self.confirmed_steps.is_empty() {
+            out.push_str("- Confirmed steps (tool evidence):\n");
+            for step in self.confirmed_steps.iter().rev().take(8) {
+                out.push_str(&format!("  - {}\n", step.summary));
+            }
+        }
+        if let Some(next) = &self.next_action {
+            out.push_str(&format!(
+                "- Next: {} (source: {})\n",
+                next.description, next.source
+            ));
+        }
+        if !self.operations.is_empty() {
+            out.push_str("- Recent operations (proven status; details_ref for large bodies):\n");
+            for op in self.operations.iter().rev().take(5) {
+                let tgt = op.target.as_deref().unwrap_or("-");
+                let status = format!("{:?}", op.status).to_ascii_lowercase();
+                let mut line = format!(
+                    "  - {} [{status}] {} target={tgt}",
+                    short_op_id(&op.operation_id),
+                    op.tool_name
+                );
+                if let Some(cap) = &op.capability {
+                    line.push_str(&format!(
+                        " read_only={} idempotent={}",
+                        cap.read_only, cap.idempotent
+                    ));
+                }
+                if let Some(res) = &op.result {
+                    line.push_str(&format!(" — {}", res.summary));
+                    if let Some(r) = &res.details_ref {
+                        line.push_str(&format!(" details_ref={r}"));
+                    }
+                }
+                line.push('\n');
+                out.push_str(&line);
+            }
+        }
+        let gated_here = self
+            .write_ledger
+            .iter()
+            .filter(|w| w.operation_id == self.current_operation_id)
+            .count();
+        if !self.write_ledger.is_empty() {
+            out.push_str(&format!(
+                "- Write ledger: {} facts ({} gated on current operation — Continue must not replay)\n",
+                self.write_ledger.len(),
+                gated_here
+            ));
+        }
+        out.push_str(&format!(
+            "- New execution protocol: set `{NEW_OPERATION_ARG}: true` on a mutating \
+             tool (advertised in that tool's schema) to begin a fresh Operation after \
+             a known terminal result. After Unknown, the model boolean alone is not \
+             enough — ask the user to authorize a re-run first.\n"
+        ));
+        if let Some(grant) = &self.user_authorized_new_op {
+            out.push_str(&format!(
+                "- User authorized a new Operation (one-shot, op {} fingerprint-bound, \
+                 turn {}); combine with `_new_operation: true` on the next matching \
+                 mutating call.\n",
+                short_op_id(&grant.prior_operation_id),
+                grant.confirming_turn
+            ));
+        }
+        Some(out)
+    }
+
+    /// Confirm a step only from a tool result fingerprint (not narration).
+    pub fn confirm_step_from_tool(
+        &mut self,
+        tool: &str,
+        call_fingerprint: &str,
+        result_fingerprint: &str,
+        summary: impl Into<String>,
+    ) {
+        if matches!(self.status, TaskStatus::Cancelled) {
+            return;
+        }
+        let id = format!("{tool}:{result_fingerprint}");
+        if self.confirmed_steps.iter().any(|s| s.id == id) {
+            return;
+        }
+        self.confirmed_steps.push(ConfirmedStep {
+            id,
+            summary: summary.into(),
+            evidence_fingerprint: result_fingerprint.to_string(),
+            source: StepSource::ToolResult {
+                tool: tool.to_string(),
+                call_fingerprint: call_fingerprint.to_string(),
+            },
+        });
+        if !matches!(self.status, TaskStatus::Completed { .. }) {
+            self.status = TaskStatus::Active;
+        }
+    }
+
+    /// Record a successful mutating write on the named operation.
+    /// Facts are appended to the ledger and never wiped for re-authorization.
+    ///
+    /// Attribution is explicit: `operation_id` must be the operation that
+    /// actually completed the write (complete_operation_succeeded passes its
+    /// own id) — never the shared current_operation_id pointer, which a
+    /// concurrent sibling write may have overwritten.
+    pub fn record_successful_write(
+        &mut self,
+        operation_id: &str,
+        write_fingerprint: impl Into<String>,
+    ) {
+        let fingerprint = write_fingerprint.into();
+        if operation_id.is_empty() {
+            return;
+        }
+        if self
+            .write_ledger
+            .iter()
+            .any(|w| w.operation_id == operation_id && w.fingerprint == fingerprint)
+        {
+            return;
+        }
+        self.write_ledger.push(WriteFact {
+            operation_id: operation_id.to_string(),
+            fingerprint,
+        });
+    }
+
+    /// Whether a write with this fingerprint may still be executed.
+    ///
+    /// Blocked when the task is cancelled, when the latest Operation for the
+    /// fingerprint already terminated (Succeeded / Failed / Unknown /
+    /// Cancelled — Unknown must inquire, never auto-replay), or when the
+    /// current-scope write ledger already recorded the fingerprint.
+    pub fn may_execute_write(&self, write_fingerprint: &str) -> bool {
+        if matches!(self.status, TaskStatus::Cancelled) {
+            return false;
+        }
+        if let Some(op) = self.latest_op_for_fingerprint(write_fingerprint) {
+            match op.status {
+                // Only the Prepared lease candidate may execute; Running =
+                // another holder already in flight.
+                OperationStatus::Prepared => return true,
+                OperationStatus::Rejected => {
+                    let prior_unknown = self
+                        .operations
+                        .iter()
+                        .rev()
+                        .find(|o| {
+                            o.write_fingerprint.as_deref() == Some(write_fingerprint)
+                                && o.status != OperationStatus::Rejected
+                        })
+                        .is_some_and(|o| o.status == OperationStatus::Unknown);
+                    return !prior_unknown;
+                }
+                OperationStatus::Running
+                | OperationStatus::Succeeded
+                | OperationStatus::Failed
+                | OperationStatus::Unknown
+                | OperationStatus::Cancelled => return false,
+            }
+        }
+        if self.current_operation_id.is_empty() {
+            return true;
+        }
+        !self.write_ledger.iter().any(|w| {
+            w.operation_id == self.current_operation_id && w.fingerprint == write_fingerprint
+        })
+    }
+
+    /// Mark completed only with an evidence id (device ACK, metric, etc.).
+    ///
+    /// When the task requires a target device command, refuses completion
+    /// until [`GoalEvidenceLevel::CommandDispatched`] (or stronger) is proven
+    /// for that device. Physical-sounding evidence ids still cannot complete
+    /// without [`GoalEvidenceLevel::PhysicalEffectVerified`].
+    ///
+    /// Returns `true` when Completed; `false` when refused (status unchanged).
+    pub fn complete_with_evidence(&mut self, evidence_id: impl Into<String>) -> bool {
+        if matches!(self.status, TaskStatus::Cancelled) {
+            return false;
+        }
+        let id = evidence_id.into();
+        if self
+            .evaluate_goal_claim(GoalClaimKind::TaskComplete)
+            .is_err()
+        {
+            return false;
+        }
+        if evidence_id_suggests_physical(&id)
+            && self
+                .evaluate_goal_claim(GoalClaimKind::PhysicalEffect)
+                .is_err()
+        {
+            return false;
+        }
+        self.status = TaskStatus::Completed { evidence_id: id };
+        self.next_action = None;
+        true
+    }
+
+    /// Record a loop/budget halt — never counts as task success.
+    pub fn halt(&mut self, reason: impl Into<String>) -> LoopHalt {
+        let reason = reason.into();
+        self.status = TaskStatus::Halted {
+            reason: reason.clone(),
+        };
+        self.next_action = None;
+        LoopHalt {
+            reason: LoopHaltReason::NoProgressRepeat,
+            detail: reason,
+            counts_as_task_success: false,
+        }
+    }
+
+    pub fn set_next_action(&mut self, description: impl Into<String>, source: impl Into<String>) {
+        if matches!(
+            self.status,
+            TaskStatus::Cancelled | TaskStatus::Completed { .. } | TaskStatus::Halted { .. }
+        ) {
+            return;
+        }
+        self.next_action = Some(NextAction {
+            description: description.into(),
+            source: source.into(),
+        });
+    }
+
+    /// Mutating tools that currently have a terminal write operation
+    /// (`Succeeded` / `Failed` / `Unknown`) in the ledger and therefore may
+    /// legitimately need explicit `_new_operation: true` schema exposure.
+    ///
+    /// Pre-submission `Rejected` operations are intentionally excluded because
+    /// they never lock behind `PreferKnown` and do not require `_new_operation`.
+    pub fn tools_needing_new_operation_protocol(&self) -> std::collections::HashSet<String> {
+        let mut tools = std::collections::HashSet::new();
+        for op in &self.operations {
+            if op.write_fingerprint.is_none() {
+                continue;
+            }
+            if matches!(
+                op.status,
+                OperationStatus::Succeeded | OperationStatus::Failed | OperationStatus::Unknown
+            ) {
+                let real = crate::tools::resolve_tool_name(&op.tool_name);
+                if NEW_OPERATION_PROTOCOL_TOOLS.contains(&real.as_str()) {
+                    tools.insert(real);
+                }
+            }
+        }
+        tools
+    }
+}
+
+/// Clear temporary skill bodies at the start of a user turn.
+///
+/// Call from stream entry points only (not mid-turn guide-recovery clears).
+/// Does **not** touch [`TaskState`] — Continue / Correct / Cancel / write-gate
+/// fingerprints must survive so multi-turn tasks stay coherent without keeping
+/// every skill guide forever.
+pub async fn begin_user_turn_clear_transient_skills(llm: &crate::llm::LlmInterface) {
+    llm.clear_skill_context().await;
+    llm.pin_turn_timestamp().await;
+}
+
+/// Whether `text` is a plain-text Unknown re-run confirm phrase.
+///
+/// Phrases alone never grant — [`AgentInternalState::accept_user_message`]
+/// consumes a unique valid pending [`ConfirmRequest`] first.
+pub fn is_authorize_new_operation_phrase(text: &str) -> bool {
+    let lower = text.trim().to_lowercase();
+    matches!(
+        lower.as_str(),
+        "确认重跑"
+            | "允许重跑"
+            | "确认再执行"
+            | "authorize re-run"
+            | "confirm re-run"
+            | "confirm rerun"
+            | "authorize new operation"
+            | "yes re-run"
+            | "yes, re-run"
+    )
+}
+
+/// Parse a user utterance into an **explicit** control directive only.
+///
+/// Round 1: ordinary text is a Turn (no SetGoal / no re-execute whitelist).
+/// Supplement / follow-up / correct / new need are left for the model from
+/// context. Only short Continue / Cancel / Correct control phrases map here.
+/// Confirm re-run phrases are handled separately via confirm-request
+/// consumption — they are **not** directives that grant without a request.
+pub fn parse_user_directive(text: &str) -> Option<TaskDirective> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let lower = t.to_lowercase();
+
+    // Cancel (zh/en)
+    if matches!(
+        lower.as_str(),
+        "取消" | "取消任务" | "算了" | "停止" | "cancel" | "cancel task" | "stop" | "never mind"
+    ) || lower.starts_with("cancel ")
+        || t.starts_with("取消") && t.chars().count() <= 8
+    {
+        return Some(TaskDirective::Cancel);
+    }
+
+    // Continue — resume same operation; write facts stay gated.
+    if matches!(
+        lower.as_str(),
+        "继续" | "继续吧" | "请继续" | "continue" | "go on" | "keep going" | "please continue"
+    ) {
+        return Some(TaskDirective::Continue);
+    }
+
+    // Confirm re-run phrases are NOT directives here — they must go through
+    // accept_user_message → consume_unique_pending_confirm (request lifecycle).
+    // See [`is_authorize_new_operation_phrase`].
+
+    // Correction control phrases update goal fields only (do not lift gates).
+    if let Some(rest) = t.strip_prefix("改成") {
+        let goal = rest.trim();
+        if !goal.is_empty() {
+            return Some(correct_directive_from_text(goal));
+        }
+    }
+    if lower.starts_with("change to ") || lower.starts_with("instead ") {
+        let goal = if let Some(r) = lower.strip_prefix("change to ") {
+            r.trim()
+        } else {
+            lower.trim_start_matches("instead").trim()
+        };
+        if !goal.is_empty() {
+            return Some(correct_directive_from_text(goal));
+        }
+    }
+    if t.contains("不是") && t.contains("是") && t.chars().count() < 80 {
+        return Some(correct_directive_from_text(t));
+    }
+    // General reject+prefer route correction (zh/en), e.g. "not webhook,
+    // use device-native command". No product-keyword branches.
+    if looks_like_route_correction(t) {
+        return Some(correct_directive_from_text(t));
+    }
+
+    // Ordinary utterances (incl. 「再发送一次」 / long requests) are Turns —
+    // not directives. Re-execute is `begin_new_operation`, not a phrase list.
+    None
+}
+
+fn correct_directive_from_text(text: &str) -> TaskDirective {
+    let parsed = parse_correction_constraints(text);
+    TaskDirective::Correct {
+        goal: text.trim().to_string(),
+        object: parsed.object,
+        content: parsed.content,
+        method: parsed.method,
+        exclude_routes: parsed.exclude_routes,
+    }
+}
+
+/// Lexical classes for delivery routes — general vocabulary only.
+const NOTIFY_WEBHOOK_TERMS: &[&str] = &[
+    "webhook",
+    "web hook",
+    "推送",
+    "push",
+    "notification",
+    "notify",
+    "通知",
+    "消息通道",
+];
+const DEVICE_NATIVE_TERMS: &[&str] = &[
+    "device-native",
+    "device native",
+    "device_command",
+    "device command",
+    "native command",
+    "device control",
+    "device",
+    "设备原生",
+    "设备命令",
+    "原生命令",
+    "设备",
+];
+const REJECT_CUES: &[&str] = &[
+    "不是",
+    "不要",
+    "别用",
+    "别走",
+    "别再",
+    "别搞",
+    "不用",
+    "not ",
+    "don't",
+    "do not",
+    "instead of",
+    "rather than",
+    "no more",
+    "stop using",
+    "without ",
+];
+/// Prefer / switch-to cues. Bare Chinese 「用」 is handled via
+/// [`STRONG_REJECT_PREFIXES`] so 「不要用设备」 stays a reject.
+const PREFER_CUES: &[&str] = &[
+    "改用", "改成", "用", "走", "via ", "use ", "prefer ", "with ", "through ",
+];
+/// Immediate reject compounds that swallow a trailing prefer verb
+/// (「不要用…」 / "don't use …").
+const STRONG_REJECT_PREFIXES: &[&str] = &[
+    "不要用",
+    "别用",
+    "不用",
+    "不要走",
+    "别走",
+    "don't use ",
+    "do not use ",
+    "stop using ",
+    "instead of ",
+    "rather than ",
+    "without ",
+    "not ",
+];
+
+#[derive(Debug, Default)]
+struct ParsedCorrectionConstraints {
+    method: Option<ExecutionMethod>,
+    exclude_routes: Vec<ExcludedRoute>,
+    object: Option<String>,
+    content: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutePolarity {
+    Rejected,
+    Preferred,
+    Neutral,
+}
+
+fn text_has_any(hay: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| hay.contains(n))
+}
+
+/// Find `term` in `hay` with ASCII word boundaries (Chinese terms unrestricted).
+fn find_term(hay: &str, term: &str) -> Option<usize> {
+    if term.is_empty() {
+        return None;
+    }
+    let non_ascii = !term.is_ascii();
+    let mut start = 0;
+    while let Some(rel) = hay[start..].find(term) {
+        let idx = start + rel;
+        if non_ascii {
+            return Some(idx);
+        }
+        let before_ok = idx == 0
+            || hay
+                .as_bytes()
+                .get(idx - 1)
+                .map(|b| !b.is_ascii_alphanumeric())
+                .unwrap_or(true);
+        let after = idx + term.len();
+        let after_ok = after >= hay.len()
+            || hay
+                .as_bytes()
+                .get(after)
+                .map(|b| !b.is_ascii_alphanumeric())
+                .unwrap_or(true);
+        if before_ok && after_ok {
+            return Some(idx);
+        }
+        start = idx + term.len().max(1);
+    }
+    None
+}
+
+/// Polarity of a route-class mention: cue window immediately before the
+/// matched term. Strong reject compounds (「不要用」/ "don't use") beat a
+/// bare prefer verb in the same window so opposite corrections stay scoped.
+fn route_polarity(hay_lower: &str, terms: &[&str]) -> RoutePolarity {
+    // Longest term first so "device-native" wins over "device".
+    let mut terms_sorted: Vec<&str> = terms.to_vec();
+    terms_sorted.sort_by_key(|t| std::cmp::Reverse(t.len()));
+    let Some(idx) = terms_sorted.iter().find_map(|t| find_term(hay_lower, t)) else {
+        return RoutePolarity::Neutral;
+    };
+    // Byte-window lookback must land on a UTF-8 boundary — CJK before
+    // ASCII terms like "webhook" used to panic mid-char (`saturating_sub(28)`).
+    let start = hay_lower.floor_char_boundary(idx.saturating_sub(28));
+    let window = &hay_lower[start..idx];
+    if STRONG_REJECT_PREFIXES
+        .iter()
+        .any(|p| window.ends_with(p) || window.contains(p))
+    {
+        // Prefer the last strong-reject vs last prefer: 「用 webhook」 after
+        // comma is a new window; 「不要用设备」 ends with strong reject.
+        let reject_at = STRONG_REJECT_PREFIXES
+            .iter()
+            .filter_map(|c| window.rfind(c).map(|i| i + c.len()))
+            .max()
+            .unwrap_or(0);
+        let prefer_at = PREFER_CUES
+            .iter()
+            .filter_map(|c| window.rfind(c).map(|i| i + c.len()))
+            .max()
+            .unwrap_or(0);
+        if reject_at >= prefer_at {
+            return RoutePolarity::Rejected;
+        }
+    }
+    let preferred = text_has_any(window, PREFER_CUES);
+    let rejected = text_has_any(window, REJECT_CUES);
+    match (rejected, preferred) {
+        (true, false) => RoutePolarity::Rejected,
+        (false, true) => RoutePolarity::Preferred,
+        (true, true) => {
+            let reject_at = REJECT_CUES
+                .iter()
+                .filter_map(|c| window.rfind(c))
+                .max()
+                .unwrap_or(0);
+            let prefer_at = PREFER_CUES
+                .iter()
+                .filter_map(|c| window.rfind(c))
+                .max()
+                .unwrap_or(0);
+            if prefer_at >= reject_at {
+                RoutePolarity::Preferred
+            } else {
+                RoutePolarity::Rejected
+            }
+        }
+        (false, false) => RoutePolarity::Neutral,
+    }
+}
+
+/// True when the utterance rejects/prefers delivery route classes (not a
+/// free-form long request). Caps length so ordinary task statements stay Turns.
+fn looks_like_route_correction(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.chars().count() > 120 {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    let has_notify = text_has_any(&lower, NOTIFY_WEBHOOK_TERMS);
+    let has_device = text_has_any(&lower, DEVICE_NATIVE_TERMS);
+    let has_reject = text_has_any(&lower, REJECT_CUES);
+    // Need a rejection cue plus at least one route class (typically reject
+    // notify/webhook and/or prefer device-native).
+    has_reject && (has_notify || has_device)
+}
+
+fn parse_correction_constraints(text: &str) -> ParsedCorrectionConstraints {
+    let lower = text.to_lowercase();
+    let mut out = ParsedCorrectionConstraints {
+        object: extract_object(text),
+        content: extract_content_fragment(text),
+        ..Default::default()
+    };
+    let notify = route_polarity(&lower, NOTIFY_WEBHOOK_TERMS);
+    let device = route_polarity(&lower, DEVICE_NATIVE_TERMS);
+
+    // Only exclude the route that is explicitly rejected — never the preferred one.
+    if notify == RoutePolarity::Rejected {
+        out.exclude_routes
+            .push(ExcludedRoute::NotificationOrWebhook);
+    }
+    if device == RoutePolarity::Rejected {
+        out.exclude_routes.push(ExcludedRoute::DeviceNativeCommand);
+    }
+    // Prefer device-native only when device is preferred (or mentioned without
+    // being rejected while notify is rejected — classic "not webhook, use device").
+    if device == RoutePolarity::Preferred
+        || (device == RoutePolarity::Neutral
+            && notify == RoutePolarity::Rejected
+            && text_has_any(&lower, DEVICE_NATIVE_TERMS))
+    {
+        out.method = Some(ExecutionMethod::DeviceNativeCommand);
+    }
+    out
+}
+
+/// Canonical goal-object form: `device:<id>`. Display names are not stored;
+/// bare ids / `device:id` / `@`-style tokens normalize to the same key.
+pub fn canonicalize_goal_object(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let lower = t.to_lowercase();
+    // 【device `id`】 / device:`id` / device:id
+    if let Some(rest) = lower
+        .strip_prefix("device:")
+        .or_else(|| lower.strip_prefix("device/"))
+        .or_else(|| lower.strip_prefix("@device:"))
+        .or_else(|| lower.strip_prefix("@device/"))
+        .or_else(|| lower.strip_prefix("@device "))
+    {
+        let id = rest
+            .trim()
+            .trim_matches('`')
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim();
+        if !id.is_empty() {
+            return format!("device:{id}");
+        }
+    }
+    // Bare device-like id (cam-1, EK410, green_01).
+    if t.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && t.len() >= 2
+    {
+        return format!("device:{}", t.to_lowercase());
+    }
+    // Fallback: keep trimmed original (display-only residue).
+    t.to_string()
+}
+
+/// True when two object strings name the same device (type+id), ignoring
+/// display-name wrappers.
+pub fn goal_objects_equivalent(a: &str, b: &str) -> bool {
+    let ca = canonicalize_goal_object(a);
+    let cb = canonicalize_goal_object(b);
+    if ca.is_empty() || cb.is_empty() {
+        return false;
+    }
+    if ca == cb {
+        return true;
+    }
+    let bare = |s: &str| s.strip_prefix("device:").unwrap_or(s).trim().to_lowercase();
+    bare(&ca) == bare(&cb)
+}
+
+/// Byte index of an ASCII `needle` in `haystack`, compared with
+/// `eq_ignore_ascii_case` on the **original** bytes. Do not search a
+/// lowercased copy and slice the original — chars like `İ` / `K` (U+212A)
+/// change byte length under `to_lowercase()`, and the offset panics.
+fn find_ascii_prefix_ci(haystack: &str, needle: &str) -> Option<usize> {
+    debug_assert!(needle.is_ascii());
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    for i in 0..=(h.len() - n.len()) {
+        if !haystack.is_char_boundary(i) {
+            continue;
+        }
+        if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn extract_object(text: &str) -> Option<String> {
+    // Prefer device-like tokens (EK410, green-01, …). Store bare id;
+    // [`goal_objects_equivalent`] treats name / id / `device:id` / `@` alike.
+    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+        if token.len() >= 3
+            && token.chars().any(|c| c.is_ascii_digit())
+            && token.chars().any(|c| c.is_ascii_alphabetic())
+        {
+            return Some(token.to_string());
+        }
+    }
+    // `device:id` / @device id already in text → bare id.
+    for prefix in ["device:", "@device:", "@device/", "device/"] {
+        if let Some(idx) = find_ascii_prefix_ci(text, prefix) {
+            let rest = &text[idx + prefix.len()..];
+            let id: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Optional content fragment from quotes; None keeps prior TaskState.content.
+fn extract_content_fragment(text: &str) -> Option<String> {
+    for (open, close) in [('「', '」'), ('"', '"'), ('“', '”'), ('\'', '\'')] {
+        if let Some(start) = text.find(open) {
+            let rest = &text[start + open.len_utf8()..];
+            if let Some(end) = rest.find(close) {
+                let inner = rest[..end].trim();
+                if !inner.is_empty() && inner.chars().count() <= 80 {
+                    return Some(inner.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether a mutating tool call matches a user-excluded delivery route.
+pub fn mutating_call_excluded_route(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Option<ExcludedRoute> {
+    let real = crate::tools::resolve_tool_name(tool_name);
+    // Structured device command maps to the device-native exclusion class.
+    if real == "device_command" {
+        return Some(ExcludedRoute::DeviceNativeCommand);
+    }
+    let canonical = canonicalize_tool_arguments(tool_name, arguments);
+    let cmd = canonical
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !cmd.is_empty() && cmd.contains("heramind device control") {
+        return Some(ExcludedRoute::DeviceNativeCommand);
+    }
+    if cmd.is_empty() {
+        // Non-shell structured tools: treat message/push-shaped names as notify.
+        if real == "message" || real.contains("push") || real.contains("webhook") {
+            return Some(ExcludedRoute::NotificationOrWebhook);
+        }
+        return None;
+    }
+    if is_notification_or_webhook_mutation(&cmd) {
+        Some(ExcludedRoute::NotificationOrWebhook)
+    } else {
+        None
+    }
+}
+
+fn is_notification_or_webhook_mutation(cmd_lower: &str) -> bool {
+    let c = cmd_lower.trim();
+    if c.contains("heramind push") {
+        // Read-only push queries are not gated here (caller only passes
+        // mutating fingerprints); still exclude any push mutation verb.
+        return !(c.contains(" push list")
+            || c.contains(" push get")
+            || c.contains(" push stats")
+            || c.ends_with(" push"));
+    }
+    if c.contains("heramind message") {
+        return !(c.contains(" message list")
+            || c.contains(" message get")
+            || c.contains(" message history")
+            || c.contains(" message read"));
+    }
+    // Generic webhook configuration / enablement (not device control).
+    if c.contains("webhook")
+        && (c.contains("create")
+            || c.contains("update")
+            || c.contains("add")
+            || c.contains("enable")
+            || c.contains("start")
+            || c.contains("set ")
+            || c.contains("config"))
+    {
+        return true;
+    }
+    false
+}
+
+impl TaskState {
+    /// If this mutating call violates bound exclusions, return a block reason.
+    pub fn constraint_block_reason(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<String> {
+        if self.excluded_routes.is_empty() {
+            return None;
+        }
+        let route = mutating_call_excluded_route(tool_name, arguments)?;
+        if !self.excluded_routes.contains(&route) {
+            return None;
+        }
+        match route {
+            ExcludedRoute::NotificationOrWebhook => {
+                let method_hint = match self.method {
+                    Some(ExecutionMethod::DeviceNativeCommand) => {
+                        " Use `heramind device control` for the goal device instead."
+                    }
+                    None => " Follow the Active Task State constraints.",
+                };
+                Some(format!(
+                    "Write blocked: user correction excluded notification/webhook/push routes \
+                     for this task.{method_hint}"
+                ))
+            }
+            ExcludedRoute::DeviceNativeCommand => Some(
+                "Write blocked: user correction excluded device-native command routes \
+                 for this task. Use the preferred non-device path (e.g. webhook/push) instead."
+                    .into(),
+            ),
+        }
+    }
+
+    /// Whether claims/completion must be backed by a target device command.
+    ///
+    /// True when the charter constrains delivery **or** structured
+    /// `device_command` evidence was already observed (ordinary NL turns —
+    /// no hand-seeded SetGoal required).
+    pub fn goal_needs_device_command_evidence(&self) -> bool {
+        if self
+            .goal_evidences
+            .iter()
+            .any(|e| e.level >= GoalEvidenceLevel::CommandDispatched)
+        {
+            return true;
+        }
+        if self.goal.is_none() {
+            return false;
+        }
+        matches!(self.method, Some(ExecutionMethod::DeviceNativeCommand))
+            || self
+                .excluded_routes
+                .contains(&ExcludedRoute::NotificationOrWebhook)
+            || self.object.is_some()
+    }
+
+    /// Evidence stored for a specific Operation (no cross-op fallback).
+    pub fn goal_evidence_for(&self, operation_id: Option<&str>) -> Option<&GoalEvidence> {
+        let op = operation_id.filter(|s| !s.is_empty())?;
+        self.goal_evidences
+            .iter()
+            .find(|e| e.operation_id.as_deref() == Some(op))
+    }
+
+    /// Whether `ev` belongs to the goal's device-command Operation set.
+    fn evidence_in_goal_device_command_set(&self, ev: &GoalEvidence) -> bool {
+        if ev.level < GoalEvidenceLevel::CommandDispatched {
+            return false;
+        }
+        match (&self.object, ev.device_id.as_deref()) {
+            (Some(need), Some(got)) => goal_objects_equivalent(need, got),
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    }
+
+    /// Best evidence among the goal device-command Operation set (not
+    /// last [`Self::current_operation_id`]).
+    pub fn primary_goal_evidence(&self) -> Option<&GoalEvidence> {
+        self.goal_evidences
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| self.evidence_in_goal_device_command_set(e))
+            .max_by(|(ia, a), (ib, b)| {
+                // Highest level wins; later entry preferred on ties.
+                a.level.cmp(&b.level).then_with(|| ia.cmp(ib))
+            })
+            .map(|(_, e)| e)
+    }
+
+    /// Evidence for the current Operation only (prompt / per-op diagnostics).
+    pub fn current_goal_evidence(&self) -> Option<&GoalEvidence> {
+        let id = self.current_operation_id.as_str();
+        if id.is_empty() {
+            None
+        } else {
+            self.goal_evidence_for(Some(id))
+        }
+    }
+
+    /// Whether `claim` is allowed for the **goal device-command Operation set**.
+    ///
+    /// Does **not** key off last [`Self::current_operation_id`] alone — a later
+    /// config/queued op must not hide prior device-command evidence for the
+    /// goal device. Per-op checks use [`Self::evaluate_goal_claim_for`].
+    pub fn evaluate_goal_claim(&self, claim: GoalClaimKind) -> Result<(), String> {
+        if !self.goal_needs_device_command_evidence() {
+            return Ok(());
+        }
+        let set: Vec<&GoalEvidence> = self
+            .goal_evidences
+            .iter()
+            .filter(|e| self.evidence_in_goal_device_command_set(e))
+            .collect();
+        if set.is_empty() {
+            // Fall back: maybe only config evidence exists on current op.
+            if self
+                .goal_evidences
+                .iter()
+                .any(|e| e.level == GoalEvidenceLevel::ConfigSuccess)
+            {
+                return Err(
+                    "config/push/webhook success is not a target device command — \
+                     cannot claim sent or complete this goal"
+                        .into(),
+                );
+            }
+            return Err(
+                "need command_dispatched (or stronger) to the goal device on a \
+                 device-command Operation before claiming sent / completing"
+                    .into(),
+            );
+        }
+        let best = set
+            .iter()
+            .map(|e| e.level)
+            .max()
+            .unwrap_or(GoalEvidenceLevel::None);
+        match claim {
+            GoalClaimKind::CommandSent | GoalClaimKind::TaskComplete => {
+                if best >= GoalEvidenceLevel::CommandDispatched {
+                    Ok(())
+                } else {
+                    Err(
+                        "need command_dispatched (or stronger) to the goal device on a \
+                         device-command Operation before claiming sent / completing"
+                            .into(),
+                    )
+                }
+            }
+            GoalClaimKind::PhysicalEffect => {
+                if best >= GoalEvidenceLevel::PhysicalEffectVerified {
+                    Ok(())
+                } else {
+                    Err(
+                        "queued / adapter_accepted / device_ack ≠ physical effect — \
+                         cannot claim screen refreshed or physical update for this goal"
+                            .into(),
+                    )
+                }
+            }
+        }
+    }
+
+    /// Whether `claim` is allowed for evidence bound to `operation_id`.
+    ///
+    /// Does **not** fall back to another Operation's higher level. A prior
+    /// physical-verified op never authorizes claims for a later queued-only op.
+    pub fn evaluate_goal_claim_for(
+        &self,
+        claim: GoalClaimKind,
+        operation_id: Option<&str>,
+    ) -> Result<(), String> {
+        if !self.goal_needs_device_command_evidence() {
+            return Ok(());
+        }
+        let ev = self.goal_evidence_for(operation_id);
+        let level = ev.map(|e| e.level).unwrap_or(GoalEvidenceLevel::None);
+        let device_ok = match (&self.object, ev.and_then(|e| e.device_id.as_deref())) {
+            (Some(need), Some(got)) => goal_objects_equivalent(need, got),
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        // When an op id was requested, require the evidence entry to match it.
+        if let Some(need_op) = operation_id.filter(|s| !s.is_empty()) {
+            match ev.and_then(|e| e.operation_id.as_deref()) {
+                Some(got) if got == need_op => {}
+                Some(_) => {
+                    return Err(format!(
+                        "goal evidence operation_id mismatch (need {need_op})"
+                    ));
+                }
+                None => {
+                    // No evidence for this op — fall through to level checks
+                    // (level is None → fail below).
+                }
+            }
+        }
+        match claim {
+            GoalClaimKind::CommandSent | GoalClaimKind::TaskComplete => {
+                if level >= GoalEvidenceLevel::CommandDispatched && device_ok {
+                    Ok(())
+                } else if level == GoalEvidenceLevel::ConfigSuccess {
+                    Err(
+                        "config/push/webhook success is not a target device command — \
+                         cannot claim sent or complete this goal"
+                            .into(),
+                    )
+                } else if !device_ok {
+                    Err(format!(
+                        "no command_dispatched evidence for goal device '{}' on this Operation",
+                        self.object.as_deref().unwrap_or("?")
+                    ))
+                } else {
+                    Err(
+                        "need command_dispatched (or stronger) to the goal device on this \
+                         Operation before claiming sent / completing"
+                            .into(),
+                    )
+                }
+            }
+            GoalClaimKind::PhysicalEffect => {
+                if level >= GoalEvidenceLevel::PhysicalEffectVerified && device_ok {
+                    Ok(())
+                } else {
+                    Err(
+                        "queued / adapter_accepted / device_ack ≠ physical effect — \
+                         cannot claim screen refreshed or physical update for this Operation"
+                            .into(),
+                    )
+                }
+            }
+        }
+    }
+
+    /// System-judged goal status for the final response (evidence only).
+    ///
+    /// Does **not** inspect assistant prose. Model NL may describe outcomes
+    /// only within this structured limit. Status binds to the goal
+    /// device-command Operation set (not last current_operation_id alone).
+    pub fn system_goal_status(&self) -> SystemGoalStatus {
+        match &self.status {
+            TaskStatus::Cancelled => return SystemGoalStatus::Cancelled,
+            TaskStatus::Halted { reason } => {
+                return SystemGoalStatus::Halted {
+                    reason: reason.clone(),
+                };
+            }
+            TaskStatus::Completed { evidence_id } => {
+                return SystemGoalStatus::Completed {
+                    evidence_id: evidence_id.clone(),
+                };
+            }
+            TaskStatus::Idle | TaskStatus::Active => {}
+        }
+        if !self.goal_needs_device_command_evidence() {
+            return SystemGoalStatus::NotApplicable;
+        }
+        // Claims bind to the goal device-command set; display level may fall
+        // back to best any evidence (e.g. ConfigSuccess-only Incomplete).
+        let primary = self.primary_goal_evidence();
+        let task_complete_ok = self
+            .evaluate_goal_claim(GoalClaimKind::TaskComplete)
+            .is_ok();
+        let physical_ok = self
+            .evaluate_goal_claim(GoalClaimKind::PhysicalEffect)
+            .is_ok();
+        if task_complete_ok {
+            let ev = primary;
+            SystemGoalStatus::CompleteEligible {
+                level: ev.map(|e| e.level).unwrap_or(GoalEvidenceLevel::None),
+                operation_id: ev.and_then(|e| e.operation_id.clone()),
+                device_id: ev.and_then(|e| e.device_id.clone()),
+                command: ev.and_then(|e| e.command.clone()),
+                delivery: ev.and_then(|e| e.delivery.clone()),
+                task_complete_ok,
+                physical_ok,
+            }
+        } else {
+            let display = primary.or_else(|| {
+                self.goal_evidences
+                    .iter()
+                    .max_by(|a, b| a.level.cmp(&b.level))
+            });
+            let reason = self
+                .evaluate_goal_claim(GoalClaimKind::TaskComplete)
+                .err()
+                .unwrap_or_else(|| "incomplete".into());
+            SystemGoalStatus::Incomplete {
+                reason,
+                level: display.map(|e| e.level).unwrap_or(GoalEvidenceLevel::None),
+                operation_id: display.and_then(|e| e.operation_id.clone()),
+                task_complete_ok: false,
+                physical_ok,
+            }
+        }
+    }
+
+    /// Whether structured TaskComplete is allowed for the goal Operation set.
+    pub fn structured_completion_allowed(&self) -> bool {
+        self.evaluate_goal_claim(GoalClaimKind::TaskComplete)
+            .is_ok()
+    }
+
+    /// Aggregate per-target write receipts for a turn, keyed by `(target, operation_id)`.
+    ///
+    /// Preserves chronological order and joins each operation with its exact
+    /// delivery tag (`adapter_accepted`, `queued`, `device_ack`,
+    /// `physical_effect_verified`) or compact failure/unknown reason.
+    ///
+    /// Pre-submission `Rejected` attempts that are later superseded by a real
+    /// terminal/in-flight outcome for the same business identity
+    /// (`domain`/`action` + compatible target) are folded out of the summary
+    /// so `SystemGoalStatus` does not report a false `partial_failure` after a
+    /// successful lock-free retry (L3 Spark E4 finding).
+    pub fn turn_write_receipts(&self, turn_id: u64) -> Vec<TargetReceipt> {
+        let mut receipts: Vec<(TargetReceipt, Option<String>, Option<String>)> = Vec::new();
+        let mut index_by_key: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+
+        for op in &self.operations {
+            let is_write = op.write_fingerprint.is_some()
+                || op.capability.as_ref().is_some_and(|c| !c.read_only);
+            if !is_write {
+                continue;
+            }
+            if turn_id > 0 && op.origin_turn_id != turn_id {
+                continue;
+            }
+
+            let matching_ev = self
+                .goal_evidences
+                .iter()
+                .rev()
+                .find(|e| e.operation_id.as_deref() == Some(op.operation_id.as_str()));
+
+            let target = op
+                .target
+                .clone()
+                .or_else(|| matching_ev.and_then(|e| e.device_id.clone()))
+                .or_else(|| {
+                    serde_json::from_str::<serde_json::Value>(&op.arguments)
+                        .ok()
+                        .and_then(|v| extract_operation_target(&v))
+                })
+                .or_else(|| match (&op.domain, &op.action) {
+                    (Some(d), Some(a)) => Some(format!("{d}:{a}")),
+                    _ => None,
+                })
+                .unwrap_or_else(|| op.tool_name.clone());
+
+            let delivery = matching_ev.and_then(|e| e.delivery.clone()).or_else(|| {
+                op.result
+                    .as_ref()
+                    .and_then(|r| extract_delivery_tag_from_body(&r.body))
+            });
+
+            let detail = if matches!(
+                op.status,
+                OperationStatus::Failed | OperationStatus::Unknown | OperationStatus::Rejected
+            ) {
+                op.result.as_ref().and_then(extract_compact_failure_reason)
+            } else {
+                None
+            };
+
+            let receipt = TargetReceipt {
+                target: target.clone(),
+                operation_id: op.operation_id.clone(),
+                status: op.status.clone(),
+                delivery,
+                detail,
+            };
+            let key = (target, op.operation_id.clone());
+            if let Some(&idx) = index_by_key.get(&key) {
+                receipts[idx] = (receipt, op.domain.clone(), op.action.clone());
+            } else {
+                index_by_key.insert(key, receipts.len());
+                receipts.push((receipt, op.domain.clone(), op.action.clone()));
+            }
+        }
+        collapse_superseded_rejected_receipts(receipts)
+    }
+
+    /// Format this turn's per-target write receipts as one compact line, e.g.
+    /// `device_a: adapter_accepted; device_b: failed(offline)`.
+    pub fn format_per_target_receipts_line(&self, turn_id: u64) -> Option<String> {
+        let receipts = self.turn_write_receipts(turn_id);
+        if receipts.is_empty() {
+            return None;
+        }
+        Some(
+            receipts
+                .iter()
+                .map(TargetReceipt::format_compact)
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+
+    /// Build a compact structured `SystemGoalStatus` hard-fact block for final
+    /// summary prompts whenever the current turn has failures, partial failures,
+    /// unknown/indeterminate operations, or an incomplete/halted goal status (E4).
+    ///
+    /// Returns `None` on completely clean turns so normal replies incur zero
+    /// extra prompt tokens.
+    pub fn build_summary_goal_status_fact_block(
+        &self,
+        turn_id: u64,
+        any_failed_tool_call: bool,
+    ) -> Option<String> {
+        let goal_status = self.system_goal_status();
+        let receipts = self.turn_write_receipts(turn_id);
+
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut unknown = 0usize;
+        let mut rejected = 0usize;
+        let mut in_progress = 0usize;
+        let mut cancelled = 0usize;
+        for r in &receipts {
+            match r.status {
+                OperationStatus::Succeeded => succeeded += 1,
+                OperationStatus::Failed => failed += 1,
+                OperationStatus::Unknown => unknown += 1,
+                OperationStatus::Rejected => rejected += 1,
+                OperationStatus::Prepared | OperationStatus::Running => in_progress += 1,
+                OperationStatus::Cancelled => cancelled += 1,
+            }
+        }
+
+        let has_receipt_issues =
+            failed > 0 || unknown > 0 || rejected > 0 || in_progress > 0 || cancelled > 0;
+        let goal_is_incomplete = matches!(
+            goal_status,
+            SystemGoalStatus::Incomplete { .. }
+                | SystemGoalStatus::Halted { .. }
+                | SystemGoalStatus::Cancelled
+        );
+
+        if !has_receipt_issues && !goal_is_incomplete && !any_failed_tool_call {
+            return None;
+        }
+
+        let overall_tag = match &goal_status {
+            SystemGoalStatus::Halted { .. } => "halted",
+            SystemGoalStatus::Cancelled => "cancelled",
+            _ if succeeded > 0 && has_receipt_issues => "partial_failure",
+            _ if unknown > 0 && failed == 0 => "unknown",
+            _ if failed > 0 || rejected > 0 => "failed",
+            _ if goal_is_incomplete => "incomplete",
+            _ => "failed",
+        };
+
+        let mut out = String::from(
+            "[SystemGoalStatus — Authoritative Execution Facts (DO NOT contradict)]\n",
+        );
+        out.push_str(&format!("- status: {overall_tag}\n"));
+        if !receipts.is_empty() {
+            let line = receipts
+                .iter()
+                .map(TargetReceipt::format_compact)
+                .collect::<Vec<_>>()
+                .join("; ");
+            out.push_str(&format!("- receipts: {line}\n"));
+        }
+        match &goal_status {
+            SystemGoalStatus::Incomplete {
+                reason,
+                level,
+                physical_ok,
+                ..
+            } => {
+                out.push_str(&format!(
+                    "- goal_status: incomplete(level={level:?}, physical_ok={physical_ok}, reason={reason})\n"
+                ));
+            }
+            SystemGoalStatus::CompleteEligible {
+                level,
+                delivery,
+                physical_ok,
+                ..
+            } => {
+                out.push_str(&format!(
+                    "- goal_status: complete_eligible(level={level:?}, delivery={}, physical_ok={physical_ok})\n",
+                    delivery.as_deref().unwrap_or("none")
+                ));
+            }
+            SystemGoalStatus::Halted { reason } => {
+                out.push_str(&format!("- goal_status: halted(reason={reason})\n"));
+            }
+            SystemGoalStatus::Cancelled => {
+                out.push_str("- goal_status: cancelled\n");
+            }
+            SystemGoalStatus::Completed { evidence_id } => {
+                out.push_str(&format!(
+                    "- goal_status: completed(evidence_id={evidence_id})\n"
+                ));
+            }
+            SystemGoalStatus::NotApplicable => {}
+        }
+        out.push_str(
+            "- reporting_rule: Report EVERY target's actual outcome separately based strictly on `receipts` and tool results. \
+             NEVER claim \"all succeeded\" or \"completed\" when any item is failed, rejected, unknown, or incomplete. \
+             For unknown items, state that the outcome is unconfirmed (suggest checking with `heramind operation get <op_id>`). \
+             For `adapter_accepted`/`queued`, state dispatched only (no device ACK or physical effect verified).",
+        );
+        Some(out)
+    }
+
+    /// Fold a successful tool result into per-operation goal evidence.
+    ///
+    /// Updates are monotonic **within the same Operation id only**. A new
+    /// Operation starts at its own level and never inherits a prior op's
+    /// physical/ACK evidence. Config-only routes never raise above
+    /// [`GoalEvidenceLevel::ConfigSuccess`]. Wrong-device commands do not
+    /// satisfy a constrained goal object.
+    pub fn observe_tool_result_for_goal(
+        &mut self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        result_data: &serde_json::Value,
+        operation_id: Option<&str>,
+    ) {
+        if matches!(self.status, TaskStatus::Cancelled) {
+            return;
+        }
+        let Some(mut obs) = classify_goal_evidence(tool_name, arguments, result_data) else {
+            return;
+        };
+        // Explicit Operation id only — never fall back to current_operation_id.
+        // Without an explicit id, do not raise write-op (CommandDispatched+)
+        // evidence that would upgrade the active write lease.
+        let explicit_op = operation_id
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        if obs.level >= GoalEvidenceLevel::CommandDispatched && explicit_op.is_none() {
+            return;
+        }
+        if let Some(op) = explicit_op {
+            obs.operation_id = Some(op);
+        } else {
+            obs.operation_id = None;
+        }
+        // Constrained target: ignore evidence for a different device (type+id).
+        if let (Some(need), Some(got)) = (&self.object, &obs.device_id) {
+            if !goal_objects_equivalent(need, got)
+                && obs.level >= GoalEvidenceLevel::CommandDispatched
+            {
+                return;
+            }
+        }
+        // Ordinary NL → executed device_command: bind a lightweight charter so
+        // End.goalStatus is useful without hand-seeded SetGoal / TaskState.
+        if obs.level >= GoalEvidenceLevel::CommandDispatched {
+            if self.goal.is_none() {
+                let cmd = obs.command.as_deref().unwrap_or("command");
+                self.goal = Some(format!("device_command:{cmd}"));
+            }
+            if self.object.is_none() {
+                if let Some(ref id) = obs.device_id {
+                    self.object = Some(id.clone());
+                }
+            }
+            if self.method.is_none()
+                && !self
+                    .excluded_routes
+                    .contains(&ExcludedRoute::DeviceNativeCommand)
+            {
+                self.method = Some(ExecutionMethod::DeviceNativeCommand);
+            }
+            if matches!(self.status, TaskStatus::Idle) {
+                self.status = TaskStatus::Active;
+            }
+        }
+        // Per-operation slot — never reuse another op's higher level.
+        let op_key = obs.operation_id.clone();
+        if let Some(idx) = self
+            .goal_evidences
+            .iter()
+            .position(|e| e.operation_id == op_key)
+        {
+            let cur = &self.goal_evidences[idx];
+            let replace = obs.level > cur.level
+                || (obs.level == cur.level && obs.device_id.is_some() && cur.device_id.is_none());
+            if replace {
+                self.goal_evidences[idx] = obs;
+            }
+        } else {
+            self.goal_evidences.push(obs);
+        }
+    }
+}
+
+fn evidence_id_suggests_physical(evidence_id: &str) -> bool {
+    let lower = evidence_id.to_lowercase();
+    lower.contains("physical")
+        || lower.contains("refreshed")
+        || lower.contains("screen")
+        || lower.contains("rendered")
+        || lower.contains("display")
+}
+
+/// Classify a tool result into goal-evidence (or None if irrelevant).
+///
+/// Delivery ladder levels come **only** from exact structured enum tags
+/// (`adapter_accepted` / `extension_accepted` / `device_acknowledged` /
+/// `physical_effect_verified`). Descriptive `delivery_note` / prose /
+/// unknown enum strings never raise the level.
+pub fn classify_goal_evidence(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    result_data: &serde_json::Value,
+) -> Option<GoalEvidence> {
+    let real = crate::tools::resolve_tool_name(tool_name);
+    let canonical = canonicalize_tool_arguments(tool_name, arguments);
+
+    // Structured device_command success.
+    if real == "device_command" {
+        return evidence_from_device_command_result(&canonical, result_data);
+    }
+
+    let cmd = canonical
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Notify/push/webhook mutations → config only.
+    if mutating_call_excluded_route(tool_name, arguments)
+        == Some(ExcludedRoute::NotificationOrWebhook)
+        || (!cmd.is_empty() && is_notification_or_webhook_mutation(&cmd))
+    {
+        return Some(GoalEvidence {
+            level: GoalEvidenceLevel::ConfigSuccess,
+            device_id: extract_operation_target(&canonical),
+            command: None,
+            delivery: Some("config_or_notify".into()),
+            operation_id: None,
+            summary: "config/push/webhook path succeeded — not a device command".into(),
+        });
+    }
+
+    // Shell device control: only structured JSON delivery (stdout or body).
+    // Natural-language CLI prose never upgrades the evidence level.
+    if real == "shell" && cmd.contains("heramind device control") {
+        return evidence_from_device_control_shell(&cmd, result_data);
+    }
+    // Structured delivery payload without a device_command tool name
+    // (e.g. nested CLI JSON) — still requires exact enum + bound ids.
+    if result_data.get("delivery").is_some()
+        && (result_data.get("sent").and_then(|v| v.as_bool()) == Some(true)
+            || result_data.get("device_id").is_some())
+    {
+        return evidence_from_device_command_result(&canonical, result_data);
+    }
+    None
+}
+
+fn evidence_from_device_command_result(
+    arguments: &serde_json::Value,
+    result_data: &serde_json::Value,
+) -> Option<GoalEvidence> {
+    let device_id = result_data
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| extract_operation_target(arguments));
+    let command = result_data
+        .get("command")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+
+    let exact = parse_exact_delivery(result_data.get("delivery"));
+    // Display-only note — never consulted for level.
+    let note = result_data
+        .get("delivery_note")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+
+    let (level, delivery_tag) = match exact {
+        ExactDelivery::PhysicalEffectVerified => (
+            GoalEvidenceLevel::PhysicalEffectVerified,
+            Some("physical_effect_verified".into()),
+        ),
+        ExactDelivery::DeviceAcknowledged => (
+            GoalEvidenceLevel::DeviceAcknowledged,
+            Some("device_acknowledged".into()),
+        ),
+        ExactDelivery::AdapterAccepted => (
+            GoalEvidenceLevel::CommandDispatched,
+            Some("adapter_accepted".into()),
+        ),
+        ExactDelivery::ExtensionAccepted => (
+            GoalEvidenceLevel::CommandDispatched,
+            Some("extension_accepted".into()),
+        ),
+        ExactDelivery::Unknown(tag) => {
+            // Unknown enum stays at None for ladder purposes — do not
+            // invent a higher level from the tag string or from notes.
+            // If the payload clearly sent a command with bound ids, keep
+            // a floor of CommandDispatched only when `sent: true` is set
+            // AND device+command are bound; otherwise stay None.
+            if result_data.get("sent").and_then(|v| v.as_bool()) == Some(true)
+                && device_id.is_some()
+                && command.is_some()
+            {
+                (GoalEvidenceLevel::CommandDispatched, Some(tag))
+            } else {
+                return None;
+            }
+        }
+        ExactDelivery::Missing => {
+            // No structured delivery: require sent+bound ids → dispatched only.
+            if result_data.get("sent").and_then(|v| v.as_bool()) == Some(true)
+                && device_id.is_some()
+                && command.is_some()
+            {
+                (GoalEvidenceLevel::CommandDispatched, None)
+            } else {
+                return None;
+            }
+        }
+    };
+
+    // CommandDispatched+ always requires bound device + command.
+    if level >= GoalEvidenceLevel::CommandDispatched && (device_id.is_none() || command.is_none()) {
+        return None;
+    }
+
+    let summary = if note.is_empty() {
+        match level {
+            GoalEvidenceLevel::PhysicalEffectVerified => {
+                "physical effect verified via structured delivery".into()
+            }
+            GoalEvidenceLevel::DeviceAcknowledged => {
+                "device acknowledged receipt; physical effect unverified".into()
+            }
+            GoalEvidenceLevel::CommandDispatched => {
+                "command dispatched (adapter/extension accept); device ACK and \
+                 physical effect unverified"
+                    .into()
+            }
+            GoalEvidenceLevel::ConfigSuccess => "config success only".into(),
+            GoalEvidenceLevel::None => return None,
+        }
+    } else {
+        // Preserve operator-facing note as display text only.
+        note.to_string()
+    };
+
+    Some(GoalEvidence {
+        level,
+        device_id,
+        command,
+        delivery: delivery_tag,
+        operation_id: None,
+        summary,
+    })
+}
+
+fn evidence_from_device_control_shell(
+    cmd_lower: &str,
+    result_data: &serde_json::Value,
+) -> Option<GoalEvidence> {
+    // Prefer structured JSON delivery fields on the tool result body.
+    if result_data.get("delivery").is_some() || result_data.get("sent").is_some() {
+        let mut args = serde_json::json!({});
+        if let Some(id) = device_id_from_control_cmd(cmd_lower) {
+            args["device"] = serde_json::json!(id);
+        }
+        if let Some(c) = command_from_control_cmd(cmd_lower) {
+            args["command"] = serde_json::json!(c);
+        }
+        if let Some(ev) = evidence_from_device_command_result(&args, result_data) {
+            return Some(ev);
+        }
+    }
+    // CLI stdout must be parseable JSON with an exact delivery enum —
+    // natural-language substrings ("physical effect verified", …) are ignored.
+    if let Some(stdout) = result_data.get("stdout").and_then(|v| v.as_str()) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) {
+            let mut args = serde_json::json!({});
+            if let Some(id) = device_id_from_control_cmd(cmd_lower) {
+                args["device"] = serde_json::json!(id);
+            }
+            if let Some(c) = command_from_control_cmd(cmd_lower) {
+                args["command"] = serde_json::json!(c);
+            }
+            if let Some(ev) = evidence_from_device_command_result(&args, &v) {
+                return Some(ev);
+            }
+        }
+    }
+    // exit 0 with no structured delivery → at most dispatched, and only
+    // when device+command can be bound from the CLI argv.
+    if result_data.get("exit_code").and_then(|v| v.as_i64()) == Some(0) {
+        let device_id = device_id_from_control_cmd(cmd_lower)?;
+        let command = command_from_control_cmd(cmd_lower)?;
+        return Some(GoalEvidence {
+            level: GoalEvidenceLevel::CommandDispatched,
+            device_id: Some(device_id),
+            command: Some(command),
+            delivery: None,
+            operation_id: None,
+            summary: "device control exited 0; physical effect unverified".into(),
+        });
+    }
+    None
+}
+
+/// Exact CommandDelivery tags accepted for goal-evidence upgrades.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactDelivery {
+    AdapterAccepted,
+    ExtensionAccepted,
+    DeviceAcknowledged,
+    PhysicalEffectVerified,
+    /// Present but not one of the four known tags (kept lower / unknown).
+    Unknown(String),
+    Missing,
+}
+
+/// Parse only structured exact delivery enums.
+///
+/// Accepts:
+/// - string: `"adapter_accepted"` / `"extension_accepted"` /
+///   `"device_acknowledged"` / `"physical_effect_verified"`
+/// - single-key object: `{"adapter_accepted": …}` (serde-tagged style)
+///
+/// Rejects / does not upgrade from:
+/// - descriptive prose / delivery_note
+/// - substring matches (`physical_effect_unverified`, `"…physical effect…"`)
+/// - unknown enum tags (returned as [`ExactDelivery::Unknown`])
+fn parse_exact_delivery(raw: Option<&serde_json::Value>) -> ExactDelivery {
+    let Some(v) = raw else {
+        return ExactDelivery::Missing;
+    };
+    if let Some(s) = v.as_str() {
+        return match s.trim() {
+            "adapter_accepted" => ExactDelivery::AdapterAccepted,
+            "extension_accepted" => ExactDelivery::ExtensionAccepted,
+            "device_acknowledged" => ExactDelivery::DeviceAcknowledged,
+            "physical_effect_verified" => ExactDelivery::PhysicalEffectVerified,
+            "" => ExactDelivery::Missing,
+            other => ExactDelivery::Unknown(other.to_string()),
+        };
+    }
+    if let Some(obj) = v.as_object() {
+        if obj.len() == 1 {
+            let key = obj.keys().next().map(|s| s.as_str()).unwrap_or("");
+            return match key {
+                "adapter_accepted" => ExactDelivery::AdapterAccepted,
+                "extension_accepted" => ExactDelivery::ExtensionAccepted,
+                "device_acknowledged" => ExactDelivery::DeviceAcknowledged,
+                "physical_effect_verified" => ExactDelivery::PhysicalEffectVerified,
+                "" => ExactDelivery::Missing,
+                other => ExactDelivery::Unknown(other.to_string()),
+            };
+        }
+    }
+    // Non-string / multi-key / number → treat as unknown, not Missing,
+    // so callers don't invent a level from `sent` alone without a tag
+    // when delivery was present but unparseable.
+    ExactDelivery::Unknown(v.to_string())
+}
+
+fn device_id_from_control_cmd(cmd_lower: &str) -> Option<String> {
+    // `heramind device control <id> <command> ...`
+    let mut parts = cmd_lower.split_whitespace();
+    while let Some(p) = parts.next() {
+        if p == "control" {
+            return parts.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+fn command_from_control_cmd(cmd_lower: &str) -> Option<String> {
+    let mut parts = cmd_lower.split_whitespace();
+    while let Some(p) = parts.next() {
+        if p == "control" {
+            let _id = parts.next()?;
+            return parts.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Stable fingerprint for a mutating write (tool + canonical args).
+pub fn write_fingerprint(tool: &str, args_canonical: &str) -> String {
+    format!("{tool}|{args_canonical}")
+}
+
+/// Recursively sort object keys so fingerprint strings are order-independent.
+///
+/// Workspace `serde_json` enables `preserve_order` (ABI). `to_string` then
+/// follows insertion order — two equal maps built with different key order
+/// would mint different write fingerprints and bypass Unknown / anti-replay.
+pub fn sort_json_keys(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut sorted = serde_json::Map::with_capacity(map.len());
+            for k in keys {
+                if let Some(v) = map.get(k) {
+                    sorted.insert(k.clone(), sort_json_keys(v));
+                }
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(sort_json_keys).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Stable JSON serialization for write fingerprints (sorted object keys).
+pub fn stable_json_string(value: &serde_json::Value) -> String {
+    serde_json::to_string(&sort_json_keys(value)).unwrap_or_default()
+}
+
+/// Fingerprint a tool result body for evidence (length-capped).
+pub fn result_fingerprint(result: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    result.hash(&mut h);
+    format!("{:x}", h.finish())
+}
+
+fn short_op_id(id: &str) -> &str {
+    if id.len() > 8 {
+        &id[..8]
+    } else {
+        id
+    }
+}
+
+/// Parse the JSON object printed by `heramind …` CLI inside a `ShellTool` result
+/// (`result_data["stdout"]`), returning `None` if stdout is missing or non-JSON.
+fn extract_cli_stdout_json(result_data: &serde_json::Value) -> Option<serde_json::Value> {
+    if let Some(stdout) = result_data.get("stdout").and_then(|v| v.as_str()) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Extract exact delivery tag (`adapter_accepted`, `queued`, `device_ack`,
+/// `physical_effect_verified`, `extension_accepted`) from a stored result body.
+fn extract_delivery_tag_from_body(body: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let candidates = [
+        v.get("delivery").and_then(|x| x.as_str()),
+        v.get("data")
+            .and_then(|d| d.get("delivery"))
+            .and_then(|x| x.as_str()),
+    ];
+    for c in candidates.into_iter().flatten() {
+        let t = c.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    if let Some(stdout_json) = extract_cli_stdout_json(&v) {
+        for c in [
+            stdout_json.get("delivery").and_then(|x| x.as_str()),
+            stdout_json
+                .get("data")
+                .and_then(|d| d.get("delivery"))
+                .and_then(|x| x.as_str()),
+            stdout_json
+                .get("data")
+                .and_then(|d| d.get("data"))
+                .and_then(|d| d.get("delivery"))
+                .and_then(|x| x.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let t = c.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Whether two receipt targets describe the same business identity for E4
+/// Rejected-folding.
+///
+/// Exact target match always counts. When domain+action agree, a fallback
+/// `{domain}:{action}` target (used when concrete ID extraction failed on a
+/// preflight clap error) is also treated as compatible with a later concrete
+/// target for the same command.
+fn receipt_targets_compatible(
+    left_target: &str,
+    left_domain: Option<&str>,
+    left_action: Option<&str>,
+    right_target: &str,
+    right_domain: Option<&str>,
+    right_action: Option<&str>,
+) -> bool {
+    if left_target == right_target {
+        return true;
+    }
+    match (left_domain, left_action, right_domain, right_action) {
+        (Some(ld), Some(la), Some(rd), Some(ra)) if ld == rd && la == ra => {
+            let fallback = format!("{ld}:{la}");
+            left_target == fallback || right_target == fallback
+        }
+        _ => false,
+    }
+}
+
+/// Drop pre-submission `Rejected` receipts that were superseded by a later
+/// real outcome for the same business identity, and collapse duplicate
+/// Rejected retries down to the latest one.
+fn collapse_superseded_rejected_receipts(
+    items: Vec<(TargetReceipt, Option<String>, Option<String>)>,
+) -> Vec<TargetReceipt> {
+    let n = items.len();
+    let mut keep = vec![true; n];
+
+    for i in 0..n {
+        if items[i].0.status != OperationStatus::Rejected {
+            continue;
+        }
+        let superseded = items.iter().enumerate().any(|(j, (other, od, oa))| {
+            if i == j || !keep[j] {
+                return false;
+            }
+            // Any non-Rejected outcome for the same identity supersedes the
+            // preflight Rejected attempt (including in-progress / cancelled).
+            if other.status == OperationStatus::Rejected {
+                return false;
+            }
+            receipt_targets_compatible(
+                &items[i].0.target,
+                items[i].1.as_deref(),
+                items[i].2.as_deref(),
+                &other.target,
+                od.as_deref(),
+                oa.as_deref(),
+            )
+        });
+        if superseded {
+            keep[i] = false;
+            continue;
+        }
+        // Multiple Rejected attempts for the same identity → keep only the
+        // latest (highest index).
+        for j in (i + 1)..n {
+            if !keep[j] || items[j].0.status != OperationStatus::Rejected {
+                continue;
+            }
+            if receipt_targets_compatible(
+                &items[i].0.target,
+                items[i].1.as_deref(),
+                items[i].2.as_deref(),
+                &items[j].0.target,
+                items[j].1.as_deref(),
+                items[j].2.as_deref(),
+            ) {
+                keep[i] = false;
+                break;
+            }
+        }
+    }
+
+    items
+        .into_iter()
+        .zip(keep)
+        .filter_map(|((receipt, _, _), keep)| keep.then_some(receipt))
+        .collect()
+}
+
+/// Extract a compact failure/unknown/rejected reason string for E4 per-target receipts.
+fn extract_compact_failure_reason(result: &StructuredResult) -> Option<String> {
+    let raw = serde_json::from_str::<serde_json::Value>(&result.body)
+        .ok()
+        .and_then(|v| {
+            extract_cli_stdout_json(&v)
+                .and_then(|s| {
+                    s.get("error")
+                        .and_then(|e| e.as_str())
+                        .or_else(|| s.get("message").and_then(|m| m.as_str()))
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    v.get("error")
+                        .and_then(|e| e.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    v.get("stderr")
+                        .and_then(|e| e.as_str())
+                        .and_then(|s| s.lines().next())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_else(|| result.summary.clone());
+
+    let trimmed = raw
+        .trim()
+        .strip_prefix("Error:")
+        .or_else(|| raw.trim().strip_prefix("error:"))
+        .unwrap_or(raw.trim())
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let single_line: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut compact: String = single_line.chars().take(60).collect();
+    if single_line.chars().count() > 60 {
+        compact.push('…');
+    }
+    Some(compact)
+}
+
+/// Extract `(domain, action)` from a tool call (e.g. `shell` running
+/// `heramind device control ...` -> `(Some("device"), Some("control"))`).
+pub fn extract_operation_domain_action(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
+    let real = crate::tools::resolve_tool_name(tool_name);
+    if real == "shell" {
+        if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
+            let argv = crate::toolkit::shell::tokenize_heramind_command(cmd.trim())
+                .unwrap_or_else(|_| cmd.split_whitespace().map(str::to_string).collect());
+            let argv = crate::toolkit::shell::strip_host_meta_from_argv(argv);
+            let argv = heramind_cli_ops::json_arg::strip_global_cli_flags(&argv);
+            if argv.first().map(String::as_str) == Some("heramind") {
+                let domain = argv.get(1).cloned();
+                let action = argv.get(2).cloned();
+                return (domain, action);
+            }
+        }
+        return (Some("shell".to_string()), None);
+    }
+    if let Some((ext_id, cmd)) = heramind_core::extension::parse_extension_tool_name(&real) {
+        return (
+            Some("extension".to_string()),
+            Some(format!("{ext_id}:{cmd}")),
+        );
+    }
+    let action = arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    (Some(real), action)
+}
+
+/// Best-effort target extraction from tool arguments (device / name / channel…).
+pub fn extract_operation_target(arguments: &serde_json::Value) -> Option<String> {
+    for key in [
+        "device",
+        "device_id",
+        "deviceId",
+        "target",
+        "name",
+        "channel",
+        "agent",
+        "id",
+    ] {
+        if let Some(s) = arguments.get(key).and_then(|v| v.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    // Shell command: first look for explicit target flags (`--device`, `--name`,
+    // `--channel`, `--id`), then fall back to positional `<ID>` on `heramind <domain> <action> <ID>`.
+    if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        for i in 0..parts.len() {
+            if matches!(parts[i], "--device" | "--name" | "--channel" | "--id") {
+                if let Some(v) = shell_flag_value(&parts, i) {
+                    if !v.is_empty() {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        let argv = crate::toolkit::shell::tokenize_heramind_command(cmd.trim())
+            .unwrap_or_else(|_| parts.iter().map(|s| (*s).to_string()).collect());
+        let argv = crate::toolkit::shell::strip_host_meta_from_argv(argv);
+        let argv = heramind_cli_ops::json_arg::strip_global_cli_flags(&argv);
+        if argv.first().map(String::as_str) == Some("heramind") && argv.len() >= 4 {
+            let domain = argv[1].as_str();
+            let action = argv[2].as_str();
+            let candidate = argv[3].as_str();
+            let has_positional_target = matches!(
+                (domain, action),
+                (
+                    "device",
+                    "control" | "update" | "delete" | "write-metric" | "get" | "history" | "latest"
+                ) | (
+                    "dashboard",
+                    "update"
+                        | "update-component"
+                        | "add-components"
+                        | "remove-components"
+                        | "delete"
+                        | "share"
+                        | "get"
+                ) | (
+                    "rule",
+                    "update"
+                        | "delete"
+                        | "enable"
+                        | "disable"
+                        | "test"
+                        | "get"
+                        | "explain"
+                        | "history"
+                ) | (
+                    "agent",
+                    "update"
+                        | "delete"
+                        | "control"
+                        | "invoke"
+                        | "clear-memory"
+                        | "send-message"
+                        | "get"
+                        | "memory"
+                        | "executions"
+                        | "latest-execution"
+                        | "conversation"
+                ) | (
+                    "extension",
+                    "invoke" | "config" | "reload" | "uninstall" | "status" | "logs" | "get"
+                ) | (
+                    "transform",
+                    "update" | "delete" | "enable" | "disable" | "get" | "executions"
+                ) | (
+                    "push",
+                    "update"
+                        | "delete"
+                        | "enable"
+                        | "disable"
+                        | "start"
+                        | "stop"
+                        | "test"
+                        | "get"
+                        | "logs"
+                ) | (
+                    "connector",
+                    "update" | "delete" | "enable" | "disable" | "test" | "get"
+                ) | (
+                    "message",
+                    "get" | "read" | "delete" | "channel-get" | "channel-delete" | "channel-test"
+                ) | ("operation", "get")
+            );
+            if has_positional_target && !candidate.is_empty() && !candidate.starts_with('-') {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read a CLI flag value after `parts[flag_idx]`, rejoining quoted tokens.
+fn shell_flag_value(parts: &[&str], flag_idx: usize) -> Option<String> {
+    let first = *parts.get(flag_idx + 1)?;
+    if first.starts_with('"') {
+        if first.len() > 1 && first.ends_with('"') {
+            return Some(first.trim_matches('"').to_string());
+        }
+        let mut acc = first.trim_start_matches('"').to_string();
+        for part in parts.iter().skip(flag_idx + 2) {
+            acc.push(' ');
+            if part.ends_with('"') {
+                acc.push_str(part.trim_end_matches('"'));
+                return Some(acc);
+            }
+            acc.push_str(part);
+        }
+        return Some(acc);
+    }
+    Some(first.to_string())
+}
+
+/// Cap a result body for storage on [`StructuredResult`].
+pub fn cap_result_body(body: &str) -> String {
+    const MAX: usize = 4_096;
+    if body.len() <= MAX {
+        body.to_string()
+    } else {
+        let mut out = body.chars().take(MAX).collect::<String>();
+        out.push('…');
+        out
+    }
+}
+
+/// Bodies larger than this get a `details_ref` in the model-facing summary.
+pub const DETAILS_REF_BODY_THRESHOLD: usize = 512;
+
+/// Build `$cached:op:<operation_id>` when the body is large enough that the
+/// model must not treat a truncated prefix as the fact.
+pub fn details_ref_for_body(operation_id: &str, body: &str) -> Option<String> {
+    if body.len() > DETAILS_REF_BODY_THRESHOLD {
+        Some(format!("$cached:op:{operation_id}"))
+    } else {
+        None
+    }
+}
+
+/// Extract short factual needles from a tool body (never a raw 120-char slice).
+pub fn extract_result_needles(body: &str) -> Vec<String> {
+    let mut needles = Vec::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        for key in [
+            "exit_code",
+            "status",
+            "queued",
+            "state",
+            "device",
+            "device_id",
+            "id",
+            "error",
+            "timed_out",
+            "success",
+        ] {
+            if let Some(val) = v.get(key) {
+                let s = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if !s.is_empty() && s.len() < 80 {
+                    needles.push(format!("{key}={s}"));
+                }
+            }
+        }
+        if let Some(stdout) = v.get("stdout").and_then(|x| x.as_str()) {
+            if let Some(line) = stdout.lines().find(|l| !l.trim().is_empty()) {
+                let brief: String = line.chars().take(60).collect();
+                needles.push(format!("stdout_line={brief}"));
+            }
+        }
+    } else {
+        // Non-JSON: keep a single status-like token if present.
+        let lower = body.to_lowercase();
+        for token in ["queued", "ok", "error", "failed", "timeout", "unknown"] {
+            if lower.contains(token) {
+                needles.push(token.to_string());
+                break;
+            }
+        }
+    }
+    needles
+}
+
+/// Structured summary for ops / confirm_step — **not** `body.chars().take(120)`.
+pub fn build_structured_summary(
+    tool_name: &str,
+    status_label: &str,
+    body: &str,
+    target: Option<&str>,
+    error: Option<&str>,
+) -> String {
+    let mut parts = vec![format!("{tool_name}:{status_label}")];
+    if let Some(t) = target {
+        if !t.is_empty() {
+            parts.push(format!("target={t}"));
+        }
+    }
+    if let Some(e) = error {
+        let brief: String = e.chars().take(80).collect();
+        parts.push(format!("error={brief}"));
+    }
+    let needles = extract_result_needles(body);
+    if !needles.is_empty() {
+        parts.push(needles.join(","));
+    } else if body.is_empty() {
+        parts.push("body=empty".into());
+    } else {
+        parts.push(format!("body_len={}", body.len()));
+    }
+    parts.join(" ")
+}
+
+/// Full structured result for an Operation (body kept; details_ref when large).
+pub fn build_structured_result(
+    operation_id: &str,
+    tool_name: &str,
+    status_label: &str,
+    success: bool,
+    body: &str,
+    target: Option<&str>,
+    error: Option<&str>,
+) -> StructuredResult {
+    let summary = build_structured_summary(tool_name, status_label, body, target, error);
+    let details_ref = details_ref_for_body(operation_id, body);
+    StructuredResult::with_body(success, summary, cap_result_body(body), details_ref)
+}
+
+/// True when `arguments` already look like a mapped shell payload
+/// (`{"command":"heramind …"}` ± timeout) — re-running domain inference would
+/// misread the command string as a device-control `command` field.
+fn already_canonical_shell_args(arguments: &serde_json::Value) -> bool {
+    let Some(obj) = arguments.as_object() else {
+        return false;
+    };
+    let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if !cmd.trim_start().starts_with("heramind ") && !cmd.trim_start().starts_with("heramind\t") {
+        return false;
+    }
+    // Allow only shell-shaped keys (+ lifecycle flag if a caller forgot to strip).
+    obj.keys().all(|k| {
+        k == "command"
+            || k == "timeout"
+            || k == "description"
+            || k == "working_dir"
+            || k == "params"
+            || k == NEW_OPERATION_ARG
+            || k == HOST_PREPARED_OPERATION_ARG
+            || k == PREPARED_OPERATION_ARG
+            || k == HOST_ATTACH_ERROR_ARG
+            || k == HOST_TICKET_STRIPPED_ARG
+    })
+}
+
+/// Canonicalize tool args before capability / fingerprint classification.
+///
+/// - Strips lifecycle-only [`NEW_OPERATION_ARG`] **before** CLI serialization
+///   so the flag never becomes `--_new_operation` inside the command string.
+/// - Strips host PreparedInvoke carriage ([`HOST_PREPARED_OPERATION_ARG`] /
+///   [`PREPARED_OPERATION_ARG`]) so fingerprints stay business-only.
+/// - CLI-domain structured calls (`device` / …) map to `heramind …` once.
+/// - Idempotent: already-canonical `{command:"heramind …"}` is returned as-is
+///   (does not re-enter mapper action inference).
+///
+/// **Execute path must call [`restore_host_prepared_carriage`] after this** —
+/// otherwise Shell loses the classify-time ticket and fails with
+/// `PreparedInvoke missing` (NM-247 case-c / 10:50 weather follow-up).
+pub fn canonicalize_tool_arguments(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> serde_json::Value {
+    let mut cleaned = arguments.clone();
+    strip_new_operation_flag(&mut cleaned);
+    // Host ticket / attach diagnostics are dispatch-internal — never part of
+    // business fingerprint.
+    if let Some(obj) = cleaned.as_object_mut() {
+        obj.remove(HOST_PREPARED_OPERATION_ARG);
+        obj.remove(PREPARED_OPERATION_ARG);
+        obj.remove(HOST_ATTACH_ERROR_ARG);
+        obj.remove(HOST_TICKET_STRIPPED_ARG);
+    }
+    let real = crate::tools::resolve_tool_name(tool_name);
+    if real == "shell" && tool_name != "shell" {
+        if already_canonical_shell_args(&cleaned) {
+            return cleaned;
+        }
+        crate::tools::mapper::build_cli_command(tool_name, &cleaned).unwrap_or(cleaned)
+    } else {
+        cleaned
+    }
+}
+
+/// Re-attach dispatch-internal PreparedInvoke carriage after
+/// [`canonicalize_tool_arguments`] (fingerprint-safe strip).
+///
+/// Stages: attach mints `_host_prepared_operation_id` → write-gate fingerprints
+/// without it → execute restores it → Shell host context → claim → HTTP consume.
+pub fn restore_host_prepared_carriage(
+    original: &serde_json::Value,
+    canonicalized: &mut serde_json::Value,
+) {
+    let Some(src) = original.as_object() else {
+        return;
+    };
+    let Some(dst) = canonicalized.as_object_mut() else {
+        return;
+    };
+    for key in [
+        HOST_PREPARED_OPERATION_ARG,
+        PREPARED_OPERATION_ARG,
+        HOST_ATTACH_ERROR_ARG,
+        HOST_TICKET_STRIPPED_ARG,
+    ] {
+        if let Some(v) = src.get(key) {
+            if !v.is_null() {
+                dst.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+}
+
+/// Strip host-only PreparedInvoke carriage from args before model-visible
+/// history / tool-call persistence (NM-247).
+pub fn strip_host_prepared_from_arguments(arguments: &mut serde_json::Value) {
+    if let Some(obj) = arguments.as_object_mut() {
+        obj.remove(HOST_PREPARED_OPERATION_ARG);
+        obj.remove(PREPARED_OPERATION_ARG);
+        obj.remove(HOST_ATTACH_ERROR_ARG);
+        obj.remove(HOST_TICKET_STRIPPED_ARG);
+        if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+            if let Some(stripped) = strip_prepared_id_from_shell_command(cmd) {
+                obj.insert("command".into(), serde_json::Value::String(stripped));
+            }
+        }
+    }
+}
+
+fn strip_prepared_id_from_shell_command(cmd: &str) -> Option<String> {
+    let argv = crate::toolkit::shell::tokenize_heramind_command(cmd.trim()).ok()?;
+    let stripped = crate::toolkit::shell::strip_host_meta_from_argv(argv.clone());
+    if stripped.len() == argv.len() && stripped == argv {
+        return None;
+    }
+    Some(stripped.join(" "))
+}
+
+/// Classify capability from a **resolved** tool name + already-canonical args.
+///
+/// Does **not** re-canonicalize — callers must pass shell-shaped args for
+/// CLI domains (see [`canonicalize_tool_arguments`]).
+pub fn derive_tool_capability_resolved(
+    real_tool_name: &str,
+    canonical_arguments: &serde_json::Value,
+) -> ToolCapability {
+    match real_tool_name {
+        "shell" => {
+            let cmd = canonical_arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Platform CLI → parsed command type; other/unknown shell →
+            // unknown side-effects. Keyword absence is NOT proven read-only.
+            crate::toolkit::shell::classify_shell_capability_with_args(cmd, canonical_arguments)
+        }
+        "file_read" | "web_search" | "web_fetch" | "vision" => ToolCapability::read_query(),
+        // Skill is polymorphic: search/load are RO; create/update/delete
+        // mutate persisted skill files — must enter the write gate (a blanket
+        // read_query let writes skip it). Missing/unknown action → fail closed.
+        "skill" => match canonical_arguments
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+        {
+            "search" | "load" => ToolCapability::read_query(),
+            "create" | "update" | "delete" => ToolCapability::mutating_write(),
+            _ => ToolCapability::mutating_unknown_sensitive(),
+        },
+        // Memory is polymorphic: most actions write durable facts. Classify
+        // by `action` so add/rewrite/replace/remove/create enter the write
+        // gate (a blanket read_query let 5/7 actions skip it).
+        "memory" => match canonical_arguments
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+        {
+            "read" | "list" => ToolCapability::read_query(),
+            "add" | "rewrite" | "replace" | "remove" | "create" => ToolCapability::mutating_write(),
+            // Missing / unknown action: fail closed into the gate.
+            _ => ToolCapability::mutating_unknown_sensitive(),
+        },
+        "file_write" | "file_edit" | "image_edit" | "run_now" | "device_command" => {
+            ToolCapability::mutating_write()
+        }
+        other => {
+            // Extension tools (`ext:cmd` / sanitized `ext_cmd`): NM-240 binds
+            // Chat write-gate to a real PreparedInvoke (prepare→authorize for
+            // RO). Cache-only RO without a prepareable snapshot cannot skip.
+            if let Some((ext_id, cmd)) = heramind_core::extension::parse_extension_tool_name(other)
+            {
+                // Prefer an already-attached classify-time token (no remint).
+                if let Some(op_id) = canonical_arguments
+                    .get(PREPARED_OPERATION_ARG)
+                    .and_then(|v| v.as_str())
+                {
+                    if let Some(prep) = heramind_core::extension::peek_prepared_invoke(op_id) {
+                        return match prep.contract.effect {
+                            heramind_core::extension::CommandEffect::ReadOnly => {
+                                ToolCapability::read_query()
+                                    .with_prepared_operation_id(Some(op_id.to_string()))
+                            }
+                            heramind_core::extension::CommandEffect::Mutating => {
+                                ToolCapability::mutating_write()
+                                    .with_prepared_operation_id(Some(op_id.to_string()))
+                            }
+                        };
+                    }
+                    // Stale/missing token → fail closed into the write gate.
+                    return ToolCapability::mutating_write();
+                }
+                let bind = heramind_core::extension::classify_and_bind_chat_invoke(
+                    &ext_id,
+                    &cmd,
+                    canonical_arguments,
+                );
+                return match bind.effect {
+                    heramind_core::extension::CommandEffect::ReadOnly => {
+                        ToolCapability::read_query()
+                            .with_prepared_operation_id(bind.prepared_operation_id)
+                    }
+                    heramind_core::extension::CommandEffect::Mutating => {
+                        ToolCapability::mutating_write()
+                            .with_prepared_operation_id(bind.prepared_operation_id)
+                    }
+                };
+            }
+            // Conservative default: unknown tools enter the write gate.
+            ToolCapability::mutating_unknown_sensitive()
+        }
+    }
+}
+
+/// NM-240: classify once and attach `prepared_operation_id` to **this** call's
+/// arguments so execute claims that exact ticket (no global FIFO by params).
+///
+/// - `shell` + `extension invoke`: appends `--prepared-operation-id <id>` to
+///   the command string when missing.
+/// - Extension tools (`ext:cmd`): sets [`PREPARED_OPERATION_ARG`] when missing.
+/// - Already attached: peeks the ticket (no remint).
+///
+/// Returns the capability for write-gate decisions. Call before fingerprint /
+/// gate / execute on the stream path.
+pub fn attach_chat_prepared_invoke(
+    tool_name: &str,
+    arguments: &mut serde_json::Value,
+) -> ToolCapability {
+    let real = crate::tools::resolve_tool_name(tool_name);
+    match real.as_str() {
+        "shell" => attach_shell_prepared_invoke(arguments),
+        other => {
+            if let Some((ext_id, cmd)) = heramind_core::extension::parse_extension_tool_name(other)
+            {
+                attach_extension_tool_prepared_invoke(&ext_id, &cmd, arguments)
+            } else {
+                derive_tool_capability_resolved(other, arguments)
+            }
+        }
+    }
+}
+
+fn attach_shell_prepared_invoke(arguments: &mut serde_json::Value) -> ToolCapability {
+    let cmd = arguments
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if cmd.trim().is_empty() {
+        return ToolCapability::mutating_unknown_sensitive();
+    }
+
+    // NM-247: host ticket already on this dispatch — peek only (no remint).
+    if let Some(op_id) = arguments
+        .get(HOST_PREPARED_OPERATION_ARG)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    {
+        if let Some(prep) = heramind_core::extension::peek_prepared_invoke(&op_id) {
+            return match prep.contract.effect {
+                heramind_core::extension::CommandEffect::ReadOnly => {
+                    ToolCapability::read_query().with_prepared_operation_id(Some(op_id))
+                }
+                heramind_core::extension::CommandEffect::Mutating => {
+                    ToolCapability::mutating_write().with_prepared_operation_id(Some(op_id))
+                }
+            };
+        }
+        // Stale host ticket — fall through to re-classify from business call.
+    }
+
+    // Non-extension shell: ordinary CLI classify (no PreparedInvoke token).
+    if !shell_cmd_is_extension_invoke(&cmd) {
+        return crate::toolkit::shell::classify_shell_capability(&cmd);
+    }
+
+    // Structured params vs --params/--params-file conflict → param error later;
+    // fail closed here (no ticket) so execute reports the conflict.
+    if let Err(msg) = crate::toolkit::shell::validate_extension_params_sources(arguments) {
+        tracing::warn!(error = %msg, "extension invoke params conflict at attach");
+        return ToolCapability::mutating_unknown_sensitive();
+    }
+
+    // Extension invoke: classify once from business command+params. Host ticket
+    // stays in `_host_prepared_operation_id` — never append to model-visible
+    // command. Legacy `--prepared-operation-id` in the command string is ignored
+    // for remint (compat execute path may still claim it if host field absent).
+    let argv = match crate::toolkit::shell::tokenize_heramind_command(cmd.trim()) {
+        Ok(a) => a,
+        Err(e) => {
+            let tip = crate::toolkit::shell::extension_invoke_params_retry_tip();
+            let msg = format!("could not tokenize extension invoke command ({e}) — {tip}");
+            tracing::warn!(
+                error = %e,
+                stage = "attach_classify",
+                "{msg}"
+            );
+            if let Some(obj) = arguments.as_object_mut() {
+                obj.insert(HOST_ATTACH_ERROR_ARG.into(), serde_json::Value::String(msg));
+            }
+            return ToolCapability::mutating_unknown_sensitive();
+        }
+    };
+    let (ext_id, command, raw) = match resolve_extension_invoke_business(arguments, &argv) {
+        Some(v) => v,
+        None => {
+            // NM-302: illegal / unquoted --params used to fall through to
+            // classify_shell_capability with no ticket and no WARN — Shell bind
+            // then reported a misleading case-c "PreparedInvoke missing".
+            let tip = crate::toolkit::shell::extension_invoke_params_retry_tip();
+            let msg = format!("could not parse invoke params — {tip}");
+            tracing::warn!(
+                command = %cmd,
+                stage = "attach_classify",
+                tip = %tip,
+                "extension invoke attach could not resolve business params — no PreparedInvoke ticket minted"
+            );
+            if let Some(obj) = arguments.as_object_mut() {
+                obj.insert(HOST_ATTACH_ERROR_ARG.into(), serde_json::Value::String(msg));
+            }
+            return ToolCapability::mutating_unknown_sensitive();
+        }
+    };
+    let bind = heramind_core::extension::classify_and_bind_chat_invoke(&ext_id, &command, &raw);
+    if let Some(op_id) = bind.prepared_operation_id.clone() {
+        tracing::debug!(
+            extension_id = %ext_id,
+            command = %command,
+            prepared_operation_id = %op_id,
+            stage = "attach_classify",
+            "minted host PreparedInvoke ticket for shell invoke"
+        );
+        if let Some(obj) = arguments.as_object_mut() {
+            obj.insert(
+                HOST_PREPARED_OPERATION_ARG.into(),
+                serde_json::Value::String(op_id),
+            );
+            // Keep command free of tickets for history / PreferKnown clarity.
+            if let Some(stripped) = strip_prepared_id_from_shell_command(&cmd) {
+                obj.insert("command".into(), serde_json::Value::String(stripped));
+            }
+        }
+    } else {
+        tracing::warn!(
+            extension_id = %ext_id,
+            command = %command,
+            stage = "attach_classify",
+            "extension invoke classify produced no PreparedInvoke ticket"
+        );
+    }
+    match bind.effect {
+        heramind_core::extension::CommandEffect::ReadOnly => {
+            ToolCapability::read_query().with_prepared_operation_id(bind.prepared_operation_id)
+        }
+        heramind_core::extension::CommandEffect::Mutating => {
+            ToolCapability::mutating_write().with_prepared_operation_id(bind.prepared_operation_id)
+        }
+    }
+}
+
+/// Business (ext, command, params) for classify — prefers shell `params` object.
+fn resolve_extension_invoke_business(
+    arguments: &serde_json::Value,
+    argv: &[String],
+) -> Option<(String, String, serde_json::Value)> {
+    if let Some(p) = arguments.get("params") {
+        if !p.is_object() && !p.is_null() {
+            return None;
+        }
+        let (ext_id, command, _) = parse_extension_invoke_argv(argv)?;
+        let raw = if p.is_null() {
+            serde_json::json!({})
+        } else {
+            p.clone()
+        };
+        return Some((ext_id, command, raw));
+    }
+    parse_extension_invoke_argv(argv)
+}
+
+fn attach_extension_tool_prepared_invoke(
+    ext_id: &str,
+    cmd: &str,
+    arguments: &mut serde_json::Value,
+) -> ToolCapability {
+    if let Some(op_id) = arguments
+        .get(PREPARED_OPERATION_ARG)
+        .and_then(|v| v.as_str())
+    {
+        if let Some(prep) = heramind_core::extension::peek_prepared_invoke(op_id) {
+            return match prep.contract.effect {
+                heramind_core::extension::CommandEffect::ReadOnly => {
+                    ToolCapability::read_query().with_prepared_operation_id(Some(op_id.to_string()))
+                }
+                heramind_core::extension::CommandEffect::Mutating => {
+                    ToolCapability::mutating_write()
+                        .with_prepared_operation_id(Some(op_id.to_string()))
+                }
+            };
+        }
+        return ToolCapability::mutating_write();
+    }
+    let bind = heramind_core::extension::classify_and_bind_chat_invoke(ext_id, cmd, arguments);
+    if let Some(op_id) = &bind.prepared_operation_id {
+        if let Some(obj) = arguments.as_object_mut() {
+            obj.insert(
+                PREPARED_OPERATION_ARG.into(),
+                serde_json::Value::String(op_id.clone()),
+            );
+        }
+    }
+    match bind.effect {
+        heramind_core::extension::CommandEffect::ReadOnly => {
+            ToolCapability::read_query().with_prepared_operation_id(bind.prepared_operation_id)
+        }
+        heramind_core::extension::CommandEffect::Mutating => {
+            ToolCapability::mutating_write().with_prepared_operation_id(bind.prepared_operation_id)
+        }
+    }
+}
+
+fn shell_cmd_is_extension_invoke(cmd: &str) -> bool {
+    let t = cmd.trim();
+    t.contains("extension invoke") || t.contains("extension  invoke")
+}
+
+fn parse_extension_invoke_argv(argv: &[String]) -> Option<(String, String, serde_json::Value)> {
+    use clap::Parser;
+    use heramind_cli_ops::dispatch::commands::{Args, Command, ExtensionCommand};
+    let parsed = Args::try_parse_from(argv.iter()).ok()?;
+    let Command::Extension {
+        extension_cmd:
+            ExtensionCommand::Invoke {
+                extension_id,
+                command,
+                params,
+                params_file,
+                ..
+            },
+    } = parsed.command
+    else {
+        return None;
+    };
+    let raw = if let Some(path) = params_file.as_ref() {
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(text.trim()).ok()?
+    } else {
+        match params.as_deref() {
+            None => serde_json::json!({}),
+            Some(s) => serde_json::from_str(s).ok()?,
+        }
+    };
+    Some((extension_id, command, raw))
+}
+
+/// Derive [`ToolCapability`] from tool name + args (CLI mutation when shell).
+///
+/// Classifies from the **canonical** executable call (see
+/// [`canonicalize_tool_arguments`]). Missing / empty shell command is **not**
+/// proven read-only.
+pub fn derive_tool_capability(tool_name: &str, arguments: &serde_json::Value) -> ToolCapability {
+    let real = crate::tools::resolve_tool_name(tool_name);
+    let canonical = canonicalize_tool_arguments(tool_name, arguments);
+    derive_tool_capability_resolved(real.as_str(), &canonical)
+}
+
+/// Progress-loop decision (Round 3) on top of identical-round counting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressDecision {
+    /// New information or allowed status-poll change.
+    Allow,
+    /// Same query + same result hit the no-progress limit.
+    HaltNoProgress { identical_rounds: usize },
+    /// Write ended unknown — inquire; do not blind replay.
+    InquireUnknown { operation_id: OperationId },
+}
+
+/// Timed allowance for status-poll rounds with **changing** evidence.
+pub const STATUS_POLL_TIMED_ALLOW_ROUNDS: usize = 6;
+
+/// Decide progress vs halt vs inquire.
+///
+/// - Identical no-progress rounds ≥ `identical_limit` → halt (unless this
+///   round looks like a status poll **and** results changed — then allow
+///   while under [`STATUS_POLL_TIMED_ALLOW_ROUNDS`]).
+/// - `write_unknown_op` set → inquire, never treat as success / auto-replay.
+pub fn progress_loop_decision(
+    identical_rounds: usize,
+    identical_limit: usize,
+    call_fingerprints: &[String],
+    results_changed: bool,
+    status_poll_rounds: usize,
+    write_unknown_op: Option<&str>,
+) -> ProgressDecision {
+    if let Some(op) = write_unknown_op {
+        return ProgressDecision::InquireUnknown {
+            operation_id: op.to_string(),
+        };
+    }
+    let all_status = !call_fingerprints.is_empty()
+        && call_fingerprints
+            .iter()
+            .all(|fp| looks_like_status_poll(fp));
+    if all_status && results_changed {
+        if status_poll_rounds < STATUS_POLL_TIMED_ALLOW_ROUNDS {
+            return ProgressDecision::Allow;
+        }
+        // Timed allow exhausted — endless status polling is still a loop.
+        return ProgressDecision::HaltNoProgress {
+            identical_rounds: status_poll_rounds.max(identical_limit),
+        };
+    }
+    if let Some(halt) = loop_halt_decision(identical_rounds, identical_limit) {
+        let _ = halt;
+        return ProgressDecision::HaltNoProgress { identical_rounds };
+    }
+    ProgressDecision::Allow
+}
+
+/// Budget pressure order under assemble constraints (Round 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetPressureStep {
+    /// Drop / truncate nonessential transient skills first.
+    CompressNonessentialSkills,
+    /// Summarize older history groups (keep refs / details_ref stubs).
+    CompressOldHistory,
+    /// Keep current user + @refs + TaskState ops + newest tool pair.
+    KeepMandatoryContext,
+    /// Still cannot fit current-op feedback → stop or compress-retry;
+    /// never continue with tools after losing feedback (ZeroBudget path).
+    StopOrCompressRetryNoTools,
+}
+
+/// Canonical Round 3 pressure order for assemble / tests.
+pub fn budget_pressure_order() -> &'static [BudgetPressureStep] {
+    &[
+        BudgetPressureStep::CompressNonessentialSkills,
+        BudgetPressureStep::CompressOldHistory,
+        BudgetPressureStep::KeepMandatoryContext,
+        BudgetPressureStep::StopOrCompressRetryNoTools,
+    ]
+}
+
+/// Whether tools may continue after budget selection (aligns with ZeroBudget).
+pub fn tools_allowed_under_budget_pressure(
+    current_op_feedback_fits: bool,
+    history_select_zero_budget: bool,
+    history_was_nonempty: bool,
+) -> bool {
+    if !current_op_feedback_fits {
+        return false;
+    }
+    if history_was_nonempty && history_select_zero_budget {
+        return false;
+    }
+    true
+}
+
+/// Resolve a mutating write to an Operation ID ready for the execution lease.
+///
+/// - First attempt: dispatch Execute with empty id →
+///   [`TaskState::begin_new_operation_for_owner`] (owner from this stream).
+/// - Known terminal + schema `_new_operation: true` → fresh Operation.
+/// - Unknown + `_new_operation` alone → still InquireStatus (need user grant).
+/// - Prepared: returns that id for lease acquire.
+/// - Running / terminal: `Err(WriteDispatch)` — InProgress / PreferKnown / inquire.
+///
+/// `call_site_turn` is the immutable Turn ID of this stream/tool loop —
+/// passed into grant consume, never via a shared `turn_count` hop.
+pub fn prepare_mutating_dispatch(
+    state: &mut TaskState,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    write_fingerprint: &str,
+    stream_owner: Option<&str>,
+    call_site_turn: u64,
+) -> Result<OperationId, WriteDispatch> {
+    let authorize_new = wants_new_operation(arguments);
+    let dispatch = state.dispatch_mutating_write(write_fingerprint);
+
+    // Production new-op entry: terminal same-args + explicit `_new_operation`
+    // → begin a fresh Operation (resume without the flag never replays).
+    // Source constraints: PreferKnown/BlockedSucceeded accept the model
+    // protocol bit; InquireStatus (Unknown) also requires a consumed user grant.
+    if authorize_new {
+        match &dispatch {
+            WriteDispatch::PreferKnown {
+                operation_id,
+                result,
+            } => {
+                // Retry cap (wires the declared capability policy in):
+                // a Failed write may re-open only while its retry budget
+                // allows — OnFailure{max_attempts} counts prior Failed ops,
+                // Never/unknown capability never retries a failure.
+                // Exhausted → resume the known failed result instead of
+                // silently re-executing a non-idempotent write.
+                let latest_failed = state
+                    .latest_op_for_fingerprint(write_fingerprint)
+                    .is_some_and(|o| o.status == OperationStatus::Failed);
+                if latest_failed && !state.write_failure_may_retry(write_fingerprint) {
+                    tracing::warn!(
+                        fingerprint = write_fingerprint,
+                        "new-operation re-run refused: retry policy exhausted for failed write"
+                    );
+                    return Err(WriteDispatch::PreferKnown {
+                        operation_id: operation_id.clone(),
+                        result: result.clone(),
+                    });
+                }
+                let mut clean = arguments.clone();
+                strip_new_operation_flag(&mut clean);
+                let args = serde_json::to_string(&clean).unwrap_or_else(|_| "{}".into());
+                let id = state.begin_new_operation_for_owner(
+                    tool_name,
+                    extract_operation_target(&clean),
+                    args,
+                    Some(write_fingerprint.to_string()),
+                    stream_owner,
+                );
+                return Ok(id);
+            }
+            WriteDispatch::BlockedSucceeded { .. } => {
+                let mut clean = arguments.clone();
+                strip_new_operation_flag(&mut clean);
+                let args = serde_json::to_string(&clean).unwrap_or_else(|_| "{}".into());
+                let id = state.begin_new_operation_for_owner(
+                    tool_name,
+                    extract_operation_target(&clean),
+                    args,
+                    Some(write_fingerprint.to_string()),
+                    stream_owner,
+                );
+                return Ok(id);
+            }
+            WriteDispatch::InquireStatus { operation_id } => {
+                if state.take_user_authorized_new_op(
+                    operation_id,
+                    write_fingerprint,
+                    call_site_turn,
+                ) {
+                    let mut clean = arguments.clone();
+                    strip_new_operation_flag(&mut clean);
+                    let args = serde_json::to_string(&clean).unwrap_or_else(|_| "{}".into());
+                    let id = state.begin_new_operation_for_owner(
+                        tool_name,
+                        extract_operation_target(&clean),
+                        args,
+                        Some(write_fingerprint.to_string()),
+                        stream_owner,
+                    );
+                    return Ok(id);
+                }
+                return Err(WriteDispatch::InquireStatus {
+                    operation_id: operation_id.clone(),
+                });
+            }
+            WriteDispatch::InProgress { operation_id } => {
+                return Err(WriteDispatch::InProgress {
+                    operation_id: operation_id.clone(),
+                });
+            }
+            WriteDispatch::BlockedCancelled => return Err(WriteDispatch::BlockedCancelled),
+            WriteDispatch::Execute { .. } => { /* fall through — first attempt */ }
+        }
+    }
+
+    match dispatch {
+        WriteDispatch::Execute { operation_id } if operation_id.is_empty() => {
+            let mut clean = arguments.clone();
+            strip_new_operation_flag(&mut clean);
+            let args = serde_json::to_string(&clean).unwrap_or_else(|_| "{}".into());
+            let id = state.begin_new_operation_for_owner(
+                tool_name,
+                extract_operation_target(&clean),
+                args,
+                Some(write_fingerprint.to_string()),
+                stream_owner,
+            );
+            Ok(id)
+        }
+        WriteDispatch::Execute { operation_id } => Ok(operation_id),
+        other => Err(other),
+    }
+}
+
+/// Wall-clock validity window for a UI confirm request (15 minutes).
+///
+/// Server-side grants still expire on turn advance; this bound is for the
+/// host/UI button so stale confirm chips cannot be clicked forever.
+pub const UNKNOWN_RERUN_CONFIRM_VALIDITY_MS: u64 = 15 * 60 * 1000;
+
+/// Model-facing prose for an Unknown Operation re-run confirm.
+///
+/// Does **not** embed `write_fingerprint=` KV tokens — fingerprints with
+/// spaces (e.g. `shell|heramind device control …`) must travel via
+/// [`ConfirmRequest`] / WS JSON fields, never whitespace-split text parse.
+pub fn unknown_rerun_confirm_message(confirm: &ConfirmRequest) -> String {
+    let target = confirm
+        .target
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!(" target={t}"))
+        .unwrap_or_default();
+    format!(
+        "Write blocked: operation {op}{target} ended with unknown outcome (e.g. timeout). \
+         Inquire status; do not auto-replay; do not pretend success. A model-added \
+         `{flag}=true` alone is not user-authorized replay. Ask the user to confirm \
+         a re-run of THIS operation (confirm request {req}), then set `{flag}` \
+         from the tool schema.",
+        op = confirm.prior_operation_id,
+        target = target,
+        req = confirm.request_id,
+        flag = NEW_OPERATION_ARG,
+    )
+}
+
+/// Stream-path outcome for a mutating write gate (Round 2 + prod lease).
+#[derive(Debug)]
+pub enum MutatingGateOutcome {
+    /// Proceed to execute; caller holds the Running lease.
+    Proceed { operation_id: OperationId },
+    /// Same fingerprint already Running — wait; do not re-exec the tool.
+    InProgress { operation_id: OperationId },
+    /// Same-op resume — return known structured result without re-exec.
+    ResumeKnown {
+        operation_id: OperationId,
+        output: crate::toolkit::tool::ToolOutput,
+    },
+    /// Blocked (cancelled / unknown / succeeded without body).
+    ///
+    /// When `confirm` is set, the host/UI must render a button from the
+    /// structured fields (and the matching WS event) — never by parsing
+    /// fingerprint tokens out of `message` text.
+    Block {
+        message: String,
+        confirm: Option<ConfirmRequest>,
+    },
+}
+
+/// Evaluate + prepare the mutating write gate for stream_core / multimodal.
+///
+/// Acquires the atomic Prepared→Running lease; concurrent same-args callers
+/// get [`MutatingGateOutcome::InProgress`] so the tool runs once.
+///
+/// `stream_owner` is the calling stream's immutable token — passed into
+/// create/lease, never via a shared session hop.
+/// `call_site_turn` is the calling stream's immutable Turn ID — passed into
+/// grant consume vs `confirming_turn`, never via shared `turn_count`.
+pub fn evaluate_mutating_gate(
+    state: &mut TaskState,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    write_fingerprint: &str,
+    stream_owner: Option<&str>,
+    call_site_turn: u64,
+) -> MutatingGateOutcome {
+    // Structured correction constraints bind before Operation lease — prompt
+    // alone is not enough when the model still reaches for excluded routes.
+    if let Some(message) = state.constraint_block_reason(tool_name, arguments) {
+        return MutatingGateOutcome::Block {
+            message,
+            confirm: None,
+        };
+    }
+    match prepare_mutating_dispatch(
+        state,
+        tool_name,
+        arguments,
+        write_fingerprint,
+        stream_owner,
+        call_site_turn,
+    ) {
+        Ok(op_id) => {
+            if state.try_acquire_execution_lease(&op_id) {
+                MutatingGateOutcome::Proceed {
+                    operation_id: op_id,
+                }
+            } else {
+                // Race: another holder transitioned Prepared→Running first.
+                MutatingGateOutcome::InProgress {
+                    operation_id: op_id,
+                }
+            }
+        }
+        Err(WriteDispatch::InProgress { operation_id }) => {
+            MutatingGateOutcome::InProgress { operation_id }
+        }
+        Err(WriteDispatch::PreferKnown {
+            operation_id,
+            result,
+        }) => {
+            let body = serde_json::from_str::<serde_json::Value>(&result.body)
+                .unwrap_or_else(|_| serde_json::json!({ "body": result.body }));
+            // NM-247: PreferKnown means the prior result is reused — not a new
+            // execution. Spell that out so models do not invent prepared ids or
+            // treat the resume as a fresh attempt.
+            let not_reexecuted = !result.success;
+            let summary = if not_reexecuted {
+                format!(
+                    "PreferKnown: prior failure reused — not re-executed. \
+                     Last error: {}. To retry the same business call set \
+                     `{NEW_OPERATION_ARG}: true` (see tool schema); do not invent \
+                     prepared-operation tickets.",
+                    result.summary
+                )
+            } else {
+                result.summary.clone()
+            };
+            let mut data = serde_json::json!({
+                "_operation_resume": true,
+                "_not_reexecuted": not_reexecuted,
+                "operation_id": operation_id,
+                "success": result.success,
+                "summary": summary,
+                "data": body,
+            });
+            if let Some(r) = &result.details_ref {
+                data["_details_ref"] = serde_json::Value::String(r.clone());
+            }
+            // Outer success must match the Operation outcome — never mark
+            // pending/failed resumes as ToolOutput.success (effective_success
+            // and confirm_step_from_tool key on the outer flag).
+            let output = operation_envelope_tool_output(result.success, data, &summary);
+            MutatingGateOutcome::ResumeKnown {
+                operation_id: operation_id.clone(),
+                output,
+            }
+        }
+        Err(WriteDispatch::InquireStatus { operation_id }) => {
+            let target = state
+                .operation(&operation_id)
+                .and_then(|op| op.target.clone())
+                .or_else(|| extract_operation_target(arguments));
+            let confirm = state.issue_or_reuse_confirm_request(
+                &operation_id,
+                write_fingerprint,
+                tool_name,
+                target,
+            );
+            MutatingGateOutcome::Block {
+                message: unknown_rerun_confirm_message(&confirm),
+                confirm: Some(confirm),
+            }
+        }
+        Err(WriteDispatch::BlockedCancelled) => MutatingGateOutcome::Block {
+            message: "Write blocked: the task was cancelled. Do not replay mutations.".into(),
+            confirm: None,
+        },
+        Err(WriteDispatch::BlockedSucceeded { operation_id }) => MutatingGateOutcome::Block {
+            message: format!(
+                "Write blocked: mutation already succeeded on operation {operation_id}. Do not \
+                 replay it; report status or wait for evidence. Authorized re-run: set \
+                 `{NEW_OPERATION_ARG}=true` (see tool schema)."
+            ),
+            confirm: None,
+        },
+        Err(WriteDispatch::Execute { .. }) => MutatingGateOutcome::Block {
+            message: "Write blocked: unable to prepare operation.".into(),
+            confirm: None,
+        },
+    }
+}
+
+/// Build a gate envelope [`ToolOutput`] whose outer `success` matches the
+/// Operation outcome (inner `data.success` stays for the model).
+pub fn operation_envelope_tool_output(
+    succeeded: bool,
+    data: serde_json::Value,
+    summary: &str,
+) -> crate::toolkit::tool::ToolOutput {
+    if succeeded {
+        crate::toolkit::tool::ToolOutput::success(data)
+    } else {
+        crate::toolkit::tool::ToolOutput {
+            success: false,
+            data,
+            error: Some(summary.to_string()),
+            metadata: None,
+        }
+    }
+}
+
+/// In-progress gate result as a tool output (no second execution).
+///
+/// Outer `success` is false — pending is not a confirmed success step.
+pub fn in_progress_tool_output(operation_id: &str) -> crate::toolkit::tool::ToolOutput {
+    let summary = format!("operation {operation_id} already running — wait; do not re-exec");
+    let data = serde_json::json!({
+        "_operation_in_progress": true,
+        "operation_id": operation_id,
+        "success": false,
+        "summary": summary,
+        "message": format!(
+            "Operation {operation_id} is already in progress for these args. Wait for its result; do not start a duplicate execution."
+        ),
+    });
+    operation_envelope_tool_output(false, data, &summary)
+}
+
+/// Build a structured result and, when large, store the full body in
+/// [`crate::agent::types::LargeDataCache`] under `op:<id>` **before**
+/// publishing `details_ref=$cached:op:<id>`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_structured_result_with_cache(
+    cache: &mut crate::agent::types::LargeDataCache,
+    operation_id: &str,
+    tool_name: &str,
+    status_label: &str,
+    success: bool,
+    body: &str,
+    target: Option<&str>,
+    error: Option<&str>,
+) -> StructuredResult {
+    let summary = build_structured_summary(tool_name, status_label, body, target, error);
+    let details_ref = if body.len() > DETAILS_REF_BODY_THRESHOLD {
+        Some(cache.store_operation_body(operation_id, body))
+    } else {
+        None
+    };
+    StructuredResult::with_body(success, summary, cap_result_body(body), details_ref)
+}
+
+/// Apply a tool execution outcome onto the Operation record.
+///
+/// Large bodies are stored in `cache` under `$cached:op:<id>` before the
+/// model-facing `details_ref` is published (session-scoped; eviction → clear
+/// fail on read — never treat a truncated body as the sole fact).
+pub fn finalize_operation_from_tool_result(
+    state: &mut TaskState,
+    cache: &mut crate::agent::types::LargeDataCache,
+    operation_id: &str,
+    tool_name: &str,
+    result: &Result<crate::toolkit::tool::ToolOutput, crate::toolkit::error::ToolError>,
+) {
+    if operation_id.is_empty() {
+        return;
+    }
+    let target = state
+        .operation(operation_id)
+        .and_then(|op| op.target.clone());
+    if outcome_is_unknown(result) {
+        let body = match result {
+            Ok(out) => out.data.to_string(),
+            Err(e) => e.to_string(),
+        };
+        state.complete_operation_unknown(
+            operation_id,
+            build_structured_result_with_cache(
+                cache,
+                operation_id,
+                tool_name,
+                "unknown",
+                false,
+                &body,
+                target.as_deref(),
+                None,
+            ),
+        );
+        return;
+    }
+    match result {
+        Ok(out)
+            if crate::toolkit::tool::effective_success(
+                &crate::tools::resolve_tool_name(tool_name),
+                out,
+            ) =>
+        {
+            let body = out.data.to_string();
+            state.complete_operation_succeeded(
+                operation_id,
+                build_structured_result_with_cache(
+                    cache,
+                    operation_id,
+                    tool_name,
+                    "succeeded",
+                    true,
+                    &body,
+                    target.as_deref(),
+                    None,
+                ),
+                None::<String>,
+            );
+        }
+        Ok(out) => {
+            let body = out.data.to_string();
+            let err = out
+                .error
+                .clone()
+                .unwrap_or_else(|| "tool reported failure".into());
+            let rejected = outcome_is_pre_submission_rejection(tool_name, result);
+            let structured = build_structured_result_with_cache(
+                cache,
+                operation_id,
+                tool_name,
+                if rejected { "rejected" } else { "failed" },
+                false,
+                &body,
+                target.as_deref(),
+                Some(&err),
+            );
+            if rejected {
+                state.complete_operation_rejected(operation_id, structured);
+            } else {
+                state.complete_operation_failed(operation_id, structured);
+            }
+        }
+        Err(e) => {
+            let err = e.to_string();
+            let rejected = outcome_is_pre_submission_rejection(tool_name, result);
+            let structured = build_structured_result_with_cache(
+                cache,
+                operation_id,
+                tool_name,
+                if rejected { "rejected" } else { "failed" },
+                false,
+                &err,
+                target.as_deref(),
+                Some(&err),
+            );
+            if rejected {
+                state.complete_operation_rejected(operation_id, structured);
+            } else {
+                state.complete_operation_failed(operation_id, structured);
+            }
+        }
+    }
+}
+
+/// True when a non-unknown failure is guaranteed to have been rejected BEFORE
+/// reaching backend side-effect execution:
+/// - tool argument validation (`ToolError::InvalidArguments`)
+/// - clap syntax/parse rejection (`exit_code == 2` on `shell`)
+/// - local JSON/param validation or unbound `PreparedInvoke` ("not executed")
+/// - API 422 / 400 validation preflight ("was NOT sent", schema/field errors)
+/// - localhost `http_connect` / connection refused ("not submitted")
+///
+/// Always called AFTER [`outcome_is_unknown`] so timeouts / ambiguous transport
+/// remain `OperationStatus::Unknown`. Real server execution errors (5xx,
+/// adapter runtime send failures, etc.) return `false` and stay `Failed`.
+pub fn outcome_is_pre_submission_rejection(
+    tool_name: &str,
+    result: &Result<crate::toolkit::tool::ToolOutput, crate::toolkit::error::ToolError>,
+) -> bool {
+    if outcome_is_unknown(result) {
+        return false;
+    }
+    match result {
+        Err(crate::toolkit::error::ToolError::InvalidArguments(_)) => true,
+        Err(e) => {
+            let l = e.to_string().to_lowercase();
+            l.contains("http_connect:")
+                || l.contains("not submitted")
+                || l.contains("was not sent")
+                || (l.contains("connection refused") && l.contains("not reached"))
+        }
+        Ok(out) => {
+            let resolved = crate::tools::resolve_tool_name(tool_name);
+            if resolved == "shell" && out.data.get("exit_code").and_then(|v| v.as_i64()) == Some(2)
+            {
+                return true;
+            }
+            let mut blob = String::new();
+            if let Some(e) = out.error.as_deref() {
+                blob.push_str(e);
+                blob.push('\n');
+            }
+            if let Some(s) = out.data.get("stderr").and_then(|v| v.as_str()) {
+                blob.push_str(s);
+                blob.push('\n');
+            }
+            if let Some(s) = out.data.get("stdout").and_then(|v| v.as_str()) {
+                blob.push_str(s);
+            }
+            text_indicates_pre_submission_rejection(&blob)
+        }
+    }
+}
+
+fn text_indicates_pre_submission_rejection(text: &str) -> bool {
+    let l = text.to_lowercase();
+    // Explicit connect-refuse / never reached server.
+    if l.contains("http_connect:")
+        || l.contains("not submitted")
+        || (l.contains("connection refused") && l.contains("not reached"))
+    {
+        return true;
+    }
+    // Local pre-dispatch / JSON / argument / PreparedInvoke rejection.
+    if l.contains("invalid json")
+        || l.contains("is not valid json")
+        || l.contains("\"code\":\"invalid_json\"")
+        || l.contains("\"code\": \"invalid_json\"")
+        || l.contains("\"code\":\"missing_name\"")
+        || l.contains("\"code\": \"missing_name\"")
+        || l.contains("\"code\":\"missing_type\"")
+        || l.contains("\"code\": \"missing_type\"")
+        || l.contains("\"code\":\"missing_fields\"")
+        || l.contains("\"code\": \"missing_fields\"")
+        || l.contains("\"code\":\"unknown_type\"")
+        || l.contains("\"code\": \"unknown_type\"")
+        || l.contains("\"code\":\"invalid_schedule_config\"")
+        || l.contains("\"code\": \"invalid_schedule_config\"")
+        || l.contains("conflict: pass json via shell")
+        || l.contains("preparedinvoke missing")
+        || l.contains("preparedinvoke stale")
+        || l.contains("fabricated tool output refused")
+    {
+        return true;
+    }
+    // Server preflight explicitly declaring command was NOT sent.
+    if l.contains("was not sent") || l.contains("not sent:") {
+        return true;
+    }
+    // HTTP 422 Unprocessable Entity is validation before execution.
+    if l.contains("api error (422") {
+        return true;
+    }
+    // HTTP 400 Bad Request when paired with validation/schema/parse markers
+    // (excludes runtime adapter send errors wrapped in 400 like "no adapter connected").
+    if l.contains("api error (400")
+        && (l.contains("missing field")
+            || l.contains("unknown field")
+            || l.contains("missing required")
+            || l.contains("validation")
+            || l.contains("invalid")
+            || l.contains("params_example")
+            || l.contains("input_schema")
+            || l.contains("unknown command")
+            || l.contains("command not found")
+            || l.contains("cannot be empty")
+            || l.contains("must be")
+            || l.contains("failed to deserialize"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Apply a progress-loop stop to TaskState (all entry points: text + image).
+///
+/// Writes a halt reason so status is [`TaskStatus::Halted`] — never leaves
+/// the task [`TaskStatus::Active`] after a stop decision.
+pub fn apply_progress_stop(state: &mut TaskState, decision: &ProgressDecision) -> bool {
+    match decision {
+        ProgressDecision::HaltNoProgress { identical_rounds } => {
+            let reason =
+                format!("progress loop halt after {identical_rounds} identical no-progress rounds");
+            let _ = state.halt(reason);
+            true
+        }
+        ProgressDecision::InquireUnknown { operation_id } => {
+            // Not a success; pin Halted so Active cannot be mistaken for progress.
+            let _ = state.halt(format!(
+                "write outcome unknown on operation {operation_id} — inquire, do not auto-replay"
+            ));
+            // `halt` clears next_action; re-attach the inquire directive.
+            state.next_action = Some(NextAction {
+                description: format!(
+                    "Inquire status of operation {operation_id} (outcome unknown)"
+                ),
+                source: "progress_loop".into(),
+            });
+            true
+        }
+        ProgressDecision::Allow => false,
+    }
+}
+
+/// True when a tool outcome is timeout / indeterminate (→ Operation Unknown).
+///
+/// Aligned with shell transport staging (NM-247): `http_timeout` /
+/// ambiguous `http_transport` / "result unknown" → Unknown even when the
+/// text has no "timeout" substring. Connection refuse / `http_connect` /
+/// "not submitted" stays Failed (known not executed).
+pub fn outcome_is_unknown(
+    result: &Result<crate::toolkit::tool::ToolOutput, crate::toolkit::error::ToolError>,
+) -> bool {
+    match result {
+        Ok(out) => {
+            if out
+                .data
+                .get("timed_out")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            // Shell put transport text in data.stderr (success envelope with
+            // exit_code != 0); also scan out.error for guidance markers.
+            let mut blob = String::new();
+            if let Some(e) = out.error.as_deref() {
+                blob.push_str(e);
+                blob.push('\n');
+            }
+            if let Some(s) = out.data.get("stderr").and_then(|v| v.as_str()) {
+                blob.push_str(s);
+            }
+            text_indicates_outcome_unknown(&blob)
+        }
+        Err(e) => {
+            matches!(e, crate::toolkit::error::ToolError::Timeout)
+                || text_indicates_outcome_unknown(&e.to_string())
+        }
+    }
+}
+
+/// Shared markers for ledger Unknown vs Failed (shell + Err paths).
+fn text_indicates_outcome_unknown(text: &str) -> bool {
+    let l = text.to_lowercase();
+    // Known-not-submitted transport → Failed (do not inquire / auto-treat as
+    // maybe-landed). Prefer explicit connect tags / "not submitted".
+    if l.contains("http_connect:")
+        || l.contains("not submitted")
+        || (l.contains("connection refused") && l.contains("not reached"))
+    {
+        return false;
+    }
+    l.contains("result unknown")
+        || l.contains("outcome unknown")
+        || l.contains("http_timeout:")
+        || l.contains("http_transport:")
+        || l.contains("timed out")
+        || l.contains("timeout")
+}
+
+// ─── G3: loop classification / halt honesty ───────────────────────────────
+
+/// Classification of one tool round relative to recent fingerprints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoundClass {
+    /// First time we see this result set, or new calls were introduced.
+    Progress,
+    /// Same calls + identical results as a recent round (no new information).
+    NoProgressRepeat { identical_rounds: usize },
+}
+
+/// Why the tool loop was force-stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoopHaltReason {
+    NoProgressRepeat,
+    WallClock,
+    ReadOnlyStreak,
+    SkillExplorationExhausted,
+    IterationCap,
+}
+
+/// Forced loop stop — never a successful task completion by itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopHalt {
+    pub reason: LoopHaltReason,
+    pub detail: String,
+    /// Always false for G3 force-stops.
+    pub counts_as_task_success: bool,
+}
+
+impl LoopHalt {
+    pub fn no_progress(identical_rounds: usize) -> Self {
+        Self {
+            reason: LoopHaltReason::NoProgressRepeat,
+            detail: format!("identical tool result sets for {identical_rounds} consecutive rounds"),
+            counts_as_task_success: false,
+        }
+    }
+}
+
+/// Default identical-round limit matching chat stream (`CHAT_IDENTICAL_ROUNDS_LIMIT`).
+pub const DEFAULT_IDENTICAL_ROUNDS_LIMIT: usize = 3;
+
+/// Classify a round given the consecutive identical-set counter from the
+/// existing [`ChatLoopProgress`]-style observer.
+pub fn classify_round(identical_rounds: usize) -> RoundClass {
+    if identical_rounds == 0 {
+        RoundClass::Progress
+    } else {
+        RoundClass::NoProgressRepeat { identical_rounds }
+    }
+}
+
+/// Decide whether to halt. Halt never counts as task success.
+pub fn loop_halt_decision(identical_rounds: usize, limit: usize) -> Option<LoopHalt> {
+    if identical_rounds >= limit {
+        Some(LoopHalt::no_progress(identical_rounds))
+    } else {
+        None
+    }
+}
+
+/// Status-like call signatures: repeating them with **changed** results is
+/// legitimate polling (handled upstream by resetting identical_rounds).
+/// Repeating with **identical** results is no-progress (see [`classify_round`]).
+pub fn looks_like_status_poll(call_fingerprint: &str) -> bool {
+    let f = call_fingerprint.to_lowercase();
+    f.contains("status")
+        || f.contains("|get")
+        || f.contains("list")
+        || f.contains("sysinfo")
+        || f.contains("health")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_domain_action_skips_global_cli_flags() {
+        let args = serde_json::json!({
+            "command": "heramind --json rule create --name x"
+        });
+        assert_eq!(
+            extract_operation_domain_action("shell", &args),
+            (Some("rule".to_string()), Some("create".to_string()))
+        );
+        let mid = serde_json::json!({
+            "command": "heramind extension --json config weather"
+        });
+        assert_eq!(
+            extract_operation_domain_action("shell", &mid),
+            (Some("extension".to_string()), Some("config".to_string()))
+        );
+    }
+
+    #[test]
+    fn correct_overwrites_goal_and_clears_next() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "写天气到墨水屏".into(),
+            object: Some("screen-a".into()),
+            content: Some("晴".into()),
+        });
+        s.set_next_action("call render_text", "planner");
+        s.apply_directive(TaskDirective::Correct {
+            goal: "写到 eink EK410".into(),
+            object: Some("EK410".into()),
+            content: None,
+            method: None,
+            exclude_routes: vec![],
+        });
+        assert_eq!(s.goal.as_deref(), Some("写到 eink EK410"));
+        assert_eq!(s.object.as_deref(), Some("EK410"));
+        assert_eq!(s.content.as_deref(), Some("晴")); // content kept when correction omits it
+        assert!(s.next_action.is_none());
+        assert_eq!(s.status, TaskStatus::Active);
+    }
+
+    #[test]
+    fn cancel_stops_and_blocks_writes() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "render".into(),
+            object: Some("EK410".into()),
+            content: None,
+        });
+        let fp = write_fingerprint("shell", "heramind ext invoke render");
+        assert!(s.may_execute_write(&fp));
+        s.apply_directive(TaskDirective::Cancel);
+        assert_eq!(s.status, TaskStatus::Cancelled);
+        assert!(!s.may_execute_write(&fp));
+        assert_eq!(
+            s.dispatch_mutating_write(&fp),
+            WriteDispatch::BlockedCancelled
+        );
+        assert_eq!(
+            s.apply_directive(TaskDirective::Continue),
+            ApplyOutcome::Ignored {
+                reason: "cancelled"
+            }
+        );
+    }
+
+    #[test]
+    fn continue_does_not_replay_successful_write() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "写天气".into(),
+            object: Some("EK410".into()),
+            content: None,
+        });
+        let fp = write_fingerprint("shell", "render_text EK410");
+        let op = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"render_text EK410"}"#,
+            Some(fp.clone()),
+        );
+        s.mark_operation_running(&op);
+        s.complete_operation_succeeded(
+            &op,
+            StructuredResult {
+                success: true,
+                summary: "render queued".into(),
+                body: "queued".into(),
+                details_ref: None,
+            },
+            ["ack-queued-1".into()],
+        );
+        // Evidence-only confirm
+        s.confirm_step_from_tool("shell", &fp, "ack-queued-1", "render queued");
+        s.apply_directive(TaskDirective::Continue);
+        assert_eq!(s.status, TaskStatus::Active);
+        assert!(
+            !s.may_execute_write(&fp),
+            "continue must not replay a write that already succeeded"
+        );
+        assert!(matches!(
+            s.dispatch_mutating_write(&fp),
+            WriteDispatch::PreferKnown { .. }
+        ));
+        assert_eq!(s.confirmed_steps.len(), 1);
+        assert!(matches!(
+            s.confirmed_steps[0].source,
+            StepSource::ToolResult { .. }
+        ));
+    }
+
+    #[test]
+    fn complete_requires_evidence_id_not_narration() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "done?".into(),
+            object: None,
+            content: None,
+        });
+        // No complete_with_evidence → still Active even if model would claim done.
+        assert_eq!(s.status, TaskStatus::Active);
+        assert!(s.complete_with_evidence("device:EK410:ack"));
+        assert!(matches!(
+            s.status,
+            TaskStatus::Completed { evidence_id } if evidence_id == "device:EK410:ack"
+        ));
+    }
+
+    #[test]
+    fn parse_continue_correct_cancel_zh_en() {
+        assert_eq!(parse_user_directive("继续"), Some(TaskDirective::Continue));
+        assert_eq!(
+            parse_user_directive("continue"),
+            Some(TaskDirective::Continue)
+        );
+        assert_eq!(parse_user_directive("取消"), Some(TaskDirective::Cancel));
+        assert_eq!(parse_user_directive("cancel"), Some(TaskDirective::Cancel));
+        match parse_user_directive("改成 eink 屏 EK410") {
+            Some(TaskDirective::Correct { goal, object, .. }) => {
+                assert!(goal.contains("eink"));
+                assert_eq!(object.as_deref(), Some("EK410"));
+            }
+            other => panic!("expected Correct, got {other:?}"),
+        }
+        // Round 1: ordinary / re-send phrases are Turns, not directives.
+        assert!(parse_user_directive("把天气写到屏幕").is_none());
+        assert!(parse_user_directive("再发送一次").is_none());
+        assert!(parse_user_directive("好的").is_none());
+        assert!(parse_user_directive("你好").is_none());
+        // Confirm phrases are not directives — request consumption is required.
+        assert!(parse_user_directive("确认重跑").is_none());
+        assert!(parse_user_directive("confirm re-run").is_none());
+        assert!(is_authorize_new_operation_phrase("确认重跑"));
+        assert!(is_authorize_new_operation_phrase("confirm re-run"));
+    }
+
+    #[test]
+    fn route_polarity_chinese_prefix_before_webhook_is_char_boundary_safe() {
+        // 10 CJK chars = 30 bytes before "webhook". A raw `idx - 28` byte
+        // window lands mid-char and used to panic on slice.
+        let padded = "一二三四五六七八九十webhook";
+        assert_eq!(
+            route_polarity(&padded.to_lowercase(), NOTIFY_WEBHOOK_TERMS),
+            RoutePolarity::Neutral
+        );
+        let rejected = "一二三四五六七八九十不要用webhook";
+        assert_eq!(
+            route_polarity(&rejected.to_lowercase(), NOTIFY_WEBHOOK_TERMS),
+            RoutePolarity::Rejected
+        );
+        // Full directive path must also survive the same UTF-8 lookback.
+        match parse_user_directive("一二三四五六七八九十不是 webhook，用设备原生命令")
+        {
+            Some(TaskDirective::Correct {
+                method,
+                exclude_routes,
+                ..
+            }) => {
+                assert_eq!(method, Some(ExecutionMethod::DeviceNativeCommand));
+                assert!(exclude_routes.contains(&ExcludedRoute::NotificationOrWebhook));
+            }
+            other => panic!("expected zh padded route Correct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn correction_binds_device_method_and_excludes_webhook_push() {
+        // Acceptance: after “not webhook, use device-native command”,
+        // constraints bind (no eink/weather keyword branch).
+        match parse_user_directive("not webhook, use device-native command") {
+            Some(TaskDirective::Correct {
+                method,
+                exclude_routes,
+                ..
+            }) => {
+                assert_eq!(method, Some(ExecutionMethod::DeviceNativeCommand));
+                assert!(exclude_routes.contains(&ExcludedRoute::NotificationOrWebhook));
+                assert!(!exclude_routes.contains(&ExcludedRoute::DeviceNativeCommand));
+            }
+            other => panic!("expected route Correct, got {other:?}"),
+        }
+        match parse_user_directive("不是 webhook，用设备原生命令") {
+            Some(TaskDirective::Correct {
+                method,
+                exclude_routes,
+                ..
+            }) => {
+                assert_eq!(method, Some(ExecutionMethod::DeviceNativeCommand));
+                assert!(exclude_routes.contains(&ExcludedRoute::NotificationOrWebhook));
+                assert!(!exclude_routes.contains(&ExcludedRoute::DeviceNativeCommand));
+            }
+            other => panic!("expected zh route Correct, got {other:?}"),
+        }
+        // Ordinary goal statements stay Turns (no reject cue).
+        assert!(parse_user_directive("把天气写到屏幕").is_none());
+        assert!(parse_user_directive("configure the webhook for weather").is_none());
+    }
+
+    #[test]
+    fn correction_opposite_does_not_ban_preferred_webhook() {
+        // EN: reject device, prefer webhook — must NOT exclude webhook.
+        match parse_user_directive("don't use device, use webhook") {
+            Some(TaskDirective::Correct {
+                method,
+                exclude_routes,
+                ..
+            }) => {
+                assert!(
+                    exclude_routes.contains(&ExcludedRoute::DeviceNativeCommand),
+                    "device path must be excluded: {exclude_routes:?}"
+                );
+                assert!(
+                    !exclude_routes.contains(&ExcludedRoute::NotificationOrWebhook),
+                    "preferred webhook must not be banned: {exclude_routes:?}"
+                );
+                assert!(
+                    method.is_none(),
+                    "must not force device-native method when device was rejected"
+                );
+            }
+            other => panic!("expected opposite Correct, got {other:?}"),
+        }
+        // ZH opposite.
+        match parse_user_directive("不要用设备，用 webhook") {
+            Some(TaskDirective::Correct {
+                method,
+                exclude_routes,
+                ..
+            }) => {
+                assert!(exclude_routes.contains(&ExcludedRoute::DeviceNativeCommand));
+                assert!(!exclude_routes.contains(&ExcludedRoute::NotificationOrWebhook));
+                assert!(method.is_none());
+            }
+            other => panic!("expected zh opposite Correct, got {other:?}"),
+        }
+
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::Correct {
+            goal: "don't use device, use webhook".into(),
+            object: None,
+            content: None,
+            method: None,
+            exclude_routes: vec![ExcludedRoute::DeviceNativeCommand],
+        });
+        let call_site = s.note_user_turn();
+        let dc_args = serde_json::json!({
+            "device": "cam-1",
+            "command": "render_text",
+            "params": {"text": "x"}
+        });
+        let fp = crate::agent::streaming::mutating_write_fingerprint("device_command", &dc_args)
+            .expect("device_command write");
+        match evaluate_mutating_gate(&mut s, "device_command", &dc_args, &fp, None, call_site) {
+            MutatingGateOutcome::Block { message, .. } => {
+                assert!(
+                    message.contains("device-native") || message.contains("excluded"),
+                    "{message}"
+                );
+            }
+            other => {
+                panic!("device_command must be blocked after opposite correction, got {other:?}")
+            }
+        }
+        let push_args = serde_json::json!({
+            "command": "heramind push start weather-screen"
+        });
+        let fp_push = crate::agent::streaming::mutating_write_fingerprint("shell", &push_args)
+            .expect("push write");
+        match evaluate_mutating_gate(&mut s, "shell", &push_args, &fp_push, None, call_site) {
+            MutatingGateOutcome::Proceed { .. } => {}
+            other => panic!("preferred webhook/push must proceed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_object_prefix_offsets_stay_on_original_text() {
+        // Lowercasing K (U+212A, 3 bytes) → "k" (1 byte) shortens the
+        // string; searching a lowercased copy then slicing the original
+        // used to panic mid-char. Ids stay short so the digit+alpha token
+        // loop does not short-circuit before the prefix path.
+        assert_eq!(extract_object("Kdevice:xy"), Some("xy".into()));
+        assert_eq!(extract_object("K@device:ab"), Some("ab".into()));
+        // İ (U+0130) expands under to_lowercase; ASCII-CI on original is safe.
+        assert_eq!(extract_object("İdevice:zz"), Some("zz".into()));
+        assert_eq!(extract_object("DEVICE:EK410"), Some("EK410".into()));
+    }
+
+    #[test]
+    fn goal_object_name_id_at_same_device_same_verdict() {
+        assert!(goal_objects_equivalent("cam-1", "device:cam-1"));
+        assert!(goal_objects_equivalent("cam-1", "@device:cam-1"));
+        assert!(goal_objects_equivalent("device:cam-1", "CAM-1"));
+        assert!(!goal_objects_equivalent("cam-1", "cam-2"));
+
+        let mut s = TaskState::default();
+        // Object as display-ish id form from @ / device: prefix — same device.
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "update screen".into(),
+            object: Some("device:cam-1".into()),
+            content: None,
+        });
+        s.method = Some(ExecutionMethod::DeviceNativeCommand);
+        s.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({"device": "cam-1", "command": "render_text"}),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "cam-1",
+                "command": "render_text",
+                "delivery": "adapter_accepted"
+            }),
+            Some("op-at"),
+        );
+        assert!(s.evaluate_goal_claim(GoalClaimKind::CommandSent).is_ok());
+
+        // Bare id object vs same evidence.
+        let mut s2 = TaskState::default();
+        s2.apply_directive(TaskDirective::SetGoal {
+            goal: "update screen".into(),
+            object: Some("cam-1".into()),
+            content: None,
+        });
+        s2.method = Some(ExecutionMethod::DeviceNativeCommand);
+        s2.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({"device": "cam-1", "command": "render_text"}),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "cam-1",
+                "command": "render_text",
+                "delivery": "adapter_accepted"
+            }),
+            Some("op-bare"),
+        );
+        assert_eq!(
+            s.evaluate_goal_claim(GoalClaimKind::CommandSent).is_ok(),
+            s2.evaluate_goal_claim(GoalClaimKind::CommandSent).is_ok()
+        );
+        match (s.system_goal_status(), s2.system_goal_status()) {
+            (
+                SystemGoalStatus::CompleteEligible {
+                    task_complete_ok: true,
+                    ..
+                },
+                SystemGoalStatus::CompleteEligible {
+                    task_complete_ok: true,
+                    ..
+                },
+            ) => {}
+            (a, b) => panic!("name/id/@ must yield same verdict: {a:?} vs {b:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinary_device_command_without_set_goal_yields_useful_goal_status() {
+        // NL → tools → End: no prefilled TaskState / SetGoal.
+        let mut s = TaskState::default();
+        assert!(matches!(
+            s.system_goal_status(),
+            SystemGoalStatus::NotApplicable
+        ));
+        s.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({"device": "cam-1", "command": "reboot"}),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "cam-1",
+                "command": "reboot",
+                "delivery": "adapter_accepted"
+            }),
+            Some("op-nl-1"),
+        );
+        assert!(s.goal.is_some(), "auto-bind goal from device_command");
+        assert_eq!(s.object.as_deref(), Some("cam-1"));
+        assert_eq!(s.method, Some(ExecutionMethod::DeviceNativeCommand));
+        let status = s.system_goal_status();
+        match &status {
+            SystemGoalStatus::CompleteEligible {
+                task_complete_ok: true,
+                level: GoalEvidenceLevel::CommandDispatched,
+                operation_id: Some(op),
+                ..
+            } => assert_eq!(op, "op-nl-1"),
+            other => panic!("expected useful CompleteEligible from device_command, got {other:?}"),
+        }
+        // Later unrelated current_operation_id must not hide the goal set.
+        s.current_operation_id = "op-other".into();
+        match s.system_goal_status() {
+            SystemGoalStatus::CompleteEligible {
+                operation_id: Some(op),
+                ..
+            } => assert_eq!(op, "op-nl-1"),
+            other => panic!("goal-set status must ignore stray current op, got {other:?}"),
+        }
+
+        // End → stamp → reload: history keeps goalStatus without TaskState.
+        let mut agent = crate::agent::types::AgentInternalState::new("nl-goal".into());
+        agent.push_message(crate::agent::types::AgentMessage::user(
+            "reboot cam-1 please",
+        ));
+        agent.push_message(crate::agent::types::AgentMessage::assistant(
+            "command dispatched",
+        ));
+        agent.task_state = s;
+        let stamped = agent.task_state.system_goal_status();
+        agent.stamp_final_goal_on_last_assistant(stamped.clone(), StreamEndReason::Normal);
+        let snap = agent.memory.clone();
+        // Simulate reload: restore messages only — no TaskState / SetGoal seed.
+        let mut reloaded = crate::agent::types::AgentInternalState::new("nl-goal".into());
+        reloaded.restore_memory(snap);
+        assert!(
+            matches!(
+                reloaded.task_state.system_goal_status(),
+                SystemGoalStatus::NotApplicable
+            ),
+            "reload must not recompute from empty TaskState"
+        );
+        let last = reloaded
+            .memory
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .expect("assistant");
+        assert_eq!(last.goal_status.as_ref(), Some(&stamped));
+        assert_eq!(last.end_reason, Some(StreamEndReason::Normal));
+        match last.goal_status.as_ref().unwrap() {
+            SystemGoalStatus::CompleteEligible {
+                task_complete_ok: true,
+                level: GoalEvidenceLevel::CommandDispatched,
+                operation_id: Some(op),
+                ..
+            } => assert_eq!(op, "op-nl-1"),
+            other => panic!("reloaded history goalStatus must stay useful, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continue_keeps_corrected_constraints_and_blocks_push() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "update the screen".into(),
+            object: Some("cam-1".into()),
+            content: Some("晴".into()),
+        });
+        // User was on a push path; corrects to device-native.
+        s.apply_directive(TaskDirective::Correct {
+            goal: "not webhook, use device-native command on cam-1".into(),
+            object: Some("cam-1".into()),
+            content: None, // keep prior content
+            method: Some(ExecutionMethod::DeviceNativeCommand),
+            exclude_routes: vec![ExcludedRoute::NotificationOrWebhook],
+        });
+        assert_eq!(s.content.as_deref(), Some("晴"));
+        assert_eq!(s.method, Some(ExecutionMethod::DeviceNativeCommand));
+        assert!(s
+            .excluded_routes
+            .contains(&ExcludedRoute::NotificationOrWebhook));
+
+        s.note_user_turn();
+        s.apply_directive(TaskDirective::Continue);
+        assert!(s.goal.as_deref().unwrap().contains("device-native"));
+        assert_eq!(s.object.as_deref(), Some("cam-1"));
+        assert_eq!(s.content.as_deref(), Some("晴"));
+        assert_eq!(s.method, Some(ExecutionMethod::DeviceNativeCommand));
+        assert!(s
+            .excluded_routes
+            .contains(&ExcludedRoute::NotificationOrWebhook));
+
+        let prompt = s.to_prompt_section().expect("prompt");
+        assert!(prompt.contains("Constraints"));
+        assert!(prompt.contains("device_native_command"));
+        assert!(prompt.contains("notification_or_webhook"));
+
+        let call_site = s.turn_count;
+        let push_args = serde_json::json!({
+            "command": "heramind push start weather-screen"
+        });
+        let fp = crate::agent::streaming::mutating_write_fingerprint("shell", &push_args)
+            .expect("push start is a write");
+        match evaluate_mutating_gate(&mut s, "shell", &push_args, &fp, None, call_site) {
+            MutatingGateOutcome::Block { message, confirm } => {
+                assert!(message.contains("excluded"), "{message}");
+                assert!(confirm.is_none());
+            }
+            other => panic!("push must be blocked by correction constraints, got {other:?}"),
+        }
+
+        // Device-native path remains allowed.
+        let dc_args = serde_json::json!({
+            "device": "cam-1",
+            "command": "render_text",
+            "params": {"text": "晴"}
+        });
+        let fp_dc = crate::agent::streaming::mutating_write_fingerprint("device_command", &dc_args)
+            .expect("device_command write");
+        match evaluate_mutating_gate(&mut s, "device_command", &dc_args, &fp_dc, None, call_site) {
+            MutatingGateOutcome::Proceed { .. } => {}
+            other => panic!("device_command must proceed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn followup_correct_do_not_lift_anti_replay_reexecute_advances_operation() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "写天气到 EK410".into(),
+            object: Some("EK410".into()),
+            content: None,
+        });
+        let fp = write_fingerprint("shell", "heramind ext invoke render --device EK410");
+        let op1 = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"heramind ext invoke render --device EK410"}"#,
+            Some(fp.clone()),
+        );
+        s.mark_operation_running(&op1);
+        s.complete_operation_succeeded(
+            &op1,
+            StructuredResult {
+                success: true,
+                summary: "render queued".into(),
+                body: "queued-1".into(),
+                details_ref: None,
+            },
+            None::<String>,
+        );
+        s.confirm_step_from_tool("shell", &fp, "queued-1", "render queued");
+        assert!(!s.may_execute_write(&fp));
+        assert_eq!(s.write_ledger.len(), 1);
+        assert_eq!(s.current_operation_id, op1);
+
+        // Follow-up turn + Continue: still gated; ledger kept.
+        s.note_user_turn();
+        s.apply_directive(TaskDirective::Continue);
+        assert!(!s.may_execute_write(&fp));
+        assert_eq!(s.write_ledger.len(), 1);
+
+        // Correct: goal updates; anti-replay stays; steps kept.
+        s.note_user_turn();
+        s.apply_directive(TaskDirective::Correct {
+            goal: "写到 eink EK410 更大字号".into(),
+            object: Some("EK410".into()),
+            content: None,
+            method: None,
+            exclude_routes: vec![],
+        });
+        assert!(!s.may_execute_write(&fp));
+        assert_eq!(s.confirmed_steps.len(), 1);
+        assert_eq!(s.write_ledger.len(), 1);
+
+        // Explicit re-execute = new operation (no wipe).
+        let op2 = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"heramind ext invoke render --device EK410"}"#,
+            Some(fp.clone()),
+        );
+        assert_ne!(op2, op1);
+        assert_eq!(s.current_operation_id, op2);
+        assert_eq!(s.write_ledger.len(), 1, "ledger must survive re-execute");
+        assert!(
+            s.may_execute_write(&fp),
+            "new operation may re-run the same fingerprint"
+        );
+        s.mark_operation_running(&op2);
+        s.complete_operation_succeeded(
+            &op2,
+            StructuredResult {
+                success: true,
+                summary: "render queued again".into(),
+                body: "queued-2".into(),
+                details_ref: None,
+            },
+            None::<String>,
+        );
+        assert_eq!(s.write_ledger.len(), 2);
+        assert!(!s.may_execute_write(&fp));
+    }
+
+    #[test]
+    fn weather_to_screen_regression_continue_blocks_reexecute_allows() {
+        // Shared weather→screen path: resume must not replay; new operation may.
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "把天气写到 EK410 屏幕".into(),
+            object: Some("EK410".into()),
+            content: Some("晴".into()),
+        });
+        let fp = write_fingerprint(
+            "shell",
+            "heramind extension invoke weather-forecast-v2 render_text --device EK410",
+        );
+        let op = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"heramind extension invoke weather-forecast-v2 render_text --device EK410"}"#,
+            Some(fp.clone()),
+        );
+        s.mark_operation_running(&op);
+        s.complete_operation_succeeded(
+            &op,
+            StructuredResult {
+                success: true,
+                summary: "render queued".into(),
+                body: "queued".into(),
+                details_ref: None,
+            },
+            None::<String>,
+        );
+        s.confirm_step_from_tool("shell", &fp, "queued", "render queued");
+        s.note_user_turn();
+        s.apply_directive(TaskDirective::Continue);
+        assert!(!s.may_execute_write(&fp));
+        s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"heramind extension invoke weather-forecast-v2 render_text --device EK410"}"#,
+            Some(fp.clone()),
+        );
+        assert!(s.may_execute_write(&fp));
+        assert!(s.to_prompt_section().unwrap().contains("Write ledger"));
+        assert!(s.to_prompt_section().unwrap().contains("Recent operations"));
+    }
+
+    #[test]
+    fn cross_business_write_fingerprints_share_operation_scope() {
+        // device / notify / rule / transform / agent — same lifecycle mechanics.
+        let mut s = TaskState::default();
+        let cases = [
+            (
+                "device",
+                write_fingerprint(
+                    "shell",
+                    "heramind device control sensor-001 --action reboot",
+                ),
+                Some("sensor-001".into()),
+            ),
+            (
+                "notify",
+                write_fingerprint("shell", "heramind message send --channel local --text hi"),
+                Some("local".into()),
+            ),
+            (
+                "rule",
+                write_fingerprint("shell", "heramind rule create --name r1"),
+                Some("r1".into()),
+            ),
+            (
+                "transform",
+                write_fingerprint("shell", "heramind transform create --name t1"),
+                Some("t1".into()),
+            ),
+            (
+                "agent",
+                write_fingerprint("shell", "heramind agent invoke inspect-agent"),
+                Some("inspect-agent".into()),
+            ),
+        ];
+        for (label, fp, target) in &cases {
+            assert!(s.may_execute_write(fp), "{label} first attempt");
+            let op = s.begin_new_operation(
+                "shell",
+                target.clone(),
+                format!("{{{label}}}"),
+                Some(fp.clone()),
+            );
+            s.mark_operation_running(&op);
+            s.complete_operation_succeeded(
+                &op,
+                StructuredResult {
+                    success: true,
+                    summary: format!("{label} ok"),
+                    body: "ok".into(),
+                    details_ref: None,
+                },
+                None::<String>,
+            );
+            assert!(!s.may_execute_write(fp), "{label} gated after success");
+        }
+        assert_eq!(s.write_ledger.len(), 5);
+        assert_eq!(s.operations.len(), 5);
+        // Follow-up does not lift any of them.
+        s.note_user_turn();
+        s.apply_directive(TaskDirective::Continue);
+        for (_, fp, _) in &cases {
+            assert!(!s.may_execute_write(fp));
+        }
+        // Authorized re-run per business: new op each.
+        for (label, fp, target) in &cases {
+            s.begin_new_operation(
+                "shell",
+                target.clone(),
+                format!("{{{label}-rerun}}"),
+                Some(fp.clone()),
+            );
+            assert!(
+                s.may_execute_write(fp),
+                "{label} re-run after begin_new_operation"
+            );
+        }
+        assert_eq!(s.write_ledger.len(), 5, "facts kept across businesses");
+        assert_eq!(s.operations.len(), 10);
+    }
+
+    #[test]
+    fn continue_uses_prompt_section_with_goal_and_gated_writes() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "写天气到 EK410".into(),
+            object: Some("EK410".into()),
+            content: None,
+        });
+        let fp = write_fingerprint("shell", "render");
+        let op = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"render"}"#,
+            Some(fp.clone()),
+        );
+        s.mark_operation_running(&op);
+        s.complete_operation_succeeded(
+            &op,
+            StructuredResult {
+                success: true,
+                summary: "render queued".into(),
+                body: "ok".into(),
+                details_ref: None,
+            },
+            None::<String>,
+        );
+        s.confirm_step_from_tool("shell", "shell|render", "abc", "render queued");
+        s.apply_directive(TaskDirective::Continue);
+        let section = s.to_prompt_section().expect("active task section");
+        assert!(section.contains("写天气到 EK410"));
+        assert!(section.contains("EK410"));
+        assert!(section.contains("render queued"));
+        assert!(section.contains("Write ledger"));
+        assert!(section.contains(&format!("Operation: {op}")));
+        assert!(section.contains("succeeded"));
+    }
+
+    #[test]
+    fn ordinary_user_message_is_turn_not_set_goal() {
+        use crate::agent::types::{AgentInternalState, AgentMessage};
+        let mut state = AgentInternalState::new("s-turn".into());
+        state.push_message(AgentMessage::user("把天气写到 EK410 屏幕"));
+        assert_eq!(state.task_state.turn_count, 1);
+        assert!(
+            state.task_state.goal.is_none(),
+            "Round 1 must not invent SetGoal from utterance length"
+        );
+        state.push_message(AgentMessage::user("再发送一次"));
+        assert_eq!(state.task_state.turn_count, 2);
+        assert!(
+            state.task_state.current_operation_id.is_empty(),
+            "phrase whitelist must not begin_new_operation"
+        );
+        assert!(state.task_state.operations.is_empty());
+    }
+
+    #[test]
+    fn g3_identical_rounds_halt_is_not_success() {
+        assert_eq!(classify_round(0), RoundClass::Progress);
+        assert_eq!(
+            classify_round(2),
+            RoundClass::NoProgressRepeat {
+                identical_rounds: 2
+            }
+        );
+        assert!(loop_halt_decision(2, 3).is_none());
+        let halt = loop_halt_decision(3, 3).expect("halt");
+        assert!(!halt.counts_as_task_success);
+        assert_eq!(halt.reason, LoopHaltReason::NoProgressRepeat);
+
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "poll".into(),
+            object: None,
+            content: None,
+        });
+        let h = s.halt(halt.detail.clone());
+        assert!(!h.counts_as_task_success);
+        assert!(matches!(s.status, TaskStatus::Halted { .. }));
+        // Halted task is not Completed — stop-loop ≠ success.
+        assert!(!matches!(s.status, TaskStatus::Completed { .. }));
+    }
+
+    #[test]
+    fn status_poll_helper_recognizes_common_signatures() {
+        assert!(looks_like_status_poll("shell|heramind device status"));
+        assert!(looks_like_status_poll("shell|list"));
+        assert!(!looks_like_status_poll("shell|render_text --device EK410"));
+    }
+
+    #[test]
+    fn push_message_applies_continue_and_cancel() {
+        use crate::agent::types::{AgentInternalState, AgentMessage};
+        let mut state = AgentInternalState::new("s1".into());
+        state.task_state.apply_directive(TaskDirective::SetGoal {
+            goal: "render".into(),
+            object: Some("EK410".into()),
+            content: None,
+        });
+        state.push_message(AgentMessage::user("继续"));
+        assert_eq!(state.task_state.status, TaskStatus::Active);
+        state.push_message(AgentMessage::user("取消"));
+        assert_eq!(state.task_state.status, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn accept_user_message_takes_content_nodes_atomically() {
+        use crate::agent::types::{AgentInternalState, AgentMessage};
+        let mut state = AgentInternalState::new("s-nodes".into());
+        let nodes = vec![serde_json::json!({
+            "kind": "reference",
+            "type": "device",
+            "id": "d1",
+            "labelSnapshot": "D"
+        })];
+        let _ = state.accept_user_message(AgentMessage::user("check"), None, Some((nodes, 1)));
+        let last = state.memory.last().expect("user msg");
+        assert_eq!(last.content_version, Some(1));
+        assert_eq!(last.content_nodes.as_ref().unwrap()[0]["id"], "d1");
+        // Later accept without nodes keeps None — no shared pending leftover.
+        let _ = state.accept_user_message(AgentMessage::user("again"), None, None);
+        assert!(state.memory.last().unwrap().content_nodes.is_none());
+    }
+
+    #[test]
+    fn interleaved_accepts_do_not_steal_content_nodes() {
+        use crate::agent::types::{AgentInternalState, AgentMessage};
+        let mut state = AgentInternalState::new("s-nodes-race".into());
+        let nodes_a = vec![serde_json::json!({
+            "kind": "reference",
+            "type": "device",
+            "id": "dev-a",
+            "labelSnapshot": "A"
+        })];
+        let nodes_b = vec![serde_json::json!({
+            "kind": "reference",
+            "type": "device",
+            "id": "dev-b",
+            "labelSnapshot": "B"
+        })];
+        let _ = state.accept_user_message(AgentMessage::user("look @A"), None, Some((nodes_a, 1)));
+        let _ = state.accept_user_message(AgentMessage::user("look @B"), None, Some((nodes_b, 1)));
+        assert_eq!(
+            state.memory[0].content_nodes.as_ref().unwrap()[0]["id"],
+            "dev-a"
+        );
+        assert_eq!(
+            state.memory[1].content_nodes.as_ref().unwrap()[0]["id"],
+            "dev-b"
+        );
+    }
+
+    #[test]
+    fn unknown_receipt_does_not_complete() {
+        // Write succeeded at queue layer but physical receipt unknown —
+        // confirm the step, do NOT complete without device evidence.
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "render".into(),
+            object: Some("EK410".into()),
+            content: None,
+        });
+        let fp = write_fingerprint("shell", "render");
+        let op = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"render"}"#,
+            Some(fp.clone()),
+        );
+        s.mark_operation_running(&op);
+        s.complete_operation_succeeded(
+            &op,
+            StructuredResult {
+                success: true,
+                summary: "queued, no physical ACK".into(),
+                body: "queued-only".into(),
+                details_ref: None,
+            },
+            ["queued-only".into()],
+        );
+        s.confirm_step_from_tool("shell", &fp, "queued-only", "queued, no physical ACK");
+        assert_eq!(s.status, TaskStatus::Active);
+        assert!(!matches!(s.status, TaskStatus::Completed { .. }));
+        // Device delivery remains separate evidence — Succeeded ≠ physical ACK.
+        assert_eq!(
+            s.operation(&op).unwrap().evidence,
+            vec!["queued-only".to_string()]
+        );
+    }
+
+    #[test]
+    fn config_success_cannot_claim_sent_or_complete_device_goal() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "update target device display".into(),
+            object: Some("cam-1".into()),
+            content: Some("hello".into()),
+        });
+        s.apply_directive(TaskDirective::Correct {
+            goal: "not webhook, use device-native command".into(),
+            object: None,
+            content: None,
+            method: Some(ExecutionMethod::DeviceNativeCommand),
+            exclude_routes: vec![ExcludedRoute::NotificationOrWebhook],
+        });
+        s.current_operation_id = "op-config".into();
+
+        // Push/config path "succeeds" — config only.
+        s.observe_tool_result_for_goal(
+            "shell",
+            &serde_json::json!({"command": "heramind push start weather-screen"}),
+            &serde_json::json!({"exit_code": 0, "stdout": "started"}),
+            Some("op-config"),
+        );
+        assert_eq!(
+            s.current_goal_evidence().map(|e| e.level),
+            Some(GoalEvidenceLevel::ConfigSuccess)
+        );
+        assert!(s.evaluate_goal_claim(GoalClaimKind::CommandSent).is_err());
+        assert!(s.evaluate_goal_claim(GoalClaimKind::TaskComplete).is_err());
+        assert!(!s.complete_with_evidence("push:weather-screen:ok"));
+        assert_eq!(s.status, TaskStatus::Active);
+        assert!(!s.structured_completion_allowed());
+        match s.system_goal_status() {
+            SystemGoalStatus::Incomplete {
+                task_complete_ok: false,
+                level: GoalEvidenceLevel::ConfigSuccess,
+                ..
+            } => {}
+            other => panic!("expected Incomplete(config), got {other:?}"),
+        }
+
+        let prompt = s.to_prompt_section().unwrap();
+        assert!(prompt.contains("Goal verification"));
+        assert!(prompt.contains("CommandSent NOT allowed"));
+        assert!(prompt.contains("system-judged"));
+    }
+
+    #[test]
+    fn queued_dispatch_allows_sent_not_physical_or_screen_claim() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "show text on device".into(),
+            object: Some("cam-1".into()),
+            content: Some("晴".into()),
+        });
+        s.method = Some(ExecutionMethod::DeviceNativeCommand);
+        s.current_operation_id = "op-dispatch-1".into();
+
+        s.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({
+                "device": "cam-1",
+                "command": "render_text",
+                "params": {"text": "晴"}
+            }),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "cam-1",
+                "command": "render_text",
+                "delivery": "adapter_accepted",
+                "delivery_note": "delivered to 1 adapter(s) (broker publish); device acknowledgment: none; physical effect unverified"
+            }),
+            Some("op-dispatch-1"),
+        );
+        assert_eq!(
+            s.current_goal_evidence()
+                .and_then(|e| e.operation_id.as_deref()),
+            Some("op-dispatch-1")
+        );
+        assert_eq!(
+            s.current_goal_evidence().map(|e| e.level),
+            Some(GoalEvidenceLevel::CommandDispatched)
+        );
+        assert!(s.evaluate_goal_claim(GoalClaimKind::CommandSent).is_ok());
+        assert!(s
+            .evaluate_goal_claim(GoalClaimKind::PhysicalEffect)
+            .is_err());
+        // Completing as "screen refreshed" must fail; completing after dispatch OK.
+        assert!(!s.complete_with_evidence("screen-refreshed"));
+        assert_eq!(s.status, TaskStatus::Active);
+        assert!(s.complete_with_evidence("op:dispatched"));
+        assert!(matches!(s.status, TaskStatus::Completed { .. }));
+        assert!(matches!(
+            s.system_goal_status(),
+            SystemGoalStatus::Completed { .. }
+        ));
+    }
+
+    #[test]
+    fn wrong_device_command_does_not_satisfy_goal_object() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "update cam-1".into(),
+            object: Some("cam-1".into()),
+            content: None,
+        });
+        s.current_operation_id = "op-wrong-dev".into();
+        s.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({"device": "other-9", "command": "reboot"}),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "other-9",
+                "command": "reboot",
+                "delivery": "adapter_accepted",
+                "delivery_note": "physical effect unverified"
+            }),
+            Some("op-wrong-dev"),
+        );
+        assert!(s.current_goal_evidence().is_none());
+        assert!(s.goal_evidences.is_empty());
+        assert!(s.evaluate_goal_claim(GoalClaimKind::CommandSent).is_err());
+    }
+
+    #[test]
+    fn physical_effect_level_allows_physical_claim() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "update cam-1".into(),
+            object: Some("cam-1".into()),
+            content: None,
+        });
+        s.current_operation_id = "op-phys-1".into();
+        s.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({"device": "cam-1", "command": "render_text"}),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "cam-1",
+                "command": "render_text",
+                "delivery": "physical_effect_verified",
+                "delivery_note": "physical effect verified via state feedback"
+            }),
+            Some("op-phys-1"),
+        );
+        assert_eq!(
+            s.current_goal_evidence().map(|e| e.level),
+            Some(GoalEvidenceLevel::PhysicalEffectVerified)
+        );
+        assert_eq!(
+            s.current_goal_evidence()
+                .and_then(|e| e.operation_id.as_deref()),
+            Some("op-phys-1")
+        );
+        assert!(s.evaluate_goal_claim(GoalClaimKind::PhysicalEffect).is_ok());
+        assert!(s.complete_with_evidence("screen-refreshed"));
+    }
+
+    #[test]
+    fn delivery_note_negation_text_does_not_raise_physical() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "update cam-1".into(),
+            object: Some("cam-1".into()),
+            content: None,
+        });
+        s.current_operation_id = "op-neg".into();
+        // Note contains both "physical effect verified" and negation — display only.
+        s.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({"device": "cam-1", "command": "render_text"}),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "cam-1",
+                "command": "render_text",
+                "delivery": "adapter_accepted",
+                "delivery_note": "NOT physical effect verified; device acknowledged nothing"
+            }),
+            Some("op-neg"),
+        );
+        assert_eq!(
+            s.current_goal_evidence().map(|e| e.level),
+            Some(GoalEvidenceLevel::CommandDispatched)
+        );
+        assert!(s
+            .evaluate_goal_claim(GoalClaimKind::PhysicalEffect)
+            .is_err());
+    }
+
+    #[test]
+    fn echo_content_prose_does_not_raise_delivery_level() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "update cam-1".into(),
+            object: Some("cam-1".into()),
+            content: None,
+        });
+        s.current_operation_id = "op-echo".into();
+        // Params / stdout echo the magic phrase; no exact delivery enum.
+        s.observe_tool_result_for_goal(
+            "shell",
+            &serde_json::json!({
+                "command": "heramind device control cam-1 render_text --text x"
+            }),
+            &serde_json::json!({
+                "exit_code": 0,
+                "stdout": "physical effect verified via state feedback; device acknowledged"
+            }),
+            Some("op-echo"),
+        );
+        // exit 0 + bound device/command → dispatched only; prose ignored.
+        assert_eq!(
+            s.current_goal_evidence().map(|e| e.level),
+            Some(GoalEvidenceLevel::CommandDispatched)
+        );
+        assert_ne!(
+            s.current_goal_evidence()
+                .and_then(|e| e.delivery.as_deref()),
+            Some("physical_effect_verified")
+        );
+        assert!(s
+            .evaluate_goal_claim(GoalClaimKind::PhysicalEffect)
+            .is_err());
+    }
+
+    #[test]
+    fn unknown_delivery_enum_physical_effect_unverified_stays_lower() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "update cam-1".into(),
+            object: Some("cam-1".into()),
+            content: None,
+        });
+        s.current_operation_id = "op-unknown-enum".into();
+        s.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({"device": "cam-1", "command": "render_text"}),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "cam-1",
+                "command": "render_text",
+                "delivery": "physical_effect_unverified",
+                "delivery_note": "physical effect verified" // display bait
+            }),
+            Some("op-unknown-enum"),
+        );
+        assert_eq!(
+            s.current_goal_evidence().map(|e| e.level),
+            Some(GoalEvidenceLevel::CommandDispatched)
+        );
+        assert_eq!(
+            s.current_goal_evidence()
+                .and_then(|e| e.delivery.as_deref()),
+            Some("physical_effect_unverified")
+        );
+        assert!(s
+            .evaluate_goal_claim(GoalClaimKind::PhysicalEffect)
+            .is_err());
+        assert!(s.evaluate_goal_claim(GoalClaimKind::CommandSent).is_ok());
+    }
+
+    #[test]
+    fn later_queued_op_does_not_inherit_prior_physical_evidence() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "update cam-1".into(),
+            object: Some("cam-1".into()),
+            content: None,
+        });
+        s.method = Some(ExecutionMethod::DeviceNativeCommand);
+
+        // Op A — physical verified.
+        s.current_operation_id = "op-A".into();
+        s.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({"device": "cam-1", "command": "render_text"}),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "cam-1",
+                "command": "render_text",
+                "delivery": "physical_effect_verified"
+            }),
+            Some("op-A"),
+        );
+        assert!(s
+            .evaluate_goal_claim_for(GoalClaimKind::PhysicalEffect, Some("op-A"))
+            .is_ok());
+
+        // Op B — only queued / adapter_accepted. Must NOT inherit A's physical.
+        s.current_operation_id = "op-B".into();
+        s.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({"device": "cam-1", "command": "render_text"}),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "cam-1",
+                "command": "render_text",
+                "delivery": "adapter_accepted",
+                "delivery_note": "queued"
+            }),
+            Some("op-B"),
+        );
+        assert_eq!(s.goal_evidences.len(), 2);
+        assert_eq!(
+            s.goal_evidence_for(Some("op-A")).map(|e| e.level),
+            Some(GoalEvidenceLevel::PhysicalEffectVerified)
+        );
+        assert_eq!(
+            s.current_goal_evidence().map(|e| e.level),
+            Some(GoalEvidenceLevel::CommandDispatched)
+        );
+        // Goal-set claim: op-A physical counts for the goal device set
+        // (not keyed off last current_operation_id = op-B).
+        assert!(s.evaluate_goal_claim(GoalClaimKind::PhysicalEffect).is_ok());
+        assert!(s.evaluate_goal_claim(GoalClaimKind::CommandSent).is_ok());
+        // Per-op: op-B alone still must not look physically verified.
+        assert!(s
+            .evaluate_goal_claim_for(GoalClaimKind::PhysicalEffect, Some("op-B"))
+            .is_err());
+        assert!(s
+            .evaluate_goal_claim_for(GoalClaimKind::PhysicalEffect, Some("op-A"))
+            .is_ok());
+        match s.system_goal_status() {
+            SystemGoalStatus::CompleteEligible {
+                physical_ok: true,
+                task_complete_ok: true,
+                level: GoalEvidenceLevel::PhysicalEffectVerified,
+                operation_id: Some(op),
+                ..
+            } => assert_eq!(op, "op-A"),
+            other => {
+                panic!("expected CompleteEligible(physical,op-A) from goal op set, got {other:?}")
+            }
+        }
+        assert!(s.complete_with_evidence("screen-refreshed"));
+    }
+
+    #[test]
+    fn observe_without_explicit_op_id_does_not_raise_write_op_evidence() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "update cam-1".into(),
+            object: Some("cam-1".into()),
+            content: None,
+        });
+        s.method = Some(ExecutionMethod::DeviceNativeCommand);
+        s.current_operation_id = "op-current".into();
+
+        // No explicit Operation id — must NOT bind to / upgrade current write op.
+        s.observe_tool_result_for_goal(
+            "device_command",
+            &serde_json::json!({"device": "cam-1", "command": "render_text"}),
+            &serde_json::json!({
+                "sent": true,
+                "device_id": "cam-1",
+                "command": "render_text",
+                "delivery": "physical_effect_verified"
+            }),
+            None,
+        );
+        assert!(
+            s.goal_evidence_for(Some("op-current")).is_none(),
+            "implicit current-op fallback must not raise write-op evidence"
+        );
+        assert!(s.goal_evidences.is_empty());
+        assert!(s
+            .evaluate_goal_claim(GoalClaimKind::PhysicalEffect)
+            .is_err());
+    }
+
+    #[test]
+    fn config_only_success_is_not_structured_complete_for_device_native_goal() {
+        // Production completion gate: system status — not model NL / "成功".
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "put weather on cam-1".into(),
+            object: Some("cam-1".into()),
+            content: Some("晴".into()),
+        });
+        s.apply_directive(TaskDirective::Correct {
+            goal: "device-native only".into(),
+            object: None,
+            content: None,
+            method: Some(ExecutionMethod::DeviceNativeCommand),
+            exclude_routes: vec![ExcludedRoute::NotificationOrWebhook],
+        });
+        s.current_operation_id = "op-push".into();
+        s.observe_tool_result_for_goal(
+            "shell",
+            &serde_json::json!({"command": "heramind push start weather-screen"}),
+            &serde_json::json!({"exit_code": 0, "stdout": "started successfully 成功"}),
+            Some("op-push"),
+        );
+        assert!(!s.structured_completion_allowed());
+        assert!(!s.complete_with_evidence("model said 成功"));
+        let status = s.system_goal_status();
+        assert!(
+            matches!(
+                status,
+                SystemGoalStatus::Incomplete {
+                    task_complete_ok: false,
+                    ..
+                }
+            ),
+            "config-only must not be structured-complete: {status:?}"
+        );
+        // Serialize shape carried on final response — no reply-text scan.
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["status"], "incomplete");
+        assert_eq!(json["task_complete_ok"], false);
+    }
+
+    /// NM-245: validation / send failures must not raise delivery evidence or
+    /// flip structured goal status to complete. PreferKnown resume of a failed
+    /// device-control op stays `success: false` (product wiring already correct;
+    /// unevidenced "成功" claims are model wording only).
+    #[test]
+    fn nm245_device_control_failures_keep_incomplete_without_delivery_evidence() {
+        let mut s = TaskState::default();
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "show text on EK410".into(),
+            object: Some("EK410".into()),
+            content: Some("你好".into()),
+        });
+        s.method = Some(ExecutionMethod::DeviceNativeCommand);
+
+        let args = serde_json::json!({
+            "command": "heramind device control EK410 render_text --params '{\"cmd\":\"render_text\",\"params\":{\"text\":\"你好\"}}'"
+        });
+        let fp = write_fingerprint("shell", &serde_json::to_string(&args).unwrap());
+        let call_site_turn = s.turn_count;
+        let MutatingGateOutcome::Proceed { operation_id } =
+            evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, call_site_turn)
+        else {
+            panic!("first control attempt must Proceed");
+        };
+        s.mark_operation_running(&operation_id);
+        s.complete_operation_failed(
+            &operation_id,
+            StructuredResult::with_body(
+                false,
+                "NOT sent: missing required top-level params: text",
+                r#"{"success":false,"summary":"Command 'render_text' was NOT sent"}"#,
+                None,
+            ),
+        );
+        // Validation failure tool result: exit 1, no delivery → no CommandDispatched.
+        s.observe_tool_result_for_goal(
+            "shell",
+            &args,
+            &serde_json::json!({
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "Failed to send command: Command 'render_text' was NOT sent: missing required top-level params: text. Example: {\"text\":\"Hello\"}."
+            }),
+            Some(&operation_id),
+        );
+        assert!(
+            s.goal_evidences
+                .iter()
+                .all(|e| e.level < GoalEvidenceLevel::CommandDispatched),
+            "validation fail must not raise delivery evidence: {:?}",
+            s.goal_evidences
+        );
+        assert!(!s.structured_completion_allowed());
+        match s.system_goal_status() {
+            SystemGoalStatus::Incomplete {
+                task_complete_ok: false,
+                ..
+            } => {}
+            other => panic!("expected Incomplete after validation fail, got {other:?}"),
+        }
+
+        // PreferKnown resume of the failed op must stay non-success.
+        match evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, call_site_turn) {
+            MutatingGateOutcome::ResumeKnown { output, .. } => {
+                assert!(
+                    !output.success,
+                    "failed PreferKnown resume must not look successful"
+                );
+                assert!(!crate::toolkit::tool::effective_success("shell", &output));
+            }
+            other => panic!("failed control must PreferKnown/ResumeKnown, got {other:?}"),
+        }
+
+        // Honest adapter-less send failure on a distinct op also stays Incomplete.
+        let send_args = serde_json::json!({
+            "command": "heramind device control EK410 render_text --params '{\"text\":\"你好\"}'",
+            "_new_operation": true
+        });
+        let send_fp = write_fingerprint("shell", &serde_json::to_string(&send_args).unwrap());
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_send,
+        } = evaluate_mutating_gate(
+            &mut s,
+            "shell",
+            &send_args,
+            &send_fp,
+            None,
+            call_site_turn + 1,
+        )
+        else {
+            panic!("send-fail attempt must Proceed under _new_operation");
+        };
+        s.observe_tool_result_for_goal(
+            "shell",
+            &send_args,
+            &serde_json::json!({
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "Failed to send command: no adapter connected"
+            }),
+            Some(&op_send),
+        );
+        match s.system_goal_status() {
+            SystemGoalStatus::Incomplete {
+                task_complete_ok: false,
+                ..
+            } => {}
+            other => panic!("all-send-fail must stay Incomplete, got {other:?}"),
+        }
+        let _ = send_args;
+        assert!(
+            matches!(
+                s.system_goal_status(),
+                SystemGoalStatus::Incomplete {
+                    task_complete_ok: false,
+                    ..
+                }
+            ),
+            "final structured status must stay incomplete for the model"
+        );
+    }
+
+    #[test]
+    fn delivery_without_bound_device_or_command_is_ignored() {
+        let ev = classify_goal_evidence(
+            "device_command",
+            &serde_json::json!({}),
+            &serde_json::json!({
+                "sent": true,
+                "delivery": "physical_effect_verified",
+                "delivery_note": "physical effect verified"
+            }),
+        );
+        assert!(ev.is_none(), "unbound physical delivery must not count");
+    }
+
+    #[test]
+    fn parse_exact_delivery_rejects_substring_lookalikes() {
+        assert_eq!(
+            parse_exact_delivery(Some(&serde_json::json!("physical_effect_verified"))),
+            ExactDelivery::PhysicalEffectVerified
+        );
+        assert_eq!(
+            parse_exact_delivery(Some(&serde_json::json!("physical_effect_unverified"))),
+            ExactDelivery::Unknown("physical_effect_unverified".into())
+        );
+        assert_eq!(
+            parse_exact_delivery(Some(&serde_json::json!("device acknowledged"))),
+            ExactDelivery::Unknown("device acknowledged".into())
+        );
+        assert_eq!(
+            parse_exact_delivery(Some(&serde_json::json!({"physical_effect_verified": null}))),
+            ExactDelivery::PhysicalEffectVerified
+        );
+        assert_eq!(parse_exact_delivery(None), ExactDelivery::Missing);
+    }
+
+    #[test]
+    fn timeout_unknown_blocks_auto_replay_and_is_not_success() {
+        let mut s = TaskState::default();
+        let fp = write_fingerprint("shell", "heramind ext invoke render --device EK410");
+        let op = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"heramind ext invoke render --device EK410"}"#,
+            Some(fp.clone()),
+        );
+        s.mark_operation_running(&op);
+        s.complete_operation_unknown(
+            &op,
+            StructuredResult {
+                success: false,
+                summary: "timed out — outcome unknown".into(),
+                body: r#"{"timed_out":true}"#.into(),
+                details_ref: None,
+            },
+        );
+        let rec = s.operation(&op).unwrap();
+        assert_eq!(rec.status, OperationStatus::Unknown);
+        assert!(!rec.result.as_ref().unwrap().success);
+        assert!(
+            !s.may_execute_write(&fp),
+            "timeout recovery must not auto-replay / double-write"
+        );
+        assert!(matches!(
+            s.dispatch_mutating_write(&fp),
+            WriteDispatch::InquireStatus { .. }
+        ));
+        assert!(s.write_ledger.is_empty(), "unknown must not ledger a write");
+        // Authorized re-run only via begin_new_operation.
+        let op2 = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"heramind ext invoke render --device EK410"}"#,
+            Some(fp.clone()),
+        );
+        assert_ne!(op2, op);
+        assert!(s.may_execute_write(&fp));
+    }
+
+    #[test]
+    fn same_op_resume_prefers_known_result() {
+        let mut s = TaskState::default();
+        let fp = write_fingerprint("shell", "render_text EK410");
+        let op = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"render_text EK410"}"#,
+            Some(fp.clone()),
+        );
+        s.mark_operation_running(&op);
+        s.complete_operation_succeeded(
+            &op,
+            StructuredResult {
+                success: true,
+                summary: "ok".into(),
+                body: "queued".into(),
+                details_ref: None,
+            },
+            None::<String>,
+        );
+        let known = s.prefer_known_result(&fp).expect("known result");
+        assert!(known.success);
+        assert_eq!(known.body, "queued");
+        match s.dispatch_mutating_write(&fp) {
+            WriteDispatch::PreferKnown {
+                operation_id,
+                result,
+            } => {
+                assert_eq!(operation_id, op);
+                assert_eq!(result.body, "queued");
+            }
+            other => panic!("expected PreferKnown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn correct_cancels_prepared_keeps_executed_facts() {
+        let mut s = TaskState::default();
+        let fp_done = write_fingerprint("shell", "done-write");
+        let fp_pending = write_fingerprint("shell", "pending-write");
+        let done =
+            s.begin_new_operation("shell", Some("EK410".into()), "{}", Some(fp_done.clone()));
+        s.mark_operation_running(&done);
+        s.complete_operation_succeeded(
+            &done,
+            StructuredResult {
+                success: true,
+                summary: "done".into(),
+                body: "ok".into(),
+                details_ref: None,
+            },
+            None::<String>,
+        );
+        let pending = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            "{}",
+            Some(fp_pending.clone()),
+        );
+        assert_eq!(
+            s.operation(&pending).unwrap().status,
+            OperationStatus::Prepared
+        );
+        s.apply_directive(TaskDirective::Correct {
+            goal: "写到更大字号".into(),
+            object: Some("EK410".into()),
+            content: None,
+            method: None,
+            exclude_routes: vec![],
+        });
+        assert_eq!(
+            s.operation(&pending).unwrap().status,
+            OperationStatus::Cancelled
+        );
+        assert_eq!(
+            s.operation(&done).unwrap().status,
+            OperationStatus::Succeeded,
+            "executed facts kept"
+        );
+        assert!(!s.may_execute_write(&fp_done));
+        assert!(
+            !s.may_execute_write(&fp_pending),
+            "cancelled prepared still blocks until begin_new_operation"
+        );
+    }
+
+    #[test]
+    fn outcome_is_unknown_detects_timeout_flags() {
+        use crate::toolkit::tool::ToolOutput;
+        let timed = ToolOutput::success(serde_json::json!({"timed_out": true, "exit_code": null}));
+        assert!(outcome_is_unknown(&Ok(timed)));
+        let ok = ToolOutput::success(serde_json::json!({"exit_code": 0, "stdout": "fine"}));
+        assert!(!outcome_is_unknown(&Ok(ok)));
+        assert!(outcome_is_unknown(&Err(
+            crate::toolkit::error::ToolError::Timeout
+        )));
+        assert!(outcome_is_unknown(&Err(
+            crate::toolkit::error::ToolError::Execution("Tool 'shell' timed out after 30s".into())
+        )));
+    }
+
+    /// Regression (canceled-mid-effect classification): replay-unsafe cancels
+    /// and transient network errors return Err(Execution(err +
+    /// outcome_unknown_guidance())) — those MUST classify as Unknown so the
+    /// re-run needs user confirmation. Clean failures without the marker stay
+    /// Failed (re-runnable via _new_operation without confirm).
+    #[test]
+    fn outcome_is_unknown_err_branch_honors_guidance_marker() {
+        use crate::toolkit::tool::outcome_unknown_guidance;
+        // Replay-unsafe cancel: error carries the guidance marker → Unknown.
+        let canceled = crate::toolkit::error::ToolError::Execution(format!(
+            "Operation canceled{}",
+            outcome_unknown_guidance()
+        ));
+        assert!(
+            outcome_is_unknown(&Err(canceled)),
+            "cancel-with-guidance (effect may have landed) must be Unknown"
+        );
+        // Plain execution failure: no marker → stays Failed.
+        let plain = crate::toolkit::error::ToolError::Execution("exit code 1".into());
+        assert!(
+            !outcome_is_unknown(&Err(plain)),
+            "clean failure without the marker must stay Failed"
+        );
+    }
+
+    /// NM-247: ambiguous `http_transport` (no "timeout" substring) must still
+    /// land as ledger Unknown — same as shell "result unknown" staging.
+    /// Connection refuse / not-submitted stays Failed.
+    #[test]
+    fn outcome_is_unknown_http_transport_without_timeout_wording() {
+        use crate::toolkit::tool::ToolOutput;
+        let ambiguous = ToolOutput::success(serde_json::json!({
+            "exit_code": 1,
+            "timed_out": false,
+            "stdout": "",
+            "stderr": "http_transport: error sending request for url (http://localhost:9375/api/extensions/weather/invoke)"
+        }));
+        assert!(
+            outcome_is_unknown(&Ok(ambiguous)),
+            "http_transport without timeout wording → Unknown"
+        );
+
+        let classified = ToolOutput::success(serde_json::json!({
+            "exit_code": 1,
+            "timed_out": false,
+            "stderr": "transport error (localhost API): http_transport: connection reset. \
+                       Stage=transport — result unknown (request may already have been submitted)"
+        }));
+        assert!(outcome_is_unknown(&Ok(classified)));
+
+        let connect = ToolOutput::success(serde_json::json!({
+            "exit_code": 1,
+            "timed_out": false,
+            "stderr": "transport error (localhost API): http_connect: connection refused. \
+                       Stage=transport — connection failed before submit; extension \
+                       business body was not reached (not submitted)."
+        }));
+        assert!(
+            !outcome_is_unknown(&Ok(connect)),
+            "connect refuse / not submitted must stay Failed"
+        );
+    }
+
+    /// Case-c / NM-247: execute canonicalize must not drop the host ticket
+    /// forever — restore keeps Shell claim → HTTP consume on the same id.
+    #[test]
+    fn execute_canonicalize_restores_host_prepared_ticket() {
+        let original = serde_json::json!({
+            "command": "heramind extension invoke weather-forecast-v2 get_weather --params '{\"city\":\"上海\"}'",
+            "description": "follow-up",
+            HOST_PREPARED_OPERATION_ARG: "op_case_c_corr",
+        });
+        let mut canon = canonicalize_tool_arguments("shell", &original);
+        assert!(
+            canon.get(HOST_PREPARED_OPERATION_ARG).is_none(),
+            "fingerprint canonicalize must strip host ticket"
+        );
+        restore_host_prepared_carriage(&original, &mut canon);
+        assert_eq!(
+            canon
+                .get(HOST_PREPARED_OPERATION_ARG)
+                .and_then(|v| v.as_str()),
+            Some("op_case_c_corr"),
+            "execute path must restore host ticket for Shell dispatch"
+        );
+        // Re-canonicalizing the restored args must still strip the ticket
+        // (fingerprint / PreferKnown stay business-only).
+        let again = canonicalize_tool_arguments("shell", &canon);
+        assert!(again.get(HOST_PREPARED_OPERATION_ARG).is_none());
+        assert_eq!(
+            again.get("command"),
+            original.get("command"),
+            "business command must be unchanged"
+        );
+    }
+
+    /// Regression (write-fact attribution): the fact for a completing
+    /// operation is recorded under THAT operation's id, not under the shared
+    /// current_operation_id pointer that a concurrently-begun sibling has
+    /// already overwritten.
+    #[test]
+    fn write_fact_attributes_to_completing_operation_not_current_pointer() {
+        let mut s = TaskState {
+            status: TaskStatus::Active,
+            ..TaskState::default()
+        };
+
+        let op_a = s.begin_new_operation(
+            "device_command",
+            Some("dev-1".into()),
+            r#"{"command":"reboot"}"#,
+            Some("device_command|{\"command\":\"reboot\"}".into()),
+        );
+        // Sibling write begins BEFORE op-A's result is finalized — the
+        // current_operation_id pointer now names op-B.
+        let op_b = s.begin_new_operation(
+            "file_write",
+            Some("/tmp/x".into()),
+            r#"{"path":"/tmp/x"}"#,
+            Some("file_write|{\"path\":\"/tmp/x\"}".into()),
+        );
+        assert_ne!(op_a, op_b);
+        assert_eq!(s.current_operation_id, op_b);
+
+        s.complete_operation_succeeded(
+            &op_a,
+            StructuredResult::with_body(true, "reboot dispatched", "{}", None),
+            std::iter::empty(),
+        );
+
+        let fact = s
+            .write_ledger
+            .iter()
+            .find(|w| w.fingerprint == "device_command|{\"command\":\"reboot\"}")
+            .expect("write fact recorded");
+        assert_eq!(
+            fact.operation_id, op_a,
+            "fact must be attributed to the completing op-A, not current pointer op-B"
+        );
+    }
+
+    #[test]
+    fn structured_summary_is_not_body_prefix_and_sets_details_ref() {
+        let op = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let large = format!(
+            r#"{{"exit_code":0,"status":"queued","payload":"{}"}}"#,
+            "x".repeat(600)
+        );
+        let res =
+            build_structured_result(op, "shell", "succeeded", true, &large, Some("EK410"), None);
+        assert!(res.summary.contains("shell:succeeded"));
+        assert!(res.summary.contains("target=EK410"));
+        assert!(res.summary.contains("exit_code=0") || res.summary.contains("status=queued"));
+        assert!(
+            !res.summary.contains(&"x".repeat(120)),
+            "summary must not be a raw body prefix"
+        );
+        assert_eq!(
+            res.details_ref.as_deref(),
+            Some("$cached:op:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+        assert!(res.body.len() >= 500, "full body kept on the record");
+    }
+
+    #[test]
+    fn prompt_section_emits_details_ref_and_capability() {
+        let mut s = TaskState::default();
+        let fp = write_fingerprint(
+            "shell",
+            "heramind extension invoke weather-forecast-v2 render_text --device EK410",
+        );
+        let args = serde_json::json!({
+            "command": "heramind extension invoke weather-forecast-v2 render_text --device EK410"
+        });
+        let op = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            args.to_string(),
+            Some(fp.clone()),
+        );
+        assert!(
+            s.operation(&op)
+                .unwrap()
+                .capability
+                .as_ref()
+                .is_some_and(|c| !c.read_only),
+            "render_text shell must be mutating capability"
+        );
+        s.mark_operation_running(&op);
+        let large = format!(
+            r#"{{"exit_code":0,"status":"queued","blob":"{}"}}"#,
+            "W".repeat(700)
+        );
+        s.complete_operation_succeeded(
+            &op,
+            build_structured_result(&op, "shell", "succeeded", true, &large, Some("EK410"), None),
+            None::<String>,
+        );
+        let section = s.to_prompt_section().unwrap();
+        assert!(section.contains("details_ref=$cached:op:"));
+        assert!(section.contains("read_only=false"));
+        assert!(section.contains("shell:succeeded"));
+        assert!(!s.may_execute_write(&fp));
+        // Authorized re-run still works (weather→screen regression).
+        s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            args.to_string(),
+            Some(fp.clone()),
+        );
+        assert!(s.may_execute_write(&fp));
+    }
+
+    #[test]
+    fn tool_capability_distinguishes_shell_read_vs_write() {
+        let ro = derive_tool_capability(
+            "shell",
+            &serde_json::json!({"command": "heramind device get sensor-001"}),
+        );
+        assert!(ro.read_only && ro.idempotent);
+        assert_eq!(ro.retry_policy, RetryPolicy::AlwaysSafe);
+
+        let wr = derive_tool_capability(
+            "shell",
+            &serde_json::json!({
+                "command": "heramind device delete sensor-001"
+            }),
+        );
+        assert!(!wr.read_only && !wr.idempotent);
+        assert!(matches!(wr.retry_policy, RetryPolicy::OnFailure { .. }));
+
+        // Unparsed / non-CLI shell (e.g. legacy `extension invoke` line) is
+        // unknown side-effects — Never retry, still not read-only.
+        let unk = derive_tool_capability(
+            "shell",
+            &serde_json::json!({
+                "command": "heramind extension invoke weather-forecast-v2 render_text --device EK410"
+            }),
+        );
+        assert!(!unk.read_only);
+        assert_eq!(unk.retry_policy, RetryPolicy::Never);
+    }
+
+    #[test]
+    fn memory_tool_capability_classifies_by_action() {
+        for action in ["read", "list"] {
+            let cap = derive_tool_capability(
+                "memory",
+                &serde_json::json!({"action": action, "target": "user"}),
+            );
+            assert!(
+                cap.read_only,
+                "{action} must stay read_query (skip write gate)"
+            );
+        }
+        for action in ["add", "rewrite", "replace", "remove", "create"] {
+            let cap = derive_tool_capability(
+                "memory",
+                &serde_json::json!({"action": action, "target": "user", "content": "x"}),
+            );
+            assert!(
+                !cap.read_only,
+                "{action} must enter the mutating write gate"
+            );
+        }
+        let missing = derive_tool_capability("memory", &serde_json::json!({}));
+        assert!(
+            !missing.read_only,
+            "missing action must fail closed into the write gate"
+        );
+    }
+
+    #[test]
+    fn skill_tool_capability_classifies_by_action() {
+        for action in ["search", "load"] {
+            let cap = derive_tool_capability(
+                "skill",
+                &serde_json::json!({"action": action, "query": "device"}),
+            );
+            assert!(
+                cap.read_only,
+                "{action} must stay read_query (skip write gate)"
+            );
+        }
+        for action in ["create", "update", "delete"] {
+            let cap = derive_tool_capability(
+                "skill",
+                &serde_json::json!({"action": action, "id": "x", "content": "y"}),
+            );
+            assert!(
+                !cap.read_only,
+                "{action} must enter the mutating write gate"
+            );
+        }
+        let missing = derive_tool_capability("skill", &serde_json::json!({}));
+        assert!(
+            !missing.read_only,
+            "missing skill action must fail closed into the write gate"
+        );
+        let unknown = derive_tool_capability("skill", &serde_json::json!({"action": "explode"}));
+        assert!(
+            !unknown.read_only,
+            "unknown skill action must fail closed into the write gate"
+        );
+    }
+
+    /// Regression (retry-cap wiring): `_new_operation` re-runs of a Failed
+    /// write consult the declared capability policy — OnFailure{2} allows
+    /// ONE retry, then the dispatch resumes the known failed result instead
+    /// of silently re-executing.
+    #[test]
+    fn failed_write_new_operation_respects_retry_policy() {
+        let mut s = TaskState {
+            status: TaskStatus::Active,
+            ..TaskState::default()
+        };
+        let args = serde_json::json!({"path":"/tmp/a"});
+        let fp = "file_write|{\"path\":\"/tmp/a\"}".to_string();
+
+        // First attempt fails.
+        let op1 = prepare_mutating_dispatch(&mut s, "file_write", &args, &fp, None, 1).unwrap();
+        s.complete_operation_failed(&op1, StructuredResult::with_body(false, "boom", "", None));
+
+        // Retry 1 (within OnFailure{max_attempts: 2}) opens a fresh op.
+        let mut retry_args = args.clone();
+        retry_args["_new_operation"] = serde_json::json!(true);
+        let op2 =
+            prepare_mutating_dispatch(&mut s, "file_write", &retry_args, &fp, None, 2).unwrap();
+        assert_ne!(op1, op2, "first retry must open a new Operation");
+        s.complete_operation_failed(
+            &op2,
+            StructuredResult::with_body(false, "boom again", "", None),
+        );
+
+        // Retry 2: budget exhausted → known failed result, no re-execution.
+        let err =
+            prepare_mutating_dispatch(&mut s, "file_write", &retry_args, &fp, None, 3).unwrap_err();
+        assert!(
+            matches!(err, WriteDispatch::PreferKnown { .. }),
+            "exhausted retry must resume the known failed result, got {err:?}"
+        );
+    }
+
+    /// Regression (fingerprint format migration): a ledger persisted under
+    /// the pre-sorting insertion-order format must still gate post-upgrade
+    /// lookups — restore recomputes fingerprints from stored args and
+    /// rewrites the ledger facts, so a durable Unknown cannot become an
+    /// invisible "no prior op" that re-executes without user confirm.
+    #[test]
+    fn restore_migrates_insertion_order_fingerprints_to_sorted() {
+        let old_fp = "device_command|{\"device_id\":\"D\",\"params\":{\"z\":1,\"a\":2}}";
+        let mut s = TaskState::default();
+        let op = OperationRecord {
+            operation_id: "op-mig-1".into(),
+            origin_turn_id: 1,
+            tool_name: "device_command".into(),
+            domain: Some("device".into()),
+            action: Some("control".into()),
+            target: Some("D".into()),
+            arguments: r#"{"device_id":"D","params":{"z":1,"a":2}}"#.into(),
+            status: OperationStatus::Unknown,
+            result: None,
+            evidence: vec![],
+            write_fingerprint: Some(old_fp.into()),
+            capability: None,
+            owner_id: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        s.restore_op_ledger(PersistedOpLedger {
+            version: 1,
+            operations: vec![op],
+            write_ledger: vec![WriteFact {
+                operation_id: "op-mig-1".into(),
+                fingerprint: old_fp.into(),
+            }],
+            current_operation_id: String::new(),
+            turn_count: 1,
+        });
+
+        // Live lookup with ANY key order now finds the persisted Unknown op.
+        let sorted_fp = crate::agent::streaming::mutating_write_fingerprint(
+            "device_command",
+            &serde_json::json!({"params": {"a": 2, "z": 1}, "device_id": "D"}),
+        )
+        .expect("fingerprint");
+        assert_eq!(
+            s.latest_op_for_fingerprint(&sorted_fp).map(|o| &o.status),
+            Some(&OperationStatus::Unknown),
+            "sorted-format lookup must hit the migrated op"
+        );
+        // The old insertion-order string no longer matches (single format).
+        assert!(
+            s.latest_op_for_fingerprint(old_fp).is_none(),
+            "old-format fingerprint must not linger as a second key"
+        );
+        // Ledger fact rewritten to the same sorted fingerprint.
+        assert!(
+            s.write_ledger
+                .iter()
+                .any(|f| f.operation_id == "op-mig-1" && f.fingerprint == sorted_fp),
+            "write facts must follow the migrated fingerprint"
+        );
+    }
+
+    #[test]
+    fn write_failure_retry_policy_and_unknown_inquire() {
+        let mut s = TaskState::default();
+        // Must parse as a proven CLI mutation (OnFailure), not an unparsed
+        // unknown-sensitive line (Never).
+        let cmd = "heramind device delete cam-retry-1";
+        let fp = write_fingerprint("shell", cmd);
+        let op = s.begin_new_operation(
+            "shell",
+            Some("cam-retry-1".into()),
+            serde_json::json!({ "command": cmd }).to_string(),
+            Some(fp.clone()),
+        );
+        s.mark_operation_running(&op);
+        s.complete_operation_failed(
+            &op,
+            StructuredResult {
+                success: false,
+                summary: "shell:failed".into(),
+                body: "err".into(),
+                details_ref: None,
+            },
+        );
+        assert!(
+            s.write_failure_may_retry(&fp),
+            "OnFailure policy allows one retry after first fail"
+        );
+        assert!(matches!(
+            progress_loop_decision(0, 3, &[], false, 0, Some(&op)),
+            ProgressDecision::InquireUnknown { .. }
+        ));
+        // Unknown blocks blind replay regardless of retry policy.
+        let op_u = s.begin_new_operation(
+            "shell",
+            Some("cam-retry-1".into()),
+            serde_json::json!({ "command": cmd }).to_string(),
+            Some(fp.clone()),
+        );
+        s.mark_operation_running(&op_u);
+        s.complete_operation_unknown(
+            &op_u,
+            StructuredResult {
+                success: false,
+                summary: "shell:unknown".into(),
+                body: "timeout".into(),
+                details_ref: None,
+            },
+        );
+        assert!(!s.may_execute_write(&fp));
+        assert!(matches!(
+            s.dispatch_mutating_write(&fp),
+            WriteDispatch::InquireStatus { .. }
+        ));
+    }
+
+    #[test]
+    fn progress_status_poll_changing_evidence_timed_allow() {
+        let poll = write_fingerprint("shell", "heramind device status EK410");
+        assert!(looks_like_status_poll(&poll));
+        // Changing evidence under timed allow → Allow even if identical_rounds
+        // would otherwise look scary (caller passes results_changed=true).
+        assert_eq!(
+            progress_loop_decision(0, 3, std::slice::from_ref(&poll), true, 2, None),
+            ProgressDecision::Allow
+        );
+        // Same query same result hits limit → Halt.
+        assert_eq!(
+            progress_loop_decision(3, 3, std::slice::from_ref(&poll), false, 0, None),
+            ProgressDecision::HaltNoProgress {
+                identical_rounds: 3
+            }
+        );
+        // Cross-business write fingerprint is not a status poll.
+        let write_fp = write_fingerprint("shell", "heramind transform create --name t1");
+        assert!(!looks_like_status_poll(&write_fp));
+        assert_eq!(
+            progress_loop_decision(3, 3, &[write_fp], false, 0, None),
+            ProgressDecision::HaltNoProgress {
+                identical_rounds: 3
+            }
+        );
+    }
+
+    #[test]
+    fn budget_pressure_order_and_no_tools_when_feedback_lost() {
+        assert_eq!(
+            budget_pressure_order(),
+            &[
+                BudgetPressureStep::CompressNonessentialSkills,
+                BudgetPressureStep::CompressOldHistory,
+                BudgetPressureStep::KeepMandatoryContext,
+                BudgetPressureStep::StopOrCompressRetryNoTools,
+            ]
+        );
+        assert!(!tools_allowed_under_budget_pressure(false, false, true));
+        assert!(!tools_allowed_under_budget_pressure(true, true, true));
+        assert!(tools_allowed_under_budget_pressure(true, false, true));
+    }
+
+    /// New-user-turn contract: skills clear; TaskState + write gate survive.
+    #[tokio::test]
+    async fn continue_after_write_clears_skills_keeps_write_gate() {
+        use crate::agent::types::{AgentInternalState, AgentMessage};
+        use crate::llm::{ChatConfig, LlmInterface};
+
+        let llm = LlmInterface::new(ChatConfig::default());
+        let mut state = AgentInternalState::new("s-continue-skill".into());
+        state.task_state.apply_directive(TaskDirective::SetGoal {
+            goal: "写天气到 EK410".into(),
+            object: Some("EK410".into()),
+            content: None,
+        });
+        let fp = write_fingerprint("shell", "render_text EK410");
+        let op = state.task_state.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"render_text EK410"}"#,
+            Some(fp.clone()),
+        );
+        state.task_state.mark_operation_running(&op);
+        state.task_state.complete_operation_succeeded(
+            &op,
+            StructuredResult {
+                success: true,
+                summary: "render queued".into(),
+                body: "queued-1".into(),
+                details_ref: None,
+            },
+            None::<String>,
+        );
+        state
+            .task_state
+            .confirm_step_from_tool("shell", &fp, "queued-1", "render queued");
+        llm.set_skill_context("weather-guide".into(), "FULL WEATHER SKILL BODY".into())
+            .await;
+        assert!(llm.get_skill_context().await.is_some());
+
+        // New user turn (stream entry order): clear skills, then Continue.
+        begin_user_turn_clear_transient_skills(&llm).await;
+        state.push_message(AgentMessage::user("继续"));
+
+        assert!(
+            llm.get_skill_context().await.is_none(),
+            "transient skills must not survive into the next user turn"
+        );
+        assert_eq!(state.task_state.status, TaskStatus::Active);
+        assert_eq!(state.task_state.goal.as_deref(), Some("写天气到 EK410"));
+        assert_eq!(state.task_state.confirmed_steps.len(), 1);
+        assert!(
+            !state.task_state.may_execute_write(&fp),
+            "Continue must still refuse replaying the successful write"
+        );
+    }
+
+    #[tokio::test]
+    async fn correct_clears_skills_and_overwrites_goal() {
+        use crate::agent::types::{AgentInternalState, AgentMessage};
+        use crate::llm::{ChatConfig, LlmInterface};
+
+        let llm = LlmInterface::new(ChatConfig::default());
+        let mut state = AgentInternalState::new("s-correct-skill".into());
+        state.task_state.apply_directive(TaskDirective::SetGoal {
+            goal: "写到墨水屏".into(),
+            object: Some("screen-a".into()),
+            content: Some("晴".into()),
+        });
+        state.task_state.set_next_action("render old", "planner");
+        llm.set_skill_context("eink-old".into(), "OLD SCREEN SKILL".into())
+            .await;
+
+        begin_user_turn_clear_transient_skills(&llm).await;
+        state.push_message(AgentMessage::user("改成 eink 屏 EK410"));
+
+        assert!(llm.get_skill_context().await.is_none());
+        assert!(state.task_state.goal.as_deref().unwrap().contains("eink"));
+        assert_eq!(state.task_state.object.as_deref(), Some("EK410"));
+        assert!(state.task_state.next_action.is_none());
+        assert_eq!(state.task_state.status, TaskStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_skills_and_blocks_writes() {
+        use crate::agent::types::{AgentInternalState, AgentMessage};
+        use crate::llm::{ChatConfig, LlmInterface};
+
+        let llm = LlmInterface::new(ChatConfig::default());
+        let mut state = AgentInternalState::new("s-cancel-skill".into());
+        state.task_state.apply_directive(TaskDirective::SetGoal {
+            goal: "render".into(),
+            object: Some("EK410".into()),
+            content: None,
+        });
+        let fp = write_fingerprint("shell", "heramind ext invoke render");
+        llm.set_skill_context("render-guide".into(), "RENDER SKILL".into())
+            .await;
+
+        begin_user_turn_clear_transient_skills(&llm).await;
+        state.push_message(AgentMessage::user("取消"));
+
+        assert!(llm.get_skill_context().await.is_none());
+        assert_eq!(state.task_state.status, TaskStatus::Cancelled);
+        assert!(!state.task_state.may_execute_write(&fp));
+        assert_eq!(
+            state.task_state.apply_directive(TaskDirective::Continue),
+            ApplyOutcome::Ignored {
+                reason: "cancelled"
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_write_recovery_reload_skill_ok_write_still_gated() {
+        use crate::agent::types::{AgentInternalState, AgentMessage};
+        use crate::llm::{ChatConfig, LlmInterface};
+
+        let llm = LlmInterface::new(ChatConfig::default());
+        let mut state = AgentInternalState::new("s-recover-skill".into());
+        state.task_state.apply_directive(TaskDirective::SetGoal {
+            goal: "写天气".into(),
+            object: Some("EK410".into()),
+            content: None,
+        });
+        let fp = write_fingerprint("shell", "render_text EK410");
+        let op = state.task_state.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"render_text EK410"}"#,
+            Some(fp.clone()),
+        );
+        state.task_state.mark_operation_running(&op);
+        state.task_state.complete_operation_succeeded(
+            &op,
+            StructuredResult {
+                success: true,
+                summary: "ok".into(),
+                body: "ok".into(),
+                details_ref: None,
+            },
+            None::<String>,
+        );
+
+        // Turn N ends with a skill still loaded; turn N+1 clears then Continues.
+        llm.set_skill_context("weather".into(), "GUIDE".into())
+            .await;
+        begin_user_turn_clear_transient_skills(&llm).await;
+        state.push_message(AgentMessage::user("继续"));
+        assert!(llm.get_skill_context().await.is_none());
+
+        // Model may reload a skill within the new turn — that must not reopen
+        // the completed write gate.
+        llm.set_skill_context("weather".into(), "GUIDE RELOADED".into())
+            .await;
+        assert!(llm
+            .get_skill_context()
+            .await
+            .unwrap()
+            .contains("GUIDE RELOADED"));
+        assert!(!state.task_state.may_execute_write(&fp));
+        assert_eq!(state.task_state.status, TaskStatus::Active);
+    }
+
+    // ── Production-path groups (exec-state prod gaps) ───────────────────
+
+    #[test]
+    fn prod_concurrent_same_args_tool_runs_once() {
+        let mut s = TaskState::default();
+        let call_site_turn = s.turn_count;
+
+        let cmd = "heramind extension invoke weather-forecast-v2 render_text --device EK410";
+        let args = serde_json::json!({ "command": cmd });
+        let fp = write_fingerprint("shell", cmd);
+        assert!(
+            !derive_tool_capability("shell", &args).read_only,
+            "capability unify: shell mutation is not read_only"
+        );
+
+        let first = evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, call_site_turn);
+        let MutatingGateOutcome::Proceed { operation_id: op1 } = first else {
+            panic!("first lease holder must Proceed, got {first:?}");
+        };
+        assert_eq!(s.operation(&op1).unwrap().status, OperationStatus::Running);
+
+        let second = evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, call_site_turn);
+        match second {
+            MutatingGateOutcome::InProgress { operation_id } => {
+                assert_eq!(operation_id, op1, "same op — wait, do not re-exec");
+            }
+            other => panic!("concurrent same-args must InProgress, got {other:?}"),
+        }
+        // Tool body ran at most once: still a single Running op, no second begin.
+        assert_eq!(s.operations.len(), 1);
+        assert!(!s.may_execute_write(&fp));
+    }
+
+    #[test]
+    fn prod_user_new_op_reruns_resume_old_does_not_replay() {
+        let mut s = TaskState::default();
+        let call_site_turn = s.turn_count;
+
+        let cmd = "heramind extension invoke weather-forecast-v2 render_text --device EK410";
+        let args = serde_json::json!({ "command": cmd });
+        let fp = write_fingerprint("shell", cmd);
+
+        let MutatingGateOutcome::Proceed { operation_id: op1 } =
+            evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, call_site_turn)
+        else {
+            panic!("first attempt Proceed");
+        };
+        let mut cache = crate::agent::types::LargeDataCache::new();
+        finalize_operation_from_tool_result(
+            &mut s,
+            &mut cache,
+            &op1,
+            "shell",
+            &Ok(crate::toolkit::tool::ToolOutput::success(
+                serde_json::json!({
+                    "queued": true,
+                    "stdout": "ok"
+                }),
+            )),
+        );
+        assert_eq!(
+            s.operation(&op1).unwrap().status,
+            OperationStatus::Succeeded
+        );
+
+        // Resume old without new-op flag → PreferKnown, no replay.
+        match evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, call_site_turn) {
+            MutatingGateOutcome::ResumeKnown {
+                operation_id,
+                output,
+            } => {
+                assert_eq!(operation_id, op1);
+                assert_eq!(
+                    output
+                        .data
+                        .get("_operation_resume")
+                        .and_then(|v| v.as_bool()),
+                    Some(true)
+                );
+            }
+            other => panic!("resume must PreferKnown/ResumeKnown, got {other:?}"),
+        }
+        assert_eq!(s.operations.len(), 1, "resume must not begin a new op");
+
+        // User/model new-op production entry (not a phrase) → same args re-run.
+        let mut new_args = args.clone();
+        new_args
+            .as_object_mut()
+            .unwrap()
+            .insert(NEW_OPERATION_ARG.into(), serde_json::json!(true));
+        let MutatingGateOutcome::Proceed { operation_id: op2 } =
+            evaluate_mutating_gate(&mut s, "shell", &new_args, &fp, None, call_site_turn)
+        else {
+            panic!("_new_operation must authorize begin_new_operation");
+        };
+        assert_ne!(op2, op1);
+        assert_eq!(s.operations.len(), 2);
+        assert_eq!(s.operation(&op2).unwrap().status, OperationStatus::Running);
+        // Flag stripped from stored Operation args (not forwarded as tool fact).
+        assert!(
+            !s.operation(&op2)
+                .unwrap()
+                .arguments
+                .contains(NEW_OPERATION_ARG),
+            "stored args must not keep the protocol flag: {}",
+            s.operation(&op2).unwrap().arguments
+        );
+    }
+
+    #[test]
+    fn prod_details_ref_round_trips_expired_clear_fail() {
+        let mut s = TaskState::default();
+        let mut cache = crate::agent::types::LargeDataCache::new();
+        let big = "X".repeat(DETAILS_REF_BODY_THRESHOLD + 64);
+        let data = serde_json::json!({
+            "stdout": big,
+            "exit_code": 0,
+            "status": "ok"
+        });
+        let op = s.begin_new_operation(
+            "shell",
+            Some("EK410".into()),
+            r#"{"command":"heramind device get EK410"}"#,
+            None,
+        );
+        s.mark_operation_running(&op);
+        finalize_operation_from_tool_result(
+            &mut s,
+            &mut cache,
+            &op,
+            "shell",
+            &Ok(crate::toolkit::tool::ToolOutput::success(data)),
+        );
+        let res = s.operation(&op).unwrap().result.as_ref().unwrap();
+        let details_ref = res.details_ref.clone().expect("large body → details_ref");
+        assert!(
+            details_ref.starts_with("$cached:op:"),
+            "details_ref={details_ref}"
+        );
+        assert!(
+            !res.summary.contains(&big[..64.min(big.len())]),
+            "summary must not be a body-prefix fact"
+        );
+        // Round-trip through session cache.
+        let window = cache
+            .read_cached_window(&details_ref, 0, Some(128))
+            .expect("session cache hit");
+        assert!(window.content.contains("exit_code") || window.total_chars > 0);
+        // Expiry / eviction → clear fail (not empty success).
+        assert!(cache.drop_operation_body(&op));
+        let err = cache
+            .read_cached_window(&details_ref, 0, None)
+            .expect_err("expired ref must fail clearly");
+        assert!(
+            err.contains("Unknown $cached") || err.contains("evicted"),
+            "clear fail message: {err}"
+        );
+        // Other session cannot see it.
+        let other = crate::agent::types::LargeDataCache::new();
+        assert!(other.resolve_reference(&details_ref).is_none());
+    }
+
+    #[test]
+    fn prod_long_history_polling_stop_paths_consistent() {
+        // Packer keeps details_ref under pressure.
+        let details = "$cached:op:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let history = vec![
+            heramind_core::Message::user("old noise"),
+            heramind_core::Message::assistant("called shell"),
+            heramind_core::Message::user(format!(
+                "[Tool: shell returned]\nstatus=ok details_ref={details}\n{}",
+                "z".repeat(4000)
+            )),
+        ];
+        // Tiny budget forces stub compression of the newest tool group.
+        let got = crate::agent::history_select::select_messages_for_history_budget(&history, 80);
+        let joined: String = got
+            .messages
+            .iter()
+            .map(|m| m.content.as_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains(details),
+            "packer must keep critical details_ref feedback intact: {joined}"
+        );
+
+        // Status-poll changing evidence allowed; identical → halt writes Halted.
+        let poll = write_fingerprint("shell", "heramind device status EK410");
+        assert_eq!(
+            progress_loop_decision(0, 3, std::slice::from_ref(&poll), true, 1, None),
+            ProgressDecision::Allow
+        );
+        let halt_dec = progress_loop_decision(3, 3, &[poll], false, 0, None);
+        assert!(matches!(
+            halt_dec,
+            ProgressDecision::HaltNoProgress {
+                identical_rounds: 3
+            }
+        ));
+        let mut text_state = TaskState {
+            status: TaskStatus::Active,
+            ..TaskState::default()
+        };
+        assert!(apply_progress_stop(&mut text_state, &halt_dec));
+        assert!(matches!(text_state.status, TaskStatus::Halted { .. }));
+
+        // Image/text stop paths share apply_progress_stop — unknown write → Halted.
+        let mut image_state = TaskState {
+            status: TaskStatus::Active,
+            ..TaskState::default()
+        };
+        let inquire = ProgressDecision::InquireUnknown {
+            operation_id: "op-unknown-1".into(),
+        };
+        assert!(apply_progress_stop(&mut image_state, &inquire));
+        assert!(matches!(image_state.status, TaskStatus::Halted { .. }));
+        assert!(
+            image_state
+                .next_action
+                .as_ref()
+                .map(|a| a.description.contains("Inquire"))
+                .unwrap_or(false),
+            "inquire directive retained after halt"
+        );
+        assert!(!matches!(image_state.status, TaskStatus::Active));
+    }
+
+    // ── GPT review blockers (fcdff59b) ──────────────────────────────────
+
+    #[test]
+    fn gpt_capability_after_cli_mapping_control_is_mutating() {
+        // Structured device control must classify from the mapped CLI, not
+        // the bare `command: render_text` alias field.
+        let alias = serde_json::json!({
+            "action": "control",
+            "device_id": "D",
+            "command": "render_text",
+            "param": "text=weather"
+        });
+        let cap = derive_tool_capability("device", &alias);
+        assert!(
+            !cap.read_only,
+            "mapped heramind device control must not be read_only"
+        );
+        let empty = derive_tool_capability("shell", &serde_json::json!({"command": ""}));
+        assert!(
+            !empty.read_only,
+            "empty shell command is not proven read-only"
+        );
+    }
+
+    #[test]
+    fn gpt_new_operation_flag_does_not_bypass_concurrent_lease() {
+        // Fingerprint equality of flag vs no-flag is covered in intent tests;
+        // here the gate must treat them as the same business write.
+        let base = serde_json::json!({"agent_id": "A"});
+        let mut with_flag = base.clone();
+        with_flag
+            .as_object_mut()
+            .unwrap()
+            .insert(NEW_OPERATION_ARG.into(), serde_json::json!(true));
+        let mut clean = with_flag.clone();
+        strip_new_operation_flag(&mut clean);
+        let fp = write_fingerprint(
+            "run_now",
+            &serde_json::to_string(&clean).unwrap_or_default(),
+        );
+
+        let mut s = TaskState::default();
+        let call_site_turn = s.turn_count;
+
+        let first = evaluate_mutating_gate(&mut s, "run_now", &base, &fp, None, call_site_turn);
+        let MutatingGateOutcome::Proceed { operation_id: op1 } = first else {
+            panic!("first must Proceed, got {first:?}");
+        };
+        // Concurrent same business args + flag must hit the Running lease.
+        let second =
+            evaluate_mutating_gate(&mut s, "run_now", &with_flag, &fp, None, call_site_turn);
+        match second {
+            MutatingGateOutcome::InProgress { operation_id } => {
+                assert_eq!(operation_id, op1);
+            }
+            other => panic!("flag must not bypass concurrent lease, got {other:?}"),
+        }
+        assert_eq!(s.operations.len(), 1);
+    }
+
+    #[test]
+    fn gpt_pending_and_failed_resume_are_not_effective_success() {
+        let pending = in_progress_tool_output("op-pending");
+        assert!(!pending.success, "outer success must be false for pending");
+        assert!(!crate::toolkit::tool::effective_success(
+            "run_now", &pending
+        ));
+
+        let mut s = TaskState::default();
+        let call_site_turn = s.turn_count;
+
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let MutatingGateOutcome::Proceed { operation_id } = evaluate_mutating_gate(
+            &mut s,
+            "run_now",
+            &serde_json::json!({"agent_id": "A"}),
+            &fp,
+            None,
+            call_site_turn,
+        ) else {
+            panic!("Proceed");
+        };
+        s.complete_operation_failed(
+            &operation_id,
+            StructuredResult::with_body(false, "failed", r#"{"ok":false}"#, None),
+        );
+        match evaluate_mutating_gate(
+            &mut s,
+            "run_now",
+            &serde_json::json!({"agent_id": "A"}),
+            &fp,
+            None,
+            call_site_turn,
+        ) {
+            MutatingGateOutcome::ResumeKnown { output, .. } => {
+                assert!(!output.success, "failed resume outer success must be false");
+                assert_eq!(
+                    output.data.get("success").and_then(|v| v.as_bool()),
+                    Some(false)
+                );
+                assert!(!crate::toolkit::tool::effective_success("run_now", &output));
+            }
+            other => panic!("failed op must ResumeKnown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpt_interrupt_abandons_running_so_new_op_can_proceed() {
+        let mut s = TaskState::default();
+        let call_site_turn = s.turn_count;
+
+        let owner = new_stream_owner();
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let MutatingGateOutcome::Proceed { operation_id: op1 } = evaluate_mutating_gate(
+            &mut s,
+            "run_now",
+            &serde_json::json!({"agent_id": "A"}),
+            &fp,
+            Some(owner.as_str()),
+            call_site_turn,
+        ) else {
+            panic!("Proceed");
+        };
+        assert_eq!(s.operation(&op1).unwrap().status, OperationStatus::Running);
+        assert_eq!(
+            s.operation(&op1).unwrap().owner_id.as_deref(),
+            Some(owner.as_str())
+        );
+
+        s.abandon_owned_operations_on_interrupt(&owner, "user interrupt during tool batch");
+        assert_eq!(
+            s.operation(&op1).unwrap().status,
+            OperationStatus::Unknown,
+            "Running must become terminal Unknown"
+        );
+
+        // Model boolean alone after Unknown must NOT authorize replay.
+        let mut new_args = serde_json::json!({"agent_id": "A"});
+        new_args
+            .as_object_mut()
+            .unwrap()
+            .insert(NEW_OPERATION_ARG.into(), serde_json::json!(true));
+        match evaluate_mutating_gate(
+            &mut s,
+            "run_now",
+            &new_args,
+            &fp,
+            Some(new_stream_owner().as_str()),
+            call_site_turn,
+        ) {
+            MutatingGateOutcome::Block { message, confirm } => {
+                assert!(
+                    message.contains("alone is not user-authorized") || message.contains("confirm"),
+                    "unexpected block: {message}"
+                );
+                assert!(
+                    confirm.is_some(),
+                    "InquireStatus must issue a confirm request"
+                );
+            }
+            other => panic!("model-alone after Unknown must Block, got {other:?}"),
+        }
+
+        // User grant + schema flag → Proceed.
+        s.apply_directive(TaskDirective::AuthorizeNewOperation {
+            prior_operation_id: Some(op1.clone()),
+            write_fingerprint: Some(fp.clone()),
+        });
+        let owner2 = new_stream_owner();
+        let MutatingGateOutcome::Proceed { operation_id: op2 } = evaluate_mutating_gate(
+            &mut s,
+            "run_now",
+            &new_args,
+            &fp,
+            Some(owner2.as_str()),
+            call_site_turn,
+        ) else {
+            panic!("user-authorized _new_operation after interrupt must Proceed");
+        };
+        assert_ne!(op2, op1);
+        assert_eq!(s.operation(&op2).unwrap().status, OperationStatus::Running);
+        assert_eq!(
+            s.operation(&op2).unwrap().owner_id.as_deref(),
+            Some(owner2.as_str())
+        );
+    }
+
+    // ── GPT residuals on d2fbffca ───────────────────────────────────────
+
+    #[test]
+    fn gpt_cli_alias_flag_shares_fingerprint_and_lease() {
+        let base = serde_json::json!({
+            "action": "control",
+            "device_id": "D",
+            "command": "render_text",
+            "param": "text=weather"
+        });
+        let mut flagged = base.clone();
+        flagged
+            .as_object_mut()
+            .unwrap()
+            .insert(NEW_OPERATION_ARG.into(), serde_json::json!(true));
+        let fp1 = crate::agent::streaming::mutating_write_fingerprint("device", &base)
+            .expect("device control write");
+        let fp2 = crate::agent::streaming::mutating_write_fingerprint("device", &flagged)
+            .expect("flagged device control");
+        assert_eq!(fp1, fp2, "flag must not change CLI alias business fp");
+        assert!(
+            !fp1.contains("_new_operation"),
+            "flag must not be baked into command: {fp1}"
+        );
+
+        let mut s = TaskState::default();
+        let call_site_turn = s.turn_count;
+
+        let MutatingGateOutcome::Proceed { operation_id: op1 } =
+            evaluate_mutating_gate(&mut s, "device", &base, &fp1, None, call_site_turn)
+        else {
+            panic!("first Proceed");
+        };
+        match evaluate_mutating_gate(&mut s, "device", &flagged, &fp2, None, call_site_turn) {
+            MutatingGateOutcome::InProgress { operation_id } => assert_eq!(operation_id, op1),
+            other => panic!("flagged concurrent alias must InProgress, got {other:?}"),
+        }
+        assert_eq!(s.operations.len(), 1);
+    }
+
+    #[test]
+    fn gpt_device_list_repeat_is_not_resume_known() {
+        let list = serde_json::json!({"action": "list"});
+        assert!(
+            derive_tool_capability("device", &list).read_only,
+            "list is read_only"
+        );
+        assert!(
+            crate::agent::streaming::mutating_write_fingerprint("device", &list).is_none(),
+            "list must not be write-leased"
+        );
+        // Parity: classifying the canonical form must stay read_only (no
+        // double-canonicalize flipping list→control via command-key inference).
+        let canon = canonicalize_tool_arguments("device", &list);
+        assert!(
+            derive_tool_capability("device", &canon).read_only,
+            "canonical re-derive must stay read_only: {canon}"
+        );
+        assert!(crate::agent::streaming::mutating_write_fingerprint("device", &canon).is_none());
+    }
+
+    #[test]
+    fn gpt_stream_lease_guard_drop_abandons_running() {
+        let state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::agent::types::AgentInternalState::new("drop-guard".into()),
+        ));
+        let owner = new_stream_owner();
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        {
+            let mut s = state.blocking_write();
+            let call_site_turn = s.task_state.turn_count;
+            let MutatingGateOutcome::Proceed { .. } = evaluate_mutating_gate(
+                &mut s.task_state,
+                "run_now",
+                &serde_json::json!({"agent_id": "A"}),
+                &fp,
+                Some(owner.as_str()),
+                call_site_turn,
+            ) else {
+                panic!("Proceed");
+            };
+            assert_eq!(
+                s.task_state.operations.last().unwrap().status,
+                OperationStatus::Running
+            );
+            assert_eq!(
+                s.task_state.operations.last().unwrap().owner_id.as_deref(),
+                Some(owner.as_str())
+            );
+        }
+        // Guard drop (simulates consumer.abort / stream Drop) must finalize.
+        {
+            let _guard = StreamLeaseGuard::new(state.clone(), owner, "unit-test stream drop");
+        }
+        let mut s = state.blocking_write();
+        assert_eq!(
+            s.task_state.operations.last().unwrap().status,
+            OperationStatus::Unknown
+        );
+        // Unknown: model boolean alone blocked; user grant required.
+        let mut new_args = serde_json::json!({"agent_id": "A"});
+        new_args
+            .as_object_mut()
+            .unwrap()
+            .insert(NEW_OPERATION_ARG.into(), serde_json::json!(true));
+        let call_site_turn = s.task_state.turn_count;
+        match evaluate_mutating_gate(
+            &mut s.task_state,
+            "run_now",
+            &new_args,
+            &fp,
+            None,
+            call_site_turn,
+        ) {
+            MutatingGateOutcome::Block { .. } => {}
+            other => panic!("model-alone after Unknown must Block, got {other:?}"),
+        }
+        let op = s.task_state.operations.last().unwrap().operation_id.clone();
+        s.task_state
+            .apply_directive(TaskDirective::AuthorizeNewOperation {
+                prior_operation_id: Some(op),
+                write_fingerprint: Some(fp.clone()),
+            });
+        let owner2 = new_stream_owner();
+        let call_site_turn = s.task_state.turn_count;
+        let MutatingGateOutcome::Proceed { .. } = evaluate_mutating_gate(
+            &mut s.task_state,
+            "run_now",
+            &new_args,
+            &fp,
+            Some(owner2.as_str()),
+            call_site_turn,
+        ) else {
+            panic!("user-authorized new-op after drop must Proceed");
+        };
+    }
+
+    #[test]
+    fn gpt_old_stream_drop_must_not_clear_sibling_running() {
+        // A/B handover: delayed Drop of stream A must not mark B Unknown or
+        // allow a duplicate Proceed while B's executor is still active.
+        let state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::agent::types::AgentInternalState::new("handover".into()),
+        ));
+        let owner_a = new_stream_owner();
+        let owner_b = new_stream_owner();
+        let fp_a = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let fp_b = write_fingerprint("run_now", r#"{"agent_id":"B"}"#);
+
+        let guard_a = {
+            let mut s = state.blocking_write();
+            let call_site_turn = s.task_state.turn_count;
+            let MutatingGateOutcome::Proceed { operation_id } = evaluate_mutating_gate(
+                &mut s.task_state,
+                "run_now",
+                &serde_json::json!({"agent_id": "A"}),
+                &fp_a,
+                Some(owner_a.as_str()),
+                call_site_turn,
+            ) else {
+                panic!("A Proceed");
+            };
+            // Simulate A finishing its tool then going idle while stream lives.
+            s.task_state.complete_operation_succeeded(
+                &operation_id,
+                StructuredResult::with_body(true, "done", "{}", None),
+                None::<String>,
+            );
+            StreamLeaseGuard::new(state.clone(), owner_a, "old stream A")
+        };
+
+        let op_b = {
+            let mut s = state.blocking_write();
+            let call_site_turn = s.task_state.turn_count;
+            let MutatingGateOutcome::Proceed { operation_id } = evaluate_mutating_gate(
+                &mut s.task_state,
+                "run_now",
+                &serde_json::json!({"agent_id": "B"}),
+                &fp_b,
+                Some(owner_b.as_str()),
+                call_site_turn,
+            ) else {
+                panic!("B Proceed");
+            };
+            assert_eq!(
+                s.task_state.operation(&operation_id).unwrap().status,
+                OperationStatus::Running
+            );
+            operation_id
+        };
+
+        // Delayed teardown of A (cancel_session / contended Drop spawn).
+        drop(guard_a);
+
+        let mut s = state.blocking_write();
+        assert_eq!(
+            s.task_state.operation(&op_b).unwrap().status,
+            OperationStatus::Running,
+            "sibling B must stay Running after A's Drop"
+        );
+        // Same-business re-call while B still Running → InProgress, not Proceed.
+        let mut retry = serde_json::json!({"agent_id": "B"});
+        retry
+            .as_object_mut()
+            .unwrap()
+            .insert(NEW_OPERATION_ARG.into(), serde_json::json!(true));
+        let call_site_turn = s.task_state.turn_count;
+        match evaluate_mutating_gate(
+            &mut s.task_state,
+            "run_now",
+            &retry,
+            &fp_b,
+            Some(owner_b.as_str()),
+            call_site_turn,
+        ) {
+            MutatingGateOutcome::InProgress { operation_id } => {
+                assert_eq!(operation_id, op_b);
+            }
+            other => panic!("B re-call must InProgress while Running, got {other:?}"),
+        }
+        // Late/spawned cleanup for an unrelated owner must not touch B.
+        s.task_state
+            .abandon_owned_operations_on_interrupt("unrelated-owner", "late spawn");
+        assert_eq!(
+            s.task_state.operation(&op_b).unwrap().status,
+            OperationStatus::Running
+        );
+        assert_eq!(
+            s.task_state.operation(&op_b).unwrap().owner_id.as_deref(),
+            Some(owner_b.as_str())
+        );
+    }
+
+    /// P1-1 e2e: interleaved dual-stream create + exit cannot cross-attribute.
+    #[test]
+    fn gpt_dual_stream_interleaved_create_exit_no_cross_attribution() {
+        let mut s = TaskState::default();
+        let call_site_turn = s.turn_count;
+
+        let owner_a = new_stream_owner();
+        let owner_b = new_stream_owner();
+        let fp_a = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let fp_b = write_fingerprint("run_now", r#"{"agent_id":"B"}"#);
+
+        // Interleaved create: A then B with explicit owners (no shared hop).
+        let MutatingGateOutcome::Proceed { operation_id: op_a } = evaluate_mutating_gate(
+            &mut s,
+            "run_now",
+            &serde_json::json!({"agent_id": "A"}),
+            &fp_a,
+            Some(owner_a.as_str()),
+            call_site_turn,
+        ) else {
+            panic!("A Proceed");
+        };
+        let MutatingGateOutcome::Proceed { operation_id: op_b } = evaluate_mutating_gate(
+            &mut s,
+            "run_now",
+            &serde_json::json!({"agent_id": "B"}),
+            &fp_b,
+            Some(owner_b.as_str()),
+            call_site_turn,
+        ) else {
+            panic!("B Proceed");
+        };
+
+        assert_eq!(
+            s.operation(&op_a).unwrap().owner_id.as_deref(),
+            Some(owner_a.as_str()),
+            "A must keep its own owner even after B creates"
+        );
+        assert_eq!(
+            s.operation(&op_b).unwrap().owner_id.as_deref(),
+            Some(owner_b.as_str())
+        );
+
+        // A exit must not Unknown B; A cannot clear B's ops.
+        s.abandon_owned_operations_on_interrupt(&owner_a, "stream A exit");
+        assert_eq!(s.operation(&op_a).unwrap().status, OperationStatus::Unknown);
+        assert_eq!(
+            s.operation(&op_b).unwrap().status,
+            OperationStatus::Running,
+            "B must stay Running after A exit"
+        );
+
+        // B exit clears only B; A stays Unknown (not re-touched into a wrong state).
+        s.abandon_owned_operations_on_interrupt(&owner_b, "stream B exit");
+        assert_eq!(s.operation(&op_b).unwrap().status, OperationStatus::Unknown);
+        assert_eq!(s.operation(&op_a).unwrap().status, OperationStatus::Unknown);
+        assert_eq!(
+            s.operation(&op_a).unwrap().owner_id.as_deref(),
+            Some(owner_a.as_str())
+        );
+        assert_eq!(
+            s.operation(&op_b).unwrap().owner_id.as_deref(),
+            Some(owner_b.as_str())
+        );
+    }
+
+    /// P1-2 e2e: first run → resume → run-again via registered tool schema.
+    #[test]
+    fn gpt_run_again_via_registered_tool_schema_not_manual_inject() {
+        // Build the schema the model actually sees (inject protocol).
+        let mut defs = vec![crate::toolkit::tool::ToolDefinition {
+            name: "run_now".into(),
+            description: "Ask an agent to run now.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string" }
+                },
+                "required": ["agent"]
+            }),
+            example: None,
+            category: crate::toolkit::tool::ToolCategory::System,
+            scenarios: vec![],
+            relationships: Default::default(),
+            deprecated: false,
+            replaced_by: None,
+            version: "1.0.0".into(),
+            examples: vec![],
+            response_format: None,
+            namespace: None,
+        }];
+        inject_new_operation_protocol(&mut defs);
+        let def = &defs[0];
+        assert!(
+            def.parameters
+                .get("properties")
+                .and_then(|p| p.get(NEW_OPERATION_ARG))
+                .is_some(),
+            "registered schema must expose {NEW_OPERATION_ARG}"
+        );
+
+        let mut s = TaskState::default();
+        let call_site_turn = s.turn_count;
+
+        let owner = new_stream_owner();
+        let base = serde_json::json!({"agent": "cold-room"});
+        let fp = crate::agent::streaming::mutating_write_fingerprint("run_now", &base)
+            .expect("run_now write");
+
+        // First run.
+        let MutatingGateOutcome::Proceed { operation_id: op1 } = evaluate_mutating_gate(
+            &mut s,
+            "run_now",
+            &base,
+            &fp,
+            Some(owner.as_str()),
+            call_site_turn,
+        ) else {
+            panic!("first Proceed");
+        };
+        s.complete_operation_succeeded(
+            &op1,
+            StructuredResult::with_body(true, "ok", r#"{"ok":true}"#, None),
+            None::<String>,
+        );
+
+        // Resume without flag → PreferKnown.
+        match evaluate_mutating_gate(
+            &mut s,
+            "run_now",
+            &base,
+            &fp,
+            Some(owner.as_str()),
+            call_site_turn,
+        ) {
+            MutatingGateOutcome::ResumeKnown { operation_id, .. } => {
+                assert_eq!(operation_id, op1);
+            }
+            other => panic!("resume must ResumeKnown, got {other:?}"),
+        }
+
+        // User asks run-again: model discovers flag from schema (not hard-injected).
+        let new_args = apply_new_operation_from_tool_schema(def, base.clone())
+            .expect("schema discovery must yield args");
+        assert!(wants_new_operation(&new_args));
+        let owner2 = new_stream_owner();
+        let MutatingGateOutcome::Proceed { operation_id: op2 } = evaluate_mutating_gate(
+            &mut s,
+            "run_now",
+            &new_args,
+            &fp,
+            Some(owner2.as_str()),
+            call_site_turn,
+        ) else {
+            panic!("schema-based _new_operation must Proceed after known terminal");
+        };
+        assert_ne!(op2, op1);
+        assert_eq!(s.operation(&op2).unwrap().status, OperationStatus::Running);
+
+        // Schema helper refuses tools that never received the protocol inject.
+        let bare = crate::toolkit::tool::ToolDefinition {
+            name: "query_conclusion".into(),
+            description: "read-only".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "agent": { "type": "string" } }
+            }),
+            example: None,
+            category: crate::toolkit::tool::ToolCategory::System,
+            scenarios: vec![],
+            relationships: Default::default(),
+            deprecated: false,
+            replaced_by: None,
+            version: "1.0.0".into(),
+            examples: vec![],
+            response_format: None,
+            namespace: None,
+        };
+        assert!(apply_new_operation_from_tool_schema(&bare, base).is_err());
+    }
+
+    // ── GPT op-scoped Unknown re-run auth (86a49573 P1) ─────────────────
+
+    fn unknown_op_with_fp(s: &mut TaskState, tool: &str, args: &str, fp: &str) -> OperationId {
+        let op = s.begin_new_operation(tool, None, args, Some(fp.to_string()));
+        s.mark_operation_running(&op);
+        s.complete_operation_unknown(
+            &op,
+            StructuredResult {
+                success: false,
+                summary: "interrupted".into(),
+                body: String::new(),
+                details_ref: None,
+            },
+        );
+        op
+    }
+
+    fn confirm_submit_for(
+        s: &mut TaskState,
+        op: &str,
+        fp: &str,
+        tool: &str,
+        target: Option<&str>,
+    ) -> AuthorizeNewOpSubmit {
+        let req = s.issue_or_reuse_confirm_request(op, fp, tool, target.map(|t| t.to_string()));
+        let _ = s.drain_confirm_lifecycle_notices();
+        AuthorizeNewOpSubmit {
+            request_id: req.request_id,
+            prior_operation_id: req.prior_operation_id,
+            write_fingerprint: req.write_fingerprint,
+        }
+    }
+
+    fn flagged_args(base: serde_json::Value) -> serde_json::Value {
+        let mut v = base;
+        v.as_object_mut()
+            .unwrap()
+            .insert(NEW_OPERATION_ARG.into(), serde_json::json!(true));
+        v
+    }
+
+    #[test]
+    fn gpt_unknown_auth_cross_op_grant_does_not_leak() {
+        let mut s = TaskState::default();
+        s.note_user_turn();
+        let call_site_turn = s.turn_count;
+
+        let fp_a = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let fp_b = write_fingerprint("run_now", r#"{"agent_id":"B"}"#);
+        let op_a = unknown_op_with_fp(&mut s, "run_now", r#"{"agent_id":"A"}"#, &fp_a);
+        let op_b = unknown_op_with_fp(&mut s, "run_now", r#"{"agent_id":"B"}"#, &fp_b);
+        assert_eq!(s.current_operation_id, op_b);
+        // Bare AuthorizeNewOperation without a consumed confirm is refused.
+        assert_eq!(
+            s.apply_directive(TaskDirective::AuthorizeNewOperation {
+                prior_operation_id: None,
+                write_fingerprint: None,
+            }),
+            ApplyOutcome::Ignored {
+                reason: "confirm_request_required"
+            }
+        );
+        assert!(s.user_authorized_new_op.is_none());
+        // Explicit confirm for B only.
+        assert_eq!(
+            s.apply_directive(TaskDirective::AuthorizeNewOperation {
+                prior_operation_id: Some(op_b.clone()),
+                write_fingerprint: Some(fp_b.clone()),
+            }),
+            ApplyOutcome::Applied
+        );
+        let grant = s.user_authorized_new_op.clone().expect("grant");
+        assert_eq!(grant.prior_operation_id, op_b);
+        assert_eq!(grant.write_fingerprint, fp_b);
+        assert_eq!(grant.confirming_turn, s.turn_count);
+
+        let args_a = flagged_args(serde_json::json!({"agent_id": "A"}));
+        let args_b = flagged_args(serde_json::json!({"agent_id": "B"}));
+
+        match evaluate_mutating_gate(&mut s, "run_now", &args_a, &fp_a, None, call_site_turn) {
+            MutatingGateOutcome::Block { .. } => {}
+            other => panic!("A must not consume B grant, got {other:?}"),
+        }
+        assert!(
+            s.user_authorized_new_op.is_some(),
+            "mismatched consume must restore grant"
+        );
+
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_new,
+        } = evaluate_mutating_gate(&mut s, "run_now", &args_b, &fp_b, None, call_site_turn)
+        else {
+            panic!("B with matching grant must Proceed");
+        };
+        assert_ne!(op_new, op_a);
+        assert_ne!(op_new, op_b);
+        assert!(
+            s.user_authorized_new_op.is_none(),
+            "grant one-shot consumed"
+        );
+    }
+
+    #[test]
+    fn gpt_unknown_auth_cross_turn_expires() {
+        let mut s = TaskState::default();
+        s.note_user_turn();
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut s, "run_now", r#"{"agent_id":"A"}"#, &fp);
+        assert_eq!(
+            s.apply_directive(TaskDirective::AuthorizeNewOperation {
+                prior_operation_id: Some(op.clone()),
+                write_fingerprint: Some(fp.clone()),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            s.user_authorized_new_op
+                .as_ref()
+                .unwrap()
+                .prior_operation_id,
+            op
+        );
+        s.note_user_turn();
+        let call_site_turn = s.turn_count;
+        assert!(
+            s.user_authorized_new_op.is_none(),
+            "grant must expire on turn advance"
+        );
+        let args = flagged_args(serde_json::json!({"agent_id": "A"}));
+        match evaluate_mutating_gate(&mut s, "run_now", &args, &fp, None, call_site_turn) {
+            MutatingGateOutcome::Block { .. } => {}
+            other => panic!("expired grant must Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpt_unknown_auth_concurrent_consume_is_one_shot() {
+        let mut s = TaskState::default();
+        s.note_user_turn();
+        let call_site_turn = s.turn_count;
+
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut s, "run_now", r#"{"agent_id":"A"}"#, &fp);
+        s.apply_directive(TaskDirective::AuthorizeNewOperation {
+            prior_operation_id: Some(op.clone()),
+            write_fingerprint: Some(fp.clone()),
+        });
+        assert!(s.take_user_authorized_new_op(&op, &fp, call_site_turn));
+        assert!(!s.take_user_authorized_new_op(&op, &fp, call_site_turn));
+        assert!(s.user_authorized_new_op.is_none());
+    }
+
+    #[test]
+    fn gpt_unknown_auth_cancel_and_target_change_invalidate() {
+        let mut s = TaskState::default();
+        s.note_user_turn();
+        let call_site_turn = s.turn_count;
+
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut s, "run_now", r#"{"agent_id":"A"}"#, &fp);
+
+        s.apply_directive(TaskDirective::AuthorizeNewOperation {
+            prior_operation_id: Some(op.clone()),
+            write_fingerprint: Some(fp.clone()),
+        });
+        assert!(s.user_authorized_new_op.is_some());
+        s.apply_directive(TaskDirective::Correct {
+            goal: "do something else".into(),
+            object: Some("other".into()),
+            content: None,
+            method: None,
+            exclude_routes: vec![],
+        });
+        assert!(
+            s.user_authorized_new_op.is_none(),
+            "Correct must invalidate grant"
+        );
+        assert!(!s.take_user_authorized_new_op(&op, &fp, call_site_turn));
+
+        s.apply_directive(TaskDirective::AuthorizeNewOperation {
+            prior_operation_id: Some(op.clone()),
+            write_fingerprint: Some(fp.clone()),
+        });
+        assert!(s.user_authorized_new_op.is_some());
+        s.apply_directive(TaskDirective::SetGoal {
+            goal: "new goal".into(),
+            object: Some("X".into()),
+            content: None,
+        });
+        assert!(
+            s.user_authorized_new_op.is_none(),
+            "SetGoal must invalidate grant"
+        );
+
+        s.apply_directive(TaskDirective::AuthorizeNewOperation {
+            prior_operation_id: Some(op.clone()),
+            write_fingerprint: Some(fp.clone()),
+        });
+        assert!(s.user_authorized_new_op.is_some());
+        s.apply_directive(TaskDirective::Cancel);
+        assert!(
+            s.user_authorized_new_op.is_none(),
+            "Cancel must invalidate grant"
+        );
+        assert!(!s.take_user_authorized_new_op(&op, &fp, call_site_turn));
+    }
+
+    #[test]
+    fn gpt_unknown_auth_phrase_feeds_same_structured_grant() {
+        assert!(is_authorize_new_operation_phrase("确认重跑"));
+        assert!(is_authorize_new_operation_phrase("confirm re-run"));
+        assert!(parse_user_directive("确认重跑").is_none());
+        assert!(parse_user_directive("confirm re-run").is_none());
+        assert!(parse_user_directive("再发送一次").is_none());
+        assert!(parse_user_directive("请再跑一下那个任务").is_none());
+
+        let mut state = crate::agent::types::AgentInternalState::new("phrase-grant".into());
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut state.task_state, "run_now", r#"{"agent_id":"A"}"#, &fp);
+        let _ = confirm_submit_for(&mut state.task_state, &op, &fp, "run_now", None);
+        // Phrase with unique pending confirm → consume request → grant.
+        let accepted = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("确认重跑"),
+            None,
+            None,
+        );
+        let grant = state
+            .task_state
+            .user_authorized_new_op
+            .clone()
+            .expect("phrase must consume unique pending");
+        assert_eq!(grant.prior_operation_id, op);
+        assert_eq!(grant.write_fingerprint, fp);
+        assert_eq!(grant.confirming_turn, accepted.call_site_turn);
+        assert!(state.task_state.pending_confirm_requests.is_empty());
+
+        let args = flagged_args(serde_json::json!({"agent_id": "A"}));
+        let MutatingGateOutcome::Proceed { .. } = evaluate_mutating_gate(
+            &mut state.task_state,
+            "run_now",
+            &args,
+            &fp,
+            None,
+            accepted.call_site_turn,
+        ) else {
+            panic!("phrase-fed grant must Proceed via same protocol");
+        };
+        assert!(state.task_state.user_authorized_new_op.is_none());
+    }
+
+    #[test]
+    fn gpt_unknown_auth_grant_without_confirm_request_is_ignored() {
+        let mut s = TaskState::default();
+        s.note_user_turn();
+        assert_eq!(
+            s.apply_directive(TaskDirective::AuthorizeNewOperation {
+                prior_operation_id: None,
+                write_fingerprint: None
+            }),
+            ApplyOutcome::Ignored {
+                reason: "confirm_request_required"
+            }
+        );
+        assert!(s.user_authorized_new_op.is_none());
+    }
+
+    // ── GPT auth source binding (e6726c07 P1 residuals) ─────────────────
+
+    #[test]
+    fn gpt_auth_source_confirm_specified_older_unknown_only() {
+        let mut s = TaskState::default();
+        s.note_user_turn();
+        let call_site_turn = s.turn_count;
+        let fp_a = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let fp_b = write_fingerprint("run_now", r#"{"agent_id":"B"}"#);
+        let op_a = unknown_op_with_fp(&mut s, "run_now", r#"{"agent_id":"A"}"#, &fp_a);
+        let op_b = unknown_op_with_fp(&mut s, "run_now", r#"{"agent_id":"B"}"#, &fp_b);
+        assert_eq!(s.current_operation_id, op_b, "B is latest/current");
+
+        // Confirm carries original Operation ID + fingerprint for older A.
+        assert_eq!(
+            s.apply_directive(TaskDirective::AuthorizeNewOperation {
+                prior_operation_id: Some(op_a.clone()),
+                write_fingerprint: Some(fp_a.clone()),
+            }),
+            ApplyOutcome::Applied
+        );
+        let grant = s.user_authorized_new_op.clone().expect("grant");
+        assert_eq!(grant.prior_operation_id, op_a);
+        assert_eq!(grant.write_fingerprint, fp_a);
+        assert_ne!(grant.prior_operation_id, op_b);
+
+        let args_a = flagged_args(serde_json::json!({"agent_id": "A"}));
+        let args_b = flagged_args(serde_json::json!({"agent_id": "B"}));
+
+        // Newer B cannot consume A's grant.
+        match evaluate_mutating_gate(&mut s, "run_now", &args_b, &fp_b, None, call_site_turn) {
+            MutatingGateOutcome::Block { .. } => {}
+            other => panic!("newer B must not consume older-A grant, got {other:?}"),
+        }
+        assert!(
+            s.user_authorized_new_op.is_some(),
+            "mismatched consume must restore grant"
+        );
+
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_new,
+        } = evaluate_mutating_gate(&mut s, "run_now", &args_a, &fp_a, None, call_site_turn)
+        else {
+            panic!("specified older A must Proceed");
+        };
+        assert_ne!(op_new, op_a);
+        assert_ne!(op_new, op_b);
+        assert!(s.user_authorized_new_op.is_none());
+    }
+
+    #[test]
+    fn gpt_auth_source_old_stream_cannot_consume_new_turn_grant() {
+        let mut s = TaskState::default();
+        s.note_user_turn();
+        let old_stream_turn = s.turn_count;
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut s, "run_now", r#"{"agent_id":"A"}"#, &fp);
+
+        // New user Turn confirms — grant binds confirming_turn = new turn.
+        s.note_user_turn();
+        let confirming_turn = s.turn_count;
+        assert_ne!(old_stream_turn, confirming_turn);
+        assert_eq!(
+            s.apply_directive(TaskDirective::AuthorizeNewOperation {
+                prior_operation_id: Some(op.clone()),
+                write_fingerprint: Some(fp.clone()),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            s.user_authorized_new_op.as_ref().unwrap().confirming_turn,
+            confirming_turn
+        );
+
+        // Old stream still holds call_site_turn from before confirm.
+        assert!(
+            !s.take_user_authorized_new_op(&op, &fp, old_stream_turn),
+            "old stream Turn must not consume grant from a later confirm"
+        );
+        assert!(
+            s.user_authorized_new_op.is_some(),
+            "stale call-site must restore grant"
+        );
+
+        let args = flagged_args(serde_json::json!({"agent_id": "A"}));
+        match evaluate_mutating_gate(&mut s, "run_now", &args, &fp, None, old_stream_turn) {
+            MutatingGateOutcome::Block { .. } => {}
+            other => panic!("old stream gate must Block, got {other:?}"),
+        }
+        assert!(s.user_authorized_new_op.is_some());
+
+        // Matching call-site Turn consumes.
+        let MutatingGateOutcome::Proceed { .. } =
+            evaluate_mutating_gate(&mut s, "run_now", &args, &fp, None, confirming_turn)
+        else {
+            panic!("confirming Turn call-site must Proceed");
+        };
+        assert!(s.user_authorized_new_op.is_none());
+    }
+
+    // ── GPT confirm lifecycle (a76f348f P1 residuals) ───────────────────
+
+    #[test]
+    fn gpt_confirm_lifecycle_spaced_fingerprint_shell_device_control() {
+        // Fingerprints with spaces must survive end-to-end via JSON fields.
+        let mut s = TaskState::default();
+        let cmd = r#"heramind device control --device "Front Door Cam" --action reboot"#;
+        let fp = write_fingerprint("shell", cmd);
+        assert!(fp.contains(' '), "fixture must include spaces: {fp}");
+        let op = unknown_op_with_fp(&mut s, "shell", &format!(r#"{{"command":"{cmd}"}}"#), &fp);
+        let args = flagged_args(serde_json::json!({ "command": cmd }));
+        let call_site = s.note_user_turn();
+        let MutatingGateOutcome::Block { confirm, message } =
+            evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, call_site)
+        else {
+            panic!("Unknown must Block with confirm");
+        };
+        let confirm = confirm.expect("confirm issued");
+        assert_eq!(confirm.write_fingerprint, fp);
+        assert_eq!(confirm.target.as_deref(), Some("Front Door Cam"));
+        assert!(
+            !message.contains("write_fingerprint="),
+            "model prose must not embed fingerprint KV for text parse"
+        );
+        // Submit request id → grant with full spaced fingerprint.
+        let submit = AuthorizeNewOpSubmit {
+            request_id: confirm.request_id.clone(),
+            prior_operation_id: confirm.prior_operation_id.clone(),
+            write_fingerprint: confirm.write_fingerprint.clone(),
+        };
+        s.note_user_turn();
+        let (bound_op, bound_fp) = s.submit_confirm_request(&submit, None).expect("consume");
+        assert_eq!(bound_op, op);
+        assert_eq!(bound_fp, fp);
+        s.grant_user_authorized_new_op(Some(&bound_op), Some(&bound_fp))
+            .expect("grant");
+        assert_eq!(
+            s.user_authorized_new_op.as_ref().unwrap().write_fingerprint,
+            fp
+        );
+    }
+
+    #[test]
+    fn gpt_confirm_lifecycle_duplicate_requests_same_op_reuse_id() {
+        let mut s = TaskState::default();
+        let fp = write_fingerprint(
+            "shell",
+            "heramind device control --device EK410 --action reboot",
+        );
+        let op = unknown_op_with_fp(&mut s, "shell", r#"{"command":"x"}"#, &fp);
+        let a = s.issue_or_reuse_confirm_request(&op, &fp, "shell", Some("EK410".into()));
+        let _ = s.drain_confirm_lifecycle_notices();
+        // Shrink remaining TTL without expiring, then reuse — must refresh.
+        let shrunk = a.valid_until_ms.saturating_sub(600_000);
+        if let Some(c) = s.pending_confirm_requests.first_mut() {
+            c.valid_until_ms = shrunk;
+        }
+        let b = s.issue_or_reuse_confirm_request(&op, &fp, "shell", Some("EK410".into()));
+        assert_eq!(
+            a.request_id, b.request_id,
+            "same Unknown op must reuse request id"
+        );
+        assert!(
+            b.valid_until_ms > shrunk,
+            "reuse must refresh valid_until_ms past shrunk ({shrunk}), got {}",
+            b.valid_until_ms
+        );
+        assert_eq!(s.pending_confirm_requests.len(), 1);
+    }
+
+    #[test]
+    fn gpt_confirm_lifecycle_consumed_replay_rejected() {
+        let mut s = TaskState::default();
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut s, "run_now", r#"{"agent_id":"A"}"#, &fp);
+        let submit = confirm_submit_for(&mut s, &op, &fp, "run_now", None);
+        s.note_user_turn();
+        s.submit_confirm_request(&submit, None)
+            .expect("first consume");
+        let err = s
+            .submit_confirm_request(&submit, None)
+            .expect_err("replay must fail");
+        assert_eq!(err, "confirm_request_not_found");
+        assert!(s.pending_confirm(&submit.request_id).is_none());
+    }
+
+    #[test]
+    fn gpt_confirm_lifecycle_expired_click_rejected() {
+        let mut s = TaskState::default();
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut s, "run_now", r#"{"agent_id":"A"}"#, &fp);
+        let mut req = s.issue_or_reuse_confirm_request(&op, &fp, "run_now", None);
+        let _ = s.drain_confirm_lifecycle_notices();
+        // Force expiry.
+        req.valid_until_ms = 1;
+        s.pending_confirm_requests.clear();
+        s.pending_confirm_requests.push(req.clone());
+        let submit = AuthorizeNewOpSubmit {
+            request_id: req.request_id.clone(),
+            prior_operation_id: req.prior_operation_id.clone(),
+            write_fingerprint: req.write_fingerprint.clone(),
+        };
+        let err = s
+            .submit_confirm_request(&submit, Some(2))
+            .expect_err("expired");
+        assert_eq!(err, "confirm_request_expired");
+        assert!(s.pending_confirm(&submit.request_id).is_none());
+    }
+
+    #[test]
+    fn gpt_atomic_accept_local_turn_survives_interleaved_confirm() {
+        // accept_user_message returns an immutable TurnContext; a later
+        // confirm accept must not replace stream A's local call_site_turn.
+        let mut state = crate::agent::types::AgentInternalState::new("atomic-turn".into());
+        let stream_a = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("start A"),
+            None,
+            None,
+        );
+        assert_eq!(stream_a.call_site_turn, 1);
+
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut state.task_state, "run_now", r#"{"agent_id":"A"}"#, &fp);
+        let submit = confirm_submit_for(&mut state.task_state, &op, &fp, "run_now", None);
+
+        let stream_b = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("确认重跑"),
+            Some(submit),
+            None,
+        );
+        assert_eq!(stream_b.call_site_turn, 2);
+        assert_ne!(stream_a.call_site_turn, stream_b.call_site_turn);
+        assert_eq!(
+            state
+                .task_state
+                .user_authorized_new_op
+                .as_ref()
+                .unwrap()
+                .confirming_turn,
+            stream_b.call_site_turn
+        );
+
+        // Delayed "first poll" of stream A still holds its local Turn 1.
+        assert!(
+            !state
+                .task_state
+                .take_user_authorized_new_op(&op, &fp, stream_a.call_site_turn),
+            "local Turn A must not consume confirm Turn B's grant"
+        );
+        assert!(state.task_state.user_authorized_new_op.is_some());
+
+        let args = flagged_args(serde_json::json!({"agent_id": "A"}));
+        match evaluate_mutating_gate(
+            &mut state.task_state,
+            "run_now",
+            &args,
+            &fp,
+            None,
+            stream_a.call_site_turn,
+        ) {
+            MutatingGateOutcome::Block { .. } => {}
+            other => panic!("stream A delayed poll must Block, got {other:?}"),
+        }
+
+        let MutatingGateOutcome::Proceed { .. } = evaluate_mutating_gate(
+            &mut state.task_state,
+            "run_now",
+            &args,
+            &fp,
+            None,
+            stream_b.call_site_turn,
+        ) else {
+            panic!("confirm Turn B call-site must Proceed");
+        };
+        assert!(state.task_state.user_authorized_new_op.is_none());
+    }
+
+    #[test]
+    fn gpt_atomic_accept_auth_travels_with_message_not_shared_hop() {
+        // Authorization is an accept argument — interleaved accepts cannot
+        // steal each other's target (no pending_authorize_new_op hop).
+        let mut state = crate::agent::types::AgentInternalState::new("atomic-auth".into());
+        let fp_a = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let fp_b = write_fingerprint("run_now", r#"{"agent_id":"B"}"#);
+        let op_a = unknown_op_with_fp(
+            &mut state.task_state,
+            "run_now",
+            r#"{"agent_id":"A"}"#,
+            &fp_a,
+        );
+        let op_b = unknown_op_with_fp(
+            &mut state.task_state,
+            "run_now",
+            r#"{"agent_id":"B"}"#,
+            &fp_b,
+        );
+        assert_eq!(state.task_state.current_operation_id, op_b);
+
+        // Bare phrase alone is ambiguous with two Unknowns.
+        let _ = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("确认重跑"),
+            None,
+            None,
+        );
+        assert!(
+            state.task_state.user_authorized_new_op.is_none(),
+            "bare phrase with two Unknowns must not grant"
+        );
+
+        // Interleaved: accept B with auth for A — grant binds A on B's Turn.
+        // A concurrent plain accept must not consume a shared pending hop
+        // (there is none): auth only applies when passed to accept.
+        let submit_a = confirm_submit_for(&mut state.task_state, &op_a, &fp_a, "run_now", None);
+        let confirm = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("确认重跑"),
+            Some(submit_a),
+            None,
+        );
+        let grant = state
+            .task_state
+            .user_authorized_new_op
+            .clone()
+            .expect("auth arg must grant specified op");
+        assert_eq!(grant.prior_operation_id, op_a);
+        assert_eq!(grant.write_fingerprint, fp_a);
+        assert_ne!(grant.prior_operation_id, op_b);
+        assert_eq!(grant.confirming_turn, confirm.call_site_turn);
+
+        // Another accept without auth does not steal — grant already applied
+        // to confirm's Turn; a later plain accept expires it (confirming_turn
+        // binding) rather than redirecting it.
+        let interloper = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("顺便问一下天气"),
+            None,
+            None,
+        );
+        assert!(
+            state.task_state.user_authorized_new_op.is_none(),
+            "later Turn without auth must expire prior grant, not steal it"
+        );
+        assert_ne!(interloper.call_site_turn, confirm.call_site_turn);
+
+        // Re-accept with auth for A after interloper.
+        let submit_a2 = confirm_submit_for(&mut state.task_state, &op_a, &fp_a, "run_now", None);
+        let confirm2 = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("确认重跑"),
+            Some(submit_a2),
+            None,
+        );
+        let args_a = flagged_args(serde_json::json!({"agent_id": "A"}));
+        let args_b = flagged_args(serde_json::json!({"agent_id": "B"}));
+        match evaluate_mutating_gate(
+            &mut state.task_state,
+            "run_now",
+            &args_b,
+            &fp_b,
+            None,
+            confirm2.call_site_turn,
+        ) {
+            MutatingGateOutcome::Block { .. } => {}
+            other => panic!("newer B must not consume A's grant, got {other:?}"),
+        }
+        let MutatingGateOutcome::Proceed { .. } = evaluate_mutating_gate(
+            &mut state.task_state,
+            "run_now",
+            &args_a,
+            &fp_a,
+            None,
+            confirm2.call_site_turn,
+        ) else {
+            panic!("auth traveling with confirm accept must Proceed for A");
+        };
+        assert!(state.task_state.user_authorized_new_op.is_none());
+    }
+
+    #[test]
+    fn gpt_atomic_accept_interleaved_confirm_and_save_keep_own_auth() {
+        // Two confirm accepts for different Unknowns: each TurnContext keeps
+        // its own call_site; only the matching Turn consumes its grant.
+        let mut state = crate::agent::types::AgentInternalState::new("interleaved".into());
+        let fp_a = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let fp_b = write_fingerprint("run_now", r#"{"agent_id":"B"}"#);
+        let op_a = unknown_op_with_fp(
+            &mut state.task_state,
+            "run_now",
+            r#"{"agent_id":"A"}"#,
+            &fp_a,
+        );
+        let _op_b = unknown_op_with_fp(
+            &mut state.task_state,
+            "run_now",
+            r#"{"agent_id":"B"}"#,
+            &fp_b,
+        );
+
+        let submit_a = confirm_submit_for(&mut state.task_state, &op_a, &fp_a, "run_now", None);
+        let turn_a = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("确认重跑 A"),
+            Some(submit_a),
+            None,
+        );
+        // Note: second accept expires turn_a's grant (confirming_turn binding).
+        // Simulate the race the shared hop had: auth for B arrives as its own
+        // accept argument — never overwriting a pending slot turn_a relied on.
+        let submit_b = confirm_submit_for(&mut state.task_state, &_op_b, &fp_b, "run_now", None);
+        let turn_b = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("确认重跑 B"),
+            Some(submit_b),
+            None,
+        );
+        assert_ne!(turn_a.call_site_turn, turn_b.call_site_turn);
+
+        // Grant is for B (latest accept). Turn A cannot take it.
+        assert!(
+            !state
+                .task_state
+                .take_user_authorized_new_op(&op_a, &fp_a, turn_a.call_site_turn),
+            "Turn A must not consume Turn B's grant"
+        );
+        // Restore path left grant in place when call-site mismatched for A;
+        // but grant is for B — take with A's op fails without consuming.
+        // Matching Turn B + op B proceeds.
+        let args_b = flagged_args(serde_json::json!({"agent_id": "B"}));
+        let MutatingGateOutcome::Proceed { .. } = evaluate_mutating_gate(
+            &mut state.task_state,
+            "run_now",
+            &args_b,
+            &fp_b,
+            None,
+            turn_b.call_site_turn,
+        ) else {
+            panic!("Turn B with auth-for-B must Proceed");
+        };
+    }
+
+    // ── GPT phrase must consume confirm request (7d1ad679 P1 residual) ──
+
+    #[test]
+    fn gpt_phrase_confirm_expired_does_not_reauthorize() {
+        let mut state = crate::agent::types::AgentInternalState::new("phrase-expired".into());
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut state.task_state, "run_now", r#"{"agent_id":"A"}"#, &fp);
+        let mut req = state
+            .task_state
+            .issue_or_reuse_confirm_request(&op, &fp, "run_now", None);
+        let _ = state.task_state.drain_confirm_lifecycle_notices();
+        // Force wall-clock expiry while keeping the record visible.
+        req.valid_until_ms = 1;
+        state.task_state.pending_confirm_requests.clear();
+        state.task_state.pending_confirm_requests.push(req);
+
+        let _ = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("confirm re-run"),
+            None,
+            None,
+        );
+        assert!(
+            state.task_state.user_authorized_new_op.is_none(),
+            "expired pending + phrase must not re-authorize"
+        );
+        assert!(
+            state.task_state.pending_confirm_requests.is_empty(),
+            "expired request must be swept on phrase attempt"
+        );
+    }
+
+    #[test]
+    fn gpt_phrase_confirm_consumed_does_not_reauthorize() {
+        let mut state = crate::agent::types::AgentInternalState::new("phrase-consumed".into());
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut state.task_state, "run_now", r#"{"agent_id":"A"}"#, &fp);
+        let submit = confirm_submit_for(&mut state.task_state, &op, &fp, "run_now", None);
+        // First accept consumes the request and grants.
+        let first = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("确认重跑"),
+            Some(submit),
+            None,
+        );
+        assert!(state.task_state.user_authorized_new_op.is_some());
+        assert_eq!(
+            state
+                .task_state
+                .user_authorized_new_op
+                .as_ref()
+                .unwrap()
+                .confirming_turn,
+            first.call_site_turn
+        );
+        // Unique Unknown still present, but request already consumed.
+        // Phrase alone must refuse — no op-level Unique-Unknown fallback.
+        let _ = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("confirm re-run"),
+            None,
+            None,
+        );
+        assert!(
+            state.task_state.user_authorized_new_op.is_none(),
+            "consumed request + phrase must not re-authorize"
+        );
+        assert!(state.task_state.pending_confirm_requests.is_empty());
+    }
+
+    #[test]
+    fn gpt_phrase_confirm_empty_structured_does_not_reauthorize() {
+        let mut state = crate::agent::types::AgentInternalState::new("phrase-empty".into());
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = unknown_op_with_fp(&mut state.task_state, "run_now", r#"{"agent_id":"A"}"#, &fp);
+        let _ = confirm_submit_for(&mut state.task_state, &op, &fp, "run_now", None);
+        assert_eq!(state.task_state.pending_confirm_requests.len(), 1);
+
+        // Incomplete structured fields + phrase → refuse (no phrase fallback).
+        let _ = state.accept_user_message(
+            crate::agent::types::AgentMessage::user("确认重跑"),
+            Some(AuthorizeNewOpSubmit {
+                request_id: String::new(),
+                prior_operation_id: String::new(),
+                write_fingerprint: String::new(),
+            }),
+            None,
+        );
+        assert!(
+            state.task_state.user_authorized_new_op.is_none(),
+            "empty structured + phrase must not re-authorize"
+        );
+        assert_eq!(
+            state.task_state.pending_confirm_requests.len(),
+            1,
+            "incomplete submit must not consume the pending request"
+        );
+    }
+
+    // ── GPT op-ledger restore (1b35bed1 P1) ─────────────────────────────
+
+    #[test]
+    fn restore_drops_stale_cached_op_details_ref() {
+        let mut live = TaskState::default();
+        let fp = "shell|heramind device command send --id cam-details";
+        let op = live.begin_new_operation_for_owner(
+            "shell",
+            Some("cam-details".into()),
+            r#"{"command":"heramind device command send --id cam-details"}"#,
+            Some(fp.into()),
+            Some("owner-d"),
+        );
+        live.mark_operation_running(&op);
+        live.complete_operation_succeeded(
+            &op,
+            StructuredResult::with_body(
+                true,
+                "sent",
+                "x".repeat(DETAILS_REF_BODY_THRESHOLD + 8),
+                Some(format!("$cached:op:{op}")),
+            ),
+            ["broker accepted".into()],
+        );
+        assert_eq!(
+            live.operation(&op)
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()
+                .details_ref
+                .as_deref(),
+            Some(format!("$cached:op:{op}")).as_deref()
+        );
+
+        let snap = live.snapshot_op_ledger();
+        let mut cold = TaskState::default();
+        cold.restore_op_ledger(snap);
+        let restored = cold.operation(&op).unwrap().result.as_ref().unwrap();
+        assert!(
+            restored.details_ref.is_none(),
+            "stale $cached:op must not survive restore"
+        );
+        assert!(
+            restored
+                .summary
+                .contains("details unavailable after restore"),
+            "summary must mark details unavailable, got: {}",
+            restored.summary
+        );
+        assert!(
+            cold.operation(&op)
+                .unwrap()
+                .evidence
+                .iter()
+                .any(|e| e.contains("details unavailable after restore")),
+            "evidence must record cache loss"
+        );
+    }
+
+    #[test]
+    fn op_ledger_success_then_restart_blocks_auto_replay() {
+        let mut live = TaskState::default();
+        let fp = "shell|heramind device command send --id cam-1";
+        let op = live.begin_new_operation_for_owner(
+            "shell",
+            Some("cam-1".into()),
+            r#"{"command":"heramind device command send --id cam-1"}"#,
+            Some(fp.into()),
+            Some("owner-a"),
+        );
+        live.mark_operation_running(&op);
+        live.complete_operation_succeeded(
+            &op,
+            StructuredResult::with_body(true, "sent", "ok", None),
+            ["broker accepted".into()],
+        );
+        assert!(!live.may_execute_write(fp));
+        assert!(matches!(
+            live.dispatch_mutating_write(fp),
+            WriteDispatch::PreferKnown { .. }
+        ));
+
+        // Simulate process restart: snapshot → fresh TaskState restore.
+        let snap = live.snapshot_op_ledger();
+        assert!(
+            snap.operations.iter().all(|o| o.owner_id.is_none()),
+            "leases must not be persisted"
+        );
+        // Stale grant / confirm must not survive restore.
+        let mut cold = TaskState {
+            user_authorized_new_op: Some(NewOpAuthorization {
+                prior_operation_id: "stale".into(),
+                write_fingerprint: fp.into(),
+                confirming_turn: 99,
+            }),
+            pending_confirm_requests: vec![ConfirmRequest {
+                request_id: "req-stale".into(),
+                prior_operation_id: "stale".into(),
+                write_fingerprint: fp.into(),
+                tool_name: "shell".into(),
+                target: None,
+                valid_until_ms: u64::MAX,
+            }],
+            ..Default::default()
+        };
+        cold.restore_op_ledger(snap);
+
+        assert!(cold.user_authorized_new_op.is_none(), "auth not restored");
+        assert!(
+            cold.pending_confirm_requests.is_empty(),
+            "confirms not restored"
+        );
+        assert!(!cold.may_execute_write(fp), "success must still block");
+        assert!(
+            matches!(
+                cold.dispatch_mutating_write(fp),
+                WriteDispatch::PreferKnown { .. }
+            ),
+            "restored Succeeded → PreferKnown, no auto re-side-effect"
+        );
+        assert_eq!(
+            cold.operation(&op).unwrap().status,
+            OperationStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn op_ledger_interrupted_then_restart_is_unknown_no_auto_replay() {
+        let mut live = TaskState::default();
+        let fp = "shell|heramind device command send --id cam-2";
+        let op = live.begin_new_operation_for_owner(
+            "shell",
+            Some("cam-2".into()),
+            r#"{"command":"heramind device command send --id cam-2"}"#,
+            Some(fp.into()),
+            Some("owner-b"),
+        );
+        live.mark_operation_running(&op);
+        assert_eq!(
+            live.operation(&op).unwrap().status,
+            OperationStatus::Running
+        );
+
+        // Crash / restart while Running — snapshot sanitizes to Unknown.
+        let snap = live.snapshot_op_ledger();
+        assert_eq!(
+            snap.operations.last().unwrap().status,
+            OperationStatus::Unknown,
+            "Running must become Unknown in the persisted ledger"
+        );
+        assert!(snap.operations.last().unwrap().owner_id.is_none());
+
+        let mut cold = TaskState::default();
+        cold.restore_op_ledger(snap);
+
+        assert!(!cold.may_execute_write(fp));
+        assert!(
+            matches!(
+                cold.dispatch_mutating_write(fp),
+                WriteDispatch::InquireStatus { .. }
+            ),
+            "restored Unknown must inquire — never auto re-side-effect"
+        );
+        assert_eq!(
+            cold.operation(&op).unwrap().status,
+            OperationStatus::Unknown
+        );
+        assert!(cold.operation(&op).unwrap().owner_id.is_none());
+        assert!(cold.user_authorized_new_op.is_none());
+    }
+
+    #[test]
+    fn op_ledger_restore_cancels_prepared_and_strips_leases() {
+        let mut live = TaskState::default();
+        let prepared = live.begin_new_operation_for_owner(
+            "shell",
+            None,
+            r#"{"command":"echo ready"}"#,
+            Some("shell|echo ready".into()),
+            Some("owner-c"),
+        );
+        assert_eq!(
+            live.operation(&prepared).unwrap().status,
+            OperationStatus::Prepared
+        );
+
+        let mut cold = TaskState::default();
+        cold.restore_op_ledger(live.snapshot_op_ledger());
+        assert_eq!(
+            cold.operation(&prepared).unwrap().status,
+            OperationStatus::Cancelled,
+            "orphaned Prepared must not stay executable after restart"
+        );
+        assert!(cold.operation(&prepared).unwrap().owner_id.is_none());
+        assert!(
+            !cold.may_execute_write("shell|echo ready"),
+            "cancelled Prepared must not auto-execute"
+        );
+    }
+
+    // ── GPT durable write intent (f4b0b193 P1) ──────────────────────────
+
+    #[derive(Default)]
+    struct MemOpLedgerCommit {
+        bytes: std::sync::Mutex<Option<Vec<u8>>>,
+        fail: std::sync::atomic::AtomicBool,
+        commits: std::sync::atomic::AtomicUsize,
+    }
+
+    impl OpLedgerCommit for MemOpLedgerCommit {
+        fn commit(&self, ledger_json: &[u8]) -> Result<(), String> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("simulated durable commit failure".into());
+            }
+            *self.bytes.lock().unwrap() = Some(ledger_json.to_vec());
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn durable_write_intent_crash_window_restores_unknown_no_auto_replay() {
+        let sink = std::sync::Arc::new(MemOpLedgerCommit::default());
+        let mut state = crate::agent::types::AgentInternalState::new("cw-intent".into());
+        state.set_op_ledger_commit(Some(sink.clone()));
+
+        let args = serde_json::json!({"command":"heramind device command send --id cam-cw"});
+        let fp = crate::agent::streaming::mutating_write_fingerprint("shell", &args)
+            .expect("shell fingerprint");
+        let MutatingGateOutcome::Proceed { operation_id } =
+            state.evaluate_mutating_gate_durable("shell", &args, &fp, Some("owner-cw"), 1)
+        else {
+            panic!("intent path must Proceed after durable commit");
+        };
+        assert_eq!(
+            state.task_state.operation(&operation_id).unwrap().status,
+            OperationStatus::Running,
+            "memory keeps Running lease for the live executor"
+        );
+        assert!(
+            sink.commits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "write intent must be committed before the side-effect tool"
+        );
+
+        // Crash window: process dies before the tool body runs / terminal save.
+        let bytes = sink
+            .bytes
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("intent snapshot on disk");
+        let snap: PersistedOpLedger =
+            serde_json::from_slice(&bytes).expect("intent snapshot deserializes");
+        assert_eq!(
+            snap.operations.last().unwrap().status,
+            OperationStatus::Unknown,
+            "persisted intent sanitizes Running → Unknown"
+        );
+
+        let mut cold = crate::agent::types::AgentInternalState::new("cw-intent".into());
+        cold.restore_op_ledger(snap);
+        assert!(
+            matches!(
+                cold.task_state.dispatch_mutating_write(&fp),
+                WriteDispatch::InquireStatus { .. }
+            ),
+            "crash-window restore must inquire — never auto re-side-effect"
+        );
+        assert!(!cold.task_state.may_execute_write(&fp));
+    }
+
+    #[test]
+    fn durable_write_intent_commit_failure_fail_closed_no_proceed() {
+        let sink = std::sync::Arc::new(MemOpLedgerCommit::default());
+        sink.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut state = crate::agent::types::AgentInternalState::new("cw-fail".into());
+        state.set_op_ledger_commit(Some(sink));
+
+        let args = serde_json::json!({"command":"heramind device command send --id cam-fail"});
+        let fp = crate::agent::streaming::mutating_write_fingerprint("shell", &args)
+            .expect("shell fingerprint");
+        match state.evaluate_mutating_gate_durable("shell", &args, &fp, Some("owner-f"), 1) {
+            MutatingGateOutcome::Block { message, confirm } => {
+                assert!(
+                    message.contains("durable write-intent commit failed"),
+                    "fail-closed message, got: {message}"
+                );
+                assert!(confirm.is_none());
+            }
+            other => panic!("commit failure must Block, got {other:?}"),
+        }
+        assert_eq!(state.task_state.operations.len(), 1);
+        assert_eq!(
+            state.task_state.operations[0].status,
+            OperationStatus::Failed,
+            "lease released as Failed — tool must not run"
+        );
+        assert!(
+            !matches!(
+                state.task_state.dispatch_mutating_write(&fp),
+                WriteDispatch::Execute { .. } | WriteDispatch::InProgress { .. }
+            ),
+            "failed intent must not leave an executable / Running lease"
+        );
+    }
+
+    #[test]
+    fn durable_terminal_after_success_survives_restart() {
+        let sink = std::sync::Arc::new(MemOpLedgerCommit::default());
+        let mut state = crate::agent::types::AgentInternalState::new("cw-term".into());
+        state.set_op_ledger_commit(Some(sink.clone()));
+
+        let args = serde_json::json!({"command":"heramind device command send --id cam-ok"});
+        let fp = crate::agent::streaming::mutating_write_fingerprint("shell", &args)
+            .expect("shell fingerprint");
+        let MutatingGateOutcome::Proceed { operation_id } =
+            state.evaluate_mutating_gate_durable("shell", &args, &fp, Some("owner-t"), 1)
+        else {
+            panic!("Proceed");
+        };
+        state.task_state.complete_operation_succeeded(
+            &operation_id,
+            StructuredResult::with_body(true, "sent", "ok", None),
+            ["broker accepted".into()],
+        );
+        state.persist_op_ledger_terminal_best_effort();
+        assert!(
+            sink.commits.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "intent + terminal commits"
+        );
+
+        let bytes = sink.bytes.lock().unwrap().clone().unwrap();
+        let snap: PersistedOpLedger = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            snap.operations.last().unwrap().status,
+            OperationStatus::Succeeded
+        );
+
+        let mut cold = crate::agent::types::AgentInternalState::new("cw-term".into());
+        cold.restore_op_ledger(snap);
+        assert!(matches!(
+            cold.task_state.dispatch_mutating_write(&fp),
+            WriteDispatch::PreferKnown { .. }
+        ));
+    }
+
+    #[test]
+    fn deserialize_fail_marks_untrusted_not_silent_empty_ledger() {
+        let mut state = crate::agent::types::AgentInternalState::new("cw-bad".into());
+        // Simulate SessionManager restore path after corrupt bytes.
+        state.mark_op_ledger_untrusted();
+        assert!(state.task_state.operations.is_empty());
+
+        let args = serde_json::json!({"command":"heramind device command send --id cam-bad"});
+        let fp = crate::agent::streaming::mutating_write_fingerprint("shell", &args)
+            .expect("shell fingerprint");
+        match state.evaluate_mutating_gate_durable("shell", &args, &fp, None, 1) {
+            MutatingGateOutcome::Block { message, .. } => {
+                assert!(
+                    message.contains("op ledger restore failed"),
+                    "untrusted must fail closed, got: {message}"
+                );
+            }
+            other => panic!("untrusted empty ledger must not Proceed, got {other:?}"),
+        }
+        assert!(
+            state.task_state.operations.is_empty(),
+            "untrusted path must not begin a new Operation"
+        );
+    }
+
+    #[test]
+    fn untrusted_commit_refuses_and_does_not_touch_sink() {
+        let sink = std::sync::Arc::new(MemOpLedgerCommit::default());
+        let mut state = crate::agent::types::AgentInternalState::new("cw-skip".into());
+        state.set_op_ledger_commit(Some(sink.clone()));
+        state.mark_op_ledger_untrusted();
+        let err = state
+            .commit_op_ledger_now()
+            .expect_err("untrusted must refuse durable persist");
+        assert!(err.contains("untrusted"), "got: {err}");
+        assert_eq!(
+            sink.commits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "empty untrusted memory must not overwrite the sink"
+        );
+    }
+
+    /// Version-aware sink mirroring SessionStore::save_op_ledger reject rules.
+    struct VersionedMemOpLedgerCommit {
+        bytes: std::sync::Mutex<Option<Vec<u8>>>,
+        commits: std::sync::atomic::AtomicUsize,
+        rejects: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Default for VersionedMemOpLedgerCommit {
+        fn default() -> Self {
+            Self {
+                bytes: std::sync::Mutex::new(None),
+                commits: std::sync::atomic::AtomicUsize::new(0),
+                rejects: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl OpLedgerCommit for VersionedMemOpLedgerCommit {
+        fn commit(&self, ledger_json: &[u8]) -> Result<(), String> {
+            #[derive(serde::Deserialize)]
+            struct Peek {
+                #[serde(default)]
+                version: u64,
+            }
+            let incoming: Peek =
+                serde_json::from_slice(ledger_json).map_err(|e| format!("unreadable: {e}"))?;
+            let mut slot = self.bytes.lock().unwrap();
+            if let Some(existing) = slot.as_ref() {
+                let existing_v: Peek = serde_json::from_slice(existing)
+                    .map_err(|e| format!("unreadable on-disk: {e}"))?;
+                if incoming.version <= existing_v.version {
+                    self.rejects
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(format!(
+                        "stale op ledger write rejected (incoming version {} <= on-disk {})",
+                        incoming.version, existing_v.version
+                    ));
+                }
+            }
+            *slot = Some(ledger_json.to_vec());
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn interleaved_stale_snapshot_cannot_clobber_newer_intent_version() {
+        // persist_history snapshot-then-write racing mid-turn write-intent:
+        // older version must not replace newer intent bytes.
+        let sink = std::sync::Arc::new(VersionedMemOpLedgerCommit::default());
+        let mut state = crate::agent::types::AgentInternalState::new("cw-race".into());
+        state.set_op_ledger_commit(Some(sink.clone()));
+
+        let args = serde_json::json!({"command":"heramind device command send --id cam-race"});
+        let fp = crate::agent::streaming::mutating_write_fingerprint("shell", &args)
+            .expect("shell fingerprint");
+        let MutatingGateOutcome::Proceed { .. } =
+            state.evaluate_mutating_gate_durable("shell", &args, &fp, Some("owner-race"), 1)
+        else {
+            panic!("intent commit must Proceed");
+        };
+        assert_eq!(state.op_ledger_version, 1);
+        let intent_bytes = sink.bytes.lock().unwrap().clone().expect("intent on sink");
+        let intent: PersistedOpLedger = serde_json::from_slice(&intent_bytes).unwrap();
+        assert_eq!(intent.version, 1);
+        assert_eq!(
+            intent.operations.last().unwrap().status,
+            OperationStatus::Unknown
+        );
+
+        // Stale empty snapshot taken before the intent (version 0), written
+        // out-of-band like the old persist_history path.
+        let stale = PersistedOpLedger {
+            version: 0,
+            ..PersistedOpLedger::default()
+        };
+        let stale_bytes = serde_json::to_vec(&stale).unwrap();
+        let err = sink
+            .commit(&stale_bytes)
+            .expect_err("stale snapshot must be rejected");
+        assert!(err.contains("stale"), "got: {err}");
+        assert_eq!(sink.rejects.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let kept: PersistedOpLedger =
+            serde_json::from_slice(sink.bytes.lock().unwrap().as_ref().unwrap()).unwrap();
+        assert_eq!(kept.version, 1);
+        assert_eq!(kept.operations.len(), 1);
+        assert_eq!(
+            kept.operations[0].status,
+            OperationStatus::Unknown,
+            "newer write intent must survive interleaved stale persist"
+        );
+    }
+
+    #[test]
+    fn pre_submission_rejections_do_not_lock_prefer_known() {
+        use crate::agent::types::LargeDataCache;
+        use crate::toolkit::error::ToolError;
+        use crate::toolkit::tool::ToolOutput;
+
+        let args = serde_json::json!({
+            "command": "heramind dashboard update-component dash-1 --component-id c1",
+            "params": {"position": {"w": 2, "h": 2}}
+        });
+        let fp = write_fingerprint("shell", &serde_json::to_string(&args).unwrap());
+
+        let cases: Vec<(&str, Result<ToolOutput, ToolError>)> = vec![
+            (
+                "clap exit 2",
+                Ok(ToolOutput::success(serde_json::json!({
+                    "exit_code": 2,
+                    "stdout": "",
+                    "stderr": "error: unexpected argument '--width' found"
+                }))),
+            ),
+            (
+                "invalid arguments",
+                Err(ToolError::InvalidArguments(
+                    "shell params for `--components` must be a JSON array".into(),
+                )),
+            ),
+            (
+                "api 400 preflight NOT sent",
+                Ok(ToolOutput::success(serde_json::json!({
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "API error (400 Bad Request): Failed to send command: Command 'render_text' was NOT sent: missing required top-level params: text."
+                }))),
+            ),
+            (
+                "api 422 validation",
+                Ok(ToolOutput::success(serde_json::json!({
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "API error (422 Unprocessable Entity): Rule error: missing field condition"
+                }))),
+            ),
+            (
+                "http_connect refused",
+                Ok(ToolOutput::success(serde_json::json!({
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "transport error (localhost API): http_connect: connection refused. Stage=transport — connection failed before submit; extension business body was not reached (not submitted)."
+                }))),
+            ),
+        ];
+
+        for (label, outcome) in cases {
+            let mut s = TaskState::default();
+            let mut cache = LargeDataCache::default();
+            let MutatingGateOutcome::Proceed { operation_id } =
+                evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, 1)
+            else {
+                panic!("{label}: initial attempt must Proceed");
+            };
+            finalize_operation_from_tool_result(
+                &mut s,
+                &mut cache,
+                &operation_id,
+                "shell",
+                &outcome,
+            );
+            assert_eq!(
+                s.operation(&operation_id).unwrap().status,
+                OperationStatus::Rejected,
+                "{label} must finalize as Rejected, not Failed"
+            );
+            assert!(
+                s.write_ledger.is_empty(),
+                "{label} must not record a write fact"
+            );
+            assert!(s.may_execute_write(&fp), "{label} must allow direct retry");
+
+            // Immediate retry WITHOUT `_new_operation: true` must Proceed (no PreferKnown lock).
+            match evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, 1) {
+                MutatingGateOutcome::Proceed {
+                    operation_id: retry_op,
+                } => assert_ne!(retry_op, operation_id, "{label} retry must open a fresh op"),
+                other => {
+                    panic!("{label}: retry without _new_operation must Proceed, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_backend_failures_succeeded_and_unknown_still_protected() {
+        use crate::agent::types::LargeDataCache;
+        use crate::toolkit::tool::ToolOutput;
+
+        let args = serde_json::json!({
+            "command": "heramind device control EK410 render_text",
+            "params": {"text": "hello"}
+        });
+        let fp = write_fingerprint("shell", &serde_json::to_string(&args).unwrap());
+
+        // 1) Real runtime backend failure (e.g. adapter send error / 500) stays Failed → PreferKnown.
+        {
+            let mut s = TaskState::default();
+            let mut cache = LargeDataCache::default();
+            let MutatingGateOutcome::Proceed { operation_id } =
+                evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, 1)
+            else {
+                panic!("must Proceed");
+            };
+            let runtime_err = Ok(ToolOutput::success(serde_json::json!({
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "API error (400 Bad Request): Failed to send command: no adapter connected"
+            })));
+            finalize_operation_from_tool_result(
+                &mut s,
+                &mut cache,
+                &operation_id,
+                "shell",
+                &runtime_err,
+            );
+            assert_eq!(
+                s.operation(&operation_id).unwrap().status,
+                OperationStatus::Failed
+            );
+            assert!(
+                matches!(
+                    evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, 1),
+                    MutatingGateOutcome::ResumeKnown { .. }
+                ),
+                "real backend failure must still PreferKnown"
+            );
+        }
+
+        // 2) Succeeded stays PreferKnown.
+        {
+            let mut s = TaskState::default();
+            let mut cache = LargeDataCache::default();
+            let MutatingGateOutcome::Proceed { operation_id } =
+                evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, 1)
+            else {
+                panic!("must Proceed");
+            };
+            let ok_out = Ok(ToolOutput::success(serde_json::json!({
+                "exit_code": 0,
+                "stdout": "{\"success\":true}",
+                "stderr": ""
+            })));
+            finalize_operation_from_tool_result(
+                &mut s,
+                &mut cache,
+                &operation_id,
+                "shell",
+                &ok_out,
+            );
+            assert_eq!(
+                s.operation(&operation_id).unwrap().status,
+                OperationStatus::Succeeded
+            );
+            assert!(
+                matches!(
+                    evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, 1),
+                    MutatingGateOutcome::ResumeKnown { .. }
+                ),
+                "succeeded op must still PreferKnown"
+            );
+        }
+
+        // 3) Timeout / Unknown stays InquireStatus (even if a later Rejected op exists).
+        {
+            let mut s = TaskState::default();
+            let mut cache = LargeDataCache::default();
+            let MutatingGateOutcome::Proceed { operation_id } =
+                evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, 1)
+            else {
+                panic!("must Proceed");
+            };
+            let timeout_out = Ok(ToolOutput::success(serde_json::json!({
+                "exit_code": 1,
+                "timed_out": false,
+                "stdout": "",
+                "stderr": "http_timeout: request timed out"
+            })));
+            finalize_operation_from_tool_result(
+                &mut s,
+                &mut cache,
+                &operation_id,
+                "shell",
+                &timeout_out,
+            );
+            assert_eq!(
+                s.operation(&operation_id).unwrap().status,
+                OperationStatus::Unknown
+            );
+            assert!(
+                matches!(
+                    evaluate_mutating_gate(&mut s, "shell", &args, &fp, None, 1),
+                    MutatingGateOutcome::Block {
+                        confirm: Some(_),
+                        ..
+                    }
+                ),
+                "timeout must still require Unknown confirm"
+            );
+        }
+    }
+
+    /// P2-2: `heramind operation get <op_id>` confirming a terminal outcome
+    /// (`succeeded` or `failed`) reconciles a previously `Unknown` operation in
+    /// `TaskState`, records the write fact on success, clears stale pending
+    /// confirms, and keeps `tools_needing_new_operation_protocol()` accurate.
+    #[test]
+    fn operation_get_reconciles_unknown_operation_to_succeeded_and_failed() {
+        let mut s = TaskState {
+            turn_count: 1,
+            ..Default::default()
+        };
+        let args_a = serde_json::json!({
+            "command": "heramind device control device_a render_text",
+            "params": {"text": "sunny"}
+        });
+        let fp_a = crate::agent::streaming::mutating_write_fingerprint("shell", &args_a)
+            .expect("fingerprint");
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_ok,
+        } = evaluate_mutating_gate(&mut s, "shell", &args_a, &fp_a, None, 1)
+        else {
+            panic!("must Proceed");
+        };
+        s.complete_operation_unknown(
+            &op_ok,
+            StructuredResult::with_body(false, "http_timeout", "timed out", None),
+        );
+        // Gate issues a pending confirm for the Unknown op.
+        let MutatingGateOutcome::Block {
+            confirm: Some(_), ..
+        } = evaluate_mutating_gate(&mut s, "shell", &args_a, &fp_a, None, 1)
+        else {
+            panic!("Unknown op must issue confirm");
+        };
+        assert_eq!(s.pending_confirm_requests.len(), 1);
+
+        // `heramind operation get <op_ok>` returns confirmed `succeeded`.
+        let get_args = serde_json::json!({ "command": format!("heramind operation get {op_ok}") });
+        let get_data = serde_json::json!({
+            "exit_code": 0,
+            "stdout": serde_json::json!({
+                "success": true,
+                "data": {
+                    "operation_id": op_ok,
+                    "status": "succeeded",
+                    "result_summary": "adapter_accepted",
+                    "evidence": ["delivery=adapter_accepted"]
+                }
+            }).to_string(),
+            "stderr": ""
+        });
+        assert!(
+            s.reconcile_operation_lookup_tool_result("shell", &get_args, &get_data),
+            "operation get confirming succeeded must reconcile Unknown op"
+        );
+        let op = s.operation(&op_ok).unwrap();
+        assert_eq!(op.status, OperationStatus::Succeeded);
+        assert_eq!(op.domain.as_deref(), Some("device"));
+        assert_eq!(op.action.as_deref(), Some("control"));
+        assert_eq!(op.target.as_deref(), Some("device_a"));
+        assert!(s.pending_confirm_requests.is_empty());
+        assert!(s
+            .write_ledger
+            .iter()
+            .any(|w| w.operation_id == op_ok && w.fingerprint == fp_a));
+        assert!(s.tools_needing_new_operation_protocol().contains("shell"));
+
+        // Second op: Unknown -> Failed reconciliation.
+        let args_b = serde_json::json!({
+            "command": "heramind device control device_b render_text",
+            "params": {"text": "sunny"}
+        });
+        let fp_b = crate::agent::streaming::mutating_write_fingerprint("shell", &args_b)
+            .expect("fingerprint");
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_fail,
+        } = evaluate_mutating_gate(&mut s, "shell", &args_b, &fp_b, None, 1)
+        else {
+            panic!("must Proceed");
+        };
+        s.complete_operation_unknown(
+            &op_fail,
+            StructuredResult::with_body(false, "http_timeout", "timed out", None),
+        );
+        let get_fail_args =
+            serde_json::json!({ "command": format!("heramind operation get {op_fail}") });
+        let get_fail_data = serde_json::json!({
+            "exit_code": 0,
+            "stdout": serde_json::json!({
+                "success": true,
+                "data": {
+                    "operation_id": op_fail,
+                    "status": "failed",
+                    "error_summary": "device offline"
+                }
+            }).to_string(),
+            "stderr": ""
+        });
+        assert!(s.reconcile_operation_lookup_tool_result("shell", &get_fail_args, &get_fail_data));
+        assert_eq!(
+            s.operation(&op_fail).unwrap().status,
+            OperationStatus::Failed
+        );
+        assert!(!s.write_ledger.iter().any(|w| w.operation_id == op_fail));
+    }
+
+    /// E4: multi-target per-item receipts aggregate by `(target, operation_id)`
+    /// and inject a compact `SystemGoalStatus` hard-fact block whenever any
+    /// target fails, is unknown, or the goal is incomplete (while staying silent
+    /// on clean turns).
+    #[test]
+    fn multi_target_receipts_and_system_goal_status_fact_block() {
+        let mut s = TaskState {
+            turn_count: 3,
+            ..Default::default()
+        };
+
+        // Target A succeeds with `adapter_accepted`.
+        let args_a = serde_json::json!({
+            "command": "heramind device control device_a render_text",
+            "params": {"text": "26C"}
+        });
+        let fp_a = crate::agent::streaming::mutating_write_fingerprint("shell", &args_a).unwrap();
+        let MutatingGateOutcome::Proceed { operation_id: op_a } =
+            evaluate_mutating_gate(&mut s, "shell", &args_a, &fp_a, None, 3)
+        else {
+            panic!("must Proceed");
+        };
+        let body_a = serde_json::json!({
+            "exit_code": 0,
+            "stdout": serde_json::json!({
+                "success": true,
+                "data": {"device_id": "device_a", "command": "render_text", "delivery": "adapter_accepted"}
+            }).to_string(),
+            "stderr": ""
+        });
+        s.complete_operation_succeeded(
+            &op_a,
+            StructuredResult::with_body(true, "adapter_accepted", body_a.to_string(), None),
+            None::<String>,
+        );
+        s.observe_tool_result_for_goal("shell", &args_a, &body_a, Some(&op_a));
+
+        // Clean single-target turn with no failures returns None (zero prompt noise).
+        assert!(s.build_summary_goal_status_fact_block(3, false).is_none());
+
+        // Target B fails with `offline`.
+        let args_b = serde_json::json!({
+            "command": "heramind device control device_b render_text",
+            "params": {"text": "26C"}
+        });
+        let fp_b = crate::agent::streaming::mutating_write_fingerprint("shell", &args_b).unwrap();
+        let MutatingGateOutcome::Proceed { operation_id: op_b } =
+            evaluate_mutating_gate(&mut s, "shell", &args_b, &fp_b, None, 3)
+        else {
+            panic!("must Proceed");
+        };
+        let body_b = serde_json::json!({
+            "exit_code": 1,
+            "stdout": serde_json::json!({
+                "success": false,
+                "error": "offline"
+            }).to_string(),
+            "stderr": "Error: offline"
+        });
+        s.complete_operation_failed(
+            &op_b,
+            StructuredResult::with_body(false, "offline", body_b.to_string(), None),
+        );
+
+        let line = s
+            .format_per_target_receipts_line(3)
+            .expect("per-target receipt line");
+        assert_eq!(
+            line,
+            "device_a: adapter_accepted; device_b: failed(offline)"
+        );
+
+        let block = s
+            .build_summary_goal_status_fact_block(3, true)
+            .expect("partial failure must emit SystemGoalStatus fact block");
+        assert!(block.contains("[SystemGoalStatus — Authoritative Execution Facts"));
+        assert!(block.contains("- status: partial_failure"));
+        assert!(block.contains("device_a: adapter_accepted; device_b: failed(offline)"));
+        assert!(block.contains("NEVER claim \"all succeeded\""));
+    }
+
+    /// E4 (L3 Spark): preflight `Rejected` must not survive in receipts after a
+    /// lock-free retry reaches Succeeded/Failed for the same target — otherwise
+    /// summary prompts report a false `partial_failure` and confuse small models.
+    #[test]
+    fn rejected_preflight_receipts_fold_when_same_target_reaches_terminal() {
+        let mut s = TaskState {
+            turn_count: 1,
+            ..Default::default()
+        };
+
+        // display-a: clap syntax Rejected, then lock-free retry Succeeded.
+        let args_a_bad = serde_json::json!({
+            "command": "heramind device control display-a display_text --param text=System Ready"
+        });
+        let fp_a_bad =
+            crate::agent::streaming::mutating_write_fingerprint("shell", &args_a_bad).unwrap();
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_a_rej,
+        } = evaluate_mutating_gate(&mut s, "shell", &args_a_bad, &fp_a_bad, None, 1)
+        else {
+            panic!("must Proceed");
+        };
+        s.complete_operation_rejected(
+            &op_a_rej,
+            StructuredResult::with_body(
+                false,
+                "unexpected argument 'Ready'",
+                serde_json::json!({
+                    "exit_code": 2,
+                    "stdout": "",
+                    "stderr": "error: unexpected argument 'Ready' found"
+                })
+                .to_string(),
+                None,
+            ),
+        );
+
+        let args_a_ok = serde_json::json!({
+            "command": "heramind device control display-a display_text",
+            "params": {"text": "System Ready", "brightness": 80}
+        });
+        let fp_a_ok =
+            crate::agent::streaming::mutating_write_fingerprint("shell", &args_a_ok).unwrap();
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_a_ok,
+        } = evaluate_mutating_gate(&mut s, "shell", &args_a_ok, &fp_a_ok, None, 1)
+        else {
+            panic!("retry must Proceed (Rejected is lock-free)");
+        };
+        let body_a = serde_json::json!({
+            "exit_code": 0,
+            "stdout": serde_json::json!({
+                "success": true,
+                "data": {"device_id": "display-a", "command": "display_text", "delivery": "adapter_accepted"}
+            }).to_string(),
+            "stderr": ""
+        });
+        s.complete_operation_succeeded(
+            &op_a_ok,
+            StructuredResult::with_body(true, "adapter_accepted", body_a.to_string(), None),
+            None::<String>,
+        );
+        s.observe_tool_result_for_goal("shell", &args_a_ok, &body_a, Some(&op_a_ok));
+
+        // display-b: Rejected then real Failed (not found).
+        let args_b_bad = serde_json::json!({
+            "command": "heramind device control display-b display_text --param text=System Ready"
+        });
+        let fp_b_bad =
+            crate::agent::streaming::mutating_write_fingerprint("shell", &args_b_bad).unwrap();
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_b_rej,
+        } = evaluate_mutating_gate(&mut s, "shell", &args_b_bad, &fp_b_bad, None, 1)
+        else {
+            panic!("must Proceed");
+        };
+        s.complete_operation_rejected(
+            &op_b_rej,
+            StructuredResult::with_body(
+                false,
+                "unexpected argument 'Ready'",
+                serde_json::json!({
+                    "exit_code": 2,
+                    "stdout": "",
+                    "stderr": "error: unexpected argument 'Ready' found"
+                })
+                .to_string(),
+                None,
+            ),
+        );
+
+        let args_b_fail = serde_json::json!({
+            "command": "heramind device control display-b display_text",
+            "params": {"text": "System Ready", "brightness": 80}
+        });
+        let fp_b_fail =
+            crate::agent::streaming::mutating_write_fingerprint("shell", &args_b_fail).unwrap();
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_b_fail,
+        } = evaluate_mutating_gate(&mut s, "shell", &args_b_fail, &fp_b_fail, None, 1)
+        else {
+            panic!("must Proceed");
+        };
+        let body_b = serde_json::json!({
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "API error (400 Bad Request): Failed to send command: NotFoundStr(\"display-b\")"
+        });
+        s.complete_operation_failed(
+            &op_b_fail,
+            StructuredResult::with_body(false, "not found", body_b.to_string(), None),
+        );
+
+        let line = s
+            .format_per_target_receipts_line(1)
+            .expect("receipts after fold");
+        assert!(
+            !line.contains("rejected"),
+            "superseded Rejected must be folded out: {line}"
+        );
+        assert!(
+            line.contains("display-a: adapter_accepted"),
+            "expected display-a success: {line}"
+        );
+        assert!(
+            line.contains("display-b: failed"),
+            "expected display-b failure: {line}"
+        );
+
+        let block = s
+            .build_summary_goal_status_fact_block(1, true)
+            .expect("true partial failure must still emit fact block");
+        assert!(
+            block.contains("- status: partial_failure"),
+            "status must stay partial_failure for a/b split: {block}"
+        );
+        let receipts_line = block
+            .lines()
+            .find(|l| l.starts_with("- receipts:"))
+            .expect("fact block must include receipts");
+        assert!(
+            !receipts_line.contains("rejected"),
+            "receipts line must not keep folded Rejected: {receipts_line}"
+        );
+
+        // Dashboard-style fallback target (`domain:action`) Rejected must also
+        // fold when a later Succeeded uses the concrete dashboard id.
+        let mut dash = TaskState {
+            turn_count: 2,
+            ..Default::default()
+        };
+        let args_missing_id = serde_json::json!({
+            "command": "heramind dashboard update-component --component-id widget-temp --set '{\"position\":{\"w\":2,\"h\":2}}'"
+        });
+        let fp_missing =
+            crate::agent::streaming::mutating_write_fingerprint("shell", &args_missing_id).unwrap();
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_miss,
+        } = evaluate_mutating_gate(&mut dash, "shell", &args_missing_id, &fp_missing, None, 2)
+        else {
+            panic!("must Proceed");
+        };
+        // Force domain/action + fallback target the way clap-miss paths do.
+        if let Some(op) = dash.operation_mut(&op_miss) {
+            op.domain = Some("dashboard".into());
+            op.action = Some("update-component".into());
+            op.target = Some("dashboard:update-component".into());
+        }
+        dash.complete_operation_rejected(
+            &op_miss,
+            StructuredResult::with_body(
+                false,
+                "required arguments were not provided",
+                serde_json::json!({
+                    "exit_code": 2,
+                    "stdout": "",
+                    "stderr": "error: the following required arguments were not provided:\n  <ID>"
+                })
+                .to_string(),
+                None,
+            ),
+        );
+
+        let args_ok = serde_json::json!({
+            "command": "heramind dashboard update-component dash-1 --component-id widget-temp",
+            "params": {"position": {"w": 2, "h": 2}}
+        });
+        let fp_ok = crate::agent::streaming::mutating_write_fingerprint("shell", &args_ok).unwrap();
+        let MutatingGateOutcome::Proceed {
+            operation_id: op_ok,
+        } = evaluate_mutating_gate(&mut dash, "shell", &args_ok, &fp_ok, None, 2)
+        else {
+            panic!("must Proceed");
+        };
+        if let Some(op) = dash.operation_mut(&op_ok) {
+            op.domain = Some("dashboard".into());
+            op.action = Some("update-component".into());
+            op.target = Some("dash-1".into());
+        }
+        dash.complete_operation_succeeded(
+            &op_ok,
+            StructuredResult::with_body(
+                true,
+                "updated",
+                serde_json::json!({
+                    "exit_code": 0,
+                    "stdout": "{\"success\":true}",
+                    "stderr": ""
+                })
+                .to_string(),
+                None,
+            ),
+            None::<String>,
+        );
+
+        let dash_line = dash
+            .format_per_target_receipts_line(2)
+            .expect("dashboard receipts");
+        assert_eq!(dash_line, "dash-1: succeeded");
+        assert!(
+            dash.build_summary_goal_status_fact_block(2, false)
+                .is_none(),
+            "clean folded success must stay silent (zero prompt noise)"
+        );
+    }
+}

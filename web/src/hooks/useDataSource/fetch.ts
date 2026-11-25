@@ -8,7 +8,7 @@ import { getUnifiedField } from '@/types/dashboard'
 import { useStore } from '@/store'
 import { logError, isNetworkError } from '@/lib/errors'
 import { getTimeRange } from '@/lib/telemetryTransform'
-import { insertAndMaintain, normalizeImageValue } from './helpers'
+import { normalizeImageValue } from './helpers'
 
 // ============================================================================
 // Cache (replaces TypedCache class instances)
@@ -113,6 +113,33 @@ const extractTimestamp = (point: unknown): number => {
 // ============================================================================
 
 const telemetryInflight = new Map<string, Promise<{ data: number[]; raw?: unknown[]; success: boolean }>>()
+
+/**
+ * Decide what image raw points to store in the telemetry cache.
+ * URL/path frames are cheap — keep the full page. Huge base64 payloads
+ * truncate to the newest 5 to bound memory.
+ */
+export function selectImageRawForCache(rawPoints: unknown[]): unknown[] {
+  if (rawPoints.length <= 5) return rawPoints
+  const looksHeavy = rawPoints.some((p) => {
+    if (typeof p === 'string') {
+      return p.length > 2000 && !p.startsWith('http') && !p.startsWith('/api/')
+    }
+    if (p && typeof p === 'object') {
+      const v = (p as Record<string, unknown>).value ?? (p as Record<string, unknown>).v
+      if (typeof v !== 'string') return false
+      if (v.startsWith('data:image/') && v.length > 8000) return true
+      return (
+        v.length > 2000 &&
+        !v.startsWith('http') &&
+        !v.startsWith('/api/') &&
+        !v.startsWith('data:image/')
+      )
+    }
+    return false
+  })
+  return looksHeavy ? rawPoints.slice(-5) : rawPoints
+}
 
 export async function fetchHistoricalTelemetry(
   deviceId: string,
@@ -297,7 +324,7 @@ export async function fetchHistoricalTelemetry(
           // raw — sort once then cap, instead of O(n²) per-point insertion.
           // Backend returns newest-first; sort ascending (oldest-first) for display.
           const displayLimit = limit || 50
-          const preserveAll = includeRawPoints
+          const _preserveAll = includeRawPoints
 
           // Sort indices by timestamp ascending to avoid creating wrapper objects
           const indices = metricData.map((_, i) => i)
@@ -330,13 +357,8 @@ export async function fetchHistoricalTelemetry(
           }) : undefined
         }
 
-        // For image sources, only cache the last 5 raw items to avoid
-        // holding 30-50MB of base64 data in memory. Switching back to the
-        // dashboard will instantly show the latest 5 images from cache while
-        // the full history loads in the background.
-        const rawToCache = isImgMetric && rawPoints && rawPoints.length > 5
-          ? rawPoints.slice(-5)
-          : rawPoints
+        const rawToCache =
+          isImgMetric && rawPoints ? selectImageRawForCache(rawPoints) : rawPoints
         telemetryCache.set(cacheKey, { data: values, raw: rawToCache }, { cachedAt: Date.now() })
         return { data: values, raw: rawPoints, success: true }
       }
@@ -544,6 +566,12 @@ async function flushBatch() {
 }
 
 export async function fetchDeviceTelemetry(deviceId: string): Promise<{ success: boolean; metricsCount: number }> {
+  // ai:{agent} / transform:{id} namespaces are NOT devices — their latest
+  // values live in the unified telemetry store, not device.current_values.
+  // Calling the device endpoints yields "Device not found" noise.
+  if (deviceId.startsWith('ai:') || deviceId.startsWith('transform:')) {
+    return { success: false, metricsCount: 0 }
+  }
   const existing = activeFetches.get(deviceId)
   if (existing) return existing
 

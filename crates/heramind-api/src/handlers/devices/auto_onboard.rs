@@ -26,8 +26,8 @@ fn draft_error_to_response(
 use heramind_agent::llm_backends::backends::{OllamaConfig, OllamaRuntime};
 use heramind_core::llm::backend::LlmRuntime;
 use heramind_devices::{
-    ConnectionConfig, ConnectionStatus, DeviceConfig, DeviceTypeMode, DeviceTypeTemplate,
-    MdlMetricDefinition as MetricDefinition,
+    AssociationBindInput, ConnectionConfig, ConnectionStatus, DeviceConfig, DeviceError,
+    DeviceTypeMode, DeviceTypeTemplate, MdlMetricDefinition as MetricDefinition,
 };
 
 use crate::handlers::common::{ok, HandlerResult};
@@ -110,7 +110,7 @@ fn create_default_llm_runtime() -> Arc<dyn LlmRuntime> {
 
 /// Helper to get or create the AutoOnboardManager from ServerState
 /// Uses double-checked locking to ensure only one instance is created.
-async fn get_auto_onboard_manager(
+pub(crate) async fn get_auto_onboard_manager(
     state: &ServerState,
 ) -> Result<Arc<AutoOnboardManager>, ErrorResponse> {
     // First check: read lock (fast path)
@@ -256,6 +256,26 @@ pub async fn approve_draft_device(
         ErrorResponse::not_found(format!("Draft device '{}' not found", device_id))
     })?;
 
+    // Association-exception drafts use a placeholder id (`pending-assoc-*`).
+    // Ordinary approve would register that placeholder as a real device and
+    // leave later traffic still A/B-ambiguous. Require the confirm-association
+    // path with an explicit real identity + parse field instead.
+    if draft.association_exception
+        || heramind_devices::adapters::mqtt::is_pending_association_candidate_id(&device_id)
+    {
+        return Err(ErrorResponse::bad_request(
+            "This draft is an MQTT association exception. Use POST \
+             /api/devices/drafts/{id}/confirm-association with an explicit \
+             real device_id and identity_field (never pending-assoc-*). \
+             Ordinary approve is refused so the placeholder cannot become a \
+             registered device.",
+        )
+        .with_hint(
+            "Open the pending conflict UI, confirm the real identity and parse \
+             field, or dismiss/reject the draft.",
+        ));
+    }
+
     let _draft_id = draft.id.clone();
 
     // Get device name from request (user-provided name for this device instance)
@@ -297,11 +317,23 @@ pub async fn approve_draft_device(
                 // Webhook devices don't need MQTT topic config
                 ConnectionConfig::default()
             } else {
-                ConnectionConfig {
+                let mut connection_config = ConnectionConfig {
                     telemetry_topic: Some(topic.clone()),
-                    json_path: Some("$.value".to_string()),
                     ..Default::default()
+                };
+                if let Some(ref src) = draft.mqtt_identity_source {
+                    connection_config.extra.insert(
+                        "mqtt_identity_source".to_string(),
+                        serde_json::Value::String(src.clone()),
+                    );
                 }
+                if let Some(ref field) = draft.mqtt_identity_field {
+                    connection_config.extra.insert(
+                        "mqtt_identity_field".to_string(),
+                        serde_json::Value::String(field.clone()),
+                    );
+                }
+                connection_config
             };
 
             // Create device config with the existing type
@@ -316,11 +348,11 @@ pub async fn approve_draft_device(
                 offline_timeout_secs: None,
             };
 
-            // Register the device
+            // Register the device (MQTT subscribe honesty → BindIncomplete)
             device_service
                 .register_device(device_config)
                 .await
-                .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+                .map_err(bind_error_to_response)?;
 
             (
                 existing_type.clone(),
@@ -377,6 +409,8 @@ pub async fn approve_draft_device(
                 uplink_samples: Vec::new(), // Samples not stored in draft
                 default_offline_timeout_secs: None,
                 store_raw: None,
+                builtin_version: None, // auto-onboard types are user-domain, never builtin
+                ct_prov: None,
             };
 
             // Register the device type template
@@ -400,11 +434,23 @@ pub async fn approve_draft_device(
             let connection_config = if adapter_type == "webhook" {
                 ConnectionConfig::default()
             } else {
-                ConnectionConfig {
+                let mut connection_config = ConnectionConfig {
                     telemetry_topic: Some(topic.clone()),
-                    json_path: Some("$.value".to_string()),
                     ..Default::default()
+                };
+                if let Some(ref src) = draft.mqtt_identity_source {
+                    connection_config.extra.insert(
+                        "mqtt_identity_source".to_string(),
+                        serde_json::Value::String(src.clone()),
+                    );
                 }
+                if let Some(ref field) = draft.mqtt_identity_field {
+                    connection_config.extra.insert(
+                        "mqtt_identity_field".to_string(),
+                        serde_json::Value::String(field.clone()),
+                    );
+                }
+                connection_config
             };
 
             // Create device config
@@ -419,11 +465,11 @@ pub async fn approve_draft_device(
                 offline_timeout_secs: None,
             };
 
-            // Register the device
+            // Register the device (MQTT subscribe honesty → BindIncomplete)
             device_service
                 .register_device(device_config)
                 .await
-                .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+                .map_err(bind_error_to_response)?;
 
             tracing::info!("Registered device '{}' with type '{}'", device_id, type_id);
 
@@ -435,24 +481,35 @@ pub async fn approve_draft_device(
             )
         };
 
-    // Mark device as Connected - it was actively sending data when discovered
-    device_service
-        .update_device_status(&device_id, ConnectionStatus::Connected)
-        .await;
+    let is_webhook = draft.source == "webhook";
+    let subscription_ready = if is_webhook {
+        // Webhook unchanged: no MQTT subscribe gate.
+        false
+    } else {
+        // MQTT (and other transport): register_device only returns Ok after
+        // subscribe succeeded (or non-mqtt adapters). Config ≠ online.
+        true
+    };
 
-    // Publish DeviceOnline event so frontend immediately shows device as online
-    if let Some(event_bus) = state.core.event_bus.as_ref() {
-        let _ = event_bus
-            .publish(heramind_core::HeraMindEvent::DeviceOnline {
-                device_id: device_id.clone(),
-                device_type: device_type.clone(),
-                timestamp: chrono::Utc::now().timestamp(),
-            })
+    if is_webhook {
+        // Legacy webhook path: mark Connected + DeviceOnline from discovery traffic.
+        device_service
+            .update_device_status(&device_id, ConnectionStatus::Connected)
             .await;
+        if let Some(event_bus) = state.core.event_bus.as_ref() {
+            let _ = event_bus
+                .publish(heramind_core::HeraMindEvent::DeviceOnline {
+                    device_id: device_id.clone(),
+                    device_type: device_type.clone(),
+                    timestamp: chrono::Utc::now().timestamp(),
+                })
+                .await;
+        }
     }
+    // MQTT: do NOT mark Connected / publish DeviceOnline here — online follows
+    // real telemetry or transport evidence (same as association confirm).
 
-    // Remove draft completely after successful registration (same behavior as reject)
-    // This allows the device to be re-discovered if needed and keeps the pending list clean
+    // Draft consumed ONLY after register (+ MQTT subscribe) succeeded.
     manager
         .remove_draft(&device_id)
         .await
@@ -464,6 +521,8 @@ pub async fn approve_draft_device(
         device_type,
         recommended_topic,
         registered: true,
+        subscription_ready,
+        online: false,
         message,
     })
 }
@@ -476,39 +535,37 @@ fn convert_metrics_to_template(metrics: &[DiscoveredMetric]) -> Vec<MetricDefini
     metrics
         .iter()
         .map(|m| {
-            // Map semantic type to data type
-            let data_type = match m.semantic_type {
-                SemanticType::Temperature
-                | SemanticType::Humidity
-                | SemanticType::Pressure
-                | SemanticType::Light
-                | SemanticType::Power
-                | SemanticType::Energy
-                | SemanticType::Speed
-                | SemanticType::Flow
-                | SemanticType::Level
-                | SemanticType::Co2
-                | SemanticType::Pm25
-                | SemanticType::Voc => MetricDataType::Float,
+            // Data type comes from the OBSERVED values; the semantic type only
+            // fills the gap when the observed type carries no information
+            // (unknown/all-null fields). The old mapping let the semantic type
+            // override real values — numeric battery/rssi fields were forced
+            // to String (SemanticType::Battery/Rssi arm), breaking charts and
+            // numeric transforms.
+            let data_type = match m.data_type {
+                DataType::Float => MetricDataType::Float,
+                DataType::Integer => MetricDataType::Integer,
+                DataType::Boolean => MetricDataType::Boolean,
+                DataType::String => MetricDataType::String,
+                DataType::Array => MetricDataType::Array { element_type: None },
+                DataType::Binary => MetricDataType::Binary,
+                DataType::Object | DataType::Null | DataType::Unknown => match m.semantic_type {
+                    SemanticType::Temperature
+                    | SemanticType::Humidity
+                    | SemanticType::Pressure
+                    | SemanticType::Light
+                    | SemanticType::Power
+                    | SemanticType::Energy
+                    | SemanticType::Speed
+                    | SemanticType::Flow
+                    | SemanticType::Level
+                    | SemanticType::Co2
+                    | SemanticType::Pm25
+                    | SemanticType::Voc => MetricDataType::Float,
 
-                SemanticType::Motion | SemanticType::Switch => MetricDataType::Boolean,
+                    SemanticType::Motion | SemanticType::Switch => MetricDataType::Boolean,
 
-                SemanticType::Dimmer => MetricDataType::Integer,
+                    SemanticType::Dimmer => MetricDataType::Integer,
 
-                SemanticType::Color => MetricDataType::String,
-
-                SemanticType::Status
-                | SemanticType::Error
-                | SemanticType::Alarm
-                | SemanticType::Battery
-                | SemanticType::Rssi => MetricDataType::String,
-
-                SemanticType::Unknown => match m.data_type {
-                    DataType::Float => MetricDataType::Float,
-                    DataType::Integer => MetricDataType::Integer,
-                    DataType::Boolean => MetricDataType::Boolean,
-                    DataType::String => MetricDataType::String,
-                    DataType::Array => MetricDataType::Array { element_type: None },
                     _ => MetricDataType::String,
                 },
             };
@@ -566,6 +623,301 @@ pub async fn reject_draft_device(
     ok(SuccessResponse {
         message: format!("Draft device '{}' rejected", device_id),
     })
+}
+
+/// Confirm a real device identity for an MQTT association-exception draft.
+///
+/// Ordinary `/approve` is refused for these drafts (placeholder `pending-assoc-*`
+/// must never become a registered device). This endpoint requires an explicit
+/// real `device_id` + payload `identity_field`, registers/attaches that device
+/// on the draft's topic, and leaves blocked devices untouched unless
+/// `overwrite_blocked` is set.
+#[utoipa::path(
+    post,
+    path = "/api/devices/drafts/{device_id}/confirm-association",
+    tag = "drafts",
+    params(
+        ("device_id" = String, Path, description = "Association-exception draft id"),
+    ),
+    request_body = ConfirmAssociationRequest,
+    responses(
+        (status = 200, description = "Real identity confirmed; device attached"),
+        (status = 400, description = "Missing/invalid identity or ordinary approve path"),
+        (status = 404, description = "Not found"),
+    )
+)]
+pub async fn confirm_association_draft(
+    State(state): State<ServerState>,
+    Path(draft_key): Path<String>,
+    Json(request): Json<ConfirmAssociationRequest>,
+) -> HandlerResult<ApproveDraftResponse> {
+    let manager = get_auto_onboard_manager(&state).await?;
+    let device_service = state.devices.service.clone();
+
+    // Serialize same-draft confirms; release on both Ok and Err so failed
+    // attempts remain retryable. Same-device bind coordination lives inside
+    // `apply_association_bind` (per-device mutex).
+    let draft_lock = manager.confirm_draft_lock_for(&draft_key);
+    let _draft_guard = draft_lock.lock().await;
+
+    // Re-read after lock — a concurrent confirm may have consumed the draft.
+    let draft = manager.get_draft(&draft_key).await.ok_or_else(|| {
+        ErrorResponse::not_found(format!("Draft device '{}' not found", draft_key))
+    })?;
+
+    if !draft.association_exception
+        && !heramind_devices::adapters::mqtt::is_pending_association_candidate_id(&draft_key)
+    {
+        return Err(ErrorResponse::bad_request(
+            "Draft is not an association exception — use POST .../approve instead",
+        ));
+    }
+
+    use heramind_devices::adapters::mqtt::{
+        is_pending_association_candidate_id, normalize_confirm_device_id,
+        verify_confirm_identity_against_raw, MqttIdentitySource,
+    };
+
+    let identity_source_raw = request
+        .identity_source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(draft.mqtt_identity_source.as_deref())
+        .unwrap_or("auto_payload");
+    let identity_source = MqttIdentitySource::parse(identity_source_raw).ok_or_else(|| {
+        ErrorResponse::bad_request(format!(
+            "identity_source '{identity_source_raw}' is invalid"
+        ))
+        .with_hint(
+            "Use one of: auto_payload, configured_payload, topic_strong, topic_weak, topic_hash",
+        )
+    })?;
+
+    let identity_field = {
+        let trimmed = request.identity_field.trim();
+        let from_draft = draft
+            .mqtt_identity_field
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let effective = if trimmed.is_empty() {
+            from_draft.unwrap_or("")
+        } else {
+            trimmed
+        };
+        if identity_source.requires_identity_field() && effective.is_empty() {
+            return Err(ErrorResponse::bad_request(
+                "identity_field is required — name the JSON parse field that identifies the device",
+            )
+            .with_hint("Example: sn, data.sn, device_id, mac"));
+        }
+        // Persist only nonempty fields (topic sources may omit).
+        if effective.is_empty() {
+            None
+        } else {
+            Some(effective.to_string())
+        }
+    };
+
+    let real_id = {
+        let trimmed = request.device_id.trim();
+        if trimmed.is_empty() {
+            return Err(ErrorResponse::bad_request(
+                "device_id is required — confirm the real device identity explicitly",
+            )
+            .with_hint("Do not reuse the pending-assoc-* placeholder."));
+        }
+        normalize_confirm_device_id(trimmed).ok_or_else(|| {
+            ErrorResponse::bad_request(
+                "device_id is empty or invalid after normalization (ascii alnum, -, _, :, . only)",
+            )
+            .with_hint(
+                "Enter the real payload identity (e.g. sn value), not a path or placeholder.",
+            )
+        })?
+    };
+    if is_pending_association_candidate_id(&real_id) {
+        return Err(ErrorResponse::bad_request(
+            "device_id must not be a pending-assoc-* placeholder",
+        )
+        .with_hint(
+            "Enter the real device identity from the payload (e.g. sn value) or an existing id.",
+        ));
+    }
+
+    let overwrite_blocked = request.overwrite_blocked.unwrap_or(false);
+    if draft.blocked_device_ids.iter().any(|id| id == &real_id) && !overwrite_blocked {
+        return Err(ErrorResponse::bad_request(format!(
+            "Device '{}' is blocked by this association exception — confirming it would \
+             overwrite that device's identity binding. Pass overwrite_blocked=true only if \
+             you intentionally want to retarget that device.",
+            real_id
+        ))
+        .with_hint(
+            "Prefer confirming a different real identity (e.g. the conflicting sn value) \
+             so blocked devices keep their current binding.",
+        ));
+    }
+
+    let topic = draft
+        .original_topic
+        .clone()
+        .unwrap_or_else(|| draft.source.clone());
+
+    // Fail closed on the full raw sample before mutating registry / consuming draft.
+    if let Err(reason) = verify_confirm_identity_against_raw(
+        draft.samples.first().map(|s| s.raw_data.as_slice()),
+        &topic,
+        identity_source,
+        identity_field.as_deref(),
+        &real_id,
+    ) {
+        return Err(ErrorResponse::bad_request(format!(
+            "identity config does not match the draft sample: {reason}"
+        ))
+        .with_hint(
+            "Check identity_field / device_id against the sample payload before confirming.",
+        ));
+    }
+
+    let adapter_type = draft.source.clone();
+    let default_adapter_id = format!("internal-{}", adapter_type);
+    // Confirmed draft source constrains broker — never silently keep a stale adapter_id.
+    let confirmed_adapter_id = draft
+        .adapter_id
+        .clone()
+        .or(Some(default_adapter_id.clone()));
+
+    let device_instance_name = request
+        .device_name
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("Device {}", real_id));
+
+    let identity_field_label = identity_field.as_deref().unwrap_or("(topic)");
+
+    let existing = device_service.get_device(&real_id);
+    let device_type = if let Some(existing_cfg) = existing.as_ref() {
+        existing_cfg.device_type.clone()
+    } else {
+        // Resolve type for a new device before the unified bind.
+        let use_existing_type = request.existing_type.as_ref().filter(|s| !s.is_empty());
+        let new_type_info = request.new_type.as_ref();
+
+        if let Some(existing_type) = use_existing_type {
+            existing_type.clone()
+        } else if let Some(new_info) = new_type_info {
+            let gen_type = draft.generated_type.as_ref();
+            let type_id = new_info.device_type.clone();
+            let type_name = if new_info.name.trim().is_empty() {
+                type_id.clone()
+            } else {
+                new_info.name.clone()
+            };
+            let type_description = new_info.description.clone();
+            let mode = match gen_type {
+                Some(g) if !g.metrics.is_empty() => DeviceTypeMode::Full,
+                _ => DeviceTypeMode::Simple,
+            };
+            let metrics = gen_type
+                .map(|g| convert_metrics_to_template(&g.metrics))
+                .unwrap_or_default();
+            let template = DeviceTypeTemplate {
+                device_type: type_id.clone(),
+                name: type_name,
+                description: type_description,
+                categories: Vec::new(),
+                mode,
+                metrics,
+                commands: Vec::new(),
+                uplink_samples: Vec::new(),
+                default_offline_timeout_secs: None,
+                store_raw: None,
+                builtin_version: None,
+                ct_prov: None,
+            };
+            device_service
+                .register_template(template)
+                .await
+                .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+            type_id
+        } else if let Some(blocked) = draft.blocked_device_ids.first() {
+            if let Some(peer) = device_service.get_device(blocked) {
+                peer.device_type.clone()
+            } else {
+                return Err(ErrorResponse::bad_request(
+                    "existing_type or new_type is required when confirming a new device",
+                ));
+            }
+        } else {
+            return Err(ErrorResponse::bad_request(
+                "existing_type or new_type is required when confirming a new device",
+            ));
+        }
+    };
+
+    // Unified business op: apply config + subscribe switch; return actual result.
+    let bind = device_service
+        .apply_association_bind(AssociationBindInput {
+            device_id: real_id.clone(),
+            name: device_instance_name,
+            device_type: device_type.clone(),
+            adapter_type,
+            adapter_id: confirmed_adapter_id,
+            telemetry_topic: topic.clone(),
+            identity_source: identity_source.as_str().to_string(),
+            identity_field: identity_field.clone(),
+        })
+        .await
+        .map_err(bind_error_to_response)?;
+
+    // Draft consumed ONLY after config+subscribe both succeeded.
+    manager
+        .remove_draft(&draft_key)
+        .await
+        .map_err(draft_error_to_response)?;
+
+    // Config ≠ online: do not mark Connected / publish DeviceOnline here.
+    // Online/connected follows real telemetry or transport evidence.
+
+    let action = if bind.was_existing {
+        "Attached"
+    } else {
+        "Registered"
+    };
+    let message = format!(
+        "{action} device '{}' on topic '{}' with identity_field='{}' via adapter {:?} (subscription ready; not marked online — waiting for telemetry)",
+        real_id, topic, identity_field_label, bind.subscribed_adapter_id
+    );
+
+    ok(ApproveDraftResponse {
+        original_device_id: draft_key,
+        system_device_id: real_id,
+        device_type,
+        recommended_topic: topic,
+        registered: true,
+        subscription_ready: true,
+        online: false,
+        message,
+    })
+}
+
+fn bind_error_to_response(e: DeviceError) -> ErrorResponse {
+    match e {
+        DeviceError::BindIncomplete {
+            message,
+            config_applied,
+            retry_hint,
+        } => ErrorResponse::service_unavailable(format!(
+            "{message}; config_applied={config_applied}"
+        ))
+        .with_hint(retry_hint),
+        DeviceError::InvalidParameter(msg) => ErrorResponse::bad_request(msg),
+        other => ErrorResponse::from(other),
+    }
 }
 
 /// Trigger manual analysis of a draft device
@@ -964,6 +1316,27 @@ pub struct DraftDeviceDto {
     pub updated_at: i64,
     pub error_message: Option<String>,
     pub user_name: Option<String>,
+    /// MQTT association exception pending human confirm (not silent drop).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub association_exception: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association_exception_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_device_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_identity: Option<String>,
+    /// First sample payload preview (association-exception conflict UX).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_preview: Option<serde_json::Value>,
+    /// Sticky identity source discovered with the sample (confirm prefill).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mqtt_identity_source: Option<String>,
+    /// Sticky identity field path (e.g. `data.sn`) for confirm prefill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mqtt_identity_field: Option<String>,
+    /// Source adapter id from the draft (cross-broker confirm).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_id: Option<String>,
 }
 
 impl From<crate::automation::DraftDevice> for DraftDeviceDto {
@@ -979,6 +1352,8 @@ impl From<crate::automation::DraftDevice> for DraftDeviceDto {
             crate::automation::DraftDeviceStatus::Failed => "failed",
         };
 
+        let sample_preview = draft.samples.first().and_then(|s| s.parsed.clone());
+
         Self {
             id: draft.id,
             device_id: draft.device_id,
@@ -992,6 +1367,14 @@ impl From<crate::automation::DraftDevice> for DraftDeviceDto {
             updated_at: draft.updated_at,
             error_message: draft.error_message,
             user_name: draft.user_name,
+            association_exception: draft.association_exception,
+            association_exception_kind: draft.association_exception_kind,
+            blocked_device_ids: draft.blocked_device_ids,
+            claimed_identity: draft.claimed_identity,
+            sample_preview,
+            mqtt_identity_source: draft.mqtt_identity_source,
+            mqtt_identity_field: draft.mqtt_identity_field,
+            adapter_id: draft.adapter_id,
         }
     }
 }
@@ -1070,7 +1453,7 @@ impl From<&crate::automation::ProcessingSummary> for ProcessingSummaryDto {
     }
 }
 
-/// Response for device approval
+/// Response for device approval / association confirm
 #[derive(Debug, Serialize)]
 pub struct ApproveDraftResponse {
     /// Original device_id (also used as the registered device_id)
@@ -1083,6 +1466,12 @@ pub struct ApproveDraftResponse {
     pub recommended_topic: String,
     /// Whether registration was successful
     pub registered: bool,
+    /// True when adapter subscribe switch completed (confirm path).
+    #[serde(default)]
+    pub subscription_ready: bool,
+    /// Always false on confirm — online requires real telemetry/transport evidence.
+    #[serde(default)]
+    pub online: bool,
     /// Success message
     pub message: String,
 }
@@ -1099,8 +1488,33 @@ pub struct ApproveDraftDeviceRequest {
     pub device_name: Option<String>,
 }
 
+/// Confirm real identity for an MQTT association-exception draft.
+#[derive(utoipa::ToSchema, Debug, Clone, Deserialize)]
+pub struct ConfirmAssociationRequest {
+    /// Real device identity to register or attach (never `pending-assoc-*`).
+    pub device_id: String,
+    /// JSON field used to parse identity on later messages (e.g. `sn`).
+    pub identity_field: String,
+    /// Sticky identity source; defaults to `auto_payload` when omitted.
+    #[serde(default)]
+    pub identity_source: Option<String>,
+    /// Optional existing device type when registering a new device.
+    #[serde(default)]
+    pub existing_type: Option<String>,
+    /// Optional new type details when registering a new device.
+    #[serde(default)]
+    pub new_type: Option<NewTypeDetails>,
+    /// Display name for the device instance.
+    #[serde(default)]
+    pub device_name: Option<String>,
+    /// Explicitly allow targeting a blocked device id (default false — never
+    /// silently overwrite A).
+    #[serde(default)]
+    pub overwrite_blocked: Option<bool>,
+}
+
 /// Details for creating a new device type
-#[derive(utoipa::ToSchema, Debug, Deserialize)]
+#[derive(utoipa::ToSchema, Debug, Clone, Deserialize)]
 pub struct NewTypeDetails {
     /// Device type ID (user-specified)
     pub device_type: String,
@@ -1243,4 +1657,61 @@ fn infer_semantic_type_from_metric_name(name: &str) -> SemanticType {
     }
 
     SemanticType::Unknown
+}
+
+#[cfg(test)]
+mod convert_metrics_tests {
+    use super::*;
+    use heramind_devices::MetricDataType;
+
+    fn metric(path: &str, data_type: DataType, semantic_type: SemanticType) -> DiscoveredMetric {
+        DiscoveredMetric {
+            name: path.to_string(),
+            display_name: path.to_string(),
+            description: String::new(),
+            path: path.to_string(),
+            data_type,
+            semantic_type,
+            unit: None,
+            value_range: None,
+            is_readable: true,
+            is_writable: false,
+        }
+    }
+
+    #[test]
+    fn observed_data_type_wins_over_semantic_type() {
+        // Numeric battery/rssi fields used to be forced to String by the
+        // semantic-type arm (SemanticType::Battery/Rssi → String), breaking
+        // charts and numeric transforms.
+        let metrics = vec![
+            metric(
+                "device_info.battery_percent",
+                DataType::Integer,
+                SemanticType::Battery,
+            ),
+            metric("rssi", DataType::Integer, SemanticType::Rssi),
+            metric("status", DataType::String, SemanticType::Status),
+        ];
+        let defs = convert_metrics_to_template(&metrics);
+
+        assert!(matches!(defs[0].data_type, MetricDataType::Integer));
+        assert!(matches!(defs[1].data_type, MetricDataType::Integer));
+        assert!(matches!(defs[2].data_type, MetricDataType::String));
+        // Dotted path is kept as the metric name (it doubles as the
+        // extraction path).
+        assert_eq!(defs[0].name, "device_info.battery_percent");
+    }
+
+    #[test]
+    fn semantic_type_fills_uninformative_observed_types() {
+        let metrics = vec![
+            metric("temp", DataType::Unknown, SemanticType::Temperature),
+            metric("flag", DataType::Null, SemanticType::Switch),
+        ];
+        let defs = convert_metrics_to_template(&metrics);
+
+        assert!(matches!(defs[0].data_type, MetricDataType::Float));
+        assert!(matches!(defs[1].data_type, MetricDataType::Boolean));
+    }
 }

@@ -7,6 +7,8 @@ import { ExtensionUploadDialog } from "@/components/extensions"
 import { useToast } from "@/hooks/use-toast"
 import { RefreshCw, Upload, Globe } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { MobilePageActionsLift, SearchInput } from "@/components/shared"
+import { useIsMobile } from "@/hooks/useMobile"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -23,6 +25,7 @@ import type { Extension } from "@/types"
 export function ExtensionsPage() {
   const { t } = useTranslation(["extensions", "common"])
   const { toast } = useToast()
+  const isMobile = useIsMobile()
 
   // Use the main store to access extension state and actions
   const extensions = useStore((state) => state.extensions)
@@ -41,6 +44,9 @@ export function ExtensionsPage() {
   const [detailsDialogOpen, setDetailsDialogOpen] = useState(false)
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false)
   const [marketplaceDialogOpen, setMarketplaceDialogOpen] = useState(false)
+  // Search lives in the page toolbar row (no-tab standard: content
+  // controls left, actions right); the grid receives it controlled.
+  const [searchQuery, setSearchQuery] = useState("")
 
   // Confirmation dialogs state
   const [reloadConfirmOpen, setReloadConfirmOpen] = useState(false)
@@ -70,6 +76,10 @@ export function ExtensionsPage() {
     if (result) {
       // Clear extension's components from dynamic registry
       dynamicRegistry.unregisterExtension(id)
+
+      // Notify sidebar/nav that the extension page list changed —
+      // useExtensionPages picks this up and clears stale nav entries.
+      window.dispatchEvent(new CustomEvent('extensions-changed'))
 
       toast({
         title: t("extensions:extensionUninstalled"),
@@ -120,7 +130,9 @@ export function ExtensionsPage() {
     setPendingActionExtension(null)
   }
 
-  const handleUploadComplete = (extensionId: string) => {
+  const handleUploadComplete = (_extensionId: string) => {
+    // Notify sidebar/nav that the extension page list changed.
+    window.dispatchEvent(new CustomEvent('extensions-changed'))
     fetchExtensions()
     toast({
       title: t("extensions:extensionUploaded"),
@@ -128,16 +140,47 @@ export function ExtensionsPage() {
     // Dialog will be closed by ExtensionUploadDialog after showing success message
   }
 
+  const mobileActions = [
+    {
+      label: t("extensions:marketplace", { defaultValue: "Marketplace" }),
+      icon: <Globe className="h-4 w-4" />,
+      onClick: () => setMarketplaceDialogOpen(true),
+    },
+    {
+      label: t("extensions:uploadExtension", { defaultValue: "Upload" }),
+      icon: <Upload className="h-4 w-4" />,
+      onClick: () => setUploadDialogOpen(true),
+    },
+  ]
+
+  const extensionSearch = (
+    <SearchInput
+      value={searchQuery}
+      onChange={setSearchQuery}
+      placeholder={t("searchPlaceholder", { defaultValue: "Search extensions and commands..." })}
+      aria-label={t("searchPlaceholder", { defaultValue: "Search extensions and commands..." })}
+      className="w-full sm:max-w-md sm:mr-auto"
+    />
+  )
+
   return (
     <>
       <PageLayout
         title={t("extensions:title", { defaultValue: "Extensions" })}
-        subtitle={t("extensions:description", { defaultValue: "Manage dynamic extensions and plugins" })}
         borderedHeader={false}
         headerContent={
-          // Same toolbar-row shape as every other page (PageTabsBar row)
-          <div className="flex shrink-0 items-center bg-background px-4 py-2 sm:px-6 md:px-8">
-            <div className="flex shrink-0 flex-wrap items-center gap-1.5 sm:gap-2">
+          isMobile ? (
+            <MobilePageActionsLift actions={mobileActions} actionsExtra={extensionSearch} />
+          ) : (
+          // No-tab page standard (actions-left variant): page actions sit
+          // in the tab slot, page actions anchor the right edge (aligned with
+          // the content below) — the mirrored layout to tabbed pages'
+          // "tabs left, search middle, actions right".
+          <div className="flex shrink-0 flex-col gap-2 bg-background px-4 pt-1 sm:flex-row sm:items-end sm:px-6 md:px-8 md:pt-2">
+            {/* Search leads (utility), actions anchor the trailing edge
+                (primary CTA) — the same order as PageTabsBar's group. */}
+            {extensionSearch}
+            <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
               <Button
                 variant="default"
                 size="sm"
@@ -157,16 +200,22 @@ export function ExtensionsPage() {
               </Button>
             </div>
           </div>
+          )
         }
       >
-        {/* Extensions Grid */}
-        <ExtensionGrid
-          extensions={extensions}
-          loading={extensionsLoading}
-          onUninstall={handleUninstall}
-          onDetails={handleConfigure}
-          onReload={handleReload}
-        />
+        {/* Extensions Grid — mt-4 mirrors PageTabsContent's tabs→content
+            gap (16px) so the no-tab toolbar doesn't touch the cards. */}
+        <div className="mt-2 md:mt-4">
+          <ExtensionGrid
+            extensions={extensions}
+            loading={extensionsLoading}
+            onUninstall={handleUninstall}
+            onDetails={handleConfigure}
+            onReload={handleReload}
+            searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
+          />
+        </div>
       </PageLayout>
 
       {/* Extension Details Dialog */}
@@ -187,7 +236,7 @@ export function ExtensionsPage() {
       <MarketplaceDialog
         open={marketplaceDialogOpen}
         onOpenChange={setMarketplaceDialogOpen}
-        onInstallComplete={(extensionId) => {
+        onInstallComplete={(_extensionId) => {
           toast({
             title: t("extensions:extensionInstalled", { defaultValue: "Extension installed successfully" }),
           })

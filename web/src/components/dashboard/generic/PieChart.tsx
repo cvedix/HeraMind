@@ -25,7 +25,7 @@ import { DataMapper, type CategoricalMappingConfig } from '@/lib/dataMapping'
 import { dashboardCardBase, dashboardComponentSize } from '@/design-system/tokens/size'
 import { indicatorFontWeight } from '@/design-system/tokens/indicator'
 import { chartColors as designChartColors, chartColorsHex } from '@/design-system/tokens/color'
-import type { DataSource, DataSourceOrList, TelemetryAggregate } from '@/types/dashboard'
+import type { DataSourceOrList, TelemetryAggregate } from '@/types/dashboard'
 import { getSourceId } from '@/types/dashboard'
 import { ChartContainer, ChartTooltip, EmptyState, useChartDimensions, useStaggeredData, createMemoRenderer, useChartPipeline } from '../shared'
 import { isNameValueData, isNumberArray, isMultiSourceData } from '../shared'
@@ -34,7 +34,7 @@ import {
 } from '@/lib/telemetryTransform'
 
 // Use design system chart colors
-const chartColors = designChartColors
+const _chartColors = designChartColors
 
 // Fallback colors as hex values for SVG
 const fallbackColors = chartColorsHex
@@ -179,7 +179,7 @@ export const PieChart = memo(function PieChart({
   dataSource,
   data: propData,
   title,
-  height = 'auto',
+  height: _height = 'auto',
   showLegend = false,
   showTooltip = true,
   showLabels = false,
@@ -189,7 +189,7 @@ export const PieChart = memo(function PieChart({
   limit = 10,
   timeRange = 1,
   aggregate = 'latest',  // Default to latest value for pie charts
-  timeWindow,
+  timeWindow: _timeWindow,
   dataMapping,
   colors,
   size = 'md',
@@ -201,7 +201,7 @@ export const PieChart = memo(function PieChart({
   // Shared data pipeline — same pattern as LineChart/AreaChart
   const {
     sources, data, loading, effectiveAggregate,
-    hasData, showLoading, getSeriesName, getDeviceName,
+    hasData: _hasData, showLoading, getSeriesName, getDeviceName,
   } = useChartPipeline<PieData[] | number[] | number[][]>({
     dataSource,
     aggregate,
@@ -339,7 +339,7 @@ export const PieChart = memo(function PieChart({
 
   // Only show empty state when loading is fully complete
   if (!loading && chartData.length === 0) {
-    return <EmptyState size={size} className={className} message={title ? `${title} - No Data Available` : undefined} />
+    return <EmptyState size={size} className={className} message={title ? `${title} - ${t('defaultStates.noData')}` : undefined} />
   }
 
   const effectiveColors = colors || fallbackColors

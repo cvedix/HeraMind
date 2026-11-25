@@ -5,6 +5,8 @@
  * These states replace the entire card container.
  */
 
+import { useLayoutEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 import { RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -23,6 +25,30 @@ const ICON_SIZE: Record<DashboardComponentSize, string> = {
   lg: 'h-16 w-16',
 }
 
+/** Below this card height the stacked icon + two-line states cram. */
+const COMPACT_THRESHOLD_PX = 132
+
+/**
+ * Dashboard grid cells vary per widget — the same state must collapse to a
+ * single quiet line on short cards instead of cramming icon + two lines.
+ * Exported for hand-rolled card states outside this module (e.g. the
+ * registry's unknown-component / error fallbacks).
+ */
+export function useCompactCard<T extends HTMLElement>() {
+  const ref = useRef<T>(null)
+  const [compact, setCompact] = useState(false)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const ro = new ResizeObserver(([entry]) => {
+      setCompact(entry.contentRect.height < COMPACT_THRESHOLD_PX)
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  return { ref, compact }
+}
+
 /**
  * Empty state with message (optional icon)
  * Replaces the entire card container.
@@ -38,14 +64,41 @@ export function EmptyState({
   size = 'md',
   className,
   icon,
-  message = 'No Data Available',
+  message,
   subMessage,
   action,
 }: EmptyStateProps) {
+  const { t } = useTranslation('dashboardComponents')
+  const resolvedMessage = message ?? t('defaultStates.noData')
   const sizeConfig = dashboardComponentSize[size]
+  const { ref, compact } = useCompactCard<HTMLDivElement>()
+
+  if (compact) {
+    // Short card: one quiet line — forced-small icon + message; the
+    // subMessage survives as the hover title, the action stays inline.
+    return (
+      <div
+        ref={ref}
+        title={subMessage}
+        className={cn(
+          dashboardCardBase,
+          'flex-row items-center justify-center gap-2 px-3 min-h-full w-full',
+          className
+        )}
+      >
+        {icon && (
+          <span className="flex h-4 w-4 shrink-0 items-center justify-center text-muted-foreground [&>svg]:h-4 [&>svg]:w-4">
+            {icon}
+          </span>
+        )}
+        <p className="truncate text-xs font-medium text-muted-foreground">{resolvedMessage}</p>
+        {action}
+      </div>
+    )
+  }
 
   return (
-    <div className={cn(
+    <div ref={ref} className={cn(
       dashboardCardBase,
       'flex flex-col items-center justify-center gap-3 min-h-full w-full',
       sizeConfig.padding,
@@ -57,7 +110,7 @@ export function EmptyState({
         </div>
       )}
       <div className="text-center">
-        <p className="text-muted-foreground text-sm font-medium">{message}</p>
+        <p className="text-muted-foreground text-sm font-medium">{resolvedMessage}</p>
         {subMessage && (
           <p className="text-muted-foreground text-xs mt-1">{subMessage}</p>
         )}
@@ -81,22 +134,55 @@ export interface ErrorStateProps extends StateProps {
 export function ErrorState({
   size = 'md',
   className,
-  message = 'Failed to Load Data',
+  message,
   subMessage,
   onRetry,
-  retryLabel = 'Retry',
+  retryLabel,
 }: ErrorStateProps) {
+  const { t } = useTranslation('dashboardComponents')
+  const resolvedMessage = message ?? t('defaultStates.failedToLoad')
+  const resolvedRetry = retryLabel ?? t('defaultStates.retry')
   const sizeConfig = dashboardComponentSize[size]
+  const { ref, compact } = useCompactCard<HTMLDivElement>()
+
+  if (compact) {
+    // Short card: error line + inline retry icon-button; the subMessage
+    // survives as the hover title.
+    return (
+      <div
+        ref={ref}
+        title={subMessage}
+        className={cn(
+          dashboardCardBase,
+          'flex-row items-center justify-center gap-2 px-3 min-h-full w-full',
+          className
+        )}
+      >
+        <p className="truncate text-xs font-medium text-error">{resolvedMessage}</p>
+        {onRetry && (
+          <Button
+            variant="outline"
+            size="icon-sm"
+            className="h-7 w-7 shrink-0 sm:h-7 sm:w-7"
+            onClick={onRetry}
+            aria-label={resolvedRetry}
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+          </Button>
+        )}
+      </div>
+    )
+  }
 
   return (
-    <div className={cn(
+    <div ref={ref} className={cn(
       dashboardCardBase,
       'flex flex-col items-center justify-center gap-2 min-h-full w-full',
       sizeConfig.padding,
       className
     )}>
       <div className="text-center">
-        <p className="text-error text-sm font-medium">{message}</p>
+        <p className="text-error text-sm font-medium">{resolvedMessage}</p>
         {subMessage && (
           <p className="text-muted-foreground text-xs mt-1">{subMessage}</p>
         )}
@@ -108,7 +194,7 @@ export function ErrorState({
             onClick={onRetry}
           >
             <RefreshCw className="h-4 w-4" />
-            {retryLabel}
+            {resolvedRetry}
           </Button>
         )}
       </div>

@@ -234,7 +234,7 @@ impl LlmBackendInstanceManager {
 
             let config = OllamaConfig::new(&instance.model)
                 .with_endpoint(endpoint)
-                .with_timeout_secs(180);
+                .with_timeout_secs(env_timeout_secs("OLLAMA_TIMEOUT_SECS", 180));
 
             let ollama_runtime = OllamaRuntime::new(config)
                 .map_err(|e| LlmError::BackendUnavailable(e.to_string()))?;
@@ -349,7 +349,7 @@ impl LlmBackendInstanceManager {
                             .as_deref()
                             .unwrap_or("http://127.0.0.1:8080"),
                     )
-                    .with_timeout_secs(600);
+                    .with_timeout_secs(env_timeout_secs("LLAMACPP_TIMEOUT_SECS", 600));
 
                 if let Some(ref key) = instance.api_key {
                     config = config.with_api_key(key);
@@ -474,6 +474,25 @@ impl LlmBackendInstanceManager {
                         }))
                         .map_err(|e| LlmError::BackendUnavailable(e.to_string()))?;
                         cfg.provider = provider;
+                        // Per-provider timeout override, unified default 300s:
+                        // agent executions issue long multi-step calls, and the
+                        // implicit serde default (60s) was too tight once this
+                        // became the single factory for chat AND agents (M0-2).
+                        // A longer timeout only waits longer on hung backends.
+                        let timeout_env = match instance.backend_type {
+                            LlmBackendType::OpenAi => "OPENAI_TIMEOUT_SECS",
+                            LlmBackendType::Anthropic => "ANTHROPIC_TIMEOUT_SECS",
+                            LlmBackendType::Google => "GOOGLE_TIMEOUT_SECS",
+                            LlmBackendType::XAi => "XAI_TIMEOUT_SECS",
+                            LlmBackendType::Qwen => "QWEN_TIMEOUT_SECS",
+                            LlmBackendType::DeepSeek => "DEEPSEEK_TIMEOUT_SECS",
+                            LlmBackendType::GLM => "GLM_TIMEOUT_SECS",
+                            LlmBackendType::MiniMax => "MINIMAX_TIMEOUT_SECS",
+                            _ => "",
+                        };
+                        if !timeout_env.is_empty() {
+                            cfg.timeout_secs = env_timeout_secs(timeout_env, 300);
+                        }
 
                         let runtime = CloudRuntime::new(cfg)
                             .map_err(|e| LlmError::BackendUnavailable(e.to_string()))?;
@@ -593,6 +612,28 @@ impl LlmBackendInstanceManager {
         Ok(())
     }
 
+    /// Clear the active backend pointer (no backend active afterwards).
+    ///
+    /// Used when the active backend is being torn down — e.g. the builtin
+    /// model's files are deleted, so "active" would point at a dead server.
+    pub async fn clear_active(&self) -> Result<(), LlmError> {
+        // Clear runtime cache when switching
+        self.runtime_cache.clear();
+
+        // Update storage
+        self.storage
+            .clear_active_backend()
+            .map_err(|e| LlmError::InvalidInput(e.to_string()))?;
+
+        // Update in-memory state
+        let mut active_id = self.active_id.write().map_err(|_| {
+            LlmError::InvalidInput("Failed to acquire active_id write lock".to_string())
+        })?;
+        *active_id = None;
+
+        Ok(())
+    }
+
     /// Add or update an instance
     pub async fn upsert_instance(&self, instance: LlmBackendInstance) -> Result<(), LlmError> {
         // Validate
@@ -643,6 +684,24 @@ impl LlmBackendInstanceManager {
         self.health_cache.remove(id);
 
         Ok(())
+    }
+
+    /// Remove an instance even when it is the ACTIVE backend (clearing the
+    /// active pointer first). For teardown paths where the backing model is
+    /// going away — `remove_instance` refuses to delete the active backend,
+    /// which used to leave an orphaned builtin instance (still listed and
+    /// selectable in the chat picker) after the model files were deleted.
+    pub async fn force_remove_instance(&self, id: &str) -> Result<(), LlmError> {
+        let is_active = {
+            let active_id = self.active_id.read().map_err(|_| {
+                LlmError::InvalidInput("Failed to acquire active_id read lock".to_string())
+            })?;
+            active_id.as_ref().map(|a| a == id).unwrap_or(false)
+        };
+        if is_active {
+            self.clear_active().await?;
+        }
+        self.remove_instance(id).await
     }
 
     /// List all instances
@@ -760,8 +819,19 @@ impl LlmBackendInstanceManager {
             };
 
             if let Some(caps) = runtime.detect_capabilities().await {
+                // /props n_ctx is the server's own per-request truth —
+                // report it VERBATIM for builtin and custom backends alike.
+                // The builtin spawn defaults to one slot, so this IS the
+                // window; when HERAMIND_BUILTIN_LLM_PARALLEL raises the slot
+                // count (or omits the flag for upstream's 4), concurrent
+                // requests share the unified pool and an over-commit
+                // degrades through the context-overflow retry ladder —
+                // platform turns are serialized anyway (one UI turn,
+                // extraction defers). A divide-by-slots budget here used to
+                // silently shrink the window 4× (the 8K-wedge class).
+                let effective_ctx = caps.max_context;
                 let changed = instance.capabilities.supports_multimodal != caps.supports_multimodal
-                    || instance.capabilities.max_context != caps.max_context
+                    || instance.capabilities.max_context != effective_ctx
                     || instance.capabilities.supports_tools != caps.supports_tools;
                 if changed {
                     tracing::info!(
@@ -770,14 +840,14 @@ impl LlmBackendInstanceManager {
                         old_multimodal = instance.capabilities.supports_multimodal,
                         new_multimodal = caps.supports_multimodal,
                         old_ctx = instance.capabilities.max_context,
-                        new_ctx = caps.max_context,
+                        new_ctx = effective_ctx,
                         "Startup: updated llama.cpp capabilities from /props"
                     );
                     let mut updated = instance.clone();
                     updated.capabilities.supports_multimodal = caps.supports_multimodal;
                     updated.capabilities.supports_thinking = caps.supports_thinking;
                     updated.capabilities.supports_tools = caps.supports_tools;
-                    updated.capabilities.max_context = caps.max_context;
+                    updated.capabilities.max_context = effective_ctx;
                     if let Err(e) = self.storage.save_instance(&updated) {
                         tracing::warn!(
                             error = %e,
@@ -1359,6 +1429,19 @@ impl LlmBackendInstanceManager {
 /// Global singleton for the instance manager
 static INSTANCE_MANAGER: OnceLock<RwLock<Option<Arc<LlmBackendInstanceManager>>>> = OnceLock::new();
 
+/// Read a per-backend timeout (seconds) from an environment variable.
+///
+/// Single source for runtime construction timeouts. The agent-side copy of
+/// this logic lived in `ai_agent/executor/llm_runtime.rs` and was removed
+/// when the factories unified (M0-2) — new producers must not reintroduce
+/// per-site timeout parsing.
+fn env_timeout_secs(env_var: &str, default: u64) -> u64 {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 /// Get or create the global instance manager
 pub fn get_instance_manager() -> Result<Arc<LlmBackendInstanceManager>, LlmError> {
     // Ensure the RwLock is initialized (only once)
@@ -1457,11 +1540,18 @@ mod tests {
         use heramind_storage::{BackendCapabilities, LlmBackendInstance, LlmBackendType};
 
         let stale_text_model = LlmBackendInstance {
-            id: "test-deepseek".to_string(),
-            name: "DeepSeek (stale)".to_string(),
-            backend_type: LlmBackendType::DeepSeek,
-            endpoint: Some("https://api.deepseek.com".to_string()),
-            model: "deepseek-v4-flash".to_string(),
+            id: "test-stale-text-only".to_string(),
+            name: "Stale text-only pin".to_string(),
+            backend_type: LlmBackendType::OpenAi,
+            endpoint: Some("https://api.openai.com".to_string()),
+            // gpt-3.5-turbo: frozen-in-time model, text-only in every
+            // registry snapshot to date. The OLD pin (deepseek-chat, moved
+            // from deepseek-v4-flash) broke twice on upstream refreshes
+            // granting vision — the test now derives its expectation from
+            // the registry itself, so data changes can no longer break it
+            // (the strict refresh-to-false path stays covered while the
+            // data says text-only, which is the durable case for 3.5).
+            model: "gpt-3.5-turbo".to_string(),
             api_key: Some("sk-test".to_string()),
             is_active: true,
             is_builtin: false,
@@ -1474,7 +1564,8 @@ mod tests {
             thinking_effort: None,
             capabilities: BackendCapabilities {
                 supports_streaming: true,
-                // Stale: deepseek-v4-flash is text-only but DB says true.
+                // Stale on purpose: DB says multimodal, the layered
+                // detection must correct it.
                 supports_multimodal: true,
                 multimodal_user_override: None,
                 multimodal_source: None,
@@ -1486,12 +1577,21 @@ mod tests {
             updated_at: 0,
         };
 
+        let expected = detect_vision_capability(&stale_text_model.model);
         let refreshed = ensure_instance_capabilities(stale_text_model);
-        assert!(
-            !refreshed.capabilities.supports_multimodal,
-            "deepseek-v4-flash is a text-only model; stale supports_multimodal=true must be \
-             refreshed to false so the agent path does not ship image parts to a text API"
+        assert_eq!(
+            refreshed.capabilities.supports_multimodal, expected,
+            "refresh must converge to the layered detection's own truth for the pinned model"
         );
+        if !expected {
+            // The regression path this test exists for: a stale
+            // supports_multimodal=true must be DOWNGRADED so the agent path
+            // does not ship image parts to a text API.
+            assert!(
+                !refreshed.capabilities.supports_multimodal,
+                "stale supports_multimodal=true must refresh to false for a text-only pin"
+            );
+        }
     }
 
     /// User override must win over auto-detection even when the stored
@@ -1505,7 +1605,7 @@ mod tests {
             name: "DeepSeek (user override)".to_string(),
             backend_type: LlmBackendType::DeepSeek,
             endpoint: Some("https://api.deepseek.com".to_string()),
-            model: "deepseek-v4-flash".to_string(),
+            model: "deepseek-chat".to_string(),
             api_key: None,
             is_active: true,
             is_builtin: false,
@@ -1544,8 +1644,8 @@ mod tests {
     /// Open a throwaway store at a unique temp path. The store layer keeps a
     /// process-global singleton keyed by path, so distinct paths yield isolated
     /// databases — ":memory:" would be shared across tests and leak instances.
-    #[cfg(feature = "llamacpp")]
     fn test_store(tag: &str) -> Arc<LlmBackendStore> {
+        crate::prune_stale_temp_entries("heramind-test-", std::time::Duration::from_secs(3600));
         let path =
             std::env::temp_dir().join(format!("heramind-test-{}-{}.redb", tag, std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -1663,6 +1763,62 @@ mod tests {
         assert!(
             manager.get_active_instance().is_some(),
             "no active backend → auto-registered instance must be active"
+        );
+    }
+
+    // ==== force_remove_instance ====
+
+    #[tokio::test]
+    async fn test_remove_instance_refuses_active_backend() {
+        let manager = LlmBackendInstanceManager::new(test_store("rm-active-refused"));
+        manager
+            .upsert_instance(LlmBackendInstance::new(
+                "builtin-x".into(),
+                "Builtin".into(),
+                LlmBackendType::LlamaCpp,
+            ))
+            .await
+            .unwrap();
+        manager.set_active("builtin-x").await.unwrap();
+
+        let err = manager
+            .remove_instance("builtin-x")
+            .await
+            .expect_err("plain remove must refuse the active backend");
+        assert!(err.to_string().contains("active"));
+
+        assert!(
+            manager.get_instance("builtin-x").is_some(),
+            "refused remove must leave the instance in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_remove_instance_removes_active_backend() {
+        // Regression for the orphaned-builtin bug: deleting the builtin model
+        // while it was the active backend left the instance listed (and
+        // selectable in the chat picker) forever, because remove_instance's
+        // active-protection failure was swallowed by the delete handler.
+        let manager = LlmBackendInstanceManager::new(test_store("force-rm-active"));
+        manager
+            .upsert_instance(LlmBackendInstance::new(
+                "builtin-x".into(),
+                "Builtin".into(),
+                LlmBackendType::LlamaCpp,
+            ))
+            .await
+            .unwrap();
+        manager.set_active("builtin-x").await.unwrap();
+
+        manager.force_remove_instance("builtin-x").await.unwrap();
+
+        assert!(
+            manager.get_instance("builtin-x").is_none(),
+            "force remove must delete the instance even when active"
+        );
+        assert!(
+            manager.get_active_instance().is_none(),
+            "force remove must clear the active pointer"
         );
     }
 }

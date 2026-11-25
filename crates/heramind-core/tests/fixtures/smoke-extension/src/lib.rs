@@ -90,6 +90,10 @@ impl Extension for NativeCapabilitySmokeExtension {
                     "value": "ok",
                 })],
                 parameter_groups: Vec::new(),
+                ai_exposed: true,
+                effect: Default::default(),
+                replay_safety: Default::default(),
+                execution: Default::default(),
             },
             ExtensionCommand {
                 name: "get_last_event_result".to_string(),
@@ -101,6 +105,10 @@ impl Extension for NativeCapabilitySmokeExtension {
                 fixed_values: std::collections::HashMap::new(),
                 samples: vec![json!({})],
                 parameter_groups: Vec::new(),
+                ai_exposed: true,
+                effect: Default::default(),
+                replay_safety: Default::default(),
+                execution: Default::default(),
             },
         ]
     }

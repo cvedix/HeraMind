@@ -54,14 +54,35 @@ echo "spawned: dir=$_script_dir args=$*" >> /tmp/fake-spawns.log
 if [ -f "$_script_dir/FAST_FAIL" ]; then
     exit 1
 fi
+# Vision-chain markers (mmproj e2e): record whether the spawn carried
+# --mmproj (the test asserts the flag reached argv), and switch /props
+# modalities.vision on when the test planted REPORT_VISION.
+case "$*" in
+    *--mmproj*) printf "%s\n" "$*" > "$_script_dir/MMPROJ_ARGS" ;;
+esac
+if [ -f "$_script_dir/REPORT_VISION" ]; then
+    export FAKE_VISION=1
+fi
+# "$@" is forwarded so the python payload can bind the REAL --port from the
+# spawn argv — one binary then serves any port (the dual-model tests spawn
+# the main server AND the vision companion through the same script).
 exec python3 -c '
-import http.server, socketserver, json, sys
+import http.server, socketserver, json, sys, os
+port = {port}
+args = sys.argv[1:]
+for i in range(len(args)-1):
+    if args[i] == "--port":
+        port = int(args[i+1])
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             body = b"ok"
         elif self.path == "/props":
-            body = json.dumps({{"model_path": "{model}", "n_ctx": 32768}}).encode()
+            # slot_n_ctx + slot count: the instance stamps the PER-SLOT
+            # share (32768 / 2 = 16384), not the raw server n_ctx.
+            # modalities.vision mirrors what a projector-mounted llama-server
+            # reports (off unless the test planted REPORT_VISION).
+            body = json.dumps({{"model_path": "{model}", "n_ctx": 32768, "total_slots": 2, "modalities": {{"vision": os.environ.get("FAKE_VISION") == "1"}}}}).encode()
         else:
             self.send_error(404); return
         self.send_response(200)
@@ -80,9 +101,9 @@ class H(http.server.BaseHTTPRequestHandler):
 # dies instantly. That exact bug masqueraded as sandbox flakiness for
 # days — tests failed fast with "server unhealthy" while the same payload
 # worked when run by hand with double quotes.
-with socketserver.TCPServer(("127.0.0.1", {port}), H) as httpd:
+with socketserver.TCPServer(("127.0.0.1", port), H) as httpd:
     httpd.serve_forever()
-'
+' "$@"
 "#,
             port = server_port,
             model = props_model_path,
@@ -204,6 +225,7 @@ fn pick_free_port() -> u16 {
 /// (discovered via PATH) → health passes → is_alive passes (real spawned
 /// child) → instance registered with the REAL spawn port and the registry's
 /// default ctx, and set active (no other backend was).
+#[serial_test::serial]
 #[tokio::test]
 async fn bootstrap_full_chain_spawns_registers_activates() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -242,9 +264,15 @@ async fn bootstrap_full_chain_spawns_registers_activates() {
     );
     assert!(inst.is_builtin);
     assert_eq!(inst.model, "minicpm5-2b");
+    // The instance stamps the healthy server's /props n_ctx VERBATIM: the
+    // fake reports n_ctx=32768 with total_slots=2, and that value IS the
+    // server's per-request truth. (1.2.1 removed the divide-by-slots
+    // budget — on an auto-slotted server it silently shrank the window 4x
+    // and, since /props n_ctx already reflects partitioning, it was wrong
+    // for unified-KV servers anyway.)
     assert_eq!(
         inst.capabilities.max_context, 32768,
-        "registry default_ctx (32K) must land on the instance"
+        "server /props n_ctx must land on the instance verbatim"
     );
     assert!(
         fx.manager.get_active_instance().is_some(),
@@ -345,6 +373,7 @@ async fn port_squatted_by_foreign_server_is_rejected() {
 
 /// Stale instance record + healthy server → idempotent short-circuit, and
 /// the refresh stamps effective_ctx (override honored), not the bare default.
+#[serial_test::serial]
 #[tokio::test]
 async fn already_running_refresh_honors_ctx_override() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -395,11 +424,325 @@ async fn already_running_refresh_honors_ctx_override() {
         "healthy + instance record must short-circuit, got {outcome:?}"
     );
     let inst = fx.manager.get_instance(BUILTIN_INSTANCE_ID).unwrap();
-    assert_eq!(
-        inst.capabilities.max_context, 65536,
-        "refresh must stamp cfg.effective_ctx (override), not the bare default"
+    // Contract: the refresh stamps the OVERRIDE run through the host-RAM
+    // guard — not the bare per-model default. Assert against the guard's own
+    // answer: on a memory-tight host BOTH the override and the bare default
+    // clamp to the 8192 floor, so a hard-coded 65536 made this test flap
+    // with whatever else the machine was running.
+    let def = heramind_core::builtin_llm::manifest::model_def("minicpm5-2b")
+        .expect("minicpm5-2b is a registry model");
+    let expected = heramind_api::builtin_llm::handlers::guarded_ctx_quiet(
+        &cfg,
+        port,
+        def.default_ctx,
+        Some(def),
     );
+    assert_eq!(
+        inst.capabilities.max_context, expected,
+        "refresh must stamp the guarded effective ctx (override 65536, RAM-capped), \
+         not the bare default; expected {expected}"
+    );
+    // The stale 4096 must never survive the refresh either.
+    assert_ne!(inst.capabilities.max_context, 4096);
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Vision chain: a manifest recording an mmproj (file present) makes the
+/// spawn carry `--mmproj`, and the instance is stamped
+/// `supports_multimodal` from the server's /props modalities — so the chat
+/// picker and image-upload gate light up without waiting for a chat round.
+#[serial_test::serial]
+#[tokio::test]
+async fn bootstrap_spawns_with_mmproj_and_stamps_vision() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    require_fake_server!();
+    let port = pick_free_port();
+    let model_path = "/tmp/x/gemma-4-E2B_q4_0-it.qat.gguf";
+    let fx = Fixture::new(port, model_path);
+    // The fake /props reports modalities.vision=true only when planted.
+    std::fs::write(fx.bin_dir.path().join("REPORT_VISION"), "1").unwrap();
+    fx.seed_model(
+        "gemma4-e2b",
+        "gemma-4-E2B_q4_0-it.qat.gguf",
+        "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634",
+    );
+    // Projector file + a manifest that records it (seed_model's manifest
+    // has no mmproj — overwrite with the vision shape).
+    let mdir = fx.data_dir.path().join("models").join("gemma4-e2b");
+    std::fs::write(
+        mdir.join("gemma-4-E2B-it-mmproj.gguf"),
+        b"fake-mmproj-bytes",
+    )
+    .unwrap();
+    let manifest = serde_json::json!({
+        "id": "gemma4-e2b", "version": "1.0",
+        "file_name": "gemma-4-E2B_q4_0-it.qat.gguf",
+        "sha256": "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634",
+        "quant": "qat_q4_0",
+        "mmproj": {"file_name": "gemma-4-E2B-it-mmproj.gguf",
+                    "sha256": "021059cce659fe7f9170d5599761d7bbaf644b798dab9503aca30dc43e6beb14"}
+    });
+    std::fs::write(
+        mdir.join("manifest.json"),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let saved_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fx.bin_dir.path().display(), saved_path),
+    );
+    let outcome = bootstrap(fx.data_dir.path(), &fx.cfg(), &fx.manager).await;
+    std::env::set_var("PATH", &saved_path);
+
+    assert!(
+        matches!(outcome, BootstrapOutcome::ServerReady { .. }),
+        "expected ServerReady, got {outcome:?}"
+    );
+
+    // argv check: the projector flag AND file reached llama-server.
+    let marker = fx.bin_dir.path().join("MMPROJ_ARGS");
+    assert!(
+        marker.exists(),
+        "spawn must carry --mmproj when the manifest records a present projector"
+    );
+    let args = std::fs::read_to_string(&marker).unwrap();
+    assert!(args.contains("--mmproj"), "args: {args}");
+    assert!(
+        args.contains("gemma-4-E2B-it-mmproj.gguf"),
+        "projector path must be the argv value, args: {args}"
+    );
+
+    let inst = fx
+        .manager
+        .get_instance(BUILTIN_INSTANCE_ID)
+        .expect("instance registered");
+    assert!(
+        inst.capabilities.supports_multimodal,
+        "/props modalities.vision must stamp the instance at spawn time"
+    );
+
+    heramind_api::builtin_llm::server::stop_all_llama_servers();
+}
+
+/// Manifest records a projector but the FILE is gone (partial delete /
+/// failed mmproj download) → the spawn degrades to text-only: ServerReady,
+/// no --mmproj on argv, and no vision capability stamped (the fake reports
+/// modalities.vision=true — /props is the authority, attachment is not).
+#[serial_test::serial]
+#[tokio::test]
+async fn missing_mmproj_file_degrades_to_text_only() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    require_fake_server!();
+    let port = pick_free_port();
+    let model_path = "/tmp/x/gemma-4-E2B_q4_0-it.qat.gguf";
+    let fx = Fixture::new(port, model_path);
+    // /props claims vision — the stamp must still be false because the
+    // projector never reached argv... the server LIES here on purpose:
+    // query_server_modalities_vision would stamp true. The degrade contract
+    // is therefore "no --mmproj flag", not "capability false" — a lying
+    // /props is exactly what the spawn-time probe trusts by design.
+    std::fs::write(fx.bin_dir.path().join("REPORT_VISION"), "1").unwrap();
+    fx.seed_model(
+        "gemma4-e2b",
+        "gemma-4-E2B_q4_0-it.qat.gguf",
+        "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634",
+    );
+    // Manifest records a projector whose file does NOT exist.
+    let mdir = fx.data_dir.path().join("models").join("gemma4-e2b");
+    let manifest = serde_json::json!({
+        "id": "gemma4-e2b", "version": "1.0",
+        "file_name": "gemma-4-E2B_q4_0-it.qat.gguf",
+        "sha256": "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634",
+        "quant": "qat_q4_0",
+        "mmproj": {"file_name": "gemma-4-E2B-it-mmproj.gguf", "sha256": "021059cc"}
+    });
+    std::fs::write(
+        mdir.join("manifest.json"),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let saved_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fx.bin_dir.path().display(), saved_path),
+    );
+    let outcome = bootstrap(fx.data_dir.path(), &fx.cfg(), &fx.manager).await;
+    std::env::set_var("PATH", &saved_path);
+
+    assert!(
+        matches!(outcome, BootstrapOutcome::ServerReady { .. }),
+        "missing projector must degrade, not fail: {outcome:?}"
+    );
+    assert!(
+        !fx.bin_dir.path().join("MMPROJ_ARGS").exists(),
+        "text-only degrade must not pass --mmproj"
+    );
+
+    heramind_api::builtin_llm::server::stop_all_llama_servers();
+}
+
+/// Seed the registry's vision-companion model (minicpm-v-4.7-1b, role=vlm)
+/// with its projector on disk — the dual-model tests' companion payload.
+fn seed_companion(fx: &Fixture) {
+    fx.seed_model(
+        "minicpm-v-4.7-1b",
+        "minicpm-v-4.7-1b-q4_k_m.gguf",
+        "f18f594747e5317ab490cff9c06339c9cfb89acbe2f02ebc48a4e167bc23576d",
+    );
+    let cdir = fx.data_dir.path().join("models").join("minicpm-v-4.7-1b");
+    std::fs::write(
+        cdir.join("minicpm-v-4.7-1b-mmproj-f16-4x.gguf"),
+        b"fake-mmproj-bytes",
+    )
+    .unwrap();
+    // seed_model's manifest has no mmproj — rewrite with the vision shape.
+    let manifest = serde_json::json!({
+        "id": "minicpm-v-4.7-1b", "version": "1.0",
+        "file_name": "minicpm-v-4.7-1b-q4_k_m.gguf",
+        "sha256": "f18f594747e5317ab490cff9c06339c9cfb89acbe2f02ebc48a4e167bc23576d",
+        "quant": "q4_k_m",
+        "mmproj": {"file_name": "minicpm-v-4.7-1b-mmproj-f16-4x.gguf",
+                    "sha256": "1e0ab439877e6896ded59ff24cdd242fdffb236394f6fc4a5b019cbd60bb5f4a"}
+    });
+    std::fs::write(
+        cdir.join("manifest.json"),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Dual-model bootstrap: main text model AND the vision companion come up on
+/// their own ports; the companion instance is registered with vision
+/// capabilities but is NEVER the active chat backend.
+#[serial_test::serial]
+#[tokio::test]
+async fn bootstrap_spawns_vision_companion_alongside_main() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    require_fake_server!();
+    let main_port = pick_free_port();
+    let vlm_port = pick_free_port();
+    let fx = Fixture::new(main_port, "/tmp/x/minicpm5-2b-q4_k_m.gguf");
+    // /props reports vision for both spawns (same script + env) — fine: the
+    // assertions below only read the COMPANION's capability stamp.
+    std::fs::write(fx.bin_dir.path().join("REPORT_VISION"), "1").unwrap();
+    fx.seed_model(
+        "minicpm5-2b",
+        "minicpm5-2b-q4_k_m.gguf",
+        "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd",
+    );
+    seed_companion(&fx);
+
+    let mut cfg = fx.cfg();
+    cfg.vlm_port = vlm_port;
+
+    let saved_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fx.bin_dir.path().display(), saved_path),
+    );
+    let outcome = bootstrap(fx.data_dir.path(), &cfg, &fx.manager).await;
+    std::env::set_var("PATH", &saved_path);
+
+    assert!(
+        matches!(outcome, BootstrapOutcome::ServerReady { .. }),
+        "expected ServerReady, got {outcome:?}"
+    );
+
+    // Main first: active as usual.
+    let active_id = fx.manager.get_active_instance().map(|i| i.id);
+    assert_eq!(active_id.as_deref(), Some("builtin-lfm25-2.6b"));
+
+    // Companion: registered, vision-capable, describe-only, NEVER active.
+    let comp = fx
+        .manager
+        .get_instance("builtin-vlm-minicpm-v-4.7-1b")
+        .expect("companion instance registered");
+    assert!(
+        !comp.is_active,
+        "companion must never be the active backend"
+    );
+    assert!(comp.is_builtin);
+    assert!(
+        comp.capabilities.supports_multimodal,
+        "vision capability stamped"
+    );
+    assert!(
+        !comp.capabilities.supports_tools,
+        "companion is describe-only"
+    );
+    assert_eq!(
+        comp.endpoint.as_deref(),
+        Some(format!("http://127.0.0.1:{}", vlm_port).as_str())
+    );
+
+    // argv proof: the projector AND the companion model reached llama-server
+    // on the companion port (marker content carries the full argv).
+    let marker = fx.bin_dir.path().join("MMPROJ_ARGS");
+    assert!(marker.exists(), "companion spawn must carry --mmproj");
+    let args = std::fs::read_to_string(&marker).unwrap();
+    assert!(args.contains("--mmproj"), "args: {args}");
+    assert!(
+        args.contains("minicpm-v-4.7-1b"),
+        "companion model in argv: {args}"
+    );
+    assert!(
+        args.contains(&format!("--port {vlm_port}")),
+        "companion on its own port: {args}"
+    );
+
+    heramind_api::builtin_llm::server::stop_all_llama_servers();
+}
+
+/// HERAMIND_BUILTIN_VLM=off (cfg.vlm_enabled=false): the companion is skipped
+/// entirely — no instance, no second server — and the MAIN model's outcome
+/// is untouched.
+#[serial_test::serial]
+#[tokio::test]
+async fn vlm_disabled_skips_companion_main_unaffected() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    require_fake_server!();
+    let main_port = pick_free_port();
+    let vlm_port = pick_free_port();
+    let fx = Fixture::new(main_port, "/tmp/x/minicpm5-2b-q4_k_m.gguf");
+    fx.seed_model(
+        "minicpm5-2b",
+        "minicpm5-2b-q4_k_m.gguf",
+        "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd",
+    );
+    seed_companion(&fx);
+
+    let mut cfg = fx.cfg();
+    cfg.vlm_port = vlm_port;
+    cfg.vlm_enabled = false;
+
+    let saved_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", fx.bin_dir.path().display(), saved_path),
+    );
+    let outcome = bootstrap(fx.data_dir.path(), &cfg, &fx.manager).await;
+    std::env::set_var("PATH", &saved_path);
+
+    assert!(
+        matches!(outcome, BootstrapOutcome::ServerReady { .. }),
+        "main model must be unaffected: {outcome:?}"
+    );
+    assert!(
+        fx.manager
+            .list_instances()
+            .iter()
+            .all(|i| i.id != "builtin-vlm-minicpm-v-4.7-1b"),
+        "disabled companion must not register an instance"
+    );
+    assert!(
+        !heramind_api::builtin_llm::server::health_check(vlm_port).await,
+        "no second server may run with the feature off"
+    );
+
+    heramind_api::builtin_llm::server::stop_all_llama_servers();
 }

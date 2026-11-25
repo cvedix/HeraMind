@@ -118,7 +118,8 @@ pub mod mock_llm {
     use futures::Stream;
 
     use heramind_core::llm::backend::{
-        BackendId, FinishReason, LlmError, LlmInput, LlmOutput, LlmRuntime, StreamChunk, TokenUsage,
+        BackendCapabilities, BackendId, FinishReason, LlmError, LlmInput, LlmOutput, LlmRuntime,
+        StreamChunk, TokenUsage,
     };
 
     /// One scripted LLM response. Returned in order, one per `generate` /
@@ -138,6 +139,11 @@ pub mod mock_llm {
         /// text/tools. Stored as a `String` (not `LlmError`) so `MockResponse`
         /// stays `Clone` — `LlmError` itself is not `Clone`.
         pub error_msg: Option<String>,
+        /// Append the serialized `tool_calls` to `text`, exactly as every real
+        /// backend does (ollama.rs / openai runtime.rs / llamacpp.rs — no
+        /// separator). Off by default so scripted-text assertions keep their
+        /// shape; turn it on wherever a test must see what production sees.
+        pub append_tool_calls_to_text: bool,
     }
 
     impl MockResponse {
@@ -148,6 +154,7 @@ pub mod mock_llm {
                 thinking: None,
                 tool_calls: vec![],
                 error_msg: None,
+                append_tool_calls_to_text: false,
             }
         }
 
@@ -158,12 +165,20 @@ pub mod mock_llm {
                 thinking: None,
                 tool_calls: vec![serde_json::json!({ "name": name, "arguments": arguments })],
                 error_msg: None,
+                append_tool_calls_to_text: false,
             }
         }
 
         /// Attach assistant text to a tool-call response.
         pub fn with_text(mut self, s: impl Into<String>) -> Self {
             self.text = s.into();
+            self
+        }
+
+        /// Give this tool-call response the text shape of a real backend: the
+        /// serialized tool-call array is appended to the text.
+        pub fn with_backend_text_shape(mut self) -> Self {
+            self.append_tool_calls_to_text = true;
             self
         }
 
@@ -180,6 +195,7 @@ pub mod mock_llm {
                 thinking: None,
                 tool_calls: vec![],
                 error_msg: Some(msg.into()),
+                append_tool_calls_to_text: false,
             }
         }
     }
@@ -201,6 +217,14 @@ pub mod mock_llm {
     #[derive(Clone)]
     pub struct MockLlmRuntime {
         state: Arc<Mutex<State>>,
+        /// Advertised via `capabilities()` — the default (false) keeps the
+        /// legacy text-only analysis paths under test; tool-loop tests turn
+        /// it on so the executor activates tool mode.
+        function_calling: bool,
+        /// Advertised via `capabilities().supports_images` / `multimodal`.
+        /// Default false; multimodal agent tests turn it on so the executor
+        /// strips the vision tool and injects inline-vision guidance.
+        supports_images: bool,
     }
 
     struct State {
@@ -209,6 +233,9 @@ pub mod mock_llm {
         call_count: usize,
         msg_counts: Vec<usize>,
         max_context: usize,
+        captured_messages: Vec<serde_json::Value>,
+        /// Tool names advertised on each call, in call order.
+        captured_tools: Vec<Vec<String>>,
     }
 
     impl MockLlmRuntime {
@@ -227,9 +254,36 @@ pub mod mock_llm {
                     default,
                     call_count: 0,
                     msg_counts: Vec::new(),
+                    captured_messages: Vec::new(),
+                    captured_tools: Vec::new(),
                     max_context: 4096,
                 })),
+                function_calling: false,
+                supports_images: false,
             }
+        }
+
+        /// Advertise function-calling support so the executor takes the
+        /// tool-calling path (`capabilities().function_calling`).
+        pub fn with_function_calling(mut self) -> Self {
+            self.function_calling = true;
+            self
+        }
+
+        /// Advertise multimodal / vision support so scheduled agents strip
+        /// the `vision` tool and inject inline-image guidance.
+        pub fn with_supports_images(mut self) -> Self {
+            self.supports_images = true;
+            self
+        }
+
+        /// Advertise a specific context window via `capabilities()` — lets
+        /// tests exercise context-budget behavior at realistic sizes (e.g.
+        /// 32768 for the cached read-back budget integration tests; the
+        /// 4096 default sends history assembly down its aggressive path).
+        pub fn with_max_context(self, max_context: usize) -> Self {
+            self.state.lock().unwrap().max_context = max_context;
+            self
         }
 
         /// Number of times any generation method was invoked.
@@ -243,6 +297,18 @@ pub mod mock_llm {
             self.state.lock().unwrap().msg_counts.clone()
         }
 
+        /// The messages of every call, serialized — lets a test assert on
+        /// multimodal parts (e.g. that an image actually reached the model).
+        pub fn captured_messages(&self) -> Vec<serde_json::Value> {
+            self.state.lock().unwrap().captured_messages.clone()
+        }
+
+        /// Tool names advertised on each call (`LlmInput::tools`), in call
+        /// order — lets a test assert what the model was offered.
+        pub fn captured_tool_names(&self) -> Vec<Vec<String>> {
+            self.state.lock().unwrap().captured_tools.clone()
+        }
+
         /// Pop the next scripted response (or the default), recording the call.
         fn next_response(&self, msg_count: usize) -> MockResponse {
             let mut st = self.state.lock().unwrap();
@@ -253,8 +319,17 @@ pub mod mock_llm {
 
         fn to_output(resp: MockResponse) -> LlmOutput {
             let has_tools = !resp.tool_calls.is_empty();
+            let text = if has_tools && resp.append_tool_calls_to_text {
+                format!(
+                    "{}{}",
+                    resp.text,
+                    serde_json::to_string(&resp.tool_calls).unwrap_or_default()
+                )
+            } else {
+                resp.text
+            };
             LlmOutput {
-                text: resp.text,
+                text,
                 finish_reason: if has_tools {
                     FinishReason::ToolCalls
                 } else {
@@ -281,8 +356,40 @@ pub mod mock_llm {
             "mock-model"
         }
 
+        fn capabilities(&self) -> BackendCapabilities {
+            let modalities = if self.supports_images {
+                vec!["text".to_string(), "image".to_string()]
+            } else {
+                vec!["text".to_string()]
+            };
+            BackendCapabilities {
+                streaming: true,
+                multimodal: self.supports_images,
+                function_calling: self.function_calling,
+                multiple_models: false,
+                max_context: Some(self.state.lock().unwrap().max_context),
+                modalities,
+                reasoning: Default::default(),
+                supports_images: self.supports_images,
+                thinking_display: false,
+            }
+        }
+
         async fn generate(&self, input: LlmInput) -> Result<LlmOutput, LlmError> {
             let msg_count = input.messages.len();
+            {
+                let mut st = self.state.lock().unwrap();
+                st.captured_messages
+                    .push(serde_json::to_value(&input.messages).unwrap_or_default());
+                st.captured_tools.push(
+                    input
+                        .tools
+                        .iter()
+                        .flatten()
+                        .map(|tool| tool.name.clone())
+                        .collect(),
+                );
+            }
             let resp = self.next_response(msg_count);
             if let Some(msg) = resp.error_msg {
                 return Err(LlmError::Network(msg));
@@ -295,6 +402,22 @@ pub mod mock_llm {
             input: LlmInput,
         ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>, LlmError> {
             let msg_count = input.messages.len();
+            {
+                // Same capture as `generate` — the streaming path is the
+                // chat default, and without it captured_messages() only
+                // saw non-streaming calls.
+                let mut st = self.state.lock().unwrap();
+                st.captured_messages
+                    .push(serde_json::to_value(&input.messages).unwrap_or_default());
+                st.captured_tools.push(
+                    input
+                        .tools
+                        .iter()
+                        .flatten()
+                        .map(|tool| tool.name.clone())
+                        .collect(),
+                );
+            }
             let resp = self.next_response(msg_count);
             if let Some(msg) = resp.error_msg {
                 return Err(LlmError::Network(msg));

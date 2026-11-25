@@ -10,11 +10,25 @@
     "moreAlerts": "+{{count}} more alerts"
   },
   "messages": {
+    "chain": {
+      "title": "Why this fired",
+      "description": "The rule execution behind this alert, and what it acted on",
+      "rule": "Rule",
+      "evidence": "Evidence",
+      "firedAt": "Fired",
+      "actions": "Actions",
+      "noActions": "none",
+      "expired": "This alert points at a rule execution whose record has expired — rule history is kept for 30 days.",
+      "trackRecord": "Track record",
+      "dismissedOf": "{{fp}} of {{total}} alerts dismissed as false",
+      "thresholdAdvice": "this rule probably fires too easily — consider tightening its condition"
+    },
     "title": "Messages",
     "description": "Notifications, channels, and IM sessions",
     "tabs": {
       "messages": "Messages",
-      "channels": "Channels"
+      "channels": "Channels",
+      "im": "IM Sessions"
     },
     "create": "Create Message",
     "createTitle": "Create New Message",
@@ -29,6 +43,9 @@
     "resolve": "Resolve",
     "archive": "Archive",
     "acknowledge": "Acknowledge",
+    "markFalsePositive": "Not a real alert",
+    "falsePositiveSuccess": "Marked as a false positive",
+    "falsePositiveError": "Failed",
     "source": "Source",
     "filter": {
       "title": "Filter",
@@ -109,7 +126,7 @@
       "emailFrom": "From Address",
       "empty": {
         "title": "No Channels",
-        "description": "Create a notification channel to send messages"
+        "description": "Alerts always land here. Add a channel to also send them somewhere you will see sooner."
       },
       "webhookUrl": "Webhook URL",
       "webhookUrlPlaceholder": "https://example.com/webhook",
@@ -157,6 +174,8 @@
       "typeSlackDesc": "Incoming webhook",
       "typeFeishu": "Feishu",
       "typeFeishuDesc": "Custom bot",
+      "howToGet": "How do I get these values? → official guide",
+      "pasteAddressHint": "Paste the whole webhook address shown on that page — we read the needed part out of it",
       "webhookConfig": "Webhook Configuration",
       "emailConfig": "Email Configuration",
       "botToken": "Bot Token",
@@ -242,7 +261,20 @@
     "messageDetails": "Message Details",
     "basicInfo": "Basic Info",
     "basicInfoDesc": "Basic channel information",
-    "metadataDesc": "Additional channel metadata"
+    "metadataDesc": "Additional channel metadata",
+    "im": {
+      "chatId": "Chat ID",
+      "boundAgent": "Agent",
+      "lastActive": "Last Active",
+      "reset": "Reset",
+      "resetSuccess": "Session reset",
+      "confirmReset": "Reset the binding for this session?",
+      "goToSettings": "Configure IM bridge",
+      "noBridge": "No IM Bridge Configured",
+      "noBridgeDesc": "Configure an IM bridge in Settings to start managing chat sessions.",
+      "noSessions": "No Sessions",
+      "noSessionsDesc": "No active chat sessions yet. Start a chat with the bot to create one."
+    }
   },
   "connection": {
     "connected": "Connected",
@@ -250,6 +282,7 @@
   },
   "nav": {
     "dashboard": "Chat",
+    "dashboardShort": "Dashboard",
     "visual-dashboard": "Visual Dashboard",
     "devices": "Devices",
     "automation": "Automation",
@@ -257,7 +290,8 @@
     "data": "Data Explorer",
     "messages": "Messages",
     "extensions": "Extensions",
-    "settings": "Settings"
+    "settings": "Settings",
+    "mobilePrimary": "Primary navigation"
   },
   "add": "Add",
   "edit": "Edit",
@@ -359,13 +393,7 @@
       "evening": "Good evening",
       "night": "Good evening"
     },
-    "tagline": "{{appName}} Smart IoT Assistant, at your service",
-    "stats": {
-      "devicesOnline": "{{online}}/{{total}} Devices Online",
-      "activeRules": "{{count}} Active Rules",
-      "pendingAlerts": "{{count}} Pending Alerts",
-      "pendingAlertsShort": "Alerts"
-    },
+    "askLine": "{{greeting}}. Just ask me if you need anything.",
     "aiSuggestion": "AI Suggestions",
     "suggestions": {
       "pendingAlerts": "{{count}} alert(s) pending",
@@ -373,11 +401,20 @@
       "noRules": "No automation rules enabled yet"
     },
     "suggestionPrompts": {
-      "title": "Try these questions:",
       "checkDevices": "Check current online device status",
       "createRule": "Help me create a temperature monitoring rule",
       "checkAlerts": "What alerts need attention?",
-      "showLogs": "Show today's device activity log"
+      "showLogs": "Show today's device activity log",
+      "createAgent": "Create a scheduled monitoring agent for me",
+      "checkAgents": "What are my AI agents doing?",
+      "addLlmBackend": "Help me add an LLM backend",
+      "createVirtualDevice": "Create a virtual device with simulated data"
+    },
+    "mobileSuggestions": {
+      "devices": "Devices",
+      "alerts": "Alerts",
+      "rules": "Rules",
+      "agent": "AI Agent"
     },
     "quickActions": {
       "devices": "Devices",
@@ -474,8 +511,10 @@
   "session": {
     "history": "Session History",
     "sessions": "Sessions",
+    "recent": "Recent chats",
+    "openDrawer": "Open menu",
     "newChat": "New Chat",
-    "search": "Search...",
+    "search": "Search chats...",
     "noSessions": "No sessions yet",
     "noMatch": "No matching sessions",
     "messages": "{{count}} messages",
@@ -483,10 +522,8 @@
     "deleteTitle": "Delete Session",
     "deleteDescription": "Are you sure you want to delete this session? This action cannot be undone.",
     "sessionDeleted": "Session deleted",
-    "resumeResponseTitle": "Resume incomplete response?",
-    "resumeResponseDesc": "Detected an in-progress response from previous disconnection",
-    "discard": "Discard",
-    "resume": "Resume"
+    "generating": "Generating",
+    "rename": "Rename"
   },
   "language": {
     "switchToChinese": "Switch to Chinese",
@@ -574,7 +611,10 @@
     "toggle": "Start / Stop",
     "nameRequired": "Name Required",
     "urlRequired": "Url Required",
-    "topicRequired": "Topic is required"
+    "topicRequired": "Topic is required",
+    "source": "Source",
+    "payload": "Payload",
+    "searchTargets": "Search push targets..."
   },
   "active": "Active",
   "test": "Test Connection",
@@ -737,8 +777,11 @@
     "retry": "Retry connection"
   },
   "system": {
-    "pageTitle": "System",
+    "pageTitle": "Workspace",
     "menu": "Menu",
+    "openWorkspace": "Workspace",
+    "moreEntries": "All destinations",
+    "workspaceHint": "Devices, agents, dashboards, and settings",
     "sectionBusiness": "Business",
     "sectionSystem": "System",
     "sectionAbout": "About",
@@ -747,7 +790,17 @@
     "about": "Help / About",
     "version": "v{{version}}",
     "back": "Back",
+    "localInstance": "Local instance",
+    "connected": "Connected",
+    "disconnected": "Disconnected",
+    "mobileSummary": "{{online}} / {{total}} devices online · {{alerts}} unresolved alerts",
+    "extensionPage": "Extension page",
+    "preferences": "Preferences and account",
+    "account": "Account",
     "cards": {
+      "devices": "Devices and device types",
+      "agents": "AI agents and capabilities",
+      "dashboard": "Visual dashboards",
       "automation": "Transforms and data push",
       "data": "Telemetry data explorer",
       "messages": "Notification center",
@@ -795,5 +848,11 @@
     "ownCta": "Configure",
     "downloadingTitle": "Built-in model downloading",
     "downloading": "DL"
-  }
+  },
+  "opacity": "Opacity",
+  "size": "Size",
+  "saveChanges": "Save Changes",
+  "priority": "Priority",
+  "send": "Send",
+  "selectPlaceholder": "Select..."
 }

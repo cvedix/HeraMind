@@ -118,7 +118,7 @@ pub struct ExtensionPackageManifest {
     #[serde(default)]
     pub permissions: Vec<String>,
 
-    /// Extension type (native, wasm, frontend-only)
+    /// Extension type (native, frontend-only)
     #[serde(default = "default_extension_type")]
     #[serde(rename = "type")]
     pub extension_type: String,
@@ -156,6 +156,41 @@ pub struct FrontendConfig {
     /// Dashboard components provided by this extension
     #[serde(default)]
     pub components: Vec<DashboardComponentDef>,
+    /// Standalone pages contributed into the main app (routes + nav).
+    /// Rendered by the core web via ExtensionPageHost.
+    #[serde(default)]
+    pub pages: Vec<ExtensionPageDef>,
+}
+
+/// A page contributed by an extension into the main application.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionPageDef {
+    /// Page type ID (unique per extension)
+    #[serde(rename = "type")]
+    pub page_type: String,
+    /// Display title (used as page heading fallback and nav tooltip)
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    /// Route path inside the main app, e.g. "/devices/wifi-onboarding"
+    pub route: String,
+    /// Nav placement: "main" appends to the primary group, a known section
+    /// id (e.g. "devices") inserts after that item. Empty = route only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nav_section: Option<String>,
+    /// Nav label (plain text; extensions may ship localized strings client-side)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nav_label: Option<String>,
+    /// Icon name from the lucide set (e.g. "wifi"); default puzzle
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Path to bundled JS file (relative to frontend/)
+    pub bundle_path: String,
+    /// Exported component name inside the bundle
+    pub export_name: String,
+    /// Global variable name for the bundle (script tag loading)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_name: Option<String>,
 }
 
 /// Intermediate type for deserializing frontend field that accepts both string and struct formats
@@ -175,6 +210,7 @@ impl FrontendField {
         match self {
             FrontendField::String(_) => FrontendConfig {
                 components: Vec::new(),
+                pages: Vec::new(),
             },
             FrontendField::Struct(config) => config,
         }
@@ -323,6 +359,15 @@ pub struct CommandDescriptor {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<serde_json::Value>,
+    /// Whether this command is exposed to the LLM as a tool (default true).
+    /// `false` hides it from `definitions_for_llm()` regardless of admin
+    /// toggles — the extension author's decision wins.
+    #[serde(default = "default_true", skip_serializing_if = "bool::clone")]
+    pub ai_exposed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Installation result
@@ -777,7 +822,9 @@ impl ExtensionPackage {
 
             for i in 0..archive.len() {
                 if let Ok(mut file) = archive.by_index(i) {
-                    let name = file.name().to_string();
+                    // zip 9: `name()` validates UTF-8 and returns Result — an invalid
+                    // name can never match an expected prefix, so it degrades to "".
+                    let name = file.name().map(|n| n.to_string()).unwrap_or_default();
                     // Same directory, not the binary itself, not a directory entry
                     if name.starts_with(&dir_prefix)
                         && !name.ends_with('/')
@@ -794,7 +841,7 @@ impl ExtensionPackage {
                                 name
                             )));
                         }
-                        if file.size() > Self::MAX_EXTRACT_FILE_SIZE {
+                        if file.size() > Self::effective_max_file_size() {
                             return Err(PackageError::Zip(format!(
                                 "Bundled library '{}' is {} bytes (exceeds limit)",
                                 name,
@@ -991,12 +1038,12 @@ impl ExtensionPackage {
             )));
         }
         // Zip-bomb defense: reject oversized entries.
-        if file.size() > Self::MAX_EXTRACT_FILE_SIZE {
+        if file.size() > Self::effective_max_file_size() {
             return Err(PackageError::Zip(format!(
                 "File '{}' is {} bytes (exceeds {} byte limit)",
                 src_path,
                 file.size(),
-                Self::MAX_EXTRACT_FILE_SIZE
+                Self::effective_max_file_size()
             )));
         }
         budget.charge(file.size())?;
@@ -1023,9 +1070,41 @@ impl ExtensionPackage {
     /// Zip-bomb defense caps — shared by BOTH extraction paths. The async
     /// path (`extract_file`/`extract_directory`, used by `install()`) had NO
     /// caps while the sync path did; one definition so they can't drift again.
+    ///
+    /// These are DEFAULTS, not hardwired limits: GPU deployments install
+    /// extension bundles whose CUDA Execution Provider library alone is
+    /// 330–390 MB (onnxruntime_providers_cuda.so statically links its CUDA
+    /// kernels), which no vendor ships under the 200 MiB default. Set
+    /// HERAMIND_EXTENSION_MAX_FILE_SIZE / HERAMIND_EXTENSION_MAX_TOTAL_SIZE
+    /// (bytes) in the service environment to raise them; unset keeps the
+    /// zip-bomb-safe defaults below.
     pub(crate) const MAX_EXTRACT_FILE_SIZE: u64 = 200 * 1024 * 1024;
     pub(crate) const MAX_EXTRACT_TOTAL_SIZE: u64 = 500 * 1024 * 1024;
     pub(crate) const MAX_EXTRACT_FILE_COUNT: usize = 10_000;
+
+    /// Effective per-file extraction cap in bytes.
+    pub(crate) fn effective_max_file_size() -> u64 {
+        static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| {
+            std::env::var("HERAMIND_EXTENSION_MAX_FILE_SIZE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(Self::MAX_EXTRACT_FILE_SIZE)
+        })
+    }
+
+    /// Effective total-extraction cap in bytes.
+    pub(crate) fn effective_max_total_size() -> u64 {
+        static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| {
+            std::env::var("HERAMIND_EXTENSION_MAX_TOTAL_SIZE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(Self::MAX_EXTRACT_TOTAL_SIZE)
+        })
+    }
 
     /// Resolve `rel_path` against `dst_dir`, rejecting any entry that would
     /// escape `dst_dir` via `..` traversal or absolute paths.
@@ -1076,7 +1155,9 @@ impl ExtensionPackage {
                 .by_index(i)
                 .map_err(|e| PackageError::Zip(format!("Failed to access file {}: {}", i, e)))?;
 
-            let name = file.name().to_string();
+            // zip 9: `name()` validates UTF-8 and returns Result — an invalid
+            // name can never match an expected prefix, so it degrades to "".
+            let name = file.name().map(|n| n.to_string()).unwrap_or_default();
 
             // Check if file starts with prefix
             if name.starts_with(src_prefix) && !name.ends_with('/') {
@@ -1092,12 +1173,12 @@ impl ExtensionPackage {
                         name
                     )));
                 }
-                if entry_size > Self::MAX_EXTRACT_FILE_SIZE {
+                if entry_size > Self::effective_max_file_size() {
                     return Err(PackageError::Zip(format!(
                         "File '{}' is {} bytes (exceeds {} byte limit)",
                         name,
                         entry_size,
-                        Self::MAX_EXTRACT_FILE_SIZE
+                        Self::effective_max_file_size()
                     )));
                 }
                 budget.charge(entry_size)?;
@@ -1227,12 +1308,12 @@ impl ExtensionPackage {
                 src_path
             )));
         }
-        if file.size() > Self::MAX_EXTRACT_FILE_SIZE {
+        if file.size() > Self::effective_max_file_size() {
             return Err(PackageError::Zip(format!(
                 "File '{}' is {} bytes (exceeds {} byte limit)",
                 src_path,
                 file.size(),
-                Self::MAX_EXTRACT_FILE_SIZE
+                Self::effective_max_file_size()
             )));
         }
 
@@ -1285,7 +1366,9 @@ impl ExtensionPackage {
                 .by_index(i)
                 .map_err(|e| PackageError::Zip(format!("Failed to access file {}: {}", i, e)))?;
 
-            let name = file.name().to_string();
+            // zip 9: `name()` validates UTF-8 and returns Result — an invalid
+            // name can never match an expected prefix, so it degrades to "".
+            let name = file.name().map(|n| n.to_string()).unwrap_or_default();
 
             // Check if file starts with prefix
             if name.starts_with(src_prefix) && !name.ends_with('/') {
@@ -1300,19 +1383,19 @@ impl ExtensionPackage {
                     )));
                 }
                 let entry_size = file.size();
-                if entry_size > Self::MAX_EXTRACT_FILE_SIZE {
+                if entry_size > Self::effective_max_file_size() {
                     return Err(PackageError::Zip(format!(
                         "File '{}' is {} bytes (exceeds {} byte limit)",
                         name,
                         entry_size,
-                        Self::MAX_EXTRACT_FILE_SIZE
+                        Self::effective_max_file_size()
                     )));
                 }
                 total_bytes += entry_size;
-                if total_bytes > Self::MAX_EXTRACT_TOTAL_SIZE {
+                if total_bytes > Self::effective_max_total_size() {
                     return Err(PackageError::Zip(format!(
                         "Total extracted size exceeds {} bytes (zip-bomb suspected)",
-                        Self::MAX_EXTRACT_TOTAL_SIZE
+                        Self::effective_max_total_size()
                     )));
                 }
 
@@ -1569,10 +1652,10 @@ impl InstallBudget {
     pub(crate) fn charge(&mut self, bytes: u64) -> Result<(), PackageError> {
         self.total_bytes = self.total_bytes.saturating_add(bytes);
         self.file_count += 1;
-        if self.total_bytes > ExtensionPackage::MAX_EXTRACT_TOTAL_SIZE {
+        if self.total_bytes > ExtensionPackage::effective_max_total_size() {
             return Err(PackageError::Zip(format!(
                 "Total extracted size exceeds {} bytes across the whole install (zip-bomb suspected)",
-                ExtensionPackage::MAX_EXTRACT_TOTAL_SIZE
+                ExtensionPackage::effective_max_total_size()
             )));
         }
         if self.file_count > ExtensionPackage::MAX_EXTRACT_FILE_COUNT {

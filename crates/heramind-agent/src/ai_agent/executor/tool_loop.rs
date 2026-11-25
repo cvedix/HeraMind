@@ -28,7 +28,7 @@ impl AgentExecutor {
         &self,
         agent: &AiAgent,
         registry: &crate::toolkit::registry::ToolRegistry,
-        llm_runtime: &Arc<dyn LlmRuntime + Send + Sync>,
+        llm_runtime: &Arc<dyn LlmRuntime>,
         filtered_tools: &[heramind_core::llm::backend::ToolDefinition],
         messages: &mut Vec<Message>,
         execution_id: &str,
@@ -36,7 +36,7 @@ impl AgentExecutor {
         tool_name_map: &std::collections::HashMap<String, String>,
         bound_image: Option<&str>,
     ) -> ToolLoopOutput {
-        use crate::agent::tool_parser::parse_tool_calls;
+        use crate::agent::tool_parser::{is_degenerate_final_output, parse_tool_calls};
         use heramind_core::llm::backend::{GenerationParams, LlmInput};
 
         // Build reverse map: original_name → sanitized_name
@@ -86,9 +86,32 @@ impl AgentExecutor {
         let mut failed_blacklist: HashSet<String> = HashSet::new();
         const FAILED_RETRY_BUDGET: u32 = 3;
         // Duplicate round detection: track tool signatures per round to detect loops.
+        // Narration-collapse guard state: fires at most once (see below).
+        let mut narration_nudged = false;
+        // The narration that triggered the nudge — restore source when the
+        // nudged round degenerates to a bare empty JSON container.
+        let mut nudge_saved_narration: Option<String> = None;
+        // Armed only while the NUDGE round itself is being evaluated. A later
+        // round that recovers real tool calls must not resurrect the stale
+        // narration when IT ends degenerate (that would discard the tool
+        // results and re-surface a promise as the final answer).
+        let mut nudge_restore_armed = false;
 
         // Get context window for token-aware compaction
         let context_window = llm_runtime.max_context_length();
+
+        // Tool definitions ride every request and are NOT part of `messages`.
+        // The system prompt IS messages[0] — subtracting it here as well
+        // double-counted it and collapsed max_tokens to the 512 floor while
+        // the window still had room (2026-11-11 review). Skill injection
+        // grows that system message later; history_tokens is recomputed
+        // each round and picks the growth up.
+        let tool_overhead_tokens = executor_tool_overhead(filtered_tools);
+
+        // Per-run token budget accumulator (backend-reported usage only —
+        // see ToolLoopOutput::tokens_used). Checked after every LLM call.
+        let token_budget = agent.max_tokens_per_run;
+        let mut tokens_used: u64 = 0;
 
         let mut round: usize = 0;
 
@@ -119,6 +142,17 @@ impl AgentExecutor {
                 skill_injected = true;
             }
 
+            // Generation budget shrinks with the history so the REQUEST
+            // (prompt + completion) can never exceed the window: the old
+            // fixed 4,000 max_tokens rode on top of whatever the history
+            // had grown to — a 26K-token history on a 32K window with ~7K
+            // prompt overhead produced a 33K-token request that errored
+            // 400 before the overflow-retry could even run (2026-11-11
+            // ctxfix validation, en/A3). Reserve for response first, floor
+            // at 512 so a nearly-full window still yields a usable reply.
+            let history_tokens = heramind_core::llm::compaction::estimate_messages_tokens(messages);
+            let response_budget =
+                executor_response_budget(context_window, tool_overhead_tokens, history_tokens);
             let input = LlmInput {
                 messages: messages.clone(),
                 params: GenerationParams {
@@ -127,7 +161,7 @@ impl AgentExecutor {
                     // fed the chat path).
                     temperature: Some(agent_defaults.default_temperature),
                     top_p: Some(agent_defaults.default_top_p),
-                    max_tokens: Some(4000),
+                    max_tokens: Some(response_budget),
                     ..Default::default()
                 },
                 model: None,
@@ -195,13 +229,50 @@ impl AgentExecutor {
                                     // halve the effective window so
                                     // CompactionConfig keeps fewer full-size
                                     // results and evicts more aggressively.
+                                    // When the backend reported the actual
+                                    // prompt size, verify against the real
+                                    // overflow amount — the estimator can
+                                    // under-count (whitespace-heavy output,
+                                    // tool args) and a halve that still
+                                    // exceeds the window would just fail the
+                                    // retry too.
                                     let window =
                                         if context_window == 0 || context_window > 1_000_000 {
                                             8192
                                         } else {
                                             context_window
                                         };
-                                    compact::compact_executor_messages(messages, window / 2);
+                                    let mut retry_window = window / 2;
+                                    // `target_history` already excludes tool
+                                    // overhead. compact_executor_messages
+                                    // subtracts its overhead argument again,
+                                    // so the retry passes 0.
+                                    let mut retry_overhead = tool_overhead_tokens;
+                                    if let LlmError::ContextOverflow { prompt_tokens, .. } = &e {
+                                        let over_by =
+                                            prompt_tokens.saturating_sub(window).saturating_add(1);
+                                        // Target: messages (system included)
+                                        // must fit in window - tools - floor.
+                                        let target_history = window
+                                            .saturating_sub(tool_overhead_tokens)
+                                            .saturating_sub(512)
+                                            .saturating_sub(over_by);
+                                        retry_window =
+                                            retry_window.min(target_history.max(window / 8));
+                                        retry_overhead = 0;
+                                        tracing::warn!(
+                                            agent_id = %agent.id,
+                                            reported_prompt = prompt_tokens,
+                                            window,
+                                            retry_window,
+                                            "Context overflow — using backend-reported size"
+                                        );
+                                    }
+                                    compact::compact_executor_messages(
+                                        messages,
+                                        retry_window,
+                                        retry_overhead,
+                                    );
                                     tracing::warn!(
                                         agent_id = %agent.id,
                                         round = round_num,
@@ -250,6 +321,29 @@ impl AgentExecutor {
                 Some(o) => o,
                 None => break, // LLM generation failed
             };
+
+            // --- Per-run token budget ---
+            // Round/timeout/call caps count the wrong units for cost; this is
+            // the only guardrail in tokens. Phase 2 below still runs on a
+            // budget stop (one bounded call) so the run produces a usable
+            // conclusion instead of dying mid-thought — same shape as the
+            // max-rounds stop.
+            if let Some(usage) = &output.usage {
+                tokens_used += usage.total_tokens as u64;
+            }
+            if let Some(cap) = token_budget {
+                if tokens_used >= cap {
+                    tracing::warn!(
+                        agent_id = %agent.id,
+                        tokens_used,
+                        cap,
+                        round = round + 1,
+                        "Per-run token budget exceeded — stopping tool loop"
+                    );
+                    stop_reason = StopReason::TokenBudget;
+                    break;
+                }
+            }
 
             // Priority: native tool_calls from API → parse from text → thinking field fallback
             let mut tool_calls = if let Some(ref native) = output.tool_calls {
@@ -355,9 +449,14 @@ impl AgentExecutor {
                         if !found.is_empty() {
                             found
                         } else {
-                            // No tool calls found anywhere — LLM produced final text
-                            final_text = output.text;
-                            break;
+                            // No tool calls found anywhere — LLM produced
+                            // final text. Fall through with EMPTY tool calls
+                            // so the shared empty-guard below (narration
+                            // nudge → final-text break) handles it — the old
+                            // direct `break` here bypassed that guard, making
+                            // it dead code on the legacy text path (caught by
+                            // the narration behavior test).
+                            Vec::new()
                         }
                     }
                 }
@@ -388,9 +487,78 @@ impl AgentExecutor {
             };
 
             if tool_calls.is_empty() {
+                // === NARRATION-COLLAPSE GUARD (at most once) ===
+                // The model promised an action in words ("我现在使用 X 工具…")
+                // but emitted no tool call. Breaking here ends the run with a
+                // promise as the conclusion. Nudge once with a pointed retry
+                // — same ephemeral-User-message pattern the AllDuplicate
+                // branch uses — and only when round budget remains.
+                if !narration_nudged
+                    && round + 1 < max_rounds
+                    && !crate::agent::user_requested_no_execution(&agent.user_prompt)
+                    && crate::agent::is_narration_without_action(&remaining_text)
+                {
+                    narration_nudged = true;
+                    tracing::info!(
+                        agent_id = %agent.id,
+                        round = round + 1,
+                        chars = remaining_text.chars().count(),
+                        "Narration without tool call — nudging once"
+                    );
+                    self.send_thinking(
+                        &agent.id,
+                        execution_id,
+                        step_num,
+                        "Promised action was not executed — retrying with a nudge",
+                    )
+                    .await;
+                    step_num += 1;
+                    // Record the narration, then the pointed nudge. `messages`
+                    // is this execution's working copy — nothing is persisted
+                    // to session history on this path. Keep the narration as
+                    // the restore source in case the nudged round degenerates
+                    // (bare `[]` compliance with the JSON-array directive).
+                    nudge_saved_narration = Some(remaining_text.clone());
+                    nudge_restore_armed = true;
+                    messages.push(Message::new(
+                        MessageRole::Assistant,
+                        Content::text(&remaining_text),
+                    ));
+                    messages.push(Message::new(
+                        MessageRole::User,
+                        // Same language as the narration being corrected.
+                        Content::text(crate::agent::narration_nudge_prompt(&remaining_text)),
+                    ));
+                    round += 1;
+                    continue;
+                }
+                // === Post-nudge degenerate output — restore the narration ===
+                // The nudged round complied with "output the tool calls"
+                // literally (bare empty JSON container, live 2026-10-20
+                // shape). The recorded narration is the real reply — keep it
+                // instead of a 2-char `[]` as the agent's final analysis.
+                // Only while THIS round is the nudged one; later rounds fall
+                // through to the Phase-2 tool-result summary below.
+                if nudge_restore_armed && is_degenerate_final_output(&remaining_text) {
+                    if let Some(restored) = nudge_saved_narration.take() {
+                        if !restored.trim().is_empty() {
+                            tracing::warn!(
+                                agent_id = %agent.id,
+                                restored_chars = restored.chars().count(),
+                                "Post-nudge round degenerated to an empty JSON container — restoring the pre-nudge narration as the final text"
+                            );
+                            final_text = restored;
+                            break;
+                        }
+                    }
+                }
                 final_text = remaining_text;
                 break;
             }
+
+            // This round produced real tool calls — the nudge round (if any)
+            // succeeded; disarm the stale-narration restore.
+            nudge_restore_armed = false;
 
             // --- Per-round tool call cap ---
             // Prevent single-round explosion (e.g. 17 parallel device queries).
@@ -582,19 +750,74 @@ impl AgentExecutor {
                 // dd to a device, mkfs, pipe-to-shell, fork bomb, destructive
                 // heramind CLI) BEFORE execution. Denied calls get a synthetic
                 // error result at their position; the rest execute normally.
+                //
+                // Same pattern for the `$cached:` read-back door: file_read
+                // calls whose `path` IS a reference are served from this
+                // execution's LargeDataCache (verbatim ref — resolve left
+                // file_read args untouched) instead of executing the tool.
+                let cached_reads: Vec<(usize, crate::toolkit::ToolOutput)> = calls
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| {
+                        crate::agent::streaming::try_cached_file_read(
+                            registry,
+                            &c.name,
+                            &c.args,
+                            &large_data_cache,
+                        )
+                        .map(|out| (i, out))
+                    })
+                    .collect();
+                let cached_read_set: HashSet<usize> =
+                    cached_reads.iter().map(|(i, _)| *i).collect();
+
+                // `calls` are post-rewrite: hallucinated CLI-domain tools
+                // (`message`, …) are already `shell` with a `heramind …`
+                // command. Judgment gate therefore covers both entry points
+                // listed in `JUDGMENT_NOTIFY_ENTRY_POINTS` (direct shell +
+                // rewritten CLI) through one helper.
                 let blocked: Vec<(usize, String)> = calls
                     .iter()
                     .enumerate()
                     .filter_map(|(i, c)| {
                         if c.name == "shell" {
-                            c.args
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .and_then(crate::toolkit::policy::deny_reason)
-                                .map(|r| (i, r))
-                        } else {
-                            None
+                            if let Some(command) = c.args.get("command").and_then(|v| v.as_str()) {
+                                if let Some(r) = crate::toolkit::policy::deny_reason(command) {
+                                    return Some((i, r));
+                                }
+                            }
                         }
+                        // Judgment-notify gate: auth from independent assistant
+                        // judgment only — never from pending send title/body.
+                        // Keyword scan of the final reply is audit-only and
+                        // cannot unsend.
+                        if let Some(r) = super::judgment_notify::judgment_deny_for_tool_call(
+                            agent, &c.name, &c.args, messages,
+                        ) {
+                            tracing::warn!(
+                                agent_id = %agent.id,
+                                reason = %r,
+                                "Judgment notify gate blocked message send"
+                            );
+                            return Some((i, r));
+                        }
+                        // Web tools a judgment-notify agent does not get by
+                        // default are refused when the model invents the call
+                        // anyway — the registry would otherwise run it.
+                        if super::judgment_notify::judgment_tool_off_by_default(agent, &c.name) {
+                            tracing::info!(
+                                agent_id = %agent.id,
+                                tool = %c.name,
+                                "Web tool not offered to a judgment-notify agent — call blocked"
+                            );
+                            return Some((
+                                i,
+                                "Web tools are off for judgment-notify agents (name the tool in \
+                                 the agent's allowlist to enable it)"
+                                    .to_string(),
+                            ));
+                        }
+                        None
                     })
                     .collect();
 
@@ -605,18 +828,30 @@ impl AgentExecutor {
                 let permitted: Vec<(usize, crate::toolkit::registry::ToolCall)> = calls
                     .iter()
                     .enumerate()
-                    .filter(|(i, _)| !blocked_set.contains(i))
+                    .filter(|(i, _)| !blocked_set.contains(i) && !cached_read_set.contains(i))
                     .map(|(i, c)| (i, c.clone()))
                     .collect();
 
-                // Insert the policy-blocked synthetic errors first.
+                // Insert the policy-blocked / judgment-gated synthetic errors first.
                 for (i, reason) in &blocked {
+                    let msg = if reason
+                        .starts_with(super::judgment_notify::JUDGMENT_GATE_REASON_PREFIX)
+                    {
+                        reason.clone()
+                    } else {
+                        format!("Blocked by safety policy: {}", reason)
+                    };
                     assembled[*i] = Some(crate::toolkit::ToolResult {
                         name: calls[*i].name.clone(),
-                        result: Err(crate::toolkit::error::ToolError::Execution(format!(
-                            "Blocked by safety policy: {}",
-                            reason
-                        ))),
+                        result: Err(crate::toolkit::error::ToolError::Execution(msg)),
+                    });
+                }
+
+                // Insert the cache-served read-back results at their positions.
+                for (i, output) in cached_reads {
+                    assembled[i] = Some(crate::toolkit::ToolResult {
+                        name: "file_read".to_string(),
+                        result: Ok(output),
                     });
                 }
 
@@ -729,7 +964,7 @@ impl AgentExecutor {
             // When the message history grows too large, compact old tool results into
             // short summaries to prevent context window overflow in subsequent rounds.
             let msg_count_before = messages.len();
-            compact::compact_executor_messages(messages, context_window);
+            compact::compact_executor_messages(messages, context_window, tool_overhead_tokens);
             let msg_count_after = messages.len();
 
             // --- Inject queried-entities summary after compaction ---
@@ -795,7 +1030,10 @@ impl AgentExecutor {
         let needs_summary = stop_reason != StopReason::Cancelled
             && (final_text.is_empty()
                 || final_text == "LLM generation failed during tool execution."
-                || final_text == "Completed tool execution rounds.");
+                || final_text == "Completed tool execution rounds."
+                // Degenerate finals (bare `[]`/`{}`, fence-only) carry no
+                // analysis value — synthesize from tool results instead.
+                || is_degenerate_final_output(&final_text));
         if needs_summary && !all_tool_results.is_empty() {
             final_text.clear();
             let summary = self
@@ -830,7 +1068,11 @@ impl AgentExecutor {
             }
         }
 
-        if final_text.is_empty() {
+        // Degenerate finals (bare `[]`/`{}`, fence-only) are as empty as ""
+        // for the agent's analysis — never hand them to the user as the
+        // conclusion. When there are tool results, Phase 2 already rebuilt
+        // the text above; this catches the no-tool-results case.
+        if final_text.is_empty() || is_degenerate_final_output(&final_text) {
             final_text = "Completed tool execution rounds.".to_string();
         }
 
@@ -843,6 +1085,7 @@ impl AgentExecutor {
                 .map(|rd| (rd.thought, rd.tool_calls))
                 .collect(),
             last_llm_error,
+            tokens_used,
         }
     }
 }
@@ -1028,4 +1271,117 @@ pub(crate) fn build_round_tool_calls(
         });
     }
     round_tool_calls
+}
+
+/// Token cost of tool definitions. These are sent beside `messages`.
+/// The system prompt is `messages[0]` and must not be added here.
+pub(crate) fn executor_tool_overhead(
+    tools: &[heramind_core::llm::backend::ToolDefinition],
+) -> usize {
+    tools
+        .iter()
+        .map(|t| {
+            heramind_core::llm::compaction::estimate_tokens(&t.name)
+                + heramind_core::llm::compaction::estimate_tokens(&t.description)
+                + heramind_core::llm::compaction::estimate_tokens(&t.parameters.to_string())
+        })
+        .sum()
+}
+
+/// Completion cap so prompt + completion stays inside the window.
+///
+/// `history_tokens` is the estimate of `messages`, which already includes
+/// the system prompt. `tool_overhead_tokens` is only the tool schemas.
+/// An unknown window (`0`) keeps the historical 4_000 cap; treating it as
+/// an empty window clamped the cap to 512.
+pub(crate) fn executor_response_budget(
+    context_window: usize,
+    tool_overhead_tokens: usize,
+    history_tokens: usize,
+) -> usize {
+    if context_window == 0 {
+        return 4000;
+    }
+    context_window
+        .saturating_sub(tool_overhead_tokens.saturating_add(history_tokens))
+        .clamp(512, 4000)
+}
+
+#[cfg(test)]
+mod response_budget_tests {
+    use super::{executor_response_budget, executor_tool_overhead};
+    use heramind_core::llm::backend::ToolDefinition;
+    use heramind_core::message::{Content, Message, MessageRole};
+
+    /// The per-round generation budget must shrink so prompt+completion
+    /// never exceed the window: a history that fills most of a 32K window
+    /// gets the 512 floor, a small history gets the 4,000 cap.
+    #[test]
+    fn response_budget_scales_with_remaining_window() {
+        let ctx = 32_768usize;
+        let overhead = 3_000usize;
+
+        let estimate =
+            |msgs: &[Message]| heramind_core::llm::compaction::estimate_messages_tokens(msgs);
+
+        let big = Message {
+            role: MessageRole::User,
+            content: Content::Text("知".repeat(28_000)),
+            tool_name: None,
+            timestamp: None,
+            compress_evidence: None,
+        };
+        let hist_tokens = estimate(&[big]);
+        let budget = executor_response_budget(ctx, overhead, hist_tokens);
+        assert_eq!(budget, 512, "nearly-full window must floor at 512");
+
+        let small = Message {
+            role: MessageRole::User,
+            content: Content::Text("hello".to_string()),
+            tool_name: None,
+            timestamp: None,
+            compress_evidence: None,
+        };
+        let hist_small = estimate(&[small]);
+        let budget2 = executor_response_budget(ctx, overhead, hist_small);
+        assert_eq!(budget2, 4000, "empty window must cap at 4000");
+        assert_eq!(executor_response_budget(0, overhead, hist_small), 4000);
+    }
+
+    /// A large system message is inside `history_tokens`. Counting it again
+    /// as overhead drops a 12K window from the 4_000 cap to ~1_000.
+    #[test]
+    fn system_prompt_is_not_subtracted_twice() {
+        let estimate =
+            |msgs: &[Message]| heramind_core::llm::compaction::estimate_messages_tokens(msgs);
+        let system = Message {
+            role: MessageRole::System,
+            content: Content::Text("知".repeat(2_000)),
+            tool_name: None,
+            timestamp: None,
+            compress_evidence: None,
+        };
+        let history = estimate(&[system]);
+        let tools = 3_000usize;
+        let budget = executor_response_budget(12_000, tools, history);
+        assert_eq!(
+            budget, 4000,
+            "system tokens were subtracted from both overhead and history: history={history}"
+        );
+    }
+
+    #[test]
+    fn tool_overhead_ignores_system_message_size() {
+        let tools = vec![ToolDefinition {
+            name: "shell".to_string(),
+            description: "run a command".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let overhead = executor_tool_overhead(&tools);
+        assert!(overhead > 0);
+        assert!(
+            overhead < 500,
+            "tool overhead swallowed a system prompt: {overhead}"
+        );
+    }
 }

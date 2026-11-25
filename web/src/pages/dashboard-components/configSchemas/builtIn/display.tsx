@@ -1,10 +1,7 @@
 import React from 'react'
-import { cn } from '@/lib/utils'
-import { chartColorsHex } from '@/design-system/tokens/color'
 import { Field } from '@/components/ui/field'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
 import {
   Select,
   SelectContent,
@@ -13,13 +10,6 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Checkbox } from '@/components/ui/checkbox'
-import { ColorPicker } from '@/components/ui/color-picker'
-import { IconPicker } from '@/components/ui/icon-picker'
-import { EntityIconPicker } from '@/components/ui/entity-icon-picker'
-import { DataMappingConfig } from '@/components/dashboard/config/UIConfigSections'
-import { LEDStateRulesConfig } from '@/components/dashboard/config/LEDStateRulesConfig'
-import type { StateRule } from '@/components/dashboard/generic/LEDIndicator'
-import type { SingleValueMappingConfig, TimeSeriesMappingConfig, CategoricalMappingConfig } from '@/lib/dataMapping'
 import { DualModeSourceField } from '@/components/dashboard/config'
 import type { ComponentConfigSchema } from '@/components/dashboard/config/ComponentConfigBuilder'
 import { SelectField } from '../../ConfigFieldComponents'
@@ -39,7 +29,7 @@ export function getImageDisplaySchema(config: any, ctx: SchemaContext, u: Update
                   onValueChange={updateConfig('src')}
                   dataSource={config.dataSource}
                   onDataSourceChange={updateDataSource}
-                  allowedTypes={['device-metric', 'system', 'extension', 'transform']}
+                  allowedTypes={['device-metric', 'system', 'extension', 'transform', 'ai']}
                   label={t('visualDashboard.imageSource')}
                   placeholder={t('visualDashboard.urlPlaceholder')}
                 />
@@ -154,7 +144,7 @@ export function getImageHistorySchema(config: any, ctx: SchemaContext, u: Update
               props: {
                 dataSource: config.dataSource,
                 onChange: updateDataSource,
-                allowedTypes: ['device-metric', 'system', 'extension', 'transform'],
+                allowedTypes: ['device-metric', 'system', 'extension', 'transform', 'ai'],
               },
             },
           ],
@@ -233,19 +223,10 @@ export function getImageHistorySchema(config: any, ctx: SchemaContext, u: Update
               type: 'custom' as const,
               render: () => (
                 <div className="space-y-3">
-                  <Field>
-                    <Label>{t('imageHistory.defaultAltText', 'Default Alt Text')}</Label>
-                    <Input
-                      value={config.alt || ''}
-                      onChange={(e) => updateConfig('alt')(e.target.value)}
-                      placeholder={t('placeholders.defaultAltText')}
-                      className="h-9"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t('imageHistory.altHint', 'Alternative text for accessibility when no specific alt is available')}
-                    </p>
-                  </Field>
-
+                  {/* Only fields the component actually consumes. The old
+                      alt / showNavigation / showDots / autoPlay(+interval)
+                      controls wrote keys ImageHistory never read — the
+                      component is a slider viewer, not a carousel. */}
                   <Field>
                     <Label>{t('visualDashboard.title')}</Label>
                     <Input
@@ -255,46 +236,6 @@ export function getImageHistorySchema(config: any, ctx: SchemaContext, u: Update
                       className="h-9"
                     />
                   </Field>
-
-                  <div className="flex items-center gap-4">
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <Checkbox
-                        checked={config.showNavigation ?? true}
-                        onCheckedChange={(checked) => updateConfig('showNavigation')(!!checked)}
-                      />
-                      <span className="text-sm">{t('imageHistory.showNavigation', 'Show Navigation')}</span>
-                    </label>
-
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <Checkbox
-                        checked={config.showDots ?? true}
-                        onCheckedChange={(checked) => updateConfig('showDots')(!!checked)}
-                      />
-                      <span className="text-sm">{t('imageHistory.showDotsIndicator', 'Show Dots Indicator')}</span>
-                    </label>
-
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <Checkbox
-                        checked={config.autoPlay ?? false}
-                        onCheckedChange={(checked) => updateConfig('autoPlay')(!!checked)}
-                      />
-                      <span className="text-sm">{t('imageHistory.autoPlay', 'Auto Play')}</span>
-                    </label>
-                  </div>
-
-                  {config.autoPlay && (
-                    <Field>
-                      <Label>{t('imageHistory.autoPlayInterval', 'Auto Play Interval (seconds)')}</Label>
-                      <Input
-                        type="number"
-                        value={config.autoPlayInterval ?? 3}
-                        onChange={(e) => updateConfig('autoPlayInterval')(Number(e.target.value))}
-                        min={1}
-                        max={60}
-                        className="h-9"
-                      />
-                    </Field>
-                  )}
                 </div>
               ),
             },
@@ -410,7 +351,7 @@ export function getWebDisplaySchema(config: any, ctx: SchemaContext, u: Updaters
                   onValueChange={updateConfig('src')}
                   dataSource={config.dataSource}
                   onDataSourceChange={updateDataSource}
-                  allowedTypes={['device-metric', 'system', 'extension', 'transform']}
+                  allowedTypes={['device-metric', 'system', 'extension', 'transform', 'ai']}
                   label={t('webDisplay.websiteUrl', 'Website URL')}
                   placeholder={t('placeholders.urlExample')}
                 />
@@ -457,37 +398,13 @@ export function getWebDisplaySchema(config: any, ctx: SchemaContext, u: Updaters
                     />
                   </Field>
 
-                  <Field>
-                    <Label>{t('webDisplay.refreshInterval', 'Refresh Interval (seconds)')}</Label>
-                    <Input
-                      type="number"
-                      value={config.refreshInterval ?? 0}
-                      onChange={(e) => updateConfig('refreshInterval')(Number(e.target.value))}
-                      min={0}
-                      max={3600}
-                      step={10}
-                      placeholder={t('webDisplay.noRefreshPlaceholder', '0 = no refresh')}
-                      className="h-9"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t('webDisplay.noRefreshHint', 'Set to 0 to disable auto-refresh')}
-                    </p>
-                  </Field>
-
-                  <Field>
-                    <Label>{t('webDisplay.loadingMessage', 'Loading Message')}</Label>
-                    <Input
-                      value={config.loadingMessage || 'Loading...'}
-                      onChange={(e) => updateConfig('loadingMessage')(e.target.value)}
-                      placeholder={t('placeholders.loadingMessage')}
-                      className="h-9"
-                    />
-                  </Field>
-
                   <label className="flex items-center gap-2 cursor-pointer">
                     <Checkbox
-                      checked={config.allowFullScreen ?? true}
-                      onCheckedChange={(checked) => updateConfig('allowFullScreen')(!!checked)}
+                      /* Reads the legacy misspelled key (allowFullScreen) for
+                         configs saved before the rename — the component prop
+                         is allowFullscreen, the old key never reached it. */
+                      checked={config.allowFullscreen ?? config.allowFullScreen ?? true}
+                      onCheckedChange={(checked) => updateConfig('allowFullscreen')(!!checked)}
                     />
                     <span className="text-sm">{t('webDisplay.allowFullscreen', 'Allow Fullscreen')}</span>
                   </label>
@@ -512,7 +429,7 @@ export function getMarkdownDisplaySchema(config: any, ctx: SchemaContext, u: Upd
                   onValueChange={updateConfig('content')}
                   dataSource={config.dataSource}
                   onDataSourceChange={updateDataSource}
-                  allowedTypes={['device-metric', 'system', 'extension', 'transform']}
+                  allowedTypes={['device-metric', 'system', 'extension', 'transform', 'ai']}
                   label={t('visualDashboard.markdownContent')}
                   placeholder={t('visualDashboard.markdownPlaceholder')}
                   rows={6}
@@ -553,25 +470,6 @@ export function getMarkdownDisplaySchema(config: any, ctx: SchemaContext, u: Upd
                       className="h-9"
                     />
                   </Field>
-
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <Checkbox
-                      checked={config.showCopyButton ?? false}
-                      onCheckedChange={(checked) => updateConfig('showCopyButton')(!!checked)}
-                    />
-                    <span className="text-sm">{t('markdownDisplay.showCopyButton', 'Show Copy Button')}</span>
-                  </label>
-
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <Checkbox
-                      checked={config.sanitizeHtml ?? true}
-                      onCheckedChange={(checked) => updateConfig('sanitizeHtml')(!!checked)}
-                    />
-                    <span className="text-sm">{t('markdownDisplay.sanitizeHtml', 'Sanitize HTML')}</span>
-                    <p className="text-xs text-muted-foreground">
-      {t('markdownDisplay.sanitizeHtmlHint', 'Remove potentially dangerous HTML tags')}
-                    </p>
-                  </label>
                 </div>
               ),
             },
@@ -756,24 +654,6 @@ export function getVideoDisplaySchema(config: any, ctx: SchemaContext, u: Update
                       className="h-9"
                     />
                   </Field>
-
-                  <Field>
-                    <Label>{t('common.description', 'Description')}</Label>
-                    <Input
-                      value={config.description || ''}
-                      onChange={(e) => updateConfig('description')(e.target.value)}
-                      placeholder={t('placeholders.videoDescription')}
-                      className="h-9"
-                    />
-                  </Field>
-
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <Checkbox
-                      checked={config.showTitleOverlay ?? false}
-                      onCheckedChange={(checked) => updateConfig('showTitleOverlay')(!!checked)}
-                    />
-                    <span className="text-sm">{t('videoDisplay.showTitleOverlay', 'Show Title Overlay')}</span>
-                  </label>
                 </div>
               ),
             },

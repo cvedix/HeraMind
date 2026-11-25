@@ -11,6 +11,7 @@
 import { useState, useCallback, useEffect } from 'react'
 import { findDevice } from '@/lib/deviceUtils'
 import { useTranslation } from 'react-i18next'
+import { useIsMobile } from '@/hooks/useMobile'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -133,6 +134,7 @@ export function LayerEditorDialog({
   onSave,
 }: LayerEditorDialogProps) {
   const { t } = useTranslation('dashboardComponents')
+  const isMobile = useIsMobile()
   const typeConfig = getTypeConfig(t)
 
   const [bindings, setBindings] = useState<LayerBinding[]>(initialBindings)
@@ -155,7 +157,7 @@ export function LayerEditorDialog({
   }, [open, initialBindings])
 
   // Convert bindings to layer items for preview
-  const convertToLayerItems = useCallback((): LayerItem[] => {
+  const _convertToLayerItems = useCallback((): LayerItem[] => {
     const getDeviceName = (deviceId: string) => {
       const device = findDevice(devices, deviceId)
       return device?.name || device?.device_id || deviceId
@@ -345,12 +347,16 @@ export function LayerEditorDialog({
             </div>
           </div>
 
-          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <div className={cn(
+            'flex items-center gap-1 transition-opacity',
+            // Hover-reveal is desktop-only; touch has no hover.
+            isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+          )}>
             {(binding.type === 'text' || binding.type === 'icon') && !isEditingText && !isEditingIcon && (
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-6 w-6"
+                className="h-6 w-6 sm:h-6 sm:w-6"
                 onClick={(e) => {
                   e.stopPropagation()
                   if (binding.type === 'text') setEditingTextBinding(binding.id)
@@ -364,7 +370,7 @@ export function LayerEditorDialog({
             <Button
               variant="ghost"
               size="icon"
-              className="h-6 w-6 text-error"
+              className="h-6 w-6 text-error sm:h-6 sm:w-6"
               onClick={(e) => {
                 e.stopPropagation()
                 handleRemoveBinding(binding.id)
@@ -401,7 +407,7 @@ export function LayerEditorDialog({
               <Button
                 size="sm"
                 variant="ghost"
-                className="h-6 px-2 text-xs"
+                className="h-6 px-2 text-xs sm:h-6"
                 onClick={(e) => {
                   e.stopPropagation()
                   setEditingTextBinding(null)
@@ -497,7 +503,7 @@ export function LayerEditorDialog({
               <Button
                 size="sm"
                 variant="ghost"
-                className="h-6 px-2 text-xs"
+                className="h-6 px-2 text-xs sm:h-6"
                 onClick={(e) => {
                   e.stopPropagation()
                   setEditingIconBinding(null)

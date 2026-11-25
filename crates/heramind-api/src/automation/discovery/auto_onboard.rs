@@ -8,12 +8,13 @@
 
 use super::types::*;
 use super::{MetricEnhancement, SemanticInference};
+use dashmap::DashMap;
 use heramind_core::{EventBus, LlmRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use base64::{engine::general_purpose, Engine as _};
 
@@ -82,12 +83,16 @@ impl MessageRateLimiter {
 
 /// Type signature for matching similar device types
 ///
-/// A type signature is a fingerprint based on the semantic and data types
-/// of metrics, allowing devices with the same data structure to share types.
+/// A type signature is a fingerprint based on the metric paths, semantic
+/// types, and data types, allowing devices with the same data structure to
+/// share types. Paths are part of the fingerprint on purpose: two devices
+/// whose fields carry the same semantics but live under different paths
+/// (e.g. `{"temp":21}` vs `{"sensors":{"temperature":21}}`) must NOT be
+/// matched — the reused template would extract nothing from the new device.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TypeSignature {
-    /// Ordered list of metric signatures (semantic_type, data_type pairs)
-    pub metric_signatures: Vec<(String, String)>,
+    /// Ordered list of metric signatures (path, semantic_type, data_type triples)
+    pub metric_signatures: Vec<(String, String, String)>,
     /// Device category for coarse filtering
     pub category: String,
 }
@@ -131,6 +136,18 @@ impl Default for AutoOnboardConfig {
     }
 }
 
+/// MQTT association-exception context attached to a pending draft.
+///
+/// Used when Conflict / Unverifiable refused a formal map against an already
+/// registered identity — the draft is customer-visible pending confirm, not
+/// an auto-register / overwrite of the blocked device.
+#[derive(Debug, Clone, Default)]
+pub struct AssociationExceptionDraft {
+    pub kind: Option<String>,
+    pub blocked_device_ids: Vec<String>,
+    pub claimed_identity: Option<String>,
+}
+
 /// Auto-onboarding manager for zero-config device discovery
 pub struct AutoOnboardManager {
     /// LLM runtime for AI analysis
@@ -155,6 +172,8 @@ pub struct AutoOnboardManager {
     blocked_devices: Arc<RwLock<HashMap<String, (Instant, String)>>>,
     /// Semantic inference
     semantic_inference: SemanticInference,
+    /// Per-draft confirm locks — serialize concurrent confirms of the same draft.
+    confirm_draft_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// Result of device registration with enhancement
@@ -191,7 +210,17 @@ impl AutoOnboardManager {
             rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             blocked_devices: Arc::new(RwLock::new(HashMap::new())),
             semantic_inference,
+            confirm_draft_locks: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Serialize concurrent `/confirm-association` calls for the same draft key.
+    /// Lock is released on both success and failure so retries can proceed.
+    pub fn confirm_draft_lock_for(&self, draft_key: &str) -> Arc<Mutex<()>> {
+        self.confirm_draft_locks
+            .entry(draft_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Set configuration (returns a new manager with updated config)
@@ -223,13 +252,16 @@ impl AutoOnboardManager {
         data: &serde_json::Value,
         is_binary: bool,
     ) -> Result<bool> {
-        self.process_unknown_device_with_topic(device_id, source, data, is_binary, None, None)
-            .await
+        self.process_unknown_device_with_topic(
+            device_id, source, data, is_binary, None, None, None, None,
+        )
+        .await
     }
 
     /// Process incoming data from an unknown device with original topic
     ///
     /// Returns whether the data was accepted for collection
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_unknown_device_with_topic(
         &self,
         device_id: &str,
@@ -238,6 +270,37 @@ impl AutoOnboardManager {
         is_binary: bool,
         original_topic: Option<String>,
         adapter_id: Option<String>,
+        mqtt_identity_source: Option<String>,
+        mqtt_identity_field: Option<String>,
+    ) -> Result<bool> {
+        self.process_unknown_device_with_topic_ex(
+            device_id,
+            source,
+            data,
+            is_binary,
+            original_topic,
+            adapter_id,
+            mqtt_identity_source,
+            mqtt_identity_field,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::process_unknown_device_with_topic`], with optional MQTT
+    /// association-exception context (Conflict / Unverifiable pending confirm).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_unknown_device_with_topic_ex(
+        &self,
+        device_id: &str,
+        source: &str,
+        data: &serde_json::Value,
+        is_binary: bool,
+        original_topic: Option<String>,
+        adapter_id: Option<String>,
+        mqtt_identity_source: Option<String>,
+        mqtt_identity_field: Option<String>,
+        association_exception: Option<AssociationExceptionDraft>,
     ) -> Result<bool> {
         // Check if device is blocked (spam detected)
         {
@@ -325,11 +388,15 @@ impl AutoOnboardManager {
             is_binary,
             original_topic,
             adapter_id,
+            mqtt_identity_source,
+            mqtt_identity_field,
+            association_exception,
         )
         .await
     }
 
     /// Create a new draft device with original topic
+    #[allow(clippy::too_many_arguments)]
     async fn create_draft_with_topic(
         &self,
         device_id: &str,
@@ -338,6 +405,9 @@ impl AutoOnboardManager {
         is_binary: bool,
         original_topic: Option<String>,
         adapter_id: Option<String>,
+        mqtt_identity_source: Option<String>,
+        mqtt_identity_field: Option<String>,
+        association_exception: Option<AssociationExceptionDraft>,
     ) -> Result<bool> {
         let mut drafts = self.drafts.write().await;
 
@@ -350,6 +420,18 @@ impl AutoOnboardManager {
 
         // Store adapter_id for external broker devices
         draft.adapter_id = adapter_id;
+        draft.mqtt_identity_source = mqtt_identity_source;
+        draft.mqtt_identity_field = mqtt_identity_field;
+        if let Some(exc) = association_exception {
+            draft.association_exception = true;
+            draft.association_exception_kind = exc.kind;
+            draft.blocked_device_ids = exc.blocked_device_ids;
+            draft.claimed_identity = exc.claimed_identity;
+            if draft.user_name.is_none() {
+                let claimed = draft.claimed_identity.as_deref().unwrap_or(device_id);
+                draft.user_name = Some(format!("Association exception ({claimed})"));
+            }
+        }
 
         // Mark as binary if applicable
         if is_binary {
@@ -449,8 +531,20 @@ impl AutoOnboardManager {
             DiscoveryError::InvalidData(format!("Draft device not found: {}", device_id))
         })?;
 
-        // Don't add samples if already analyzing
-        if draft.status != DraftDeviceStatus::Collecting {
+        // Accept follow-up samples while the draft awaits review or sits in a
+        // failed analysis — the FIRST frame alone defines the generated type,
+        // and it may miss optional fields (null values are skipped during
+        // analysis) or capture an atypical frame. Every added sample refines
+        // the generated type via re-analysis. Terminal states (registering /
+        // registered / rejected) no longer accept samples.
+        let accepts_samples = matches!(
+            draft.status,
+            DraftDeviceStatus::Collecting
+                | DraftDeviceStatus::WaitingProcessing
+                | DraftDeviceStatus::Analyzing
+                | DraftDeviceStatus::Failed
+        );
+        if !accepts_samples {
             return Ok(false);
         }
 
@@ -496,8 +590,11 @@ impl AutoOnboardManager {
                     .await;
             });
 
-            // Check if ready for analysis
-            if draft.ready_for_analysis(MIN_SAMPLES_FOR_ANALYSIS) {
+            // (Re-)trigger analysis: the first sample while Collecting, or a
+            // later sample refining an already-generated (or failed) type.
+            // Skip only while an analysis run is in flight — its tail re-check
+            // picks up samples stored in the meantime.
+            if draft.status != DraftDeviceStatus::Analyzing {
                 let draft_id = draft.id.clone();
                 let device_id = draft.device_id.clone();
                 let samples = draft.json_samples();
@@ -526,13 +623,33 @@ impl AutoOnboardManager {
         }
     }
 
-    /// Analyze collected samples and generate device type
-    pub async fn analyze_device(
+    /// Analyze collected samples and generate device type.
+    ///
+    /// Boxed future on purpose: the tail re-check (re-)spawns
+    /// `analyze_device` when samples arrived mid-analysis, and a directly
+    /// self-spawning async fn makes the future's `Send`ness cyclic — the
+    /// box breaks the type recursion.
+    pub fn analyze_device<'a>(
+        &'a self,
+        draft_id: &'a str,
+        device_id: &'a str,
+        samples: Vec<serde_json::Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<GeneratedDeviceType>> + Send + 'a>>
+    {
+        Box::pin(self.analyze_device_inner(draft_id, device_id, samples))
+    }
+
+    /// Analysis body — see `analyze_device` for why it is reached boxed.
+    async fn analyze_device_inner(
         &self,
         draft_id: &str,
         device_id: &str,
         samples: Vec<serde_json::Value>,
     ) -> Result<GeneratedDeviceType> {
+        // Count at entry: the tail re-check compares against it to catch
+        // samples stored mid-analysis (see add_sample_to_draft).
+        let analyzed_sample_count = samples.len();
+
         // Update status to Analyzing
         {
             let mut drafts = self.drafts.write().await;
@@ -730,6 +847,28 @@ impl AutoOnboardManager {
             type_id,
             reusing_type
         );
+
+        // Samples that arrived while this analysis was running were stored
+        // but not analyzed (add_sample_to_draft skips spawning mid-analysis).
+        // Re-run so later frames can refine the generated type — a first
+        // frame may miss optional fields (nulls are skipped above).
+        {
+            let drafts = self.drafts.read().await;
+            if let Some(draft) = drafts.get(device_id) {
+                if draft.samples.len() > analyzed_sample_count {
+                    let manager = self.clone_for_task();
+                    let draft_id_str = draft_id.to_string();
+                    let device_id_str = device_id.to_string();
+                    let samples = draft.json_samples();
+                    drop(drafts);
+                    tokio::spawn(async move {
+                        let _ = manager
+                            .analyze_device(&draft_id_str, &device_id_str, samples)
+                            .await;
+                    });
+                }
+            }
+        }
 
         // Get the generated type from drafts
         let drafts = self.drafts.read().await;
@@ -981,6 +1120,43 @@ impl AutoOnboardManager {
         limiters.remove(device_id);
 
         Ok(())
+    }
+
+    /// Clear Pending drafts that belong to a now-registered identity.
+    ///
+    /// Matches the draft map key **or** `claimed_identity` (association-exception
+    /// candidates keep a non-colliding map key but still claim the real id).
+    /// Used by BLE provision / re-provision so a pre-BLE MQTT discovery draft
+    /// does not linger in Pending after the same SN is formally registered.
+    pub async fn remove_drafts_for_identity(&self, device_id: &str) -> usize {
+        let mut drafts = self.drafts.write().await;
+        let keys: Vec<String> = drafts
+            .iter()
+            .filter(|(key, draft)| {
+                key.as_str() == device_id
+                    || draft.device_id == device_id
+                    || draft.claimed_identity.as_deref() == Some(device_id)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let removed = keys.len();
+        for key in &keys {
+            drafts.remove(key);
+        }
+        drop(drafts);
+
+        if removed > 0 {
+            let mut limiters = self.rate_limiters.write().await;
+            for key in &keys {
+                limiters.remove(key);
+            }
+            tracing::info!(
+                device_id = %device_id,
+                removed,
+                "Cleared discovery draft(s) for registered identity"
+            );
+        }
+        removed
     }
 
     /// Set the status of a draft device
@@ -1248,19 +1424,23 @@ impl AutoOnboardManager {
                 std::cmp::Ordering::Equal => {
                     let a_data = format!("{:?}", a.data_type);
                     let b_data = format!("{:?}", b.data_type);
-                    a_data.cmp(&b_data)
+                    a_data.cmp(&b_data).then_with(|| a.path.cmp(&b.path))
                 }
                 other => other,
             }
         });
 
+        // The path is part of every metric signature: it is the extraction
+        // identity, so same-semantics-different-paths devices must not hash
+        // to the same signature (a reused template with foreign paths
+        // extracts nothing from the new device).
         let metric_signatures = sorted_metrics
             .iter()
             .map(|m| {
                 // Convert semantic_type and data_type to strings for consistent hashing
                 let semantic_str = format!("{:?}", m.semantic_type);
                 let data_type_str = format!("{:?}", m.data_type);
-                (semantic_str, data_type_str)
+                (m.path.clone(), semantic_str, data_type_str)
             })
             .collect();
 
@@ -1504,6 +1684,7 @@ impl AutoOnboardManager {
             rate_limiters: self.rate_limiters.clone(),
             blocked_devices: self.blocked_devices.clone(),
             semantic_inference: SemanticInference::new(self.llm.clone()),
+            confirm_draft_locks: self.confirm_draft_locks.clone(),
         }
     }
 }
@@ -1576,6 +1757,31 @@ mod tests {
         assert_eq!(draft.status, DraftDeviceStatus::Registered);
     }
 
+    #[tokio::test]
+    async fn remove_drafts_for_identity_clears_key_and_claimed() {
+        let manager = create_test_manager();
+        {
+            let mut drafts = manager.drafts.write().await;
+            drafts.insert(
+                "e37d627a".into(),
+                DraftDevice::new("e37d627a".into(), "mqtt".into(), 5),
+            );
+            let mut assoc = DraftDevice::new("pending-e37d-topic".into(), "mqtt".into(), 5);
+            assoc.claimed_identity = Some("e37d627a".into());
+            drafts.insert("pending-e37d-topic".into(), assoc);
+            drafts.insert(
+                "other-device".into(),
+                DraftDevice::new("other-device".into(), "mqtt".into(), 5),
+            );
+        }
+
+        let removed = manager.remove_drafts_for_identity("e37d627a").await;
+        assert_eq!(removed, 2);
+        let drafts = manager.get_drafts().await;
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].device_id, "other-device");
+    }
+
     #[test]
     fn test_category_inference() {
         let manager = create_test_manager();
@@ -1605,6 +1811,49 @@ mod tests {
             manager.infer_category(&metrics),
             DeviceCategory::TemperatureSensor
         );
+    }
+
+    #[test]
+    fn test_type_signature_includes_paths() {
+        // Same semantics + data types under DIFFERENT paths must not collide:
+        // a reused template built from foreign paths extracts nothing from
+        // the new device (silent data loss — the reason paths are part of
+        // the signature).
+        let manager = create_test_manager();
+        let mk = |name: &str, path: &str, semantic: SemanticType| DiscoveredMetric {
+            name: name.to_string(),
+            path: path.to_string(),
+            data_type: DataType::Float,
+            semantic_type: semantic,
+            ..Default::default()
+        };
+
+        let flat = vec![
+            mk("temp", "temp", SemanticType::Temperature),
+            mk("hum", "hum", SemanticType::Humidity),
+        ];
+        let nested = vec![
+            mk(
+                "temperature",
+                "sensors.temperature",
+                SemanticType::Temperature,
+            ),
+            mk("humidity", "sensors.humidity", SemanticType::Humidity),
+        ];
+
+        let sig_flat = manager.compute_type_signature(&flat, &DeviceCategory::Unknown);
+        let sig_nested = manager.compute_type_signature(&nested, &DeviceCategory::Unknown);
+        assert_ne!(
+            sig_flat.to_hash(),
+            sig_nested.to_hash(),
+            "same semantics under different paths must not hash equal"
+        );
+        assert!(manager.compute_signature_similarity(&sig_flat, &sig_nested) < 1.0);
+
+        // Identical structure (same paths) still matches exactly
+        let sig_flat_again = manager.compute_type_signature(&flat, &DeviceCategory::Unknown);
+        assert_eq!(sig_flat.to_hash(), sig_flat_again.to_hash());
+        assert_eq!(sig_flat, sig_flat_again);
     }
 
     fn create_test_manager() -> AutoOnboardManager {

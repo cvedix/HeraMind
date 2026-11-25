@@ -410,8 +410,10 @@ pub fn resolve_server_url(headers: Option<&axum::http::HeaderMap>) -> (String, S
     //    (and the Loopback source) to teach "restart with
     //    HERAMIND_HOST=0.0.0.0" rather than silently implying the address is
     //    fine. Falls back to localhost only when no routable host exists.
-    let port = crate::server::http_bind_port();
-    let port = if port == 0 { 9375 } else { port };
+    // Prefer the live bind port (config / HERAMIND_PORT → actual listen), then
+    // the shared advertise fallback — never invent a stale hardcoded 9375 when
+    // the process already bound elsewhere.
+    let port = heramind_core::advertise::advertise_http_port();
     let host = get_server_host();
     let host_is_loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
     let source = if !host_is_loopback && crate::server::http_bind_is_loopback() {
@@ -681,7 +683,7 @@ mod tests {
         }
         h
     }
-
+    #[serial_test::serial]
     #[test]
     fn test_resolve_server_url_priority_chain() {
         const KEY: &str = "HERAMIND_SERVER_URL";
@@ -734,8 +736,13 @@ mod tests {
     /// every HTTP request carries Host, and its value just echoes the URL
     /// the client typed. A user browsing `http://localhost:9375` would
     /// otherwise trick the server into advertising localhost as the canonical URL.
+    #[serial_test::serial]
     #[test]
     fn test_resolve_server_url_host_alone_not_trusted() {
+        const KEY: &str = "HERAMIND_SERVER_URL";
+        let prev = std::env::var(KEY).ok();
+        std::env::remove_var(KEY);
+
         let (url, src) = resolve_server_url(Some(&make_headers(Some("localhost:9375"), None)));
         assert_eq!(src, ServerUrlSource::Fallback);
         assert!(
@@ -748,15 +755,30 @@ mod tests {
             "Host-only header must not yield localhost URL: {}",
             url
         );
+
+        match prev {
+            Some(v) => std::env::set_var(KEY, v),
+            None => std::env::remove_var(KEY),
+        }
     }
 
     /// `X-Forwarded-Host` alone (no X-Forwarded-Proto) is also a valid reverse-proxy signal.
+    #[serial_test::serial]
     #[test]
     fn test_resolve_server_url_forwarded_host_alone_trusted() {
+        const KEY: &str = "HERAMIND_SERVER_URL";
+        let prev = std::env::var(KEY).ok();
+        std::env::remove_var(KEY);
+
         let mut h = axum::http::HeaderMap::new();
         h.insert("x-forwarded-host", "example.com".parse().unwrap());
         let (url, src) = resolve_server_url(Some(&h));
         assert_eq!(src, ServerUrlSource::ProxyHeader);
         assert_eq!(url, "http://example.com");
+
+        match prev {
+            Some(v) => std::env::set_var(KEY, v),
+            None => std::env::remove_var(KEY),
+        }
     }
 }

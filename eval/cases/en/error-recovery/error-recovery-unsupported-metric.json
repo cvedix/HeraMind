@@ -29,8 +29,14 @@
       "shell"
     ],
     "commands": [
-      "heramind device get",
-      "heramind rule create"
+      "heramind device get"
     ]
-  }
+  },
+  "state_queries": [
+    {
+      "type": "rule_count",
+      "params": {},
+      "expected": 1
+    }
+  ]
 }

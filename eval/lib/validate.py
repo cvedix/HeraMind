@@ -23,6 +23,7 @@ KNOWN_QUERY_TYPES = {
     "agent_exists",
     "agent_status",
     "agent_execution_count",
+    "agent_config",
     "transform_exists",
     "transform_count",
     "dashboard_exists",
@@ -33,6 +34,7 @@ KNOWN_QUERY_TYPES = {
     "message_count",
     "push_enabled",
     "extension_installed",
+    "connector_exists",
     "widget_exists",
     "llm_backend_exists",
     "settings_value",
@@ -85,5 +87,14 @@ def validate_case(case: dict) -> list[str]:
             t = q.get("type", "") if isinstance(q, dict) else ""
             if t not in KNOWN_QUERY_TYPES:
                 errors.append(f"state_query type '{t}' not supported")
+
+    # Rule 6: fixture existence + state_query param contracts + assumed-device
+    # presence (offline). Imported lazily so validate.rs-parity callers that
+    # only need shape checks still work if case_precheck is absent.
+    try:
+        from case_precheck import precheck_case  # type: ignore
+    except ImportError:  # pragma: no cover
+        from eval.lib.case_precheck import precheck_case  # type: ignore
+    errors.extend(precheck_case(case))
 
     return errors

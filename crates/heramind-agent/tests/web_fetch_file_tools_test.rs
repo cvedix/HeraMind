@@ -672,6 +672,38 @@ async fn web_fetch_allows_public_ip() {
     }
 }
 
+/// Large HTML page (Wikipedia ~1.1MB Content-Length) must return a text
+/// window with `download_truncated`, not fail with "Response too large".
+#[tokio::test]
+#[ignore]
+async fn web_fetch_large_wikipedia_prefix_ok() {
+    let tool = WebFetchTool::new();
+    let result = tool
+        .execute(serde_json::json!({
+            "url": "https://zh.wikipedia.org/wiki/%E5%8E%A6%E9%97%A8%E5%B8%82",
+            "format": "text",
+            "max_length": 2000
+        }))
+        .await;
+
+    let output = assert_success(result);
+    assert!(
+        output.data["download_truncated"].as_bool().unwrap_or(false),
+        "1.1MB wiki page should hit the download cap: {}",
+        output.data
+    );
+    let content = output.data["content"].as_str().unwrap_or("");
+    assert!(!content.is_empty(), "prefix extract must be non-empty");
+    assert!(
+        !output
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Response too large"),
+        "must not hard-fail oversized bodies"
+    );
+}
+
 /// Real network test — fetches example.com
 #[tokio::test]
 #[ignore] // Run with --ignored to hit real network
@@ -921,7 +953,7 @@ async fn file_write_rejects_content_too_large() {
 }
 
 #[tokio::test]
-async fn file_edit_rejects_empty_old_string() {
+async fn file_edit_empty_old_string_appends() {
     let env = TestEnv::new();
     // Create a file first
     env.write_tool
@@ -932,20 +964,22 @@ async fn file_edit_rejects_empty_old_string() {
         .await
         .unwrap();
 
+    // v2 semantics: an EMPTY old_string (single-pair form) appends
+    // new_string to the end of the file instead of rejecting. A line
+    // separator is inserted when the file doesn't already end with one.
     let result = env
         .edit_tool
         .execute(serde_json::json!({
             "path": "test.txt",
             "old_string": "",
-            "new_string": "replaced"
+            "new_string": "appended line"
         }))
         .await
         .unwrap();
-    assert!(!result.success, "should reject empty old_string");
+    assert!(result.success, "empty old_string is append mode");
 
-    // Verify original content is intact
     let content = std::fs::read_to_string(env.data_dir.join("test.txt")).unwrap();
-    assert_eq!(content, "hello world", "file should not be modified");
+    assert_eq!(content, "hello world\nappended line");
 }
 
 #[tokio::test]
@@ -1094,7 +1128,40 @@ async fn file_edit_not_found_helpful_error() {
     let error = result.error.unwrap();
     assert!(error.contains("not found"), "error should say not found");
     assert!(
-        error.contains("preview"),
-        "should include file preview for context"
+        error.contains("First lines"),
+        "should include the file's first lines for context"
     );
+}
+
+// ============================================================================
+// web_search tests
+// ============================================================================
+
+use heramind_agent::toolkit::WebSearchTool;
+
+#[tokio::test]
+async fn web_search_rejects_missing_or_empty_query() {
+    let tool = WebSearchTool::new();
+    for bad in [serde_json::json!({}), serde_json::json!({"query": "   "})] {
+        let result = tool.execute(bad).await;
+        assert_failure(result);
+    }
+}
+
+#[tokio::test]
+#[ignore = "live network — cargo test -- --ignored"]
+async fn web_search_live_english_query() {
+    let tool = WebSearchTool::new();
+    let result = tool
+        .execute(serde_json::json!({"query": "rust programming language", "count": 5}))
+        .await
+        .unwrap();
+    assert!(result.success, "error: {:?}", result.error);
+    let results = result.data["results"].as_array().unwrap();
+    assert!(!results.is_empty(), "expected at least one result");
+    for item in results {
+        let url = item["url"].as_str().unwrap();
+        assert!(url.starts_with("http"), "bad url: {}", url);
+        assert!(!item["title"].as_str().unwrap().is_empty());
+    }
 }

@@ -45,6 +45,12 @@ redb = []
 # Settings migration support
 settings = []
 
+# Test-only seams (op-ledger corrupt helpers, ExtensionStore unreadable-row
+# insert, …). Off by default so they never ship in a release binary. Enable
+# via `--features test-utils` or transitively (`heramind-agent/test-utils`,
+# `heramind-api/testing`).
+test-utils = []
+
 # All features
 all = ["redb", "settings"]
 

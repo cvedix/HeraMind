@@ -13,6 +13,7 @@
 
 pub mod accel;
 pub mod capability_services;
+pub mod command_contract;
 pub mod context;
 pub mod event_dispatcher;
 pub mod event_subscription;
@@ -31,6 +32,22 @@ pub mod tracing;
 pub mod types;
 
 pub use capability_services::{keys, CapabilityServices};
+pub use command_contract::{
+    ai_command_access_denied, assert_supported_schema, authorize_existing_prepared,
+    authorize_prepared_for_chat, begin_instance_generation, build_input_schema,
+    claim_prepared_by_id, claim_prepared_for_dispatch, classify_and_bind_chat_invoke,
+    consume_authorized_prepared, consume_chat_prepared_for_execute, current_instance_generation,
+    find_authorized_prepared, format_ai_extension_catalog, format_extension_discovery_rules,
+    from_extension_command, invalidate_instance_capability, parse_extension_tool_name,
+    peek_prepared_invoke, prepare_and_issue_for_chat, prepare_invoke, remember_capability,
+    resolve_capability, search_ai_extension_commands, set_instance_ai_visibility,
+    sync_effect_for_invoke, sync_replay_for_invoke, type_base_of, validate_and_normalize,
+    validate_params, validated_params_example_for_command, AiCommandSearchHit,
+    AiCommandSearchParam, AiCommandSearchResult, AiCommandShellExample, BusinessCommandDef,
+    CapabilityGeneration, CapabilitySource, ChatInvokeBind, EffectiveCommandCapability,
+    ExtensionCallerKind, ExtensionCommandSnapshot, InvokeTarget, PrepareInvokeRequest,
+    PreparedInvoke, AI_COMMAND_SEARCH_MAX_CHARS, AI_COMMAND_SEARCH_MAX_HITS, CONTRACT_VERSION,
+};
 pub use context::{
     AvailableCapabilities, CapabilityError, CapabilityManifest, ExtensionCapability,
     ExtensionCapabilityProvider, ExtensionContext, ExtensionContextConfig,
@@ -57,10 +74,11 @@ pub use stream::{
     StreamDirection, StreamError, StreamMode, StreamResult, StreamSession,
 };
 pub use system::{
-    CExtensionMetadata, CommandDefinition, Extension, ExtensionCommand, ExtensionMetadata,
-    ExtensionMetricValue, ExtensionState, ExtensionStats, MetricDataType, MetricDefinition,
-    MetricDescriptor, ParamMetricValue, ParameterDefinition, ParameterGroup, PushOutputMessage,
-    ToolDescriptor, ValidationRule, ABI_VERSION,
+    CExtensionMetadata, CommandDefinition, CommandEffect, CommandExecutionKind,
+    CommandReplaySafety, Extension, ExtensionCommand, ExtensionMetadata, ExtensionMetricValue,
+    ExtensionState, ExtensionStats, MetricDataType, MetricDefinition, MetricDescriptor,
+    ParamMetricValue, ParameterDefinition, ParameterGroup, PushOutputMessage, ToolDescriptor,
+    ValidationRule, ABI_VERSION,
 };
 pub use tracing::{
     current_span_id, current_trace_id, extension_command_span, extension_load_span,

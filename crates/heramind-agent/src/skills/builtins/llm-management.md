@@ -1,6 +1,9 @@
 ---
 id: llm-management
+summary: Add and configure LLM backends.
+not_for: [API keys or system settings (settings-management / system-info)]
 name: LLM Backend Management
+aliases: [llm, model]
 description: Use when the user wants to manage LLM backends — adding/removing/activating model backends (Ollama/OpenAI/Qwen/DeepSeek), testing connections, switching default model, multimodal/vision models, API keys. Covers llm create/list/activate/test even without saying 'LLM' (e.g. '换个大模型', '配置一下模型'). Includes 大模型/模型后端/切换模型.
 category: llm
 origin: builtin
@@ -14,6 +17,31 @@ triggers:
 anti_triggers:
   keywords: [device, 设备, rule, 规则, dashboard, 仪表盘, widget develop, extension develop]
 ---
+
+# llm-management
+
+Inspect configured model backends and active runtime before changing them. Separate download/install, backend configuration, activation and live readiness.
+Use the user's chosen model and hardware constraints. Preserve sampling/context settings unless a change is requested.
+Verify the active backend and readiness after changes. A configured or downloaded model is not necessarily running.
+Stopping a model is intentional state; do not silently restart it. Load provider, runtime, or troubleshooting reference sections when needed.
+
+## Commands
+| Command | Purpose |
+|---|---|
+| `heramind llm list` | List configured LLM backends |
+| `heramind llm get <id>` | LLM backend details |
+| `heramind llm models` | List available models (from Ollama) |
+| `heramind llm create` | Create a new LLM backend |
+| `heramind llm update <id>` | Update LLM backend configuration |
+| `heramind llm delete <id>` | Delete an LLM backend |
+| `heramind llm activate <id>` | Activate a backend (set as default) |
+| `heramind llm test <id>` | Test LLM backend connection |
+
+## Detailed reference
+Use skill(action="load", id="llm-management", section="<exact returned title>") only for the needed detail. Section titles are returned with this overview.
+
+<!-- SKILL_REFERENCE -->
+
 
 # LLM Backend Management
 

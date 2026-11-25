@@ -1,0 +1,52 @@
+{
+  "id": "main-objective-e2e-detection-chain",
+  "lang": "en",
+  "category": "main-objective",
+  "workflow": "main-objective",
+  "scenario_type": "single_turn",
+  "description": "Plan E / E2E01 draft: camera detections → person-count Transform → threshold Rule → notify. Must keep ambient rule-battery-low intact and explain each link with evidence.",
+  "setup": {
+    "fixture": "seed-main-objective"
+  },
+  "turns": [
+    {
+      "user": "A simulated camera green-01 sends {\"detections\": [{\"cls\": \"person\"}, {\"cls\": \"person\"}, {\"cls\": \"cat\"}]}. Build the chain: Transform that counts person occurrences from green-01 detections, Rule that notifies when the count is above 2, enable what needs enabling. Do NOT delete or rewrite the existing rule-battery-low. Then explain each link's state with evidence (transform output field, rule condition source, whether notify is configured)."
+    }
+  ],
+  "applies": [
+    "tool_accuracy",
+    "task_completion",
+    "language_adherence"
+  ],
+  "expectations": {
+    "per_turn": [
+      "Build transform+rule notify chain on green-01 detections (person count > 2); preserve rule-battery-low; explain each link with evidence."
+    ],
+    "overall": "Plan E detection→transform→rule→notify chain created without forbidden ambient edits"
+  },
+  "expect": {
+    "tools": ["shell"]
+  },
+  "state_queries": [
+    {
+      "type": "device_exists",
+      "params": { "id": "green-01" },
+      "expected": true
+    },
+    {
+      "type": "transform_count",
+      "params": {},
+      "expected_min": 1
+    },
+    {
+      "type": "rule_count",
+      "params": {},
+      "expected_min": 2
+    },
+    {
+      "type": "rule_exists",
+      "params": { "name": "rule-battery-low" },
+      "expected": true
+    }
+  ]
+}

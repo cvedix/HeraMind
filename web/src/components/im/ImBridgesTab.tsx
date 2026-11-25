@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
-import { Send, Plus, Trash2, Copy, QrCode, Check, X, MessageSquare, Settings } from 'lucide-react'
+import { Send, Plus, Trash2, Copy, QrCode, Check, X, MessageSquare, Settings, ExternalLink } from 'lucide-react'
 import { QRCodeSVG } from 'qrcode.react'
 import { Card, CardContent, CardDescription, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -26,6 +26,33 @@ function platformDisplayName(platform: string, t: TFunction): string {
   return platform.charAt(0).toUpperCase() + platform.slice(1)
 }
 
+/**
+ * Copy-to-clipboard icon button with its own "copied" check feedback.
+ * Per-instance state so several of these (one per invite row, plus the
+ * bind-command cards) can coexist without stealing each other's checkmark.
+ */
+function CopyIconButton({ text, label, copiedToast }: { text: string; label: string; copiedToast: string }) {
+  const { t } = useTranslation(['settings'])
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = async () => {
+    try {
+      await copyToClipboard(text)
+      setCopied(true)
+      notifySuccess(copiedToast)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      notifyError(t('settings:im.copyFailed'))
+    }
+  }
+
+  return (
+    <IconButton size="sm" aria-label={label} onClick={handleCopy}>
+      {copied ? <Check className="h-4 w-4 text-success" /> : <Copy className="h-4 w-4" />}
+    </IconButton>
+  )
+}
+
 /** Normalize a backend bridge status into { label, className } for a Badge. */
 function statusBadge(status: string): { label: string; className: string } {
   const s = (status || '').toLowerCase()
@@ -38,8 +65,13 @@ function statusBadge(status: string): { label: string; className: string } {
 }
 
 export function ImBridgesTab() {
-  const { t } = useTranslation(['settings', 'common'])
+  const { t, i18n } = useTranslation(['settings', 'common'])
   const { handleError } = useErrorHandler()
+
+  // Resolve a per-locale docs map to one URL (zh* → zh, anything else → en,
+  // falling back to en). Same convention as the notification-channel editor.
+  const docsUrl = (docs?: { en: string; zh: string }) =>
+    docs ? ((i18n.language.toLowerCase().startsWith('zh') ? docs.zh : docs.en) || docs.en) : null
 
   const [view, setView] = useState<View>('list')
   const [loading, setLoading] = useState(true)
@@ -58,9 +90,8 @@ export function ImBridgesTab() {
   const [selectedPlatform, setSelectedPlatform] = useState<ImPlatformDef | null>(null)
   const [creating, setCreating] = useState(false)
 
-  // Invite generation + clipboard
+  // Invite generation
   const [generating, setGenerating] = useState(false)
-  const [copiedLink, setCopiedLink] = useState(false)
 
   useEffect(() => {
     loadBridges()
@@ -205,17 +236,6 @@ export function ImBridgesTab() {
     }
   }
 
-  const handleCopyLink = async (text: string) => {
-    try {
-      await copyToClipboard(text)
-      setCopiedLink(true)
-      notifySuccess(t('settings:im.linkCopied'))
-      setTimeout(() => setCopiedLink(false), 2000)
-    } catch {
-      notifyError(t('settings:im.copyFailed'))
-    }
-  }
-
   if (loading) {
     return <LoadingState variant="page" text={t('common:loading', { defaultValue: 'Loading...' })} />
   }
@@ -223,6 +243,7 @@ export function ImBridgesTab() {
   // ========== CONFIGURE VIEW (add-flow step 2) ==========
   if (view === 'configure' && selectedPlatform) {
     const PlatformIcon = selectedPlatform.icon
+    const guideUrl = docsUrl(selectedPlatform.docs)
     return (
       <>
         <ListToolbar
@@ -235,6 +256,18 @@ export function ImBridgesTab() {
         />
         <Card>
           <CardContent className="pt-6">
+            {/* How to obtain the credential values this form asks for */}
+            {guideUrl && (
+              <a
+                href={guideUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1.5 text-xs text-info hover:underline mb-4"
+              >
+                <ExternalLink className="h-3.5 w-3.5 shrink-0" />
+                {t('settings:im.howToGet')}
+              </a>
+            )}
             <PlatformConfigForm
               fields={selectedPlatform.fields}
               onSubmit={handleCreate}
@@ -257,7 +290,7 @@ export function ImBridgesTab() {
   if (view === 'list') {
     const available = IM_PLATFORMS.filter(p => p.available)
     return (
-      <div className="grid gap-4 grid-cols-[repeat(auto-fill,minmax(max(25%_-_1rem,260px),1fr))]">
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-[repeat(auto-fill,minmax(max(25%_-_1rem,260px),1fr))] md:gap-4">
         {available.map(def => {
           const PlatformIcon = def.icon
           const bridge = bridges.find(b => b.platform === def.id)
@@ -265,32 +298,32 @@ export function ImBridgesTab() {
           return (
             <Card
               key={def.id}
-              className="cursor-pointer transition-all duration-normal hover:shadow-md"
+              className="cursor-pointer rounded-2xl border border-border bg-card transition-[background-color,transform,box-shadow] active:scale-[0.99] active:bg-muted md:rounded-xl md:hover:shadow-md"
               onClick={() => (bridge ? openDetail(bridge) : handlePlatformSelect(def))}
             >
-              <CardContent className="p-4">
+              <CardContent className="px-4 py-3 md:p-4">
                 <div className="flex items-start gap-3">
-                  <div className={cn('flex items-center justify-center h-10 w-10 rounded-lg shrink-0', def.iconBg)}>
+                  <div className={cn('flex h-10 w-10 shrink-0 items-center justify-center rounded-lg', def.iconBg)}>
                     <PlatformIcon className="h-5 w-5" />
                   </div>
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
-                      <CardTitle className="text-base truncate min-w-0">{t(def.nameKey)}</CardTitle>
+                      <CardTitle className="min-w-0 truncate text-base">{t(def.nameKey)}</CardTitle>
                       {bridge && st ? (
-                        <Badge className={cn('text-xs border shrink-0', st.className)}>{st.label}</Badge>
+                        <Badge className={cn('shrink-0 border text-xs', st.className)}>{st.label}</Badge>
                       ) : (
-                        <Badge className="text-xs border shrink-0 bg-muted-30 text-muted-foreground border-border">
+                        <Badge className="shrink-0 border border-border bg-muted-30 text-xs text-muted-foreground">
                           {t('settings:im.notConfigured')}
                         </Badge>
                       )}
                     </div>
-                    <CardDescription className="mt-1 text-xs line-clamp-1">
+                    <CardDescription className="mt-1 line-clamp-1 text-xs">
                       {t(def.descriptionKey)}
                     </CardDescription>
                   </div>
                 </div>
                 {bridge && (
-                  <div className="mt-3 flex items-center justify-end gap-1">
+                  <div className="mt-3 hidden items-center justify-end gap-1 md:flex">
                     <IconButton
                       size="sm"
                       aria-label={t('settings:im.manage')}
@@ -304,7 +337,7 @@ export function ImBridgesTab() {
                     <IconButton
                       size="sm"
                       aria-label={t('common:delete', { defaultValue: 'Delete' })}
-                      className="hover:text-error hover:bg-error-light"
+                      className="hover:bg-error-light hover:text-error"
                       onClick={(e: React.MouseEvent) => {
                         e.stopPropagation()
                         handleDelete(bridge)
@@ -326,6 +359,7 @@ export function ImBridgesTab() {
   if (view === 'detail' && selectedBridge) {
     const st = statusBadge(selectedBridge.status)
     const deepLink = lastInvite?.deep_link ?? null
+    const guideUrl = docsUrl(getPlatformDef(selectedBridge.platform)?.docs)
     return (
       <>
         <ListToolbar
@@ -347,6 +381,18 @@ export function ImBridgesTab() {
             <div className="min-w-0">
               <h3 className="text-base font-semibold">{t('settings:im.invites')}</h3>
               <p className="text-sm text-muted-foreground mt-0.5">{t('settings:im.invitesDesc')}</p>
+              {/* What to DO with an invite: the /start pairing steps live in the same wiki guide */}
+              {guideUrl && (
+                <a
+                  href={guideUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1.5 text-xs text-info hover:underline mt-1"
+                >
+                  <ExternalLink className="h-3.5 w-3.5 shrink-0" />
+                  {t('settings:im.howToPair')}
+                </a>
+              )}
             </div>
             <Button onClick={handleGenerateInvite} disabled={generating}>
               {generating ? <QrCode className="mr-2 h-4 w-4 animate-pulse" /> : <Plus className="mr-2 h-4 w-4" />}
@@ -375,13 +421,11 @@ export function ImBridgesTab() {
                       <code className="flex-1 min-w-0 truncate text-xs font-mono bg-muted-30 px-2 py-1 rounded">
                         {deepLink}
                       </code>
-                      <IconButton
-                        size="sm"
-                        aria-label={t('settings:im.copyLink', { defaultValue: 'Copy link' })}
-                        onClick={() => handleCopyLink(deepLink)}
-                      >
-                        {copiedLink ? <Check className="h-4 w-4 text-success" /> : <Copy className="h-4 w-4" />}
-                      </IconButton>
+                      <CopyIconButton
+                        text={deepLink}
+                        label={t('settings:im.copyLink', { defaultValue: 'Copy link' })}
+                        copiedToast={t('settings:im.linkCopied')}
+                      />
                     </div>
                   </div>
                 </div>
@@ -390,43 +434,42 @@ export function ImBridgesTab() {
           )}
 
           {/* Invite generated but no deep link / QR available.
-              Two distinct causes:
-              (a) Telegram: the bot was not identified yet (token not validated
-                  / username unknown) — show a generic "not ready" note.
-              (b) Feishu: there is no deep-link concept at all; the user binds
-                  a chat by sending the bot `/start <token>` manually. Without
-                  this branch the invite card silently disappears after a
-                  "generate" success, looking broken. */}
+              The token is still the only way to bind a chat — `/start <token>`
+              is handled platform-agnostically by the backend router (before
+              the allowlist guard), so always surface the command with a copy
+              button; only the hint text differs:
+              (a) Feishu: no deep-link concept at all, by design.
+              (b) Telegram (or any platform) with the bot not yet identified
+                  (token not validated / username unknown). */}
           {lastInvite && !deepLink && (
             <Card className="mb-3 border-dashed">
               <CardContent className="py-4">
-                {selectedBridge.platform === 'feishu' ? (
-                  <div className="flex items-start gap-2 text-sm text-muted-foreground">
-                    <MessageSquare className="h-4 w-4 mt-0.5 shrink-0" />
-                    <div className="min-w-0 flex-1">
-                      <p>{t('settings:im.feishuBindHint')}</p>
-                      <div className="mt-2 flex items-center gap-2">
-                        <code className="flex-1 min-w-0 truncate text-xs font-mono bg-muted-30 px-2 py-1 rounded">
-                          /start {lastInvite.token}
-                        </code>
-                        <IconButton
-                          size="sm"
-                          aria-label={t('settings:im.copyLink', { defaultValue: 'Copy link' })}
-                          onClick={() => handleCopyLink(`/start ${lastInvite.token}`)}
-                        >
-                          {copiedLink ? <Check className="h-4 w-4 text-success" /> : <Copy className="h-4 w-4" />}
-                        </IconButton>
-                      </div>
+                <div className="flex items-start gap-2 text-sm text-muted-foreground">
+                  <MessageSquare className="h-4 w-4 mt-0.5 shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <p>
+                      {selectedBridge.platform === 'feishu'
+                        ? t('settings:im.feishuBindHint')
+                        : t('settings:im.manualBindHint', {
+                            defaultValue:
+                              'Deep link is unavailable until the bot is identified. Send the bot the following command to bind this chat:',
+                          })}
+                    </p>
+                    <div className="mt-2 flex items-center gap-2">
+                      <code
+                        className="flex-1 min-w-0 truncate text-xs font-mono bg-muted-30 px-2 py-1 rounded"
+                        title={`/start ${lastInvite.token}`}
+                      >
+                        /start {lastInvite.token}
+                      </code>
+                      <CopyIconButton
+                        text={`/start ${lastInvite.token}`}
+                        label={t('settings:im.copyCommand', { defaultValue: 'Copy command' })}
+                        copiedToast={t('settings:im.commandCopied')}
+                      />
                     </div>
                   </div>
-                ) : (
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <QrCode className="h-4 w-4" />
-                    {t('settings:im.deepLinkUnavailable', {
-                      defaultValue: 'Deep link is unavailable until the bot is identified.',
-                    })}
-                  </div>
-                )}
+                </div>
               </CardContent>
             </Card>
           )}
@@ -437,7 +480,6 @@ export function ImBridgesTab() {
             <Card className="border-dashed">
               <CardContent className="py-6">
                 <EmptyState
-                  icon={<QrCode className="h-10 w-10" />}
                   title={t('settings:im.noInvites')}
                   description={t('settings:im.noInvitesDesc')}
                 />
@@ -446,14 +488,21 @@ export function ImBridgesTab() {
           ) : (
             <div className="space-y-2">
               {invites.map(inv => {
-                const short = inv.token.length > 10 ? `${inv.token.slice(0, 8)}…` : inv.token
                 return (
                   <Card key={inv.token}>
                     <CardContent className="py-3">
                       <div className="flex items-center justify-between gap-3">
                         <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <code className="text-xs font-mono">{short}</code>
+                          <div className="flex items-center gap-2 flex-wrap min-w-0">
+                            {/* Full token in the DOM (CSS-truncated, title on
+                                hover): the generate-time card with its copy
+                                button is gone once the user leaves this view,
+                                so this list is the only place an old invite's
+                                token can still be recovered — keep it complete
+                                and copyable. */}
+                            <code className="text-xs font-mono truncate min-w-0" title={inv.token}>
+                              {inv.token}
+                            </code>
                             {inv.used ? (
                               <Badge className="bg-success-light text-success border-success-light text-xs">
                                 {t('settings:im.used')}
@@ -461,21 +510,28 @@ export function ImBridgesTab() {
                             ) : (
                               <Badge variant="secondary" className="text-xs">{t('settings:im.unused')}</Badge>
                             )}
-                            {inv.used && inv.bound_chat_id && (
-                              <span className="text-xs text-muted-foreground">
-                                {t('settings:im.boundTo', { chatId: inv.bound_chat_id })}
-                              </span>
-                            )}
                           </div>
+                          {inv.used && inv.bound_chat_id && (
+                            <span className="text-xs text-muted-foreground">
+                              {t('settings:im.boundTo', { chatId: inv.bound_chat_id })}
+                            </span>
+                          )}
                         </div>
-                        <IconButton
-                          size="sm"
-                          aria-label={t('settings:im.revoke', { defaultValue: 'Revoke' })}
-                          className="hover:text-error hover:bg-error-light"
-                          onClick={() => handleRevoke(inv.token)}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </IconButton>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <CopyIconButton
+                            text={inv.token}
+                            label={t('settings:im.copyToken', { defaultValue: 'Copy token' })}
+                            copiedToast={t('settings:im.tokenCopied')}
+                          />
+                          <IconButton
+                            size="sm"
+                            aria-label={t('settings:im.revoke', { defaultValue: 'Revoke' })}
+                            className="hover:text-error hover:bg-error-light"
+                            onClick={() => handleRevoke(inv.token)}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </IconButton>
+                        </div>
                       </div>
                     </CardContent>
                   </Card>
@@ -498,7 +554,6 @@ export function ImBridgesTab() {
             <Card className="border-dashed">
               <CardContent className="py-6">
                 <EmptyState
-                  icon={<Send className="h-10 w-10" />}
                   title={t('settings:im.noAllowlist')}
                   description={t('settings:im.noAllowlistDesc')}
                 />

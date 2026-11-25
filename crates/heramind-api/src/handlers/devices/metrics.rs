@@ -11,6 +11,7 @@ use serde_json::json;
 use heramind_devices::{DataPoint, MetricValue};
 
 use super::models::SendCommandRequest;
+use crate::automation::metric_publish;
 use crate::handlers::{
     common::{ok, HandlerResult},
     ServerState,
@@ -38,11 +39,31 @@ pub async fn send_command_handler(
     Path((device_id, command)): Path<(String, String)>,
     Json(req): Json<SendCommandRequest>,
 ) -> HandlerResult<serde_json::Value> {
+    // Shared preflight with schema feedback: a wrong command name lists the
+    // template's commands, wrong params return the offending command's
+    // schema (types/required/allowed_values/min/max/default/unit) in `hint`,
+    // which the CLI appends to error output — every caller (HTTP, CLI, chat
+    // via shell) gets the same corrective loop. DeviceService validation
+    // remains the authority below.
+    if let Some(config) = state.devices.service.get_device(&device_id) {
+        if let Some(template) = state.devices.service.get_template(&config.device_type) {
+            let catalog = heramind_devices::command_validation::catalog_from_template(&template);
+            if let Err(pf) =
+                heramind_devices::command_validation::preflight(&catalog, &command, &req.params)
+            {
+                let mut err =
+                    ErrorResponse::bad_request(format!("Failed to send command: {}", pf.message));
+                err.hint = pf.hint;
+                return Err(err);
+            }
+        }
+    }
+
     // Use DeviceService.send_command which accepts HashMap<String, serde_json::Value>
-    state
+    let (_value, delivery) = state
         .devices
         .service
-        .send_command(&device_id, &command, req.params)
+        .send_command_reported(&device_id, &command, req.params)
         .await
         .map_err(|e| ErrorResponse::bad_request(format!("Failed to send command: {:?}", e)))?;
 
@@ -50,6 +71,8 @@ pub async fn send_command_handler(
         "device_id": device_id,
         "command": command,
         "sent": true,
+        "delivery": serde_json::to_value(&delivery).unwrap_or(serde_json::Value::Null),
+        "delivery_note": delivery.describe(),
     }))
 }
 
@@ -141,21 +164,7 @@ pub async fn write_metric_handler(
     // device's last_seen never advanced (a REST-fed device showed offline
     // despite fresh data).
     if let Some(bus) = &state.core.event_bus {
-        let core_value = match &metric_value {
-            MetricValue::Float(f) => heramind_core::MetricValue::Float(*f),
-            MetricValue::Integer(i) => heramind_core::MetricValue::Integer(*i),
-            MetricValue::Boolean(b) => heramind_core::MetricValue::Boolean(*b),
-            MetricValue::String(s) => heramind_core::MetricValue::String(s.clone()),
-            // devices-side has no Json variant; Binary/Null degrade to a JSON
-            // null payload (same degradation the webhook adapter applies);
-            // Array serializes into the JSON variant.
-            MetricValue::Array(items) => heramind_core::MetricValue::Json(
-                serde_json::to_value(items).unwrap_or(serde_json::json!(null)),
-            ),
-            MetricValue::Binary(_) | MetricValue::Null => {
-                heramind_core::MetricValue::Json(serde_json::json!(null))
-            }
-        };
+        let core_value = metric_publish::devices_to_core(&metric_value);
         let event_device_id = device_id.clone();
         let event_metric = req.metric.clone();
         let event_ts = timestamp_secs;

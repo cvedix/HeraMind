@@ -20,7 +20,25 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 /// One model entry in the remote catalog (mirrors `models/catalog.json`).
-#[derive(Debug, Clone, Deserialize)]
+/// Default for [`CatalogModel::format`] — everything predating the format
+/// contract is GGUF.
+fn default_catalog_format() -> String {
+    "gguf".to_string()
+}
+
+/// Shape check for a catalog `format` value: lowercase ascii/digits/hyphen,
+/// 2-16 chars. Open-ended on PURPOSE (vendors keep appearing — rkllm today,
+/// others later): an UNKNOWN-but-well-formed format must parse fine and be
+/// surfaced as "unsupported on this platform" by the eligibility layer, not
+/// break catalog loading. Only malformed strings are rejected (entry
+/// skipped + warned).
+pub fn format_is_wellformed(f: &str) -> bool {
+    (2..=16).contains(&f.len())
+        && f.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct CatalogModel {
     pub id: String,
     #[serde(rename = "name")]
@@ -28,6 +46,21 @@ pub struct CatalogModel {
     pub file_name: String,
     pub sha256: String,
     pub quant: String,
+    /// Model package format (open string, see [`format_is_wellformed`]).
+    /// Absent in older catalogs → "gguf".
+    #[serde(default = "default_catalog_format")]
+    pub format: String,
+    /// SoC/board constraints for hardware-specific formats (e.g.
+    /// `["rk3588", "rk3572"]`). `None`/empty = runs anywhere the format is
+    /// supported. Parsed + exposed now; host-eligibility filtering arrives
+    /// with the first hardware-specific model.
+    #[serde(default)]
+    pub target_hardware: Option<Vec<String>>,
+    /// Minimum llama.cpp runtime tag (e.g. "b11960") — downloads are
+    /// refused with guidance while the active runtime is older. `None` = no
+    /// floor. Compared with `tag_cmp` (b-prefixed numeric ordering).
+    #[serde(default)]
+    pub min_runtime: Option<String>,
     pub hf_repo: String,
     pub hf_file: String,
     pub size_bytes: u64,
@@ -55,6 +88,24 @@ pub struct CatalogModel {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub top_k: Option<u32>,
+    /// min_p override (llama.cpp default 0.05); absent = server default.
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// repeat_penalty override (llama.cpp default 1.0 = off); absent =
+    /// server default.
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
+    /// Vision projector shipped with the model; absent = text-only (and in
+    /// pre-mmproj catalogs — resolve_model inherits from the compiled-in
+    /// registry entry of the same id so a stale remote catalog can't
+    /// silently disable vision).
+    #[serde(default)]
+    pub mmproj: Option<heramind_core::builtin_llm::manifest::MmprojSource>,
+    /// Instance role: absent = main chat model; `Some("vlm")` = vision
+    /// companion (own port, never the active chat backend). Pre-role
+    /// catalogs parse as all-main — safe default.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// Catalog fetch target. The Runtimes repo's `models/catalog.json` on the
@@ -65,7 +116,8 @@ pub const CATALOG_URL: &str =
     "https://raw.githubusercontent.com/camthink-ai/NeoMind-Runtimes/main/models/catalog.json";
 
 fn catalog_url() -> String {
-    std::env::var("HERAMIND_CATALOG_URL").unwrap_or_else(|_| CATALOG_URL.to_string())
+    // Settings layer (mirror config) > env > default — see `sources.rs`.
+    super::sources::catalog_url()
 }
 // Short TTL: catalog edits on GitHub should reach users on refresh-ish
 // timescales (the "add a model = edit the JSON" flow), while still shielding
@@ -147,7 +199,23 @@ async fn fetch_catalog_uncached() -> Option<Vec<CatalogModel>> {
             return None;
         }
     };
-    Some(parsed.models)
+    // Shape-check `format` per entry: an unknown-but-wellformed vendor
+    // format (rkllm, a future dxnn, …) MUST survive parsing — it becomes an
+    // "unsupported on this platform" entry later. Only malformed strings
+    // (spaces, uppercase, …) are dropped, and they drop alone.
+    let models: Vec<CatalogModel> = parsed
+        .models
+        .into_iter()
+        .filter(|m| {
+            let ok = format_is_wellformed(&m.format);
+            if !ok {
+                tracing::warn!(id = %m.id, format = %m.format,
+                    "catalog: entry has a malformed format string — skipping");
+            }
+            ok
+        })
+        .collect();
+    Some(models)
 }
 
 #[derive(Deserialize)]
@@ -161,4 +229,105 @@ pub fn catalog_model(id: &str) -> Option<CatalogModel> {
     let guard = cache().read().ok()?;
     let models = guard.as_ref()?.1.as_ref()?;
     models.iter().find(|m| m.id == id).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mmproj extension must parse from real catalog JSON (the Runtimes
+    /// file ships this shape since catalog_version 11) — and pre-mmproj
+    /// entries must keep parsing (serde default, no deny_unknown_fields).
+    /// Locks the JSON key names against the `MmprojSource` field names: a
+    /// rename on either side silently turns every vision entry into
+    /// text-only.
+    #[test]
+    fn catalog_json_with_and_without_mmproj_parses() {
+        let raw = r#"{"catalog_version": 11, "schema": "heramind-model-catalog/v1", "models": [
+            {"id":"gemma4-e2b","name":"Gemma4-E2B","file_name":"m.gguf","sha256":"aa",
+             "quant":"q4_0","hf_repo":"r","hf_file":"m.gguf","size_bytes":1,
+             "default_ctx":8192,
+             "mmproj":{"file_name":"mm.gguf","sha256":"bb","hf_repo":"r",
+                        "hf_file":"mm.gguf","size_bytes":2}},
+            {"id":"old","name":"Old","file_name":"o.gguf","sha256":"cc",
+             "quant":"q4_0","hf_repo":"r","hf_file":"o.gguf","size_bytes":1,
+             "default_ctx":8192},
+            {"id":"minicpm-v-4.7-1b","name":"MiniCPM-V-4.7-1B","file_name":"v.gguf","sha256":"dd",
+             "quant":"q4_k_m","hf_repo":"r","hf_file":"v.gguf","size_bytes":3,
+             "default_ctx":32768,"role":"vlm"}
+        ]}"#;
+        let parsed: CatalogRoot = serde_json::from_str(raw).expect("catalog parses");
+        assert_eq!(parsed.models.len(), 3);
+        let mm = parsed.models[0].mmproj.as_ref().expect("mmproj parsed");
+        assert_eq!(mm.file_name, "mm.gguf");
+        assert_eq!(mm.sha256, "bb");
+        assert_eq!(mm.hf_repo, "r");
+        assert_eq!(mm.hf_file, "mm.gguf");
+        assert_eq!(mm.size_bytes, 2);
+        assert!(
+            parsed.models[1].mmproj.is_none(),
+            "entry without mmproj must parse to None"
+        );
+        assert_eq!(parsed.models[1].role, None, "main model has no role");
+        assert_eq!(
+            parsed.models[2].role.as_deref(),
+            Some("vlm"),
+            "companion role must parse"
+        );
+        // Entries without a format field default to gguf.
+        assert_eq!(parsed.models[1].format, "gguf");
+    }
+
+    #[test]
+    fn format_shape_rules() {
+        for good in ["gguf", "rkllm", "rkllm2", "dxnn", "a-b9"] {
+            assert!(format_is_wellformed(good), "{good}");
+        }
+        for bad in [
+            "",
+            "g",
+            "GGUF",
+            "rk llm",
+            "rk_llm",
+            "rkllm/",
+            "waytoolongformatstring",
+        ] {
+            assert!(!format_is_wellformed(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn unknown_vendor_formats_parse_and_malformed_entries_drop_alone() {
+        let raw = r#"{"models":[
+            {"id":"rk","name":"RK","file_name":"llm.rkllm","sha256":"aa",
+             "quant":"w4a16","format":"rkllm","target_hardware":["rk3588","rk3572"],
+             "hf_repo":"r","hf_file":"llm.rkllm","size_bytes":1,"default_ctx":8192},
+            {"id":"dx","name":"DX","file_name":"llm.dxnn","sha256":"bb",
+             "quant":"w4","format":"dxnn",
+             "hf_repo":"r","hf_file":"llm.dxnn","size_bytes":1,"default_ctx":8192},
+            {"id":"bad","name":"Bad","file_name":"x","sha256":"cc",
+             "quant":"q4_0","format":"Not A Format",
+             "hf_repo":"r","hf_file":"x","size_bytes":1,"default_ctx":8192},
+            {"id":"gg","name":"GG","file_name":"g.gguf","sha256":"dd",
+             "quant":"q4_0","hf_repo":"r","hf_file":"g.gguf","size_bytes":1,
+             "default_ctx":8192}
+        ]}"#;
+        let parsed: CatalogRoot = serde_json::from_str(raw).expect("parses");
+        let kept: Vec<&CatalogModel> = parsed
+            .models
+            .iter()
+            .filter(|m| format_is_wellformed(&m.format))
+            .collect();
+        // The future vendor formats parse — forward compatibility is the
+        // whole point of the open string.
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0].format, "rkllm");
+        assert_eq!(
+            kept[0].target_hardware.as_deref(),
+            Some(["rk3588".to_string(), "rk3572".to_string()].as_slice())
+        );
+        assert_eq!(kept[1].format, "dxnn");
+        // Untouched gguf entries keep working regardless.
+        assert_eq!(kept[2].format, "gguf");
+    }
 }

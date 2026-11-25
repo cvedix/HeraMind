@@ -34,6 +34,7 @@ async-trait = { workspace = true }
 async-stream = { workspace = true }
 async-channel = { version = "2", optional = true }
 base64 = { workspace = true }
+regex = { workspace = true }
 tempfile = { workspace = true }
 semver = { workspace = true }
 bcrypt = { workspace = true, optional = true }
@@ -42,6 +43,8 @@ bcrypt = { workspace = true, optional = true }
 default = ["mqtt"]
 mqtt = ["rumqttc", "rustls", "rustls-pki-types", "rustls-pemfile", "rustls-native-certs", "async-channel"]
 embedded-broker = ["rmqtt", "bcrypt"]
+# Test-only helpers (synthetic broker slots). Never enable in production binaries.
+test-utils = []
 all = ["mqtt", "embedded-broker"]
 
 [dev-dependencies]

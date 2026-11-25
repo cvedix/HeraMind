@@ -1,3 +1,4 @@
+import { contextUsageSnapshot, type ContextTokenUsage } from '@/lib/contextUsage'
 /**
  * PanelChatView - Independent chat interface for the global side panel
  *
@@ -8,16 +9,22 @@
  * session history).
  */
 
-import { useState, useRef, useEffect, useCallback, useReducer, useMemo } from "react"
+import { useState, useRef, useEffect, useCallback, useMemo } from "react"
 import { useTranslation } from "react-i18next"
 import { useStore } from "@/store"
 import { BuiltinModelWizard } from "@/components/llm/BuiltinModelWizard"
 import { generateId } from "@/lib/id"
 import { ws } from "@/lib/websocket"
 import { api } from "@/lib/api"
-import type { ServerMessage, Message } from "@/types"
-import type { StreamProgress as StreamProgressType } from "@/types"
+import type {
+  AuthorizeNewOperationRequest,
+  ChatContentNode,
+  ChatImage,
+  ChatReference,
+  Message,
+} from "@/types"
 import { filterPartialMessages, mergeMessagesForDisplay as mergeAssistantMessages } from "@/lib/messageUtils"
+import { useChatStream } from "@/hooks/useChatStream"
 import {
   selectLlmBackendState,
   selectChatActions,
@@ -28,9 +35,27 @@ import { pickPageAssistant, panelSessionKey, profileFingerprint, readStoredPanel
 import { useLocation } from "react-router-dom"
 import { ChatMessages } from "./ChatMessages"
 import { ChatComposer } from "./ChatComposer"
+import {
+  contentNodesToComposerFields,
+  loadSessionDraft,
+  markDraftForRetry,
+  normalizeContentNodes,
+  saveSessionDraft,
+  canHydrateDraftIntoEditor,
+  composerReplaceTextOnly,
+  settlePendingDraft,
+  stashPendingDraft,
+  validateSendContent,
+} from "@/lib/chat/contentProtocol"
+import {
+  resolveAuthorizeNewOperationForSend,
+  toAuthorizeRequest,
+  type AuthorizeNewOperationConfirm,
+} from "@/lib/chat/authorizeNewOperation"
+import { AuthorizeConfirmBar } from "./AuthorizeConfirmBar"
+import { ChatScrollPill } from "./ChatScrollPill"
 import { X, Minimize2, Bot, Plus, Settings, Cpu, Download } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import type { ChatImage } from "@/types"
 
 /** Pin at most this many page-matched skills per send (prompt-budget guard). */
 const MAX_PINNED_SKILLS = 5
@@ -53,133 +78,6 @@ interface PanelChatViewProps {
   onStreamingChange: (streaming: boolean) => void
   showMinimize?: boolean
   onNavigateToSettings?: () => void
-}
-
-// Stream state - same structure as ChatContainer
-interface StreamState {
-  isStreaming: boolean
-  streamingContent: string
-  streamingThinking: string
-  // Per-round thinking for grouped rendering (completed rounds, keyed by round)
-  streamingRoundThinking: Record<number, string>
-  streamingToolCalls: any[]
-  streamProgress: StreamProgressType
-  currentPlanStep: string
-  roundContents: Record<number, string>
-  currentRound: number
-}
-
-type StreamAction =
-  | { type: 'START_STREAM' }
-  | { type: 'THINKING'; content: string }
-  | { type: 'CONTENT'; content: string }
-  | { type: 'TOOL_START'; tool: string; arguments?: any; round?: number }
-  | { type: 'TOOL_END'; tool: string; result: any }
-  | { type: 'PROGRESS'; progress: Partial<StreamProgressType> }
-  | { type: 'PLAN'; step: string }
-  | { type: 'WARNING'; message: string }
-  | { type: 'ROUND_END' }
-  | { type: 'END_STREAM' }
-  | { type: 'ERROR' }
-  | { type: 'RESET' }
-
-const initialStreamState: StreamState = {
-  isStreaming: false,
-  streamingContent: "",
-  streamingThinking: "",
-  streamingRoundThinking: {},
-  streamingToolCalls: [],
-  streamProgress: {
-    elapsed: 0,
-    stage: 'thinking',
-    warnings: [],
-    remainingTime: 300,
-  },
-  currentPlanStep: "",
-  roundContents: {},
-  currentRound: 1,
-}
-
-function streamReducer(state: StreamState, action: StreamAction): StreamState {
-  switch (action.type) {
-    case 'START_STREAM':
-      return { ...state, isStreaming: true }
-    case 'THINKING':
-      return {
-        ...state,
-        isStreaming: true,
-        streamingThinking: state.streamingThinking + action.content,
-        streamingRoundThinking: {
-          ...state.streamingRoundThinking,
-          [state.currentRound]: (state.streamingRoundThinking[state.currentRound] || "") + action.content,
-        },
-        streamProgress: { ...state.streamProgress, stage: 'thinking' },
-      }
-    case 'CONTENT':
-      return {
-        ...state,
-        isStreaming: true,
-        streamingContent: state.streamingContent + action.content,
-        streamProgress: { ...state.streamProgress, stage: 'generating' },
-      }
-    case 'TOOL_START':
-      return {
-        ...state,
-        isStreaming: true,
-        streamingToolCalls: [
-          ...state.streamingToolCalls,
-          { id: generateId(), name: action.tool, arguments: action.arguments, result: null, round: action.round },
-        ],
-        streamProgress: { ...state.streamProgress, stage: 'tool_execution' },
-      }
-    case 'TOOL_END': {
-      const idx = state.streamingToolCalls.findIndex(
-        tc => tc.name === action.tool && tc.result === null
-      )
-      if (idx === -1) return state
-      const updated = [...state.streamingToolCalls]
-      updated[idx] = { ...updated[idx], result: action.result }
-      return { ...state, streamingToolCalls: updated }
-    }
-    case 'PROGRESS':
-      return {
-        ...state,
-        streamProgress: {
-          ...state.streamProgress,
-          ...action.progress,
-          warnings: action.progress.warnings ?? state.streamProgress.warnings,
-        },
-      }
-    case 'PLAN':
-      return { ...state, currentPlanStep: action.step }
-    case 'WARNING':
-      return {
-        ...state,
-        streamProgress: {
-          ...state.streamProgress,
-          warnings: [...state.streamProgress.warnings, action.message],
-        },
-      }
-    case 'ROUND_END':
-      return {
-        ...state,
-        roundContents: {
-          ...state.roundContents,
-          [state.currentRound]: state.streamingContent,
-        },
-        streamingContent: "",
-        streamingThinking: "",
-        currentRound: state.currentRound + 1,
-      }
-    case 'END_STREAM':
-      return { ...initialStreamState, isStreaming: false }
-    case 'ERROR':
-      return { ...initialStreamState, isStreaming: false }
-    case 'RESET':
-      return initialStreamState
-    default:
-      return state
-  }
 }
 
 export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavigateToSettings }: PanelChatViewProps) {
@@ -206,15 +104,176 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
   // Independent panel state — does NOT touch global messages/sessionId
   const [panelMessages, setPanelMessages] = useState<Message[]>([])
   const [isHistoryLoading, setIsHistoryLoading] = useState(true)
+  /** Session id whose detached turn this panel resumed — drives the poll.
+   *  The panel has no recovery dialog; restore is automatic. */
+  const [resumedPendingPanel, setResumedPendingPanel] = useState<string | null>(null)
   const [attachedImages, setAttachedImages] = useState<ChatImage[]>([])
   const panelSessionIdRef = useRef<string | null>(null)
+  // Session-filter binding for useChatStream. Unlike panelSessionIdRef this
+  // is NEVER nulled on page change: while a page switch finds the next
+  // session, the PREVIOUS page's turn may still be streaming on the shared
+  // socket — binding to the stale id keeps those events filtered out
+  // (null/undefined would mean "accept everything" and drive a phantom bubble).
+  // Start with a non-matching sentinel (same idea as chat page WELCOME_DETACHED).
+  const PANEL_UNBOUND = "\u0000__panel_unbound__"
+  const filterSessionIdRef = useRef<string>(PANEL_UNBOUND)
 
-  // Streaming state
-  const [streamState, dispatch] = useReducer(streamReducer, initialStreamState)
-  const [currentStreamMessageId, setCurrentStreamMessageId] = useState<string | null>(null)
-  const currentStreamMessageIdRef = useRef<string | null>(null)
+  // Shared stream state machine (the same one the chat page uses) — the
+  // panel's view-specific behavior rides the callbacks: local-message
+  // persistence (seconds-precision timestamps), reset-on-error, and the
+  // post-end reconciliation against the server's canonical history.
+  const [contextTokens, setContextTokens] = useState<ContextTokenUsage | null>(null)
+  const [contextAction, setContextAction] = useState<{
+    phase: "running" | "done" | "failed"
+    summarizedCount?: number
+  } | null>(null)
+
+  useEffect(() => {
+    if (contextAction?.phase !== "done" && contextAction?.phase !== "failed") return
+    const timer = window.setTimeout(() => setContextAction(null), 3200)
+    return () => window.clearTimeout(timer)
+  }, [contextAction])
+
+  const {
+    isStreaming,
+    hasReceivedEvent,
+    isStreamingRef,
+    streamingMessageId,
+    streamingContent,
+    streamingThinking,
+    streamingToolCalls,
+    pendingAuthorizeConfirms,
+    roundContents,
+    streamingRoundThinking,
+    currentRound,
+    beginTurn,
+    hardReset,
+    restore,
+    restoreIfBehind,
+    dismissAuthorizeConfirm,
+  } = useChatStream({
+    onContextCompacted: (count) => {
+      // Post-compact tokenUsage is applied via onTokenUsage when present.
+      setContextAction({ phase: "done", summarizedCount: count })
+    },
+    onTokenUsage: (usage) => setContextTokens(usage),
+    // Drop events from other sessions — the chat page shares this socket.
+    // See filterSessionIdRef: intentionally never cleared on page change.
+    sessionId: filterSessionIdRef.current,
+    onCancelled: () => {
+      // Cross-view cancel: stop the pending-poll before its next 3s tick
+      // resurrects a ghost stream from a deleted snapshot.
+      setResumedPendingPanel(null)
+    },
+    onEnd: (result) => {
+      setResumedPendingPanel(null)
+      if (result.interrupted) {
+        // The accumulator was reset mid-turn — the local assembly holds a
+        // tail only. Skip it and force-adopt the server's full message
+        // (the reconcile below skips when lengths match, which they would
+        // for a truncated single message — hence this dedicated path).
+        const sid = panelSessionIdRef.current
+        if (sid) {
+          api.getSessionHistory(sid, undefined, { skipErrorToast: true }).then(r => {
+            if (isStreamingRef.current) return
+            setPanelMessages(mergeAssistantMessages(r.messages || []))
+          }).catch(() => {})
+        }
+        return
+      }
+      addPanelMessage({
+        id: result.id,
+        role: "assistant",
+        content: result.content,
+        timestamp: Math.floor(Date.now() / 1000),
+        thinking: result.thinking,
+        tool_calls: result.toolCalls.length > 0 ? result.toolCalls : undefined,
+        round_contents: result.roundContents,
+        systemNotes: result.systemNotes,
+        goalStatus: result.goalStatus,
+        endReason: result.endReason,
+        round_thinking: result.roundThinking,
+      })
+      // Reconcile with the server's canonical history. The live assembly
+      // above can diverge from what the server persisted (interleaved
+      // turns, replayed round events, mid-stream remounts) — reloading
+      // converges the panel to exactly what /chat renders.
+      const sid = panelSessionIdRef.current
+      if (sid) {
+        api.getSessionHistory(sid, undefined, { skipErrorToast: true }).then(r => {
+          // A new stream started while the fetch was in flight — keep
+          // the live state; the next end reconciles again.
+          if (isStreamingRef.current) return
+          const merged = mergeAssistantMessages(r.messages || [])
+          setPanelMessages(prev =>
+            // Same turn count → the live assembly is already correct AND
+            // holds stable local ids. Adopting server ids here would
+            // change every React key and remount the whole list (the
+            // visible "snap to one message" at completion). Only take
+            // server truth when it actually diverges.
+            merged.length === prev.length ? prev : merged
+          )
+        }).catch(() => { /* keep the live assembly */ })
+      }
+    },
+    onError: (message) => {
+      addPanelMessage({
+        id: generateId(),
+        role: "assistant",
+        content: `**${t("errors.llmError")}**\n\n${message}`,
+        timestamp: Math.floor(Date.now() / 1000),
+      })
+      hardReset()
+    },
+  })
+
   const [input, setInput] = useState("")
+  const [panelReferences, setPanelReferences] = useState<ChatReference[]>([])
+  const [panelContentNodes, setPanelContentNodes] = useState<ChatContentNode[]>([])
+  /** Latest composer state — the page-change draft restore reads it without
+   *  re-running on every keystroke (E15). */
+  const panelComposerRef = useRef({
+    input,
+    references: panelReferences,
+    nodes: panelContentNodes,
+    images: attachedImages,
+  })
+  panelComposerRef.current = {
+    input,
+    references: panelReferences,
+    nodes: panelContentNodes,
+    images: attachedImages,
+  }
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const editorHostRef = useRef<HTMLElement | null>(null)
+  const [sendPhase, setSendPhase] = useState<"idle" | "preparing" | "waiting">("idle")
+  const [sendElapsedSeconds, setSendElapsedSeconds] = useState(0)
+  const sendInProgressRef = useRef(false)
+  const sendEpochRef = useRef(0)
+  const sendStartedAtRef = useRef<number | null>(null)
+  const pendingAssistantMessageIdRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (sendPhase === "idle") {
+      setSendElapsedSeconds(0)
+      sendStartedAtRef.current = null
+      pendingAssistantMessageIdRef.current = null
+      return
+    }
+    const timer = window.setInterval(() => {
+      if (sendStartedAtRef.current !== null) {
+        setSendElapsedSeconds(Math.floor((Date.now() - sendStartedAtRef.current) / 1000))
+      }
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [sendPhase])
+
+  useEffect(() => {
+    if (sendPhase === "waiting" && !isStreaming) {
+      setSendPhase("idle")
+      sendInProgressRef.current = false
+    }
+  }, [isStreaming, sendPhase])
 
   // Page context — reactive, only read when sending first message.
   // The page-scoped assistant specializes the panel per route: its
@@ -277,27 +336,104 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
   // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
-  const isStreamingRef = useRef(false)
+  const isPinnedRef = useRef(true)
+  const [showScrollPill, setShowScrollPill] = useState(false)
   const onStreamingChangeRef = useRef(onStreamingChange)
   useEffect(() => { onStreamingChangeRef.current = onStreamingChange }, [onStreamingChange])
 
   // Sync streaming state to parent
   useEffect(() => {
-    isStreamingRef.current = streamState.isStreaming
-    onStreamingChangeRef.current(streamState.isStreaming)
-  }, [streamState.isStreaming])
+    onStreamingChangeRef.current(isStreaming || sendPhase !== "idle")
+  }, [isStreaming, sendPhase])
 
-  // Auto-scroll
+  const handlePanelScroll = useCallback(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    isPinnedRef.current = distanceFromBottom < 80
+    setShowScrollPill(distanceFromBottom > 120)
+  }, [])
+
+  const scrollPanelToBottom = useCallback(() => {
+    isPinnedRef.current = true
+    setShowScrollPill(false)
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [])
+
+  // Auto-scroll — same pinning rule as the chat page: once the user scrolls
+  // up to read, streaming updates must not yank them back to the bottom.
   useEffect(() => {
+    if (!isPinnedRef.current) return
     messagesEndRef.current?.scrollIntoView({
-      behavior: streamState.isStreaming ? "smooth" : "instant",
+      behavior: isStreaming ? "smooth" : "instant",
     })
-  }, [panelMessages, streamState.streamingContent, streamState.isStreaming])
+  }, [panelMessages, streamingContent, isStreaming])
 
   // Add message to local panel state (NOT global store)
   const addPanelMessage = useCallback((msg: Message) => {
     setPanelMessages(prev => [...prev, msg])
   }, [])
+
+  // Detached-turn poll for a resumed panel turn: adopt the server snapshot
+  // when ahead; when pending clears the turn finished server-side — reload
+  // the panel history and clear the restored display.
+  useEffect(() => {
+    if (!resumedPendingPanel) return
+    // Only poll while this is still the panel's active session (page
+    // switches swap it — see the init effect's reset block).
+    if (panelSessionIdRef.current !== resumedPendingPanel) {
+      setResumedPendingPanel(null)
+      return
+    }
+    let stopped = false
+    let lastLen = -1
+    let stallTicks = 0
+    const timer = setInterval(() => {
+      if (stopped) return
+      api.getPendingStream(resumedPendingPanel).then(result => {
+        if (stopped || panelSessionIdRef.current !== resumedPendingPanel) return
+        if (result?.hasPending) {
+          // Stall guard: 60s without snapshot growth = server died mid-turn.
+          // Tool-call COUNT is part of the signature (slow tools grow no text).
+          const len = (result.content || "").length + (result.thinking || "").length
+            + (result.toolCalls?.length ?? 0)
+            + Object.values(result.roundContents || {}).reduce((a, b) => a + b.length, 0)
+          // Stall = 60s with no growth across SUCCESSFUL polls. (A previous
+          // "resultless last call ⇒ 10-minute cap" branch was dead code: the
+          // server emits a tool batch's Start/End back-to-back after
+          // execution completes, so an EXECUTING tool never appears
+          // resultless in a snapshot.)
+          if (len > lastLen) { lastLen = len; stallTicks = 0 }
+          else stallTicks += 1
+          restoreIfBehind(result.content || "", result.thinking || "",
+            { toolCalls: result.toolCalls, roundContents: result.roundContents, currentRound: result.currentRound })
+          if (stallTicks >= 20) {
+            setResumedPendingPanel(null)
+            hardReset()
+          }
+        } else {
+          setResumedPendingPanel(null)
+          hardReset()
+          api.getSessionHistory(resumedPendingPanel, undefined, { skipErrorToast: true })
+            .then(r => {
+              if (isStreamingRef.current) return
+              setPanelMessages(mergeAssistantMessages(r.messages || []))
+            }).catch(() => {})
+        }
+      }).catch(() => {
+        // Transient blip OR a dead server — both count toward the stall
+        // cap (a dead server rejects every poll; the old catch-branch
+        // polled forever). A blip resets on the next successful poll.
+        if (stopped) return
+        stallTicks += 1
+        if (stallTicks >= 20) {
+          setResumedPendingPanel(null)
+          hardReset()
+        }
+      })
+    }, 3000)
+    return () => { stopped = true; clearInterval(timer) }
+  }, [resumedPendingPanel, restoreIfBehind, hardReset, isStreamingRef])
 
   // Create a new panel session for the current page. The page profile
   // (system-prompt suffix + tool allowlist) rides the creation request —
@@ -312,12 +448,18 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
       const result = await api.createSession(cfg)
       if (result?.sessionId) {
         panelSessionIdRef.current = result.sessionId
+        setContextTokens(null)
+        filterSessionIdRef.current = result.sessionId
         writeStoredPanelSession(currentPageKeyRef.current, result.sessionId, profileFingerprint(baseAssistant))
         ws.setSessionId(result.sessionId)
-        setPanelMessages([])
+        isPinnedRef.current = true
+        setShowScrollPill(false)
+        setIsHistoryLoading(false)
+        return result.sessionId as string
       }
-    } catch { /* ignore — panel just won't work until backend is available */ }
+    } catch { /* handled by the caller; the panel can retry on the next send */ }
     setIsHistoryLoading(false)
+    return null
   }, [assistant, baseAssistant])
 
   // Initialize/re-init the panel for the current page. Runs on mount AND on
@@ -330,27 +472,71 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
     currentPageKeyRef.current = pageKey
     matchedSkillIdsRef.current = []
 
-    // Reset transient state from the previous page's conversation
+    // Reset transient state from the previous page's conversation —
+    // including a resumed poll: keyed to the OLD page's session, it would
+    // re-inject that conversation's content into the new page's panel.
     panelSessionIdRef.current = null
+        setContextTokens(null)
+    sendEpochRef.current += 1
+    sendInProgressRef.current = false
+    setSendPhase("idle")
+    isPinnedRef.current = true
+    setShowScrollPill(false)
     setPanelMessages([])
     setIsHistoryLoading(true)
-    dispatch({ type: 'RESET' })
+    setResumedPendingPanel(null)
+    hardReset()
 
     // Fingerprint-aware: a session whose creation-time profile (prompt
     // suffix / tool allowlist / language) no longer matches is dropped —
     // reusing it would silently keep the OLD specialization forever.
     // sessionFingerprint comes from the URL/i18n-derived base profile, so
     // neither dashboard edits nor store load timing can flip it.
+    // Async-chain cancellation: a fast page switch re-runs this effect
+    // (the reset block above runs synchronously), but the OLD chain's late
+    // callbacks used to still fire — stomping panelSessionIdRef with the
+    // previous page's id, restoring ITS stream, and pinning the poll key.
+    // The poll guard only cleared the key, never the restored stream state.
+    let initCancelled = false
     const persistedId = readStoredPanelSession(pageKey, sessionFingerprint)
     if (persistedId) {
+      // Draft lifecycle (E15): entering this page's conversation with an
+      // EMPTY composer restores its persisted draft (failed-send / refresh
+      // recovery). In-progress typing is never clobbered; a successful send
+      // clears the key (handleSend).
+      const cur = panelComposerRef.current
+      if (cur.input === "" && cur.references.length === 0 && cur.nodes.length === 0) {
+        const draft = loadSessionDraft(persistedId)
+        if (draft && (draft.message || draft.references.length > 0)) {
+          setInput(draft.message)
+          setPanelReferences(draft.references)
+          setPanelContentNodes(draft.contentNodes ?? [])
+        }
+      }
       // Load history for this page's persisted session
-      api.getSessionHistory(persistedId, { skipErrorToast: true }).then(result => {
+      api.getSessionHistory(persistedId, undefined, { skipErrorToast: true }).then(result => {
+        if (initCancelled) return
         panelSessionIdRef.current = persistedId
+        setContextTokens(null)
+        filterSessionIdRef.current = persistedId
         ws.setSessionId(persistedId)
         const merged = mergeAssistantMessages(result.messages || [])
         setPanelMessages(merged)
         setIsHistoryLoading(false)
+        // A turn that was generating when the page unmounted/refreshed is
+        // still running server-side; its events went to a dead socket. The
+        // panel has no recovery dialog — restore the partial answer and let
+        // the poll below carry it to completion.
+        api.getPendingStream(persistedId).then(p => {
+          if (initCancelled) return
+          if (p?.hasPending) {
+            restore(p.content || "", p.thinking || "",
+              { toolCalls: p.toolCalls, roundContents: p.roundContents, currentRound: p.currentRound })
+            setResumedPendingPanel(persistedId)
+          }
+        }).catch(() => {})
       }).catch(() => {
+        if (initCancelled) return
         // Session no longer exists — clear the bucket; a fresh one (with the
         // page profile) is created lazily on first send.
         localStorage.removeItem(panelSessionKey(pageKey))
@@ -364,145 +550,25 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
     // Best-effort skill matching for this page's domain
     if (assistant && assistant.skillKeywords.length > 0) {
       api.listSkills(1, 100).then(res => {
+        if (initCancelled) return
         matchedSkillIdsRef.current = matchSkills(res.skills || [], assistant.skillKeywords)
       }).catch(() => { /* skills stay unpinned */ })
     }
+    return () => { initCancelled = true }
   }, [location.pathname]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // New conversation handler — resets the CURRENT page's bucket
   const handleNewConversation = useCallback(async () => {
-    if (streamState.isStreaming) return
+    if (isStreaming || sendInProgressRef.current) return
     localStorage.removeItem(panelSessionKey(currentPageKeyRef.current))
     panelSessionIdRef.current = null
+        setContextTokens(null)
+    isPinnedRef.current = true
+    setShowScrollPill(false)
     setPanelMessages([])
-    dispatch({ type: 'RESET' })
+    hardReset()
     await createPanelSession()
-  }, [streamState.isStreaming, createPanelSession])
-
-  // Handle WebSocket events — all messages go to local panel state
-  useEffect(() => {
-    let streamingContentAcc = ""
-    let streamingThinkingAcc = ""
-    let streamingToolCallsAcc: any[] = []
-    let roundContentsAcc: Record<number, string> = {}
-    let currentRound = 1
-
-    const handleMessage = (data: ServerMessage) => {
-      switch (data.type) {
-        case "Thinking":
-          streamingThinkingAcc += (data.content || "")
-          dispatch({ type: 'THINKING', content: data.content || "" })
-          break
-        case "Content":
-          streamingContentAcc += (data.content || "")
-          dispatch({ type: 'CONTENT', content: data.content || "" })
-          break
-        case "ToolCallStart":
-          dispatch({ type: 'TOOL_START', tool: data.tool, arguments: data.arguments, round: data.round ?? currentRound })
-          streamingToolCallsAcc.push({
-            id: generateId(), name: data.tool, arguments: data.arguments, result: null, round: data.round ?? currentRound,
-          })
-          break
-        case "ToolCallEnd": {
-          const idx = streamingToolCallsAcc.findIndex(tc => tc.name === data.tool && tc.result === null)
-          if (idx !== -1) {
-            streamingToolCallsAcc[idx] = { ...streamingToolCallsAcc[idx], result: data.result }
-          }
-          dispatch({ type: 'TOOL_END', tool: data.tool, result: data.result })
-          break
-        }
-        case "IntermediateEnd":
-        case "intermediate_end":
-          if (streamingContentAcc) roundContentsAcc[currentRound] = streamingContentAcc
-          streamingContentAcc = ""
-          streamingThinkingAcc = ""
-          currentRound += 1
-          dispatch({ type: 'ROUND_END' })
-          break
-        case "Progress":
-          dispatch({ type: 'PROGRESS', progress: { elapsed: data.elapsed, stage: data.stage, remainingTime: data.remainingTime ?? 300 } })
-          if (data.message) dispatch({ type: 'PLAN', step: data.message })
-          break
-        case "Plan":
-          dispatch({ type: 'PLAN', step: data.step })
-          break
-        case "Warning":
-          dispatch({ type: 'WARNING', message: data.message })
-          break
-        case "cancelled":
-          // Server acknowledged __CANCEL__; no trailing 'end' is guaranteed
-          // on this path — reset stream state HERE (the local cancel path
-          // already rendered its notice; this covers cross-tab cancels).
-          dispatch({ type: 'END_STREAM' })
-          setCurrentStreamMessageId(null)
-          currentStreamMessageIdRef.current = null
-          isStreamingRef.current = false
-          break
-        case "end":
-          if (streamingContentAcc || streamingThinkingAcc || streamingToolCallsAcc.length > 0) {
-            if (streamingContentAcc) roundContentsAcc[currentRound] = streamingContentAcc
-            const hasMultipleRounds = Object.keys(roundContentsAcc).length > 1
-            // Use currentStreamMessageId as the message ID so the streaming block
-            // transitions smoothly to the saved message without flash
-            const msgId = currentStreamMessageIdRef.current || generateId()
-            addPanelMessage({
-              id: msgId,
-              role: "assistant",
-              content: streamingContentAcc,
-              timestamp: Math.floor(Date.now() / 1000),
-              thinking: streamingThinkingAcc || undefined,
-              tool_calls: streamingToolCallsAcc.length > 0 ? streamingToolCallsAcc : undefined,
-              round_contents: hasMultipleRounds ? roundContentsAcc : undefined,
-            })
-          }
-          dispatch({ type: 'END_STREAM' })
-          setCurrentStreamMessageId(null)
-          currentStreamMessageIdRef.current = null
-          streamingContentAcc = ""
-          streamingThinkingAcc = ""
-          streamingToolCallsAcc = []
-          roundContentsAcc = {}
-          currentRound = 1
-          // Reconcile with the server's canonical history. The live assembly
-          // above can diverge from what the server persisted (interleaved
-          // turns, replayed round events, mid-stream remounts) — reloading
-          // converges the panel to exactly what /chat renders.
-          const sid = panelSessionIdRef.current
-          if (sid) {
-            isStreamingRef.current = false
-            api.getSessionHistory(sid, { skipErrorToast: true }).then(result => {
-              // A new stream started while the fetch was in flight — keep
-              // the live state; the next end reconciles again.
-              if (isStreamingRef.current) return
-              const merged = mergeAssistantMessages(result.messages || [])
-              setPanelMessages(prev =>
-                // Same turn count → the live assembly is already correct AND
-                // holds stable local ids. Adopting server ids here would
-                // change every React key and remount the whole list (the
-                // visible "snap to one message" at completion). Only take
-                // server truth when it actually diverges (interleaved turns,
-                // replayed rounds).
-                merged.length === prev.length ? prev : merged
-              )
-            }).catch(() => { /* keep the live assembly */ })
-          }
-          break
-        case "Error":
-          addPanelMessage({
-            id: generateId(),
-            role: "assistant",
-            content: `**${t("errors.llmError")}**\n\n${data.message}`,
-            timestamp: Math.floor(Date.now() / 1000),
-          })
-          dispatch({ type: 'ERROR' })
-          isStreamingRef.current = false
-          break
-      }
-    }
-
-    const unsubscribe = ws.onMessage(handleMessage)
-    return () => { void unsubscribe() }
-  }, [addPanelMessage, t])
+  }, [isStreaming, createPanelSession, hardReset])
 
   // Surface connection failures that would otherwise leave the streaming
   // bubble spinning forever. With server-side detached delivery the turn
@@ -534,10 +600,7 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
       killTimer = setTimeout(() => {
         killTimer = null
         if (!isStreamingRef.current) return
-        dispatch({ type: 'ERROR' })
-        isStreamingRef.current = false
-        setCurrentStreamMessageId(null)
-        currentStreamMessageIdRef.current = null
+        hardReset()
         const content = state.errorMessage
           ? `**${t("chat.connection.authFailed")}**\n\n${state.errorMessage}`
           : `⚠️ ${t("chat.connection.interruptedSaved")}`
@@ -553,78 +616,306 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
       clearKillTimer()
       void unsubscribe()
     }
-  }, [addPanelMessage, t])
+  }, [addPanelMessage, t, hardReset, isStreamingRef])
 
   // Multimodal gate — mirrors the chat page's composer input
   const activeBackend = llmBackends.find(b => b.id === activeBackendId)
   const supportsMultimodal = activeBackend?.capabilities?.supports_multimodal ?? false
 
+  // Vision companion: same delegation rule as the main chat page — a
+  // running local VLM unlocks image upload for a text-only active model.
+  // 8s + refresh-on-focus; the poll only runs while the active model is
+  // text-only (a multimodal model passes the gate on its own).
+  const needCompanionPoll = !supportsMultimodal
+  const [companionRunning, setCompanionRunning] = useState(false)
+  useEffect(() => {
+    let alive = true
+    const check = () =>
+      api
+        .getBuiltinLlmStatus()
+        .then((s) => {
+          if (alive) setCompanionRunning(s?.companion?.running === true)
+        })
+        .catch(() => {})
+    check()
+    if (!needCompanionPoll) return () => { alive = false }
+    const timer = window.setInterval(check, 8000)
+    window.addEventListener('focus', check)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+      window.removeEventListener('focus', check)
+    }
+  }, [needCompanionPoll])
+  const imagesAllowed = supportsMultimodal || companionRunning
+  const visionDelegate = !supportsMultimodal && companionRunning
+
   // Send message — ensure session is ready before sending
-  const handleSend = useCallback(async () => {
-    const text = input.trim()
-    if ((!text && attachedImages.length === 0) || streamState.isStreaming) return
+  const handleSend = useCallback(async (overrides?: {
+    message?: string
+    authorizeNewOperation?: AuthorizeNewOperationRequest
+  }) => {
+    const text = (overrides?.message ?? input).trim()
+    if ((!text && attachedImages.length === 0) || isStreaming || sendInProgressRef.current || isHistoryLoading) return
+
+    // Authorize-confirm sends (E16) ride ONLY the phrase text + the
+    // authorizeNewOperation payload: no staged images / references / inline
+    // nodes are attached, and the user's in-progress draft is never cleared.
+    const isOverrideSend = overrides?.message !== undefined
 
     // Images need a vision-capable backend
-    if (attachedImages.length > 0 && !supportsMultimodal) {
+    if (!isOverrideSend && attachedImages.length > 0 && !imagesAllowed) {
       toast({ title: t("model.visionError"), variant: "destructive" })
       return
     }
 
-    // Ensure we have a session before sending
-    if (!panelSessionIdRef.current) {
-      await createPanelSession()
+    // Client mirror of the server's content-node caps (E14): an over-cap
+    // draft must fail HERE with the composer intact, not as a 400 after the
+    // composer was already cleared.
+    if (!isOverrideSend && panelContentNodes.some((n) => n.kind === "reference")) {
+      const capCode = validateSendContent(panelContentNodes)
+      if (capCode) {
+        // Keep editable draft for fix-and-resend — only under a real panel
+        // session (the session-less "new" bucket belongs to the chat page).
+        if (panelSessionIdRef.current) {
+          saveSessionDraft({
+            sessionId: panelSessionIdRef.current,
+            message: input,
+            references: panelReferences,
+            contentNodes: panelContentNodes.length > 0 ? panelContentNodes : undefined,
+            updatedAt: Date.now(),
+          })
+        }
+        toast({ title: t("mention.contentOverLimit"), variant: "destructive" })
+        return
+      }
     }
 
+    // Echo the user's message immediately. Session setup happens in the
+    // background, with a streaming placeholder shown until the request starts.
+    const pendingUserMessageId = generateId()
+    const pendingAssistantMessageId = generateId()
+    pendingAssistantMessageIdRef.current = pendingAssistantMessageId
+    const sendEpoch = sendEpochRef.current
+    const sentImages = !isOverrideSend && attachedImages.length > 0 ? [...attachedImages] : undefined
+    sendInProgressRef.current = true
+    sendStartedAtRef.current = Date.now()
+    setSendElapsedSeconds(0)
+    setSendPhase("preparing")
+    const sentReferences = !isOverrideSend && panelReferences.length > 0 ? [...panelReferences] : undefined
+    const hasInlineRefs = !isOverrideSend && panelContentNodes.some((n) => n.kind === "reference")
+    const sentContentNodes = hasInlineRefs ? [...panelContentNodes] : undefined
     addPanelMessage({
-      id: generateId(),
+      id: pendingUserMessageId,
       role: "user",
       content: text || "[Image]",
       timestamp: Math.floor(Date.now() / 1000),
-      images: attachedImages.length > 0 ? [...attachedImages] : undefined,
+      images: sentImages,
+      contentNodes: sentContentNodes,
     })
 
-    const sentImages = attachedImages.length > 0 ? [...attachedImages] : undefined
-    setAttachedImages([])
-    setInput("")
-    if (inputRef.current) inputRef.current.style.height = "auto"
-    dispatch({ type: 'START_STREAM' })
-    isStreamingRef.current = true
-    const streamMsgId = generateId()
-    setCurrentStreamMessageId(streamMsgId)
-    currentStreamMessageIdRef.current = streamMsgId
+    // Draft key captured BEFORE createPanelSession mints a new id — the
+    // persisted draft lives under the session the draft was saved under.
+    // Stash until wire ack so a failed send can restore (authorize-confirm
+    // never touches the user's draft).
+    const draftSession = panelSessionIdRef.current
+    const draftStash = !isOverrideSend
+      ? {
+          message: input,
+          references: panelReferences,
+          contentNodes: panelContentNodes.length > 0 ? panelContentNodes : undefined,
+          images: attachedImages,
+        }
+      : null
+    if (!isOverrideSend) {
+      setAttachedImages([])
+      setInput("")
+      setPanelReferences([])
+      setPanelContentNodes([])
+      if (inputRef.current) inputRef.current.style.height = "auto"
+    }
+
+    // Ensure we have a session before sending. This await used to happen
+    // before any UI feedback, making the first message feel unresponsive.
+    let sessionId = panelSessionIdRef.current
+    if (!sessionId) sessionId = await createPanelSession()
+    if (sendEpoch !== sendEpochRef.current) return
+    if (!sessionId) {
+      setPanelMessages(prev => prev.filter(message => message.id !== pendingUserMessageId))
+      if (draftStash) {
+        // Failed send: restore the FULL composer state and persist for
+        // refresh recovery (E15). Session-less buckets are not persisted —
+        // the "new" draft key belongs to the chat page's welcome composer.
+        setInput(draftStash.message)
+        setAttachedImages(draftStash.images)
+        setPanelReferences(draftStash.references)
+        setPanelContentNodes(draftStash.contentNodes ?? [])
+        if (draftSession) {
+          markDraftForRetry(draftSession, {
+            message: draftStash.message,
+            references: draftStash.references,
+            contentNodes: draftStash.contentNodes,
+          })
+        }
+      }
+      setSendPhase("idle")
+      sendInProgressRef.current = false
+      toast({ title: t("errors.sendMessage"), variant: "destructive" })
+      return
+    }
+
+    beginTurn(pendingAssistantMessageId)
+    setSendPhase("waiting")
     // Page-matched skills ride every send (backend pins them per message);
     // the page's system focus already lives in the session's system prompt.
     const skillIds = matchedSkillIdsRef.current.length > 0 ? [...matchedSkillIdsRef.current] : undefined
-    ws.sendMessage(text, sentImages, skillIds, undefined)
-    requestAnimationFrame(() => inputRef.current?.focus())
-  }, [input, attachedImages, streamState.isStreaming, addPanelMessage, createPanelSession, supportsMultimodal, toast, t])
+    const authorizeNewOperation =
+      overrides?.authorizeNewOperation ??
+      resolveAuthorizeNewOperationForSend(text, pendingAuthorizeConfirms) ??
+      undefined
+    const { wireOk, requestId } = ws.sendMessage(
+      text,
+      sentImages,
+      skillIds,
+      undefined,
+      sentReferences,
+      sentContentNodes,
+      authorizeNewOperation,
+    )
+    if (!isOverrideSend && draftStash && draftSession) {
+      // Keep draft by request id until server MessageReceived.
+      stashPendingDraft(requestId, draftSession, draftStash)
+      if (!wireOk) {
+        settlePendingDraft(requestId, "failed")
+        // beginTurn already armed streaming — terminal-reset without Error+end.
+        hardReset()
+        setPanelMessages(prev => prev.filter(message => message.id !== pendingUserMessageId))
+        setInput(draftStash.message)
+        setAttachedImages(draftStash.images)
+        setPanelReferences(draftStash.references)
+        setPanelContentNodes(draftStash.contentNodes ?? [])
+        setSendPhase("idle")
+        sendInProgressRef.current = false
+        toast({ title: t("errors.sendMessage"), variant: "destructive" })
+        return
+      }
+      void ws.waitForReceiveAck(requestId).then((ack) => {
+        if (ack.status === "accepted") {
+          settlePendingDraft(requestId, "accepted")
+          return
+        }
+        // rejected / timeout / queue_drop: always leave a terminal UI state.
+        hardReset()
+        setSendPhase("idle")
+        sendInProgressRef.current = false
+        // Persist under the original panel session; hydrate only if still
+        // on that session and the composer is unmodified.
+        // Drop any still-queued copy — no server clientRequestId dedupe yet.
+        // panelSessionIdRef is the LIVE panel session (not send-time close-over).
+        ws.dropPendingByRequestId(requestId)
+        const restored = settlePendingDraft(requestId, "failed")
+        if (restored) {
+          const live = panelComposerRef.current
+          const currentSession = panelSessionIdRef.current
+          const mayHydrate =
+            currentSession != null &&
+            canHydrateDraftIntoEditor(restored.sessionId, currentSession, {
+              message: live.input,
+              references: live.references,
+              contentNodes: live.nodes,
+              images: live.images,
+            })
+          if (mayHydrate) {
+            setPanelMessages(prev => prev.filter(message => message.id !== pendingUserMessageId))
+            setInput(restored.message)
+            setAttachedImages(restored.images ?? [])
+            setPanelReferences(restored.references)
+            setPanelContentNodes(restored.contentNodes ?? [])
+          }
+        }
+        toast({ title: t("errors.sendMessage"), variant: "destructive" })
+      })
+    }
+    requestAnimationFrame(() => {
+      const pm = editorHostRef.current?.querySelector<HTMLElement>(".ProseMirror")
+      if (pm) pm.focus()
+      else inputRef.current?.focus()
+    })
+  }, [input, attachedImages, panelReferences, panelContentNodes, isStreaming, isHistoryLoading, addPanelMessage, createPanelSession, imagesAllowed, toast, t, beginTurn, hardReset, pendingAuthorizeConfirms])
+
+  const handleConfirmAuthorize = useCallback((confirm: AuthorizeNewOperationConfirm) => {
+    const phrase = i18n.language?.startsWith('zh') ? '确认重跑' : 'confirm re-run'
+    dismissAuthorizeConfirm(confirm.requestId)
+    void handleSend({
+      message: phrase,
+      authorizeNewOperation: toAuthorizeRequest(confirm),
+    })
+  }, [handleSend, i18n.language, dismissAuthorizeConfirm])
 
   const filteredMessages = useMemo(() => filterPartialMessages(panelMessages), [panelMessages])
 
-  // Context estimate — mirrors the chat page's composer input
+  // Use the same per-request measurements as the full chat page.
+  // Stored UI history includes rounds omitted/compacted by the server.
   const contextUsage = useMemo(() => {
     if (filteredMessages.length === 0) return null
-    const maxContext = activeBackend?.capabilities?.max_context ?? 8192
-    const msgChars = panelMessages.reduce((sum, m) => sum + (m.content?.length ?? 0), 0)
-    const streamChars = (streamState.streamingContent?.length ?? 0) + (streamState.streamingThinking?.length ?? 0)
-      + streamState.streamingToolCalls.reduce((s, tc) => s + (tc.arguments?.length ?? 0) + (tc.result?.length ?? 0), 0)
-    return { used: Math.ceil((msgChars + streamChars) / 3), max: maxContext }
-  }, [filteredMessages.length, panelMessages, activeBackend, streamState.streamingContent, streamState.streamingThinking, streamState.streamingToolCalls])
+    return contextUsageSnapshot(contextTokens, activeBackend?.capabilities?.max_context, panelMessages.length)
+  }, [filteredMessages.length, panelMessages, activeBackend, contextTokens])
+
+  // Manual context compaction / clear — same contract as the chat page's
+  // usage-card actions (the panel shares ChatComposer).
+  const [isCompacting, setIsCompacting] = useState(false)
+
+  const handleCompact = useCallback(async () => {
+    const sid = panelSessionIdRef.current
+    if (!sid || isCompacting) return
+    setIsCompacting(true)
+    setContextAction({ phase: "running" })
+    try {
+      const r = await api.compactSession(sid)
+      if (r.summarizedMessages > 0) {
+        if (r.tokenUsage && Number.isFinite(r.tokenUsage.promptTokens)) {
+          setContextTokens(r.tokenUsage)
+        }
+        // Keep prior meter when API omits tokenUsage — clearing paints empty ring.
+      }
+      setContextAction({
+        phase: "done",
+        summarizedCount: r.summarizedMessages,
+      })
+    } catch {
+      setContextAction({ phase: "failed" })
+    } finally {
+      setIsCompacting(false)
+    }
+  }, [isCompacting])
+
+  const handleClearContext = useCallback(async () => {
+    const sid = panelSessionIdRef.current
+    if (!sid) return
+    try {
+      await api.clearSessionHistory(sid)
+      setPanelMessages([])
+      toast({ description: t("chat:context.clearDone") })
+    } catch {
+      toast({ title: t("chat:context.clearFailed"), variant: "destructive" })
+    }
+  }, [t, toast])
 
   // Cancel the in-flight request (same channel the chat page uses)
   const handleCancelRequest = useCallback(() => {
-    if (!streamState.isStreaming) return
+    if (!isStreaming) return
     ws.sendMessage("__CANCEL__", undefined)
-    dispatch({ type: 'ERROR' })
-    setCurrentStreamMessageId(null)
-    currentStreamMessageIdRef.current = null
+    hardReset()
+    // Drop the pending-poll key with the stream state (the server deletes
+    // the snapshot on __CANCEL__; a lingering key would revive a ghost).
+    setResumedPendingPanel(null)
     addPanelMessage({
       id: generateId(),
       role: "assistant",
       content: "⚠️ Request cancelled by user",
       timestamp: Math.floor(Date.now() / 1000),
     })
-  }, [streamState.isStreaming, addPanelMessage])
+  }, [isStreaming, addPanelMessage, hardReset])
 
   return (
     <div className="flex flex-col h-full bg-background">
@@ -634,11 +925,21 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
           <div className="w-8 h-8 rounded-lg bg-info-light flex items-center justify-center">
             <Bot className="h-4 w-4 text-info" />
           </div>
-          <div>
+          <div className="flex min-w-0 flex-col gap-0.5">
             <span className="text-sm font-semibold leading-tight">{t("panelTitle")}</span>
-            {isStreamingRef.current && (
-              <span className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
-                <span className="w-1.5 h-1.5 rounded-full bg-info animate-pulse" />
+            {(sendPhase !== "idle" || isStreaming) && (
+              <span className="inline-flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground" role="status" aria-live="polite">
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-info animate-pulse" />
+                {(sendPhase === "preparing" || hasReceivedEvent) && (
+                  <span className="truncate">
+                    {sendPhase === "preparing"
+                      ? t("panelStatus.preparing")
+                      : t("panelStatus.responding")}
+                  </span>
+                )}
+                {sendPhase !== "idle" && !hasReceivedEvent && (
+                  <span className="shrink-0" aria-hidden="true">· {sendElapsedSeconds}s</span>
+                )}
               </span>
             )}
           </div>
@@ -648,8 +949,8 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
             variant="ghost"
             size="icon"
             onClick={handleNewConversation}
-            disabled={streamState.isStreaming}
-            className="h-8 w-8 rounded-lg text-muted-foreground hover:text-foreground"
+            disabled={isStreaming || sendPhase !== "idle"}
+            className="h-8 w-8 rounded-lg text-muted-foreground hover:text-foreground sm:h-8 sm:w-8"
             aria-label={t("newChat", "New conversation")}
           >
             <Plus className="h-4 w-4" />
@@ -658,7 +959,7 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
             variant="ghost"
             size="icon"
             onClick={onClose}
-            className="h-8 w-8 rounded-lg text-muted-foreground hover:text-foreground"
+            className="h-8 w-8 rounded-lg text-muted-foreground hover:text-foreground sm:h-8 sm:w-8"
             aria-label={t("closePanel")}
           >
             {showMinimize ? <Minimize2 className="h-4 w-4" /> : <X className="h-4 w-4" />}
@@ -667,10 +968,12 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
       </div>
 
       {/* Messages */}
-      <div
-        ref={scrollContainerRef}
-        className="flex-1 overflow-y-auto px-4 py-5 min-h-0"
-      >
+      <div className="relative flex-1 min-h-0">
+        <div
+          ref={scrollContainerRef}
+          onScroll={handlePanelScroll}
+          className="h-full min-w-0 overflow-x-hidden overflow-y-auto px-5 py-5 sm:px-6"
+        >
         {!llmBackendLoading && (!llmBackends || llmBackends.length === 0) ? (
             <div className="flex flex-col items-center justify-center h-full gap-3 px-4">
               <div className="w-14 h-14 rounded-xl bg-primary-light text-primary flex items-center justify-center">
@@ -746,7 +1049,7 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
                 </div>
               </div>
             </div>
-          ) : filteredMessages.length === 0 && !streamState.isStreaming ? (
+          ) : filteredMessages.length === 0 && !isStreaming ? (
             <div className="flex flex-col items-center justify-center h-full gap-3 px-2">
               <div className="w-12 h-12 rounded-xl bg-muted flex items-center justify-center">
                 <Bot className="h-6 w-6 text-foreground" />
@@ -761,7 +1064,10 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
                       key={qa.label}
                       type="button"
                       onClick={() => {
-                        setInput(qa.prompt)
+                        const next = composerReplaceTextOnly(qa.prompt)
+                        setInput(next.message)
+                        setPanelReferences(next.references)
+                        setPanelContentNodes(next.contentNodes)
                         requestAnimationFrame(() => inputRef.current?.focus())
                       }}
                       className="text-left text-xs rounded-lg border border-border bg-card px-3 py-2 text-muted-foreground transition-colors hover:text-foreground hover:bg-muted-50"
@@ -776,32 +1082,68 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
             <ChatMessages
               messages={filteredMessages}
               user={user}
-              isStreaming={streamState.isStreaming && !(currentStreamMessageId && filteredMessages.some(m => m.id === currentStreamMessageId))}
-              streamingContent={streamState.streamingContent}
-              streamingThinking={streamState.streamingThinking}
-              streamingRoundThinking={streamState.streamingRoundThinking}
-              streamingToolCalls={streamState.streamingToolCalls}
-              roundContents={streamState.roundContents}
-              currentRound={streamState.currentRound}
-              streamingMessageId={currentStreamMessageId}
-              onScrollToBottom={() => {
-                const el = scrollContainerRef.current
-                if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" })
-              }}
+              isStreaming={(isStreaming || sendPhase !== "idle") && !(streamingMessageId && filteredMessages.some(m => m.id === streamingMessageId))}
+              streamingContent={streamingContent}
+              streamingThinking={streamingThinking}
+              streamingRoundThinking={streamingRoundThinking}
+              streamingToolCalls={streamingToolCalls}
+              roundContents={roundContents}
+              currentRound={currentRound}
+              streamingMessageId={pendingAssistantMessageIdRef.current || streamingMessageId}
+              streamingPlaceholder={sendPhase === "preparing" ? t("panelStatus.preparing") : undefined}
               endRef={messagesEndRef}
+              contextAction={contextAction}
+              onReuseUserMessage={(message) => {
+                const nodes =
+                  normalizeContentNodes(message.contentNodes) ??
+                  (message.content ? [{ kind: "text" as const, text: message.content }] : [])
+                const fields = contentNodesToComposerFields(nodes)
+                setInput(fields.message)
+                setPanelReferences(fields.references)
+                setPanelContentNodes(fields.contentNodes)
+                // Draft persistence is session-scoped by design — the panel
+                // never writes the shared welcome-mode "new" bucket (chat
+                // welcome restore reads it; a panel reuse draft surfacing
+                // there would be cross-context bleed). Skip when sessionless.
+                if (panelSessionIdRef.current) {
+                  saveSessionDraft({
+                    sessionId: panelSessionIdRef.current,
+                    message: fields.message,
+                    references: fields.references,
+                    contentNodes: fields.contentNodes,
+                    updatedAt: Date.now(),
+                  })
+                }
+                requestAnimationFrame(() => {
+                  const pm = editorHostRef.current?.querySelector<HTMLElement>(".ProseMirror")
+                  if (pm) pm.focus()
+                  else inputRef.current?.focus()
+                })
+              }}
             />
           )}
 
           {/* Scroll anchor */}
           <div ref={messagesEndRef} />
+        </div>
+        <ChatScrollPill
+          visible={showScrollPill}
+          hasNewContent={isStreaming || sendPhase !== "idle"}
+          onClick={scrollPanelToBottom}
+        />
       </div>
 
       {/* Input area — the shared ChatComposer, same design as the chat page */}
       <div className="px-3 pt-3 pb-4 flex-shrink-0">
+        <AuthorizeConfirmBar
+          pending={pendingAuthorizeConfirms}
+          disabled={isStreaming || isHistoryLoading || sendPhase !== "idle"}
+          onConfirm={handleConfirmAuthorize}
+        />
         <ChatComposer
           value={input}
           onChange={setInput}
-          onSend={handleSend}
+          onSend={() => { void handleSend() }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault()
@@ -810,16 +1152,26 @@ export function PanelChatView({ onClose, onStreamingChange, showMinimize, onNavi
             if (e.key === "Escape") onClose()
           }}
           textareaRef={inputRef}
+          editorHostRef={editorHostRef}
           placeholder={t("input.placeholder")}
-          isStreaming={streamState.isStreaming}
+          isStreaming={isStreaming}
+          disabled={isHistoryLoading || sendPhase !== "idle"}
           onCancel={handleCancelRequest}
           attachments={attachedImages}
           onAttachmentsChange={setAttachedImages}
-          supportsMultimodal={supportsMultimodal}
+          references={panelReferences}
+          onReferencesChange={setPanelReferences}
+          contentNodes={panelContentNodes}
+          onContentNodesChange={setPanelContentNodes}
+          supportsMultimodal={imagesAllowed}
+          visionDelegate={visionDelegate}
           backends={llmBackends}
           activeBackendId={activeBackendId}
           onActivateBackend={activateBackend}
           contextUsage={contextUsage}
+          onCompact={handleCompact}
+          onClearContext={handleClearContext}
+          compacting={isCompacting}
           maxHeight={128}
         />
       </div>

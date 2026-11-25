@@ -122,7 +122,7 @@ i18n
   .use(initReactI18next)
   .init({
     resources,
-    fallbackLng: 'vi',
+    fallbackLng: ['vi', 'en'],
     supportedLngs: ['vi', 'en', 'zh'],
     load: 'languageOnly',
     defaultNS: 'common',
@@ -139,10 +139,10 @@ i18n
   });
 
 // Keep <html lang> in sync with the active language — index.html ships a
-// static zh-CN and it was never updated, so screen readers and translation
+// static vi and it was never updated, so screen readers and translation
 // tools saw Chinese on an English UI (and vice versa after any switch).
 const applyHtmlLang = (lng: string) => {
-  document.documentElement.lang = lng.startsWith('zh') ? 'zh-CN' : lng || 'en';
+  document.documentElement.lang = lng.startsWith('zh') ? 'zh-CN' : lng || 'vi';
 };
 applyHtmlLang(i18n.language);
 i18n.on('languageChanged', applyHtmlLang);

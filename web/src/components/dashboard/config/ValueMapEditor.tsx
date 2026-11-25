@@ -12,8 +12,8 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Field } from '@/components/ui/field'
-import { CompactColorPicker, COLOR_PRESETS } from '@/components/ui/color-picker'
+import { CompactColorPicker } from '@/components/ui/color-picker'
+import { COLOR_PRESETS } from '@/components/ui/color-picker.presets'
 import { cn } from '@/lib/utils'
 
 export type LEDState = 'on' | 'off' | 'error' | 'warning' | 'unknown'
@@ -93,8 +93,8 @@ export function ValueMapEditor({ valueMap, onChange }: ValueMapEditorProps) {
             {t('valueMap.noRules')}
           </div>
         ) : (
-          valueMap.map((mapping, index) => {
-            const stateInfo = stateOptions.find(s => s.value === mapping.state)
+          valueMap.map((mapping, _index) => {
+            const _stateInfo = stateOptions.find(s => s.value === mapping.state)
             return (
               <div
                 key={mapping.id}
@@ -165,7 +165,7 @@ export function ValueMapEditor({ valueMap, onChange }: ValueMapEditorProps) {
                   variant="ghost"
                   size="sm"
                   onClick={() => removeMapping(mapping.id)}
-                  className="shrink-0 h-8 w-8 p-0 text-muted-foreground hover:text-error"
+                  className="shrink-0 h-8 w-8 p-0 text-muted-foreground hover:text-error sm:h-8 sm:w-8"
                 >
                   <Trash2 className="h-4 w-4" />
                 </Button>

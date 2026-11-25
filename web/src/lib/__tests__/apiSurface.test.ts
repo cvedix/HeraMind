@@ -1,0 +1,85 @@
+/// Runtime smoke for the api.ts split (2026-09): the barrel composes 17
+/// domain modules; static checks (tsc + member-conservation script) cover
+/// types, this guards the RUNTIME composition — every expected member is a
+/// function on the composed object, and the legacy helper exports still
+/// resolve from "@/lib/api".
+import { describe, it, expect } from 'vitest'
+import {
+  api,
+  fetchAPI,
+  getApiBase,
+  isTauriEnv,
+  setApiBase,
+  getApiKey,
+  setApiKey,
+  clearApiKey,
+  tokenManager,
+} from '@/lib/api'
+
+describe('api surface (post-split composition)', () => {
+  it('exposes the full member set — spot-check across every domain module', () => {
+    // One representative member per split module (17; system has two blocks)
+    const expected = [
+      'get', 'post', // http
+      'login', // auth
+      'getDevices', // devices
+      'getDraftDevices', 'getMessageChain', 'markMessageFalsePositive', // onboarding (the message API lives here)
+      'listMessageChannels', // channels
+      'listLlmBackends', // llm
+      'listImBridges', // imBridges
+      'getMqttStatus', // brokers
+      'listSessions', // sessions
+      'getDeviceTelemetrySummary', // telemetry
+      'checkServerUpgrade', 'bulkAcknowledgeMessages', // system (two blocks)
+      'getRule', // automation
+      'getMidTermMemory', // memory
+      'listExtensionTypes', // extensions
+      'listAgents', // agents
+      'createPushTarget', // dataPush
+    ]
+    for (const key of expected) {
+      expect(typeof (api as Record<string, unknown>)[key], `api.${key}`).toBe('function')
+    }
+  })
+
+  it('keeps the legacy helper exports importable from "@/lib/api"', () => {
+    expect(typeof fetchAPI).toBe('function')
+    expect(typeof getApiBase).toBe('function')
+    expect(typeof isTauriEnv).toBe('function')
+    expect(typeof setApiBase).toBe('function')
+    expect(typeof getApiKey).toBe('function')
+    expect(typeof setApiKey).toBe('function')
+    expect(typeof clearApiKey).toBe('function')
+    expect(tokenManager).toBeTruthy()
+  })
+
+  // A ratchet, not a snapshot. The split had to conserve the pre-split member
+  // set exactly, and every later addition to the surface has to be
+  // acknowledged here. 266 -> 267 when the agent editor's dry-run added
+  // `testAgentPreview` (bcd026fe); 267 -> 268 when the alert detail added
+  // `getMessageChain` (M2-5); 268 -> 269 when the feedback loop added
+  // `markMessageFalsePositive`; 269 -> 270 when the About tab added
+  // `refreshDataDirUsage`, the manual recompute behind the data-directory
+  // footprint — real, called members, not surface bloat. 270 -> 272 when
+  // the context-card actions added `compactSession` and `clearSessionHistory`
+  // (manual compaction endpoints backing the usage ring). 272 -> 273 when
+  // multi-model coexistence added `switchBuiltinModel` (restart?model=, the
+  // instant switch to a downloaded builtin model). 273 -> 282 when the
+  // standalone llama.cpp runtime upgrade added five members (getBuiltinRuntime,
+  // checkBuiltinRuntimeUpdate, upgradeBuiltinRuntime, revertBuiltinRuntime,
+  // setBuiltinRuntimeVariant), the mirror layer two (getLlmSources,
+  // putLlmSource), and the offline model paths two (importBuiltinModelLocal,
+  // uploadBuiltinModel) — all consumed by the LLM tab / runtime dialog.
+  // 282 -> 283 when the deliberate engine stop added `stopBuiltinLlm`
+  // (POST /api/builtin-llm/stop, backed by the persisted stop flag).
+  // 283 -> 284 when Rule detail gained `getRuleExplain`
+  // (GET /api/rules/:id/explain, why-not-triggered UI).
+  // 284 -> 285 when MQTT association-exception confirm landed
+  // (`confirmAssociationDraft`, POST .../confirm-association).
+  // 285 -> 286 when AI enable split from run enable
+  // (`setExtensionAiEnabled`, PATCH /extensions/:id/ai-enabled).
+  it('member count grows only by deliberate additions (286)', () => {
+    const keys = Object.keys(api)
+    expect(keys.length).toBe(286)
+  })
+})

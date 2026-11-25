@@ -19,6 +19,7 @@ import {
 } from "@/components/automation/dialog"
 import { Button } from "@/components/ui/button"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
+import { useIsMobile } from "@/hooks/useMobile"
 import { useTranslation } from "react-i18next"
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -102,6 +103,7 @@ interface ToolRow {
 export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter = 'all' }: ToolsPanelProps = {}) {
   const { handleError } = useErrorHandler()
   const { t } = useTranslation(["agents", "common"])
+  const isMobile = useIsMobile()
 
   const [tools, setTools] = useState<AgentToolCatalogItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -150,11 +152,26 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
   }, [searchQuery, sourceFilter])
 
   // Pagination: client-side slice of the filtered list.
+  // Mobile infinite scroll must keep prior pages visible (cumulative 0..page),
+  // matching agents.tsx / PushTargetsTab / PendingDevicesList. Desktop keeps
+  // a single-page slice so the footer pager still replaces the list.
   const total = filteredTools.length
   const pageCount = Math.max(1, Math.ceil(total / TOOLS_PAGE_SIZE))
   const safePage = Math.min(currentPage, pageCount)
   const startIdx = (safePage - 1) * TOOLS_PAGE_SIZE
-  const pagedTools = filteredTools.slice(startIdx, startIdx + TOOLS_PAGE_SIZE)
+  const pagedTools = isMobile
+    ? filteredTools.slice(0, safePage * TOOLS_PAGE_SIZE)
+    : filteredTools.slice(startIdx, startIdx + TOOLS_PAGE_SIZE)
+
+  // Desktop page changes replace the list — scroll to top so the new page is
+  // visible. Mobile appends in place; never reset scroll there.
+  const handlePageChange = useCallback((page: number) => {
+    setCurrentPage(page)
+    if (!isMobile) {
+      const scrollContainer = document.querySelector('[data-page-scroll-container]')
+      if (scrollContainer) scrollContainer.scrollTo({ top: 0 })
+    }
+  }, [isMobile])
 
   // Notify parent of pagination state for PageLayout footer (mirror SkillsPanel).
   useEffect(() => {
@@ -162,10 +179,10 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
       total,
       pageSize: TOOLS_PAGE_SIZE,
       currentPage: safePage,
-      onPageChange: (page: number) => setCurrentPage(page),
+      onPageChange: handlePageChange,
       loading,
     })
-  }, [total, safePage, loading, onPaginationChange])
+  }, [total, safePage, loading, onPaginationChange, handlePageChange])
 
   const handleView = (tool: AgentToolCatalogItem) => {
     setDialogTool(tool)
@@ -202,9 +219,10 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
   return (
     <div className="space-y-4">
       <ResponsiveTable
-        className="table-fixed"
+        className="table-fixed w-full min-w-[1320px]"
         columns={[
-          { key: "name", label: t("agents:detail.toolsColumnName", "Tool"), width: "w-[440px]" },
+          { key: "name", label: t("agents:detail.toolsColumnName", "Tool"), width: "w-[200px]" },
+          { key: "description", label: t("agents:detail.toolsColumnDesc", "Description"), width: "w-[240px]" },
           {
             key: "version",
             label: t("agents:detail.toolsColumnVersion", "Version"),
@@ -215,7 +233,8 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
             key: "source",
             label: t("agents:detail.toolsColumnSource"),
             align: "center",
-            width: "w-32",
+            width: "w-36",
+            className: "whitespace-nowrap",
           },
           {
             key: "namespace",
@@ -225,6 +244,7 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
           {
             key: "param_names",
             label: t("agents:detail.toolsColumnParams", "Parameters"),
+            width: "w-[420px]",
           },
         ]}
         data={tableData}
@@ -242,6 +262,22 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
           // source badge) keep their accent so the state stays readable.
           return row.disabled ? "bg-muted-30 text-muted-foreground" : ""
         }}
+        renderMobileBody={(rowData) => {
+          // Mobile is a catalog index: source, parameter count and version
+          // are enough here. Full schemas remain available in the detail.
+          const row = rowData as ToolRow
+          const src = resolveSource(row.source)
+          return (
+            <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+              <span className="truncate">{t(src.labelKey)}</span>
+              <span aria-hidden="true">·</span>
+              <span className="shrink-0">
+                {row.param_count} {t("agents:detail.toolsColumnParams", "Parameters")}
+              </span>
+              {row.version && <code className="ml-auto shrink-0 font-mono">v{row.version}</code>}
+            </div>
+          )
+        }}
         renderCell={(columnKey, rowData) => {
           const row = rowData
           const src = resolveSource(row.source)
@@ -253,7 +289,7 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
                 <div className="flex items-center gap-2.5 min-w-0 w-full overflow-hidden">
                   <div
                     className={cn(
-                      "w-8 h-8 rounded-lg flex items-center justify-center border shrink-0",
+                      "hidden w-8 h-8 rounded-lg items-center justify-center shrink-0 md:flex",
                       src.color
                     )}
                   >
@@ -275,16 +311,25 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
                         </span>
                       )}
                     </div>
-                    <div className="text-xs text-muted-foreground line-clamp-2 break-words overflow-hidden">
-                      {row.description}
-                    </div>
                   </div>
                 </div>
               )
 
+            case "description":
+              return row.description ? (
+                <p
+                  className="line-clamp-2 max-h-10 overflow-hidden break-words text-xs leading-5 text-muted-foreground"
+                  title={row.description}
+                >
+                  {row.description}
+                </p>
+              ) : (
+                <span className="text-xs text-muted-foreground">—</span>
+              )
+
             case "source":
               return (
-                <Badge variant="outline" className={cn("h-6 gap-1", src.color)}>
+                <Badge variant="outline" className={cn("h-6 shrink-0 gap-1 whitespace-nowrap", src.color)}>
                   <SrcIcon className="h-3 w-3" />
                   {t(src.labelKey)}
                 </Badge>
@@ -351,7 +396,7 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
               return null
           }
         }}
-        actions={[
+        actions={isMobile ? undefined : [
           {
             label: t("agents:detail.toolsActionView", "View"),
             icon: <Eye className="h-4 w-4" />,
@@ -364,7 +409,6 @@ export function ToolsPanel({ onPaginationChange, searchQuery = "", sourceFilter 
         ]}
         emptyState={
           <EmptyState
-            icon={<Wrench className="h-12 w-12" />}
             title={
               searchQuery.trim()
                 ? t("common:noResults", "No matching results")

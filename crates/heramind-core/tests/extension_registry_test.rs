@@ -94,6 +94,10 @@ impl Extension for MockExtension {
                         fixed_values: Default::default(),
                         samples: vec![],
                         parameter_groups: vec![],
+                        ai_exposed: true,
+                        effect: Default::default(),
+                        replay_safety: Default::default(),
+                        execution: Default::default(),
                     },
                     ExtensionCommand {
                         name: "get_value".to_string(),
@@ -104,6 +108,10 @@ impl Extension for MockExtension {
                         fixed_values: Default::default(),
                         samples: vec![],
                         parameter_groups: vec![],
+                        ai_exposed: true,
+                        effect: Default::default(),
+                        replay_safety: Default::default(),
+                        execution: Default::default(),
                     },
                 ]
             })
@@ -170,12 +178,14 @@ impl Extension for MockExtension {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_registry_creation() {
     let registry = ExtensionRegistry::new();
     assert_eq!(registry.count().await, 0);
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_registry_default() {
     let registry = ExtensionRegistry::default();
     assert_eq!(registry.count().await, 0);
@@ -186,6 +196,7 @@ async fn test_registry_default() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_register_extension() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -200,6 +211,7 @@ async fn test_register_extension() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_register_duplicate_extension() {
     let registry = ExtensionRegistry::new();
     let ext1 = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -223,6 +235,7 @@ async fn test_register_duplicate_extension() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_unregister_extension() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -243,6 +256,7 @@ async fn test_unregister_extension() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_unregister_nonexistent_extension() {
     let registry = ExtensionRegistry::new();
 
@@ -252,6 +266,7 @@ async fn test_unregister_nonexistent_extension() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_register_multiple_extensions() {
     let registry = ExtensionRegistry::new();
 
@@ -272,6 +287,7 @@ async fn test_register_multiple_extensions() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_get_extension() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -290,6 +306,7 @@ async fn test_get_extension() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_get_nonexistent_extension() {
     let registry = ExtensionRegistry::new();
 
@@ -298,6 +315,7 @@ async fn test_get_nonexistent_extension() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_get_extension_info() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -321,6 +339,7 @@ async fn test_get_extension_info() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_list_extensions() {
     let registry = ExtensionRegistry::new();
 
@@ -338,6 +357,7 @@ async fn test_list_extensions() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_contains_extension() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -361,6 +381,7 @@ async fn test_contains_extension() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_execute_command_success() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -383,6 +404,7 @@ async fn test_execute_command_success() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_execute_command_not_found() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -403,6 +425,7 @@ async fn test_execute_command_not_found() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_execute_command_extension_not_found() {
     let registry = ExtensionRegistry::new();
 
@@ -413,6 +436,7 @@ async fn test_execute_command_extension_not_found() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_execute_command_execution_failure() {
     let registry = ExtensionRegistry::new();
     let mock = MockExtension::new("test.ext", "Test Extension", "1.0.0");
@@ -437,6 +461,7 @@ async fn test_execute_command_execution_failure() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_health_check_success() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -456,6 +481,7 @@ async fn test_health_check_success() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_health_check_failure() {
     let registry = ExtensionRegistry::new();
     let mock = MockExtension::new("test.ext", "Test Extension", "1.0.0");
@@ -474,6 +500,7 @@ async fn test_health_check_failure() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_health_check_extension_not_found() {
     let registry = ExtensionRegistry::new();
 
@@ -486,6 +513,7 @@ async fn test_health_check_extension_not_found() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_get_current_metrics() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -511,6 +539,7 @@ async fn test_get_current_metrics() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_get_current_metrics_extension_not_found() {
     let registry = ExtensionRegistry::new();
 
@@ -519,6 +548,7 @@ async fn test_get_current_metrics_extension_not_found() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_get_stats() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -553,6 +583,7 @@ async fn test_get_stats() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_safety_manager_exists() {
     let registry = ExtensionRegistry::new();
     let safety_manager = registry.safety_manager();
@@ -564,6 +595,7 @@ async fn test_safety_manager_exists() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_trait_get_extensions() {
     use heramind_core::extension::registry::ExtensionRegistryTrait;
 
@@ -584,6 +616,7 @@ async fn test_trait_get_extensions() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_trait_get_extension() {
     use heramind_core::extension::registry::ExtensionRegistryTrait;
 
@@ -604,6 +637,7 @@ async fn test_trait_get_extension() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_trait_execute_command() {
     let registry = ExtensionRegistry::new();
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(
@@ -624,6 +658,7 @@ async fn test_trait_execute_command() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_trait_get_metrics() {
     use heramind_core::extension::registry::ExtensionRegistryTrait;
 
@@ -648,6 +683,7 @@ async fn test_trait_get_metrics() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_concurrent_registration() {
     let registry = Arc::new(ExtensionRegistry::new());
     let mut handles = vec![];
@@ -675,6 +711,7 @@ async fn test_concurrent_registration() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_concurrent_command_execution() {
     let registry = Arc::new(ExtensionRegistry::new());
     let ext = Arc::new(tokio::sync::RwLock::new(Box::new(MockExtension::new(

@@ -14,6 +14,7 @@ import {
   ChevronUp,
 } from "lucide-react"
 import { api } from "@/lib/api"
+import { resolveImageSrc } from "@/lib/imageUtils"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
 import { formatTimestamp } from "@/lib/utils/format"
 import { cn } from "@/lib/utils"
@@ -22,86 +23,11 @@ import { textMicro, badgeSize, textNano } from "@/design-system/tokens/typograph
 import type { AgentExecutionDetail, DataCollected } from "@/types"
 import { FormSection, FormSectionGroup } from "@/components/ui/form-section"
 import { UnifiedFormDialog } from "@/components/dialog/UnifiedFormDialog"
+import { AgentExecutionEvidencePanel } from "@/components/agents/AgentExecutionEvidencePanel"
 
 // ============================================================================
 // Pure helper functions (extracted from component for stable reference)
 // ============================================================================
-
-const isPureBase64 = (str: string): boolean => {
-  if (!str || str.length < 100) return false
-  const cleaned = str.trim()
-
-  if (cleaned.startsWith('http://') || cleaned.startsWith('https://') || cleaned.startsWith('/')) {
-    return false
-  }
-  if (cleaned.startsWith('data:')) {
-    return false
-  }
-
-  const base64Regex = /^[A-Za-z0-9+/=_-]+$/
-  if (!base64Regex.test(cleaned)) {
-    return false
-  }
-
-  try {
-    atob(cleaned.slice(0, 100))
-    return true
-  } catch {
-    return false
-  }
-}
-
-const detectImageFormat = (base64Data: string): { mime: string } | null => {
-  try {
-    const pureBase64 = base64Data.replace(/^data:image\/[^;]+;base64,/, '').replace(/^data:,/, '')
-    const binaryString = atob(pureBase64.slice(0, 32))
-
-    const magicBytes: Record<string, { magic: number[]; mime: string }> = {
-      png: { magic: [0x89, 0x50, 0x4E, 0x47], mime: 'image/png' },
-      jpeg: { magic: [0xFF, 0xD8, 0xFF], mime: 'image/jpeg' },
-      gif: { magic: [0x47, 0x49, 0x46], mime: 'image/gif' },
-      webp: { magic: [0x52, 0x49, 0x46, 0x46], mime: 'image/webp' },
-      bmp: { magic: [0x42, 0x4D], mime: 'image/bmp' },
-    }
-
-    for (const info of Object.values(magicBytes)) {
-      if (info.magic.every((byte, i) => binaryString.charCodeAt(i) === byte)) {
-        return { mime: info.mime }
-      }
-    }
-  } catch {
-    // Invalid base64
-  }
-  return null
-}
-
-const normalizeImageUrl = (value: unknown): string | null => {
-  if (!value) return null
-
-  const valueStr = String(value)
-  const trimmed = valueStr.trim()
-
-  if (trimmed === '-' || trimmed === 'undefined' || trimmed === 'null' || trimmed === '') {
-    return null
-  }
-
-  if (trimmed.startsWith('data:image/')) {
-    return trimmed
-  }
-
-  if (trimmed.startsWith('data:base64,')) {
-    const base64Data = trimmed.slice(12)
-    const formatInfo = detectImageFormat(base64Data) || { mime: 'image/png' }
-    return `data:${formatInfo.mime};base64,${base64Data}`
-  }
-
-  if (isPureBase64(trimmed)) {
-    const formatInfo = detectImageFormat(trimmed) || { mime: 'image/png' }
-    return `data:${formatInfo.mime};base64,${trimmed}`
-  }
-
-  return trimmed
-}
 
 const extractImageData = (data: DataCollected) => {
   const values = data.values
@@ -112,17 +38,17 @@ const extractImageData = (data: DataCollected) => {
       if (typeof item === 'object' && item !== null) {
         const obj = item as Record<string, unknown>
         for (const key of ['image_base64', 'imageBase64', 'base64', 'image_url', 'imageUrl', 'url', 'image', 'src']) {
-          const normalized = normalizeImageUrl(obj[key])
-          if (normalized) {
-            return { src: normalized, mimeType: obj.image_mime_type || obj.mimeType }
+          const src = resolveImageSrc(obj[key] as string | undefined)
+          if (src) {
+            return { src, mimeType: obj.image_mime_type || obj.mimeType }
           }
         }
       }
     }
     for (const item of values) {
       if (typeof item === 'string') {
-        const normalized = normalizeImageUrl(item)
-        if (normalized) return { src: normalized, mimeType: null }
+        const src = resolveImageSrc(item)
+        if (src) return { src, mimeType: null }
       }
     }
   }
@@ -130,16 +56,16 @@ const extractImageData = (data: DataCollected) => {
   if (typeof values === 'object') {
     const obj = values as Record<string, unknown>
     for (const key of ['image_base64', 'imageBase64', 'base64', 'image_url', 'imageUrl', 'url', 'image', 'src', 'value']) {
-      const normalized = normalizeImageUrl(obj[key])
-      if (normalized) {
-        return { src: normalized, mimeType: obj.image_mime_type || obj.mimeType }
+      const src = resolveImageSrc(obj[key] as string | undefined)
+      if (src) {
+        return { src, mimeType: obj.image_mime_type || obj.mimeType }
       }
     }
   }
 
   if (typeof values === 'string') {
-    const normalized = normalizeImageUrl(values)
-    if (normalized) return { src: normalized, mimeType: null }
+    const src = resolveImageSrc(values)
+    if (src) return { src, mimeType: null }
   }
 
   return null
@@ -290,6 +216,9 @@ export function ExecutionDetailDialog({
             </div>
           </div>
 
+          {/* Evidence: inputs/times, output, actions, failure — missing = unknown */}
+          <AgentExecutionEvidencePanel detail={execution} />
+
           {execution.error && (
             <Card className="p-2 border-error bg-muted">
               <div className="flex items-start gap-1.5 text-error">
@@ -325,13 +254,18 @@ export function ExecutionDetailDialog({
                       return (
                         <div key={idx} className="border rounded-lg overflow-hidden">
                           <div
-                            className="flex items-center justify-between p-2 bg-bg-50 cursor-pointer hover:bg-bg-80 transition-colors"
+                            className="flex items-center justify-between p-2 bg-glass cursor-pointer hover:bg-glass-heavy transition-colors"
                             onClick={() => toggleDataExpanded(idx)}
                           >
                             <div className="flex items-center gap-2 min-w-0 flex-1">
                               {hasImage && <ImageIcon className="h-4 w-4 text-accent-purple shrink-0" />}
                               <span className={cn(textNano, "font-medium truncate")}>{data.source}</span>
                               <Badge variant="outline" className={cn(badgeSize.micro, "h-4 px-1 shrink-0")}>{data.data_type}</Badge>
+                              <span className={cn(textNano, "text-muted-foreground shrink-0")}>
+                                {data.timestamp > 0
+                                  ? formatTimestamp(data.timestamp, false)
+                                  : t('agents:evidence.timeUnknown')}
+                              </span>
                             </div>
                             {dataPairs.length > 0 && (
                               isExpanded ? (
@@ -397,9 +331,14 @@ export function ExecutionDetailDialog({
                           <div className="text-xs font-medium">{step.description}</div>
                           <div className="flex items-center gap-2 mt-1">
                             <Badge variant="outline" className={cn(badgeSize.micro, "h-4 px-1")}>{step.step_type}</Badge>
-                            <span className={cn(textNano, "text-muted-foreground")}>
-                              {Math.round(step.confidence * 100)}%
-                            </span>
+                            {/* Only when the step reported one. A missing
+                                confidence is not a percentage, and rendering
+                                `undefined * 100` would say "NaN%". */}
+                            {step.confidence !== undefined && (
+                              <span className={cn(textNano, "text-muted-foreground")}>
+                                {Math.round(step.confidence * 100)}%
+                              </span>
+                            )}
                           </div>
                         </div>
                       </div>
@@ -419,7 +358,7 @@ export function ExecutionDetailDialog({
                       <div key={idx} className="p-2 bg-background rounded border">
                         <div className="text-xs font-medium mb-1">{decision.description}</div>
                         <div className="flex items-center justify-between">
-                          <span className={cn(textNano, "text-muted-foreground truncate flex-1 mr-2")}>{decision.rationale}</span>
+                          <span className={cn(textNano, "mr-2 min-w-0 flex-1 truncate text-muted-foreground")}>{decision.rationale}</span>
                           <Badge variant="secondary" className={cn(badgeSize.micro, "h-4 px-1 shrink-0")}>{decision.action}</Badge>
                         </div>
                       </div>

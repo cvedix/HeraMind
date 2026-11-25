@@ -1,31 +1,64 @@
 ---
 id: dashboard-management
+summary: Create pages, add and bind visualization components.
+not_for: [connecting devices (device-onboarding), alert conditions (rule-management)]
 name: Dashboard Management & Component Creation
+aliases: [dashboard, dashboards]
 description: Use when the user wants to create or manage dashboards and their components — creating boards, adding/removing chart/widget/gauge components, binding data sources to widgets, sharing dashboards. Covers dashboard create/update/share/add-components even without saying 'dashboard' (e.g. '做个监控面板', '把温度画出来'). Includes 仪表盘/看板/组件/绑定数据.
 category: dashboard
 origin: builtin
 priority: 85
 token_budget: 14000
 triggers:
-  keywords: [dashboard, 仪表盘, 仪表板, create dashboard, 组件, widget, component, 数据源, data source, dashboard component, dashboard widget, 绑定数据, bind data, 创建仪表盘, 监控面板, share dashboard, 共享仪表盘, add-components, 添加组件, 删除组件, remove component]
+  keywords: [dashboard, 仪表盘, 仪表板, create dashboard, 组件, widget, component, 数据源, data source, dashboard component, dashboard widget, 绑定数据, bind data, 创建仪表盘, 监控面板, share dashboard, 共享仪表盘, add-components, 添加组件, 删除组件, remove component, 显示到, 展示到, 放到首页, 上屏, show on, display on, home page, visualization, 可视化]
   tool_target:
     - tool: dashboard
       actions: [list, get, create, update, delete, share, add-components, update-component, remove-components]
     - tool: widget
       actions: [list, get]
     - tool: device
-      actions: [list, latest]
+      actions: [list, get]
     - tool: extension
-      actions: [info, list]
+      actions: [get, list]
 anti_triggers:
   keywords: [rule, 规则, agent, 代理, extension develop, 扩展开发]
 ---
 
+# dashboard-management
+
+Ask vs inspect vs mutate: how-to / layout questions → answer with zero writes; inspect with `dashboard list`/`get` and widget/device discovery; mutate only on an explicit create/update/add/remove request.
+Always `dashboard get <ID>` before adding components — read occupied rows / next free row / existing ids, then `add-components` (append). Never guess layout.
+Resize/tweak in place: keep current `position.x/y`; only patch `position.w`/`position.h` (grid units — "N行N列" means h=N,w=N). Do not ask for pixels. Prefer shell `params` object for `--set` JSON.
+Inspect available dashboards and data sources. Discover component types/schema before adding unfamiliar widgets. Bind actual device, extension, transform or AI output fields.
+Create or update the requested dashboard and widgets, then read them back. A saved dashboard does not prove every data binding has live values.
+Preserve existing layout and unrelated widgets during edits. Use resource IDs, not display labels or guessed metric paths.
+For transform outputs use transform ID and plain field. For extension sources use the format returned by component/data-source discovery.
+Load widget/layout/binding reference sections before constructing complex configuration.
+
+## Commands
+| Command | Purpose |
+|---|---|
+| `heramind dashboard list` | List all dashboards |
+| `heramind dashboard get <id>` | Dashboard details |
+| `heramind dashboard create` | Create a new dashboard |
+| `heramind dashboard update <id>` | Update name/description/layout (--components needs --replace-all) |
+| `heramind dashboard add-components <id>` (with shell `params: [...]`) | Add components (append mode) |
+| `heramind dashboard update-component <id> --component-id <cid>` (with shell `params: {...}`) | **Tweak ONE component** (deep merge — preferred) |
+| `heramind dashboard remove-components <id>` (with shell `params: ["<cid>"]`) | Remove components by ID |
+| `heramind dashboard delete <id>` | Delete a dashboard |
+| `heramind dashboard share <id>` | Share a dashboard |
+
+## Detailed reference
+Use skill(action="load", id="dashboard-management", section="<exact returned title>") only for the needed detail. Section titles are returned with this overview.
+
+<!-- SKILL_REFERENCE -->
+
+
 # Dashboard Management & Component Creation
 
-## Command Cheat-Sheet (run these via `shell`)
+## Command Cheat-Sheet (via `shell` when mutating or inspecting live state)
 
-Always RUN the command yourself and report the real output.
+Ask → answer from this guide with examples (**zero shell writes**). Inspect → read (`list`/`get`, widget/device discovery). Mutate → write only on an explicit create/update/add/remove request; then report the real output. Always `dashboard get <ID>` before adding components.
 
 | Command | Purpose |
 |---|---|
@@ -33,9 +66,9 @@ Always RUN the command yourself and report the real output.
 | `heramind dashboard get <id>` | Dashboard details |
 | `heramind dashboard create` | Create a new dashboard |
 | `heramind dashboard update <id>` | Update name/description/layout (--components needs --replace-all) |
-| `heramind dashboard add-components <id>` | Add components (append mode) |
-| `heramind dashboard update-component <id> --component-id <cid> --set '<partial JSON>'` | **Tweak ONE component** (deep merge — preferred) |
-| `heramind dashboard remove-components <id>` | Remove components by ID |
+| `heramind dashboard add-components <id>` (with shell `params: [...]`) | Add components (append mode) |
+| `heramind dashboard update-component <id> --component-id <cid>` (with shell `params: {...}`) | **Tweak ONE component** (deep merge — preferred) |
+| `heramind dashboard remove-components <id>` (with shell `params: ["<cid>"]`) | Remove components by ID |
 | `heramind dashboard delete <id>` | Delete a dashboard |
 | `heramind dashboard share <id>` | Share a dashboard |
 
@@ -47,23 +80,38 @@ Creating dashboards with data-bound components is the most complex CLI operation
 2. **Use `add-components` to add widgets** — this appends without replacing existing components
 3. **To change ONE component's fields use `update-component`** — deep-merges a partial JSON into it; no need to re-send the whole component or remove+re-add
 4. **`update --components` is GATED** — it replaces ALL components and requires the explicit `--replace-all` flag; without it the command fails. You almost never want it: ADD → `add-components`, TWEAK → `update-component`
-5. **ALWAYS `dashboard get <ID>` before adding components** — its output ends with a grid summary (occupied rows + `next free row: y=N`); place new widgets at that y. Component ids are listed too (avoid collisions)
-6. **Grid is 12 columns wide** — plan layout accordingly
-7. **NEVER use Python/pipe/file tricks** — each shell call is an isolated process; you cannot share data between calls via files, pipes, or variables. Build the complete JSON string inline.
-8. **Use `widget get <type>` to inspect config_schema** before configuring unfamiliar widgets
-9. **NEVER use emoji in component titles or descriptions** — use plain text labels only. Example: use "Temperature" not "Temperature", use "Humidity" not "Humidity"
-10. **Charts (line-chart, area-chart, bar-chart, sparkline, pie-chart) MUST use `mode: "timeseries"`** — using `mode: "latest"` on charts causes rendering errors. Always include `timeWindow` (e.g., `"timeWindow": {"type": "last_24hours"}`) for proper historical data. Value-cards and indicators use `mode: "latest"`.
+5. **ALWAYS `dashboard get <ID>` before adding components** — its output ends with a grid summary (occupied rows + `next free row: y=N`); place **new** widgets at that y. Component ids are listed too (avoid collisions). **Resize/move are different:** keep current x,y unless the user asks to move; only change `position.w`/`position.h`.
+6. **Grid is 12 columns wide** — `w`/`h` are grid units (not pixels). "大概2行2列" → shell `params` `{"position":{"w":2,"h":2}}` at the existing x,y.
+7. **Chat JSON = shell structured `params` ONLY** — preferred shape: `{ "command": "heramind dashboard add-components <ID>", "params": [ … ] }`. Never invent CLI `--params` for dashboard commands (primary flags are `--components` / `--set` / `--ids`). Do not paste huge `--components '[…]'` strings in Chat.
+8. **Batch 1–2 components per call** — verify with `dashboard get`, then append the next row. Never first-turn a 5+ chart mega-array.
+9. **NEVER put ephemeral `"data"` or `"label"` on value-card/charts** — those keys are rejected / not persisted. Live values require `data_source` (telemetry or extension-metric). Static prose → `markdown-display` + `config.content` only.
+10. **Weather / extension metrics** — `extension invoke … refresh` or `get_weather` first (shell `params` object), then bind `data_source` with `type:"extension-metric"`, `field:"COMMAND:FIELD"` (e.g. `get_weather:temperature_c`).
+11. **Use `widget get <type>` to inspect config_schema** before configuring unfamiliar widgets
+12. **NEVER use emoji in component titles or descriptions** — plain text labels only ("Temperature" / "温度", not "🌡 Temperature")
+13. **Charts MUST use `mode: "timeseries"`** with `timeWindow`. Value-cards use `mode: "latest"`.
+
+## Minimal Component Shape (the schema validators REQUIRE exactly this)
+
+```json
+{"id": "my-unique-id", "type": "value-card", "title": "Temp", "position": {"x": 0, "y": 0, "w": 4, "h": 2}}
+```
+
+- `id` + `type` + `position` are REQUIRED; `title`, `data_source`, `display`, `config` are optional.
+- `position` is an OBJECT with four required integers `x, y, w, h` — never a number or an array.
+- `type` must be a real widget type (`widget list`); a typo'd type is rejected on add.
+- CUSTOM widget (files under `frontend-components/`): register it FIRST — `heramind widget install <dir>` — then use the widget's ID as `type` (e.g. `"type": "drawing-component"`). `"custom"` is the manifest's category, NOT a valid type.
+- Unsure about the shape? `dashboard get <ID>` prints existing components — copy one and change the fields (safest for unfamiliar widget types).
 
 ## Component Management Commands
 
 | Command | Purpose |
 |---------|---------|
-| `dashboard add-components <ID> --components '<JSON>'` | **Append** new components — the reply lists added ids, confirms types verified, and gives the next free row (no follow-up get needed) |
-| `dashboard update-component <ID> --component-id c1 --set '{"title":"New"}'` | **Change fields of ONE component** (deep merge — preferred for tweaks) |
-| `dashboard remove-components <ID> --ids '["c1","c2"]'` | Remove components by ID |
-| `dashboard update <ID> --name 'New Name'` | Update metadata only (name, description) |
-| `dashboard update <ID> --replace-all --components '<JSON>'` | Replace ALL components (gated — rarely needed) |
-| `dashboard delete <ID>` | Delete entire dashboard |
+| `shell`: `command="heramind dashboard add-components <ID>"`, `params=[{...}]` (terminal CLI: `--components '<JSON>'`) | **Append** new components — the reply lists added ids, confirms types verified, and gives the next free row (no follow-up get needed) |
+| `shell`: `command="heramind dashboard update-component <ID> --component-id c1"`, `params={"title":"New"}` (terminal CLI: `--set '<JSON>'`) | **Change fields of ONE component** (deep merge — preferred for tweaks) |
+| `shell`: `command="heramind dashboard remove-components <ID>"`, `params=["c1","c2"]` (terminal CLI: `--ids '<JSON>'`) | Remove components by ID |
+| `heramind dashboard update <ID> --name 'New Name'` | Update metadata only (name, description) |
+| `shell`: `command="heramind dashboard update <ID> --replace-all"`, `params=[...]` (terminal CLI: `--components '<JSON>'`) | Replace ALL components (gated — rarely needed) |
+| `heramind dashboard delete <ID>` | Delete entire dashboard |
 
 ## Step-by-Step: Create a Data Dashboard
 
@@ -102,67 +150,75 @@ heramind dashboard create --name "Battery Monitor"
 
 ### Step 4: Add Components (RECOMMENDED)
 
-Use `add-components` — it appends without replacing existing components:
+Use shell structured `params` (1–2 cards per call). Appends without replacing existing components:
 
-```bash
-heramind dashboard add-components <DASHBOARD_ID> --components '[
-  {
-    "id": "c1",
-    "type": "value-card",
-    "title": "Temperature",
-    "position": {"x": 0, "y": 0, "w": 4, "h": 2},
-    "data_source": {
-      "type": "telemetry",
-      "source": "device",
-      "id": "sensor-001",
-      "field": "temperature",
-      "mode": "latest",
-      "sourceId": "sensor-001",
-      "metricId": "temperature",
-      "timeRange": 1,
-      "limit": 50
-    },
-    "display": {"unit": "°C", "format": ".1f"}
-  }
-]'
+```json
+{
+  "command": "heramind dashboard add-components <DASHBOARD_ID>",
+  "params": [
+    {
+      "id": "c1",
+      "type": "value-card",
+      "title": "Temperature",
+      "position": {"x": 0, "y": 0, "w": 4, "h": 2},
+      "data_source": {
+        "type": "telemetry",
+        "source": "device",
+        "id": "sensor-001",
+        "field": "temperature",
+        "mode": "latest",
+        "sourceId": "sensor-001",
+        "metricId": "temperature",
+        "timeRange": 1,
+        "limit": 50
+      },
+      "display": {"unit": "°C", "format": ".1f"}
+    }
+  ]
+}
 ```
+
+Human CLI fallback only: `# Prefer shell params:[…] — string form is Human CLI fallback only
+heramind dashboard add-components <ID> --components '[{...}]'` (never invent `--params`).
 
 ### Complete Example: Battery Dashboard
 
-```bash
-# Step 1: Discover metrics
-heramind device list
-heramind device get sensor-001
-heramind device get sensor-002
-
-# Step 2: Create dashboard
-heramind dashboard create --name 'Battery Monitor'
-
-# Step 3: Add ALL components using add-components (append mode)
-heramind dashboard add-components <DASHBOARD_ID> --components '[
-  {"id":"b1","type":"value-card","title":"Sensor 1 Battery","position":{"x":0,"y":0,"w":4,"h":2},
-   "data_source":{"type":"telemetry","source":"device","id":"sensor-001","field":"battery","mode":"latest","sourceId":"sensor-001","metricId":"battery","timeRange":1,"limit":50},
-   "display":{"unit":"%","format":".0f"}},
-  {"id":"b2","type":"value-card","title":"Sensor 2 Battery","position":{"x":4,"y":0,"w":4,"h":2},
-   "data_source":{"type":"telemetry","source":"device","id":"sensor-002","field":"battery","mode":"latest","sourceId":"sensor-002","metricId":"battery","timeRange":1,"limit":50},
-   "display":{"unit":"%","format":".0f"}},
-  {"id":"chart","type":"line-chart","title":"Battery Trends","position":{"x":0,"y":2,"w":12,"h":4},
-   "data_source":[
-     {"type":"telemetry","source":"device","id":"sensor-001","field":"battery","mode":"timeseries","sourceId":"sensor-001","metricId":"battery","timeRange":1,"limit":50,"timeWindow":{"type":"last_24hours"}},
-     {"type":"telemetry","source":"device","id":"sensor-002","field":"battery","mode":"timeseries","sourceId":"sensor-002","metricId":"battery","timeRange":1,"limit":50,"timeWindow":{"type":"last_24hours"}}
-   ],
-   "display":{"unit":"%","showLegend":true}}
-]'
-
-# Step 4: Verify
-heramind dashboard get <DASHBOARD_ID>
+1. Discover: `heramind device list` / `device get sensor-001` / `device get sensor-002`
+2. Create: `heramind dashboard create --name "Battery Monitor"`
+3. Add **two value-cards** via shell `params` array (one call, ≤2 items):
+```json
+{
+  "command": "heramind dashboard add-components <DASHBOARD_ID>",
+  "params": [
+    {"id":"b1","type":"value-card","title":"Sensor 1 Battery","position":{"x":0,"y":0,"w":4,"h":2},
+     "data_source":{"type":"telemetry","source":"device","id":"sensor-001","field":"battery","mode":"latest","sourceId":"sensor-001","metricId":"battery","timeRange":1,"limit":50},
+     "display":{"unit":"%","format":".0f"}},
+    {"id":"b2","type":"value-card","title":"Sensor 2 Battery","position":{"x":4,"y":0,"w":4,"h":2},
+     "data_source":{"type":"telemetry","source":"device","id":"sensor-002","field":"battery","mode":"latest","sourceId":"sensor-002","metricId":"battery","timeRange":1,"limit":50},
+     "display":{"unit":"%","format":".0f"}}
+  ]
+}
 ```
+4. Append the chart in a **second** call (still 1 item):
+```json
+{
+  "command": "heramind dashboard add-components <DASHBOARD_ID>",
+  "params": [
+    {"id":"chart","type":"line-chart","title":"Battery Trends","position":{"x":0,"y":2,"w":12,"h":4},
+     "data_source":[
+       {"type":"telemetry","source":"device","id":"sensor-001","field":"battery","mode":"timeseries","sourceId":"sensor-001","metricId":"battery","timeRange":1,"limit":50,"timeWindow":{"type":"last_24hours"}},
+       {"type":"telemetry","source":"device","id":"sensor-002","field":"battery","mode":"timeseries","sourceId":"sensor-002","metricId":"battery","timeRange":1,"limit":50,"timeWindow":{"type":"last_24hours"}}
+     ],
+     "display":{"unit":"%","showLegend":true}}
+  ]
+}
+```
+5. Verify: `heramind dashboard get <DASHBOARD_ID>`
 
 ### Remove Components
 
-```bash
-# Remove specific components by their IDs
-heramind dashboard remove-components <DASHBOARD_ID> --ids '["b1","chart"]'
+```json
+{ "command": "heramind dashboard remove-components <DASHBOARD_ID>", "params": ["b1","chart"] }
 ```
 
 ### Delete Dashboard
@@ -184,12 +240,27 @@ heramind dashboard update-component <ID> --component-id c3 \
 heramind dashboard update-component <ID> --component-id c1 \
   --set '{"data_source":{"id":"sensor-002","field":"humidity","metricId":"humidity"}}'
 
-# Retitle + resize + display tweak
+# Retitle + resize + display tweak (w/h = grid units; omit x/y to keep place)
 heramind dashboard update-component <ID> --component-id c2 \
   --set '{"title":"Humidity","position":{"w":6},"display":{"unit":"%"}}'
+
+# Preferred (no JSON quoting): shell tool `params` object
+# command: heramind dashboard update-component <ID> --component-id c2
+# params:  {"position":{"w":2,"h":2}}
 ```
 
-Find component IDs with `heramind dashboard get <ID>` (each component has an `id`).
+### Resize example (Chat/shell tool — copy this shape)
+
+```json
+{
+  "command": "heramind dashboard update-component <DASH_ID> --component-id <CID>",
+  "params": { "position": { "w": 2, "h": 2 } }
+}
+```
+
+`"N行N列"` / `2x2` means `h=N,w=N` grid cells. Keep current `x,y` unless the user asks to move.
+
+Find component IDs with `heramind dashboard get <ID>` (each component has an `id`). Resize = patch `w`/`h` only; do not relocate to `next free row` unless adding a new widget.
 
 ## Expression Data Source (inline computed values — NO transform needed)
 
@@ -382,6 +453,7 @@ heramind dashboard get <ID>
 # Note: find max(existing y + h) for the new y position
 
 # Step 2: Add new components (they are appended, not replaced)
+# Prefer shell params:[…] — string form is Human CLI fallback only
 heramind dashboard add-components <ID> --components '[
   {"id":"new_chart","type":"line-chart","title":"New Chart",
    "position":{"x":0,"y":4,"w":12,"h":4},
@@ -398,6 +470,7 @@ heramind extension get weather-forecast
 
 # Create dashboard with mixed sources
 heramind dashboard create --name 'Weather Comparison'
+# Prefer shell params:[…] — string form is Human CLI fallback only
 heramind dashboard add-components <ID> --components '[
   {"id":"indoor","type":"value-card","title":"Indoor Temp",
    "position":{"x":0,"y":0,"w":4,"h":2},
@@ -419,13 +492,17 @@ heramind dashboard add-components <ID> --components '[
 
 ## Static Content (no data binding)
 
-Markdown display widget for static content:
-```bash
-heramind dashboard add-components <ID> --components '[{
-  "id":"md1","type":"markdown-display","title":"Report",
-  "position":{"x":0,"y":0,"w":12,"h":4},
-  "config":{"content":"# Status\nAll systems normal"}
-}]'
+**Only** `markdown-display` + `config.content` is for static text. Never put `"data"` / `"label"` on value-card.
+
+```json
+{
+  "command": "heramind dashboard add-components <ID>",
+  "params": [{
+    "id":"md1","type":"markdown-display","title":"Report",
+    "position":{"x":0,"y":0,"w":12,"h":4},
+    "config":{"content":"# Status\nAll systems normal"}
+  }]
+}
 ```
 
 ## Share Dashboard
@@ -447,4 +524,6 @@ heramind dashboard share <ID> --expires 3600
 | Chart shows no history | mode is "latest" | Charts need `mode:"timeseries"` with `timeWindow` |
 | Position overlap | Same x,y coords | Each component needs unique position; grid is 12 columns |
 | "Dashboard not found" | Wrong dashboard ID | Run `heramind dashboard list` for valid IDs |
-| JSON parse error | Malformed JSON in --components | Validate JSON structure carefully |
+| JSON parse error | Malformed JSON in --components / string path | Prefer shell `params: […]`; add 1–2 components; fix missing `}` |
+| unexpected `--params` | Invented CLI `--params` on add-components | Use shell `params` array (maps to `--components`) — do not invent `--params` |
+| unknown field `data`/`label` | Ephemeral static payload on value-card | Use `data_source` (or markdown-display `config.content` for static text) |

@@ -117,14 +117,85 @@ export interface BuiltinModelDef {
   notes: string
   recommended: boolean
   installed: boolean
+  /** Ships a vision projector (mmproj) — images work in chat out of the box. */
+  vision?: boolean
+  /** `"vlm"` = vision companion entry (own port, never the chat backend). */
+  role?: string | null
   /** Locally imported GGUF (open catalog local channel). */
   custom?: boolean
+  /** Model package format — open string ("gguf" today; "rkllm"/vendor
+   * formats when hardware-specific models ship). Absent on older backends. */
+  format?: string
+  /** SoC/board constraints for hardware-specific formats (e.g.
+   * ["rk3588","rk3572"]); absent/empty = runs anywhere the format is
+   * supported. Display-only until the eligibility filter ships. */
+  target_hardware?: string[]
+  /** Minimum llama.cpp runtime tag (e.g. "b11960") — the wizard shows a
+   * badge and the download endpoint refuses with guidance while the active
+   * runtime is older. Absent = no floor. */
+  min_runtime?: string | null
+
+}
+
+/** Last spawn's GPU offload decision, from the backend's vram record —
+ * `ngl: null` means no `-ngl` flag was passed (llama-server default /
+ * auto-sizing skipped). Served on the status API; the note carries the
+ * why (pin / plan arithmetic / skip reason). */
+export interface GpuOffloadDecision {
+  ngl: number | null
+  total_layers: number | null
+  free_mib: number | null
+  reclaim_mib: number
+  ctx: number
+  note: string
+}
+
+
+// ---- llama.cpp runtime layer (standalone upgrades) ------------------------
+
+/** One installed/resolvable runtime (bundled binary or a versioned cache dir). */
+export interface BuiltinRuntimeEntry {
+  variant: string
+  tag: string
+  source: 'bundled' | 'cache' | 'pin-download'
+  path?: string | null
+  note?: string | null
+}
+
+/** The `runtime` block of GET /api/builtin-llm/status and GET /api/builtin-llm/runtime. */
+export interface BuiltinRuntimeInfo {
+  active: BuiltinRuntimeEntry
+  bundled: { present: boolean; tag: string | null; usable: boolean; path: string | null }
+  installed: BuiltinRuntimeEntry[]
+  detected_variant: string
+  override_variant: string | null
+  pin: string
+  recommended: { tag: string; notes_zh?: string | null; notes_en?: string | null } | null
+  update_available: boolean
+  channel: 'ok' | 'unreachable'
+  channel_error?: string | null
+  upgrading: boolean
 }
 
 export interface BuiltinLlmStatus {
   /** Whether the model GGUF is present on disk. */
   installed: boolean
   model_id: string | null
+  /** Multi-model coexistence: every downloaded model id (files kept across
+   * switches) and the one the active-model pointer selects. Switching a
+   * downloaded model is instant (restart?model=<id>) — never a re-download. */
+  installed_models?: string[]
+  active_model?: string | null
+  /** KV cache quantization of the current spawn. */
+  kv_cache?: 'q8_0' | 'f16'
+  /** Slot count of the current spawn; null = --parallel omitted (upstream default). */
+  parallel?: number | null
+  /** GPU offload facts of the main engine's last spawn (null before the
+   *  first spawn in the backend process). */
+  gpu_offload?: GpuOffloadDecision | null
+  /** Registry display name of the installed model (newer backends; the
+   * frontend keeps an id→name fallback map for older ones). */
+  model_name?: string | null
   /**
    * Derived server state:
    * - `not_configured` — model not downloaded
@@ -134,6 +205,16 @@ export interface BuiltinLlmStatus {
    * - `error`          — manifest unreadable
    */
   server_state: 'not_configured' | 'downloading' | 'running' | 'stopped' | 'error'
+  /** True when the engine was deliberately stopped via the stop API (vs.
+   *  crashed/dead): the UI offers "start" instead of implying self-healing.
+   *  Absent on older servers (treat as false). */
+  deliberately_stopped?: boolean
+  /** Failure reason when `server_state === 'error'` (bootstrap/runtime
+   *  download failure) — null otherwise. Newer backends only. */
+  error?: string | null
+  /** llama.cpp runtime layer (variant/tag/channel) — newer backends only;
+   * absent on older servers (treat as feature-missing and hide the row). */
+  runtime?: BuiltinRuntimeInfo
   /** Effective context size (override if set, else per-model default). */
   ctx?: number
   /** Explicit override from env / restart API (null = per-model default). */
@@ -145,6 +226,17 @@ export interface BuiltinLlmStatus {
   min_ram_mb?: number
   available_ram_mb?: number
   total_ram_mb?: number
+  /** Vision companion state — null when not installed or feature off. */
+  companion?: {
+    model_id: string
+    name: string
+    port: number
+    running: boolean
+    ctx?: number | null
+    kv_cache?: string
+    parallel?: number
+    gpu_offload?: GpuOffloadDecision | null
+  } | null
   downloaded_bytes: number | null
   total_bytes: number | null
 }

@@ -3,7 +3,7 @@
  *
  * Shows a FAB on all non-chat pages. Clicking opens the panel:
  * - WIDE (>=1280px): a DOCKED right column — full height, resizable width
- *   (default 400px, drag its left edge), in-flow beside the page content
+ *   (default 480px, drag its left edge), in-flow beside the page content
  *   (which squeezes).
  * - NARROW: a floating window anchored bottom-right, scale-up animation.
  *
@@ -29,9 +29,10 @@ type PanelState = "closed" | "opening" | "open" | "closing"
 // Resizable panel width (both the docked column and the floating window).
 // Right-anchored, so dragging the left edge leftward widens.
 const CHAT_WIDTH_KEY = "heramind_chat_width"
-const CHAT_WIDTH_MIN = 320
-const CHAT_WIDTH_MAX = 720
-const CHAT_WIDTH_DEFAULT = 400
+const CHAT_WIDTH_MIN = 360
+const CHAT_WIDTH_MAX = 800
+const CHAT_WIDTH_DEFAULT = 480
+const CHAT_WIDTH_LEGACY_DEFAULT = 400
 
 function useChatWidth() {
   const [width, setWidth] = useState(() => {
@@ -39,6 +40,9 @@ function useChatWidth() {
     const raw = window.localStorage.getItem(CHAT_WIDTH_KEY)
     const n = raw ? Number.parseInt(raw, 10) : NaN
     if (Number.isNaN(n)) return CHAT_WIDTH_DEFAULT
+    // 400px was the previous default; upgrade that untouched default so the
+    // panel has enough room for regular chat content after this UI update.
+    if (n === CHAT_WIDTH_LEGACY_DEFAULT) return CHAT_WIDTH_DEFAULT
     return Math.min(CHAT_WIDTH_MAX, Math.max(CHAT_WIDTH_MIN, n))
   })
   useEffect(() => {
@@ -64,7 +68,7 @@ export function GlobalChatFab() {
   const [panelState, setPanelState] = useState<PanelState>("closed")
   const [isStreaming, setIsStreaming] = useState(false)
   const location = useLocation()
-  const navigate = useNavigate()
+  const _navigate = useNavigate()
   const openSettings = useStore((s) => s.openSettings)
   const chatPanelRequest = useStore((s) => s.chatPanelRequest)
   const { t } = useTranslation("chat")
@@ -153,21 +157,23 @@ export function GlobalChatFab() {
 
   return (
     <>
-      {/* Floating action button — ink circle */}
+      {/* Floating action button — quiet utility chip. A 56px ink circle
+          out-shouted the page's primary actions; the card-styled 48px chip
+          reads as an auxiliary tool (card surface + border, muted icon)
+          that only gains presence on hover. */}
       <button
         ref={fabRef}
         onClick={isOpen ? handleClose : handleOpen}
         aria-label={isOpen ? t("closePanel") : t("openPanel")}
         className={cn(
           "fixed bottom-[calc(5rem+var(--keyboard-offset,0px))] right-6 z-50",
-          "w-14 h-14 rounded-full",
+          "w-12 h-12 rounded-full",
           "flex items-center justify-center",
           "transition-all duration-slow ease-out",
           "safe-bottom",
-          "bg-primary text-primary-foreground",
-          "border border-transparent",
-          "shadow-lg",
-          "hover:shadow-xl hover:bg-primary-hover",
+          "bg-card text-muted-foreground border border-border",
+          "shadow-sm",
+          "hover:text-foreground hover:shadow-md",
           isOpen
             ? "scale-0 opacity-0 pointer-events-none"
             : "scale-100 opacity-100 hover:scale-105"

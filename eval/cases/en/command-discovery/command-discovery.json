@@ -39,7 +39,8 @@
       "shell"
     ],
     "commands": [
-      "heramind device get"
+      "heramind device get",
+      "heramind device control"
     ]
   }
 }

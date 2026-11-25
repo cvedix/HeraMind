@@ -1,3 +1,4 @@
+import { contextUsageSnapshot } from '@/lib/contextUsage'
 import { useEffect, useRef, useState, useCallback, useMemo } from "react"
 import { createPortal } from "react-dom"
 import { usePageSidebarSlot, PageSidebarColumn } from "@/components/layout/PageSidebarSlot"
@@ -6,43 +7,58 @@ import { useStore } from "@/store"
 import { shallow } from "zustand/shallow"
 import { useParams, useNavigate, useSearchParams } from "react-router-dom"
 import { generateId } from "@/lib/id"
-import { Settings, Sparkles, MessageSquare, Loader2, RotateCcw, Plus } from "lucide-react"
+import { Loader2, Menu, Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { MobilePageHeader } from "@/components/layout/MobilePageHeader"
 import { SessionSidebar } from "@/components/session/SessionSidebar"
 import { WelcomeArea } from "@/components/chat/WelcomeArea"
 import { ChatMessages } from "@/components/chat/ChatMessages"
 import { ChatComposer } from "@/components/chat/ChatComposer"
+import { ChatScrollPill } from "@/components/chat/ChatScrollPill"
 import { ConnectionStatus } from "@/components/chat/ConnectionStatus"
-import { MobilePageHeader } from "@/components/layout/MobilePageHeader"
 import { ws, type ConnectionState } from "@/lib/websocket"
 import { api } from "@/lib/api"
-import type { Message, ServerMessage, ChatImage } from "@/types"
+import { mentionKey, resolveMentions } from "@/lib/api/mentions"
+import type {
+  AuthorizeNewOperationRequest,
+  ChatContentNode,
+  ChatImage,
+  ChatReference,
+  Message,
+} from "@/types"
+import {
+  contentNodesToComposerFields,
+  loadSessionDraft,
+  markDraftForRetry,
+  normalizeContentNodes,
+  pruneSessionDrafts,
+  saveSessionDraft,
+  canHydrateDraftIntoEditor,
+  composerReplaceTextOnly,
+  sessionUnchangedAfterAwait,
+  settlePendingDraft,
+  stashPendingDraft,
+  validateSendContent,
+} from "@/lib/chat/contentProtocol"
+import {
+  resolveAuthorizeNewOperationForSend,
+  toAuthorizeRequest,
+  type AuthorizeNewOperationConfirm,
+} from "@/lib/chat/authorizeNewOperation"
+import { AuthorizeConfirmBar } from "@/components/chat/AuthorizeConfirmBar"
 import { cn } from "@/lib/utils"
-import { getPortalRoot } from "@/lib/portal"
+import { getSessionDisplayTitle } from "@/lib/utils/sessionTitle"
+import { normalizeTimestampMs } from "@/lib/utils/format"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
 import { LoadingState } from "@/components/shared"
 import { forceViewportReset } from "@/hooks/useVisualViewport"
 import { useToast } from "@/hooks/use-toast"
 import { LlmSetupGuide } from "@/components/llm/LlmSetupGuide"
+import { useChatStream } from "@/hooks/useChatStream"
 
 // Hook to detect desktop breakpoint — md: 768px, matching the app-wide
 // breakpoint (useIsMobile < 768). The old 1024 left the 768–1024 band in a
 // hybrid state.
-// Character estimator with the backend's weights (CJK ≈1.8 tokens/char,
-// ASCII ≈0.25/char, ×1.1 buffer) — the old chars/3 underestimated Chinese
-// ~5x, which made the ring look like it RESET on every send.
-function estimateTokens(text: string): number {
-  let cjk = 0, ascii = 0, digits = 0, special = 0
-  for (const ch of text) {
-    const cp = ch.codePointAt(0) ?? 0
-    if ((cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0x3400 && cp <= 0x4dbf) || (cp >= 0x3000 && cp <= 0x303f) || (cp >= 0xff00 && cp <= 0xffef)) cjk++
-    else if (ch >= '0' && ch <= '9') digits++
-    else if (/[a-zA-Z]/.test(ch)) ascii++
-    else special++
-  }
-  return Math.ceil((cjk * 1.8 + ascii * 0.25 + digits * 0.3 + special * 0.5) * 1.1)
-}
-
 function useIsDesktop() {
   const [isDesktop, setIsDesktop] = useState(() => {
     if (typeof window === 'undefined') return false
@@ -67,12 +83,18 @@ function getActiveBackendSupportsMultimodal(llmBackends: any[], activeBackendId:
 
 // Convert file to base64 data URL
 
+/** Welcome-mode stream binding: matches no real session id. */
+const WELCOME_DETACHED = "\u0000__welcome_detached__"
+
 export function ChatPage() {
-  const { t } = useTranslation(['common', 'chat'])
+  const { t, i18n } = useTranslation(['common', 'chat'])
   const { toast } = useToast()
   const { sessionId: urlSessionId } = useParams<{ sessionId?: string }>()
+  /** Live URL session for ACK callbacks — never close over a stale send-time id. */
+  const urlSessionIdRef = useRef(urlSessionId)
+  urlSessionIdRef.current = urlSessionId
   const navigate = useNavigate()
-  const openSettings = useStore((s) => s.openSettings)
+  const _openSettings = useStore((s) => s.openSettings)
   const [searchParams, setSearchParams] = useSearchParams()
   const { handleError } = useErrorHandler()
   const llmBackends = useStore((state) => state.llmBackends)
@@ -80,6 +102,9 @@ export function ChatPage() {
   // True once a load has resolved with an empty list — distinguishes the
   // first load (skeleton) from refetches (keep the guide mounted).
   const everLoadedBackendsRef = useRef(false)
+  // One context-truncation notice per session (a long turn truncates every
+  // round; toasting each time would be noise).
+  const historyTruncatedSessionRef = useRef<string | null>(null)
   const activeBackendId = useStore((state) => state.activeBackendId)
   const activateBackend = useStore((state) => state.activateBackend)
   const loadBackends = useStore((state) => state.loadBackends)
@@ -92,27 +117,40 @@ export function ChatPage() {
     messages,
     clearMessages,
     loadSessions,
-    isLoadingSession
+    isLoadingSession,
+    refreshCurrentSession
   } = useStore((s) => ({
     sessionId: s.sessionId,
     messages: s.messages,
     clearMessages: s.clearMessages,
     loadSessions: s.loadSessions,
     isLoadingSession: s.isLoadingSession,
+    refreshCurrentSession: s.refreshCurrentSession,
   }), shallow)
 
   const addMessage = useStore((s) => s.addMessage)
   const createSession = useStore((s) => s.createSession)
   const switchSession = useStore((s) => s.switchSession)
+  const hasEarlierHistory = useStore((s) => s.hasEarlierHistory)
+  const loadEarlierHistory = useStore((s) => s.loadEarlierHistory)
   const user = useStore((s) => s.user)
+  const [loadingEarlier, setLoadingEarlier] = useState(false)
 
   // Local state
   const [input, setInput] = useState("")
-  const [isStreaming, setIsStreaming] = useState(false)
-  const [streamingContent, setStreamingContent] = useState("")
-  const [streamingThinking, setStreamingThinking] = useState("")
-  const [streamingToolCalls, setStreamingToolCalls] = useState<any[]>([])
-  const [lastTokenUsage, setLastTokenUsage] = useState<{ promptTokens: number; systemPromptTokens?: number; toolTokens?: number } | null>(null)
+  const [lastTokenUsage, setLastTokenUsage] = useState<{ promptTokens: number; systemPromptTokens?: number; toolTokens?: number; maxContextTokens?: number } | null>(null)
+  const [isCompacting, setIsCompacting] = useState(false)
+  const [contextAction, setContextAction] = useState<{
+    phase: "running" | "done" | "failed"
+    summarizedCount?: number
+  } | null>(null)
+
+  // Auto-dismiss compact "done" chip so the thread stays quiet.
+  useEffect(() => {
+    if (contextAction?.phase !== "done" && contextAction?.phase !== "failed") return
+    const t = window.setTimeout(() => setContextAction(null), 3200)
+    return () => window.clearTimeout(t)
+  }, [contextAction])
 
   // Token usage survives reloads/session switches — the context it measured
   // is unchanged until the next reply, so a restored session shows real
@@ -125,7 +163,7 @@ export function ChatPage() {
       setLastTokenUsage(raw ? JSON.parse(raw) : null)
     } catch { setLastTokenUsage(null) }
   }
-  const persistTokenUsage = (sid: string | undefined, usage: { promptTokens: number; systemPromptTokens?: number; toolTokens?: number } | null) => {
+  const persistTokenUsage = (sid: string | undefined, usage: { promptTokens: number; systemPromptTokens?: number; toolTokens?: number; maxContextTokens?: number } | null) => {
     if (!sid) return
     try {
       if (usage) localStorage.setItem(tokenUsageKey(sid), JSON.stringify(usage))
@@ -135,21 +173,24 @@ export function ChatPage() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const pageSidebarSlot = usePageSidebarSlot()
   // Track the ID of the last assistant message for tool call result updates
-  const [lastAssistantMessageId, setLastAssistantMessageId] = useState<string | null>(null)
-
-  // Pending stream recovery state (for reconnect)
-  const [pendingStream, setPendingStream] = useState<{
-    hasPending: boolean
-    content: string
-    thinking: string
-    userMessage: string
-  } | null>(null)
+  const [_lastAssistantMessageId, setLastAssistantMessageId] = useState<string | null>(null)
+  /** Session id whose detached turn we resumed — drives the 3s poll.
+   *  Null = no poll. Cleared by any live end event, by finalize, and on
+   *  session switch (the poll must never display another session's
+   *  content on the screen the user is looking at). */
+  const [resumedPendingStream, setResumedPendingStream] = useState<string | null>(null)
 
   // WebSocket connection state (for reconnection UI)
   const [connectionState, setConnectionState] = useState<ConnectionState>({ status: 'disconnected' })
 
   // Image upload state
   const [attachedImages, setAttachedImages] = useState<ChatImage[]>([])
+  // Structured @-references for the next message (ids authoritative).
+  const [chatReferences, setChatReferences] = useState<ChatReference[]>([])
+  const [chatContentNodes, setChatContentNodes] = useState<ChatContentNode[]>([])
+  const editorHostRef = useRef<HTMLElement | null>(null)
+  /** Preflight failures: `type:id` → detail. Cleared on successful resolve / chip edit. */
+  const [invalidRefs, setInvalidRefs] = useState<Record<string, string>>({})
 
   // Responsive
   const isDesktop = useIsDesktop()
@@ -157,23 +198,174 @@ export function ChatPage() {
   // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  const streamingMessageIdRef = useRef<string | null>(null)
-  // Captured streaming state for use in end event (state updates are async)
-  const capturedStreamingRef = useRef({ content: "", thinking: "", toolCalls: [] as any[] })
-  // Round tracking for multi-round tool calling
-  const [roundContents, setRoundContents] = useState<Record<number, string>>({})
-  const [streamingRoundThinking, setStreamingRoundThinking] = useState<Record<number, string>>({})
+
+  // Shared stream state machine (also drives the side panel) — view-specific
+  // behaviors ride the callbacks below. See hooks/useChatStream.ts.
+  const {
+    isStreaming,
+    streamingMessageId,
+    streamingContent,
+    streamingThinking,
+    streamingToolCalls,
+    pendingAuthorizeConfirms,
+    roundContents,
+    streamingRoundThinking,
+    currentRound,
+    beginTurn,
+    hardReset,
+    restore,
+    restoreIfBehind,
+    dismissAuthorizeConfirm,
+  } = useChatStream({
+    onContextCompacted: (count, _sid) => {
+      // tokenUsage (if any) already applied via onTokenUsage from the WS
+      // ContextCompacted frame — do not clear the meter to pending.
+      // In-thread status instead of a toast popup.
+      setContextAction({ phase: "done", summarizedCount: count })
+    },
+    // Drop events from other sessions — the side panel shares this socket.
+    // Welcome mode binds a sentinel matching NO session: navigating to bare
+    // /chat keeps the store's sessionId (sidebar entries don't clear it), so
+    // binding the stale id would keep accepting the left session's stream —
+    // its isStreaming then spun the WELCOME composer with no conversation
+    // visible. The sentinel change also trips the hook's session-change
+    // hard-reset, clearing the spinner. The welcome-mode send is safe: the
+    // store session is created BEFORE ws.sendMessage, so real events only
+    // flow after this prop is the new session's id.
+    sessionId: urlSessionId ? sessionId : WELCOME_DETACHED,
+    onCancelled: () => {
+      // Cross-tab cancel: another view killed this turn; stop the
+      // detached-poll before its next 3s tick resurrects a ghost stream.
+      setResumedPendingStream(null)
+    },
+    onStalled: () => {
+      // No terminal frame arrived (server restart mid-turn / lost end frame).
+      // Settle on history instead of leaving the bubble spinning until the
+      // user switches sessions.
+      setResumedPendingStream(null)
+      void refreshCurrentSession()
+    },
+    onEnd: (result) => {
+      // Any end stops the detached-turn poll (a live end means the poll's
+      // finalize branch would race a possibly-already-started NEXT turn).
+      setResumedPendingStream(null)
+      const emptyStatusOnly =
+        !result.content &&
+        !result.thinking &&
+        result.toolCalls.length === 0 &&
+        (result.goalStatus != null || result.endReason != null)
+      if (result.interrupted || emptyStatusOnly) {
+        // Interrupted OR no-body End (goalStatus/endReason only): local
+        // assembly is incomplete — reload the list from server history.
+        void (async () => {
+          // Turn wall-time stats are LOCAL knowledge — the refreshed
+          // server history carries no generationMs. Derive them from the
+          // user message that started the turn (captured BEFORE the
+          // refresh replaces the local view) and re-attach them to the
+          // last assistant message after the refresh lands, so the
+          // "x.xs · N chars/s" footnote survives the welcome-page remount.
+          const turnStart = useStore
+            .getState()
+            .messages.filter(m => m.role === "user")
+            .pop()?.timestamp
+          await refreshCurrentSession()
+          if (turnStart == null) return
+          // turnStart comes from a store message — server history carries
+          // Unix SECONDS, local messages carry ms. Normalize before the
+          // subtraction: raw seconds against Date.now() produced a
+          // 497,289-hour generation time (2026-10-15).
+          const turnStartMs = normalizeTimestampMs(turnStart)
+          if (turnStartMs == null) return
+          const generationMs = Date.now() - turnStartMs
+          useStore.setState(s => {
+            const messages = [...s.messages]
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if (messages[i].role === "assistant") {
+                messages[i] = { ...messages[i], generationMs }
+                break
+              }
+            }
+            return { messages }
+          })
+        })()
+        return
+      }
+      const completeMessage: Message = {
+        id: result.id,
+        role: "assistant",
+        content: result.content,
+        timestamp: Date.now(),
+        generationMs: result.generationMs,
+        thinking: result.thinking,
+        tool_calls: result.toolCalls.length > 0 ? result.toolCalls : undefined,
+        round_contents: result.roundContents,
+        round_thinking: result.roundThinking,
+        systemNotes: result.systemNotes,
+        goalStatus: result.goalStatus,
+        endReason: result.endReason,
+      }
+      addMessage(completeMessage)
+      setLastAssistantMessageId(result.id)
+      if (result.historyTruncated && historyTruncatedSessionRef.current !== sessionId) {
+        historyTruncatedSessionRef.current = sessionId
+        toast({ title: t('chat:context.historyTruncated') })
+      }
+    },
+    onError: (message) => {
+      // Render immediately — the backend may still send a fallback summary
+      // before `end` finalizes the turn.
+      addMessage({
+        id: generateId(),
+        role: "assistant",
+        content: `❌ **Error**: ${message}`,
+        timestamp: Date.now(),
+      })
+    },
+    onWarning: (message) => {
+      addMessage({
+        id: generateId(),
+        role: "assistant",
+        content: `⚠️ **Warning**: ${message}`,
+        timestamp: Date.now(),
+        isPartial: true, // Mark as temporary/partial
+      })
+    },
+    onTokenUsage: (usage, sid) => {
+      setLastTokenUsage(usage)
+      persistTokenUsage(sid || urlSessionId, usage)
+    },
+    onRawEvent: (data) => {
+      // Only switch if it's a different session to avoid unnecessary API calls
+      if (
+        (data.type === "session_created" || data.type === "session_switched") &&
+        data.sessionId && data.sessionId !== sessionId
+      ) {
+        switchSession(data.sessionId)
+      }
+    },
+  })
+
+  /** Auto-resume a detached turn (live testing: a "resume?" dialog made the
+   *  user click before anything showed, and restoring its ≤2s-lagged
+   *  snapshot visibly rewound content that had streamed beneath it). The
+   *  restore happens on session enter / reconnect, before the user has seen
+   *  anything in this visit — no rewind perception, no click. */
+  const resumePending = useCallback((
+    sid: string,
+    content: string,
+    thinking: string,
+    extras?: import("@/hooks/useChatStream").RestoreExtras & { currentRound?: number },
+  ) => {
+    hardReset()
+    restore(content, thinking, extras)
+    setResumedPendingStream(sid)
+  }, [hardReset, restore])
+
   // Active tool-loop round, derived from the last in-flight tool call — no
   // own state to reset (all streaming resets clear streamingToolCalls).
   const activeToolRound = streamingToolCalls.length > 0
     ? (streamingToolCalls[streamingToolCalls.length - 1].round ?? null)
     : null
-  const currentRoundRef = useRef(1)
-  const roundContentsAccumulatorRef = useRef<Record<number, string>>({})
-  // Accumulate thinking across all rounds (interleaved thinking pattern)
-  const thinkingAccumulatorRef = useRef("")
-  // Per-round thinking for grouped rendering
-  const roundThinkingAccumulatorRef = useRef<Record<number, string>>({})
 
   // Load LLM backends and sessions on mount
   useEffect(() => {
@@ -251,6 +443,90 @@ export function ChatPage() {
     restoreTokenUsage(urlSessionId)
   }, [urlSessionId, switchSession, handleError, clearMessages])
 
+  // Draft lifecycle (E15): per-conversation drafts. On SWITCHING away, the
+  // current composer content is parked under the OLD session's key and the
+  // composer is cleared — session A's half-typed text can never be sent to
+  // session B. On entering, the target session's draft (refresh / failed
+  // send / previous switch) is restored unless a ?q= onboarding prefill is
+  // present (prefill wins). A successful send clears the key (handleSend),
+  // so a sent draft cannot resurrect.
+  const composerDraftRef = useRef({
+    input: "",
+    references: [] as ChatReference[],
+    nodes: [] as ChatContentNode[],
+    images: [] as ChatImage[],
+  })
+  composerDraftRef.current = {
+    input,
+    references: chatReferences,
+    nodes: chatContentNodes,
+    images: attachedImages,
+  }
+  const prevDraftSessionRef = useRef<string | null>(null)
+  useEffect(() => {
+    // One-time growth bound: nothing deletes drafts of removed sessions.
+    pruneSessionDrafts()
+  }, [])
+  useEffect(() => {
+    const target = urlSessionId ?? "new"
+    const prev = prevDraftSessionRef.current
+    prevDraftSessionRef.current = target
+    if (prev === target) return
+    if (prev !== null) {
+      // Switching conversations: park the old draft, never inherit it.
+      const cur = composerDraftRef.current
+      if (cur.input !== "" || cur.references.length > 0 || cur.nodes.length > 0) {
+        saveSessionDraft({
+          sessionId: prev,
+          message: cur.input,
+          references: cur.references,
+          contentNodes: cur.nodes.length > 0 ? cur.nodes : undefined,
+          updatedAt: Date.now(),
+        })
+      }
+      setInput("")
+      setChatReferences([])
+      setChatContentNodes([])
+    }
+    // ?q= onboarding prefill wins over a restored draft.
+    if (searchParams.get("q")) return
+    const draft = loadSessionDraft(target)
+    if (!draft || (!draft.message && draft.references.length === 0)) return
+    if (prev !== null) {
+      // Switch path: composer was just cleared — always restore.
+      setInput(draft.message)
+      setChatReferences(draft.references)
+      setChatContentNodes(draft.contentNodes ?? [])
+    } else {
+      // Initial mount: never clobber in-progress typing (HMR / late mount).
+      const cur = composerDraftRef.current
+      if (cur.input !== "" || cur.references.length > 0 || cur.nodes.length > 0) return
+      setInput(draft.message)
+      setChatReferences(draft.references)
+      setChatContentNodes(draft.contentNodes ?? [])
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlSessionId])
+  // Remount across /chat ↔ /chat/:id resets prevDraftSessionRef, so park on
+  // unmount — same storage keys the switch effect uses.
+  useEffect(() => {
+    return () => {
+      const cur = composerDraftRef.current
+      if (cur.input === "" && cur.references.length === 0 && cur.nodes.length === 0) {
+        return
+      }
+      const key = prevDraftSessionRef.current ?? urlSessionId ?? "new"
+      saveSessionDraft({
+        sessionId: key,
+        message: cur.input,
+        references: cur.references,
+        contentNodes: cur.nodes.length > 0 ? cur.nodes : undefined,
+        updatedAt: Date.now(),
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Handle deleted session redirects and root path
   useEffect(() => {
     if (!sessionsLoaded) return
@@ -299,10 +575,8 @@ export function ChatPage() {
   // list. We only auto-scroll on new content while pinned. If the user has
   // scrolled up to read history, auto-scrolling would yank them back down —
   // extremely annoying when waiting for a long response while reviewing context.
-  // First streamed-event timestamp of the current reply — used at `end`
-  // to report wall time + an estimated tok/s figure on the message.
-  const streamStartRef = useRef<number | null>(null)
   const isPinnedToBottomRef = useRef(true)
+  const [showScrollPill, setShowScrollPill] = useState(false)
 
   const handleScroll = useCallback(() => {
     const container = scrollContainerRef.current
@@ -311,6 +585,7 @@ export function ChatPage() {
     // diffs and the gap inserted by smooth-scroll inertia.
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
     isPinnedToBottomRef.current = distanceFromBottom < 80
+    setShowScrollPill(distanceFromBottom > 120)
   }, [])
 
   // Auto-scroll to bottom by directly setting scrollTop on the scroll container
@@ -322,12 +597,21 @@ export function ChatPage() {
       // Sending a new message or opening a session — force-pin so subsequent
       // streaming tokens auto-scroll.
       isPinnedToBottomRef.current = true
+      setShowScrollPill(false)
       container.scrollTo({ top: container.scrollHeight, behavior: "smooth" })
     }
   }, [])
 
   // Debounced scroll to reduce excessive scrolling during streaming
   const debouncedScrollRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Entering or switching a session starts pinned to the newest message.
+  // Without this, a user who had scrolled up in the previous session could
+  // land mid-history in the new one.
+  useEffect(() => {
+    isPinnedToBottomRef.current = true
+    setShowScrollPill(false)
+  }, [urlSessionId])
 
   useEffect(() => {
     // Don't auto-scroll if the user has scrolled away from the bottom to read
@@ -352,242 +636,181 @@ export function ChatPage() {
     }
   }, [messages, streamingContent, scrollToBottom])
 
-  // Handle WebSocket events
+
+  // Pending-stream recovery, path 1: reconnect while viewing a session.
   useEffect(() => {
-    const handleMessage = (data: ServerMessage) => {
-      switch (data.type) {
-        case "Thinking":
-          if (streamStartRef.current === null) streamStartRef.current = Date.now()
-          setIsStreaming(true)
-          // Immediately update ref synchronously before setState
-          capturedStreamingRef.current.thinking += (data.content || "")
-          setStreamingThinking(prev => prev + (data.content || ""))
-          break
-
-        case "Content":
-          if (streamStartRef.current === null) streamStartRef.current = Date.now()
-          setIsStreaming(true)
-          // Immediately update ref synchronously before setState
-          capturedStreamingRef.current.content += (data.content || "")
-          setStreamingContent(prev => prev + (data.content || ""))
-          break
-
-        case "ToolCallStart": {
-          const toolCall = {
-            id: generateId(),
-            name: data.tool,
-            arguments: data.arguments,
-            result: null,
-            round: data.round ?? currentRoundRef.current
-          }
-          // Immediately update ref synchronously before setState
-          capturedStreamingRef.current.toolCalls = [...capturedStreamingRef.current.toolCalls, toolCall]
-          setStreamingToolCalls(prev => [...prev, toolCall])
-          break
-        }
-
-        case "ToolCallEnd": {
-          // Match FIRST unresolved tool call with same name (not all)
-          const tcIdx = capturedStreamingRef.current.toolCalls.findIndex(
-            tc => tc.name === data.tool && tc.result === null
-          )
-          if (tcIdx !== -1) {
-            const updated = [...capturedStreamingRef.current.toolCalls]
-            updated[tcIdx] = { ...updated[tcIdx], result: data.result }
-            capturedStreamingRef.current.toolCalls = updated
-          }
-          setStreamingToolCalls(prev => {
-            const idx = prev.findIndex(
-              tc => tc.name === data.tool && tc.result === null
-            )
-            if (idx === -1) return prev
-            const updated = [...prev]
-            updated[idx] = { ...updated[idx], result: data.result }
-            return updated
-          })
-          break
-        }
-
-        case "end": {
-          // Capture token usage from backend
-          if (data.tokenUsage?.promptTokens) {
-            const usage = {
-              promptTokens: data.tokenUsage.promptTokens,
-              systemPromptTokens: data.tokenUsage.systemPromptTokens,
-              toolTokens: data.tokenUsage.toolTokens,
-            }
-            setLastTokenUsage(usage)
-            persistTokenUsage(data.sessionId || urlSessionId, usage)
-          }
-          const toolCalls = capturedStreamingRef.current.toolCalls
-          // Accumulate thinking from current round into total
-          // Store all raw data; PerRoundBlocks handles dedup during rendering
-          if (capturedStreamingRef.current.thinking) {
-            thinkingAccumulatorRef.current += capturedStreamingRef.current.thinking
-            roundThinkingAccumulatorRef.current[currentRoundRef.current] = capturedStreamingRef.current.thinking
-          }
-          const thinking = thinkingAccumulatorRef.current
-          // Last round's content becomes the final message content
-          const lastRoundContent = capturedStreamingRef.current.content
-          // NOTE: Do NOT save last round's content to roundContents — it is the
-          // final message content and will be shown as the main response.
-          // Only intermediate rounds' content (saved in IntermediateEnd) goes into round_contents.
-          const hasRoundContents = Object.keys(roundContentsAccumulatorRef.current).length > 0
-          const hasRoundThinking = Object.keys(roundThinkingAccumulatorRef.current).length > 0
-          const messageContent = lastRoundContent
-          if (messageContent || thinking || toolCalls.length > 0) {
-            const messageId = streamingMessageIdRef.current || generateId()
-            // Reply metric: wall time from the first streamed event. The
-            // per-second figure shown next to it is chars/s (exact — the
-            // frontend has the full text; token counts would be a guess).
-            const generationMs = streamStartRef.current !== null
-              ? Date.now() - streamStartRef.current
-              : undefined
-            const completeMessage: Message = {
-              id: messageId,
-              role: "assistant",
-              content: messageContent,
-              timestamp: Date.now(),
-              generationMs,
-              thinking: thinking || undefined,
-              tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
-              round_contents: hasRoundContents ? roundContentsAccumulatorRef.current : undefined,
-              round_thinking: hasRoundThinking ? roundThinkingAccumulatorRef.current : undefined,
-            }
-            addMessage(completeMessage)
-            setLastAssistantMessageId(messageId)
-          }
-          setIsStreaming(false)
-          setStreamingContent("")
-          setStreamingThinking("")
-          setStreamingToolCalls([])
-          setRoundContents({})
-          setStreamingRoundThinking({})
-          // Reset captured ref
-          capturedStreamingRef.current = { content: "", thinking: "", toolCalls: [] }
-          streamStartRef.current = null
-          streamingMessageIdRef.current = null
-          currentRoundRef.current = 1
-          roundContentsAccumulatorRef.current = {}
-          thinkingAccumulatorRef.current = ""
-          roundThinkingAccumulatorRef.current = {}
-          break
-        }
-
-        case "cancelled": {
-          // Server acknowledged __CANCEL__. No trailing 'end' is guaranteed
-          // on this path — reset ALL stream state here or the composer
-          // stays locked and the bubble spins forever. (The user-initiated
-          // path already rendered a local notice; this covers cancels from
-          // other tabs/devices on the same session.)
-          setIsStreaming(false)
-          setStreamingContent("")
-          setStreamingThinking("")
-          setStreamingToolCalls([])
-          setRoundContents({})
-          setStreamingRoundThinking({})
-          capturedStreamingRef.current = { content: "", thinking: "", toolCalls: [] }
-          streamStartRef.current = null
-          streamingMessageIdRef.current = null
-          currentRoundRef.current = 1
-          roundContentsAccumulatorRef.current = {}
-          thinkingAccumulatorRef.current = ""
-          roundThinkingAccumulatorRef.current = {}
-          break
-        }
-
-        case "IntermediateEnd":
-        case "intermediate_end": {
-          // Save current round's content to roundContents
-          if (capturedStreamingRef.current.content) {
-            roundContentsAccumulatorRef.current[currentRoundRef.current] = capturedStreamingRef.current.content
-          }
-          // Save per-round thinking for grouped rendering
-          if (capturedStreamingRef.current.thinking) {
-            thinkingAccumulatorRef.current += capturedStreamingRef.current.thinking
-            roundThinkingAccumulatorRef.current[currentRoundRef.current] = capturedStreamingRef.current.thinking
-          }
-          // Reset captured content for next round
-          // NOTE: Don't reset streamingThinking — keep showing all rounds' thinking continuously
-          // streamingThinking already has all thinking via cumulative appends in "Thinking" handler
-          capturedStreamingRef.current.content = ""
-          capturedStreamingRef.current.thinking = ""
-          currentRoundRef.current += 1
-          setRoundContents({ ...roundContentsAccumulatorRef.current })
-          setStreamingRoundThinking({ ...roundThinkingAccumulatorRef.current })
-          setStreamingContent("")
-          break
-        }
-
-        case "Error":
-          // Don't immediately stop streaming — the backend may send a fallback
-          // summary after the error (e.g., when tool calls failed). The End
-          // event will finalize the streaming state.
-          // Display error message to user with error styling
-          {
-            const errorMessage = data.message || "An error occurred during processing"
-            const errorMsg: Message = {
-              id: generateId(),
-              role: "assistant",
-              content: `❌ **Error**: ${errorMessage}`,
-              timestamp: Date.now(),
-            }
-            addMessage(errorMsg)
-          }
-          break
-
-        case "Warning":
-          // Display warning message (non-blocking)
-          const warningMessage = data.message || "Warning"
-          const warningMsg: Message = {
-            id: generateId(),
-            role: "assistant",
-            content: `⚠️ **Warning**: ${warningMessage}`,
-            timestamp: Date.now(),
-            isPartial: true,  // Mark as temporary/partial
-          }
-          addMessage(warningMsg)
-          break
-
-        case "session_created":
-        case "session_switched":
-          // Only switch if it's a different session to avoid unnecessary API calls
-          if (data.sessionId && data.sessionId !== sessionId) {
-            switchSession(data.sessionId)
-          }
-          break
-      }
-    }
-
-    const unsubscribe = ws.onMessage(handleMessage)
-    return () => { void unsubscribe() }
-  }, [addMessage, switchSession, sessionId])
-
-  // Check for pending stream after reconnection
-  useEffect(() => {
+    // Cancel flag, same as path 2: the reconnect fires a fetch whose RTT
+    // can outlive a session switch — a late restore() would paint the OLD
+    // session's stream onto the NEW view.
+    let cancelled = false
     const unsubscribe = ws.onConnection((connected, isReconnect) => {
-      if (connected && isReconnect && sessionId) {
-        // Check if there's a pending stream from before disconnection
+      // urlSessionId gate, same as path 2: on the WELCOME page (bare
+      // /chat) the store session id still points at the session just
+      // abandoned — resuming it here would inject its stream onto a page
+      // showing no conversation (the leak path 2's gate exists for).
+      if (connected && isReconnect && sessionId && urlSessionId) {
         api.getPendingStream(sessionId).then(result => {
-          if (result?.hasPending) {
-            setPendingStream({
-              hasPending: true,
-              content: result.content || "",
-              thinking: result.thinking || "",
-              userMessage: result.userMessage || "",
+          if (cancelled) return
+          if (result?.hasPending) resumePending(sessionId, result.content || "", result.thinking || "", {
+              toolCalls: result.toolCalls,
+              roundContents: result.roundContents,
+              currentRound: result.currentRound,
             })
-            // Restore streaming state
-            setStreamingContent(result.content || "")
-            setStreamingThinking(result.thinking || "")
-            setIsStreaming(true)
-          }
         }).catch(() => {
           // Ignore errors checking pending stream
         })
       }
     })
-    return () => { void unsubscribe() }
-  }, [sessionId])
+    return () => { cancelled = true; void unsubscribe() }
+  }, [sessionId, urlSessionId, resumePending])
+
+  // Pending-stream recovery, path 2: session ENTER (mount, switch, return
+  // from another page). The reconnect-only check missed the most common
+  // case — a hard refresh opens a FRESH socket whose first connect is not a
+  // "reconnect", so an in-flight answer was invisible until it silently
+  // landed in history. Switching back to a still-generating session had no
+  // check at all. Auto-resume: the user sees the generating answer as a
+  // normal streaming bubble — no dialog, no click.
+  useEffect(() => {
+    // Leaving this session stops its poll — a poll keyed to the PREVIOUS
+    // session re-injected that session's content here every 3s (the
+    // live-test cross-session bleed). Includes leaving to the WELCOME page
+    // (bare /chat): the store session id survives that navigation, so
+    // without the urlSessionId gate this effect would auto-resume the
+    // abandoned session's stream onto a page that shows no conversation.
+    setResumedPendingStream(null)
+    if (!sessionId || !urlSessionId) return
+    let cancelled = false
+    // Welcome-send remount: the hint set at send time says a turn is
+    // already in flight on THIS page — show the streaming spinner now
+    // instead of an idle composer; the pending fetch (a beat later) or the
+    // first live event replaces this optimistic state.
+    const optimisticTurn = useStore.getState().pendingTurnHint === sessionId
+    if (optimisticTurn) {
+      useStore.getState().setPendingTurnHint(null)
+      restore("", "", {})
+    }
+    // An optimistic turn (just sent from the welcome page) with no snapshot
+    // yet is usually a RACE, not a finished turn: the frame can still be
+    // queued on a reconnecting socket, and the server writes the snapshot at
+    // frame receipt — the pre-stream setup (backend reconfig, decision
+    // pipeline, first LLM request) follows it, it doesn't precede it.
+    // Killing the optimistic spinner on the first false left the whole
+    // model-load window showing an empty reply area (2026-10-19:
+    // "ai回复UI为空需要刷新页面才看得到ai正在回复中"). Retry briefly before
+    // declaring the turn dead; a live event or the snapshot takes over, and
+    // the exhausted path still settles to history.
+    const OPTIMISTIC_PENDING_RETRIES = 5
+    let attempts = 0
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    const settleDeadTurn = () => {
+      // The turn finished BEFORE this page mounted — its end event had no
+      // live listener. Clear the optimistic spinner (if any) and take the
+      // server's completed answer.
+      if (optimisticTurn) {
+        hardReset()
+        void refreshCurrentSession()
+      }
+    }
+    const checkPending = () => {
+      api.getPendingStream(sessionId).then(result => {
+        if (cancelled) return
+        if (result?.hasPending) {
+          resumePending(sessionId, result.content || "", result.thinking || "", {
+            toolCalls: result.toolCalls,
+            roundContents: result.roundContents,
+            currentRound: result.currentRound,
+          })
+          return
+        }
+        if (optimisticTurn && attempts < OPTIMISTIC_PENDING_RETRIES) {
+          attempts += 1
+          retryTimer = setTimeout(checkPending, 1000)
+          return
+        }
+        settleDeadTurn()
+      }).catch(() => {
+        if (cancelled) return
+        if (optimisticTurn && attempts < OPTIMISTIC_PENDING_RETRIES) {
+          attempts += 1
+          retryTimer = setTimeout(checkPending, 1000)
+          return
+        }
+        settleDeadTurn()
+      })
+    }
+    checkPending()
+    return () => {
+      cancelled = true
+      if (retryTimer) clearTimeout(retryTimer)
+    }
+  }, [sessionId, urlSessionId, resumePending, restore, hardReset, refreshCurrentSession])
+
+  // Detached-turn poll: after a resume, the generating turn's events may be
+  // bound to a DEAD connection (hard refresh) — the server's pending
+  // snapshot (saved every ≤2s) is then the only progress source. Adopt it
+  // whenever it is ahead of local; when pending clears, the turn finished
+  // server-side: reset the partial display and take history.
+  // Guarded to the VIEWED session (see path 2) and stalled-guarded: a
+  // snapshot that stops growing for 60s means the server died mid-turn —
+  // stop pretending and clear the spinner instead of polling forever.
+  useEffect(() => {
+    if (!resumedPendingStream || resumedPendingStream !== sessionId) return
+    let stopped = false
+    let lastLen = -1
+    let stallTicks = 0
+    const timer = setInterval(() => {
+      if (stopped) return
+      api.getPendingStream(resumedPendingStream).then(result => {
+        if (stopped) return
+        if (result?.hasPending) {
+          // Tool-call COUNT is part of the stall signature and of "ahead":
+          // during a slow tool execution (shell, extension inference) text
+          // does not grow for minutes — a new call/round is the only
+          // aliveness signal a detached page can see.
+          const len = (result.content || "").length + (result.thinking || "").length
+            + (result.toolCalls?.length ?? 0)
+            + Object.values(result.roundContents || {}).reduce((a, b) => a + b.length, 0)
+          // Stall = 60s with no growth across SUCCESSFUL polls. (A previous
+          // "resultless last call ⇒ 10-minute cap" branch was dead code: the
+          // server emits a tool batch's Start/End back-to-back after
+          // execution completes, so an EXECUTING tool never appears
+          // resultless in a snapshot.)
+          if (len > lastLen) { lastLen = len; stallTicks = 0 }
+          else stallTicks += 1
+          restoreIfBehind(result.content || "", result.thinking || "", {
+            toolCalls: result.toolCalls,
+            roundContents: result.roundContents,
+            currentRound: result.currentRound,
+          })
+          if (stallTicks >= 20) {
+            setResumedPendingStream(null)
+            hardReset()
+            // A stalled snapshot means the turn died server-side — settle
+            // the view to whatever history has instead of leaving a
+            // vanished bubble over a stale composer state.
+            void refreshCurrentSession()
+          }
+        } else {
+          setResumedPendingStream(null)
+          hardReset()
+          void refreshCurrentSession()
+        }
+      }).catch(() => {
+        // Transient blip OR a dead server — both count toward the stall
+        // cap (a dead server rejects every poll; the old catch-branch
+        // polled forever). A blip resets on the next successful poll.
+        if (stopped) return
+        stallTicks += 1
+        if (stallTicks >= 20) {
+          setResumedPendingStream(null)
+          hardReset()
+          void refreshCurrentSession()
+        }
+      })
+    }, 3000)
+    return () => { stopped = true; clearInterval(timer) }
+  }, [resumedPendingStream, sessionId, restoreIfBehind, hardReset, refreshCurrentSession])
 
   // Subscribe to WebSocket connection state changes
   useEffect(() => {
@@ -595,15 +818,109 @@ export function ChatPage() {
     return () => { void unsubscribe() }
   }, [])
 
+  // Mid-turn WS drop (server restart, network blip, proxy idle-kill): the
+  // live event feed is gone but the turn may well still be running or its
+  // pending snapshot recoverable. Instead of leaving the local bubble
+  // frozen (events between drop and reconnect are lost either way), hand
+  // the display to the pending-poll path IMMEDIATELY — it rebuilds from the
+  // server's snapshot, keeps updating while the turn lives, and settles to
+  // history when it ends or stalls. Previously the frozen bubble sat until
+  // the user refreshed or switched sessions (2026-10-15: "AI 回复的消息就
+  // 消失了，要刷新页面才能看到").
+  useEffect(() => {
+    if (connectionState.status === 'connected') return
+    if (!isStreaming || !sessionId || !urlSessionId) return
+    setResumedPendingStream(sessionId)
+  }, [connectionState.status, isStreaming, sessionId, urlSessionId])
+
   // Send message - in welcome mode, create session and navigate
-  const handleSend = async (e?: React.MouseEvent | React.KeyboardEvent) => {
-    const trimmedInput = input.trim()
+  const handleSend = async (
+    _e?: React.MouseEvent | React.KeyboardEvent,
+    overrides?: {
+      message?: string
+      authorizeNewOperation?: AuthorizeNewOperationRequest
+    },
+  ) => {
+    const trimmedInput = (overrides?.message ?? input).trim()
     if ((!trimmedInput && attachedImages.length === 0) || isStreaming || isLoadingSession) return
 
+    // Authorize-confirm sends (E16) ride ONLY the phrase text + the
+    // authorizeNewOperation payload: no staged images / references / inline
+    // nodes are attached, and the user's in-progress draft is never cleared.
+    const isOverrideSend = overrides?.message !== undefined
+    // Draft key of THIS conversation (welcome mode has no session id yet) —
+    // save / restore / clear all use the same derivation (E15).
+    const draftSession = urlSessionId ?? "new"
+
     // Check if images are attached but current model doesn't support vision
-    if (attachedImages.length > 0 && !supportsMultimodal) {
+    if (!isOverrideSend && attachedImages.length > 0 && !imagesAllowed) {
       toast({ title: t('chat:model.visionError'), variant: "destructive" })
       return
+    }
+
+    // Client mirror of the server's content-node caps (E14): an over-cap
+    // draft (e.g. 21 total inline mentions of one entity — in-sentence
+    // duplicates are legal, so the unique-count insertion guard does not
+    // catch them) must fail HERE with the composer intact, not as a 400
+    // after the composer was already cleared.
+    if (!isOverrideSend && chatContentNodes.some((n) => n.kind === "reference")) {
+      const capCode = validateSendContent(chatContentNodes)
+      if (capCode) {
+        // Keep editable draft (nodes + chips) for fix-and-resend.
+        saveSessionDraft({
+          sessionId: draftSession,
+          message: input,
+          references: chatReferences,
+          contentNodes: chatContentNodes.length > 0 ? chatContentNodes : undefined,
+          updatedAt: Date.now(),
+        })
+        toast({ title: t('chat:mention.contentOverLimit'), variant: "destructive" })
+        return
+      }
+    }
+
+    // Preflight invalid/stale references — keep draft, mark chips, do not send.
+    // Confirm sends carry no references, so they skip the preflight and keep
+    // any invalid-ref marks on the untouched draft.
+    if (!isOverrideSend && chatReferences.length > 0) {
+      try {
+        const resolved = await resolveMentions(chatReferences)
+        // After await: user may have switched sessions — do not write draft /
+        // optimistic bubbles into the wrong conversation.
+        if (!sessionUnchangedAfterAwait(draftSession, urlSessionIdRef.current)) {
+          return
+        }
+        if (!resolved.ok) {
+          const next: Record<string, string> = {}
+          for (const r of resolved.resolutions) {
+            if (!r.ok) next[mentionKey(r.type, r.id)] = r.detail
+          }
+          setInvalidRefs(next)
+          // Keep editable draft (nodes + chips) for fix-and-resend after refresh.
+          saveSessionDraft({
+            sessionId: draftSession,
+            message: input,
+            references: chatReferences,
+            contentNodes: chatContentNodes.length > 0 ? chatContentNodes : undefined,
+            updatedAt: Date.now(),
+          })
+          toast({
+            title: t('chat:mention.invalidSend', '部分引用无效，请修正后重发'),
+            variant: "destructive",
+          })
+          return
+        }
+        setInvalidRefs({})
+      } catch {
+        if (!sessionUnchangedAfterAwait(draftSession, urlSessionIdRef.current)) {
+          return
+        }
+        // Network failure on preflight must not block send — server still
+        // re-resolves and spells NOT FOUND into the model context.
+        setInvalidRefs({})
+      }
+    } else if (!isOverrideSend) {
+      setInvalidRefs({})
     }
 
     // In welcome mode, create session first, then send message
@@ -615,18 +932,27 @@ export function ChatPage() {
         return
       }
       targetSessionId = newSessionId
+      // The remount hint: /chat → /chat/:id is a route CHANGE (full
+      // remount) — without it the fresh page shows an idle composer until
+      // the pending fetch or first live event lands.
+      useStore.getState().setPendingTurnHint(newSessionId)
       // Navigate to the new session URL
       navigate(`/chat/${newSessionId}`)
     }
 
     // Prepare message content
     const messageContent = trimmedInput || (attachedImages.length > 0 ? "[Image]" : "")
+    const sentImages = !isOverrideSend && attachedImages.length > 0 ? [...attachedImages] : undefined
+    const sentReferences = !isOverrideSend && chatReferences.length > 0 ? [...chatReferences] : undefined
+    const hasInlineRefs = !isOverrideSend && chatContentNodes.some((n) => n.kind === "reference")
+    const sentContentNodes = hasInlineRefs ? [...chatContentNodes] : undefined
     const userMessage: Message = {
       id: generateId(),
       role: "user",
       content: messageContent,
       timestamp: Date.now(),
-      images: attachedImages.length > 0 ? [...attachedImages] : undefined,
+      images: sentImages,
+      contentNodes: sentContentNodes,
     }
     addMessage(userMessage)
 
@@ -634,36 +960,133 @@ export function ChatPage() {
     // streaming response auto-scroll into view, even if they had scrolled up
     // to read history a moment ago.
     isPinnedToBottomRef.current = true
+    setShowScrollPill(false)
 
-    setInput("")
-    setAttachedImages([])
+    // Stash the outgoing composer payload BEFORE clearing UI so a failed
+    // wire send can restore it. Authorize-confirm (isOverrideSend) never
+    // touches the user's draft.
+    const draftStash = !isOverrideSend
+      ? {
+          message: input,
+          references: chatReferences,
+          contentNodes: chatContentNodes.length > 0 ? chatContentNodes : undefined,
+          images: attachedImages,
+        }
+      : null
 
-    // Reset textarea height to initial state
-    if (inputRef.current) {
-      inputRef.current.style.height = "40px"
+    if (!isOverrideSend) {
+      setInput("")
+      setAttachedImages([])
+      setChatReferences([])
+      setChatContentNodes([])
+      setInvalidRefs({})
+
+      // Reset textarea height when the legacy host is active.
+      if (inputRef.current) {
+        inputRef.current.style.height = "40px"
+      }
     }
 
     // Set WebSocket session and send message
     if (!targetSessionId) {
+      if (draftStash) {
+        setInput(draftStash.message)
+        setAttachedImages(draftStash.images)
+        setChatReferences(draftStash.references)
+        setChatContentNodes(draftStash.contentNodes ?? [])
+        markDraftForRetry(draftSession, {
+          message: draftStash.message,
+          references: draftStash.references,
+          contentNodes: draftStash.contentNodes,
+        })
+      }
       handleError(new Error('No valid session ID'), { operation: 'Send message', showToast: false })
       return
     }
 
     ws.setSessionId(targetSessionId)
-    setIsStreaming(true)
-    streamingMessageIdRef.current = generateId()
+    beginTurn()
     setLastAssistantMessageId(null)
-    // Reset round tracking
-    currentRoundRef.current = 1
-    roundContentsAccumulatorRef.current = {}
-    thinkingAccumulatorRef.current = ""
-    roundThinkingAccumulatorRef.current = {}
-    setRoundContents({})
 
-    ws.sendMessage(trimmedInput, attachedImages.length > 0 ? attachedImages : undefined)
+    const authorizeNewOperation =
+      overrides?.authorizeNewOperation ??
+      resolveAuthorizeNewOperationForSend(trimmedInput, pendingAuthorizeConfirms) ??
+      undefined
+    const { wireOk, requestId } = ws.sendMessage(
+      trimmedInput,
+      sentImages,
+      undefined,
+      undefined,
+      sentReferences,
+      sentContentNodes,
+      authorizeNewOperation,
+    )
+
+    if (!isOverrideSend && draftStash) {
+      // Keep draft by request id until server MessageReceived — local
+      // ws.send / queue success is NOT a receive-ack.
+      stashPendingDraft(requestId, draftSession, draftStash)
+      if (!wireOk) {
+        settlePendingDraft(requestId, "failed")
+        // beginTurn already armed the stream machine — reach a terminal
+        // state even when no Error+end will arrive (queue/wire fail).
+        hardReset()
+        setInput(draftStash.message)
+        setAttachedImages(draftStash.images)
+        setChatReferences(draftStash.references)
+        setChatContentNodes(draftStash.contentNodes ?? [])
+        toast({ title: t('chat:errors.sendMessage'), variant: "destructive" })
+      } else {
+        void ws.waitForReceiveAck(requestId).then((ack) => {
+          if (ack.status === "accepted") {
+            settlePendingDraft(requestId, "accepted")
+            return
+          }
+          // rejected / timeout / queue_drop: always terminal-reset the stream
+          // machine (server may omit Error+end on some reject paths).
+          hardReset()
+          // Persist under the original session always; hydrate the editor
+          // only if we are still on that session and it is unmodified.
+          // Drop any still-queued copy — no server clientRequestId dedupe yet.
+          ws.dropPendingByRequestId(requestId)
+          const restored = settlePendingDraft(requestId, "failed")
+          if (restored) {
+            const live = composerDraftRef.current
+            // Read the LIVE route session — a send-time closed-over
+            // urlSessionId would hydrate the wrong composer after a switch.
+            const currentSession = urlSessionIdRef.current ?? "new"
+            if (
+              canHydrateDraftIntoEditor(restored.sessionId, currentSession, {
+                message: live.input,
+                references: live.references,
+                contentNodes: live.nodes,
+                images: live.images,
+              })
+            ) {
+              setInput(restored.message)
+              setAttachedImages(restored.images ?? [])
+              setChatReferences(restored.references)
+              setChatContentNodes(restored.contentNodes ?? [])
+            }
+          }
+          toast({ title: t('chat:errors.sendMessage'), variant: "destructive" })
+        })
+      }
+    }
 
     requestAnimationFrame(() => {
-      inputRef.current?.focus()
+      const pm = editorHostRef.current?.querySelector<HTMLElement>(".ProseMirror")
+      if (pm) pm.focus()
+      else inputRef.current?.focus()
+    })
+  }
+
+  const handleConfirmAuthorize = (confirm: AuthorizeNewOperationConfirm) => {
+    const phrase = i18n.language?.startsWith('zh') ? '确认重跑' : 'confirm re-run'
+    dismissAuthorizeConfirm(confirm.requestId)
+    void handleSend(undefined, {
+      message: phrase,
+      authorizeNewOperation: toAuthorizeRequest(confirm),
     })
   }
 
@@ -671,9 +1094,42 @@ export function ChatPage() {
   // Check if multimodal is supported
   const supportsMultimodal = getActiveBackendSupportsMultimodal(llmBackends, activeBackendId)
 
-  // Handle quick action
+  // Vision companion: a running local VLM lets a text-only active model
+  // take images (the session layer delegates the descriptions to it).
+  // 8s + refresh-on-focus is enough: the check matters ONLY while the
+  // active model is text-only (otherwise the gate passes on its own), and
+  // route changes remount this page with an immediate check anyway.
+  const needCompanionPoll = !supportsMultimodal
+  const [companionRunning, setCompanionRunning] = useState(false)
+  useEffect(() => {
+    let alive = true
+    const check = () =>
+      api
+        .getBuiltinLlmStatus()
+        .then((s) => {
+          if (alive) setCompanionRunning(s?.companion?.running === true)
+        })
+        .catch(() => {})
+    check()
+    if (!needCompanionPoll) return () => { alive = false }
+    const timer = window.setInterval(check, 8000)
+    window.addEventListener('focus', check)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+      window.removeEventListener('focus', check)
+    }
+  }, [needCompanionPoll])
+  const imagesAllowed = supportsMultimodal || companionRunning
+  const visionDelegate = !supportsMultimodal && companionRunning
+
   const handleQuickAction = (prompt: string) => {
-    setInput(prompt)
+    // Text replace must drop stale mention/reference nodes from a prior draft.
+    const next = composerReplaceTextOnly(prompt)
+    setInput(next.message)
+    setChatReferences(next.references)
+    setChatContentNodes(next.contentNodes)
+    setInvalidRefs({})
     inputRef.current?.focus()
   }
 
@@ -688,27 +1144,25 @@ export function ChatPage() {
     }
   }, [searchParams, setSearchParams])
 
-  // Handle pending stream recovery - restore
-  const handleRestorePendingStream = () => {
-    if (pendingStream) {
-      // The streaming state is already restored, just clear the prompt
-      setPendingStream(null)
+  // Load the next older history page. The scroll container is anchored: the
+  // user's viewport stays on the same messages — prepending without this
+  // yanks them to the "new" top of the list.
+  const handleLoadEarlier = async () => {
+    if (loadingEarlier) return
+    setLoadingEarlier(true)
+    const container = scrollContainerRef.current
+    const prevHeight = container?.scrollHeight ?? 0
+    const prevTop = container?.scrollTop ?? 0
+    try {
+      const loaded = await loadEarlierHistory()
+      if (loaded && container) {
+        requestAnimationFrame(() => {
+          container.scrollTop = prevTop + (container.scrollHeight - prevHeight)
+        })
+      }
+    } finally {
+      setLoadingEarlier(false)
     }
-  }
-
-  // Handle pending stream recovery - discard
-  const handleDiscardPendingStream = async () => {
-    if (sessionId && pendingStream) {
-      // Clear pending stream from server
-      await api.clearPendingStream(sessionId).catch(() => {})
-      // Reset streaming state
-      setIsStreaming(false)
-      setStreamingContent("")
-      setStreamingThinking("")
-      setStreamingToolCalls([])
-      capturedStreamingRef.current = { content: "", thinking: "", toolCalls: [] }
-    }
-    setPendingStream(null)
   }
 
   // Handle manual reconnect
@@ -723,13 +1177,14 @@ export function ChatPage() {
     // Send cancel message to backend
     ws.sendMessage("__CANCEL__", undefined)
 
-    // Reset streaming state
-    setIsStreaming(false)
-    setStreamingContent("")
-    setStreamingThinking("")
-    setStreamingToolCalls([])
-    capturedStreamingRef.current = { content: "", thinking: "", toolCalls: [] }
-    streamingMessageIdRef.current = null
+    // Reset streaming state (local path — the server's `cancelled` ack
+    // covers cross-tab cancels via the hook)
+    hardReset()
+
+    // Kill the detached-turn poll too: the server deletes the pending
+    // snapshot on __CANCEL__, but the poll key must drop locally or the
+    // next 3s tick would resurrect whatever snapshot state remains.
+    setResumedPendingStream(null)
 
     // Add a message to indicate cancellation
     const cancelMsg: Message = {
@@ -744,8 +1199,15 @@ export function ChatPage() {
   // Handle keyboard shortcuts
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
+      // IME confirmation must not send (Chinese/Japanese Enter / keyCode 229).
+      if (
+        e.nativeEvent.isComposing ||
+        (e.nativeEvent as KeyboardEvent).keyCode === 229
+      ) {
+        return
+      }
       e.preventDefault()
-      handleSend()
+      void handleSend()
     }
   }
 
@@ -757,7 +1219,7 @@ export function ChatPage() {
     }
   }
 
-  const getUserInitials = (username: string) => {
+  const _getUserInitials = (username: string) => {
     return username.slice(0, 2).toUpperCase()
   }
 
@@ -773,56 +1235,177 @@ export function ChatPage() {
 
   // Settled-messages token estimate (backend CJK-aware weights) — memoized
   // separately from the streaming delta so chunks don't resc an the history.
-  const messageTokensEstimate = useMemo(
-    () => estimateTokens(messages.map(m => m.content ?? '').join('\n')),
-    [messages],
-  )
-
-  // Context usage — real prompt tokens after a turn, chars/3 estimate otherwise
+  // Only server request snapshots describe context; UI history includes
+  // compressed/omitted rounds and must not be added into the meter.
   const contextUsage = useMemo(() => {
     if (messages.length === 0 || isWelcomeMode) return null
     const activeBackend = llmBackends.find(b => b.id === activeBackendId)
-    const maxContext = activeBackend?.capabilities?.max_context ?? 8192
-    const promptTokens = lastTokenUsage?.promptTokens
-    let used: number
-    if (promptTokens != null && !isStreaming) {
-      used = promptTokens
-    } else {
-      // Only the streaming delta is re-estimated per chunk — the settled
-      // messages' total is memoized below, so each chunk costs O(delta)
-      // instead of a full-history join + scan.
-      const streamCorpus = (streamingContent ?? '') + (streamingThinking ?? '')
-        + streamingToolCalls.map(tc => (tc.arguments ?? '') + (tc.result ?? '')).join('')
-      used = messageTokensEstimate + estimateTokens(streamCorpus)
-      // While streaming with a known real baseline, never dip below it — the
-      // in-flight request's at least the last measured prompt.
-      if (promptTokens != null) used = Math.max(used, promptTokens)
-    }
-    const system = lastTokenUsage?.systemPromptTokens
-    const tools = lastTokenUsage?.toolTokens
-    const history = system != null && tools != null && promptTokens != null
-      ? Math.max(0, used - system - tools)
-      : undefined
-    const estimated = promptTokens == null || isStreaming
-    return { used, max: maxContext, system, tools, history, estimated, messageCount: messages.length }
-  }, [messages, isWelcomeMode, llmBackends, activeBackendId, lastTokenUsage, isStreaming, streamingContent, streamingThinking, streamingToolCalls])
+    return contextUsageSnapshot(lastTokenUsage, activeBackend?.capabilities?.max_context, messages.length)
+  }, [messages, isWelcomeMode, llmBackends, activeBackendId, lastTokenUsage])
 
   // Show LLM setup prompt if not configured. First-ever load shows a
   // skeleton; a REFETCH (focus/click re-triggers loadBackends, which flips
   // llmBackendLoading true) keeps the guide mounted — the old gate fell
   // through to the real chat UI for a frame on every refetch, flashing the
   // conversation beneath the guide.
-  if (!llmBackends || llmBackends.length === 0) {
+  // Rendered INSIDE the page layout, not via an early return: the early
+  // return skipped MobilePageHeader, and on phones that header is the ONLY
+  // navigation entry point — users landed on the setup guide with no way to
+  // reach settings or any other page.
+  const noLlmContent = (() => {
+    if (llmBackends && llmBackends.length > 0) return null
+    // An install that HAS configured backends never shows the guide while a
+    // load is in flight — including first paint, where llmBackendLoading is
+    // still false (the mount effect flips it a tick later). The marker is
+    // set/cleared by loadBackends on every completed fetch.
+    const knownConfigured = localStorage.getItem('heramind_has_llm_backends') === '1'
+    if (knownConfigured && (llmBackendLoading || !everLoadedBackendsRef.current)) {
+      everLoadedBackendsRef.current = true
+      return <LoadingState variant="page" />
+    }
     if (llmBackendLoading && !everLoadedBackendsRef.current) {
       return <LoadingState variant="page" />
     }
     everLoadedBackendsRef.current = true
     return <LlmSetupGuide />
+  })()
+
+  const mobileChatTitle = noLlmContent
+    ? t('common:llmGuide.title')
+    : getSessionDisplayTitle(
+        sessions.find((session) => session.sessionId === urlSessionId),
+        t('chat:input.newChat'),
+      )
+
+  // Manual context compaction — force a summary now (backend bypasses the
+  // auto threshold). Prefer the response's post-compact tokenUsage so the
+  // ring updates immediately. If the API omits tokenUsage, KEEP the previous
+  // meter (clearing it paints an empty pending ring that looks broken).
+  const handleCompact = async () => {
+    if (!sessionId || isCompacting) return
+    setIsCompacting(true)
+    setContextAction({ phase: "running" })
+    try {
+      const r = await api.compactSession(sessionId)
+      if (r.summarizedMessages > 0) {
+        if (r.tokenUsage && Number.isFinite(r.tokenUsage.promptTokens)) {
+          setLastTokenUsage(r.tokenUsage)
+          persistTokenUsage(sessionId, r.tokenUsage)
+        }
+        // else: keep lastTokenUsage as-is — next ContextUsage will refresh.
+      }
+      setContextAction({
+        phase: "done",
+        summarizedCount: r.summarizedMessages,
+      })
+    } catch (e) {
+      setContextAction({ phase: "failed" })
+    } finally {
+      setIsCompacting(false)
+    }
   }
+
+  /** History “fill composer” — restores ordered contentNodes for resend. */
+  const handleReuseUserMessage = useCallback((message: Message) => {
+    const nodes =
+      normalizeContentNodes(message.contentNodes) ??
+      (message.content ? [{ kind: "text" as const, text: message.content }] : [])
+    const fields = contentNodesToComposerFields(nodes)
+    setInput(fields.message)
+    setChatReferences(fields.references)
+    setChatContentNodes(fields.contentNodes)
+    setInvalidRefs({})
+    const draftSession = sessionId || "new"
+    saveSessionDraft({
+      sessionId: draftSession,
+      message: fields.message,
+      references: fields.references,
+      contentNodes: fields.contentNodes,
+      updatedAt: Date.now(),
+    })
+    // Focus TipTap ProseMirror when present; fall back to legacy textarea.
+    requestAnimationFrame(() => {
+      const pm = editorHostRef.current?.querySelector<HTMLElement>(".ProseMirror")
+      if (pm) pm.focus()
+      else inputRef.current?.focus()
+    })
+  }, [sessionId])
+
+  // Clear this session's history (server + local view), keep the session.
+  const handleClearContext = async () => {
+    if (!sessionId) return
+    try {
+      await api.clearSessionHistory(sessionId)
+      clearMessages()
+      setLastTokenUsage(null)
+      persistTokenUsage(sessionId, null)
+      toast({ description: t('chat:context.clearDone') })
+    } catch (e) {
+      toast({ title: t('chat:context.clearFailed'), variant: 'destructive' })
+    }
+  }
+
+  // One composer element shared by its two hosts: below the welcome title on
+  // an empty chat and docked at the bottom during a conversation. A
+  // React element is immutable, so only one instance is ever mounted.
+  const composerEl = (
+    <ChatComposer
+      value={input}
+      onChange={setInput}
+      onSend={() => handleSend()}
+      onKeyDown={handleKeyDown}
+      textareaRef={inputRef}
+      editorHostRef={editorHostRef}
+      placeholder={t('chat:input.placeholder')}
+      isStreaming={isStreaming}
+      onCancel={handleCancelRequest}
+      attachments={attachedImages}
+      onAttachmentsChange={setAttachedImages}
+      references={chatReferences}
+      contentNodes={chatContentNodes}
+      onReferencesChange={(refs) => {
+        setChatReferences(refs)
+        // Drop invalid marks for removed entities; keep marks that still apply.
+        setInvalidRefs((prev) => {
+          const keep: Record<string, string> = {}
+          for (const r of refs) {
+            const k = mentionKey(r.type, r.id)
+            if (prev[k]) keep[k] = prev[k]
+          }
+          return keep
+        })
+      }}
+      onContentNodesChange={setChatContentNodes}
+      invalidRefs={invalidRefs}
+      supportsMultimodal={imagesAllowed}
+      visionDelegate={visionDelegate}
+      backends={llmBackends}
+      activeBackendId={activeBackendId}
+      onActivateBackend={activateBackend}
+      contextUsage={contextUsage}
+      onCompact={sessionId ? handleCompact : undefined}
+      onClearContext={sessionId ? handleClearContext : undefined}
+      compacting={isCompacting}
+      // Desktop ~8 lines (160); mobile ~6 lines at leading-5 (120) then
+      // internal scroll. Same auto-grow path in ChatComposer / TipTap.
+      maxHeight={isDesktop ? 160 : 120}
+      // One resting height everywhere — welcome vs conversation used to
+      // differ (72/56 vs 44), and the box visibly jumped the moment the
+      // first reply landed (the context ring appearing at the same time
+      // made it look icon-caused).
+      minHeight={44}
+    />
+  )
 
   return (
     <>
-    <div className="fixed left-0 right-0 flex flex-row overflow-hidden safe-top" style={{
+    <div className={cn(
+      "chat-mobile-shell fixed left-0 right-0 flex flex-row overflow-hidden bg-background",
+      // Desktop: shell owns the macOS titlebar inset. Mobile: the chat header
+      // owns safe-top (same contract as MobilePageHeader) so the notch strip
+      // is painted by the header token, not a second transparent pad.
+      isDesktop && "safe-top",
+    )} style={{
       // Offset past BOTH the desktop AppSidebar and the page sidebar column
       // (sessions list, hoisted to the shell slot). Both are 0 on mobile.
       left: 'calc(var(--app-sidebar-width, 0px) + var(--page-sidebar-width, 0px))',
@@ -835,8 +1418,6 @@ export function ChatPage() {
       // visible area. Use --visual-viewport-offset-top to follow the visible
       // area. Always 0 in Safari (where the layout viewport itself shrinks).
       top: 'var(--visual-viewport-offset-top, 0px)',
-      // No global top bar anymore (desktop chrome = sidebar rail) — the
-      // safe-top class handles the mobile notch; desktop needs no top pad.
       // Drive height from `--app-height` (visualViewport.height) so the chat
       // page shrinks with the soft keyboard on iOS PWA standalone, where
       // `interactive-widget=resizes-content` is NOT honored and 100dvh stays
@@ -845,59 +1426,6 @@ export function ChatPage() {
       // notch. Falls back to 100dvh when --app-height is unset.
       height: 'var(--app-height, 100dvh)',
     }}>
-      {/* Pending stream recovery dialog */}
-      {pendingStream?.hasPending && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-bg-80 backdrop-blur-sm">
-          <div className="max-w-md w-full mx-4 bg-card border border-border rounded-lg shadow-lg p-6">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="h-10 w-10 rounded-full bg-info-light flex items-center justify-center">
-                <RotateCcw className="h-5 w-5 text-info" />
-              </div>
-              <div>
-                <h3 className="font-semibold">{t('common:session.resumeResponseTitle')}</h3>
-                <p className="text-sm text-muted-foreground">
-                  {t('common:session.resumeResponseDesc')}
-                </p>
-              </div>
-            </div>
-
-            {(pendingStream.content || pendingStream.thinking) && (
-              <div className="mb-4 p-3 bg-muted rounded-lg text-sm">
-                {pendingStream.thinking && (
-                  <div className="mb-2 text-muted-foreground italic">
-                    {pendingStream.thinking.slice(0, 200)}
-                    {pendingStream.thinking.length > 200 && "..."}
-                  </div>
-                )}
-                {pendingStream.content && (
-                  <div>
-                    {pendingStream.content.slice(0, 200)}
-                    {pendingStream.content.length > 200 && "..."}
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                className="flex-1"
-                onClick={handleDiscardPendingStream}
-              >
-                {t('common:session.discard')}
-              </Button>
-              <Button
-                className="flex-1"
-                onClick={handleRestorePendingStream}
-              >
-                {t('common:session.resume')}
-              </Button>
-            </div>
-          </div>
-        </div>,
-        getPortalRoot()
-      )}
-
       {/* Desktop Sidebar - always show when there are sessions or in chat mode.
           Hoisted to the shell's full-height slot (left of the content) so it
           sits level with the AppSidebar; falls back to in-flow if the slot
@@ -942,8 +1470,9 @@ export function ChatPage() {
         )
       )}
 
-      {/* Mobile Sidebar - drawer */}
-      {!isDesktop && (sessions.length > 0 || !isWelcomeMode) && (
+      {/* Mobile workspace drawer — always mounted so welcome/empty chat can
+          still reach sessions + the System hub without a second top control. */}
+      {!isDesktop && (
         <SessionSidebar
           open={sidebarOpen}
           onClose={() => setSidebarOpen(false)}
@@ -951,51 +1480,72 @@ export function ChatPage() {
         />
       )}
 
-      {/* (Legacy mobile FAB removed — session toggle now lives in MobilePageHeader) */}
-
-      {/* Main Content */}
-      <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-        {/* Mobile per-page header: hamburger (nav drawer) + sessions toggle + new session */}
-        <MobilePageHeader
-          title={(() => {
-            const s = sessions.find((x) => x.sessionId === urlSessionId)
-            return s?.title || t('chat:input.newChat')
-          })()}
-          leftExtra={
-            !isDesktop && (sessions.length > 0 || !isWelcomeMode) ? (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="shrink-0"
-                onClick={() => setSidebarOpen(true)}
-                aria-label={t('common:session.history')}
-              >
-                <MessageSquare className="h-5 w-5" />
-              </Button>
-            ) : undefined
-          }
-          actions={
-            !isDesktop ? (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="shrink-0"
-                onClick={async () => {
-                  const id = await createSession()
-                  if (id) navigate(`/chat/${id}`)
-                }}
-                aria-label={t('chat:input.newChat')}
-              >
-                <Plus className="h-5 w-5" />
-              </Button>
-            ) : undefined
-          }
-        />
-        {/* Chat Content Area */}
-        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-        {isWelcomeMode && !sessionsLoaded ? (
+      {/* Main Content — mobile header overlays the conversation (transparent);
+          scroll area is full-height; content padding clears the controls. */}
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+        {/* Mobile chrome: [☰ workspace drawer] [session title] [+].
+            Left opens the unified drawer (chats + workspace exit); title is
+            display-only so it no longer competes with the list affordance. */}
+        {!isDesktop && (
+          <div className="pointer-events-none absolute inset-x-0 top-0 z-30">
+            <div className="pointer-events-auto">
+              <MobilePageHeader
+                titleAlign="center"
+                scrim
+                leftExtra={
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-10 w-10 shrink-0 rounded-full border border-glass-border bg-surface-glass shadow-sm backdrop-blur-xl hover:border-glass-border-hover hover:bg-muted sm:h-10 sm:w-10"
+                    onClick={() => setSidebarOpen(true)}
+                    aria-label={t('common:session.openDrawer')}
+                    aria-expanded={sidebarOpen}
+                    aria-controls="session-workspace-drawer"
+                    data-testid="chat-drawer-button"
+                  >
+                    <Menu className="h-5 w-5" />
+                  </Button>
+                }
+                title={
+                  <span
+                    data-testid="chat-session-title"
+                    className="mx-auto block min-w-0 max-w-full truncate text-center"
+                  >
+                    {mobileChatTitle}
+                  </span>
+                }
+                actions={
+                  !noLlmContent ? (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-10 w-10 sm:h-10 sm:w-10"
+                      onClick={async () => {
+                        const id = await createSession()
+                        if (id) navigate(`/chat/${id}`)
+                      }}
+                      aria-label={t('chat:input.newChat')}
+                      data-testid="chat-new-session"
+                    >
+                      <Plus className="h-5 w-5" strokeWidth={2} />
+                    </Button>
+                  ) : undefined
+                }
+              />
+            </div>
+          </div>
+        )}
+        {/* Full-height content column — do NOT pad the flex shell (that
+            shrinks the scroll viewport). Mobile clearance lives on the
+            scroll/content children as padding-top instead. */}
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {noLlmContent ? (
+          /* LLM setup guide / first-load skeleton — replaces the chat area
+             while the header (mobile nav) stays mounted above it. */
+          noLlmContent
+        ) : isWelcomeMode && !sessionsLoaded ? (
           /* Loading state while sessions are being loaded - prevents race condition */
-          <div className="flex-1 min-h-0 flex items-center justify-center">
+          <div className="flex min-h-0 flex-1 items-center justify-center">
             <div className="flex items-center gap-2 text-muted-foreground">
               <Loader2 className="h-5 w-5 animate-spin" />
               <span className="text-sm">{t('common:loading')}</span>
@@ -1004,14 +1554,21 @@ export function ChatPage() {
         ) : isWelcomeMode ? (
           /* Welcome Area - shown on /chat (no sessionId), scrollable on mobile */
           <div
-            className={cn("touch-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-4 sm:px-6 py-4 sm:py-6 pb-6", isDesktop && "pt-14")}
+            className={cn(
+              "touch-scroll flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pb-[calc(0.75rem+env(safe-area-inset-bottom,0px))] sm:px-6 sm:py-6",
+              isDesktop
+                ? "pt-14"
+                : "pt-[calc(4rem+env(safe-area-inset-top,0px)+var(--titlebar-inset,0px)+0.5rem)]",
+            )}
             onClick={(e) => {
               // If clicking outside interactive elements, dismiss keyboard
-              if ((e.target as HTMLElement).closest('button, a, input, textarea, [role="button"]')) return
+              if ((e.target as HTMLElement).closest('button, a, input, textarea, [role="button"], [data-chat-composer]')) return
               handleBackdropClick()
             }}
           >
-            <WelcomeArea className="min-h-full" onQuickAction={handleQuickAction} />
+            <WelcomeArea className="min-h-full" onQuickAction={handleQuickAction}>
+              {composerEl}
+            </WelcomeArea>
           </div>
         ) : isLoadingSession || (urlSessionId && sessionId !== urlSessionId) ? (
           /* Loading State - shown while a session loads: during an explicit
@@ -1019,7 +1576,12 @@ export function ChatPage() {
              store's sessionId is still null for the first frame — without
              the second condition the "Empty chat" default flashes for one
              frame before the real messages arrive. */
-          <div className={cn("flex-1 min-h-0 overflow-y-auto px-2 sm:px-4 py-2 sm:py-4", isDesktop && "pt-12")}>
+          <div className={cn(
+            "min-h-0 flex-1 overflow-y-auto px-4 py-2 sm:py-4",
+            isDesktop
+              ? "pt-12"
+              : "pt-[calc(4rem+env(safe-area-inset-top,0px)+var(--titlebar-inset,0px)+0.5rem)] pb-[calc(5.5rem+env(safe-area-inset-bottom,0px))]",
+          )}>
             <div className="max-w-3xl mx-auto space-y-4 sm:space-y-6">
               {/* Skeleton message - user */}
               <div className="flex gap-2 sm:gap-3 justify-end animate-pulse">
@@ -1056,47 +1618,67 @@ export function ChatPage() {
           </div>
         ) : hasMessages ? (
           /* Chat Messages - shown on /chat/:sessionId with messages */
-          <div
-            ref={scrollContainerRef}
-            onScroll={handleScroll}
-            className={cn("touch-scroll relative flex-1 min-h-0 overflow-y-auto px-2 sm:px-4 pt-6 pb-2 sm:pb-4 pb-4 md:pt-20")}
-            onClick={(e) => {
-              // If clicking outside interactive elements, dismiss keyboard
-              if ((e.target as HTMLElement).closest('button, a, input, textarea, [role="button"]')) return
-              handleBackdropClick()
-            }}
-          >
-            <ChatMessages
-              messages={filteredMessages}
-              user={user}
-              isStreaming={isStreaming}
-              streamingContent={streamingContent}
-              streamingThinking={streamingThinking}
-              streamingRoundThinking={streamingRoundThinking}
-              streamingToolCalls={streamingToolCalls}
-              roundContents={roundContents}
-              currentRound={currentRoundRef.current}
-              streamingMessageId={streamingMessageIdRef.current}
-              onScrollToBottom={scrollToBottom}
-              endRef={messagesEndRef}
+          <div className="relative min-h-0 flex-1">
+            <div
+              ref={scrollContainerRef}
+              onScroll={handleScroll}
+              className={cn(
+                "touch-scroll h-full overflow-y-auto px-4 pb-2 sm:pb-4",
+                isDesktop
+                  ? "pt-6 md:pt-20"
+                  // Bottom pad clears the overlay composer so the list still
+                  // paints under the transparent dock and fills the column.
+                  : "pt-[calc(4rem+env(safe-area-inset-top,0px)+var(--titlebar-inset,0px)+0.5rem)] pb-[calc(5.5rem+env(safe-area-inset-bottom,0px))]",
+              )}
+              onClick={(e) => {
+                // If clicking outside interactive elements, dismiss keyboard
+                if ((e.target as HTMLElement).closest('button, a, input, textarea, [role="button"], [data-chat-composer]')) return
+                handleBackdropClick()
+              }}
+            >
+              <ChatMessages
+
+                messages={filteredMessages}
+                user={user}
+                isStreaming={isStreaming}
+                streamingContent={streamingContent}
+                streamingThinking={streamingThinking}
+                streamingRoundThinking={streamingRoundThinking}
+                streamingToolCalls={streamingToolCalls}
+                roundContents={roundContents}
+                currentRound={currentRound}
+                streamingMessageId={streamingMessageId}
+                hasEarlierHistory={hasEarlierHistory}
+                loadingEarlier={loadingEarlier}
+                onLoadEarlier={handleLoadEarlier}
+                endRef={messagesEndRef}
+                onReuseUserMessage={handleReuseUserMessage}
+                contextAction={contextAction}
+              />
+            </div>
+            <ChatScrollPill
+              visible={showScrollPill}
+              hasNewContent={isStreaming}
+              onClick={scrollToBottom}
+              className={!isDesktop ? "bottom-[calc(5.5rem+env(safe-area-inset-bottom,0px))]" : undefined}
             />
           </div>
         ) : (
           /* Empty chat - shown on /chat/:sessionId with no messages yet */
           <div
-            className="flex-1 min-h-0 flex items-center justify-center px-4 py-4 sm:py-6"
+            className={cn(
+              "flex min-h-0 flex-1 items-center justify-center px-4 py-4 sm:py-6",
+              !isDesktop && "pt-[calc(4rem+env(safe-area-inset-top,0px)+var(--titlebar-inset,0px))] pb-[calc(5.5rem+env(safe-area-inset-bottom,0px))]",
+            )}
             onClick={(e) => {
               // If clicking outside interactive elements, dismiss keyboard
-              if ((e.target as HTMLElement).closest('button, a, input, textarea, [role="button"]')) return
+              if ((e.target as HTMLElement).closest('button, a, input, textarea, [role="button"], [data-chat-composer]')) return
               handleBackdropClick()
             }}
           >
-            <div className="text-center space-y-4 max-w-md">
-              <div className="w-16 h-16 rounded-xl bg-muted flex items-center justify-center mx-auto">
-                <Sparkles className="h-8 w-8 text-muted-foreground" />
-              </div>
+            <div className="max-w-md space-y-2 text-center">
               <div>
-                <h3 className="text-lg font-semibold">{t('chat:input.newChat')}</h3>
+                <h3 className="text-xl font-semibold tracking-tight">{t('chat:input.newChat')}</h3>
                 <p className="text-sm text-muted-foreground mt-1">
                   {t('chat:input.startNewConversation')}
                 </p>
@@ -1106,16 +1688,17 @@ export function ChatPage() {
         )}
         </div>
 
-        {/* Input Area - flex child of chat column. With
-            `interactive-widget=resizes-content` in the viewport meta, the
-            chat root's `height: 100dvh` shrinks naturally on keyboard open
-            (iOS 16.4+ / Android Chrome), and `shrink-0` keeps the input
-            pinned to the bottom of the visible area — no fixed-position
-            hacks needed. No background: transparent to match the
-            conversation area above and the desktop input. */}
+        {/* Input Area — mobile overlays the conversation with a bottom→top
+            scrim (see .chat-composer-dock); desktop stays in-flow.
+            Welcome / no-LLM skip the dock. */}
+        {!isWelcomeMode && !noLlmContent && (
         <div
-          className="shrink-0 px-2.5 sm:px-4 pt-3 pb-[calc(1.25rem+env(safe-area-inset-bottom,0px))] sm:pt-3 sm:pb-[calc(1.5rem+env(safe-area-inset-bottom,0px))] border-0"
-          style={isDesktop ? undefined : { paddingBottom: 'max(1rem, env(safe-area-inset-bottom, 12px))' }}
+          className={cn(
+            // Bottom pad for mobile lives in index.css (.chat-composer-dock +
+            // body.keyboard-open override). Desktop keeps the in-flow safe pad.
+            "chat-composer-dock overflow-visible border-0 px-4 pt-3 sm:pb-[calc(1.5rem+env(safe-area-inset-bottom,0px))] sm:pt-3",
+            isDesktop ? "relative shrink-0" : "absolute inset-x-0 bottom-0 z-20",
+          )}
         >
           <div className="max-w-3xl mx-auto">
             {/* Connection status — only surfaces when the WebSocket is not
@@ -1145,26 +1728,16 @@ export function ChatPage() {
               </div>
             )}
 
-            <ChatComposer
-              value={input}
-              onChange={setInput}
-              onSend={() => handleSend()}
-              onKeyDown={handleKeyDown}
-              textareaRef={inputRef}
-              placeholder={t('chat:input.placeholder')}
-              isStreaming={isStreaming}
-              onCancel={handleCancelRequest}
-              attachments={attachedImages}
-              onAttachmentsChange={setAttachedImages}
-              supportsMultimodal={supportsMultimodal}
-              backends={llmBackends}
-              activeBackendId={activeBackendId}
-              onActivateBackend={activateBackend}
-              contextUsage={contextUsage}
-              maxHeight={isDesktop ? 160 : 100}
+            <AuthorizeConfirmBar
+              pending={pendingAuthorizeConfirms}
+              disabled={isStreaming || isLoadingSession}
+              onConfirm={handleConfirmAuthorize}
             />
+
+            {composerEl}
           </div>
         </div>
+        )}
       </div>
     </div>
 

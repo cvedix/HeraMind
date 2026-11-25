@@ -1,10 +1,8 @@
 import { useTranslation } from "react-i18next"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
-import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu"
-import { IconButton } from "@/components/ui/button"
-import { ResponsiveTable, EmptyState } from "@/components/shared"
-import { Eye, Pencil, Trash2, Download, MoreVertical, Cpu, Database, Activity } from "lucide-react"
+import { ResponsiveTable, EmptyState, EmptyStateCard } from "@/components/shared"
+import { Eye, Pencil, Trash2, Download, Database } from "lucide-react"
 import type { DeviceType } from "@/types"
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -12,7 +10,7 @@ import { useToast } from "@/hooks/use-toast"
 import { TransformsBadge } from "@/components/automation"
 import { useIsMobile } from "@/hooks/useMobile"
 import { useTransformCounts } from "@/hooks/useTransformCounts"
-import { textNano, textMini } from "@/design-system/tokens/typography"
+import { textNano } from "@/design-system/tokens/typography"
 
 interface DeviceTypeListProps {
   deviceTypes: DeviceType[]
@@ -20,6 +18,8 @@ interface DeviceTypeListProps {
   paginatedDeviceTypes: DeviceType[]
   deviceTypePage: number
   deviceTypesPerPage: number
+  /** Attached device count per device_type id — for the devices column and delete guard */
+  deviceCounts: Record<string, number>
   onRefresh: () => void
   onViewDetails: (type: DeviceType) => void
   onEdit: (type: DeviceType) => void
@@ -29,16 +29,17 @@ interface DeviceTypeListProps {
 }
 
 export function DeviceTypeList({
-  deviceTypes,
+  deviceTypes: _deviceTypes,
   loading,
   paginatedDeviceTypes,
-  deviceTypePage,
-  deviceTypesPerPage,
+  deviceTypePage: _deviceTypePage,
+  deviceTypesPerPage: _deviceTypesPerPage,
+  deviceCounts,
   onRefresh,
   onViewDetails,
   onEdit,
   onDelete,
-  onPageChange,
+  onPageChange: _onPageChange,
   addTypeDialog,
 }: DeviceTypeListProps) {
   const { t } = useTranslation(['common', 'devices'])
@@ -74,70 +75,50 @@ export function DeviceTypeList({
 
       {isMobile ? (
         <div className="space-y-2">
+          {/* Mobile has no ResponsiveTable — carry its own empty state. */}
+          {!loading && paginatedDeviceTypes.length === 0 && (
+            <EmptyStateCard>
+              <EmptyState
+                title={t('devices:emptyType.title', 'No device types')}
+                description={t('devices:emptyType.description', 'Create a device type to define device categories')}
+              />
+            </EmptyStateCard>
+          )}
+          {loading && paginatedDeviceTypes.length === 0 && (
+            [0, 1, 2].map((i) => (
+              <Card key={i} className="overflow-hidden rounded-2xl border-border bg-card shadow-none">
+                <div className="px-3 py-2.5 animate-pulse">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-lg bg-muted" />
+                    <div className="h-4 w-32 rounded bg-muted" />
+                  </div>
+                  <div className="mt-2 ml-[40px] h-3 w-44 rounded bg-muted" />
+                </div>
+              </Card>
+            ))
+          )}
           {paginatedDeviceTypes.map((dt) => (
             <Card
               key={dt.device_type}
-              className="overflow-hidden border-border shadow-sm cursor-pointer active:scale-[0.99] transition-all"
+              className={cn(
+                "cursor-pointer overflow-hidden rounded-2xl border border-border bg-card shadow-none transition-colors active:bg-muted",
+              )}
               onClick={() => onViewDetails(dt)}
             >
-              <div className="px-3 py-2.5">
-                {/* Row 1: icon + name + stats + actions */}
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 bg-info-light text-info">
-                    <Database className="h-4 w-4" />
+              <div className="px-4 py-3.5">
+                <div className="min-w-0">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <div className="truncate text-heading font-medium">{dt.name}</div>
+                    {dt.builtin_version && (
+                      <Badge variant="outline" className={cn("h-5 shrink-0 px-1.5", textNano, "bg-muted-30 text-muted-foreground border-muted")}>
+                        {t('devices:types.builtinBadge')}
+                      </Badge>
+                    )}
                   </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="font-medium text-sm truncate">{dt.name}</div>
+                  <div className="mt-1 flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+                    <code className="shrink-0 truncate font-mono">{dt.device_type}</code>
+                    {dt.description && <span className="truncate">· {dt.description}</span>}
                   </div>
-                  {/* Compact stats: icon + count */}
-                  <span className={cn("flex items-center gap-0.5", textMini, "text-info shrink-0")}>
-                    <Activity className="h-3 w-3" />
-                    {dt.metrics?.length ?? dt.metric_count ?? 0}
-                  </span>
-                  <span className={cn("flex items-center gap-0.5", textMini, "text-accent-purple shrink-0")}>
-                    <Cpu className="h-3 w-3" />
-                    {dt.commands?.length ?? dt.command_count ?? 0}
-                  </span>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
-                      <IconButton className="shrink-0">
-                        <MoreVertical className="h-4 w-4" />
-                      </IconButton>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onViewDetails(dt) }}>
-                        <Eye className="h-4 w-4 mr-2" />
-                        {t('devices:types.actions.view')}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleExport(dt) }}>
-                        <Download className="h-4 w-4 mr-2" />
-                        {t('devices:types.actions.export')}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onEdit(dt) }}>
-                        <Pencil className="h-4 w-4 mr-2" />
-                        {t('common:edit')}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        className="text-error"
-                        onClick={(e) => { e.stopPropagation(); onDelete(dt.device_type) }}
-                      >
-                        <Trash2 className="h-4 w-4 mr-2" />
-                        {t('common:delete')}
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-                {/* Row 2: device_type code + description */}
-                <div className="flex items-center gap-1.5 mt-1 ml-[40px]">
-                  <code className={cn(textNano, "text-muted-foreground font-mono shrink-0")}>{dt.device_type}</code>
-                  {dt.description && (
-                    <>
-                      <span className={cn(textNano, "text-muted-foreground")}>·</span>
-                      <span className={cn(textNano, "text-muted-foreground truncate min-w-0")}>
-                        {dt.description}
-                      </span>
-                    </>
-                  )}
                 </div>
               </div>
             </Card>
@@ -169,6 +150,12 @@ export function DeviceTypeList({
             width: 'w-16',
           },
           {
+            key: 'devices',
+            label: t('devices:types.headers.devices'),
+            align: 'center',
+            width: 'w-16',
+          },
+          {
             key: 'transforms',
             label: t('automation:transforms', { defaultValue: 'Transforms' }),
             align: 'center',
@@ -190,8 +177,15 @@ export function DeviceTypeList({
                     <Database className="h-4 w-4" />
                   </div>
                   <div className="min-w-0">
-                    <div className="font-medium text-sm truncate">{type.name}</div>
-                    <code className="text-xs text-muted-foreground font-mono">{type.device_type}</code>
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <div className="truncate text-sm font-medium">{type.name}</div>
+                      {type.builtin_version && (
+                        <Badge variant="outline" className={cn("h-5 shrink-0 px-1.5", textNano, "bg-muted-30 text-muted-foreground border-muted")}>
+                          {t('devices:types.builtinBadge')}
+                        </Badge>
+                      )}
+                    </div>
+                    <code className="block min-w-0 truncate text-xs font-mono text-muted-foreground" title={type.device_type}>{type.device_type}</code>
                   </div>
                 </div>
               )
@@ -214,6 +208,13 @@ export function DeviceTypeList({
               return (
                 <Badge variant="outline" className="text-xs bg-accent-purple-light text-accent-purple border-accent-purple-light">
                   {type.commands?.length ?? type.command_count ?? 0}
+                </Badge>
+              )
+
+            case 'devices':
+              return (
+                <Badge variant="outline" className="text-xs bg-muted-30 text-muted-foreground border-muted">
+                  {deviceCounts[type.device_type] ?? 0}
                 </Badge>
               )
 
@@ -261,7 +262,6 @@ export function DeviceTypeList({
         ]}
         emptyState={
           <EmptyState
-            icon={<Database className="h-12 w-12" />}
             title={t('devices:emptyType.title', 'No device types')}
             description={t('devices:emptyType.description', 'Create a device type to define device categories')}
           />

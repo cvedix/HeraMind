@@ -1,7 +1,10 @@
 ---
 id: message-management
+summary: Create/query platform notifications and configure delivery channels.
+not_for: [threshold/condition logic (rule-management), device display/control (device get/control)]
 name: Message Management & Channel Configuration
-description: Use when the user wants to manage messages and notification channels — sending messages, configuring channels (webhook/email/Telegram/DingTalk/Feishu/Slack), alerts, acknowledge, severity. Covers message send/channel-create/channel-get/channel-update/channel-test/channel-delete/channel-type-schema even without saying 'message' (e.g. '发个通知到飞书', '告警发我邮箱'). Includes 消息/通知/通道/告警. NOT external MQTT brokers — use connector-management for those.
+aliases: [notification, notify]
+description: Use when the user wants platform message-center notifications and channels — create/list/get/ack messages, configure channels (webhook/email/Telegram/DingTalk/Feishu/Slack), alerts, severity. Covers message send/channel-create/channel-get/channel-update/channel-test/channel-delete/channel-type-schema even without saying 'message' (e.g. '发个通知到飞书', '告警发我邮箱', '给消息中心发一条'). Includes 消息/通知/通道/告警. NOT device text/control (use device get → device control). NOT external MQTT brokers — use connector-management for those.
 category: message
 origin: builtin
 priority: 80
@@ -15,6 +18,36 @@ anti_triggers:
   keywords: [dashboard, 仪表盘, agent, 代理, extension develop, 扩展开发, rule, 规则, device connect, 设备连接, push, 推送, data push]
 ---
 
+# message-management
+
+Platform notification center (create / query / ack) plus delivery channels — not device text or device control.
+Separate messages from channels. Discover channel types and configuration schema before creating an unfamiliar channel; use --param key=value or --config JSON.
+A rule notify action creates a platform message. Channels receive messages according to their filters; an empty filter accepts all. Do not invent channel IDs inside rule actions.
+Test delivery when requested, then inspect the result. Message stored, delivery queued and recipient received are distinct outcomes. Avoid repeated sends after an unknown result.
+Read/update/delete only the intended message or channel. Preserve credentials and filters unless the user requested changes. Load type-specific examples and routing sections as needed.
+
+## Commands
+| Command | Purpose |
+|---|---|
+| `heramind message list` | List platform notifications |
+| `heramind message get <id>` | Platform notification details |
+| `heramind message send` | Create a platform notification (message center — not device delivery) |
+| `heramind message read <id>` | Acknowledge/read a platform notification (alias: `ack`) |
+| `heramind message channel-list` | List notification channels |
+| `heramind message channel-get <id>` | Channel details |
+| `heramind message channel-types` | List available channel types |
+| `heramind message channel-type-schema <TYPE>` | Config schema + examples for a channel type |
+| `heramind message channel-create` | Create a notification channel |
+| `heramind message channel-update --name <NAME> --config '<JSON>'` | Update channel configuration (⚠️ flags, no positional id) |
+| `heramind message channel-delete <id>` | Delete a channel |
+| `heramind message channel-test <id>` | Test a notification channel |
+
+## Detailed reference
+Use skill(action="load", id="message-management", section="<exact returned title>") only for the needed detail. Section titles are returned with this overview.
+
+<!-- SKILL_REFERENCE -->
+
+
 # Message Management & Channel Configuration
 
 Messages are platform notifications delivered through configurable channels. 7 channel types are supported: webhook, email, telegram, wecom, dingtalk, slack, feishu.
@@ -25,18 +58,18 @@ Always RUN the command yourself and report the real output.
 
 | Command | Purpose |
 |---|---|
-| `heramind message list` | List messages |
-| `heramind message get <id>` | Message details |
-| `heramind message send` | Send a new message |
-| `heramind message read <id>` | Acknowledge/read a message (alias: `ack`) |
-| `heramind message channel-list` | List message channels |
+| `heramind message list` | List platform notifications |
+| `heramind message get <id>` | Platform notification details |
+| `heramind message send` | Create a platform notification (message center — not device delivery) |
+| `heramind message read <id>` | Acknowledge/read a platform notification (alias: `ack`) |
+| `heramind message channel-list` | List notification channels |
 | `heramind message channel-get <id>` | Channel details |
 | `heramind message channel-types` | List available channel types |
 | `heramind message channel-type-schema <TYPE>` | Config schema + examples for a channel type |
-| `heramind message channel-create` | Create a message channel |
-| `heramind message channel-update <id>` | Update channel configuration |
+| `heramind message channel-create` | Create a notification channel |
+| `heramind message channel-update --name <NAME> --config '<JSON>'` | Update channel configuration (⚠️ flags, no positional id) |
 | `heramind message channel-delete <id>` | Delete a channel |
-| `heramind message channel-test <id>` | Test a message channel |
+| `heramind message channel-test <id>` | Test a notification channel |
 
 ## CRITICAL Rules
 
@@ -79,7 +112,7 @@ heramind message channel-list                      # List all channels
 heramind message channel-get <NAME>                # Get channel details
 heramind message channel-create --name <N> --type <T> --param <k>=<v>...  # Create channel (flags, preferred)
 heramind message channel-create --name <N> --type <T> --config '<JSON>'  # Create channel (full JSON form)
-heramind message channel-update <NAME> --config '<JSON>'                 # Update channel config
+heramind message channel-update --name <NAME> --config '<JSON>'          # Update channel config
 heramind message channel-delete <NAME>             # Delete channel
 heramind message channel-test <NAME>               # Test channel delivery
 ```
@@ -227,7 +260,7 @@ heramind message read <ID>
 ### Update Channel Config
 
 ```bash
-heramind message channel-update alerts \
+heramind message channel-update --name alerts \
   --config '{"url": "https://new-hook.example.com/alert", "headers": {"Authorization": "Bearer new-token"}}'
 ```
 

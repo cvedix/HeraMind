@@ -25,7 +25,7 @@
 # =============================================================================
 set -euo pipefail
 
-LLAMA_CPP_TAG="${LLAMA_CPP_TAG:-b10545}"
+LLAMA_CPP_TAG="${LLAMA_CPP_TAG:-b12359}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 
@@ -64,11 +64,23 @@ echo "📥 cloning llama.cpp @ $LLAMA_CPP_TAG ..."
 git clone --depth 1 --branch "$LLAMA_CPP_TAG" \
   https://github.com/ggml-org/llama.cpp.git "$WORK/llama.cpp" -q
 
-CMAKE_FLAGS=(-DLLAMA_CURL=OFF -DGGML_LLAMAFILE=OFF)
+# LLAMA_BUILD_UI + LLAMA_USE_PREBUILT_UI both OFF: HeraMind only needs the
+# OpenAI-compatible API. HF prebuilt llama-ui currently lacks workbox and
+# fails cmake (Docker v1.3.0 / local builds with defaults).
+CMAKE_FLAGS=(-DLLAMA_CURL=OFF -DGGML_LLAMAFILE=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF)
 case "$TARGET" in
   aarch64-apple-darwin|x86_64-apple-darwin)  CMAKE_FLAGS+=(-DGGML_METAL=ON) ;;
   x86_64-unknown-linux-gnu)                  CMAKE_FLAGS+=(-DGGML_AMX_INT8=OFF) ;;
-  *) ;; # arm64 linux (NEON default) / windows (CPU)
+  aarch64-unknown-linux-gnu)
+    # Jetson Orin (Cortex-A78AE) is ARMv8.2 WITHOUT SVE. llama.cpp defaults
+    # to GGML_NATIVE=ON (compile for the BUILD host): GitHub's arm64 runners
+    # are ARMv9 (Neoverse, SVE), and that binary SIGILLs on every Orin —
+    # the b11609 linux-aarch64-jetson asset (diagnosed 2026-10-14: 1000+
+    # SVE instructions in libggml-cpu vs zero in b10545). Pin the common
+    # edge baseline; a native build on the target device stays available
+    # via GGML_NATIVE=ON by hand.
+    CMAKE_FLAGS+=(-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a) ;;
+  *) ;; # windows (CPU)
 esac
 # Composes with the per-target flags above (e.g. linux-x64 keeps AMX off).
 if [ "${CUDA:-0}" = "1" ]; then

@@ -112,7 +112,7 @@ export const SkillsPanel = forwardRef<SkillsPanelHandle, SkillsPanelProps>(funct
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [currentPage, setCurrentPage] = useState(1)
-  const [pageSize, setPageSize] = useState(10)
+  const [pageSize, _setPageSize] = useState(10)
 
   // Unified dialog state
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -356,6 +356,24 @@ anti_triggers:
         rowKey={(row: SkillRow) => row.id}
         loading={loading}
         onRowClick={(row: SkillRow) => handleView(row.id)}
+        renderMobileBody={(rowData) => {
+          // Mobile keeps only the metadata needed to distinguish skills.
+          // Keywords stay in the detail view where they can be read in full.
+          const row = rowData as SkillRow
+          const catConf = categoryConfig[row.category] || categoryConfig.general
+          return (
+            <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+              <span className="truncate">{catConf.label}</span>
+              <span aria-hidden="true">·</span>
+              <span className="shrink-0">{t("skills.columnPriority")} {row.priority}</span>
+              <span className="ml-auto shrink-0 font-mono">
+                {row.body_length > 1024
+                  ? `${(row.body_length / 1024).toFixed(1)} KB`
+                  : `${row.body_length} B`}
+              </span>
+            </div>
+          )
+        }}
         renderCell={(columnKey, rowData) => {
           const row = rowData
           const catConf = categoryConfig[row.category] || categoryConfig.general
@@ -370,7 +388,7 @@ anti_triggers:
                 <div className="flex items-center gap-2.5">
                   <div
                     className={cn(
-                      "w-8 h-8 rounded-lg flex items-center justify-center border shrink-0",
+                      "hidden w-8 h-8 rounded-lg items-center justify-center shrink-0 md:flex",
                       catConf.color
                     )}
                   >
@@ -433,7 +451,24 @@ anti_triggers:
               return null
           }
         }}
-        actions={[
+        actions={isMobile ? [
+          {
+            label: t("skills.actionEdit"),
+            icon: <Pencil className="h-4 w-4" />,
+            onClick: (rowData) => {
+              const row = rowData
+              handleEdit(row.id)
+            },
+          },
+          {
+            label: t("skills.actionDelete"),
+            icon: <Trash2 className="h-4 w-4" />,
+            onClick: (rowData) => {
+              const row = rowData
+              handleDelete(row.id, row.name)
+            },
+          },
+        ] : [
           {
             label: t("skills.actionView"),
             icon: <Eye className="h-4 w-4" />,
@@ -461,7 +496,6 @@ anti_triggers:
         ]}
         emptyState={
           <EmptyState
-            icon={<BookOpen className="h-12 w-12" />}
             title={t("skills.emptyTitle")}
             description={t("skills.emptyDesc")}
           />

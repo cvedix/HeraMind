@@ -1,25 +1,27 @@
 // Messages Page
 // Unified notification/message system for HeraMind
 
-import { useState, useCallback, useEffect, useMemo } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { PageLayout } from '@/components/layout/PageLayout'
-import { PageTabsBar, PageTabsContent, PageTabsBottomNav, Pagination, ResponsiveTable, EmptyState } from '@/components/shared'
-import { MessageSquare, Network, Settings, Filter as FilterIcon, Inbox, Loader2 } from 'lucide-react'
+import { PageTabsBar, PageTabsContent, Pagination, ResponsiveTable, EmptyState, EmptyStateCard } from '@/components/shared'
+import { MessageSquare, Network, Settings, Filter as FilterIcon, Loader2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useStore } from '@/store'
 import { useDataVersion } from '@/hooks/useDataVersion'
+import { useLiveMessageRefresh } from '@/hooks/useLiveMessageRefresh'
 import { useToast } from '@/hooks/use-toast'
+import { Flag } from 'lucide-react'
 import { confirm } from '@/hooks/use-confirm'
 import { useErrorHandler } from '@/hooks/useErrorHandler'
 import { useIsMobile } from '@/hooks/useMobile'
-import type { NotificationMessage, MessageSeverity, MessageStatus, MessageCategory, MessageChannel, ChannelFilter } from '@/types'
-import type { StandardError } from '@/lib/errors'
+import type { NotificationMessage, MessageSeverity, MessageStatus, MessageChannel, ChannelFilter } from '@/types'
+import type { MessageChain } from '@/lib/api/onboarding'
 
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { Button, IconButton } from '@/components/ui/button'
+import { Button } from '@/components/ui/button'
 import {
   Select,
   SelectContent,
@@ -29,26 +31,18 @@ import {
 } from '@/components/ui/select'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
+
+
+
+
+
+
 } from '@/components/ui/table'
 import { UnifiedFormDialog } from '@/components/dialog/UnifiedFormDialog'
 import { Label } from '@/components/ui/label'
 import { FormSection } from '@/components/ui/form-section'
 import { Input } from '@/components/ui/input'
 import { FormField } from '@/components/ui/field'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-  DropdownMenuCheckboxItem,
-} from '@/components/ui/dropdown-menu'
 import {
   Popover,
   PopoverContent,
@@ -62,10 +56,9 @@ import {
   Trash2,
   Bell,
   Megaphone,
-  MoreVertical,
   Eye,
   RefreshCw,
-  Filter,
+
   X,
   CheckCircle2,
   TestTube,
@@ -155,15 +148,23 @@ export default function MessagesPage() {
   const [messagePage, setMessagePage] = useState(1)
   const messagesPerPage = 10
   // Mobile: track loaded page count for cumulative append
-  const [mobileLoadedPages, setMobileLoadedPages] = useState(1)
+  const [_mobileLoadedPages, setMobileLoadedPages] = useState(1)
 
-  // Filters - support multiple selections
+  // Filters — single-select per dimension. The server API takes ONE value
+  // per dimension (ListMessagesQuery has scalar severity/status/category),
+  // so every active filter maps to a server param and totals/pagination
+  // stay correct. The former multi-select filtered only the current page
+  // window client-side — matched rows on later pages were unreachable and
+  // the total stayed stale. Multi-select needs a repeated-params server
+  // contract; revisit there, not here.
   const [selectedSeverities, setSelectedSeverities] = useState<Set<MessageSeverity>>(new Set())
   const [selectedStatuses, setSelectedStatuses] = useState<Set<MessageStatus>>(new Set())
   const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set())
 
-  // Dynamic categories from API
+  // Dynamic categories from API — unioned across fetched pages, so the
+  // option list doesn't reshape itself every time the user turns a page.
   const [availableCategories, setAvailableCategories] = useState<string[]>([])
+  const seenCategoriesRef = useRef<Set<string>>(new Set())
 
   // Check if any filters are active
   const hasActiveFilters = selectedSeverities.size > 0 || selectedStatuses.size > 0 || selectedCategories.size > 0
@@ -175,35 +176,18 @@ export default function MessagesPage() {
     setSelectedCategories(new Set())
   }
 
-  // Toggle filter
+  // Toggle filter — single-select: picking a value replaces the dimension's
+  // previous pick; picking the active value clears it.
   const toggleSeverity = (severity: MessageSeverity) => {
-    const newSet = new Set(selectedSeverities)
-    if (newSet.has(severity)) {
-      newSet.delete(severity)
-    } else {
-      newSet.add(severity)
-    }
-    setSelectedSeverities(newSet)
+    setSelectedSeverities(selectedSeverities.has(severity) ? new Set() : new Set([severity]))
   }
 
   const toggleStatus = (status: MessageStatus) => {
-    const newSet = new Set(selectedStatuses)
-    if (newSet.has(status)) {
-      newSet.delete(status)
-    } else {
-      newSet.add(status)
-    }
-    setSelectedStatuses(newSet)
+    setSelectedStatuses(selectedStatuses.has(status) ? new Set() : new Set([status]))
   }
 
   const toggleCategory = (category: string) => {
-    const newSet = new Set(selectedCategories)
-    if (newSet.has(category)) {
-      newSet.delete(category)
-    } else {
-      newSet.add(category)
-    }
-    setSelectedCategories(newSet)
+    setSelectedCategories(selectedCategories.has(category) ? new Set() : new Set([category]))
   }
 
   // Get active filter count
@@ -413,6 +397,10 @@ export default function MessagesPage() {
   // Dialogs
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
   const [selectedMessage, setSelectedMessage] = useState<NotificationMessage | null>(null)
+  // Why the selected alert fired (M2-5). Fetched on open — it is the question
+  // the user opened the alert with. Failure is silent: the section simply does
+  // not render and the message itself stays fully usable.
+  const [messageChain, setMessageChain] = useState<MessageChain | null>(null)
   const [channelEditorOpen, setChannelEditorOpen] = useState(false)
   const [editingChannel, setEditingChannel] = useState<MessageChannel | null>(null)
 
@@ -422,6 +410,27 @@ export default function MessagesPage() {
   useEffect(() => {
     setActiveTab(getTabFromPath(location.pathname))
   }, [location.pathname])
+
+  useEffect(() => {
+    if (!selectedMessage) {
+      setMessageChain(null)
+      return
+    }
+    let cancelled = false
+    setMessageChain(null)
+    api
+      .getMessageChain(selectedMessage.id)
+      .then(chain => {
+        if (!cancelled) setMessageChain(chain)
+      })
+      .catch(() => {
+        // An alert we cannot explain is still an alert; do not block it.
+        if (!cancelled) setMessageChain(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [selectedMessage])
 
   // Update URL when tab changes
   const handleTabChange = (tab: TabValue) => {
@@ -459,26 +468,18 @@ export default function MessagesPage() {
       // Fetch messages
       const messagesResponse = await api.getMessages(params)
 
-      let messagesArray: NotificationMessage[] = messagesResponse.messages || []
+      const messagesArray: NotificationMessage[] = messagesResponse.messages || []
       const serverTotal = messagesResponse.total ?? 0
 
-      // Extract categories
-      const categories = [...new Set(messagesArray.map(m => m.category))].sort()
-      setAvailableCategories(categories)
+      // Extract categories — union across every fetch so the option list
+      // is stable across pagination instead of reshaping per page.
+      for (const m of messagesArray) {
+        if (m.category) seenCategoriesRef.current.add(m.category)
+      }
+      setAvailableCategories([...seenCategoriesRef.current].sort())
 
-      // Multi-value filters (server only supports single value)
-      if (selectedSeverities.size > 1) {
-        messagesArray = messagesArray.filter((m: NotificationMessage) =>
-          selectedSeverities.has(m.severity as MessageSeverity))
-      }
-      if (selectedStatuses.size > 1) {
-        messagesArray = messagesArray.filter((m: NotificationMessage) =>
-          selectedStatuses.has(m.status as MessageStatus))
-      }
-      if (selectedCategories.size > 1) {
-        messagesArray = messagesArray.filter((m: NotificationMessage) =>
-          selectedCategories.has(m.category))
-      }
+      // Single-select filters are fully server-side (params above) — the
+      // response IS the filtered page; totals and pagination are exact.
 
       // Sort by timestamp descending
       messagesArray.sort((a: NotificationMessage, b: NotificationMessage) => {
@@ -538,6 +539,12 @@ export default function MessagesPage() {
     // 'im' tab manages its own data lifecycle via ImSessionsTab
   }, [activeTab, fetchMessages, fetchChannels, dataVersion])
 
+  // Live updates: the backend publishes MessageCreated on the event bus and
+  // the WS bridge forwards it, so new messages appear without Refresh. The
+  // coalesced refetch reuses fetchMessages, so the user's filters, page and
+  // scroll state survive the refresh.
+  useLiveMessageRefresh(activeTab === 'messages', fetchMessages)
+
   // Message actions - using messages API endpoints
   const handleAcknowledge = async (id: string) => {
     try {
@@ -565,7 +572,26 @@ export default function MessagesPage() {
     }
   }
 
-  const handleArchive = async (id: string) => {
+  /**
+   * Dismiss an alert as a false positive (002 §3.4) — the human half of the
+   * feedback loop. The verdict is the operator's; nothing here touches the rule
+   * that fired, and the count that may later suggest a threshold change is read
+   * back through the chain.
+   */
+  const handleFalsePositive = async (id: string) => {
+    try {
+      await api.markMessageFalsePositive(id)
+      setMessages(prev => prev.map(m =>
+        m.id === id ? { ...m, status: 'false_positive' as MessageStatus } : m
+      ))
+      toast({ title: t('messages.falsePositiveSuccess', 'Marked as a false positive') })
+    } catch (error) {
+      handleError(error, { operation: 'Mark message as false positive', showToast: true })
+      toast({ title: t('messages.falsePositiveError', 'Failed'), variant: 'destructive' })
+    }
+  }
+
+  const _handleArchive = async (id: string) => {
     try {
       await api.archiveMessage(id)
       setMessages(prev => prev.map(m =>
@@ -636,7 +662,7 @@ export default function MessagesPage() {
           )}
         </Button>
       </PopoverTrigger>
-      <PopoverContent align="end" className="w-[340px] p-0 overflow-hidden">
+      <PopoverContent align="end" className="w-[min(340px,calc(100vw-2rem))] p-0 overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b bg-muted-30">
           <span className="text-sm font-semibold">{t('messages.filter.title')}</span>
@@ -644,7 +670,7 @@ export default function MessagesPage() {
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 text-xs text-muted-foreground hover:text-foreground px-2"
+              className="h-7 text-xs text-muted-foreground hover:text-foreground px-2 sm:h-7"
               onClick={clearAllFilters}
             >
               <X className="h-3 w-3 mr-1" />
@@ -700,12 +726,15 @@ export default function MessagesPage() {
               <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">{t('messages.status.label')}</span>
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {(['active', 'acknowledged', 'resolved', 'archived'] as MessageStatus[]).map((stat) => {
+              {(['active', 'acknowledged', 'resolved', 'archived', 'false_positive'] as MessageStatus[]).map((stat) => {
                 const colors = {
                   active: "text-info bg-info-light border-info",
                   acknowledged: "text-warning bg-warning-light border-warning",
                   resolved: "text-success bg-success-light border-success",
                   archived: "text-muted-foreground bg-muted border-border",
+                  // Quiet: a dismissed alert is not something to act on. It is
+                  // filterable so the dismissals can be reviewed.
+                  false_positive: "text-muted-foreground bg-muted border-border",
                 }
                 return (
                   <button
@@ -775,16 +804,14 @@ export default function MessagesPage() {
     <>
       <PageLayout
         title={t('messages.title')}
-        subtitle={t('messages.description')}
         hideFooterOnMobile
-        hasBottomNav
         headerContent={
           <PageTabsBar
             tabs={tabs}
             activeTab={activeTab}
             onTabChange={(v) => handleTabChange(v as TabValue)}
             actions={actions}
-            actionsExtra={filterExtra}
+            actionsExtra={isMobile ? undefined : filterExtra}
           />
         }
         footer={
@@ -856,7 +883,7 @@ export default function MessagesPage() {
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-7 px-2 text-xs"
+                className="h-7 px-2 text-xs sm:h-7"
                 onClick={clearAllFilters}
               >
                 {t('messages.filter.clearAll')}
@@ -869,105 +896,56 @@ export default function MessagesPage() {
             <div className="space-y-2">
               {messages.length === 0 && loading ? (
                 Array.from({ length: 4 }).map((_, i) => (
-                  <Card key={i} className="overflow-hidden border-border">
-                    <div className="p-3 space-y-2">
+                  <div key={i} className="rounded-2xl border border-border bg-card p-3.5">
+                    <div className="space-y-2">
                       <div className="flex items-center gap-2">
-                        <div className="w-8 h-8 rounded-lg bg-muted animate-pulse" />
                         <div className="flex-1 space-y-1">
                           <div className="h-4 bg-muted rounded w-2/3 animate-pulse" />
                           <div className="h-3 bg-muted rounded w-1/3 animate-pulse" />
                         </div>
                       </div>
                     </div>
-                  </Card>
+                  </div>
                 ))
               ) : messages.length === 0 ? (
-                <EmptyState
-                  icon={<Mail className="h-12 w-12" />}
-                  title={t('messages.empty.title')}
-                  description={t('messages.empty.description')}
-                />
+                <EmptyStateCard>
+                  <EmptyState
+                    title={t('messages.empty.title')}
+                    description={t('messages.empty.description')}
+                  />
+                </EmptyStateCard>
               ) : (
                 messages.map((message) => {
                   const severityConfig = SEVERITY_CONFIG[message.severity] || SEVERITY_CONFIG.info
                   const statusConfig = STATUS_CONFIG[message.status] || STATUS_CONFIG.active
-                  const SeverityIcon = severityConfig.icon
                   const isDimmed = message.status === 'resolved' || message.status === 'archived'
 
                   return (
-                    <Card
+                    <button
+                      type="button"
                       key={message.id}
                       className={cn(
-                        "overflow-hidden border-border shadow-sm cursor-pointer active:scale-[0.99] transition-all",
+                        "block w-full rounded-2xl border border-border bg-card px-4 py-3 text-left transition-[background-color,opacity] active:bg-muted",
                         isDimmed && "opacity-50"
                       )}
                       onClick={() => setSelectedMessage(message)}
                     >
-                      <div className="px-3 py-2.5">
-                        {/* Row 1: severity icon + title + status + actions */}
-                        <div className="flex items-center gap-2.5">
-                          <div className={cn(
-                            "w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border",
-                            severityConfig.bgColor
-                          )}>
-                            <SeverityIcon className={cn("h-4 w-4", severityConfig.color)} />
+                      <div className="flex items-center gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="min-w-0 flex-1 truncate text-sm font-medium">{message.title}</span>
+                            <span className={cn(textNano, "shrink-0 text-muted-foreground")}>{t(statusConfig.label)}</span>
                           </div>
-                          <div className="flex-1 min-w-0">
-                            <div className="font-medium text-sm truncate">{message.title}</div>
+                          <div className={cn(textMini, "mt-1 flex min-w-0 items-center gap-1.5 text-muted-foreground")}>
+                            <span className={severityConfig.color}>{t(`messages.severity.${message.severity}`)}</span>
+                            <span aria-hidden="true">·</span>
+                            <span className="truncate">{message.category}</span>
+                            <span aria-hidden="true">·</span>
+                            <span className="shrink-0">{formatTimestamp(message.timestamp, false)}</span>
                           </div>
-                          <Badge variant={statusConfig.variant} className={cn(textNano, "h-5 px-1.5 shrink-0")}>
-                            {t(statusConfig.label)}
-                          </Badge>
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
-                              <IconButton>
-                                <MoreVertical className="h-4 w-4" />
-                              </IconButton>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end" className="w-40">
-                              <DropdownMenuItem onClick={(e) => { e.stopPropagation(); setSelectedMessage(message) }}>
-                                <Eye className="mr-2 h-4 w-4" />
-                                {t('messages.viewDetails', 'View Details')}
-                              </DropdownMenuItem>
-                              {message.status === 'active' && (
-                                <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleAcknowledge(message.id) }}>
-                                  <Eye className="mr-2 h-4 w-4" />
-                                  {t('messages.acknowledge')}
-                                </DropdownMenuItem>
-                              )}
-                              {message.status !== 'resolved' && message.status !== 'archived' && (
-                                <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleResolve(message.id) }}>
-                                  <CheckCircle2 className="mr-2 h-4 w-4" />
-                                  {t('messages.resolve')}
-                                </DropdownMenuItem>
-                              )}
-                              <DropdownMenuItem
-                                className="text-error"
-                                onClick={(e) => { e.stopPropagation(); handleDelete(message.id) }}
-                              >
-                                <Trash2 className="mr-2 h-4 w-4" />
-                                {t('delete')}
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </div>
-                        {/* Row 2: type badge + category + time */}
-                        <div className="flex items-center gap-1.5 mt-1.5 ml-[42px]">
-                          <Badge variant="outline" className={cn(
-                            textNano, "h-5 px-1.5 shrink-0",
-                            "bg-info-light text-info border-info"
-                          )}>
-                            {t('messages.type.notification')}
-                          </Badge>
-                          <Badge variant="outline" className={cn(textNano, "h-5 px-1.5 shrink-0")}>
-                            {message.category}
-                          </Badge>
-                          <span className={cn(textMini, "text-muted-foreground ml-auto shrink-0")}>
-                            {formatTimestamp(message.timestamp, false)}
-                          </span>
                         </div>
                       </div>
-                    </Card>
+                    </button>
                   )
                 })
               )}
@@ -982,24 +960,8 @@ export default function MessagesPage() {
           <ResponsiveTable
             columns={[
                 {
-                  key: 'messageType',
-                  label: t('messages.type.label'),
-                  width: 'w-[72px]',
-                  align: 'center',
-                },
-                {
-                  key: 'severity',
-                  label: '',
-                  width: 'w-[50px]',
-                  className: 'text-center',
-                },
-                {
                   key: 'title',
                   label: t('messages.formTitle.label'),
-                },
-                {
-                  key: 'message',
-                  label: t('messages.content.label'),
                 },
                 {
                   key: 'severityBadge',
@@ -1021,7 +983,7 @@ export default function MessagesPage() {
                 {
                   key: 'timestamp',
                   label: t('common:createdAt'),
-                  width: 'w-[130px]',
+                  width: 'w-[150px]',
                 },
               ]}
               data={messages}
@@ -1031,24 +993,20 @@ export default function MessagesPage() {
                 const severityConfig = SEVERITY_CONFIG[message.severity] || SEVERITY_CONFIG.info
                 const categoryConfig = getCategoryConfig(message.category)
                 const statusConfig = STATUS_CONFIG[message.status] || STATUS_CONFIG.active
-                const SeverityIcon = severityConfig.icon
                 const CategoryIcon = categoryConfig.icon
 
                 switch (columnKey) {
-                  case 'severity':
-                    return <SeverityIcon className={cn("h-4 w-4", severityConfig.color)} />
                   case 'title':
+                    // Title + message preview + tags in one cell — the two
+                    // columns were a truncated echo of each other.
                     return (
-                      <div className="font-medium text-sm truncate" title={message.title}>
-                        {message.title}
-                      </div>
-                    )
-                  case 'message':
-                    return (
-                      <div className="text-sm">
-                        <div className="text-muted-foreground line-clamp-2">{message.message}</div>
+                      <div className="text-sm min-w-0">
+                        <div className="font-medium truncate" title={message.title}>
+                          {message.title}
+                        </div>
+                        <div className="text-muted-foreground line-clamp-1 text-xs mt-0.5">{message.message}</div>
                         {(message.tags || []).length > 0 && (
-                          <div className="flex items-center gap-1 mt-1.5 flex-wrap">
+                          <div className="flex items-center gap-1 mt-1 flex-wrap">
                             {(message.tags || []).slice(0, 4).map((tag, i) => (
                               <Badge key={i} variant="secondary" className="text-xs h-5 px-1.5">
                                 {tag}
@@ -1073,19 +1031,6 @@ export default function MessagesPage() {
                         <CategoryIcon className="h-4 w-4 text-muted-foreground" />
                         <span className="text-xs">{t(categoryConfig.label)}</span>
                       </div>
-                    )
-                  case 'messageType':
-                    return (
-                      <Badge
-                        variant="outline"
-                        className={cn(
-                          "text-xs",
-                          "bg-info-light text-info border-info"
-                        )}
-                      >
-                        <Bell className="h-4 w-4 mr-1" />
-                        {t('messages.type.notification')}
-                      </Badge>
                     )
                   case 'status':
                     return (
@@ -1156,7 +1101,6 @@ export default function MessagesPage() {
               emptyState={
                 !loading && messages.length === 0 ? (
                   <EmptyState
-                    icon={<Mail className="h-12 w-12" />}
                     title={t('messages.empty.title')}
                     description={t('messages.empty.description')}
                   />
@@ -1173,7 +1117,7 @@ export default function MessagesPage() {
             <div className="space-y-2">
               {loading ? (
                 Array.from({ length: 3 }).map((_, i) => (
-                  <Card key={i} className="overflow-hidden border-border">
+                  <Card key={i} className="overflow-hidden rounded-none border-0 shadow-none">
                     <div className="p-3 space-y-2">
                       <div className="flex items-center gap-2">
                         <div className="w-8 h-8 rounded-lg bg-muted animate-pulse" />
@@ -1190,6 +1134,10 @@ export default function MessagesPage() {
                   icon={<Radio className="h-12 w-12" />}
                   title={t('messages.channels.empty.title')}
                   description={t('messages.channels.empty.description')}
+                  action={{
+                    label: t('messages.channels.create'),
+                    onClick: () => setCreateDialogOpen(true),
+                  }}
                 />
               ) : (
                 channels.map((channel) => {
@@ -1209,110 +1157,36 @@ export default function MessagesPage() {
                   const testResult = testResults[channel.name]
 
                   return (
-                    <Card
+                    <button
+                      type="button"
                       key={channel.name}
-                      className="overflow-hidden border-border shadow-sm cursor-pointer active:scale-[0.99] transition-all"
+                      className="block w-full rounded-2xl border border-border bg-card px-4 py-3 text-left transition-colors active:bg-muted"
                       onClick={() => handleViewChannel(channel.name)}
                     >
-                      <div className="px-3 py-2.5">
-                        {/* Row 1: icon + name + status + actions */}
-                        <div className="flex items-center gap-2.5">
-                          <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center shrink-0", channelConfig.color)}>
+                      <div className="flex items-center gap-3">
+                          <div className={cn("flex h-9 w-9 shrink-0 items-center justify-center rounded-xl", channelConfig.color)}>
                             <ChannelIcon className="h-4 w-4" />
                           </div>
-                          <div className="flex-1 min-w-0">
-                            <div className="font-medium text-sm truncate">{channel.name}</div>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="min-w-0 flex-1 truncate text-sm font-medium">{channel.name}</span>
+                              <span className={cn(textNano, "inline-flex shrink-0 items-center gap-1 text-muted-foreground")}>
+                                <span className={cn("h-1.5 w-1.5 rounded-full", channel.enabled ? "bg-success" : "bg-muted-foreground/50")} />
+                                {channel.enabled ? t('enabled') : t('disabled')}
+                              </span>
+                            </div>
+                            <div className={cn(textMini, "mt-1 flex items-center gap-1.5 text-muted-foreground")}>
+                              <span>{channel.channel_type}</span>
+                              {channel.channel_type === 'email' && channel.recipients && channel.recipients.length > 0 && (
+                                <><span aria-hidden="true">·</span><span>{channel.recipients.length} {t('messages.channels.recipients', 'recipients')}</span></>
+                              )}
+                              {testResult && (
+                                <><span aria-hidden="true">·</span><span className={testResult.success ? 'text-success' : 'text-error'}>{testResult.success ? '✓' : '✗'} {testResult.message}</span></>
+                              )}
+                            </div>
                           </div>
-                          <Badge variant={channel.enabled ? 'default' : 'secondary'} className={cn(textNano, "h-5 px-1.5 shrink-0")}>
-                            {channel.enabled ? t('enabled') : t('disabled')}
-                          </Badge>
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
-                              <IconButton>
-                                <MoreVertical className="h-4 w-4" />
-                              </IconButton>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end" className="w-40">
-                              <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleViewChannel(channel.name) }}>
-                                <Eye className="mr-2 h-4 w-4" />
-                                {t('view')}
-                              </DropdownMenuItem>
-                              {['webhook', 'email', 'telegram', 'wecom', 'dingtalk', 'slack', 'feishu'].includes(channel.channel_type) && (
-                                <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleEditChannel(channel) }}>
-                                  <Settings className="mr-2 h-4 w-4" />
-                                  {t('edit', 'Edit')}
-                                </DropdownMenuItem>
-                              )}
-                              {channel.channel_type !== 'console' && channel.channel_type !== 'memory' && (
-                                <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleOpenFilterDialog(channel) }}>
-                                  <FilterIcon className="mr-2 h-4 w-4" />
-                                  {t('messages.channels.configureFilter', 'Configure Filter')}
-                                </DropdownMenuItem>
-                              )}
-                              {channel.channel_type === 'email' && (
-                                <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleManageRecipients(channel) }}>
-                                  <UserPlus className="mr-2 h-4 w-4" />
-                                  {t('messages.channels.manageRecipients', 'Manage Recipients')}
-                                </DropdownMenuItem>
-                              )}
-                              {channel.channel_type !== 'console' && channel.channel_type !== 'memory' && (
-                                <>
-                                  {!channel.enabled && (
-                                    <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleToggleEnabled(channel.name, true) }}>
-                                      <CheckCircle2 className="mr-2 h-4 w-4" />
-                                      {t('enable')}
-                                    </DropdownMenuItem>
-                                  )}
-                                  {channel.enabled && (
-                                    <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleToggleEnabled(channel.name, false) }}>
-                                      <X className="mr-2 h-4 w-4" />
-                                      {t('disable')}
-                                    </DropdownMenuItem>
-                                  )}
-                                  <DropdownMenuSeparator />
-                                  <DropdownMenuItem
-                                    className="text-error"
-                                    onClick={(e) => { e.stopPropagation(); handleDeleteChannel(channel.name) }}
-                                  >
-                                    <Trash2 className="mr-2 h-4 w-4" />
-                                    {t('delete')}
-                                  </DropdownMenuItem>
-                                </>
-                              )}
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </div>
-                        {/* Row 2: type badge + details + test */}
-                        <div className="flex items-center gap-1.5 mt-1.5 ml-[42px]">
-                          <Badge variant="outline" className={cn(textNano, "h-5 px-1.5 shrink-0")}>
-                            {channel.channel_type}
-                          </Badge>
-                          {['webhook', 'email', 'telegram', 'wecom', 'dingtalk', 'slack', 'feishu'].includes(channel.channel_type) && (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className={cn("h-5 px-1.5", textNano)}
-                              onClick={(e) => { e.stopPropagation(); handleTestChannel(channel.name) }}
-                              disabled={testingChannel === channel.name}
-                            >
-                              <TestTube className="h-3 w-3 mr-0.5" />
-                              {testingChannel === channel.name ? '...' : 'Test'}
-                            </Button>
-                          )}
-                          {channel.channel_type === 'email' && channel.recipients && channel.recipients.length > 0 && (
-                            <span className={cn(textNano, "text-muted-foreground flex items-center gap-0.5")}>
-                              <Mail className="h-3 w-3" />
-                              {channel.recipients.length}
-                            </span>
-                          )}
-                          {testResult && (
-                            <span className={cn(textNano, testResult.success ? 'text-success' : 'text-error')}>
-                              {testResult.success ? '✓' : '✗'} {testResult.message}
-                            </span>
-                          )}
-                        </div>
                       </div>
-                    </Card>
+                    </button>
                   )
                 })
               )}
@@ -1374,7 +1248,7 @@ export default function MessagesPage() {
                             <Button
                               variant="ghost"
                               size="sm"
-                              className="h-6 px-2 text-xs"
+                              className="h-6 px-2 text-xs sm:h-6"
                               onClick={() => handleTestChannel(channel.name)}
                               disabled={testingChannel === channel.name}
                             >
@@ -1510,6 +1384,10 @@ export default function MessagesPage() {
                   icon={<Radio className="h-12 w-12" />}
                   title={t('messages.channels.empty.title')}
                   description={t('messages.channels.empty.description')}
+                  action={{
+                    label: t('messages.channels.create'),
+                    onClick: () => setCreateDialogOpen(true),
+                  }}
                 />
               ) : undefined
             }
@@ -1522,13 +1400,6 @@ export default function MessagesPage() {
           <ImSessionsTab />
         </PageTabsContent>
       </PageLayout>
-
-      {/* Mobile Bottom Navigation */}
-      <PageTabsBottomNav
-        tabs={tabs}
-        activeTab={activeTab}
-        onTabChange={(v) => handleTabChange(v as TabValue)}
-      />
 
       <CreateMessageDialog
         open={createDialogOpen}
@@ -1577,6 +1448,22 @@ export default function MessagesPage() {
                 {t('messages.acknowledge', 'Acknowledge')}
               </Button>
             )}
+            {selectedMessage?.status !== 'false_positive' &&
+              selectedMessage?.status !== 'archived' && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    if (selectedMessage) {
+                      handleFalsePositive(selectedMessage.id)
+                      setSelectedMessage(null)
+                    }
+                  }}
+                >
+                  <Flag className="h-4 w-4 mr-1" />
+                  {t('messages.markFalsePositive', 'Not a real alert')}
+                </Button>
+              )}
             {selectedMessage?.status !== 'resolved' && selectedMessage?.status !== 'archived' && (
               <Button
                 variant="outline"
@@ -1651,6 +1538,106 @@ export default function MessagesPage() {
                 </div>
               </div>
             </FormSection>
+
+            {/* Why this fired (M2-5). Rendered only when there is something to
+                say: a message that is not a rule alert has no chain at all, and
+                announcing that on every system message would be noise. */}
+            {messageChain &&
+              (messageChain.resolved || messageChain.reason === 'execution_not_found') && (
+                <FormSection
+                  title={t('messages.chain.title', 'Why this fired')}
+                  description={t(
+                    'messages.chain.description',
+                    'The rule execution behind this alert, and what it acted on',
+                  )}
+                >
+                  {messageChain.resolved ? (
+                    <div className="space-y-2 text-sm">
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-muted-foreground text-xs w-20 shrink-0">
+                          {t('messages.chain.rule', 'Rule')}
+                        </span>
+                        <span className="font-medium">
+                          {messageChain.rule?.name || messageChain.rule?.id || '-'}
+                        </span>
+                      </div>
+                      {messageChain.trigger?.source && (
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-muted-foreground text-xs w-20 shrink-0">
+                            {t('messages.chain.evidence', 'Evidence')}
+                          </span>
+                          <span className="font-mono text-xs">
+                            {messageChain.trigger.source}
+                            {messageChain.trigger.value ? ` = ${messageChain.trigger.value}` : ''}
+                          </span>
+                        </div>
+                      )}
+                      {messageChain.execution && (
+                        <>
+                          <div className="flex items-baseline gap-2">
+                            <span className="text-muted-foreground text-xs w-20 shrink-0">
+                              {t('messages.chain.firedAt', 'Fired')}
+                            </span>
+                            <span>{formatTimestamp(messageChain.execution.triggered_at, true)}</span>
+                          </div>
+                          <div className="flex items-baseline gap-2">
+                            <span className="text-muted-foreground text-xs w-20 shrink-0">
+                              {t('messages.chain.actions', 'Actions')}
+                            </span>
+                            {/* Shown raw: this is the honest record of what the
+                                system did, not a paraphrase of it. */}
+                            <span className="flex flex-wrap gap-1">
+                              {messageChain.execution.actions_executed.length > 0 ? (
+                                messageChain.execution.actions_executed.map((action, i) => (
+                                  <Badge key={i} variant="secondary" className="text-xs font-mono">
+                                    {action}
+                                  </Badge>
+                                ))
+                              ) : (
+                                <span className="text-muted-foreground">
+                                  {t('messages.chain.noActions', 'none')}
+                                </span>
+                              )}
+                            </span>
+                          </div>
+                        </>
+                      )}
+                      {/* The loop's other half: what the dismissals add up to.
+                          Advice only — the rule is never changed for you. */}
+                      {messageChain.rule_quality && messageChain.rule_quality.alerts > 0 && (
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-muted-foreground text-xs w-20 shrink-0">
+                            {t('messages.chain.trackRecord', 'Track record')}
+                          </span>
+                          <span>
+                            {t('messages.chain.dismissedOf', {
+                              defaultValue: '{{fp}} of {{total}} alerts dismissed as false',
+                              fp: messageChain.rule_quality.false_positives,
+                              total: messageChain.rule_quality.alerts,
+                            })}
+                            {messageChain.rule_quality.suggest_threshold_review && (
+                              <span className="text-warning">
+                                {' · '}
+                                {t(
+                                  'messages.chain.thresholdAdvice',
+                                  'this rule probably fires too easily — consider tightening its condition',
+                                )}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      {t(
+                        'messages.chain.expired',
+                        'This alert points at a rule execution whose record has expired — rule history is kept for 30 days.',
+                      )}
+                    </p>
+                  )}
+                </FormSection>
+              )}
 
             {/* Content Section */}
             <FormSection
@@ -1876,11 +1863,11 @@ export default function MessagesPage() {
                     key={email}
                     className="flex items-center justify-between bg-muted-50 rounded-lg px-3 py-2"
                   >
-                    <span className="text-sm truncate flex-1">{email}</span>
+                    <span className="min-w-0 flex-1 truncate text-sm">{email}</span>
                     <Button
                       variant="ghost"
                       size="sm"
-                      className="h-6 w-6 p-0 text-muted-foreground hover:text-error shrink-0 ml-2"
+                      className="h-6 w-6 p-0 text-muted-foreground hover:text-error shrink-0 ml-2 sm:h-6 sm:w-6"
                       onClick={() => handleRemoveRecipient(email)}
                     >
                       <X className="h-4 w-4" />

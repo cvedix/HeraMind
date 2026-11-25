@@ -1,4 +1,4 @@
-use crate::types::{BuildMeta, CliResponse};
+use crate::types::CliResponse;
 use crate::ApiClient;
 use anyhow::Result;
 use serde_json::json;
@@ -36,10 +36,11 @@ pub async fn list_rules(client: &ApiClient) -> Result<CliResponse> {
             json!({
                 "id": r.get("id").and_then(|v| v.as_str()).unwrap_or(r.get("rule_id").and_then(|v| v.as_str()).unwrap_or("?")),
                 "name": r.get("name").and_then(|v| v.as_str()).unwrap_or("(unnamed)"),
-                "enabled": r.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                "enabled": r.get("enabled").cloned().unwrap_or(serde_json::Value::Null),
                 "trigger_type": trigger_type,
-                "trigger_count": r.get("trigger_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                "last_triggered": r.get("last_triggered").and_then(|v| v.as_str()).unwrap_or("-"),
+                "trigger_count": r.get("trigger_count").cloned().unwrap_or(serde_json::Value::Null),
+                "last_triggered": r.get("last_triggered").cloned().unwrap_or(serde_json::Value::Null),
+                "last_error": r.get("last_error").cloned().unwrap_or(serde_json::Value::Null),
             })
         })
         .collect();
@@ -167,11 +168,262 @@ pub fn build_rule_body(args: &RuleFastPathArgs<'_>) -> Result<serde_json::Value>
     }))
 }
 
+/// Fast-path PATCH arguments for `rule update` (all optional; any
+/// condition flag triggers a full condition rebuild).
+pub struct RuleFastPatchArgs<'a> {
+    pub name: Option<&'a str>,
+    pub trigger_device: Option<&'a str>,
+    pub metric: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub operator: Option<&'a str>,
+    pub threshold: Option<f64>,
+    pub notify: Option<&'a str>,
+    pub severity: Option<&'a str>,
+    pub cooldown: Option<u64>,
+}
+
+/// Compose the FULL-definition update body from an existing rule plus
+/// fast-path patch flags. Pure — no I/O.
+///
+/// Retarget semantics (2026-11-17 eval loss sr-multi-wrong-device: models
+/// naturally reach for create-style flags on update and clap rejected
+/// them): when any condition flag is present the condition is REBUILT from
+/// the complete flag set — (trigger_device + metric) or source, operator,
+/// threshold — while the existing actions/cooldown/tags are preserved
+/// (notify/severity/cooldown patch their own fields when given).
+pub fn compose_rule_update_body(
+    existing: &serde_json::Value,
+    patch: &RuleFastPatchArgs<'_>,
+) -> Result<serde_json::Value> {
+    // Project onto the full-definition whitelist: a GET'd rule DTO carries
+    // runtime fields (trigger_count, state, …) the update endpoint rejects
+    // as unknown — compose from the recognized fields only.
+    const UPDATE_BODY_FIELDS: &[&str] = &[
+        "name",
+        "description",
+        "enabled",
+        "source",
+        "condition",
+        "trigger",
+        "actions",
+        "tags",
+        "cooldown",
+        "for_duration",
+    ];
+    let mut body = serde_json::Map::new();
+    for f in UPDATE_BODY_FIELDS {
+        if let Some(v) = existing.get(f) {
+            body.insert((*f).to_string(), v.clone());
+        }
+    }
+    let mut body = serde_json::Value::Object(body);
+    // (patches below go through the object map so the write surface stays
+    // visible to the cli-api drift scanner the same way create's literals are)
+    if let Some(name) = patch.name {
+        body.as_object_mut()
+            .expect("projected body is an object")
+            .insert("name".into(), json!(name));
+    }
+    if let Some(cooldown) = patch.cooldown {
+        body.as_object_mut()
+            .expect("projected body is an object")
+            .insert("cooldown".into(), json!(cooldown));
+    }
+
+    let retargeting = patch.trigger_device.is_some()
+        || patch.metric.is_some()
+        || patch.source.is_some()
+        || patch.operator.is_some()
+        || patch.threshold.is_some();
+    if retargeting {
+        let source = match (patch.trigger_device, patch.metric, patch.source) {
+            (Some(device), Some(metric), None) => format!("device:{}:{}", device, metric),
+            (None, None, Some(source)) => {
+                let parts: Vec<&str> = source.split(':').collect();
+                let valid =
+                    parts.len() >= 3 && matches!(parts[0], "device" | "extension" | "transform");
+                if !valid {
+                    anyhow::bail!(
+                        "invalid --source '{}': must be device:<id>:<metric>, extension:<id>:<metric>, or transform:<id>:<field>",
+                        source
+                    );
+                }
+                source.to_string()
+            }
+            _ => anyhow::bail!(
+                "re-targeting needs the complete condition: pass --trigger-device + --metric (or --source), --operator and --threshold together — or use --body with the full definition"
+            ),
+        };
+        let operator = match patch.operator {
+            Some(op) => OPERATORS
+                .iter()
+                .find(|(alias, _)| *alias == op)
+                .map(|(_, canonical)| canonical.to_string())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid --operator '{}': valid values are greater_than | less_than | greater_equal | less_equal | equal | not_equal",
+                        op
+                    )
+                })?,
+            None => anyhow::bail!(
+                "re-targeting needs --operator (and --threshold) together with the trigger flags — or use --body with the full definition"
+            ),
+        };
+        let threshold = match patch.threshold {
+            Some(t) => t,
+            None => anyhow::bail!(
+                "re-targeting needs --threshold (and --operator) together with the trigger flags — or use --body with the full definition"
+            ),
+        };
+        body.as_object_mut()
+            .expect("projected body is an object")
+            .insert(
+                "condition".into(),
+                json!({
+                    "condition_type": "comparison",
+                    "source": source,
+                    "operator": operator,
+                    "threshold": threshold,
+                }),
+            );
+    }
+
+    if let Some(notify) = patch.notify {
+        // --severity is validated up front; when patching an EXISTING notify
+        // without --severity the original severity is preserved (a
+        // message-only update must not silently downgrade critical to
+        // warning — review 2026-11-17 P2). The "warning" default applies
+        // only to a NEWLY added notify.
+        let requested_severity = match patch.severity {
+            Some(s) if SEVERITIES.contains(&s) => Some(s.to_string()),
+            Some(s) => anyhow::bail!(
+                "invalid --severity '{}': valid values are {}",
+                s,
+                SEVERITIES.join(" | ")
+            ),
+            None => None,
+        };
+        let actions = body
+            .as_object_mut()
+            .and_then(|o| o.get_mut("actions"))
+            .and_then(|a| a.as_array_mut());
+        let notify_count = actions
+            .as_ref()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|a| a.get("type") == Some(&json!("notify")))
+                    .count()
+            })
+            .unwrap_or(0);
+        match notify_count {
+            0 => {
+                // No notify yet: APPEND one, preserving every existing action
+                // in order — replacing the array here used to silently delete
+                // execute/trigger_agent actions (review P1).
+                let severity = requested_severity.unwrap_or_else(|| "warning".to_string());
+                let new_action = json!({
+                    "type": "notify",
+                    "message": notify,
+                    "severity": severity,
+                });
+                match actions {
+                    Some(arr) => arr.push(new_action),
+                    None => {
+                        body.as_object_mut()
+                            .expect("projected body is an object")
+                            .insert("actions".into(), json!([new_action]));
+                    }
+                }
+            }
+            1 => {
+                // Exactly one notify: patch its message; keep the original
+                // severity unless --severity was passed.
+                let arr = actions.expect("notify_count came from this array");
+                for action in arr.iter_mut() {
+                    if action.get("type") == Some(&json!("notify")) {
+                        action
+                            .as_object_mut()
+                            .expect("notify action is an object")
+                            .insert("message".into(), json!(notify));
+                        if let Some(sev) = &requested_severity {
+                            action
+                                .as_object_mut()
+                                .expect("notify action is an object")
+                                .insert("severity".into(), json!(sev));
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => anyhow::bail!(
+                "this rule has {} notify actions — the fast path cannot tell which one to change. \
+                 Use --body with the full actions array",
+                notify_count
+            ),
+        }
+    } else if let Some(s) = patch.severity {
+        let _ = s;
+        anyhow::bail!("--severity requires --notify on the update fast path");
+    }
+
+    Ok(body)
+}
+
+/// `rule update <ID>` via fast-path flags: fetch the existing rule, compose
+/// the full definition, PUT it. (The API only applies condition changes on
+/// full-definition bodies.)
+pub async fn update_rule_fast(
+    client: &ApiClient,
+    id: &str,
+    patch: &RuleFastPatchArgs<'_>,
+) -> Result<CliResponse> {
+    let resp = client.get(&format!("/rules/{}", id)).await?;
+    // GET returns unwrapped `{rule, history}` (or legacy `{success, data: {rule, history}}`)
+    // — compose against the RULE object itself so wrapper fields never leak into PUT.
+    let data = if resp.get("rule").is_some() || resp.get("condition").is_some() {
+        &resp
+    } else {
+        resp.get("data").unwrap_or(&resp)
+    };
+    let existing = data.get("rule").unwrap_or(data);
+    let body = compose_rule_update_body(existing, patch)?;
+    let body_str = serde_json::to_string(&body)?;
+    update_rule(client, id, &body_str).await
+}
+
+/// Merge optional `--name` into a `--body` JSON object for `rule create`.
+///
+/// Models frequently emit `heramind rule create --name "X" --body '{...}'`.
+/// If the JSON lacks `name`, insert it; if it already matches, accept; if it
+/// conflicts, return a clear error (do not silently overwrite).
+pub fn merge_rule_create_name_into_body(body: &str, name: Option<&str>) -> Result<String> {
+    let Some(name) = name else {
+        return Ok(body.to_string());
+    };
+    let mut value = crate::json_arg::parse_json_arg(body)
+        .map_err(|e| anyhow::anyhow!("Invalid JSON in --body: {e}"))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("--body must be a JSON object when used with --name"))?;
+    match obj.get("name").and_then(|v| v.as_str()) {
+        None => {
+            obj.insert("name".into(), json!(name));
+        }
+        Some(existing) if existing == name => {}
+        Some(existing) => {
+            anyhow::bail!(
+                "--name '{name}' conflicts with body name '{existing}'; omit one or make them match"
+            );
+        }
+    }
+    Ok(value.to_string())
+}
+
 /// Create a new rule via JSON body.
 ///
 /// Accepts a raw JSON string that is forwarded to the API.
 pub async fn create_rule(client: &ApiClient, json_body: &str) -> Result<CliResponse> {
-    let body: serde_json::Value = match serde_json::from_str(json_body) {
+    let body: serde_json::Value = match crate::json_arg::parse_json_arg(json_body) {
         Ok(v) => v,
         Err(e) => {
             // Surface a copy-pasteable rule example so the caller (LLM agent
@@ -180,33 +432,23 @@ pub async fn create_rule(client: &ApiClient, json_body: &str) -> Result<CliRespo
             return Ok(CliResponse::error_with_suggestion(
                 format!("Invalid JSON: {}", e),
                 "INVALID_JSON",
-                "Example: --body '{\"name\":\"HighTemp\",\"condition\":{\"condition_type\":\"comparison\",\"source\":\"device:sensor-001:temperature\",\"operator\":\"greater_than\",\"threshold\":30},\"actions\":[{\"type\":\"notify\",\"message\":\"Too hot!\"}]}'",
+                "Pass a JSON object via shell params, e.g. \
+{\"command\":\"heramind rule create\",\"params\":{\"name\":\"HighTemp\",\
+\"condition\":{\"condition_type\":\"comparison\",\"source\":\"device:sensor-001:temperature\",\
+\"operator\":\"greater_than\",\"threshold\":30},\
+\"actions\":[{\"type\":\"notify\",\"message\":\"Too hot!\"}]}}",
             ));
         }
     };
 
     let data = client.post("/rules", &body).await?;
-    let rule = data
-        .get("data")
-        .and_then(|d| d.get("rule"))
-        .unwrap_or(&data);
-    let rule_id = rule["id"].as_str().unwrap_or("unknown").to_string();
-    let rule_name = rule["name"].as_str().unwrap_or("(unnamed)").to_string();
 
-    let meta = BuildMeta {
-        r#type: "rule".to_string(),
-        action: "create".to_string(),
-        entity_id: rule_id.clone(),
-        entity_name: Some(rule_name),
-        undo_command: format!("heramind rule delete {}", rule_id),
-    };
-
-    Ok(CliResponse::success_with_meta(data, "Rule created", meta))
+    Ok(CliResponse::success(data, "Rule created"))
 }
 
 /// Update rule via JSON body.
 pub async fn update_rule(client: &ApiClient, id: &str, json_body: &str) -> Result<CliResponse> {
-    let body: serde_json::Value = match serde_json::from_str(json_body) {
+    let body: serde_json::Value = match crate::json_arg::parse_json_arg(json_body) {
         Ok(v) => v,
         Err(e) => {
             // Surface a copy-pasteable rule example so the caller (LLM agent
@@ -215,7 +457,11 @@ pub async fn update_rule(client: &ApiClient, id: &str, json_body: &str) -> Resul
             return Ok(CliResponse::error_with_suggestion(
                 format!("Invalid JSON: {}", e),
                 "INVALID_JSON",
-                "Example: --body '{\"name\":\"HighTemp\",\"condition\":{\"condition_type\":\"comparison\",\"source\":\"device:sensor-001:temperature\",\"operator\":\"greater_than\",\"threshold\":30},\"actions\":[{\"type\":\"notify\",\"message\":\"Too hot!\"}]}'",
+                "Pass a JSON object via shell params, e.g. \
+{\"command\":\"heramind rule update <ID>\",\"params\":{\"name\":\"HighTemp\",\
+\"condition\":{\"condition_type\":\"comparison\",\"source\":\"device:sensor-001:temperature\",\
+\"operator\":\"greater_than\",\"threshold\":30},\
+\"actions\":[{\"type\":\"notify\",\"message\":\"Too hot!\"}]}}",
             ));
         }
     };
@@ -266,8 +512,200 @@ pub async fn get_rule_history(client: &ApiClient, id: &str) -> Result<CliRespons
     Ok(CliResponse::success(data, "Rule history retrieved"))
 }
 
+pub async fn explain_rule(client: &ApiClient, id: &str) -> Result<CliResponse> {
+    let data = client.get(&format!("/rules/{}/explain", id)).await?;
+    Ok(CliResponse::success(data, "Rule explanation retrieved"))
+}
+
 #[cfg(test)]
 mod tests {
+
+    // ---- compose_rule_update_body (fast-path update, eval loss fix) ----
+
+    fn existing_rule() -> serde_json::Value {
+        serde_json::json!({
+            "id": "r-1", "name": "old", "enabled": true,
+            "condition": {"condition_type": "comparison",
+                          "source": "device:sensor-002:values.battery",
+                          "operator": "less_than", "threshold": 25},
+            "actions": [{"type": "notify", "message": "old msg", "severity": "warning"}],
+            "cooldown": 60000, "tags": ["keep"]
+        })
+    }
+
+    fn patch<'a>(
+        name: Option<&'a str>,
+        device: Option<&'a str>,
+        metric: Option<&'a str>,
+        op: Option<&'a str>,
+        threshold: Option<f64>,
+        notify: Option<&'a str>,
+    ) -> RuleFastPatchArgs<'a> {
+        RuleFastPatchArgs {
+            name,
+            trigger_device: device,
+            metric,
+            source: None,
+            operator: op,
+            threshold,
+            notify,
+            severity: None,
+            cooldown: None,
+        }
+    }
+
+    /// The eval failure shape: retarget sensor-002 -> sensor-001 rebuilds the
+    /// condition and preserves actions/cooldown/tags.
+    #[test]
+    fn retarget_rebuilds_condition_and_preserves_the_rest() {
+        let p = patch(
+            None,
+            Some("sensor-001"),
+            Some("values.battery"),
+            Some("less_than"),
+            Some(25.0),
+            None,
+        );
+        let body = compose_rule_update_body(&existing_rule(), &p).unwrap();
+        assert_eq!(
+            body["condition"]["source"],
+            "device:sensor-001:values.battery"
+        );
+        assert_eq!(body["condition"]["threshold"], 25.0);
+        assert_eq!(
+            body["actions"][0]["message"], "old msg",
+            "actions preserved"
+        );
+        assert_eq!(body["cooldown"], 60000, "cooldown preserved");
+        assert_eq!(body["tags"][0], "keep");
+    }
+
+    #[test]
+    fn threshold_only_patch_requires_the_full_condition_flags() {
+        let p = patch(None, None, None, None, Some(15.0), None);
+        let err = compose_rule_update_body(&existing_rule(), &p)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("complete condition"), "{err}");
+        assert!(
+            err.contains("--body"),
+            "must teach the full-body alternative: {err}"
+        );
+    }
+
+    #[test]
+    fn notify_patch_edits_first_notify_action_and_keeps_condition() {
+        let p = patch(None, None, None, None, None, Some("new msg"));
+        let body = compose_rule_update_body(&existing_rule(), &p).unwrap();
+        assert_eq!(body["actions"][0]["message"], "new msg");
+        assert_eq!(
+            body["condition"]["source"], "device:sensor-002:values.battery",
+            "untouched condition stays"
+        );
+    }
+
+    /// Review P1: adding --notify to a rule whose actions are
+    /// execute + trigger_agent must APPEND the notify and keep both original
+    /// actions in order — the first implementation replaced the whole array.
+    #[test]
+    fn notify_add_appends_and_preserves_other_actions() {
+        let mut existing = existing_rule();
+        existing["actions"] = json!([
+            {"type": "execute", "command": "heramind device control d1 open"},
+            {"type": "trigger_agent", "agent_id": "agent-1"}
+        ]);
+        let p = patch(None, None, None, None, None, Some("告警"));
+        let body = compose_rule_update_body(&existing, &p).unwrap();
+        let actions = body["actions"].as_array().unwrap();
+        assert_eq!(
+            actions.len(),
+            3,
+            "both original actions must survive: {actions:?}"
+        );
+        assert_eq!(actions[0]["type"], "execute");
+        assert_eq!(actions[1]["type"], "trigger_agent");
+        assert_eq!(actions[2]["type"], "notify");
+        assert_eq!(actions[2]["message"], "告警");
+        assert_eq!(
+            actions[2]["severity"], "warning",
+            "new notify defaults to warning"
+        );
+    }
+
+    /// Review P2: a message-only update must keep an existing CRITICAL
+    /// severity (the fixture deliberately uses critical, not warning).
+    #[test]
+    fn message_only_update_preserves_critical_severity() {
+        let mut existing = existing_rule();
+        existing["actions"] = json!([
+            {"type": "notify", "message": "old", "severity": "critical"}
+        ]);
+        let p = patch(None, None, None, None, None, Some("new msg"));
+        let body = compose_rule_update_body(&existing, &p).unwrap();
+        assert_eq!(body["actions"][0]["message"], "new msg");
+        assert_eq!(
+            body["actions"][0]["severity"], "critical",
+            "must not downgrade"
+        );
+    }
+
+    #[test]
+    fn explicit_severity_still_applies_over_existing() {
+        let mut existing = existing_rule();
+        existing["actions"] = json!([
+            {"type": "notify", "message": "old", "severity": "critical"}
+        ]);
+        let p = RuleFastPatchArgs {
+            name: None,
+            trigger_device: None,
+            metric: None,
+            source: None,
+            operator: None,
+            threshold: None,
+            notify: Some("new msg"),
+            severity: Some("info"),
+            cooldown: None,
+        };
+        let body = compose_rule_update_body(&existing, &p).unwrap();
+        assert_eq!(body["actions"][0]["severity"], "info");
+    }
+
+    /// Multiple notify actions: the fast path cannot know which one to
+    /// change — refuse and point at --body instead of guessing the first.
+    #[test]
+    fn multi_notify_rules_are_rejected_not_first_patched() {
+        let mut existing = existing_rule();
+        existing["actions"] = json!([
+            {"type": "notify", "message": "a", "severity": "info"},
+            {"type": "notify", "message": "b", "severity": "critical"}
+        ]);
+        let p = patch(None, None, None, None, None, Some("c"));
+        let err = compose_rule_update_body(&existing, &p)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 notify actions"), "{err}");
+        assert!(err.contains("--body"), "{err}");
+    }
+
+    #[test]
+    fn name_and_cooldown_patch_without_condition_touch() {
+        let p = RuleFastPatchArgs {
+            name: Some("renamed"),
+            trigger_device: None,
+            metric: None,
+            source: None,
+            operator: None,
+            threshold: None,
+            notify: None,
+            severity: None,
+            cooldown: Some(120000),
+        };
+        let body = compose_rule_update_body(&existing_rule(), &p).unwrap();
+        assert_eq!(body["name"], "renamed");
+        assert_eq!(body["cooldown"], 120000);
+        assert_eq!(body["condition"]["threshold"], 25.0);
+    }
+
     use super::*;
 
     fn fast_args() -> RuleFastPathArgs<'static> {
@@ -341,5 +779,30 @@ mod tests {
         let mut args = fast_args();
         args.cooldown = Some(60_000);
         assert_eq!(build_rule_body(&args).unwrap()["cooldown"], 60_000);
+    }
+
+    #[test]
+    fn merge_name_into_body_inserts_when_missing() {
+        let body = r#"{"condition":{"condition_type":"comparison","source":"device:s1:temp","operator":"greater_than","threshold":30},"actions":[{"type":"notify","message":"hot"}]}"#;
+        let merged = merge_rule_create_name_into_body(body, Some("High Temp")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["name"], "High Temp");
+    }
+
+    #[test]
+    fn merge_name_into_body_allows_matching_name() {
+        let body = r#"{"name":"High Temp","actions":[]}"#;
+        let merged = merge_rule_create_name_into_body(body, Some("High Temp")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["name"], "High Temp");
+    }
+
+    #[test]
+    fn merge_name_into_body_rejects_conflict() {
+        let body = r#"{"name":"A","actions":[]}"#;
+        let err = merge_rule_create_name_into_body(body, Some("B"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("conflicts"), "{err}");
     }
 }

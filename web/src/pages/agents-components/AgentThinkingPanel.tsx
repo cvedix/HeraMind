@@ -11,7 +11,7 @@ import { Card } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Brain,
-  ChevronRight,
+
   ChevronDown,
   ChevronUp,
   Loader2,
@@ -26,6 +26,7 @@ import { cn } from "@/lib/utils"
 import { useAgentEvents, type AgentThinkingStep } from "@/hooks/useAgentEvents"
 import { formatTimestamp } from "@/lib/utils/format"
 import { api } from "@/lib/api"
+import { ConclusionContent } from "./ConclusionContent"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
 import type { AgentExecutionDetail } from "@/types"
 
@@ -42,7 +43,7 @@ export function AgentThinkingPanel({ agentId, isExecuting }: AgentThinkingPanelP
     eventTypes: ['AgentExecutionStarted', 'AgentThinking', 'AgentDecision', 'AgentExecutionCompleted'],
   })
 
-  const [autoScroll, setAutoScroll] = useState(true)
+  const [_autoScroll, _setAutoScroll] = useState(true)
 
   // Track when we should show the panel
   const [showPanel, setShowPanel] = useState(false)
@@ -79,7 +80,7 @@ export function AgentThinkingPanel({ agentId, isExecuting }: AgentThinkingPanelP
     if (!isExecuting && currentExecution?.completed_at) {
       const timer = setTimeout(() => {
         setShowPanel(false)
-      }, 15000)
+      }, 4000)
       return () => clearTimeout(timer)
     }
   }, [isExecuting, currentExecution, dismissed])
@@ -224,9 +225,9 @@ export function AgentThinkingPanel({ agentId, isExecuting }: AgentThinkingPanelP
                       </h4>
                       <div className="space-y-2">
                         {conclusion && (
-                          <Card className="p-2.5 bg-muted">
-                            <p className="text-sm">{conclusion}</p>
-                          </Card>
+                          <div className="rounded-lg border border-border bg-card p-3">
+                            <ConclusionContent content={conclusion} />
+                          </div>
                         )}
                         {confidence !== undefined && (
                           <div className="flex items-center justify-between text-sm p-2 bg-muted rounded-lg">
@@ -258,7 +259,7 @@ interface ThinkingStepProps {
 }
 
 function ThinkingStep({ step }: ThinkingStepProps) {
-  const { t } = useTranslation(['common', 'agents'])
+  const { t: _t } = useTranslation(['common', 'agents'])
 
   const getStepTypeColor = (stepType: string) => {
     switch (stepType.toLowerCase()) {
@@ -330,7 +331,7 @@ interface DecisionProps {
 }
 
 function Decision({ decision }: DecisionProps) {
-  const { t } = useTranslation(['common', 'agents'])
+  const { t: _t } = useTranslation(['common', 'agents'])
 
   return (
     <Card className="p-2.5">

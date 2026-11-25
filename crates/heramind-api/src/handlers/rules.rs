@@ -159,6 +159,7 @@ fn condition_to_json(cond: &RuleCondition) -> Value {
                     heramind_core::datasource::DataSourceType::Device => "device",
                     heramind_core::datasource::DataSourceType::Extension => "extension",
                     heramind_core::datasource::DataSourceType::Transform => "transform",
+                    heramind_core::datasource::DataSourceType::Ai => "ai",
                 },
                 "source_id": source.source_id,
                 "metric": source.field_path,
@@ -178,6 +179,7 @@ fn condition_to_json(cond: &RuleCondition) -> Value {
                     heramind_core::datasource::DataSourceType::Device => "device",
                     heramind_core::datasource::DataSourceType::Extension => "extension",
                     heramind_core::datasource::DataSourceType::Transform => "transform",
+                    heramind_core::datasource::DataSourceType::Ai => "ai",
                 },
                 "source_id": source.source_id,
                 "metric": source.field_path,
@@ -240,6 +242,12 @@ fn action_to_json(action: &RuleAction) -> Value {
                 "agent_id": agent_id,
                 "input": input,
                 "data": data,
+            })
+        }
+        RuleAction::RunOperator { agent_id } => {
+            json!({
+                "type": "run_operator",
+                "agent_id": agent_id,
             })
         }
     }
@@ -433,6 +441,122 @@ pub async fn update_rule_handler(
     let rule_id = RuleId::from_string(&id)
         .map_err(|_| ErrorResponse::bad_request(format!("Invalid rule ID: {}", id)))?;
 
+    // Unknown-field rejection: a body mixing valid fields with unrecognized
+    // ones (e.g. create-style flag names such as "trigger_device") must fail
+    // loudly instead of silently dropping the unknown half and reporting a
+    // no-op update as success (T4 552 trace full--multi-turn-correction--en--r0:
+    // `rule update --body '{"name":...,"trigger_device":"sensor-002",...}'`
+    // returned success with the rule still pointing at sensor-001). The whole
+    // request is rejected; nothing is written.
+    const UPDATE_FIELDS: &[&str] = &[
+        "name",
+        "description",
+        "enabled",
+        "source",
+        "condition",
+        "trigger",
+        "actions",
+    ];
+    // Keys the full-definition path deserializes into CompiledRule; accepted
+    // so a frontend full-rule PUT (tags/cooldown/…) is not rejected, but they
+    // do not count as update fields on their own.
+    const PASSTHROUGH_KEYS: &[&str] = &[
+        "id",
+        "tags",
+        "cooldown",
+        "for_duration",
+        "state",
+        "dsl_preview",
+        "created_at",
+        "updated_at",
+    ];
+    let obj = req
+        .as_object()
+        .ok_or_else(|| ErrorResponse::bad_request("Rule update body must be a JSON object"))?;
+    let unknown: Vec<&str> = obj
+        .keys()
+        .map(|k| k.as_str())
+        .filter(|k| !UPDATE_FIELDS.contains(k) && !PASSTHROUGH_KEYS.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(ErrorResponse::bad_request(format!(
+            "Unknown rule update fields: {}. Supported update fields: {}. The request was NOT applied. \
+             To change what a rule watches, send the full definition (trigger/condition/actions).",
+            unknown.join(", "),
+            UPDATE_FIELDS.join(", ")
+        ))
+        .with_hint(
+            "Rule update accepts name/description/enabled/source or a full trigger/condition/actions \
+             definition; unknown fields are rejected so a silent no-op update cannot report success."
+                .to_string(),
+        ));
+    }
+    if !obj.keys().any(|k| UPDATE_FIELDS.contains(&k.as_str())) {
+        return Err(ErrorResponse::bad_request(format!(
+            "No supported update fields in body (supported: {}). The request was NOT applied.",
+            UPDATE_FIELDS.join(", ")
+        )));
+    }
+    // Metadata keys only take effect on the full-definition path (with
+    // trigger/condition/actions, where the whole body is deserialized into
+    // CompiledRule and tags/cooldown/for_duration are applied). In a partial
+    // update they would be accepted-but-ignored — recreating the silent
+    // no-op-success defect — so reject them there instead. On the full path,
+    // id/state/created_at/updated_at/dsl_preview remain server-authoritative
+    // (overridden from the stored rule / regenerate) by design.
+    const METADATA_KEYS: &[&str] = &[
+        "id",
+        "tags",
+        "cooldown",
+        "for_duration",
+        "state",
+        "dsl_preview",
+        "created_at",
+        "updated_at",
+    ];
+    let has_full_definition = obj
+        .keys()
+        .any(|k| matches!(k.as_str(), "condition" | "trigger" | "actions"));
+    if !has_full_definition {
+        let misused: Vec<&str> = obj
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| METADATA_KEYS.contains(k))
+            .collect();
+        if !misused.is_empty() {
+            return Err(ErrorResponse::bad_request(format!(
+                "Fields {} are only applied in full-definition updates (with trigger/condition/actions); \
+                 in a partial update they would be silently ignored, so the request was NOT applied.",
+                misused.join(", ")
+            ))
+            .with_hint(
+                "Send the full rule definition (trigger/condition/actions, plus optional \
+                 tags/cooldown/for_duration) to change those fields; partial updates accept only \
+                 name/description/enabled/source."
+                    .to_string(),
+            ));
+        }
+    }
+    // Type checks for the scalar partial fields: a wrong-typed field must be
+    // rejected, not silently treated as absent.
+    if let Some(v) = obj.get("name") {
+        if !v.is_string() {
+            return Err(ErrorResponse::bad_request("'name' must be a string"));
+        }
+    }
+    if let Some(v) = obj.get("description") {
+        if !v.is_null() && !v.is_string() {
+            return Err(ErrorResponse::bad_request(
+                "'description' must be a string or null",
+            ));
+        }
+    }
+    if let Some(v) = obj.get("enabled") {
+        if !v.is_boolean() {
+            return Err(ErrorResponse::bad_request("'enabled' must be a boolean"));
+        }
+    }
+
     // Extract fields from request (clone before potential move)
     let name = req.get("name").and_then(|v| v.as_str()).map(String::from);
     let description = req
@@ -492,6 +616,30 @@ pub async fn update_rule_handler(
         // Finalize: auto-generate dsl_preview, extract trigger sources
         rule.finalize();
 
+        // changed covers ALL writable fields on this path: compare the new
+        // definition against the stored one with volatile keys (id, runtime
+        // state, timestamps) stripped. An identical full body is a legal
+        // idempotent update: report changed=false and skip the rewrite.
+        let strip_volatile = |mut v: serde_json::Value| {
+            if let Some(map) = v.as_object_mut() {
+                for key in ["id", "state", "created_at", "updated_at"] {
+                    map.remove(key);
+                }
+            }
+            v
+        };
+        if let Some(ref old) = existing {
+            if strip_volatile(serde_json::to_value(&rule).unwrap_or_default())
+                == strip_volatile(serde_json::to_value(old).unwrap_or_default())
+            {
+                return ok(json!({
+                    "rule": RuleDetailDto::from(old),
+                    "updated": true,
+                    "changed": false,
+                }));
+            }
+        }
+
         // Validate cron expression for Schedule triggers
         validate_rule_cron(&rule)?;
 
@@ -548,6 +696,7 @@ pub async fn update_rule_handler(
         return ok(json!({
             "rule": RuleDetailDto::from(&rule),
             "updated": true,
+            "changed": true,
         }));
     }
 
@@ -558,6 +707,25 @@ pub async fn update_rule_handler(
         .get_rule(&rule_id)
         .await
         .ok_or_else(|| ErrorResponse::not_found("Rule"))?;
+
+    // Idempotent updates (same values as stored) are legal: report
+    // changed=false and leave the stored rule — including updated_at —
+    // untouched instead of bumping the timestamp on a no-op.
+    let changed = name.as_deref().is_some_and(|n| n != rule.name)
+        || description
+            .as_deref()
+            .is_some_and(|d| rule.description.as_deref() != Some(d))
+        || source
+            .as_ref()
+            .is_some_and(|s| rule.source.as_ref() != Some(s))
+        || enabled.is_some_and(|e| e != rule.enabled);
+    if !changed {
+        return ok(json!({
+            "rule": RuleDetailDto::from(&rule),
+            "updated": true,
+            "changed": false,
+        }));
+    }
 
     // Update fields
     if let Some(name) = name {
@@ -602,6 +770,7 @@ pub async fn update_rule_handler(
     ok(json!({
         "rule": RuleDetailDto::from(&rule),
         "updated": true,
+        "changed": true,
     }))
 }
 
@@ -903,6 +1072,9 @@ pub async fn test_rule_handler(
         heramind_core::datasource::DataSourceType::Transform => {
             format!("transform:{}", query_source.source_id)
         }
+        heramind_core::datasource::DataSourceType::Ai => {
+            format!("ai:{}", query_source.source_id)
+        }
     };
     let metric_variants = vec![
         metric.clone(),
@@ -1148,7 +1320,7 @@ pub async fn create_rule_handler(
                     "Provide a valid JSON rule object. Required fields: 'name'. \
                      `trigger` defaults to {{\"trigger_type\":\"data_change\"}} when omitted. \
                      Condition types: 'comparison', 'range', 'logical'. \
-                     Action types: 'notify', 'execute', 'trigger_agent'. \
+                     Action types: 'notify', 'execute', 'trigger_agent', 'run_operator'. \
                      Trigger shape (internally tagged, field is 'trigger_type'): \
                      {{\"trigger\":{{\"trigger_type\":\"data_change\"}}}} | \
                      {{\"trigger\":{{\"trigger_type\":\"schedule\",\"cron\":\"* * * * *\"}}}} | \
@@ -1285,6 +1457,45 @@ pub async fn get_rule_history_handler(
         "rule_id": id,
         "executions": history,
     }))
+}
+
+/// Explain a rule's current state (read-only).
+///
+/// GET /api/rules/:id/explain
+#[utoipa::path(
+    get,
+    path = "/api/rules/:id/explain",
+    tag = "rules",
+    params(
+        ("id" = String, Path, description = "Rule id"),
+    ),
+    responses(
+        (status = 200, description = "Read-only explanation: per-condition source/value/age/result (unknown when no value), for_duration progress, cooldown status, last execution evidence; executes nothing"),
+        (status = 404, description = "Not found"),
+    )
+)]
+pub async fn get_rule_explain_handler(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> HandlerResult<serde_json::Value> {
+    let rule_id = RuleId::from_string(&id)
+        .map_err(|_| ErrorResponse::bad_request(format!("Invalid rule ID: {}", id)))?;
+
+    state
+        .automation
+        .rule_engine
+        .get_rule(&rule_id)
+        .await
+        .ok_or_else(|| ErrorResponse::not_found("Rule"))?;
+
+    let explanation = state
+        .automation
+        .rule_engine
+        .explain_rule(&rule_id)
+        .await
+        .ok_or_else(|| ErrorResponse::not_found("Rule"))?;
+
+    ok(serde_json::to_value(explanation).unwrap_or(json!({})))
 }
 
 /// Export all rules as JSON.
@@ -1687,13 +1898,15 @@ fn validate_virtual_metric_policy(rule: &CompiledRule) -> Result<(), ErrorRespon
 /// Returns `Err` with a user-friendly message if the cron syntax is invalid.
 fn validate_rule_cron(rule: &CompiledRule) -> Result<(), ErrorResponse> {
     if let heramind_rules::RuleTrigger::Schedule { ref cron } = rule.trigger {
-        cron.parse::<cron::Schedule>().map_err(|e| {
-            ErrorResponse::bad_request(format!(
-                "Invalid cron expression '{}': {}. \
+        heramind_core::cron::normalize(cron)
+            .parse::<cron::Schedule>()
+            .map_err(|e| {
+                ErrorResponse::bad_request(format!(
+                    "Invalid cron expression '{}': {}. \
                  Use standard 5-field cron (min hour day month weekday), e.g. '0 */5 * * *'.",
-                cron, e
-            ))
-        })?;
+                    cron, e
+                ))
+            })?;
     }
     Ok(())
 }
@@ -1748,4 +1961,43 @@ pub async fn validate_rule_handler(
         "errors": result.errors,
         "warnings": result.warnings,
     }))
+}
+
+#[cfg(test)]
+mod action_dto_tests {
+    use super::action_to_json;
+
+    /// M2-4: the rule detail DTO must carry the operator action — the editor
+    /// renders actions from this JSON, so an action missing here is an action
+    /// the user cannot see or edit.
+    #[test]
+    fn run_operator_action_reaches_the_dto() {
+        let json = action_to_json(&heramind_rules::RuleAction::RunOperator {
+            agent_id: "cam01-view".to_string(),
+        });
+
+        assert_eq!(json["type"], "run_operator");
+        assert_eq!(json["agent_id"], "cam01-view");
+    }
+
+    /// Adding a fourth action must not have shifted the three already stored
+    /// and already rendered.
+    #[test]
+    fn existing_action_dtos_are_unchanged() {
+        let notify = action_to_json(&heramind_rules::RuleAction::Notify {
+            message: "m".to_string(),
+            severity: heramind_rules::NotifySeverity::Info,
+        });
+        assert_eq!(notify["type"], "notify");
+        assert_eq!(notify["message"], "m");
+        assert_eq!(notify["severity"], "info");
+
+        let trigger = action_to_json(&heramind_rules::RuleAction::TriggerAgent {
+            agent_id: "a-1".to_string(),
+            input: None,
+            data: None,
+        });
+        assert_eq!(trigger["type"], "trigger_agent");
+        assert_eq!(trigger["agent_id"], "a-1");
+    }
 }

@@ -1,43 +1,74 @@
 ---
 id: device-onboarding
-name: Device Onboarding & Connection Guide
-description: Use when the user wants to onboard, connect, or configure an IoT device, OR send a control command to a device (stop, start, set speed, alarm, reboot). Covers device provisioning, MQTT/Webhook/BLE connection, getting broker addresses, and controlling devices — even if they don't explicitly say "device" or "control" (e.g. "shut down the pump", "把泵停掉", "set the fan speed", "停下来"). Includes 设备接入/连接/配置/控制/停机/调速/命令下发.
+summary: Register devices and verify telemetry arrival (MQTT/webhook/BLE); send device control commands.
+not_for: [reading current values (use the CLI directly), dashboard display (dashboard-management), threshold alerts (rule-management), external brokers (connector-management)]
+name: Device Onboarding Guide
+aliases: [device, onboarding]
+description: Use when the user wants to onboard or configure an IoT device, OR send a control command to a device (stop, start, set speed, alarm, reboot). Covers device provisioning, MQTT/Webhook/BLE adapters, endpoint/topic setup, and controlling devices — even if they don't explicitly say "device" or "control" (e.g. "shut down the pump", "把泵停掉", "set the fan speed", "停下来"). Also covers virtual/simulated devices — create a device then feed it data with `heramind device write-metric` (adapter-independent, the device goes online immediately) or via its webhook URL with curl ('建个虚拟设备', 'create a virtual device', '模拟数据'). Includes 设备接入/连接/配置/控制/停机/调速/命令下发.
 category: device
 origin: builtin
 priority: 90
 token_budget: 12000
 triggers:
-  keywords: [设备接入, 接入, onboarding, 连接设备, connect device, MQTT, mqtt, broker, webhook, 传感器, sensor, 设备配置, device setup, device connect, provision, 配置设备, device provisioning, 网关, gateway, 接入方式, 订阅, subscribe, auto-discovery, 自动发现, 控制, 命令, 停机, 停止, control, command, stop, shutdown, reboot, set speed, device control]
+  keywords: [设备接入, 接入, onboarding, 连接设备, connect device, MQTT, mqtt, webhook, 传感器, sensor, 设备配置, device setup, device connect, provision, 配置设备, device provisioning, 网关, gateway, 接入方式, 订阅, subscribe, auto-discovery, 自动发现, 控制, 命令, 停机, 停止, control, command, stop, shutdown, reboot, set speed, device control, 虚拟设备, virtual device, 模拟设备, simulated device, 模拟数据, simulated data, mock device, 测试设备, test device, simulate]
   tool_target:
     - tool: system
       actions: [info]
     - tool: device
-      actions: [create, list, types, control, latest, drafts, webhook-url, update, delete, history, write-metric]
+      actions: [create, list, get, types, control, drafts, webhook-url, update, delete, history, write-metric]
 anti_triggers:
-  keywords: [rule, 规则, agent, 代理, dashboard, 仪表盘, transform, 转换]
+  keywords: [rule, 规则, agent, 代理, dashboard, 仪表盘, transform, 转换, external broker, remote broker, mqtt broker, connect broker, 外部 broker, 远程 mqtt]
 ---
+
+# device-onboarding
+
+**Guided sensor setup**: `heramind device types list` → `heramind device create --name … --device-type … --adapter-type mqtt` → report endpoint/topic from `heramind system info`.
+Determine the requested protocol and target; ask only for missing connection information. Inspect existing devices/types before creating anything.
+MQTT: discovery creates a candidate, not an approved device. Shared topics may carry multiple JSON identities. Preserve explicit bindings and configured identity fields; do not reject topics based on guessed uplink/downlink words. Approval and association use the real device identity.
+Webhook: create with the webhook adapter, then obtain its ingest URL. A saved configuration does not prove data is arriving.
+For control, inspect supported commands and parameters. Chat/shell preferred: `{ "command": "heramind device control <ID> <CMD>", "params": {…} }`. Human CLI: `--param key=value` (repeat) or quoted `--params JSON`. Read delivery evidence: accepted is not physical completion. Validation errors contain command/schema hints.
+Verify incoming telemetry after connection. If offline, report configuration and missing telemetry separately. Do not invent metrics or credentials.
+
+## Commands
+| Command | Purpose |
+|---|---|
+| `heramind device list` | List all devices (grouped by type) |
+| `heramind device get <id>` | Details: metadata + metrics + commands |
+| `heramind device create --name <N> --device-type <TYPE> [--id <id>] [--adapter-type <a>]` | Create a device |
+| `heramind device update <id>` | Update a device |
+| `heramind device delete <id>` | Delete a device |
+| `heramind device history <id>` | Telemetry history |
+| `heramind device control <id> <COMMAND>` | Send a control command to a device |
+| `heramind device types list` | List device-type templates |
+| `heramind device write-metric <ID> --metric <METRIC> --value <VALUE> [--timestamp <ms_epoch>]` | Write a metric data point — THE tool for virtual-device simulation / test reporting (any metric name, device goes online). ⚠️ `--metric`/`--value` are FLAGS (only `<ID>` is positional); value may be a number or "true"/"false" |
+| `heramind device webhook-url <id>` | Get the webhook URL for a device |
+| `heramind device drafts` | Manage auto-discovery drafts |
+
+## Detailed reference
+Use skill(action="load", id="device-onboarding", section="<exact returned title>") only for the needed detail. Section titles are returned with this overview.
+
+<!-- SKILL_REFERENCE -->
+
 
 # Device Onboarding & Connection Guide
 
 ## Command Cheat-Sheet (run these via `shell`)
-
-Always RUN the command yourself and report the real output — don't narrate.
 
 | Command | Purpose |
 |---|---|
 | `heramind device list` | List all devices (grouped by type) |
 | `heramind device get <id>` | Details: metadata + metrics + commands |
 | `heramind device create --name <N> --device-type <TYPE> [--id <id>] [--adapter-type <a>]` | Create a device |
-
-**When the user gives a device ID in their request (e.g. "create cam-office"), you MUST pass `--id <that-id>`** — never silently swap it for an auto-generated one. If you omit `--id`, the CLI auto-generates a random ID and the user's requested identifier is lost.
 | `heramind device update <id>` | Update a device |
 | `heramind device delete <id>` | Delete a device |
 | `heramind device history <id>` | Telemetry history |
 | `heramind device control <id> <COMMAND>` | Send a control command to a device |
 | `heramind device types list` | List device-type templates |
-| `heramind device write-metric <id> <METRIC> <VALUE>` | Write a metric data point |
+| `heramind device write-metric <ID> --metric <METRIC> --value <VALUE> [--timestamp <ms_epoch>]` | Write a metric data point — THE tool for virtual-device simulation / test reporting (any metric name, device goes online). ⚠️ `--metric`/`--value` are FLAGS (only `<ID>` is positional); value may be a number or "true"/"false" |
 | `heramind device webhook-url <id>` | Get the webhook URL for a device |
 | `heramind device drafts` | Manage auto-discovery drafts |
+
+**When the user gives a device ID in their request (e.g. "create cam-office"), you MUST pass `--id <that-id>`** — never silently swap it for an auto-generated one. If you omit `--id`, the CLI auto-generates a random ID and the user's requested identifier is lost.
 
 ## Sending Control Commands
 
@@ -289,8 +320,8 @@ heramind device drafts reject <DRAFT_ID>
 # View current settings
 heramind device drafts config
 
-# Enable auto-approve (skip manual review)
-heramind device drafts config --auto-approve true
+# Turn auto-discovery on, keeping 5 sample readings per draft
+heramind device drafts config --enabled true --max-samples 5
 
 # Disable auto-discovery
 heramind device drafts config --enabled false
@@ -343,6 +374,30 @@ Content-Type: application/json
 1. HeraMind supports connecting to external brokers.
 2. The external broker can be configured via the Web UI (Settings > MQTT).
 3. Once configured, HeraMind subscribes to the external broker and auto-discovers devices.
+
+---
+
+### Scenario E: Virtual / Simulated Device (test data source)
+
+**User wants a fake device that produces data** ('建个虚拟设备', '模拟数据源', 'create a virtual device', 'simulate reporting').
+
+1. **Pick a device type whose metrics match the data you will simulate** — run `heramind device types list` and choose accordingly. A temperature value written to a camera template still works but displays as a raw metric name. If no type matches, create one:
+```bash
+heramind device types create --name 'Weather Sensor' --metrics '[{"name":"temperature","display_name":"Temperature","data_type":"Float","unit":"°C"},{"name":"humidity","display_name":"Humidity","data_type":"Float","unit":"%"}]'
+```
+
+2. **Create the device** (adapter defaults to `mqtt`):
+```bash
+heramind device create --name "Virtual Weather" --device-type <TYPE>
+```
+
+3. **Feed it data with `write-metric` — THE tool for simulation.** No broker, no physical connection, no `control` command needed; each write lands in telemetry, fires rules/dashboards/data-push, and turns the device online:
+```bash
+heramind device write-metric <DEVICE_ID> --metric temperature --value 23.5
+```
+`write-metric` accepts ANY metric name (not limited to the type's template). Verify: `heramind device get <ID>` (status/last_seen) and `heramind device history <ID> --metric temperature`.
+
+> ⚠️ A virtual `mqtt`-adapter device has NO live transport. Bridge/adapter tools (e.g. `router-bridge send_frame`) are DOWNLINK to real bridge-attached hardware — they correctly refuse with "not connected" and are never the way to simulate reporting. For webhook-adapter devices the webhook flow also works (`curl -X POST .../api/devices/<ID>/webhook -d '{"data":{...}}'`); real MQTT hardware publishes to `device/{type}/{id}/uplink`.
 
 ---
 
@@ -442,7 +497,7 @@ heramind system info
 
 2. **Create the device first:**
 ```bash
-heramind device create --name 'Weather Station' --adapter-type webhook
+heramind device create --name 'Weather Station' --device-type weather_station --adapter-type webhook
 # Record the device ID from response
 ```
 

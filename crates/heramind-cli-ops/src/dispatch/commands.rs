@@ -25,10 +25,22 @@ pub struct Args {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
-    /// Compatibility flag for LLM-generated commands. Agent shell output is
-    /// already structured JSON via HERAMIND_JSON, so this flag is accepted and
-    /// intentionally ignored.
-    #[arg(long, global = true, hide = true)]
+    /// Terminal output format: `json` or `text`. No default flag value —
+    /// the terminal stays human-readable unless HERAMIND_JSON is set (the
+    /// flag maps onto that switch in main), and the in-process agent path
+    /// always receives JSON regardless. Accepted globally because
+    /// `--format json` is a generic CLI convention every model reaches
+    /// for; rejecting it burned the opening round of a live session twice
+    /// (`dashboard list --format=json`, `widget list --format=json`).
+    #[arg(long, global = true, value_parser = ["json", "text"])]
+    pub format: Option<String>,
+
+    /// Alias for `--format json`. Models (and many CLIs) reach for bare
+    /// `--json` on list/get/history; rejecting it burned Phase1 overnight
+    /// `haccp-compliance-deploy` (12× on one timed-out en trial alone) and
+    /// 28 failed tool calls across the tip suite. Global so every
+    /// subcommand accepts it the same way `--format` does.
+    #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
     pub json: bool,
 }
 
@@ -212,12 +224,12 @@ pub enum Command {
     },
     /// Data source discovery.
     ///
-    /// Example: `heramind data sources list`
+    /// Example: `heramind data list`
     Data {
         #[command(subcommand)]
         data_cmd: DataCommand,
     },
-    /// Data connector management (MQTT, webhook, HTTP, etc.).
+    /// Data connector management (external MQTT brokers).
     Connector {
         #[command(subcommand)]
         connector_cmd: ConnectorCommand,
@@ -226,6 +238,17 @@ pub enum Command {
     Settings {
         #[command(subcommand)]
         settings_cmd: SettingsCommand,
+    },
+    /// Inspect persisted write-operation ledger status.
+    ///
+    /// Check whether an in-progress or timed-out (`unknown`) operation reached
+    /// a terminal outcome (`succeeded` / `failed`) without replaying it.
+    ///
+    /// Example: `heramind operation get <OP_ID>`
+    /// Example: `heramind operation list --limit 20`
+    Operation {
+        #[command(subcommand)]
+        operation_cmd: OperationCommand,
     },
     /// Log in by reading a key from the server's auth DB and saving it locally.
     ///
@@ -511,19 +534,29 @@ pub enum ExtensionCommand {
         /// Extension ID or .nep file path.
         #[arg(required = true)]
         id_or_path: String,
+        /// Inspect local .nep packages on disk instead of querying the running server.
+        #[arg(long)]
+        offline: bool,
     },
     /// Install a .nep extension package.
     ///
-    /// Installs from a local file path. The extension is loaded immediately.
+    /// Uploads the .nep package to the running server and loads it immediately.
+    /// Pass `--offline` to copy into the local `./data/extensions` directory
+    /// without contacting a running server.
     /// Example: `heramind extension install ./weather-forecast.nep`
     Install {
-        /// Path to the .nep file or URL.
+        /// Path to the .nep file.
         #[arg(required = true)]
         package: String,
+        /// Copy the .nep package into the local extensions directory without
+        /// uploading to a running server (takes effect on next restart).
+        #[arg(long)]
+        offline: bool,
     },
     /// Uninstall an extension.
     ///
-    /// Stops the extension process and removes all files. This is irreversible.
+    /// Stops the extension process and removes all files via the running server.
+    /// Pass `--offline` to delete local .nep files from disk without a server.
     /// Example: `heramind extension uninstall weather-forecast --yes`
     Uninstall {
         /// Extension ID.
@@ -533,6 +566,10 @@ pub enum ExtensionCommand {
         /// the AI agent / scripts get a refusal instead of a hang without it).
         #[arg(long)]
         yes: bool,
+        /// Remove local .nep package files from disk without contacting the
+        /// running server.
+        #[arg(long)]
+        offline: bool,
     },
     /// Create a new extension scaffold.
     ///
@@ -552,20 +589,21 @@ pub enum ExtensionCommand {
     /// Get extension health status.
     ///
     /// Shows process status, uptime, last error, and resource usage.
+    /// Omit `<ID>` to list installed extensions with status (same as a compact
+    /// `extension list`) — useful when the agent forgot to pass an id.
     /// Example: `heramind extension status weather-forecast`
     Status {
-        /// Extension ID.
-        #[arg(required = true)]
-        id: String,
+        /// Extension ID (optional — omit to list all with status).
+        id: Option<String>,
     },
     /// Get extension logs.
     ///
     /// Retrieves recent log output from the extension's isolated process.
+    /// Omit `<ID>` to list installed extensions and a tip to pick one.
     /// Example: `heramind extension logs weather-forecast --lines 50`
     Logs {
-        /// Extension ID.
-        #[arg(required = true)]
-        id: String,
+        /// Extension ID (optional — omit to list ids first).
+        id: Option<String>,
         /// Number of log lines to show.
         #[arg(short, long)]
         lines: Option<usize>,
@@ -599,11 +637,21 @@ pub enum ExtensionCommand {
         #[arg(long)]
         version: Option<String>,
     },
-    /// List marketplace extensions.
+    /// List marketplace extensions (compact by default).
     ///
-    /// Shows all extensions available in the marketplace registry.
-    /// Example: `heramind extension market-list`
-    MarketList,
+    /// Prints id/name/version/one-line description only — the full registry
+    /// dump is ~48 KB and drowned small models' context (2026-10-15: an
+    /// 8-minute turn with the dump loaded twice). Give a search term to
+    /// filter: `heramind extension market-list weather`. `-v` restores the
+    /// full metadata dump.
+    /// Example: `heramind extension market-list [search] [-v]`
+    MarketList {
+        /// Case-insensitive substring filter over id/name/description.
+        filter: Option<String>,
+        /// Full metadata dump instead of the compact table.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Reload an extension.
     ///
     /// Restarts the extension process from its installed files.
@@ -628,6 +676,52 @@ pub enum ExtensionCommand {
         #[arg(long)]
         set: Option<String>,
     },
+    /// List or search machine-readable extension commands.
+    ///
+    /// Without `--search`: list the unified business command contract for one
+    /// installed extension (`id`, description, input_schema, effect, …).
+    /// With `--search "<task>"`: host-rank AI-visible commands from the current
+    /// registry snapshot (≤3 / ~500 tokens; purpose + required params; zero
+    /// hits allowed). Optional positional `<id>` scopes the search (e.g. @).
+    /// Examples:
+    ///   `heramind extension commands weather-forecast-v2`
+    ///   `heramind extension commands --search "weather in Xiamen"`
+    ///   `heramind extension commands --search "forecast" weather-forecast-v2`
+    Commands {
+        /// Task-oriented search across AI-visible installed commands (NM-252).
+        #[arg(long)]
+        search: Option<String>,
+        /// Extension ID. Required without `--search`; with `--search` scopes
+        /// the search to that extension.
+        #[arg(required_unless_present = "search")]
+        id: Option<String>,
+    },
+    /// Invoke an extension command with JSON params.
+    ///
+    /// Prefer `--params` / `--params-file` over inventing CLI flags — small
+    /// models handle one JSON object more reliably than quoted shell flags.
+    /// Same semantics as `POST /api/extensions/:id/invoke` (shared schema
+    /// validation + capability metadata).
+    /// Example: `heramind extension invoke weather-forecast-v2 get_weather --params '{"city":"Xiamen"}'`
+    Invoke {
+        /// Extension ID.
+        #[arg(required = true)]
+        extension_id: String,
+        /// Command name (from `extension commands`).
+        #[arg(required = true)]
+        command: String,
+        /// JSON object of parameters.
+        #[arg(long, conflicts_with = "params_file")]
+        params: Option<String>,
+        /// Path to a JSON file of parameters (avoids shell quoting).
+        #[arg(long, conflicts_with = "params")]
+        params_file: Option<std::path::PathBuf>,
+        /// Chat write-gate bound PreparedInvoke token (server-issued).
+        /// Injected by the agent shell after prepare→authorize; human CLI
+        /// omits this and HTTP prepares in the same request.
+        #[arg(long, hide = true)]
+        prepared_operation_id: Option<String>,
+    },
 }
 
 /// Device subcommands.
@@ -636,13 +730,15 @@ pub enum DeviceCommand {
     /// List all devices, grouped by type.
     ///
     /// Returns devices grouped by device type with metric field names and
-    /// an example device's current values per type. No need to call
-    /// `device get <ID>` for deep inspection.
+    /// an example device's current values per type. This is an inventory
+    /// overview, not a per-device telemetry history check.
     /// Use --device-type or --status to filter results.
     ///
     /// Workflow: Use this for discovery — find device IDs, metric names,
     /// and current values in one command. Then use `device get <ID>` for
-    /// deep inspection of a specific device.
+    /// deep inspection of a specific device. For missing/no-data diagnosis,
+    /// also run `device history <ID>` to verify stored telemetry. Report the
+    /// observed state and queried time range; the cause needs separate evidence.
     ///
     /// Example: `heramind device list --device-type temp_sensor --status online`
     List {
@@ -652,6 +748,9 @@ pub enum DeviceCommand {
         /// Filter by status.
         #[arg(short, long)]
         status: Option<String>,
+        /// Counts only (total/online/offline/type_count) — compact output.
+        #[arg(long)]
+        summary: bool,
     },
     /// Get device details (metadata + metrics + commands).
     ///
@@ -839,7 +938,8 @@ pub enum DeviceCommand {
         #[arg(long)]
         metric: String,
         /// Value (number, string, or "true"/"false").
-        #[arg(long)]
+        /// `allow_negative_numbers`: frozen-chain HACCP writes use `--value -20`.
+        #[arg(long, allow_negative_numbers = true)]
         value: String,
         /// Timestamp in milliseconds (defaults to now).
         #[arg(long)]
@@ -923,17 +1023,13 @@ pub enum DraftCommand {
     ///
     /// Settings:
     ///   --enabled true/false     Enable/disable auto-discovery
-    ///   --auto-approve true/false  Auto-approve new drafts
     ///   --max-samples <N>        Max samples to keep per draft
     ///
-    /// Example: `heramind device drafts config --enabled true --auto-approve false`
+    /// Example: `heramind device drafts config --enabled true --max-samples 5`
     Config {
         /// Enable or disable auto-discovery.
         #[arg(long)]
         enabled: Option<bool>,
-        /// Auto-approve new drafts without manual review.
-        #[arg(long)]
-        auto_approve: Option<bool>,
         /// Maximum data samples to keep per draft.
         #[arg(long)]
         max_samples: Option<u32>,
@@ -1098,6 +1194,8 @@ pub enum DashboardCommand {
     ///   `dashboard update-component <ID> --component-id c3 --set '{"data_source":{"timeWindow":{"type":"last_6hours"}}}'`
     ///   retitle + resize:
     ///   `dashboard update-component <ID> --component-id c3 --set '{"title":"温度","position":{"w":6}}'`
+    /// Chat/shell tool preferred: keep JSON out of the command string and pass
+    /// the object via structured `params` (maps to `--set`).
     UpdateComponent {
         /// Dashboard ID.
         #[arg(required = true)]
@@ -1114,7 +1212,11 @@ pub enum DashboardCommand {
     /// Appends new widgets without replacing existing ones.
     /// This is the RECOMMENDED way to add widgets.
     ///
-    /// Example: `heramind dashboard add-components <ID> --components '[{"id":"c1","type":"value-card",...}]'`
+    /// Chat/shell (preferred):
+    ///   `{ "command": "heramind dashboard add-components <ID>", "params": [ { "id":"c1", "type":"value-card", "position":{"x":0,"y":0,"w":4,"h":2}, "data_source":{...} } ] }`
+    /// Add only 1–2 components per call; append again for more.
+    /// Do NOT invent CLI `--params` — the primary flag is `--components`.
+    /// Human CLI fallback: `heramind dashboard add-components <ID> --components '[{...}]'`
     AddComponents {
         /// Dashboard ID.
         #[arg(required = true)]
@@ -1127,7 +1229,8 @@ pub enum DashboardCommand {
     ///
     /// Removes specific widgets by their component IDs.
     ///
-    /// Example: `heramind dashboard remove-components <ID> --ids '["c1","c2"]'`
+    /// Chat/shell (preferred): `{ "command": "heramind dashboard remove-components <ID>", "params": ["c1","c2"] }`
+    /// Human CLI fallback: `heramind dashboard remove-components <ID> --ids '["c1","c2"]'`
     RemoveComponents {
         /// Dashboard ID.
         #[arg(required = true)]
@@ -1199,11 +1302,13 @@ pub enum RuleCommand {
         /// Required fields: name, condition (optional for schedule/manual), actions.
         /// Conditions: {"condition_type":"comparison","source":"device:sensor1:temp","operator":"greater_than","threshold":30}
         /// Actions: [{"type":"notify","message":"Too hot","severity":"critical"}]
+        // `--name` is intentionally NOT in conflicts_with_all: models often emit
+        // `rule create --name X --body '{...}'`. Handler merges/validates name.
         #[arg(
             short,
             long,
             conflicts_with_all = [
-                "name", "trigger_device", "source", "metric", "operator", "threshold", "notify",
+                "trigger_device", "source", "metric", "operator", "threshold", "notify",
                 "severity", "cooldown"
             ]
         )]
@@ -1226,7 +1331,10 @@ pub enum RuleCommand {
         #[arg(long, required_unless_present = "body")]
         operator: Option<String>,
         /// Threshold value to compare the metric against.
-        #[arg(long, required_unless_present = "body")]
+        /// `allow_negative_numbers`: HACCP frozen rules use `--threshold -18`.
+        /// Prefer this over `allow_hyphen_values` so `--threshold --help` still
+        /// shows help instead of trying to parse `"--help"` as f64.
+        #[arg(long, required_unless_present = "body", allow_negative_numbers = true)]
         threshold: Option<f64>,
         /// Notify action message. Supports `{value}` and `{source_id}` placeholders.
         #[arg(long, required_unless_present = "body")]
@@ -1241,10 +1349,16 @@ pub enum RuleCommand {
     },
     /// Update rule.
     ///
-    /// Modify rule using JSON format. Only included fields are updated.
+    /// Fast path to re-target or re-threshold a rule (flags, no JSON — the
+    /// existing rule is fetched, the condition is rebuilt, actions are
+    /// preserved, and the full definition is PUT):
+    /// `heramind rule update rule-001 --trigger-device sensor-2 --metric temperature --operator greater_than --threshold 30`
+    /// `--name`, `--notify`, `--severity` and `--cooldown` patch their fields.
+    ///
+    /// Full JSON form for anything else (only included fields are updated):
+    /// `heramind rule update rule-001 --body '{"name":"New Name"}'`
     /// Test first with `rule test <ID> --input '...'` to verify new conditions.
     ///
-    /// Example: `heramind rule update rule-001 --body '{"name":"New Name"}'`
     /// The ID may also be passed as a flag: `--id rule-001` (models coming
     /// off a `rule create` response reach for this form).
     Update {
@@ -1254,9 +1368,47 @@ pub enum RuleCommand {
         /// Rule ID (flag form — exactly one of this or the positional).
         #[arg(long = "id", value_name = "ID", conflicts_with = "id")]
         id_flag: Option<String>,
-        /// Updated rule definition as JSON string.
+        /// Updated rule definition as JSON string (full or partial form).
+        #[arg(
+            short,
+            long,
+            conflicts_with_all = [
+                "name", "trigger_device", "source", "metric", "operator", "threshold", "notify",
+                "severity", "cooldown",
+            ]
+        )]
+        body: Option<String>,
+        /// New rule name.
         #[arg(short, long)]
-        body: String,
+        name: Option<String>,
+        /// Re-target: device whose metric the rule watches (with --metric).
+        #[arg(long, requires = "metric", conflicts_with = "source")]
+        trigger_device: Option<String>,
+        /// Re-target: metric name on the trigger device.
+        #[arg(long, requires = "trigger_device")]
+        metric: Option<String>,
+        /// Re-target: full source form (`extension:<id>:<metric>` / `transform:<id>:<field>`).
+        #[arg(long, conflicts_with = "trigger_device")]
+        source: Option<String>,
+        /// New comparison operator: greater_than | less_than | greater_equal |
+        /// less_equal | equal | not_equal.
+        #[arg(long)]
+        operator: Option<String>,
+        /// New threshold value.
+        /// See `Create.threshold` — negative values need `allow_negative_numbers`.
+        #[arg(long, allow_negative_numbers = true)]
+        threshold: Option<f64>,
+        /// New notify message: patches the rule's notify action (keeps its
+        /// severity) or appends one when absent; a rule with MULTIPLE notify
+        /// actions is rejected — use --body for those.
+        #[arg(long)]
+        notify: Option<String>,
+        /// New notify severity: info | warning | critical | emergency.
+        #[arg(long, requires = "notify")]
+        severity: Option<String>,
+        /// New cooldown in ms between triggers.
+        #[arg(long)]
+        cooldown: Option<u64>,
     },
     /// Delete rule.
     ///
@@ -1318,6 +1470,19 @@ pub enum RuleCommand {
     ///
     /// Example: `heramind rule history rule-001`
     History {
+        /// Rule ID.
+        #[arg(required = true)]
+        id: String,
+    },
+    /// Explain a rule's current state (read-only diagnosis).
+    ///
+    /// Shows, right now, without executing anything: each condition's source,
+    /// current value, value age and result (unknown when no data was received),
+    /// for_duration progress, cooldown remaining, trigger count and the last
+    /// execution result. Use this to answer "why did/didn't my rule fire".
+    ///
+    /// Example: `heramind rule explain rule-001`
+    Explain {
         /// Rule ID.
         #[arg(required = true)]
         id: String,
@@ -1504,8 +1669,9 @@ pub enum AgentCommand {
     },
     /// Create a new agent.
     ///
-    /// Creates an agent in paused state. You MUST activate it with
-    /// `agent control <ID> active` after creation.
+    /// Creates an agent **active** — it starts running on its schedule
+    /// immediately. Check on it with `agent latest-execution <ID>`, run it
+    /// early with `agent invoke <ID>`, stop it with `agent control <ID> paused`.
     ///
     /// Schedule is required. Use --schedule-type and --schedule-config together:
     ///   - interval: `--schedule-type interval --schedule-config "300"` (every 5 min)
@@ -1529,10 +1695,14 @@ pub enum AgentCommand {
         /// Description (0-500 chars).
         #[arg(short, long)]
         description: Option<String>,
-        /// Schedule type: interval | cron | event. Required.
+        /// Schedule type: interval | cron | event | manual. Required.
         ///   - interval: runs every N seconds (--schedule-config "300" = every 5min)
         ///   - cron:     runs on schedule (--schedule-config "0 8 * * *" = daily 8am)
         ///   - event:    runs when device data arrives (--event-filter optional)
+        ///   - manual:   never scheduled — runs only when you call
+        ///     `agent invoke`. This is what the editor's
+        ///     "on demand" strategy creates, so an agent built in the UI and
+        ///     one built here can be the same shape.
         #[arg(long)]
         schedule_type: Option<String>,
         /// Schedule config: interval seconds or cron expression.
@@ -1556,10 +1726,29 @@ pub enum AgentCommand {
         /// System prompt for the LLM (overrides default agent system prompt).
         #[arg(short, long)]
         system_prompt: Option<String>,
-        /// Execution mode: "free" (multi-round tool calling) or "focused" (single-pass with bound resources).
-        /// "focused" requires --resources or --device-ids. Default: "free".
+        /// Execution mode: "focused" (single-pass, default — plainest agent),
+        /// "free" (multi-round tool calling), or "structured" (one constrained
+        /// inference; needs --output-schema). Any mode works without bindings.
         #[arg(long)]
         execution_mode: Option<String>,
+        /// Output contract (JSON array) — fields published as ai:{id}:{field}
+        /// data sources. Required for structured mode; optional ride-along for
+        /// free/focused (published in a post-run step).
+        /// Example: --output-schema '[{"name":"status","field_type":{"type":"enum","values":["正常","异常"]}}]'
+        #[arg(long)]
+        output_schema: Option<String>,
+        /// Memory axis: "tool" (judged fresh each run) | "assistant" (carries
+        /// recent history). Omit to derive from the mode.
+        #[arg(long)]
+        memory_mode: Option<String>,
+        /// Notification routing (JSON): {"channels":["name"],"on":"failure|always|judgment"}.
+        ///   failure (default): only when the run failed — silence is health
+        ///   always: every run
+        ///   judgment: send nothing on the agent's behalf; it decides in its own
+        ///     prompt whether to speak (use for "only tell me if it matters")
+        /// Example: --notify '{"channels":["telegram:main"],"on":"always"}'
+        #[arg(long)]
+        notify: Option<String>,
         /// Device IDs to bind (comma-separated). Used in focused mode.
         /// Example: --device-ids "device-001,device-002"
         #[arg(long)]
@@ -1577,10 +1766,8 @@ pub enum AgentCommand {
         /// Example: --commands '[{"device_id":"switch-001","command_name":"toggle","display_name":"Toggle","parameters":{}}]'
         #[arg(long)]
         commands: Option<String>,
-        /// Enable tool chaining (agent can call multiple tools in sequence). Default: false.
-        #[arg(long)]
-        enable_tool_chaining: Option<bool>,
-        /// Maximum tool chain depth (1-20). Only used when --enable-tool-chaining is true. Default: 3.
+        /// Maximum tool chain depth (1-30): how many tool rounds a Focused agent may
+        /// take in one run. Default: 10.
         #[arg(long)]
         max_chain_depth: Option<usize>,
         /// Agent priority (0-255, higher = more important). Default: 128.
@@ -1615,15 +1802,25 @@ pub enum AgentCommand {
         /// System prompt.
         #[arg(short, long)]
         system_prompt: Option<String>,
-        /// New schedule type: interval | cron | event.
+        /// New schedule type: interval | cron | event | manual (see `create`).
         #[arg(long)]
         schedule_type: Option<String>,
         /// New schedule config (seconds for interval, cron expression for cron).
         #[arg(long)]
         schedule_config: Option<String>,
-        /// New execution mode: "free" or "focused".
+        /// New execution mode: "focused" | "free" | "structured".
         #[arg(long)]
         execution_mode: Option<String>,
+        /// New output contract (JSON array); replaces the existing one.
+        #[arg(long)]
+        output_schema: Option<String>,
+        /// New memory axis: "tool" | "assistant".
+        #[arg(long)]
+        memory_mode: Option<String>,
+        /// New notification routing (JSON): {"channels":[...],"on":"failure|always|judgment"}.
+        /// `judgment` routes nothing and lets the task decide whether to speak.
+        #[arg(long)]
+        notify: Option<String>,
         /// New device IDs (comma-separated). Replaces existing bindings.
         #[arg(long)]
         device_ids: Option<String>,
@@ -1638,9 +1835,6 @@ pub enum AgentCommand {
         /// Example: --commands '[{"device_id":"switch-001","command_name":"toggle","display_name":"Toggle","parameters":{}}]'
         #[arg(long)]
         commands: Option<String>,
-        /// Enable/disable tool chaining.
-        #[arg(long)]
-        enable_tool_chaining: Option<bool>,
         /// Max tool chain depth.
         #[arg(long)]
         max_chain_depth: Option<usize>,
@@ -1665,7 +1859,8 @@ pub enum AgentCommand {
     /// Control agent status.
     ///
     /// Status values: "active" (start running) or "paused" (stop).
-    /// New agents are created in paused state — you MUST run this to start them.
+    /// Stop (`paused`) or restart (`active`) a scheduled agent. New agents are
+    /// already active, so this is only needed after pausing one.
     ///
     /// Workflow:
     ///   - Start: `agent control <ID> active`
@@ -1681,19 +1876,22 @@ pub enum AgentCommand {
     },
     /// Invoke agent with input.
     ///
-    /// Runs a one-time agent execution with custom input, bypassing the schedule.
-    /// Returns the agent's response directly. Useful for testing or ad-hoc queries.
+    /// Runs a one-time agent execution, bypassing the schedule. Without input
+    /// the agent runs on its own prompt (it already knows what it watches).
+    /// The server waits up to 60s; a longer run continues in the background —
+    /// the response says `Executing`, and the result lands with
+    /// `agent latest-execution <ID>`.
     ///
-    /// Workflow: `agent invoke <ID> "your question"` → see immediate response.
+    /// Workflow: `agent invoke <ID> ["your question"]` → immediate response,
+    /// or `Executing` → `agent latest-execution <ID>`.
     ///
     /// Example: `heramind agent invoke agent-001 "Check all sensor readings"`
     Invoke {
         /// Agent ID.
         #[arg(required = true)]
         id: String,
-        /// Input prompt.
-        #[arg(required = true)]
-        input: String,
+        /// Optional extra input for this run only.
+        input: Option<String>,
     },
     /// Get agent memory.
     ///
@@ -1912,6 +2110,8 @@ pub enum MessageCommand {
     ///   feishu:   '{"hook_id":"xxxxxxxx","secret":"optional_sign_secret"}'
     ///
     /// Example: `heramind message channel-create --name "alerts" --type webhook --param url=https://hooks.slack.com/...`
+    /// Chat/shell tool preferred: pass the config object via structured `params`
+    /// (maps to `--config`), e.g. `params={"url":"https://example.com/webhook"}`.
     /// (or `--config '{"url":"https://..."}'` for the full JSON form)
     ChannelCreate {
         /// Channel name (unique identifier).
@@ -2159,7 +2359,9 @@ pub enum WidgetCommand {
         #[arg(long, default_value = "custom")]
         widget_type: String,
         /// Output directory (defaults to widget ID).
-        #[arg(long)]
+        /// Short `-o` matches the help example and `extension create -o`
+        /// (Day9 overnight `widget-full-lifecycle` rejected bare `-o` 4×).
+        #[arg(short, long)]
         output: Option<String>,
         /// Scaffold AND install in one step — register the widget immediately
         /// after scaffolding, no separate `widget install` needed.
@@ -2216,6 +2418,14 @@ pub enum SystemCommand {
     /// Example: `heramind system info`
     #[command(alias = "status")]
     Info {},
+    /// Subsystem readiness (`/health/ready`) as structured JSON.
+    ///
+    /// Example: `heramind system health`
+    Health {},
+    /// Host / platform stats (`/stats/system`) as structured JSON.
+    ///
+    /// Example: `heramind system stats`
+    Stats {},
 }
 
 /// Data source discovery commands.
@@ -2225,7 +2435,7 @@ pub enum DataCommand {
     /// dashboard / push bindings. This is the authoritative discovery entry
     /// before binding anything — don't guess DataSourceId strings.
     ///
-    /// Example: `heramind data sources list --source-type device`
+    /// Example: `heramind data list --source-type device`
     List {
         /// Filter by source type: device | extension | transform | system.
         #[arg(long)]
@@ -2295,7 +2505,18 @@ pub enum SettingsCommand {
     /// Example: `heramind settings set-retention --enabled --interval-hours 1 --default-retention 168`
     SetRetention {
         /// Enable or disable automatic retention cleanup.
-        #[arg(long)]
+        /// Accepts bare `--enabled` (true) and `--enabled=true|false` /
+        /// `--enabled true|false` — models habitually pass `=true`; clap's
+        /// default flag form rejected it (`unexpected value 'true'`) and
+        /// burned Day9 overnight `settings-retention`.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            default_value_t = false,
+            action = clap::ArgAction::Set,
+            value_parser = clap::builder::BoolishValueParser::new()
+        )]
         enabled: bool,
         /// Cleanup interval in hours (must be greater than 0).
         #[arg(long)]
@@ -2317,7 +2538,40 @@ pub enum SettingsCommand {
     Cleanup {},
 }
 
-/// Data connector subcommands (MQTT, webhook, HTTP, etc.).
+/// Operation ledger inspection subcommands (read-only).
+#[derive(Subcommand, Debug)]
+pub enum OperationCommand {
+    /// Get persisted status of one operation by operation ID.
+    ///
+    /// Returns domain/action, target, status (`in_progress`, `succeeded`,
+    /// `failed`, `unknown`, `rejected`, `cancelled`), result/error summary,
+    /// and timestamps.
+    ///
+    /// Example: `heramind operation get op-123`
+    Get {
+        /// Operation ID.
+        #[arg(required = true)]
+        id: String,
+    },
+    /// List persisted operations (newest first).
+    ///
+    /// Filter optionally by `--session-id`, `--status`, or `--limit`.
+    ///
+    /// Example: `heramind operation list --limit 20`
+    List {
+        /// Filter by session ID.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Filter by status (`in_progress`, `succeeded`, `failed`, `unknown`, `rejected`, `cancelled`).
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum number of operations to return (default: 50).
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
+}
+
+/// Data connector subcommands (external MQTT brokers only).
 #[derive(Subcommand, Debug)]
 pub enum ConnectorCommand {
     /// List all data connectors.
@@ -2346,7 +2600,7 @@ pub enum ConnectorCommand {
     ///
     ///   Example: `heramind connector create --type mqtt --name "Factory MQTT" --host 192.168.1.100 --port 1883 --topics "sensor/#,device/#"`
     Create {
-        /// Connector type (mqtt, webhook, http). Default: mqtt.
+        /// Connector type (mqtt only). Default: mqtt. Outbound data targets use push; notification channels use message.
         #[arg(long, default_value = "mqtt")]
         connector_type: String,
         /// Connector display name.
@@ -2492,6 +2746,282 @@ pub fn parse_duration(s: &str) -> u64 {
 }
 
 #[cfg(test)]
+mod rule_threshold_hyphen_tests {
+    //! Day9: `--threshold -18` must parse (frozen HACCP). Clap's default
+    //! treats leading `-` as a new flag → `unexpected argument '-1'`.
+
+    use super::{Args, Command, RuleCommand};
+    use clap::Parser;
+
+    #[test]
+    fn create_accepts_negative_threshold_as_separate_argv() {
+        let args = Args::try_parse_from([
+            "heramind",
+            "rule",
+            "create",
+            "--name",
+            "Frozen Temp Alert",
+            "--trigger-device",
+            "frozen-fridge-1",
+            "--metric",
+            "temp_c",
+            "--operator",
+            "less_than",
+            "--threshold",
+            "-18",
+            "--notify",
+            "Frozen fridge below -18C: {value}",
+        ])
+        .expect("negative --threshold must parse");
+        match args.command {
+            Command::Rule {
+                rule_cmd:
+                    RuleCommand::Create {
+                        threshold: Some(t), ..
+                    },
+            } => assert!((t - (-18.0)).abs() < f64::EPSILON, "got {t}"),
+            other => panic!("expected Rule::Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_accepts_name_together_with_body() {
+        let args = Args::try_parse_from([
+            "heramind",
+            "rule",
+            "create",
+            "--name",
+            "High Temp",
+            "--body",
+            r#"{"condition":{"condition_type":"comparison","source":"device:s1:temp","operator":"greater_than","threshold":30},"actions":[{"type":"notify","message":"hot"}]}"#,
+        ])
+        .expect("--name + --body must not be mutually exclusive");
+        match args.command {
+            Command::Rule {
+                rule_cmd:
+                    RuleCommand::Create {
+                        name: Some(n),
+                        body: Some(b),
+                        ..
+                    },
+            } => {
+                assert_eq!(n, "High Temp");
+                assert!(b.contains("condition"));
+            }
+            other => panic!("expected Rule::Create with name+body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_accepts_negative_threshold_as_separate_argv() {
+        let args = Args::try_parse_from([
+            "heramind",
+            "rule",
+            "update",
+            "rule-001",
+            "--threshold",
+            "-18",
+        ])
+        .expect("negative --threshold on update must parse");
+        match args.command {
+            Command::Rule {
+                rule_cmd:
+                    RuleCommand::Update {
+                        threshold: Some(t), ..
+                    },
+            } => assert!((t - (-18.0)).abs() < f64::EPSILON, "got {t}"),
+            other => panic!("expected Rule::Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_metric_accepts_negative_value() {
+        use super::DeviceCommand;
+        let args = Args::try_parse_from([
+            "heramind",
+            "device",
+            "write-metric",
+            "fridge-1",
+            "--metric",
+            "temp_c",
+            "--value",
+            "-20",
+        ])
+        .expect("negative --value must parse");
+        match args.command {
+            Command::Device {
+                device_cmd:
+                    DeviceCommand::WriteMetric {
+                        id, metric, value, ..
+                    },
+            } => {
+                assert_eq!(id, "fridge-1");
+                assert_eq!(metric, "temp_c");
+                assert_eq!(value, "-20");
+            }
+            other => panic!("expected Device::WriteMetric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn threshold_help_flag_is_display_help_not_float_parse_error() {
+        let err =
+            Args::try_parse_from(["heramind", "rule", "update", "r1", "--threshold", "--help"])
+                .expect_err("--threshold --help must not parse --help as f64");
+        let rendered = err.to_string();
+        assert!(
+            rendered.to_lowercase().contains("help")
+                || matches!(
+                    err.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ),
+            "expected DisplayHelp-style error, got kind={:?} msg={rendered}",
+            err.kind()
+        );
+    }
+}
+
+#[cfg(test)]
+mod day9_rejected_args_contract_tests {
+    //! Day9 D3: clear CLI contract gaps behind overnight `rejected_args`
+    //! (not pure model noise).
+
+    use super::{Args, Command, SettingsCommand, WidgetCommand};
+    use clap::Parser;
+
+    #[test]
+    fn widget_create_accepts_short_output_flag() {
+        let args = Args::try_parse_from([
+            "heramind",
+            "widget",
+            "create",
+            "Eval Widget",
+            "--widget-type",
+            "custom",
+            "-o",
+            "/tmp/eval-widget-src",
+        ])
+        .expect("widget create -o must parse (help example + extension create parity)");
+        match args.command {
+            Command::Widget {
+                widget_cmd:
+                    WidgetCommand::Create {
+                        output: Some(path), ..
+                    },
+            } => assert_eq!(path, "/tmp/eval-widget-src"),
+            other => panic!("expected Widget::Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_set_retention_accepts_enabled_equals_true() {
+        for argv in [
+            &[
+                "heramind",
+                "settings",
+                "set-retention",
+                "--enabled=true",
+                "--interval-hours",
+                "1",
+                "--default-retention",
+                "168",
+            ][..],
+            &[
+                "heramind",
+                "settings",
+                "set-retention",
+                "--enabled",
+                "true",
+                "--interval-hours",
+                "1",
+            ][..],
+            &[
+                "heramind",
+                "settings",
+                "set-retention",
+                "--enabled",
+                "--interval-hours",
+                "1",
+            ][..],
+            &[
+                "heramind",
+                "settings",
+                "set-retention",
+                "--enabled=false",
+                "--interval-hours",
+                "1",
+            ][..],
+        ] {
+            let args = Args::try_parse_from(argv.iter().copied()).unwrap_or_else(|e| {
+                panic!("expected set-retention enabled forms to parse for {argv:?}: {e}")
+            });
+            match args.command {
+                Command::Settings {
+                    settings_cmd:
+                        SettingsCommand::SetRetention {
+                            enabled,
+                            interval_hours,
+                            ..
+                        },
+                } => {
+                    assert_eq!(interval_hours, 1, "argv={argv:?}");
+                    let expect_enabled = !argv.contains(&"--enabled=false");
+                    assert_eq!(enabled, expect_enabled, "argv={argv:?}");
+                }
+                other => panic!("expected Settings::SetRetention, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod global_json_flag_tests {
+    //! Day9 overnight: bare `--json` was rejected while `--format json` was
+    //! already global — `haccp-compliance-deploy` timed out after 12×
+    //! `device|rule|transform list --json` failures on one en trial.
+
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn bare_json_flag_parses_on_list_commands() {
+        for argv in [
+            &["heramind", "device", "list", "--json"][..],
+            &["heramind", "rule", "list", "--json"][..],
+            &["heramind", "transform", "list", "--json"][..],
+            &[
+                "heramind", "device", "history", "fridge-1", "--metric", "temp_c", "--json",
+            ][..],
+        ] {
+            let args = Args::try_parse_from(argv.iter().copied())
+                .unwrap_or_else(|e| panic!("expected --json to parse for {argv:?}: {e}"));
+            assert!(args.json, "argv={argv:?}");
+            assert!(args.format.is_none());
+        }
+    }
+
+    #[test]
+    fn format_json_still_parses() {
+        let args =
+            Args::try_parse_from(["heramind", "device", "list", "--format", "json"]).unwrap();
+        assert!(!args.json);
+        assert_eq!(args.format.as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn bare_json_and_format_text_both_visible_to_dispatch() {
+        // clap accepts both; dispatch prefers --json → Json when format is text
+        // only if json is set — this just asserts parse succeeds.
+        let args =
+            Args::try_parse_from(["heramind", "device", "list", "--json", "--format", "text"])
+                .unwrap();
+        assert!(args.json);
+        assert_eq!(args.format.as_deref(), Some("text"));
+    }
+}
+
+#[cfg(test)]
 mod rule_update_id_flag_tests {
     //! `rule update` accepts the ID positionally or as `--id` — models coming
     //! off a `rule create` response habitually write `--id <uuid>` (seen in
@@ -2531,6 +3061,58 @@ mod rule_update_id_flag_tests {
     fn both_forms_conflict_and_neither_fails() {
         assert!(parse(&["rule", "update", "rule-001", "--id", "other", "--body", "{}"]).is_err());
         assert!(parse(&["rule", "update", "--body", "{}"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod extension_status_logs_optional_id_tests {
+    //! Stage-3 closeout: bare `extension status` / `extension logs` must parse
+    //! (list-all / tip path) instead of clap missing_required.
+
+    use super::{Args, Command, ExtensionCommand};
+    use clap::Parser;
+
+    fn parse(argv: &str) -> Command {
+        Args::try_parse_from(["heramind"].into_iter().chain(argv.split_whitespace()))
+            .unwrap_or_else(|e| panic!("parse `{argv}`: {e}"))
+            .command
+    }
+
+    #[test]
+    fn extension_status_parses_without_id() {
+        let Command::Extension { extension_cmd } = parse("extension status") else {
+            panic!("expected Extension");
+        };
+        match extension_cmd {
+            ExtensionCommand::Status { id: None } => {}
+            other => panic!("expected Status {{ id: None }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extension_status_parses_with_id() {
+        let Command::Extension { extension_cmd } = parse("extension status weather-forecast")
+        else {
+            panic!("expected Extension");
+        };
+        match extension_cmd {
+            ExtensionCommand::Status { id: Some(id) } => assert_eq!(id, "weather-forecast"),
+            other => panic!("expected Status with id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extension_logs_parses_without_id() {
+        let Command::Extension { extension_cmd } = parse("extension logs") else {
+            panic!("expected Extension");
+        };
+        match extension_cmd {
+            ExtensionCommand::Logs {
+                id: None,
+                lines: None,
+            } => {}
+            other => panic!("expected Logs {{ id: None }}, got {other:?}"),
+        }
     }
 }
 
@@ -2752,6 +3334,46 @@ mod unify_enable_disable_tests {
         }
     }
 
+    /// NM-252: `commands --search` and scoped `commands --search <id>`.
+    #[test]
+    fn extension_commands_search_parses() {
+        let cmd = parse("extension commands --search weather");
+        let Command::Extension { extension_cmd } = cmd else {
+            panic!("expected Extension, got {cmd:?}");
+        };
+        match extension_cmd {
+            super::ExtensionCommand::Commands { search, id } => {
+                assert_eq!(search.as_deref(), Some("weather"));
+                assert!(id.is_none());
+            }
+            other => panic!("expected Commands, got {other:?}"),
+        }
+
+        let cmd = parse("extension commands --search forecast weather-forecast-v2");
+        let Command::Extension { extension_cmd } = cmd else {
+            panic!("expected Extension, got {cmd:?}");
+        };
+        match extension_cmd {
+            super::ExtensionCommand::Commands { search, id } => {
+                assert_eq!(search.as_deref(), Some("forecast"));
+                assert_eq!(id.as_deref(), Some("weather-forecast-v2"));
+            }
+            other => panic!("expected Commands, got {other:?}"),
+        }
+
+        let cmd = parse("extension commands weather-forecast-v2");
+        let Command::Extension { extension_cmd } = cmd else {
+            panic!("expected Extension, got {cmd:?}");
+        };
+        match extension_cmd {
+            super::ExtensionCommand::Commands { search, id } => {
+                assert!(search.is_none());
+                assert_eq!(id.as_deref(), Some("weather-forecast-v2"));
+            }
+            other => panic!("expected Commands, got {other:?}"),
+        }
+    }
+
     /// Batch 1 Concern 3: extension get is primary; info is visible alias.
     #[test]
     fn extension_get_is_primary_info_is_alias() {
@@ -2761,10 +3383,16 @@ mod unify_enable_disable_tests {
         match (cmd_get, cmd_info) {
             (
                 Command::Extension {
-                    extension_cmd: super::ExtensionCommand::Get { id_or_path: id1 },
+                    extension_cmd:
+                        super::ExtensionCommand::Get {
+                            id_or_path: id1, ..
+                        },
                 },
                 Command::Extension {
-                    extension_cmd: super::ExtensionCommand::Get { id_or_path: id2 },
+                    extension_cmd:
+                        super::ExtensionCommand::Get {
+                            id_or_path: id2, ..
+                        },
                 },
             ) => {
                 assert_eq!(id1, "weather-forecast");
@@ -2787,5 +3415,44 @@ mod unify_enable_disable_tests {
             }
             other => panic!("expected Message::Read, got {other:?}"),
         }
+    }
+}
+
+/// `agent invoke` input is optional: the agent already knows what it watches,
+/// and the server-side invocation carries the agent's own prompt. The old
+/// required positional made a no-input run a parse error — which the model
+/// read as business failure (2026-11-17 eval forensics).
+#[cfg(test)]
+mod agent_invoke_input_tests {
+    use super::{AgentCommand, Args, Command};
+    use clap::Parser;
+
+    fn parse(argv: &[&str]) -> Result<Option<String>, String> {
+        Args::try_parse_from(["heramind"].into_iter().chain(argv.iter().copied()))
+            .map(|a| match a.command {
+                Command::Agent {
+                    agent_cmd: AgentCommand::Invoke { input, .. },
+                } => input,
+                _ => None,
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn invoke_without_input_parses() {
+        assert_eq!(parse(&["agent", "invoke", "agent-001"]).unwrap(), None);
+    }
+
+    #[test]
+    fn invoke_with_input_parses() {
+        assert_eq!(
+            parse(&["agent", "invoke", "agent-001", "check sensors"]).unwrap(),
+            Some("check sensors".to_string())
+        );
+    }
+
+    #[test]
+    fn invoke_requires_id() {
+        assert!(parse(&["agent", "invoke"]).is_err());
     }
 }

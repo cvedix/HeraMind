@@ -17,6 +17,8 @@ use super::tool::{DynTool, MemoryToolHandles, ToolDefinition, ToolOutput};
 /// unregistered.
 pub struct ToolRegistry {
     tools: HashMap<String, DynTool>,
+    /// Session-local gate; never changes the shared global disabled set.
+    memory_enabled: std::sync::atomic::AtomicBool,
     /// Cached tool definitions (rebuilt on register/unregister).
     cached_definitions: RwLock<Option<Vec<ToolDefinition>>>,
     /// Optional cancellation token. When set, `execute` / `execute_parallel`
@@ -39,10 +41,42 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            memory_enabled: std::sync::atomic::AtomicBool::new(true),
             cached_definitions: RwLock::new(None),
             cancellation_token: Arc::new(RwLock::new(None)),
             disabled: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    /// Share stateless tools and global policy, but isolate tools with
+    /// session-scoped state (such as `memory` and `shell`) per chat session.
+    pub(crate) fn for_chat_session(&self, session_id: &str) -> Self {
+        let mut tools = self.tools.clone();
+        for (name, tool) in &self.tools {
+            if let Some(scoped) = tool.clone_for_chat_session(session_id) {
+                tools.insert(name.clone(), scoped);
+            }
+        }
+        Self {
+            tools,
+            memory_enabled: std::sync::atomic::AtomicBool::new(true),
+            cached_definitions: RwLock::new(None),
+            cancellation_token: self.cancellation_token.clone(),
+            disabled: self.disabled.clone(),
+        }
+    }
+
+    /// Reset transient per-session state across all registered tools (e.g.
+    /// after clearing a chat session's conversation history).
+    pub(crate) fn reset_session_state(&self) {
+        for tool in self.tools.values() {
+            tool.reset_session_state();
+        }
+    }
+
+    pub(crate) fn set_memory_enabled(&self, enabled: bool) {
+        self.memory_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     /// Invalidate cached definitions (call after any mutation).
@@ -126,28 +160,34 @@ impl ToolRegistry {
                 .collect()
         };
         drop(disabled);
+        defs.retain(|d| !self.is_disabled(&d.name));
         // Deterministic order matching the system-prompt tool hierarchy.
         // self.tools is a HashMap (random iteration order per process start),
         // so without this the tools:[...] array the LLM sees reshuffles on
         // every server restart. Small models have strong positional bias
         // (they favor the first tool they see), so keep `shell` first.
         // Tools not listed here (e.g. extension tools) sort to the end,
-        // retaining their relative order via stable sort.
+        // ordered by name so HashMap iteration cannot reshuffle the tail.
         let order = [
             "shell",
             "skill",
             "memory",
             "vision",
             "image_edit",
+            "web_search",
             "web_fetch",
+            "file_read",
             "file_write",
             "file_edit",
         ];
         defs.sort_by_key(|d| {
-            order
-                .iter()
-                .position(|n| *n == d.name)
-                .unwrap_or(usize::MAX)
+            (
+                order
+                    .iter()
+                    .position(|n| *n == d.name)
+                    .unwrap_or(usize::MAX),
+                d.name.clone(),
+            )
         });
         defs
     }
@@ -172,7 +212,20 @@ impl ToolRegistry {
 
     /// Check whether a tool name is currently disabled.
     pub fn is_disabled(&self, name: &str) -> bool {
-        self.disabled.read().contains(name)
+        (name == "memory"
+            && !self
+                .memory_enabled
+                .load(std::sync::atomic::Ordering::Acquire))
+            || self.disabled.read().contains(name)
+    }
+
+    /// Replay safety of a registered tool (see [`ReplaySafety`]). Unknown
+    /// names resolve to the conservative `Unsafe` — callers deciding whether
+    /// an interrupted call may be retried must fail closed.
+    pub fn replay_safety(&self, name: &str) -> super::tool::ReplaySafety {
+        self.get(name)
+            .map(|t| t.replay_safety())
+            .unwrap_or(super::tool::ReplaySafety::Unsafe)
     }
 
     /// Snapshot of the disabled set (cloned).
@@ -199,9 +252,17 @@ impl ToolRegistry {
             return Err(ToolError::Disabled(name.to_string()));
         }
 
-        let tool = self
-            .get(name)
-            .ok_or_else(|| ToolError::NotFound(name.to_string()))?;
+        let tool = self.get(name).ok_or_else(|| {
+            if let Some(hint) = super::extension_tools::historical_extension_tool_cli_hint(name) {
+                // Historical name resolve for compat: recognize legacy
+                // ext:cmd / sanitized names and redirect to CLI — do not
+                // execute the extension here (would bypass CLI-only + confuse
+                // AI-policy attribution).
+                ToolError::NotFound(hint)
+            } else {
+                ToolError::NotFound(name.to_string())
+            }
+        })?;
 
         let token_opt = self.cancellation_token.read().clone();
         match token_opt {
@@ -446,9 +507,19 @@ impl ToolRegistryBuilder {
 
     /// Scan extensions and add their tools to the registry.
     ///
-    /// Returns the builder on success (with extension tools added), or the original builder on error.
+    /// Skipped when [`super::extension_tools::extension_direct_tools_for_llm`]
+    /// is false (CLI-only candidate) — chat then uses
+    /// `heramind extension list|commands|invoke` only.
+    ///
     /// Call `.build()` after this method to get the final registry.
     pub async fn with_extensions_scanned(mut self) -> Self {
+        if !super::extension_tools::extension_direct_tools_for_llm() {
+            tracing::info!(
+                category = "ai",
+                "CLI-only extension entry: skipping direct extension tool registration"
+            );
+            return self;
+        }
         if let Some(ext_registry) = &self.extension_registry {
             use super::extension_tools::ExtensionToolExecutor;
 
@@ -529,6 +600,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn definitions_keep_builtin_priority_and_sort_extension_tail() {
+        for names in [
+            ["z:invoke", "shell", "a:query", "skill"],
+            ["skill", "a:query", "shell", "z:invoke"],
+        ] {
+            let mut registry = ToolRegistry::new();
+            for name in names {
+                registry.register(Arc::new(TestTool { name: name.into() }));
+            }
+            let actual: Vec<_> = registry
+                .definitions_for_llm()
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
+            assert_eq!(actual, ["shell", "skill", "a:query", "z:invoke"]);
+        }
+    }
+
     #[tokio::test]
     async fn test_registry_register() {
         let mut registry = ToolRegistry::new();
@@ -581,6 +671,50 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ToolError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_historical_extension_name_redirects_to_cli_not_found() {
+        let registry = ToolRegistry::new();
+        let err = registry
+            .execute("weather-forecast-v2_get_weather", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::NotFound(msg) => {
+                assert!(
+                    msg.contains("heramind extension invoke weather-forecast-v2 get_weather"),
+                    "{msg}"
+                );
+                assert!(
+                    msg.contains("not registered for chat"),
+                    "must not silently execute: {msg}"
+                );
+            }
+            other => panic!("expected NotFound redirect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_extensions_scanned_skips_when_cli_only_env() {
+        let prev = std::env::var_os("HERAMIND_EXTENSION_DIRECT_TOOLS");
+        std::env::set_var("HERAMIND_EXTENSION_DIRECT_TOOLS", "0");
+        let registry = ToolRegistryBuilder::new()
+            .with_extension_registry(Arc::new(
+                heramind_core::extension::registry::ExtensionRegistry::new(),
+            ))
+            .with_extensions_scanned()
+            .await
+            .build();
+        assert_eq!(
+            registry.len(),
+            0,
+            "CLI-only must not register extension tools"
+        );
+        match prev {
+            Some(v) => std::env::set_var("HERAMIND_EXTENSION_DIRECT_TOOLS", v),
+            None => std::env::remove_var("HERAMIND_EXTENSION_DIRECT_TOOLS"),
+        }
     }
 
     #[tokio::test]
@@ -740,5 +874,64 @@ mod tests {
 
         let result = registry.execute("test_tool", serde_json::json!({})).await;
         assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod replay_safety_tests {
+    use super::*;
+    use crate::toolkit::tool::{ReplaySafety, Tool, ToolOutput};
+    use async_trait::async_trait;
+
+    struct SideEffectTool;
+    struct ReadOnlyTool;
+
+    #[async_trait]
+    impl Tool for SideEffectTool {
+        fn name(&self) -> &str {
+            "side_effect"
+        }
+        fn description(&self) -> &str {
+            "writes things"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value) -> super::Result<ToolOutput> {
+            Ok(ToolOutput::success("done"))
+        }
+        // No replay_safety override — must default to the conservative Unsafe.
+    }
+
+    #[async_trait]
+    impl Tool for ReadOnlyTool {
+        fn name(&self) -> &str {
+            "read_only"
+        }
+        fn description(&self) -> &str {
+            "reads things"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value) -> super::Result<ToolOutput> {
+            Ok(ToolOutput::success("data"))
+        }
+        fn replay_safety(&self) -> ReplaySafety {
+            ReplaySafety::Safe
+        }
+    }
+
+    #[test]
+    fn replay_safety_defaults_unsafe_and_looks_up() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(SideEffectTool));
+        registry.register(Arc::new(ReadOnlyTool));
+
+        assert_eq!(registry.replay_safety("read_only"), ReplaySafety::Safe);
+        // No override → conservative default.
+        assert_eq!(registry.replay_safety("side_effect"), ReplaySafety::Unsafe);
+        // Unknown tool names must fail closed.
+        assert_eq!(registry.replay_safety("no_such_tool"), ReplaySafety::Unsafe);
     }
 }

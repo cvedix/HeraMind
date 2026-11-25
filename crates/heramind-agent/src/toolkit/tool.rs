@@ -31,6 +31,16 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
+    /// Keep partial evidence on failure; callers apply their usual sanitizing
+    /// and size limits to this value before sending it to a model or UI.
+    pub(crate) fn prompt_value(&self) -> Value {
+        if self.success {
+            self.data.clone()
+        } else {
+            serde_json::json!({"success":false,"error":self.error,"data":self.data})
+        }
+    }
+
     /// Create a successful output.
     pub fn success(data: impl Into<Value>) -> Self {
         Self {
@@ -80,6 +90,171 @@ impl ToolOutput {
             error: Some(warning.into()),
             metadata: Some(metadata),
         }
+    }
+}
+
+/// Effective success for CONTROL-FLOW consumers (retries, caching, success
+/// accounting, loop guards). The SHELL tool reports `success=true` with the
+/// exit code inside `data` BY DESIGN — the model must read stderr to fix
+/// its command. Anything keying on `ToolOutput.success` to mean "the
+/// operation worked" must use THIS instead: a shell exit_code != 0 or a
+/// timed-out shell is a FAILURE. (Live: failing add-components calls were
+/// counted as successes by the agent executor's success-rate/journal, got
+/// an "already succeeded" duplicate advisory, and their failed results were
+/// cached.)
+pub fn effective_success(name: &str, out: &ToolOutput) -> bool {
+    if !out.success {
+        return false;
+    }
+    // Operation-gate envelopes nest the real outcome under data.success.
+    // Pending / failed-resume must not count as confirmed success steps
+    // even if a caller mistakenly wrapped them in ToolOutput::success.
+    if out
+        .data
+        .get("_operation_in_progress")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return false;
+    }
+    if out.data.get("_operation_resume").and_then(|v| v.as_bool()) == Some(true) {
+        if out.data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+            return false;
+        }
+        // Nested shell body may carry exit_code under data.data.
+        if name == "shell" {
+            if let Some(inner) = out.data.get("data") {
+                if inner
+                    .get("timed_out")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+                if let Some(code) = inner.get("exit_code").and_then(|v| v.as_i64()) {
+                    if code != 0 {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    if name == "shell" {
+        if out
+            .data
+            .get("timed_out")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if let Some(code) = out.data.get("exit_code").and_then(|v| v.as_i64()) {
+            if code != 0 {
+                return false;
+            }
+            // Pipeline masking: `badcmd 2>&1 | head -40` exits 0 (head's
+            // status) while the shell printed "command not found" into the
+            // captured output. Treat that as a failure so the
+            // failure-strike breaker arms and the duplicate advisory never
+            // counts it a success (live 2026-10-27: an invented
+            // `web_fetch … | head` came back exit 0 + "command not found").
+            let shell_said_not_found = ["stdout", "stderr"].iter().any(|k| {
+                out.data
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase().contains("command not found"))
+                    .unwrap_or(false)
+            });
+            return !shell_said_not_found;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod effective_success_tests {
+    use super::*;
+
+    #[test]
+    fn shell_exit_codes_decide_success() {
+        let ok = ToolOutput::success(serde_json::json!({"exit_code": 0, "stdout": "fine"}));
+        assert!(effective_success("shell", &ok));
+        let bad = ToolOutput::success(
+            serde_json::json!({"exit_code": 1, "stderr": "missing field `position`"}),
+        );
+        assert!(!effective_success("shell", &bad), "exit 1 is a failure");
+        let t = ToolOutput::success(serde_json::json!({"exit_code": null, "timed_out": true}));
+        assert!(!effective_success("shell", &t), "timeout is a failure");
+        // Non-shell tools: ToolOutput.success is authoritative.
+        let w = ToolOutput::success(serde_json::json!({"path": "x"}));
+        assert!(effective_success("file_write", &w));
+        let e = ToolOutput::error("nope");
+        assert!(!effective_success("web_fetch", &e));
+    }
+
+    #[test]
+    fn operation_envelopes_are_not_effective_success_when_pending_or_failed() {
+        // Mistaken outer success=true with pending/failed inner must still fail.
+        let pending = ToolOutput::success(serde_json::json!({
+            "_operation_in_progress": true,
+            "operation_id": "op-1",
+            "success": false,
+            "summary": "already running"
+        }));
+        assert!(!effective_success("run_now", &pending));
+        let failed_resume = ToolOutput::success(serde_json::json!({
+            "_operation_resume": true,
+            "operation_id": "op-2",
+            "success": false,
+            "summary": "failed",
+            "data": {"exit_code": 1}
+        }));
+        assert!(!effective_success("shell", &failed_resume));
+        let ok_resume = ToolOutput::success(serde_json::json!({
+            "_operation_resume": true,
+            "operation_id": "op-3",
+            "success": true,
+            "summary": "ok",
+            "data": {"exit_code": 0, "stdout": "fine"}
+        }));
+        assert!(effective_success("shell", &ok_resume));
+    }
+
+    #[test]
+    fn shell_pipeline_masked_not_found_is_failure() {
+        // zsh flavor (observed live): command fails into stdout via 2>&1,
+        // pipeline exits 0.
+        let zsh = ToolOutput::success(serde_json::json!({
+            "exit_code": 0,
+            "stdout": "zsh:1: command not found: web_fetch",
+            "stderr": ""
+        }));
+        assert!(
+            !effective_success("shell", &zsh),
+            "exit 0 + 'command not found' in stdout is a masked failure"
+        );
+        // bash flavor: error lands in stderr.
+        let bash = ToolOutput::success(serde_json::json!({
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "bash: web_fetch: command not found"
+        }));
+        assert!(!effective_success("shell", &bash));
+        // Accepted cost: a genuinely successful command whose output merely
+        // DISCUSSES the phrase (e.g. grepping docs for it) also counts as
+        // failure. The phrase in exit-0 output is ambiguous and we take the
+        // failure side — strike miscounts are recoverable (vary the command
+        // or proceed to the answer), masked failures are not.
+        let phrasey = ToolOutput::success(serde_json::json!({
+            "exit_code": 0,
+            "stdout": "grep found: 'command not found' in guide.md"
+        }));
+        assert!(!effective_success("shell", &phrasey));
+        // exit != 0 without the phrase still fails (unchanged behavior).
+        let plain_fail = ToolOutput::success(serde_json::json!({
+            "exit_code": 2, "stdout": "usage: …"
+        }));
+        assert!(!effective_success("shell", &plain_fail));
     }
 }
 
@@ -192,6 +367,41 @@ pub struct ToolDefinition {
     pub namespace: Option<String>,
 }
 
+/// Whether re-executing this tool after an interrupted call is known-safe.
+///
+/// `Safe` — read-only / idempotent: re-running after a timeout or cancel
+/// cannot double-apply an effect (queries, reads, user interaction), so a
+/// transient failure may be retried as usual.
+/// `Unsafe` — the call may have taken effect before the interruption
+/// (shell commands, device control, writes, triggering runs). An
+/// interruption must be reported to the model as "outcome unknown — verify
+/// current state first" and must NOT be auto-retried: a plain "failed"
+/// invites an immediate re-issue, which double-toggles a device command
+/// that actually landed (the shell tool's own 30s timeout vs a slow device
+/// ACK is the canonical case).
+///
+/// Default is the conservative `Unsafe` — only tools with no external side
+/// effects override to `Safe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaySafety {
+    /// Retry after interruption is harmless (no world side effects).
+    Safe,
+    /// Interruption leaves the outcome unknown — verify, don't blind-retry.
+    Unsafe,
+}
+
+/// Model-facing suffix appended when a replay-unsafe tool call was
+/// interrupted (timeout / cancel): the effect may already have been
+/// applied, so the model must verify state before re-issuing. Shared by
+/// the scheduled executor's result processing and the chat agent's
+/// `execute_tool` so both paths say the same thing.
+pub fn outcome_unknown_guidance() -> &'static str {
+    " OUTCOME UNKNOWN: the call was interrupted and may have ALREADY taken \
+     effect. Do NOT blindly re-run it — first verify the current state with \
+     a read-only query (e.g. `heramind device latest` / `device get`), then \
+     re-issue only if needed."
+}
+
 /// Tool trait for function calling.
 ///
 /// Tools are callable functions that LLM agents can invoke.
@@ -209,6 +419,17 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with the given arguments.
     async fn execute(&self, args: Value) -> Result<ToolOutput>;
 
+    /// Outer scheduler budget; tools with an inner deadline include cleanup time.
+    fn execution_timeout(&self, _args: &Value) -> Result<std::time::Duration> {
+        Ok(super::timeouts::DEFAULT)
+    }
+
+    /// Replay safety of this tool after an interrupted call (see
+    /// [`ReplaySafety`]). Default is the conservative `Unsafe`.
+    fn replay_safety(&self) -> ReplaySafety {
+        ReplaySafety::Unsafe
+    }
+
     /// Get the tool category.
     fn category(&self) -> ToolCategory {
         ToolCategory::System
@@ -224,6 +445,18 @@ pub trait Tool: Send + Sync {
         // Default: no downcast support. Override in tools that need it.
         unimplemented!("as_any not implemented for {}", self.name())
     }
+
+    /// Return a fresh per-chat-session instance if this tool carries
+    /// session-scoped mutable state (e.g. `MemoryTool` session handle or
+    /// `ShellTool` domain-index injection state). Stateless tools return `None`
+    /// and are shared across sessions as-is.
+    fn clone_for_chat_session(&self, _session_id: &str) -> Option<DynTool> {
+        None
+    }
+
+    /// Reset any transient per-session state (e.g. when conversation history
+    /// is cleared for a chat session).
+    fn reset_session_state(&self) {}
 
     /// Swap agent context for per-execution isolation (MemoryTool only).
     /// Returns per-execution handles if the tool supports it, else None.

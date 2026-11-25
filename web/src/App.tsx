@@ -7,23 +7,25 @@ import { useStore } from "@/store"
 import { shallow } from "zustand/shallow"
 import { AppSidebar } from "@/components/layout/AppSidebar"
 import { GlobalControlsFloating } from "@/components/layout/GlobalControls"
+import { MobilePrimaryNav } from "@/components/layout/MobilePrimaryNav"
 import { MobileNav } from "@/components/layout/MobileNav"
 import { SwipeNavigation } from "@/components/layout/SwipeNavigation"
-import { NavigationProgress } from "@/components/layout/NavigationProgress"
 import { useIsMobile } from "@/hooks/useMobile"
 import { useDataChangeEvents } from "@/hooks/useDataChangeEvents"
 import { Toaster } from "@/components/ui/toaster"
 import { Confirmer } from "@/components/ui/confirmer"
 import { tokenManager, getApiBase, isTauriEnv, setApiBase, getApiKey } from "@/lib/api"
+import { releaseActiveBleSession } from "@/lib/ct-prov"
 import { prefetchServerUrl } from "@/lib/server-url"
 import { StartupLoading } from "@/components/StartupLoading"
 import { LoadingState } from "@/components/shared/LoadingState"
 import { forceViewportReset } from "@/hooks/useVisualViewport"
 import { useExtensionComponents } from "@/hooks/useExtensionComponents"
+import { useExtensionPages, type ExtensionPage } from "@/hooks/useExtensionPages"
+import { ExtensionPageHost } from "@/components/extensions/ExtensionPageHost"
 import { UpdateDialog, ServerUpgradeDialog } from '@/components/update'
 import { InstanceSwitchOverlay } from '@/components/layout/InstanceSwitchOverlay'
 import { GlobalChatFab } from '@/components/chat/GlobalChatFab'
-import { SettingsDialog } from "@/components/settings/SettingsDialog"
 import { useUpdateCheck } from '@/hooks/useUpdateCheck'
 import { listen } from "@tauri-apps/api/event"
 import type { ConnectionState } from "@/lib/websocket"
@@ -31,6 +33,12 @@ import { BackendUnavailableOverlay } from "@/components/BackendUnavailableOverla
 
 // Performance optimization: Lazy load route components to reduce initial bundle size
 // Each page is loaded on-demand, reducing Time to Interactive by ~70%
+// The settings dialog is lazy for the same reason: it statically imports
+// the pages/settings/* tab components, which would otherwise drag the
+// entire 600K page-settings chunk (and its vendor deps) into the eager
+// first load — defeating the route-level lazy() above.
+const SettingsDialog = lazy(() =>
+  import("@/components/settings/SettingsDialog").then(m => ({ default: m.SettingsDialog })))
 const LoginPage = lazy(() => import('@/pages/login').then(m => ({ default: m.LoginPage })))
 const SetupPage = lazy(() => import('@/pages/setup').then(m => ({ default: m.SetupPage })))
 const ChatPage = lazy(() => import('@/pages/chat').then(m => ({ default: m.ChatPage })))
@@ -47,6 +55,15 @@ const ExtensionsPage = lazy(() => import('@/pages/extensions').then(m => ({ defa
 const SystemPage = lazy(() => import('@/pages/SystemPage'))
 const SharedDashboardPage = lazy(() => import('@/pages/share/SharedDashboard'))
 const NotFound = lazy(() => import('@/pages/NotFound'))
+// Dev-only prototype — gated so production dist never registers the route
+// or pulls the prototype chunk (Vite DCE on import.meta.env.DEV).
+const InlineAtPrototypePage = import.meta.env.DEV
+  ? lazy(() =>
+      import('@/prototypes/inline-at/InlineAtPrototypePage').then((m) => ({
+        default: m.InlineAtPrototypePage,
+      })),
+    )
+  : null
 // Suppress only the specific Radix UI Portal cleanup error during fast page transitions
 // Known issue: React 18 + Radix UI race condition where removeChild fails on unmounted portals
 const originalError = console.error
@@ -253,6 +270,7 @@ function App() {
   useDataChangeEvents()
   const extensionComponents = useExtensionComponents({ autoSync: true, syncInterval: 60000 })
   const extensionSyncRef = useRef(extensionComponents.sync)
+  const { pages: extensionPages } = useExtensionPages()
   
   // 更新 ref 当 sync 函数变化时
   useEffect(() => {
@@ -300,6 +318,21 @@ function App() {
     showNotification: true,
   })
   const location = useLocation()
+  const setAddDeviceDialogOpen = useStore((s) => s.setAddDeviceDialogOpen)
+  const bleRoutePathRef = useRef(location.pathname)
+  // Any SPA route change must drop an open CT-Prov BLE GATT link — otherwise
+  // the device stays BUSY / connected after the operator leaves Devices.
+  useEffect(() => {
+    if (bleRoutePathRef.current === location.pathname) return
+    bleRoutePathRef.current = location.pathname
+    releaseActiveBleSession()
+    setAddDeviceDialogOpen(false)
+  }, [location.pathname, setAddDeviceDialogOpen])
+  useEffect(() => {
+    const onPageHide = () => releaseActiveBleSession()
+    window.addEventListener('pagehide', onPageHide)
+    return () => window.removeEventListener('pagehide', onPageHide)
+  }, [])
   const [backendReady, setBackendReady] = useState(false)
   const [isTauri, setIsTauri] = useState(false)
   const [initialCheckDone, setInitialCheckDone] = useState(false)
@@ -546,7 +579,6 @@ function App() {
 
   return (
     <>
-      <NavigationProgress />
       <BrandGradientDef />
       <Suspense fallback={<PageLoading />}>
         <Routes>
@@ -579,7 +611,6 @@ function App() {
                       area. Empty (0 width) on pages that don't use it. */}
                   {!isMobile && <div id="page-sidebar-slot" className="flex shrink-0" />}
                   <div className="flex flex-col flex-1 min-w-0">
-                    <MobileNav />
                     {/* Skip link — keyboard users tab past the nav straight to content.
                         Visually hidden until focused. */}
                     <a
@@ -605,7 +636,10 @@ function App() {
                         onMouseDown={handleWindowDragMouseDown}
                       />
                     )}
-                    <div className="w-full h-full overflow-hidden" id="main-scroll-container">
+                    <div
+                      className="w-full h-full overflow-hidden"
+                      id="main-scroll-container"
+                    >
                     <ErrorBoundary>
                     <div key={location.pathname.split('/')[1] || 'root'} className="animate-page-enter w-full h-full overflow-hidden">
                     <Routes>
@@ -640,14 +674,39 @@ function App() {
                       <Route path="/plugins" element={<Navigate to="/extensions" replace />} />
                       {/* System container page (mobile primary nav target) */}
                       <Route path="/system" element={<SystemPage />} />
+                      {/* Dev prototype: inline @ editor — DEV builds only */}
+                      {import.meta.env.DEV && InlineAtPrototypePage ? (
+                        <Route path="/dev/inline-at" element={<InlineAtPrototypePage />} />
+                      ) : null}
+                      {/* Extension-contributed pages (manifest frontend.pages) */}
+                      {extensionPages.map((page: ExtensionPage) => (
+                        <Route
+                          key={`ext-${page.extension_id}-${page.type}`}
+                          path={page.route}
+                          element={
+                            <ExtensionPageHost
+                              bundleUrl={page.bundle_url}
+                              exportName={page.export_name}
+                              globalName={page.global_name}
+                              title={page.title}
+                            />
+                          }
+                        />
+                      ))}
                       {/* Catch all - 404 page */}
                       <Route path="*" element={<NotFound />} />
                     </Routes>
                     </div>
                     </ErrorBoundary>
                     </div>
+                    <MobilePrimaryNav />
+                    {/* Drawer behind the Chat header's hamburger — Chat hides
+                        the bottom capsule, so this is its section navigation. */}
+                    <MobileNav />
                   </main>
-                  <SettingsDialog />
+                  <Suspense fallback={null}>
+                    <SettingsDialog />
+                  </Suspense>
                   <SwipeNavigation />
                   {/* Wide screens: the chat FAB docks as an in-flow right
                       column beside main (squeezing the page content) */}

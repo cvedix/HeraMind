@@ -157,7 +157,7 @@ impl AgentExecutor {
     /// from the text output deterministically.
     pub(crate) async fn analyze_with_llm(
         &self,
-        llm: Arc<dyn heramind_core::llm::backend::LlmRuntime + Send + Sync>,
+        llm: Arc<dyn heramind_core::llm::backend::LlmRuntime>,
         agent: &AiAgent,
         data: &[DataCollected],
         _parsed_intent: Option<&heramind_storage::ParsedIntent>,
@@ -187,30 +187,44 @@ impl AgentExecutor {
             has_valid_images,
             "[DIAG] legacy analyzer vision decision"
         );
-        if !image_parts.is_empty() && !llm_supports_vision {
-            // Event-agent running blind: images are present but the configured
-            // LLM can't see them. Elevated to error so monitoring catches a
-            // misconfigured camera-event agent — the chat path rejects this
-            // outright (session.rs: "select a vision-capable model"), but the
-            // event-agent path degrades. The analysis still runs text-only to
-            // avoid breaking existing flows; the prompt below surfaces the
-            // limitation into the output.
+        // Legacy Focused path has no vision tool — images are either inline
+        // multimodal parts or unavailable. Mirror execute_with_tools: Unavailable
+        // must refuse Completed/false-success (do not blind-run text-only).
+        let legacy_vision_path = if has_valid_images {
+            super::vision_path::VisionExecutionPath::InlineMultimodal
+        } else if !image_parts.is_empty() {
+            super::vision_path::VisionExecutionPath::Unavailable
+        } else {
+            super::vision_path::VisionExecutionPath::None
+        };
+        if matches!(
+            legacy_vision_path,
+            super::vision_path::VisionExecutionPath::Unavailable
+        ) {
             tracing::error!(
                 agent_id = %agent.id,
                 model_name = %llm.model_name(),
                 image_count = image_parts.len(),
-                "Vision misconfiguration: camera event agent received images but the active \
-                 LLM does not support vision — analyzing text-only. Configure a vision-capable \
-                 backend (or set a multimodal override) for this agent to actually see images."
+                sources = ?image_sources_info,
+                "Vision required but unavailable on Legacy Focused path — refusing Completed"
             );
+            return Err(HeraMindError::Llm(
+                super::vision_path::vision_unavailable_error().to_string(),
+            ));
         }
 
         // Build system prompt using the shared builder (no tools, no invocation)
         let config = ToolLoopConfig::focused_plus(agent);
+        // The task-understanding file is inlined here too: it must carry the
+        // agent's current mission, not a copy left behind by a prompt edit.
+        let task_understanding = self.sync_task_understanding_mission(agent).await;
         let knowledge_content = self.prefetch_knowledge_files(
             &agent.id,
             &agent.memory.knowledge_files,
             llm.max_context_length(),
+            task_understanding
+                .as_ref()
+                .map(|(name, content)| (*name, content.as_str())),
         );
         let system_prompt = super::tool_prompt::build_tool_system_prompt(
             agent,
@@ -218,43 +232,16 @@ impl AgentExecutor {
             None,
             &config,
             knowledge_content.as_ref(),
+            legacy_vision_path,
         );
 
         // Build user message with data summary
         let data_lines = build_compact_data_summary(data);
-        let image_info = if !image_sources_info.is_empty() && !has_valid_images {
-            format!(
-                "\n\n[Image data unavailable — LLM does not support vision: {}]",
-                image_sources_info.join(", ")
-            )
-        } else {
-            String::new()
-        };
-
-        // User message instructing plain-text output. When running blind
-        // (images present but the model can't see them), ask the LLM to
-        // surface that limitation in its findings so a reader of the output
-        // knows the images weren't analyzed — instead of a confident
-        // text-only conclusion. No forced prepend, so downstream consumers
-        // parsing the findings aren't broken.
-        let blind = !image_info.is_empty();
-        let user_msg_text = if blind {
-            format!(
-                "{}{}\n\nAnalyze the data above and provide your findings as plain text. \
-                 Note: the image capture(s) could not be analyzed because the configured \
-                 model lacks vision — mention this limitation in your findings, then proceed \
-                 with text-only analysis. Include your conclusion at the end.",
-                data_lines.join("\n"),
-                image_info,
-            )
-        } else {
-            format!(
-                "{}{}\n\nAnalyze the data above and provide your findings as plain text. \
-                 Include your conclusion at the end.",
-                data_lines.join("\n"),
-                image_info,
-            )
-        };
+        let user_msg_text = format!(
+            "{}\n\nAnalyze the data above and provide your findings as plain text. \
+             Include your conclusion at the end.",
+            data_lines.join("\n"),
+        );
 
         // Build multimodal messages if images present
         let messages = if has_valid_images {
@@ -344,7 +331,7 @@ impl AgentExecutor {
                     step_type: "fallback".to_string(),
                     input: None,
                     output: String::new(),
-                    confidence: 0.3,
+                    confidence: Some(0.3),
                 }],
                 vec![Decision {
                     decision_type: "info".to_string(),
@@ -372,13 +359,26 @@ impl AgentExecutor {
         } else {
             text.clone()
         };
+
+        if matches!(
+            legacy_vision_path,
+            super::vision_path::VisionExecutionPath::InlineMultimodal
+        ) && super::vision_path::conclusion_admits_vision_failure_for_path(
+            &conclusion,
+            legacy_vision_path,
+        ) {
+            return Err(HeraMindError::Llm(format!(
+                "Vision analysis failed: {}",
+                truncate_to(&conclusion, 200)
+            )));
+        }
         let reasoning_steps = vec![ReasoningStep {
             step_number: 1,
             description: truncate_to(&text, 400),
             step_type: "llm_analysis".to_string(),
             input: Some(format!("{} data sources", data.len())),
             output: truncate_to(&text, 500),
-            confidence: 0.7,
+            confidence: Some(0.7),
         }];
         let decisions = vec![Decision {
             decision_type: "info".to_string(),
@@ -451,7 +451,7 @@ impl AgentExecutor {
             step_type: "data_collection".to_string(),
             input: Some(format!("{} data sources", data.len())),
             output: format!("Data collected from {} sources", data.len()),
-            confidence: 1.0,
+            confidence: Some(1.0),
         });
 
         // Step 2: Evaluate conditions based on parsed intent
@@ -466,7 +466,7 @@ impl AgentExecutor {
                     step_type: "condition_eval".to_string(),
                     input: Some(condition.clone()),
                     output: format!("Condition result: {}", result),
-                    confidence: 0.8,
+                    confidence: Some(0.8),
                 });
 
                 if result {
@@ -492,7 +492,7 @@ impl AgentExecutor {
                     step_type: "action_planning".to_string(),
                     input: Some(action.clone()),
                     output: format!("Action '{}' queued for execution", action),
-                    confidence: 0.7,
+                    confidence: Some(0.7),
                 });
             }
         }
@@ -707,6 +707,14 @@ fn build_compact_data_summary(data: &[DataCollected]) -> Vec<String> {
                     "[历史数据: {}个点]",
                     v.as_array().map(|a| a.len()).unwrap_or(0)
                 )
+            } else if d.data_type == "input_status" {
+                // The collector's own input status (event image present / no
+                // bound metrics): show its sentence, not the raw JSON row.
+                d.values
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("input status unavailable")
+                    .to_string()
             } else {
                 // Fallback to compact JSON - use character-safe truncation
                 let json_str = serde_json::to_string(&d.values).unwrap_or_default();

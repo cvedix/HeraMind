@@ -149,6 +149,7 @@ pub async fn llm_generate_handler(
             thinking_enabled: None,
             thinking_effort: None,
             max_context: None,
+            json_mode: None, // prompt-test path — free-form output
         },
         model: Some(model_name),
         stream: false,
@@ -248,7 +249,6 @@ pub async fn update_timezone(
     tracing::info!("Global timezone updated to: {}", req.timezone);
 
     ok(json!({
-        "success": true,
         "timezone": req.timezone,
     }))
 }
@@ -323,6 +323,7 @@ pub async fn get_retention_config(
         "interval_hours": config.interval_hours,
         "default_retention": config.default_retention,
         "image_retention": config.image_retention,
+        "session_retention_hours": config.session_retention_hours,
     }))
 }
 
@@ -357,6 +358,7 @@ pub async fn update_retention_config(
         interval_hours: req.interval_hours,
         default_retention: req.default_retention,
         image_retention: req.image_retention,
+        session_retention_hours: req.session_retention_hours,
     };
 
     settings_store
@@ -368,36 +370,55 @@ pub async fn update_retention_config(
         interval_h = config.interval_hours,
         default_h = ?config.default_retention,
         image_h = ?config.image_retention,
+        session_h = ?config.session_retention_hours,
         "Retention configuration updated"
     );
 
     ok(json!({
-        "success": true,
         "enabled": config.enabled,
         "interval_hours": config.interval_hours,
         "default_retention": config.default_retention,
         "image_retention": config.image_retention,
+        "session_retention_hours": config.session_retention_hours,
     }))
 }
 
 #[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
 pub struct AgentDefaultsRequest {
+    /// Absent => keep existing. Present => clamp and apply.
     #[serde(default)]
-    pub max_rounds: u32,
+    pub max_rounds: Option<u32>,
     #[serde(default)]
-    pub execution_timeout_secs: u64,
+    pub execution_timeout_secs: Option<u64>,
     #[serde(default)]
-    pub tool_concurrency: usize,
+    pub tool_concurrency: Option<usize>,
     #[serde(default)]
-    pub default_temperature: f32,
+    pub default_temperature: Option<f32>,
     #[serde(default)]
-    pub default_top_p: f32,
+    pub default_top_p: Option<f32>,
+    /// Absent => keep; Some(None) not used here — send explicit bool to set.
     #[serde(default)]
     pub default_thinking_enabled: Option<bool>,
     /// Chat history depth in turns (5-200)
     pub chat_history_depth: Option<usize>,
     /// Wall-clock budget for one interactive chat turn, seconds (60-7200)
     pub chat_turn_timeout_secs: Option<u64>,
+    /// LLM instance id used for background conversation summarization.
+    /// Outer None = field not sent, keep current value; Some(None) = clear
+    /// (use each session's own model); Some(Some(id)) = dedicated instance.
+    #[serde(default, deserialize_with = "double_option")]
+    pub summary_instance_id: Option<Option<String>>,
+}
+
+/// Deserializer that distinguishes "field absent" from "field is null" for
+/// `Option<Option<T>>` — lets callers clear the setting by sending null.
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    use serde::Deserialize as _;
+    Ok(Some(Option::<T>::deserialize(de)?))
 }
 
 /// Get agent execution defaults (max_rounds, timeout, concurrency, sampling).
@@ -427,7 +448,53 @@ pub async fn get_agent_defaults(
         "default_thinking_enabled": config.default_thinking_enabled,
         "chat_history_depth": config.chat_history_depth,
         "chat_turn_timeout_secs": config.chat_turn_timeout_secs,
+        "summary_instance_id": config.summary_instance_id,
     }))
+}
+
+/// Apply a partial [`AgentDefaultsRequest`] onto existing defaults, preserving
+/// omitted fields and clamping supplied values to valid ranges.
+fn apply_agent_defaults_patch(
+    existing: &heramind_storage::AgentDefaults,
+    req: AgentDefaultsRequest,
+) -> heramind_storage::AgentDefaults {
+    heramind_storage::AgentDefaults {
+        max_rounds: req
+            .max_rounds
+            .map(|v| v.clamp(1, 50))
+            .unwrap_or(existing.max_rounds),
+        execution_timeout_secs: req
+            .execution_timeout_secs
+            .map(|v| v.clamp(30, 1800))
+            .unwrap_or(existing.execution_timeout_secs),
+        tool_concurrency: req
+            .tool_concurrency
+            .map(|v| v.clamp(1, 16))
+            .unwrap_or(existing.tool_concurrency),
+        default_temperature: req
+            .default_temperature
+            .map(|v| v.clamp(0.0, 2.0))
+            .unwrap_or(existing.default_temperature),
+        default_top_p: req
+            .default_top_p
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(existing.default_top_p),
+        default_thinking_enabled: match req.default_thinking_enabled {
+            Some(v) => Some(v),
+            None => existing.default_thinking_enabled,
+        },
+        chat_history_depth: req
+            .chat_history_depth
+            .map(|d| d.clamp(5, 200))
+            .unwrap_or(existing.chat_history_depth),
+        chat_turn_timeout_secs: req
+            .chat_turn_timeout_secs
+            .map(|s| s.clamp(60, 7200))
+            .unwrap_or(existing.chat_turn_timeout_secs),
+        summary_instance_id: req
+            .summary_instance_id
+            .unwrap_or_else(|| existing.summary_instance_id.clone()),
+    }
 }
 
 /// Update agent execution defaults. Values are clamped to sane ranges.
@@ -451,22 +518,7 @@ pub async fn update_agent_defaults(
     let existing = SettingsStore::open_default()
         .map(|s| s.get_agent_defaults())
         .unwrap_or_default();
-    let config = heramind_storage::AgentDefaults {
-        max_rounds: req.max_rounds.clamp(1, 50),
-        execution_timeout_secs: req.execution_timeout_secs.clamp(30, 1800),
-        tool_concurrency: req.tool_concurrency.clamp(1, 16),
-        default_temperature: req.default_temperature.clamp(0.0, 2.0),
-        default_top_p: req.default_top_p.clamp(0.0, 1.0),
-        default_thinking_enabled: req.default_thinking_enabled,
-        chat_history_depth: req
-            .chat_history_depth
-            .map(|d| d.clamp(5, 200))
-            .unwrap_or(existing.chat_history_depth),
-        chat_turn_timeout_secs: req
-            .chat_turn_timeout_secs
-            .map(|s| s.clamp(60, 7200))
-            .unwrap_or(existing.chat_turn_timeout_secs),
-    };
+    let config = apply_agent_defaults_patch(&existing, req);
 
     let settings_store = SettingsStore::open_default()
         .map_err(|e| ErrorResponse::internal(format!("Failed to open settings store: {}", e)))?;
@@ -485,7 +537,6 @@ pub async fn update_agent_defaults(
     );
 
     ok(json!({
-        "success": true,
         "max_rounds": config.max_rounds,
         "execution_timeout_secs": config.execution_timeout_secs,
         "tool_concurrency": config.tool_concurrency,
@@ -563,7 +614,6 @@ pub async fn update_device_defaults(
     );
 
     ok(json!({
-        "success": true,
         "default_offline_timeout_secs": config.default_offline_timeout_secs,
         "auto_onboard_enabled": config.auto_onboard_enabled,
     }))
@@ -619,7 +669,6 @@ pub async fn trigger_retention_cleanup(
     });
 
     ok(json!({
-        "success": true,
         "triggered": true,
         "message": "Retention cleanup scheduled in background",
     }))
@@ -632,6 +681,8 @@ pub struct RetentionConfigRequest {
     pub interval_hours: u64,
     pub default_retention: Option<u64>,
     pub image_retention: Option<u64>,
+    /// Chat-session retention in hours (None = keep forever).
+    pub session_retention_hours: Option<u64>,
 }
 
 /// Trigger an immediate data-directory backup (admin only).
@@ -653,7 +704,7 @@ pub async fn create_backup_handler(
     axum::extract::Extension(admin): axum::extract::Extension<crate::auth_users::SessionInfo>,
 ) -> HandlerResult<serde_json::Value> {
     if admin.role != crate::auth_users::UserRole::Admin {
-        return Err(ErrorResponse::bad_request("Admin access required"));
+        return Err(ErrorResponse::forbidden("Admin access required"));
     }
 
     let data_dir = state.data_dir.clone();
@@ -711,7 +762,7 @@ pub async fn list_backups_handler(
     axum::extract::Extension(admin): axum::extract::Extension<crate::auth_users::SessionInfo>,
 ) -> HandlerResult<serde_json::Value> {
     if admin.role != crate::auth_users::UserRole::Admin {
-        return Err(ErrorResponse::bad_request("Admin access required"));
+        return Err(ErrorResponse::forbidden("Admin access required"));
     }
 
     let backups = heramind_storage::backup::list_backups(&state.data_dir);
@@ -822,7 +873,7 @@ pub async fn get_market_source_handler(
     axum::extract::Extension(admin): axum::extract::Extension<crate::auth_users::SessionInfo>,
 ) -> HandlerResult<serde_json::Value> {
     if admin.role != crate::auth_users::UserRole::Admin {
-        return Err(ErrorResponse::bad_request("Admin access required"));
+        return Err(ErrorResponse::forbidden("Admin access required"));
     }
 
     use heramind_storage::SettingsStore;
@@ -865,7 +916,7 @@ pub async fn update_market_source_handler(
     Json(req): Json<MarketSourceRequest>,
 ) -> HandlerResult<serde_json::Value> {
     if admin.role != crate::auth_users::UserRole::Admin {
-        return Err(ErrorResponse::bad_request("Admin access required"));
+        return Err(ErrorResponse::forbidden("Admin access required"));
     }
 
     use heramind_storage::SettingsStore;
@@ -897,4 +948,188 @@ pub async fn update_market_source_handler(
         "market_url": trimmed,
         "saved_url": trimmed,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Builtin LLM download sources (mirror config, admin)
+// ---------------------------------------------------------------------------
+
+/// GET /api/settings/llm-sources (admin): the three builtin-LLM download
+/// sources + whether each is a custom override. The default hosts are
+/// unreachable from many networks (huggingface.co / raw.githubusercontent);
+/// admins point them at mirrors (e.g. https://hf-mirror.com).
+#[utoipa::path(
+    get,
+    path = "/api/settings/llm-sources",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Effective builtin-LLM download sources"),
+    )
+)]
+pub async fn get_llm_sources_handler(
+    State(_state): State<ServerState>,
+    axum::extract::Extension(admin): axum::extract::Extension<crate::auth_users::SessionInfo>,
+) -> HandlerResult<serde_json::Value> {
+    if admin.role != crate::auth_users::UserRole::Admin {
+        return Err(ErrorResponse::forbidden("Admin access required"));
+    }
+    let snap = crate::builtin_llm::sources::snapshot();
+    ok(json!({
+        "hf_base_url": snap.hf_base_url,
+        "hf_custom": snap.hf_custom,
+        "hf_default_url": crate::builtin_llm::sources::HF_BASE_DEFAULT,
+        "catalog_url": snap.catalog_url,
+        "catalog_custom": snap.catalog_custom,
+        "catalog_default_url": crate::builtin_llm::catalog::CATALOG_URL,
+        "runtime_channel_url": snap.runtime_channel_url,
+        "runtime_channel_custom": snap.runtime_channel_custom,
+        "runtime_channel_default_url": crate::builtin_llm::runtime_manager::RUNTIME_CHANNEL_URL,
+        "last_download_error": crate::builtin_llm::runtime_manager::last_download_error(),
+    }))
+}
+
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
+pub struct LlmSourceRequest {
+    /// One of: hf_base_url | catalog_url | runtime_channel_url.
+    pub kind: String,
+    /// The mirror URL — empty string resets to the default chain.
+    pub url: String,
+}
+
+/// PUT /api/settings/llm-sources (admin): set or reset ONE builtin-LLM
+/// download source. Applies to the next fetch/download. Trust boundary:
+/// after switching, bytes come from the MIRROR — GGUF downloads still
+/// SHA-verify against the catalog; the catalog/channel themselves are
+/// trusted-by-URL exactly like the defaults.
+#[utoipa::path(
+    put,
+    path = "/api/settings/llm-sources",
+    tag = "settings",
+    request_body = LlmSourceRequest,
+    responses(
+        (status = 200, description = "Source saved"),
+    )
+)]
+pub async fn update_llm_sources_handler(
+    State(_state): State<ServerState>,
+    axum::extract::Extension(admin): axum::extract::Extension<crate::auth_users::SessionInfo>,
+    Json(req): Json<LlmSourceRequest>,
+) -> HandlerResult<serde_json::Value> {
+    if admin.role != crate::auth_users::UserRole::Admin {
+        return Err(ErrorResponse::forbidden("Admin access required"));
+    }
+    let effective = crate::builtin_llm::sources::set_override(&req.kind, &req.url)
+        .map_err(ErrorResponse::bad_request)?;
+    tracing::info!(admin = %admin.username, kind = %req.kind, url = %effective,
+        "builtin llm download source updated");
+    ok(json!({ "kind": req.kind, "url": effective }))
+}
+
+#[cfg(test)]
+mod s2_4_tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    fn non_admin_session() -> crate::auth_users::SessionInfo {
+        crate::auth_users::SessionInfo {
+            user_id: "u-non-admin".to_string(),
+            username: "viewer".to_string(),
+            role: crate::auth_users::UserRole::User,
+            created_at: 0,
+            expires_at: i64::MAX,
+        }
+    }
+
+    #[tokio::test]
+    async fn all_six_settings_admin_handlers_return_403_for_non_admin() {
+        let state = ServerState::new_for_testing().await;
+        let user = non_admin_session();
+
+        let e1 =
+            create_backup_handler(State(state.clone()), axum::extract::Extension(user.clone()))
+                .await
+                .expect_err("create_backup must reject non-admin");
+        assert_eq!(e1.status, StatusCode::FORBIDDEN);
+
+        let e2 = list_backups_handler(State(state.clone()), axum::extract::Extension(user.clone()))
+            .await
+            .expect_err("list_backups must reject non-admin");
+        assert_eq!(e2.status, StatusCode::FORBIDDEN);
+
+        let e3 =
+            get_market_source_handler(State(state.clone()), axum::extract::Extension(user.clone()))
+                .await
+                .expect_err("get_market_source must reject non-admin");
+        assert_eq!(e3.status, StatusCode::FORBIDDEN);
+
+        let e4 = update_market_source_handler(
+            State(state.clone()),
+            axum::extract::Extension(user.clone()),
+            Json(MarketSourceRequest {
+                market_url: "https://example.com".to_string(),
+            }),
+        )
+        .await
+        .expect_err("update_market_source must reject non-admin");
+        assert_eq!(e4.status, StatusCode::FORBIDDEN);
+
+        let e5 =
+            get_llm_sources_handler(State(state.clone()), axum::extract::Extension(user.clone()))
+                .await
+                .expect_err("get_llm_sources must reject non-admin");
+        assert_eq!(e5.status, StatusCode::FORBIDDEN);
+
+        let e6 = update_llm_sources_handler(
+            State(state),
+            axum::extract::Extension(user),
+            Json(LlmSourceRequest {
+                kind: "hf_base_url".to_string(),
+                url: "https://example.com".to_string(),
+            }),
+        )
+        .await
+        .expect_err("update_llm_sources must reject non-admin");
+        assert_eq!(e6.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn agent_defaults_partial_put_preserves_omitted_fields_and_clears_explicit_null() {
+        let existing = heramind_storage::AgentDefaults {
+            max_rounds: 20,
+            execution_timeout_secs: 600,
+            tool_concurrency: 6,
+            default_temperature: 0.4,
+            default_top_p: 0.85,
+            default_thinking_enabled: Some(true),
+            chat_history_depth: 40,
+            chat_turn_timeout_secs: 900,
+            summary_instance_id: Some("llm-summary-1".to_string()),
+        };
+
+        // Partial PUT sending only `max_rounds` must preserve all omitted fields.
+        let req: AgentDefaultsRequest =
+            serde_json::from_value(json!({ "max_rounds": 12 })).expect("partial deserialize");
+        let patched = apply_agent_defaults_patch(&existing, req);
+        assert_eq!(patched.max_rounds, 12);
+        assert_eq!(patched.execution_timeout_secs, 600);
+        assert_eq!(patched.tool_concurrency, 6);
+        assert!((patched.default_temperature - 0.4).abs() < 1e-6);
+        assert!((patched.default_top_p - 0.85).abs() < 1e-6);
+        assert_eq!(patched.default_thinking_enabled, Some(true));
+        assert_eq!(patched.chat_history_depth, 40);
+        assert_eq!(patched.chat_turn_timeout_secs, 900);
+        assert_eq!(
+            patched.summary_instance_id.as_deref(),
+            Some("llm-summary-1")
+        );
+
+        // Explicit null clears `summary_instance_id` without resetting other fields.
+        let clear_req: AgentDefaultsRequest =
+            serde_json::from_value(json!({ "summary_instance_id": null }))
+                .expect("clear deserialize");
+        let cleared = apply_agent_defaults_patch(&patched, clear_req);
+        assert_eq!(cleared.max_rounds, 12);
+        assert_eq!(cleared.execution_timeout_secs, 600);
+        assert_eq!(cleared.summary_instance_id, None);
+    }
 }

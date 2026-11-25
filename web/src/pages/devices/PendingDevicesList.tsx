@@ -4,7 +4,7 @@ import { useNavigate } from "react-router-dom"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
 import { Badge } from "@/components/ui/badge"
 import { ResponsiveTable, EmptyState } from "@/components/shared"
-import { Cpu, Activity, Check, ChevronDown, ChevronRight, Copy, Loader2, Search as SearchIcon, Hourglass, CheckCircle2, XCircle, AlertTriangle } from "lucide-react"
+import { Cpu, Check, CheckCircle2, ChevronDown, ChevronRight, Copy } from "lucide-react"
 import { UnifiedFormDialog } from "@/components/dialog/UnifiedFormDialog"
 import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
@@ -63,6 +63,15 @@ export function PendingDevicesList({
   // Reject confirmation dialog state
   const [rejectDialogDraft, setRejectDialogDraft] = useState<DraftDevice | null>(null)
 
+  // Association-exception confirm dialog (separate from ordinary approve)
+  const [assocDraft, setAssocDraft] = useState<DraftDevice | null>(null)
+  const [assocDeviceId, setAssocDeviceId] = useState('')
+  const [assocIdentityField, setAssocIdentityField] = useState('')
+  const [assocDeviceName, setAssocDeviceName] = useState('')
+  const [assocErrors, setAssocErrors] = useState<{ deviceId?: string; identityField?: string }>({})
+  /** Broker/subscribe incomplete reason — keep form open for retry/ignore. */
+  const [assocIncompleteReason, setAssocIncompleteReason] = useState<string | null>(null)
+
   // Unified dialog state
   const [showApproveDialog, setShowApproveDialog] = useState(false)
   const [selectedDraftForApproval, setSelectedDraftForApproval] = useState<DraftDevice | null>(null)
@@ -76,6 +85,15 @@ export function PendingDevicesList({
   const [typeInputValue, setTypeInputValue] = useState('')
   // Keyboard-highlighted option in the type dropdown (combobox navigation)
   const [highlightedTypeIndex, setHighlightedTypeIndex] = useState(0)
+  /**
+   * The input doubles as the dropdown's search filter — but only once the
+   * user actually types. Auto-selection (exact match / high score) also
+   * writes into the input, and treating that as a filter hid every existing
+   * type the moment the dialog opened: the dropdown showed nothing but
+   * "Create new type". So filtering stays off until real keystrokes land,
+   * and turns off again when a suggestion is committed.
+   */
+  const [typeFilterActive, setTypeFilterActive] = useState(false)
 
   // New type additional fields (only shown when creating a new type)
   const [newTypeFields, setNewTypeFields] = useState({
@@ -125,15 +143,13 @@ export function PendingDevicesList({
     return !suggestedTypes.some(t => t.device_type === selectedDeviceType)
   }, [selectedDeviceType, suggestedTypes])
 
-  // Combobox options: suggestions filtered by the input text, plus a
-  // "create new type" entry when the typed id doesn't match an existing
-  // suggestion — typing a novel id previously showed an unfiltered list that
-  // ignored the query entirely.
+  // Combobox options. Filtering only engages once the user has typed
+  // (typeFilterActive) — a bare open must always list every existing type.
   const typeOptions = useMemo<Array<
     | { kind: 'existing'; type: SuggestedDeviceType }
     | { kind: 'create'; value: string }
   >>(() => {
-    const q = typeInputValue.trim().toLowerCase()
+    const q = typeFilterActive ? typeInputValue.trim().toLowerCase() : ''
     const filtered = q
       ? suggestedTypes.filter(t =>
           t.name?.toLowerCase().includes(q) ||
@@ -149,7 +165,7 @@ export function PendingDevicesList({
       options.unshift({ kind: 'create', value: trimmed })
     }
     return options
-  }, [typeInputValue, suggestedTypes])
+  }, [typeInputValue, typeFilterActive, suggestedTypes])
 
   // Keep the keyboard highlight inside the (shrinking) option list
   useEffect(() => {
@@ -161,6 +177,9 @@ export function PendingDevicesList({
     setSelectedDeviceType(value)
     setTypeInputValue(value)
     setShowTypeDropdown(false)
+    // Committed — back to browse mode so reopening the dropdown lists
+    // everything again instead of filtering on the just-selected value
+    setTypeFilterActive(false)
     setFormErrors(errors => ({ ...errors, type: undefined }))
   }, [])
 
@@ -289,8 +308,109 @@ export function PendingDevicesList({
     return () => clearInterval(interval)
   }, [isConnected])
 
+  const openAssociationDialog = (draft: DraftDevice) => {
+    setAssocDraft(draft)
+    setAssocErrors({})
+    setAssocIncompleteReason(null)
+    // Never prefill pending-assoc / blocked ids — operator must type the real identity.
+    setAssocDeviceId('')
+    const preview = draft.sample_preview
+    const fromDraft =
+      (typeof draft.mqtt_identity_field === 'string' && draft.mqtt_identity_field.trim()) || ''
+    const nestedDataSn =
+      preview &&
+      typeof preview === 'object' &&
+      preview.data &&
+      typeof preview.data === 'object' &&
+      preview.data !== null &&
+      'sn' in (preview.data as Record<string, unknown>)
+        ? 'data.sn'
+        : ''
+    const hintedField =
+      fromDraft ||
+      nestedDataSn ||
+      (preview && typeof preview === 'object' && 'sn' in preview && 'sn') ||
+      (preview && typeof preview === 'object' && 'device_sn' in preview && 'device_sn') ||
+      'sn'
+    setAssocIdentityField(typeof hintedField === 'string' ? hintedField : 'sn')
+    setAssocDeviceName('')
+  }
+
+  const closeAssociationDialog = useCallback(() => {
+    setAssocDraft(null)
+    setAssocDeviceId('')
+    setAssocIdentityField('')
+    setAssocDeviceName('')
+    setAssocErrors({})
+    setAssocIncompleteReason(null)
+  }, [])
+
+  const handleConfirmAssociation = async () => {
+    if (!assocDraft) return
+    const errors: { deviceId?: string; identityField?: string } = {}
+    const realId = assocDeviceId.trim()
+    const field = assocIdentityField.trim()
+    if (!realId) {
+      errors.deviceId = t('devices:pending.associationException.pleaseEnterRealId')
+    } else if (realId.startsWith('pending-assoc-')) {
+      errors.deviceId = t('devices:pending.associationException.pendingIdForbidden')
+    }
+    if (!field) {
+      errors.identityField = t('devices:pending.associationException.pleaseEnterField')
+    }
+    setAssocErrors(errors)
+    if (Object.keys(errors).length > 0) return
+
+    setProcessing(assocDraft.id)
+    setAssocIncompleteReason(null)
+    try {
+      const result = await api.confirmAssociationDraft(assocDraft.device_id, {
+        device_id: realId,
+        identity_field: field,
+        identity_source: assocDraft.mqtt_identity_source || 'auto_payload',
+        device_name: assocDeviceName.trim() || undefined,
+      })
+      // Only toast + close after subscription_ready (SubAck success). Never mark online here.
+      if (!result.subscription_ready) {
+        setAssocIncompleteReason(
+          result.message || t('devices:pending.associationException.incompleteHint')
+        )
+        return
+      }
+      toast({
+        title: t('common:success'),
+        description:
+          result.message ||
+          t('devices:pending.associationException.confirmed', {
+            deviceId: result.system_device_id,
+          }),
+      })
+      closeAssociationDialog()
+      await fetchDrafts()
+      onRefresh?.()
+    } catch (error) {
+      // BindIncomplete / SubAck reject-timeout: keep form, show broker reason, retry/ignore.
+      const reason =
+        error instanceof Error && error.message
+          ? error.message
+          : t('devices:pending.associationException.confirmFailed')
+      setAssocIncompleteReason(reason)
+      handleError(error, {
+        operation: 'Confirm association',
+        showToast: false,
+        userMessage: t('devices:pending.associationException.confirmFailed'),
+      })
+    } finally {
+      setProcessing(null)
+    }
+  }
+
   // Approve draft device - open approval dialog with type suggestions
   const handleApproveClick = async (draft: DraftDevice) => {
+    if (draft.association_exception) {
+      openAssociationDialog(draft)
+      return
+    }
     setSelectedDraftForApproval(draft)
     setShowApproveDialog(true)
     setSelectedSampleIndex(0)
@@ -298,6 +418,7 @@ export function PendingDevicesList({
     setSuggestedTypes([])
     setSelectedDeviceType('')
     setTypeInputValue('')
+    setTypeFilterActive(false)
     setHighlightedTypeIndex(0)
     setNewTypeFields({ name: '', type_name: '', description: '', device_type: '' })
     setFormErrors({})
@@ -325,14 +446,24 @@ export function PendingDevicesList({
     try {
       const response = await api.suggestDeviceTypes(draft.device_id)
       if (!applyIfCurrent()) return
-      setSuggestedTypes(response.suggestions || [])
-      // Auto-select exact match if found
-      if (response.exact_match) {
-        setSelectedDeviceType(response.exact_match)
-        setTypeInputValue(response.exact_match)
+      const suggestions = response.suggestions || []
+      setSuggestedTypes(suggestions)
+      // Auto-select the exact match only when it actually refers to one of
+      // the existing types. The signature table also contains the draft's
+      // own auto-generated id (registered during analysis), so exact_match
+      // can point back at the draft itself — an id that doesn't exist yet.
+      // Trusting it pre-filled the input with a phantom type and pre-selected
+      // "create new" even when a strong existing match was available.
+      const validExact = response.exact_match &&
+        suggestions.some(s => s.device_type === response.exact_match)
+        ? response.exact_match
+        : null
+      if (validExact) {
+        setSelectedDeviceType(validExact)
+        setTypeInputValue(validExact)
       } else {
         // Auto-select type with match_score > 50%
-        const highMatch = response.suggestions?.find(s => s.match_score > 50)
+        const highMatch = suggestions.find(s => s.match_score > 50)
         if (highMatch) {
           setSelectedDeviceType(highMatch.device_type)
           setTypeInputValue(highMatch.device_type)
@@ -430,16 +561,21 @@ export function PendingDevicesList({
     setRejectDialogDraft(draft)
   }
 
-  // Confirm rejection
+  // Confirm rejection / dismiss association exception
   const confirmReject = async () => {
     if (!rejectDialogDraft) return
 
+    const wasAssoc = !!rejectDialogDraft.association_exception
     setProcessing(rejectDialogDraft.id)
     try {
-      await api.rejectDraftDevice(rejectDialogDraft.device_id, { reason: 'User rejected' })
+      await api.rejectDraftDevice(rejectDialogDraft.device_id, {
+        reason: wasAssoc ? 'Association exception dismissed' : 'User rejected',
+      })
       toast({
         title: t('common:success'),
-        description: t('devices:pending.rejected', { deviceId: rejectDialogDraft.device_id }),
+        description: wasAssoc
+          ? t('devices:pending.associationException.dismissed')
+          : t('devices:pending.rejected', { deviceId: rejectDialogDraft.device_id }),
       })
       await fetchDrafts()
       onRefresh?.()  // Also refresh device and device type lists
@@ -460,28 +596,29 @@ export function PendingDevicesList({
     return status.toLowerCase().replace(/[^a-z]/g, '_')
   }
 
-  // Get status badge — "waiting for the user" is a calm, informational
-  // state, not a warning: orange read as an error cue. Blue keeps the
-  // reserved warning color for states that actually need attention
-  // (offline devices, failures).
+  // Get status badge — same visual language as the shared StatusBadge
+  // (text-only tinted pill): the tint alone encodes the state, per-status
+  // icons only duplicated it at a size that dwarfed the label.
+  // "Waiting for the user" is a calm, informational state, not a warning:
+  // blue keeps the reserved warning color for states that actually need
+  // attention (offline devices, failures).
   const getStatusBadge = (status: string) => {
-    const statusMap: Record<string, { color: string; label: string; icon: React.ReactNode }> = {
-      collecting: { color: "bg-info-light text-info", label: t('devices:pending.status.collecting'), icon: <Loader2 className="h-4 w-4" /> },
-      analyzing: { color: "bg-accent-purple-light text-accent-purple", label: t('devices:pending.status.analyzing'), icon: <SearchIcon className="h-4 w-4" /> },
-      waiting_processing: { color: "bg-info-light text-info", label: t('devices:pending.status.waitingProcessing'), icon: <Hourglass className="h-4 w-4" /> },
-      registered: { color: "bg-success-light text-success", label: t('devices:pending.status.registered'), icon: <CheckCircle2 className="h-4 w-4" /> },
-      rejected: { color: "bg-error-light text-error", label: t('devices:pending.status.rejected'), icon: <XCircle className="h-4 w-4" /> },
-      failed: { color: "bg-error-light text-error", label: t('devices:pending.status.failed'), icon: <AlertTriangle className="h-4 w-4" /> },
+    const statusMap: Record<string, { color: string; label: string }> = {
+      collecting: { color: "bg-info-light text-info", label: t('devices:pending.status.collecting') },
+      analyzing: { color: "bg-accent-purple-light text-accent-purple", label: t('devices:pending.status.analyzing') },
+      waiting_processing: { color: "bg-info-light text-info", label: t('devices:pending.status.waitingProcessing') },
+      registered: { color: "bg-success-light text-success", label: t('devices:pending.status.registered') },
+      rejected: { color: "bg-error-light text-error", label: t('devices:pending.status.rejected') },
+      failed: { color: "bg-error-light text-error", label: t('devices:pending.status.failed') },
     }
 
     const key = normalizeStatus(status)
-    const info = statusMap[key] || { color: "bg-muted text-foreground", label: status, icon: <Activity className="h-4 w-4" /> }
+    const info = statusMap[key] || { color: "bg-muted text-muted-foreground", label: status }
 
     return (
-      <Badge className={cn("font-normal gap-1", info.color)}>
-        {info.icon}
+      <span className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium", info.color)}>
         {info.label}
-      </Badge>
+      </span>
     )
   }
 
@@ -531,7 +668,6 @@ export function PendingDevicesList({
           // means nothing unknown has reported yet. (The old broker-status
           // probe also misfired whenever the broker port was merely occupied.)
           <EmptyState
-            icon="inbox"
             title={t('devices:pending.noDraftsTitle')}
             description={t('devices:pending.noDraftsDesc')}
           />
@@ -611,7 +747,12 @@ export function PendingDevicesList({
 
             case 'status':
               return (
-                <div className="flex justify-center">
+                <div className="flex justify-center items-center gap-1.5 flex-wrap">
+                  {draft.association_exception && (
+                    <span className="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium bg-warning-light text-warning">
+                      {t('devices:pending.associationException.badge')}
+                    </span>
+                  )}
                   {getStatusBadge(draft.status)}
                 </div>
               )
@@ -635,8 +776,30 @@ export function PendingDevicesList({
               )
 
             case 'actions':
-              // Row-level actions — reject used to be reachable only from
-              // inside the approve dialog's footer (the least visible spot).
+              // Association exceptions are actionable even before analysis settles;
+              // ordinary drafts still wait for waiting_processing.
+              if (draft.association_exception) {
+                return (
+                  <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
+                    <Button
+                      size="sm"
+                      onClick={() => openAssociationDialog(draft)}
+                      disabled={processing === draft.id}
+                    >
+                      {t('devices:pending.associationException.resolve')}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-error hover:text-error hover:bg-error-light"
+                      onClick={() => handleReject(draft)}
+                      disabled={processing === draft.id}
+                    >
+                      {t('devices:pending.associationException.dismiss')}
+                    </Button>
+                  </div>
+                )
+              }
               if (draft.status !== 'waiting_processing') return null
               return (
                 <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
@@ -663,7 +826,6 @@ export function PendingDevicesList({
               return null
           }
         }}
-        mobileFlatHeader
         renderMobileHeaderExtra={(rowData) =>
           getStatusBadge((rowData).status)
         }
@@ -710,17 +872,31 @@ export function PendingDevicesList({
                 </span>
               </div>
 
+              {draft.association_exception && (
+                <p className="text-xs text-warning">
+                  {draft.association_exception_kind === 'unverifiable'
+                    ? t('devices:pending.associationException.kindUnverifiable')
+                    : t('devices:pending.associationException.kindConflict')}
+                </p>
+              )}
+
               {/* Row-level actions — same affordance as the desktop table's
                   actions column (the card itself opens the approve dialog). */}
-              {draft.status === 'waiting_processing' && (
+              {(draft.association_exception || draft.status === 'waiting_processing') && (
                 <div className="flex gap-2 pt-1">
                   <Button
                     size="sm"
                     className="flex-1"
-                    onClick={(e) => { e.stopPropagation(); handleApproveClick(draft) }}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      if (draft.association_exception) openAssociationDialog(draft)
+                      else handleApproveClick(draft)
+                    }}
                     disabled={processing === draft.id}
                   >
-                    {t('devices:pending.register')}
+                    {draft.association_exception
+                      ? t('devices:pending.associationException.resolve')
+                      : t('devices:pending.register')}
                   </Button>
                   <Button
                     variant="outline"
@@ -729,7 +905,9 @@ export function PendingDevicesList({
                     onClick={(e) => { e.stopPropagation(); handleReject(draft) }}
                     disabled={processing === draft.id}
                   >
-                    {t('devices:pending.reject')}
+                    {draft.association_exception
+                      ? t('devices:pending.associationException.dismiss')
+                      : t('devices:pending.reject')}
                   </Button>
                 </div>
               )}
@@ -738,7 +916,8 @@ export function PendingDevicesList({
         }}
         onRowClick={(rowData) => {
           const draft = rowData
-          handleApproveClick(draft)
+          if (draft.association_exception) openAssociationDialog(draft)
+          else handleApproveClick(draft)
         }}
       />
 
@@ -943,6 +1122,8 @@ export function PendingDevicesList({
                       const value = e.target.value
                       setTypeInputValue(value)
                       setSelectedDeviceType(value)
+                      // Real keystrokes — now the input filters the list
+                      setTypeFilterActive(true)
                       setShowTypeDropdown(true)
                       setHighlightedTypeIndex(0)
                       setFormErrors(errors => ({ ...errors, type: undefined }))
@@ -993,8 +1174,10 @@ export function PendingDevicesList({
                             onClick={() => commitTypeSelection(option)}
                             onMouseEnter={() => setHighlightedTypeIndex(index)}
                             className={cn(
-                              'p-3 cursor-pointer transition-colors border-b last:border-b-0',
-                              highlighted ? 'bg-muted border-primary' : 'hover:bg-muted-50 border-transparent'
+                              // no border line on hover — the bg change is
+                              // the only hover feedback
+                              'p-3 cursor-pointer transition-colors',
+                              highlighted ? 'bg-muted' : 'hover:bg-muted-50'
                             )}
                             style={{ touchAction: 'manipulation' }}
                           >
@@ -1259,6 +1442,171 @@ export function PendingDevicesList({
           </div>
           )}
 
+        </UnifiedFormDialog>
+      )}
+
+      {/* Association-exception: confirm real identity then attach */}
+      {assocDraft && (
+        <UnifiedFormDialog
+          open={!!assocDraft}
+          onOpenChange={(open) => { if (!open) closeAssociationDialog() }}
+          title={t('devices:pending.associationException.title')}
+          width="lg"
+          onSubmit={handleConfirmAssociation}
+          isSubmitting={processing === assocDraft.id}
+          submitLabel={t('devices:pending.associationException.confirm')}
+          submitDisabled={processing === assocDraft.id}
+          footer={
+            <div className="flex flex-wrap items-center gap-2 justify-end">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-error hover:text-error hover:bg-error-light"
+                onClick={() => {
+                  const draft = assocDraft
+                  closeAssociationDialog()
+                  if (draft) handleReject(draft)
+                }}
+                disabled={processing === assocDraft.id}
+              >
+                {t('devices:pending.associationException.dismiss')}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={closeAssociationDialog}
+                disabled={processing === assocDraft.id}
+              >
+                {assocIncompleteReason
+                  ? t('devices:pending.associationException.ignoreKeepDraft')
+                  : t('common:cancel')}
+              </Button>
+              <Button
+                size="sm"
+                onClick={handleConfirmAssociation}
+                disabled={processing === assocDraft.id}
+              >
+                {processing === assocDraft.id
+                  ? t('common:processing')
+                  : assocIncompleteReason
+                    ? t('devices:pending.associationException.retrySubscribe')
+                    : t('devices:pending.associationException.confirm')}
+              </Button>
+            </div>
+          }
+        >
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              {assocDraft.association_exception_kind === 'unverifiable'
+                ? t('devices:pending.associationException.kindUnverifiable')
+                : assocDraft.association_exception_kind === 'conflict'
+                  ? t('devices:pending.associationException.kindConflict')
+                  : t('devices:pending.associationException.kindGeneric')}
+            </p>
+
+            {assocIncompleteReason && (
+              <div
+                role="alert"
+                className="rounded-lg border border-warning bg-warning-light p-3 space-y-1 text-sm"
+              >
+                <p className="font-medium text-warning">
+                  {t('devices:pending.associationException.incompleteTitle')}
+                </p>
+                <p className="text-xs text-muted-foreground whitespace-pre-wrap break-words">
+                  {assocIncompleteReason}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {t('devices:pending.associationException.incompleteHint')}
+                </p>
+              </div>
+            )}
+
+            <div className="rounded-lg border border-border bg-muted-30 p-3 space-y-2 text-sm">
+              {assocDraft.claimed_identity && (
+                <div className="flex justify-between gap-3">
+                  <span className="text-muted-foreground shrink-0">
+                    {t('devices:pending.associationException.claimedIdentity')}
+                  </span>
+                  <code className="font-mono text-xs truncate">{assocDraft.claimed_identity}</code>
+                </div>
+              )}
+              <div className="flex justify-between gap-3">
+                <span className="text-muted-foreground shrink-0">
+                  {t('devices:pending.associationException.blocked')}
+                </span>
+                <code className="font-mono text-xs truncate text-right">
+                  {(assocDraft.blocked_device_ids || []).join(', ') || '—'}
+                </code>
+              </div>
+              <div className="flex justify-between gap-3">
+                <span className="text-muted-foreground shrink-0">
+                  {t('devices:pending.associationException.topic')}
+                </span>
+                <code className="font-mono text-xs truncate text-right">
+                  {assocDraft.original_topic || assocDraft.source}
+                </code>
+              </div>
+            </div>
+
+            {assocDraft.sample_preview && (
+              <div className="space-y-1.5">
+                <Label>{t('devices:pending.associationException.sample')}</Label>
+                <pre className="text-xs bg-muted-30 border border-border rounded-lg p-3 overflow-x-auto max-h-40">
+                  {JSON.stringify(assocDraft.sample_preview, null, 2)}
+                </pre>
+              </div>
+            )}
+
+            <div className="space-y-1.5">
+              <Label htmlFor="assoc-device-id">
+                {t('devices:pending.associationException.realDeviceId')}
+              </Label>
+              <Input
+                id="assoc-device-id"
+                value={assocDeviceId}
+                onChange={(e) => setAssocDeviceId(e.target.value)}
+                placeholder="B"
+                autoComplete="off"
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('devices:pending.associationException.realDeviceIdHint')}
+              </p>
+              {assocErrors.deviceId && (
+                <p className="text-xs text-error">{assocErrors.deviceId}</p>
+              )}
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="assoc-identity-field">
+                {t('devices:pending.associationException.identityField')}
+              </Label>
+              <Input
+                id="assoc-identity-field"
+                value={assocIdentityField}
+                onChange={(e) => setAssocIdentityField(e.target.value)}
+                placeholder="sn"
+                autoComplete="off"
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('devices:pending.associationException.identityFieldHint')}
+              </p>
+              {assocErrors.identityField && (
+                <p className="text-xs text-error">{assocErrors.identityField}</p>
+              )}
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="assoc-device-name">
+                {t('devices:pending.associationException.deviceName')}
+              </Label>
+              <Input
+                id="assoc-device-name"
+                value={assocDeviceName}
+                onChange={(e) => setAssocDeviceName(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
+          </div>
         </UnifiedFormDialog>
       )}
 

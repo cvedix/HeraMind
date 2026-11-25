@@ -349,7 +349,14 @@
     "noAllowlistDesc": "Cuộc trò chuyện kết nối qua lời mời sẽ xuất hiện ở đây.",
     "remove": "Xóa",
     "confirmRemove": "Xóa cuộc trò chuyện này khỏi danh sách được phép? Cuộc trò chuyện sẽ bị ngắt kết nối.",
-    "chatRemoved": "Đã xóa cuộc trò chuyện"
+    "chatRemoved": "Đã xóa cuộc trò chuyện",
+    "copyCommand": "Lệnh sao chép",
+    "commandCopied": "Lệnh đã sao chép",
+    "copyToken": "Chép Token",
+    "tokenCopied": "Đã sao chép mã thông báo",
+    "manualBindHint": "Liên kết sâu không sẵn sàng cho đến khi nhận diện robot. Hãy gửi cho robot lệnh này để kết nối trò chuyện này.",
+    "howToGet": "Làm sao tôi có được những giá trị này?",
+    "howToPair": "Làm thế nào để kết hợp một cuộc trò chuyện với một sách hướng dẫn giúp hiểu Kinh Thánh?"
   },
   "backupSchedule": "Sao lưu dữ liệu",
   "backupEnabled": "Sao lưu theo lịch",
@@ -385,5 +392,18 @@
     "restartNow": "Khởi động lại ngay",
     "compatNotice": "Truy cập LAN được giữ BẬT để tương thích (thiết bị đã kết nối máy này trước bản cập nhật). Tắt ở đây nếu không cần dùng.",
     "dismiss": "Đã hiểu"
-  }
+  },
+  "sessionRetention": "Thiết lập phiên chạy",
+  "sessionRetentionDesc": "Thời gian ghi nhớ dành cho các buổi trò chuyện; các phiên họp hết hạn (trong lịch sử) được cắt giảm định kỳ — để lại mãi mãi",
+  "summaryInstance": "Mô hình tính toán",
+  "summaryInstanceDesc": "Ví dụ LLM được dùng để tóm tắt lịch sử cuộc trò chuyện khi văn cảnh lấp đầy. \" Mô hình ám ảnh\" dùng mô hình riêng của mỗi cuộc đối thoại; chỉ vào một ví dụ nhỏ hơn, nhanh hơn giữ cho sự co rút khỏi cạnh tranh với mô hình chính.",
+  "summaryInstanceSessionDefault": "Mô hình phiên chạy (mặc định)",
+  "processUsage": "HeraMind sử dụng tài nguyên",
+  "dataDirUsage": "Thư mục dữ liệu",
+  "residentMemory": "Bộ nhớ thuộc địa",
+  "ofTotalMemory": "tổng cộng",
+  "processCpu": "Tiến trình CPU",
+  "ofOneCore": "của một lõi",
+  "threads": "Chỉ",
+  "processUptime": "Quá trình hết hạn"
 }

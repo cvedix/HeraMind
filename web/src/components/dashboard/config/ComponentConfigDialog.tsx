@@ -10,6 +10,7 @@
  */
 
 import { getPortalRoot } from '@/lib/portal'
+import { cn } from '@/lib/utils'
 import { useMemo, useState, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
@@ -42,7 +43,6 @@ import { getComponentMeta } from '@/components/dashboard/registry/registry'
 import type { ComponentConfigSchema } from './ComponentConfigBuilder'
 import type { DataSource, DataSourceOrList, DataSourceMode, ComponentPosition, ImplementedComponentType, DashboardComponent } from '@/types/dashboard'
 import { normalizeDataSource, getSourceId } from '@/types/dashboard'
-import { cn } from '@/lib/utils'
 import { dialogHeader, responsiveCols } from '@/design-system/tokens/size'
 import { useIsMobile, useSafeAreaInsets } from '@/hooks/useMobile'
 import { useMobileBodyScrollLock } from '@/hooks/useBodyScrollLock'
@@ -255,7 +255,10 @@ export function ComponentConfigDialog({
             <div className="flex h-full w-full flex-col">
               {/* Header */}
               <div
-                className={dialogHeader}
+                // Body is bg-background (page chrome); override dialogHeader's
+                // bg-popover so the notch/status band matches dark page tokens
+                // (#4 contract for full-bleed mobile surfaces).
+                className={cn(dialogHeader, 'bg-background')}
                 style={{ paddingTop: `calc(1rem + ${insets.top}px)` }}
               >
                 <div className="flex items-center gap-3 min-w-0 flex-1">

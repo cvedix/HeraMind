@@ -33,16 +33,25 @@ fn main() {
         .unwrap_or(&project_root);
 
     // Windows binaries carry the .exe suffix
-    let exe_suffix = if target.contains("windows") { ".exe" } else { "" };
+    let exe_suffix = if target.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
 
     // Tauri expects the sidecar at: binaries/heramind-extension-runner-{target_triple}[.exe]
-    let platform_runner = binaries_dir
-        .join(format!("heramind-extension-runner-{}{}", target, exe_suffix));
+    let platform_runner = binaries_dir.join(format!(
+        "heramind-extension-runner-{}{}",
+        target, exe_suffix
+    ));
 
     // 1. If CI (or a local dev) already staged the sidecar in binaries/, use it as-is.
     //    fs::copy overwrites, so no need to remove a stale file first.
     if platform_runner.exists() {
-        println!("cargo:warning=✅ Extension runner sidecar ready: {}", target);
+        println!(
+            "cargo:warning=✅ Extension runner sidecar ready: {}",
+            target
+        );
     } else {
         // 2. Otherwise, copy it from the workspace build output if present.
         let source_runner = workspace_root
@@ -74,12 +83,24 @@ fn main() {
             //    warnings so nobody bundles it by accident. The release
             //    workflow's smoke tests would catch a placeholder instantly.
             println!("cargo:warning=⚠️  Extension runner not found. Looked for one of:");
-            println!("cargo:warning=   staged sidecar : {}", platform_runner.display());
-            println!("cargo:warning=   workspace build: {}", source_runner.display());
-            println!("cargo:warning=   Build it first: cargo build --{} -p heramind-extension-runner", profile);
+            println!(
+                "cargo:warning=   staged sidecar : {}",
+                platform_runner.display()
+            );
+            println!(
+                "cargo:warning=   workspace build: {}",
+                source_runner.display()
+            );
+            println!(
+                "cargo:warning=   Build it first: cargo build --{} -p heramind-extension-runner",
+                profile
+            );
             println!("cargo:warning=Writing a PLACEHOLDER at {} — compile-check only, NEVER bundle this.", platform_runner.display());
-            fs::write(&platform_runner, b"placeholder: compile-check only; run cargo build -p heramind-extension-runner\n")
-                .expect("Failed to write placeholder sidecar");
+            fs::write(
+                &platform_runner,
+                b"placeholder: compile-check only; run cargo build -p heramind-extension-runner\n",
+            )
+            .expect("Failed to write placeholder sidecar");
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

@@ -32,7 +32,7 @@ import { ItemBadge, DataIndicator } from './shared'
 export interface UnifiedDataSourceConfigProps {
   value?: DataSourceOrList
   onChange: (dataSource: DataSourceOrList | undefined) => void
-  allowedTypes?: Array<'device-metric' | 'device-command' | 'device-info' | 'device' | 'metric' | 'command' | 'system' | 'extension' | 'extension-command' | 'transform'>
+  allowedTypes?: Array<'device-metric' | 'device-command' | 'device-info' | 'device' | 'metric' | 'command' | 'system' | 'extension' | 'extension-command' | 'transform' | 'ai'>
   multiple?: boolean
   maxSources?: number
   className?: string
@@ -99,6 +99,17 @@ function createTransformDS(transformId: string, field: string): DataSource {
     timeRange: DEFAULT_TIME_RANGE, limit: DEFAULT_LIMIT, aggregate: DEFAULT_AGGREGATE,
     params: { includeRawPoints: true }, transform: 'raw',
     source: 'transform', id: transformId, field, mode: 'timeseries',
+  }
+}
+
+function createAiDS(agentId: string, field: string): DataSource {
+  // Structured (L0) agent field, published under the `ai:{agentId}` telemetry
+  // namespace — same fetch shape as a transform output (timeseries read).
+  return {
+    type: 'transform', sourceId: `ai:${agentId}`, metricId: field,
+    timeRange: DEFAULT_TIME_RANGE, limit: DEFAULT_LIMIT, aggregate: DEFAULT_AGGREGATE,
+    params: { includeRawPoints: true }, transform: 'raw',
+    source: 'ai', id: agentId, field, mode: 'timeseries',
   }
 }
 
@@ -283,7 +294,9 @@ export function UnifiedDataSourceConfig({
   // Fetch extension + unified data sources when needed
   useEffect(() => {
     const needsExt = availableCategories.some(c => c.id === 'extension' || c.id === 'extension-command')
-    const needsUnified = availableCategories.some(c => c.id === 'transform')
+    // AI fields ride in the same unified listing as transforms — a widget
+    // may allow 'ai' without 'transform', and the fetch must still happen.
+    const needsUnified = availableCategories.some(c => c.id === 'transform' || c.id === 'ai')
     if (!needsExt && !needsUnified) {
       hasFetchedUnifiedSources.current = false
       return
@@ -306,35 +319,23 @@ export function UnifiedDataSourceConfig({
           promises.push(storeRef.current.fetchExtensions())
         }
 
-        // Single unified API call for all data source types (extension metrics, transforms, AI)
+        // Unified API call for transform/ai source types. Both are served by
+        // the same endpoint, but requested WITH source_type filters so the
+        // backend skips the heavy device/extension collectors — without the
+        // filter those run on every picker open and the tab spins for ages.
         if (!unifiedAlreadyLoaded) {
+          const merge = (result: { data?: UnifiedDataSourceInfo[] }) => {
+            if (cancelled) return
+            const sources = result?.data ?? []
+            setUnifiedDataSources(prev => {
+              const seen = new Set(prev.map(s => s.id))
+              return [...prev, ...sources.filter(s => !seen.has(s.id))]
+            })
+            hasFetchedUnifiedSources.current = true
+          }
           promises.push(
-            api.listUnifiedDataSources({ limit: 500, skip_telemetry: 'true' })
-              .then((result) => {
-                if (cancelled) return
-                const sources = (result as { data?: UnifiedDataSourceInfo[] })?.data ?? []
-                setUnifiedDataSources(sources)
-                hasFetchedUnifiedSources.current = true
-
-                // Feed extension data into store if needed (same data, no extra request)
-                if (needsExt && !extAlreadyLoaded) {
-                  const extSources = sources
-                    .filter(s => s.source_type === 'extension')
-                    .map(ds => ({
-                      id: ds.id,
-                      extension_id: ds.source_name,
-                      command: '',
-                      field: ds.field,
-                      display_name: ds.source_display_name + ': ' + ds.field_display_name,
-                      data_type: (ds.data_type as any) || 'float',
-                      unit: ds.unit,
-                      description: ds.description || ds.field_display_name,
-                      aggregatable: true,
-                      default_agg_func: 'last' as const,
-                    }))
-                  storeRef.current.setExtensionDataSources(extSources)
-                }
-              })
+            api.listUnifiedDataSources({ limit: 500, skip_telemetry: 'true', source_type: 'transform' }).then(merge),
+            api.listUnifiedDataSources({ limit: 500, skip_telemetry: 'true', source_type: 'ai' }).then(merge),
           )
         }
 
@@ -347,9 +348,13 @@ export function UnifiedDataSourceConfig({
     return () => { cancelled = true }
   }, [availableCategories])
 
-  // Computed lists for transform sources
-  const transformSources = useMemo(() =>
-    unifiedDataSources.filter(s => s.source_type === 'transform'),
+  // Computed lists for transform / structured-agent (ai) sources
+  const transformSources = useMemo(
+    () => unifiedDataSources.filter(s => s.source_type === 'transform'),
+    [unifiedDataSources]
+  )
+  const aiSources = useMemo(
+    () => unifiedDataSources.filter(s => s.source_type === 'ai'),
     [unifiedDataSources]
   )
 
@@ -625,7 +630,7 @@ export function UnifiedDataSourceConfig({
         isSelected: boolean
         hasData: boolean | null
         dataPointCount?: number
-        itemType: 'template' | 'virtual' | 'info'
+        itemType: 'template' | 'virtual' | 'runtime' | 'info'
         unit?: string
         dataType?: string
       }
@@ -664,9 +669,12 @@ export function UnifiedDataSourceConfig({
         })
       }
 
-      // Add virtual metrics from summary (not in template)
+      // Add non-template metrics from summary: transform-generated virtual
+      // metrics AND runtime auto-extracted metrics the device actually reported.
+      // Gating on is_virtual hid the only metrics with data whenever a type's
+      // template didn't match the device's real payload.
       for (const [metricId, metricSummary] of Object.entries(deviceSummary)) {
-        if (!templateMetricNames.has(metricId) && metricSummary.is_virtual) {
+        if (!templateMetricNames.has(metricId)) {
           const availabilityKey = `${selectedDevice.id}:${metricId}`
           const metricAvailability = availability.get(availabilityKey)
           items.push({
@@ -677,7 +685,7 @@ export function UnifiedDataSourceConfig({
             isSelected: isSelected('device', selectedDevice.id, metricId),
             hasData: metricAvailability?.hasData ?? null,
             dataPointCount: metricAvailability?.dataPointCount,
-            itemType: 'virtual',
+            itemType: metricSummary.is_virtual ? 'virtual' : 'runtime',
             unit: metricSummary.unit,
             dataType: metricSummary.data_type,
           })
@@ -725,9 +733,9 @@ export function UnifiedDataSourceConfig({
         })
       }
 
-      // Sort items: template metrics first, then device info, then virtual metrics
+      // Sort items: template metrics first, then device info, then virtual/runtime metrics
       items.sort((a, b) => {
-        const order = { template: 0, info: 1, virtual: 2 }
+        const order = { template: 0, info: 1, virtual: 2, runtime: 3 }
         return order[a.itemType] - order[b.itemType]
       })
 
@@ -757,7 +765,7 @@ export function UnifiedDataSourceConfig({
           </div>
           <div className="flex-1 overflow-y-auto p-2 space-y-1">
             {items.map(item => {
-              const [_source, deviceId, ...fieldParts] = item.key.split(':')
+              const [_source, _deviceId, ...fieldParts] = item.key.split(':')
               const field = fieldParts.join(':')
               return (
               <button
@@ -870,7 +878,7 @@ export function UnifiedDataSourceConfig({
                 key={item.key}
                 type="button"
                 onClick={() => {
-                  const [_src, devId, ...cmdParts] = item.key.split(':')
+                  const [_src, _devId, ...cmdParts] = item.key.split(':')
                   handleSelectItem(createCommandDS(selectedDevice.id, cmdParts.join(':')))
                 }}
                 className={cn(
@@ -1294,6 +1302,77 @@ export function UnifiedDataSourceConfig({
             )}
           </div>
         )
+      case 'ai':
+        // Transform data sources - flat list layout
+        return (
+          <div className="space-y-1">
+            {unifiedSourcesLoading ? (
+              <div className="p-4 text-center text-muted-foreground text-sm flex items-center justify-center gap-2">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Loading...
+              </div>
+            ) : aiSources.length === 0 ? (
+              <div className="p-4 text-center text-muted-foreground text-sm">{t('dataSource.noAiAgents')}</div>
+            ) : (
+              aiSources.map(source => {
+                const tfIsSelected = isSelected('ai', source.source_name, source.field)
+                return (
+                  <button
+                    key={source.id}
+                    type="button"
+                    onClick={() => handleSelectItem(createAiDS(source.source_name, source.field))}
+                    className={cn(
+                      'w-full flex items-center gap-3 px-3 py-2.5 rounded-lg border text-left transition-all duration-fast',
+                      tfIsSelected
+                        ? 'bg-muted border-border'
+                        : 'bg-card border-border hover:bg-accent hover:border-border'
+                    )}
+                  >
+                    <div className={cn(
+                      'shrink-0 w-5 h-5 rounded-md flex items-center justify-center transition-colors',
+                      tfIsSelected
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-muted text-muted-foreground'
+                    )}>
+                      <Check className={cn(
+                        'h-4 w-4',
+                        tfIsSelected ? 'opacity-100' : 'opacity-0'
+                      )} />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className={cn(
+                        'text-sm truncate',
+                        tfIsSelected ? 'font-medium text-foreground' : 'font-normal text-foreground'
+                      )}>
+                        {source.source_display_name} · {source.field_display_name}
+                      </div>
+                      <div className={cn(textNano, "text-muted-foreground truncate flex items-center gap-1.5")}>
+                        <code className={cn("px-1 py-0.5 bg-muted rounded", textMicro, "font-mono")}>
+                          {source.source_name}:{source.field}
+                        </code>
+                        {source.unit && source.unit !== '-' && (
+                          <>
+                            <span className="text-muted-foreground">·</span>
+                            <span className="text-muted-foreground">{source.unit}</span>
+                          </>
+                        )}
+                        {source.current_value !== undefined && source.current_value !== null && (
+                          <>
+                            <span className="text-muted-foreground">·</span>
+                            <span className="text-foreground">{String(source.current_value)}</span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    <span className={cn("shrink-0", textNano, "px-1.5 py-0.5 rounded bg-accent-indigo-light text-accent-indigo border border-accent-indigo-light")}>
+                      {t('dataSource.aiAgent')}
+                    </span>
+                  </button>
+                )
+              })
+            )}
+          </div>
+        )
 
       default:
         return null
@@ -1406,7 +1485,7 @@ export function UnifiedDataSourceConfig({
             variant="ghost"
             size="sm"
             onClick={handleClearSelection}
-            className="h-7 px-2 text-xs hover:bg-muted hover:text-error shrink-0"
+            className="h-7 px-2 text-xs hover:bg-muted hover:text-error shrink-0 sm:h-7"
             title={t('dataSource.clearAllSelections')}
           >
             <X className="h-4 w-4" />
@@ -1414,66 +1493,35 @@ export function UnifiedDataSourceConfig({
         </div>
       )}
 
-      {/* Category tabs */}
-      {isMobile ? (
-        <div className="shrink-0 px-3 pt-3 pb-2">
-          <div className="grid grid-cols-4 gap-1.5">
-            {availableCategories.map(cat => {
-              const Icon = cat.icon
-              const isActive = selectedCategory === cat.id
-              return (
-                <button
-                  key={cat.id}
-                  type="button"
-                  onClick={() => {
-                    setSelectedCategory(cat.id)
-                    setSelectedDeviceId(null)
-                    setSelectedExtensionId(null)
-                  }}
-                  className={cn(
-                    'flex flex-col items-center justify-center gap-1 py-1.5 min-w-0 rounded-lg transition-colors',
-                    isActive
-                      ? 'bg-primary text-primary-foreground'
-                      : 'bg-muted-30 text-muted-foreground'
-                  )}
-                >
-                  <Icon className="h-4 w-4 shrink-0" />
-                  <span className="text-mini font-medium leading-none truncate w-full text-center">
-                    {cat.name}
-                  </span>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-      ) : (
-        <div className="flex border-b overflow-x-auto shrink-0 scrollbar-none [-webkit-overflow-scrolling:touch]">
-          {availableCategories.map(cat => {
-            const Icon = cat.icon
-            const isActive = selectedCategory === cat.id
-            return (
-              <button
-                key={cat.id}
-                type="button"
-                onClick={() => {
-                  setSelectedCategory(cat.id)
-                  setSelectedDeviceId(null)
-                  setSelectedExtensionId(null)
-                }}
-                className={cn(
-                  'flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors shrink-0',
-                  isActive
-                    ? 'border-primary text-primary'
-                    : 'border-transparent text-muted-foreground hover:text-foreground hover:bg-muted-50'
-                )}
-              >
-                <Icon className="h-4 w-4" />
-                {cat.name}
-              </button>
-            )
-          })}
-        </div>
-      )}
+      {/* Category tabs — horizontal scroll on all viewports. A fixed
+          grid-cols-4 on mobile crushed long labels (e.g. zh "结构化智能体（ai）"). */}
+      <div className="flex min-w-0 shrink-0 overflow-x-auto border-b scrollbar-none [-webkit-overflow-scrolling:touch]">
+        {availableCategories.map(cat => {
+          const Icon = cat.icon
+          const isActive = selectedCategory === cat.id
+          return (
+            <button
+              key={cat.id}
+              type="button"
+              onClick={() => {
+                setSelectedCategory(cat.id)
+                setSelectedDeviceId(null)
+                setSelectedExtensionId(null)
+              }}
+              className={cn(
+                'relative flex shrink-0 items-center gap-1.5 px-3 py-2.5 text-sm font-medium transition-colors sm:px-4',
+                'min-h-11 after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:rounded-full after:transition-colors',
+                isActive
+                  ? 'text-primary after:bg-primary'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted-50'
+              )}
+            >
+              <Icon className="h-4 w-4 shrink-0" />
+              <span className="whitespace-nowrap">{cat.name}</span>
+            </button>
+          )
+        })}
+      </div>
 
       {/* Content area */}
       {usesDeviceSplitLayout ? (

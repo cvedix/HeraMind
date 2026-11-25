@@ -29,6 +29,11 @@ pub struct ListBackendsQuery {
     pub r#type: Option<String>,
     /// Show only active backend
     pub active_only: Option<bool>,
+    /// Include vision-companion instances (builtin-vlm-*) — hidden by
+    /// DEFAULT so pre-companion UIs (and the chat picker) never see a
+    /// non-chat backend they would try to activate. Settings surfaces that
+    /// manage the companion pass ?include_vlm=true.
+    pub include_vlm: Option<bool>,
 }
 
 /// Request to create/update an LLM backend instance
@@ -153,6 +158,9 @@ pub struct BackendInstanceDto {
     pub api_key_configured: bool,
     pub is_active: bool,
     pub is_builtin: bool,
+    /// `"vlm"` = vision companion (describe-only, never a chat backend);
+    /// null = regular backend. Derived from the id prefix.
+    pub role: Option<String>,
     pub thinking_is_integral: bool,
     pub temperature: f32,
     pub top_p: f32,
@@ -169,6 +177,10 @@ pub struct BackendInstanceDto {
 impl From<LlmBackendInstance> for BackendInstanceDto {
     fn from(instance: LlmBackendInstance) -> Self {
         let backend_type = instance.backend_name().to_string();
+        // Role is derived, never stored — the builtin-vlm- id prefix IS the
+        // marker, so no schema can drift it.
+        let role = crate::builtin_llm::handlers::is_companion_instance_id(&instance.id)
+            .then(|| "vlm".to_string());
         Self {
             id: instance.id,
             name: instance.name,
@@ -179,6 +191,7 @@ impl From<LlmBackendInstance> for BackendInstanceDto {
                 && !instance.api_key.as_ref().is_some_and(|k| k.is_empty()),
             is_active: instance.is_active,
             is_builtin: instance.is_builtin,
+            role,
             thinking_is_integral: instance.thinking_is_integral,
             temperature: instance.temperature,
             top_p: instance.top_p,
@@ -288,6 +301,12 @@ pub async fn list_backends_handler(
 ) -> HandlerResult<serde_json::Value> {
     let manager = get_manager()?;
     let mut instances = manager.list_instances();
+
+    // Companions are hidden unless explicitly requested — the default list
+    // feeds chat pickers and activation flows that must never see them.
+    if !query.include_vlm.unwrap_or(false) {
+        instances.retain(|inst| !crate::builtin_llm::handlers::is_companion_instance_id(&inst.id));
+    }
 
     // Apply filters
     if let Some(type_filter) = query.r#type {
@@ -503,7 +522,7 @@ pub async fn create_backend_handler(
     )
 )]
 pub async fn update_backend_handler(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
     Path(id): Path<String>,
     Json(mut req): Json<UpdateBackendRequest>,
 ) -> HandlerResult<serde_json::Value> {
@@ -592,6 +611,9 @@ pub async fn update_backend_handler(
     }
     if let Some(top_p) = req.top_p {
         instance.top_p = top_p;
+    }
+    if let Some(top_k) = req.top_k {
+        instance.top_k = top_k;
     }
     if let Some(thinking_enabled) = req.thinking_enabled {
         let prev = instance.thinking_enabled;
@@ -687,6 +709,43 @@ pub async fn update_backend_handler(
 
     // Clear cache
     manager.clear_cache();
+
+    // Editing the ACTIVE chat backend must retune sessions immediately:
+    // the session manager holds a snapshot of the backend's request settings
+    // (bound at activation/session-creation time), so without this rebind the
+    // user's temperature/top_p/top_k/thinking edits would only apply after a
+    // restart or manual re-activation. Sessions explicitly bound to a
+    // different backend keep their own settings (isolation by design).
+    let is_active = manager
+        .get_active_instance()
+        .map(|active| active.id == instance.id)
+        .unwrap_or(false);
+    if is_active {
+        state
+            .agents
+            .session_manager
+            .set_llm_backend_instance(&instance)
+            .await
+            .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+    } else {
+        // Sessions pinned to this (non-active) backend still hold the
+        // snapshot captured at bind time; refresh those so a mid-session
+        // effort/toggle/sampling edit applies without a restart or manual
+        // re-activation. Sessions bound to other backends are untouched
+        // (isolation by design).
+        let retuned = state
+            .agents
+            .session_manager
+            .retune_sessions_bound_to_instance(&instance)
+            .await;
+        if retuned > 0 {
+            tracing::info!(
+                backend_id = %id,
+                sessions = retuned,
+                "Refreshed request defaults for sessions bound to edited backend"
+            );
+        }
+    }
 
     ok(json!({
         "id": id,
@@ -848,6 +907,15 @@ pub async fn activate_backend_handler(
 ) -> HandlerResult<serde_json::Value> {
     let manager = get_manager()?;
 
+    // Vision companions are describe-only engines (vision tool / image
+    // delegation), not chat backends — activating one would strand every
+    // session on a model that can't hold a conversation.
+    if crate::builtin_llm::handlers::is_companion_instance_id(&id) {
+        return Err(ErrorResponse::bad_request(format!(
+            "{id} is a vision companion (describe-only) — activate a main chat backend instead"
+        )));
+    }
+
     // Get the backend instance to extract its configuration
     let instance = manager
         .get_instance(&id)
@@ -859,174 +927,14 @@ pub async fn activate_backend_handler(
         .await
         .map_err(|e| ErrorResponse::internal(e.to_string()))?;
 
-    // Also update the SessionManager's LLM backend for existing sessions
-    use heramind_agent::LlmBackend;
-    /// Convert storage BackendCapabilities to core BackendCapabilities
-    fn convert_capabilities(
-        storage_caps: &heramind_storage::BackendCapabilities,
-    ) -> heramind_core::BackendCapabilities {
-        heramind_core::BackendCapabilities {
-            streaming: storage_caps.supports_streaming,
-            multimodal: storage_caps.supports_multimodal,
-            function_calling: storage_caps.supports_tools,
-            thinking_display: storage_caps.supports_thinking,
-            max_context: Some(storage_caps.max_context),
-            multiple_models: false,
-            modalities: Vec::new(),
-            supports_images: storage_caps.supports_multimodal,
-            reasoning: heramind_core::ReasoningCapabilities::default(),
-        }
-    }
-
-    // Convert capabilities from storage type to core type
-    let capabilities = Some(convert_capabilities(&instance.capabilities));
-
-    let backend = match instance.backend_type {
-        LlmBackendType::Ollama => {
-            let endpoint = instance
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "http://localhost:11434".to_string());
-            let model = instance.model.clone();
-            LlmBackend::Ollama {
-                endpoint,
-                model,
-                capabilities,
-            }
-        }
-        LlmBackendType::OpenAi => {
-            let api_key = instance.api_key.clone().unwrap_or_default();
-            let endpoint = instance
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-            let model = instance.model.clone();
-            LlmBackend::OpenAi {
-                api_key,
-                endpoint,
-                model,
-                capabilities,
-            }
-        }
-        LlmBackendType::Anthropic => {
-            let api_key = instance.api_key.clone().unwrap_or_default();
-            let endpoint = instance
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
-            let model = instance.model.clone();
-            LlmBackend::Anthropic {
-                api_key,
-                endpoint,
-                model,
-                capabilities,
-            }
-        }
-        LlmBackendType::Google => {
-            let api_key = instance.api_key.clone().unwrap_or_default();
-            let endpoint = instance
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1".to_string());
-            let model = instance.model.clone();
-            LlmBackend::Google {
-                api_key,
-                endpoint,
-                model,
-                capabilities,
-            }
-        }
-        LlmBackendType::XAi => {
-            let api_key = instance.api_key.clone().unwrap_or_default();
-            let endpoint = instance
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "https://api.x.ai/v1".to_string());
-            let model = instance.model.clone();
-            LlmBackend::XAi {
-                api_key,
-                endpoint,
-                model,
-                capabilities,
-            }
-        }
-        LlmBackendType::Qwen => {
-            let api_key = instance.api_key.clone().unwrap_or_default();
-            let endpoint = instance
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string());
-            let model = instance.model.clone();
-            LlmBackend::Qwen {
-                api_key,
-                endpoint,
-                model,
-                capabilities,
-            }
-        }
-        LlmBackendType::DeepSeek => {
-            let api_key = instance.api_key.clone().unwrap_or_default();
-            let endpoint = instance
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "https://api.deepseek.com".to_string());
-            let model = instance.model.clone();
-            LlmBackend::DeepSeek {
-                api_key,
-                endpoint,
-                model,
-                capabilities,
-            }
-        }
-        LlmBackendType::GLM => {
-            let api_key = instance.api_key.clone().unwrap_or_default();
-            let endpoint = instance
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "https://open.bigmodel.cn/api/paas/v4".to_string());
-            let model = instance.model.clone();
-            LlmBackend::GLM {
-                api_key,
-                endpoint,
-                model,
-                capabilities,
-            }
-        }
-        LlmBackendType::MiniMax => {
-            let api_key = instance.api_key.clone().unwrap_or_default();
-            let endpoint = instance
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "https://api.minimax.chat/v1".to_string());
-            let model = instance.model.clone();
-            LlmBackend::MiniMax {
-                api_key,
-                endpoint,
-                model,
-                capabilities,
-            }
-        }
-        LlmBackendType::LlamaCpp => {
-            let endpoint = instance
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
-            let model = instance.model.clone();
-            LlmBackend::LlamaCpp {
-                endpoint,
-                model,
-                capabilities,
-            }
-        }
-    };
-
-    // Update existing chat sessions and set as default for new sessions.
-    // Note: SessionManager.sessions contains chat Agent instances (not AI agents).
-    // AI agents use their own locked llm_backend_id via get_llm_runtime_for_agent.
+    // Also update the SessionManager's LLM backend for existing sessions.
+    // set_llm_backend_instance performs the instance→backend conversion
+    // internally and binds the instance's sampling/thinking settings, so the
+    // activated backend keeps its request parameters.
     state
         .agents
         .session_manager
-        .set_llm_backend(backend.clone())
+        .set_llm_backend_instance(&instance)
         .await
         .map_err(|e| ErrorResponse::internal(e.to_string()))?;
 
@@ -2019,11 +1927,13 @@ pub async fn list_llamacpp_server_info_handler(
                         // n_ctx from runtime settings
                         server_details.n_ctx = props.n_ctx();
 
-                        // Use runtime n_ctx as fallback if no n_ctx_train
-                        if capabilities.max_context == 4096 {
-                            if let Some(n_ctx) = server_details.n_ctx {
-                                capabilities.max_context = n_ctx;
-                            }
+                        // The runtime n_ctx from /props is the server's own
+                        // per-request truth (`slot_n_ctx`: per-slot quota on
+                        // partitioned servers, full pool on auto-slotted
+                        // ones) — more accurate than the model-name guess
+                        // from /v1/models above, so it wins when present.
+                        if let Some(n_ctx) = server_details.n_ctx {
+                            capabilities.max_context = n_ctx;
                         }
 
                         server_details.total_slots = props.total_slots;

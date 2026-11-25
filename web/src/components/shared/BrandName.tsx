@@ -5,11 +5,12 @@
  * Uses centralized i18n configuration for easy rebranding.
  *
  * Logo images:
- * - Square logo: HeraMind mark icon
- * - Horizontal logo: HeraMind wordmark + icon
+ * - Square logo: for favicons, app icons (logo-square.png, dark tile)
+ * - Dark theme logo: for dark backgrounds (logo-dark.png)
+ * - Light theme logo: for light backgrounds (logo-light.png)
  */
 
-import { useBrand, useBrandMessages } from '@/hooks/useBrand'
+import { useBrand } from '@/hooks/useBrand'
 import { cn } from '@/lib/utils'
 
 /**
@@ -41,7 +42,7 @@ export function ShortBrandName({ className }: { className?: string }) {
 }
 
 /**
- * Brand logo with short name (square logo image)
+ * HeraMind app mark.
  *
  * @example
  * ```tsx
@@ -61,7 +62,8 @@ export function BrandLogo({ className }: { className?: string }) {
 }
 
 /**
- * Horizontal brand logo
+ * Horizontal brand logo (auto-switches based on theme)
+ * Uses logo-dark.png for dark theme, logo-light.png for light theme
  *
  * @example
  * ```tsx
@@ -71,18 +73,27 @@ export function BrandLogo({ className }: { className?: string }) {
  */
 export function BrandLogoHorizontal({ className }: { className?: string }) {
   return (
-    <img
-      src="/logo-light.png"
-      alt="HeraMind"
-      className={cn('h-6', className)}
-    />
+    <>
+      {/* Light theme logo */}
+      <img
+        src="/logo-light.png"
+        alt="HeraMind"
+        className={cn('h-6 dark:hidden', className)}
+      />
+      {/* Dark theme logo */}
+      <img
+        src="/logo-dark.png"
+        alt="HeraMind"
+        className={cn('h-6 hidden dark:block', className)}
+      />
+    </>
   )
 }
 
 /**
  * Styled brand name with logo-inspired design
- * - Light mode: foreground text with blue shadow/stroke
- * - Dark mode: foreground text with blue shadow/stroke
+ * - Light mode: white text with blue shadow/stroke
+ * - Dark mode: black text with blue shadow/stroke
  *
  * @example
  * ```tsx
@@ -111,7 +122,7 @@ export function StyledBrandName({
         'inline-block font-black italic tracking-tight',
         // Use foreground color that adapts to light/dark mode
         'text-foreground',
-        // Blue shadow effect (3D) - top-right direction via --brand-shadow
+        // Brand shadow effect
         'drop-shadow-[1.5px_-1.5px_0_var(--brand-shadow)]',
         // Transition
         'transition-all duration-normal',
@@ -126,8 +137,8 @@ export function StyledBrandName({
 
 /**
  * Combined brand logo and name
- * - Mobile: horizontal HeraMind wordmark, scaled down
- * - Desktop: horizontal HeraMind wordmark
+ * - Mobile: horizontal logo (logo-light/logo-dark) with theme switching, scaled down
+ * - Desktop: horizontal logo (logo-light/logo-dark) with theme switching
  *
  * @example
  * ```tsx
@@ -136,9 +147,9 @@ export function StyledBrandName({
  */
 export function BrandLogoWithName({
   logoClassName,
-  nameClassName,
-  showLogo = false,
-  styled = true
+  nameClassName: _nameClassName,
+  showLogo: _showLogo = false,
+  styled: _styled = true
 }: {
   logoClassName?: string
   nameClassName?: string

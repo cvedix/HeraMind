@@ -9,6 +9,8 @@ const os = require('node:os');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '../..');
+const {version} = requireWeb('./package.json');
+const binary = process.env.HERAMIND_SMOKE_BINARY ?? path.join(root, 'target/debug/heramind');
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'heramind-upgrade-smoke-'));
 let base, httpPort;
 async function freePort() {
@@ -28,10 +30,10 @@ async function api(route, method='GET', body, authenticated=true) {
  const json = JSON.parse(text); return json.data ?? json;
 }
 async function start() {
- server = spawn(root+'/target/debug/heramind', ['serve','--host','127.0.0.1','--port',String(httpPort)], {cwd:dataDir, env:{...process.env, HERAMIND_DATA_DIR:dataDir, HERAMIND_WEB_DIR:root+'/web/dist', HERAMIND_BUILTIN_LLM:'off', HERAMIND_MQTT_BIND:'127.0.0.1'}, stdio:['ignore',serverLog,serverLog]});
+ server = spawn(binary, ['serve','--host','127.0.0.1','--port',String(httpPort)], {cwd:dataDir, env:{...process.env, HERAMIND_DATA_DIR:dataDir, HERAMIND_WEB_DIR:root+'/web/dist', HERAMIND_BUILTIN_LLM:'off', HERAMIND_MQTT_BIND:'127.0.0.1'}, stdio:['ignore',serverLog,serverLog]});
  for(let i=0; i<120; i++) {
   if(server.exitCode !== null) throw new Error('Server exited '+server.exitCode);
-  try { const health=await api('/health'); assert.equal(health.version,'0.9.24'); return; } catch {}
+  try { const health=await api('/health'); assert.equal(health.version,version); return; } catch {}
   await new Promise(r=>setTimeout(r,500));
  }
  throw new Error('Startup timeout');
@@ -49,7 +51,7 @@ async function stop() {
   base = `http://127.0.0.1:${httpPort}`;
   fs.writeFileSync(path.join(dataDir, 'config.toml'), `[mqtt]\nlisten = "127.0.0.1"\nport = ${mqttPort}\n`);
   console.log('Scratch data and artifacts:', dataDir);
-  await start(); pass('server boots as HeraMind 0.9.24 with isolated data');
+  await start(); pass(`server boots as HeraMind ${version} with isolated data`);
   const unauthorized=await fetch(base+'/api/devices'); assert.equal(unauthorized.status,401); pass('device API requires authentication');
   const spec=await api('/docs/openapi.json'); assert.ok(Object.keys(spec.paths).length>250);
   const refs=[]; function visit(v){ if(!v || typeof v!=='object')return; if(v.$ref)refs.push(v.$ref);Object.values(v).forEach(visit); } visit(spec);
@@ -92,7 +94,7 @@ async function stop() {
   assert.equal(value(count),3);assert.equal(value(sum),20);
   pass('original HeraCam device type, metric ingestion, count=3 and sum=20');
   await api('/devices/heracam-upgrade-smoke/metrics','POST',{metric:'vehicle_count',value:5,timestamp:(now-4000)*1000});
-  const history=JSON.parse(execFileSync(root+'/target/debug/heramind', ['device','history','heracam-upgrade-smoke','--metric','vehicle_count','--time-range','1h','--offset','1h','--aggregate','sum','--compress=false'], {cwd:dataDir,env:{...process.env,HERAMIND_DATA_DIR:dataDir,HERAMIND_API_BASE:base+'/api',HERAMIND_API_KEY:token,HERAMIND_JSON:"1"},encoding:'utf8'}));
+  const history=JSON.parse(execFileSync(binary, ['device','history','heracam-upgrade-smoke','--metric','vehicle_count','--time-range','1h','--offset','1h','--aggregate','sum','--compress=false'], {cwd:dataDir,env:{...process.env,HERAMIND_DATA_DIR:dataDir,HERAMIND_API_BASE:base+'/api',HERAMIND_API_KEY:token,HERAMIND_JSON:"1"},encoding:'utf8'}));
   fs.writeFileSync(path.join(dataDir, 'cli-history.json'), JSON.stringify(history,null,2));
   assert.equal(value(history),5);
   pass('CLI previous-hour offset and server-side sum remain compatible');

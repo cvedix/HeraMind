@@ -6,7 +6,15 @@ import type { JsonSchema } from './api'
 export type MessageSeverity = 'info' | 'warning' | 'critical' | 'emergency'
 // Message Type - must match backend MessageType enum
 export type MessageType = 'notification'
-export type MessageStatus = 'active' | 'acknowledged' | 'resolved' | 'archived'
+export type MessageStatus =
+  | 'active'
+  | 'acknowledged'
+  | 'resolved'
+  | 'archived'
+  // A verdict rather than a lifecycle step: the operator dismissed the alert
+  // as a false positive (002 §3.4). `messages.tsx` has carried a label for it
+  // since before the backend had the status.
+  | 'false_positive'
 // Category is a flexible string - backend can provide any category value
 export type MessageCategory = string
 
@@ -115,6 +123,10 @@ export interface ChannelTypeInfo {
   description_zh: string
   icon: string
   category: string
+  /** Vendor doc explaining how to obtain this channel's credentials (English). */
+  docs_url: string
+  /** Chinese variant of docs_url when the vendor maintains one. */
+  docs_url_zh: string
 }
 
 export interface ChannelStats {
@@ -152,6 +164,8 @@ export interface ChannelSchemaResponse {
   icon: string
   category: string
   config_schema: JsonSchema
+  docs_url: string
+  docs_url_zh: string
 }
 
 // ========== Message Channel Types ==========

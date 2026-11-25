@@ -11,6 +11,7 @@
 pub mod device_type_generator;
 pub mod discovery;
 pub mod error;
+pub mod metric_publish;
 pub mod output_registry;
 pub mod store;
 pub mod transform;
@@ -27,10 +28,10 @@ pub use error::{AutomationError, Result};
 
 // Re-export discovery module
 pub use discovery::{
-    AutoOnboardManager, DataPathExtractor, DeviceCategory, DeviceSample, DiscoveredMetric,
-    DiscoveredPath, DraftDevice, DraftDeviceStatus, FieldSemantic, GeneratedDeviceType,
-    InferenceContext, ProcessingSummary, RegistrationResult, SemanticInference, SemanticType,
-    TypeSignature, VirtualMetricGenerator,
+    AssociationExceptionDraft, AutoOnboardManager, DataPathExtractor, DeviceCategory, DeviceSample,
+    DiscoveredMetric, DiscoveredPath, DraftDevice, DraftDeviceStatus, FieldSemantic,
+    GeneratedDeviceType, InferenceContext, ProcessingSummary, RegistrationResult,
+    SemanticInference, SemanticType, TypeSignature, VirtualMetricGenerator,
 };
 
 // Re-export transform-specific types

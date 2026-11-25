@@ -27,8 +27,8 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         agents, auth as auth_handlers, auth_users, automations, basic, capabilities, config,
         dashboards, data, data_push, devices, events, extension_stream, extensions,
         frontend_components, im_bridges, images, instances, llm_backends, logs, memory,
-        message_channels, messages, mqtt, onboarding, rules, sessions, settings, setup, skills,
-        stats, suggestions, system, tools,
+        message_channels, messages, mqtt, onboarding, operations, rules, sessions, settings, setup,
+        skills, stats, suggestions, system, tools,
     };
 
     // Public routes (no authentication required)
@@ -106,8 +106,17 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             get(extensions::get_all_dashboard_components_handler),
         )
         .route(
+            "/api/extensions/pages",
+            get(extensions::get_extension_pages_handler),
+        )
+        .route(
             "/api/extensions/capabilities",
             get(extensions::list_extension_capabilities_handler),
+        )
+        // Must precede `/api/extensions/:id` so `commands` is not an id.
+        .route(
+            "/api/extensions/commands/search",
+            get(extensions::search_extension_commands_handler),
         )
         // Capability API (public - static metadata)
         .route(
@@ -300,6 +309,12 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             get(data::list_all_data_sources_handler),
         )
         .route("/api/stats/system", get(stats::get_system_stats_handler))
+        // Data-directory footprint — recomputed only on explicit request
+        // (the walk is too expensive for the polling path).
+        .route(
+            "/api/stats/data-dir/refresh",
+            post(stats::refresh_data_dir_usage_handler),
+        )
         // Diagnostic log archive download (admin/auth-only) — bundles
         // data/logs/*.log.* into a zip for support flows.
         .route("/api/logs/download", get(logs::download_logs_handler))
@@ -367,11 +382,15 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             "/api/extensions/:id",
             delete(extensions::unregister_extension_handler),
         )
-        // Tool enable/disable (master + per-command). Distinct paths so they
-        // don't get shadowed by the `:id` catch-all above.
+        // Run/load enable, AI master, and per-command toggles. Distinct paths
+        // so they don't get shadowed by the `:id` catch-all above.
         .route(
             "/api/extensions/:id/enabled",
             axum::routing::patch(extensions::set_extension_enabled_handler),
+        )
+        .route(
+            "/api/extensions/:id/ai-enabled",
+            axum::routing::patch(extensions::set_extension_ai_enabled_handler),
         )
         .route(
             "/api/extensions/:id/commands/:cmd/enabled",
@@ -416,6 +435,10 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         .route("/api/sessions", post(sessions::create_session_handler))
         .route("/api/sessions", get(sessions::list_sessions_handler))
         .route(
+            "/api/sessions/pending",
+            get(sessions::list_pending_sessions_handler),
+        )
+        .route(
             "/api/sessions/cleanup",
             post(sessions::cleanup_sessions_handler),
         )
@@ -433,7 +456,24 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             "/api/sessions/:id",
             delete(sessions::delete_session_handler),
         )
+        .route(
+            "/api/sessions/:id/compact",
+            post(sessions::compact_session_handler),
+        )
+        .route(
+            "/api/sessions/:id/clear",
+            post(sessions::clear_session_history_handler),
+        )
         .route("/api/sessions/:id/chat", post(sessions::chat_handler))
+        // @-mention search + reference preflight (1.3 iter C)
+        .route(
+            "/api/mentions/search",
+            get(crate::handlers::mentions::search_mentions_handler),
+        )
+        .route(
+            "/api/mentions/resolve",
+            post(crate::handlers::mentions::resolve_mentions_handler),
+        )
         // Skills API (protected - write operations)
         .route("/api/skills", post(skills::create_skill_handler))
         .route("/api/skills/reload", post(skills::reload_skills_handler))
@@ -449,6 +489,20 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         .route(
             "/api/sessions/:id/pending",
             delete(sessions::clear_pending_stream_handler),
+        )
+        // P2-2: Persistent operation ledger query endpoints
+        .route(
+            "/api/v1/operations",
+            get(operations::list_operations_handler),
+        )
+        .route(
+            "/api/v1/operations/:id",
+            get(operations::get_operation_handler),
+        )
+        .route("/api/operations", get(operations::list_operations_handler))
+        .route(
+            "/api/operations/:id",
+            get(operations::get_operation_handler),
         )
         // Devices API
         .route("/api/devices", get(devices::list_devices_handler))
@@ -531,6 +585,10 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             post(devices::approve_draft_device),
         )
         .route(
+            "/api/devices/drafts/:device_id/confirm-association",
+            post(devices::confirm_association_draft),
+        )
+        .route(
             "/api/devices/drafts/:device_id/reject",
             post(devices::reject_draft_device),
         )
@@ -586,6 +644,10 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             "/api/rules/:id/history",
             get(rules::get_rule_history_handler),
         )
+        .route(
+            "/api/rules/:id/explain",
+            get(rules::get_rule_explain_handler),
+        )
         // Messages API
         .route("/api/messages", get(messages::list_messages_handler))
         .route("/api/messages", post(messages::create_message_handler))
@@ -604,6 +666,14 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         .route(
             "/api/messages/:id",
             delete(messages::delete_message_handler),
+        )
+        .route(
+            "/api/messages/:id/chain",
+            get(messages::get_message_chain_handler),
+        )
+        .route(
+            "/api/messages/:id/false-positive",
+            post(messages::mark_message_false_positive_handler),
         )
         .route(
             "/api/messages/:id/acknowledge",
@@ -844,11 +914,13 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         // or Axum's router will route `GET /api/agents/tools` to `get_agent` with
         // id="tools". Read-only catalog of the server's ToolRegistry.
         .route("/api/agents/tools", get(agents::list_agent_tools))
+        .route("/api/agents/test-preview", post(agents::test_agent_preview))
         .route("/api/agents/:id", get(agents::get_agent))
         .route("/api/agents/:id", put(agents::update_agent))
         .route("/api/agents/:id", delete(agents::delete_agent))
         .route("/api/agents/:id/execute", post(agents::execute_agent))
         .route("/api/agents/:id/invoke", post(agents::invoke_agent))
+        .route("/api/agents/:id/test", post(agents::test_agent))
         .route("/api/agents/:id/status", post(agents::set_agent_status))
         .route(
             "/api/agents/:id/executions",
@@ -1154,9 +1226,22 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             "/api/builtin-llm/restart",
             post(crate::builtin_llm::handlers::restart_handler),
         )
+        // Deliberate stop (no file deletion); the persisted flag suppresses
+        // bootstrap/watchdog respawn until the next restart. Same hybrid-auth
+        // class as restart itself.
+        .route(
+            "/api/builtin-llm/stop",
+            post(crate::builtin_llm::handlers::stop_handler),
+        )
         .route(
             "/api/builtin-llm/activate",
             post(crate::builtin_llm::handlers::activate_handler),
+        )
+        // Runtime status is read-only (settings-card badge) — hybrid auth
+        // like the siblings; the mutating runtime endpoints are admin-only.
+        .route(
+            "/api/builtin-llm/runtime",
+            get(crate::builtin_llm::handlers::runtime_status_handler),
         )
         // Instances API (remote backend management)
         .route("/api/instances", get(instances::list_instances_handler))
@@ -1240,6 +1325,36 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         .route(
             "/api/settings/market",
             put(settings::update_market_source_handler),
+        )
+        // Builtin LLM download sources (admin): HF/catalog/runtime-channel
+        // mirror configuration for restricted networks.
+        .route(
+            "/api/settings/llm-sources",
+            get(settings::get_llm_sources_handler),
+        )
+        .route(
+            "/api/settings/llm-sources",
+            put(settings::update_llm_sources_handler),
+        )
+        // Standalone llama.cpp runtime management (admin only for the
+        // mutating endpoints — they download and swap executables, the same
+        // sensitivity class as the self-upgrade above; the read-only
+        // GET /runtime lives in protected_routes for the settings badge).
+        .route(
+            "/api/builtin-llm/runtime/check",
+            post(crate::builtin_llm::handlers::runtime_check_handler),
+        )
+        .route(
+            "/api/builtin-llm/runtime/variant",
+            post(crate::builtin_llm::handlers::runtime_variant_handler),
+        )
+        .route(
+            "/api/builtin-llm/runtime/upgrade",
+            post(crate::builtin_llm::handlers::runtime_upgrade_handler),
+        )
+        .route(
+            "/api/builtin-llm/runtime/revert",
+            post(crate::builtin_llm::handlers::runtime_revert_handler),
         )
         // Server self-upgrade (admin only): release check + staged trigger +
         // progress. Replaces the running binary — the most sensitive write

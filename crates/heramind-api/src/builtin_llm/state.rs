@@ -93,7 +93,7 @@ fn props_model_is_ours(model_path: Option<&str>, data_dir: &Path) -> bool {
 /// Best-effort reclaim of a llama-server left on the OLD default port by a
 /// previous version. Kills ONLY if the listener's reported model path lives
 /// under our data dir (an unrelated service on the port is left alone).
-async fn reclaim_legacy_llama_port(port: u16, data_dir: &Path) {
+pub(crate) async fn reclaim_legacy_llama_port(port: u16, data_dir: &Path) {
     if !super::server::health_check(port).await {
         return; // nothing there — the common case
     }
@@ -150,6 +150,12 @@ pub async fn bootstrap(
     if !cfg.enabled {
         return BootstrapOutcome::Disabled;
     }
+    if cfg.stopped {
+        // Deliberate API stop — the user turned the engine off; respawning
+        // here (boot or watchdog) would silently undo that decision.
+        tracing::info!("builtin llm deliberately stopped — skipping spawn");
+        return BootstrapOutcome::Disabled;
+    }
 
     // [legacy-port advisory] Custom (non-builtin) backends pointing at the
     // OLD builtin port keep working only while the pre-upgrade orphan lives,
@@ -172,24 +178,60 @@ pub async fn bootstrap(
         // max_context (4096) from before this instance existed.
         if let Some(inst) = manager.get_instance(BUILTIN_INSTANCE_ID) {
             let mut updated = inst;
-            if let Some(def) = model_def(&updated.model).or_else(|| Some(default_model_def())) {
+            // Catalog-only active model: synthesize from manifest + cached
+            // catalog BEFORE the LFM2.5 default — stamping the default model's
+            // name/thinking onto a different active model was a silent lie.
+            let def: BuiltinModelDef = model_def(&updated.model)
+                .cloned()
+                .or_else(|| {
+                    let mdir = super::handlers::models_dir(data_dir);
+                    super::handlers::catalog_only_def(&mdir, &updated.model)
+                })
+                .unwrap_or_else(|| default_model_def().clone());
+            {
                 updated.capabilities.supports_streaming = true;
                 updated.capabilities.supports_tools = true;
                 updated.capabilities.supports_thinking = def.default_thinking;
+                // Vision: refresh only when /props actually reports
+                // modalities — an older runtime's silence must not clear a
+                // capability stamped at spawn. Source stays runtime_api so
+                // the name-heuristic in ensure_instance_capabilities can't
+                // rewrite an observed value.
+                if let Some(v) = super::handlers::query_server_modalities_vision(cfg.port).await {
+                    updated.capabilities.supports_multimodal = v;
+                    updated.capabilities.multimodal_source = Some("runtime_api".to_string());
+                }
                 // Model property — refreshed alongside the rest: the spawn
                 // path sets it, so a short-circuited restart used to keep
                 // whatever a PREVIOUS build stamped (e.g. Ling imported
                 // before the registry field existed).
                 updated.thinking_is_integral = def.thinking_is_integral;
+                // Same for the display name — the stable instance id means a
+                // name stamped by an older build/model switch would otherwise
+                // outlive the model it described (spawn_builtin_server has the
+                // matching restamp).
+                updated.name = def.display_name.to_string();
                 // Record what the server ACTUALLY runs with: an explicit
                 // override (HERAMIND_BUILTIN_LLM_CTX / restart API) beats the
-                // per-model default — stamping the bare default here used to
+                // per-model default, and the RAM guard caps what the device
+                // can fund — stamping the bare default here used to
                 // silently rewrite a raised ctx back down (and the agent's
                 // history budget shrank to match the phantom smaller window).
-                updated.capabilities.max_context = cfg.effective_ctx(def.default_ctx);
+                updated.capabilities.max_context =
+                    super::handlers::guarded_ctx(cfg, cfg.port, def.default_ctx, Some(&def));
                 let _ = manager.upsert_instance(updated).await;
             }
         }
+        // Companion bring-up runs on the already-running path too — a main
+        // server that survived a process restart must not leave an installed
+        // companion sleeping. Skip reasons are logged inside; never fatal.
+        match super::handlers::ensure_companion(data_dir, cfg, manager).await {
+            Ok(_) => {}
+            Err(skip) => {
+                tracing::info!(reason = %skip, "builtin llm: vision companion not running")
+            }
+        }
+        super::runtime_manager::record_bootstrap_error(None);
         return BootstrapOutcome::ServerAlreadyRunning;
     }
 
@@ -200,6 +242,26 @@ pub async fn bootstrap(
     let mdir = models_dir(data_dir);
     let Some((def, manifest)): Option<(BuiltinModelDef, ModelManifest)> = installed_model(&mdir)
     else {
+        // Self-heal: model files gone but a builtin instance still on record
+        // is an orphan (a delete that failed while the instance was active
+        // leaves exactly this). It would keep appearing in the chat picker
+        // and could be activated against a dead server — drop it, active or
+        // not, so already-affected installs recover on restart.
+        if manager.get_instance(BUILTIN_INSTANCE_ID).is_some() {
+            if let Err(e) = manager.force_remove_instance(BUILTIN_INSTANCE_ID).await {
+                tracing::warn!(error = %e, "builtin llm: failed to clean up orphan instance");
+            }
+        }
+        // No MAIN model ≠ no companion: a vision companion still serves the
+        // vision tool and chat-image delegation against whatever text backend
+        // IS active (e.g. a cloud one). Skipping it here left an installed
+        // companion dead on every boot without a main model.
+        match super::handlers::ensure_companion(data_dir, cfg, manager).await {
+            Ok(_) => {}
+            Err(skip) => {
+                tracing::info!(reason = %skip, "builtin llm: vision companion not running")
+            }
+        }
         return BootstrapOutcome::ModelMissing;
     };
 
@@ -215,7 +277,12 @@ pub async fn bootstrap(
 
     let binary = match ensure_llama_server(data_dir).await {
         Ok(b) => b,
-        Err(e) => return BootstrapOutcome::Failed(format!("llama-server unavailable: {}", e)),
+        Err(e) => {
+            super::runtime_manager::record_bootstrap_error(Some(format!(
+                "llama-server unavailable: {e}"
+            )));
+            return BootstrapOutcome::Failed(format!("llama-server unavailable: {}", e));
+        }
     };
     let model_path = cfg
         .model_path
@@ -226,26 +293,70 @@ pub async fn bootstrap(
     }
 
     // spawn + healthy — ctx: explicit override (HERAMIND_BUILTIN_LLM_CTX /
-    // restart API) wins over the per-model default.
-    let effective_ctx = cfg.effective_ctx(def.default_ctx);
+    // restart API) picks the starting point, the RAM guard caps what the
+    // device can fund (128K defaults on small edge devices would OOM).
+    let effective_ctx = super::handlers::guarded_ctx(cfg, cfg.port, def.default_ctx, Some(&def));
+    // Vision projector (same resolution rules as spawn_builtin_server):
+    // manifest records it + file present; a model_path override opts out.
+    let mmproj = if cfg.model_path.is_some() {
+        None
+    } else {
+        match manifest.mmproj_path(&mdir) {
+            Some(p) if p.exists() => Some(p),
+            Some(p) => {
+                tracing::warn!(
+                    path = %p.display(),
+                    "builtin llm: mmproj recorded but file missing — spawning text-only"
+                );
+                None
+            }
+            None => None,
+        }
+    };
+    let mmproj_attached = mmproj.is_some();
+    // GPU offload sizing: an explicit NGL pin wins; otherwise auto-size to
+    // the free VRAM a discrete NVIDIA GPU actually has (a full-offload
+    // default on a shared GPU dies on its first cudaMalloc). None
+    // elsewhere preserves the llama-server default exactly.
+    let ngl = super::vram::resolve_spawn_ngl(&super::vram::NglQuery {
+        explicit: cfg.ngl,
+        binary: &binary,
+        model_path: &model_path,
+        mmproj: mmproj.as_deref(),
+        ctx: effective_ctx,
+        port: cfg.port,
+        kv_bytes_per_token_f16: def.kv_bytes_per_token,
+        kv_const_bytes: def.kv_const_bytes,
+        kv_quant: cfg.kv_quant,
+    });
     let server_cfg = LlamaServerConfig {
         binary,
         model: model_path,
         port: cfg.port,
         ctx: effective_ctx,
-        ngl: cfg.ngl,
+        ngl,
         threads: None,
-        // Per-model sampling defaults → server-side --temp/--top-p/--top-k.
+        // Per-model sampling defaults → server-side --temp/--top-p/--top-k
+        // (plus --min-p/--repeat-penalty where the official card demands).
         temperature: def.temperature,
         top_p: def.top_p,
         top_k: def.top_k,
+        min_p: def.min_p,
+        repeat_penalty: def.repeat_penalty,
+        kv_quant: cfg.kv_quant,
+        parallel: cfg.parallel,
+        mmproj,
     };
     let mut proc = match LlamaServerProcess::spawn(&server_cfg) {
         Ok(p) => p,
-        Err(e) => return BootstrapOutcome::Failed(format!("spawn failed: {}", e)),
+        Err(e) => {
+            super::runtime_manager::record_bootstrap_error(Some(format!("spawn failed: {e}")));
+            return BootstrapOutcome::Failed(format!("spawn failed: {}", e));
+        }
     };
     if let Err(e) = proc.wait_healthy(Duration::from_secs(60)).await {
         let _ = proc.stop().await;
+        super::runtime_manager::record_bootstrap_error(Some(format!("server unhealthy: {e}")));
         return BootstrapOutcome::Failed(format!("server unhealthy: {}", e));
     }
     // wait_healthy 只证明端口有 /health 响应——可能是占用该端口的其他服务
@@ -253,6 +364,10 @@ pub async fn bootstrap(
     // 会指向别人的服务器,且 kill_process_on_port 会误杀无关进程。
     if !proc.is_alive() {
         let _ = proc.stop().await;
+        super::runtime_manager::record_bootstrap_error(Some(format!(
+            "port {} in use — llama-server exited after bind",
+            cfg.port
+        )));
         return BootstrapOutcome::Failed(format!(
             "port {} in use — llama-server exited after bind (another server on that port?)",
             cfg.port
@@ -273,6 +388,9 @@ pub async fn bootstrap(
         ),
     };
     instance.is_builtin = true;
+    // Restamp the name per spawn — the stable instance id would otherwise
+    // keep the FIRST model's display name after a model switch.
+    instance.name = def.display_name.to_string();
     // Integral thinking is a MODEL property (LFM's template ignores any
     // reasoning toggle), not "is this the default model" — the default
     // moving off LFM must not flip this flag for LFM installs.
@@ -280,12 +398,40 @@ pub async fn bootstrap(
     instance.thinking_enabled = def.default_thinking;
     instance.endpoint = Some(endpoint.clone());
     instance.model = def.manifest.id.clone();
+    // Per-model sampling → instance fields (same as handlers::spawn_builtin_server).
+    // The instance fields are what chat requests send, and request-level
+    // temperature/top_p/top_k OVERRIDE the server-side --temp/--top-p/--top-k
+    // spawn defaults — a bootstrap-created instance that kept the storage
+    // defaults (0.6/0.85/20) would shadow the model's official sampling on
+    // every request. min_p/repeat_penalty have no instance/request field and
+    // stay covered by the spawn flags.
+    if let Some(t) = def.temperature {
+        instance.temperature = t;
+    }
+    if let Some(p) = def.top_p {
+        instance.top_p = p;
+    }
+    if let Some(k) = def.top_k {
+        instance.top_k = k as usize;
+    }
     // Same as handlers::spawn_builtin_server — the capability refresh loop
-    // predates this instance; set the real ctx so chat shows 128K/32K.
+    // predates this instance; set the ctx the server actually runs with
+    // (/props verbatim — no per-slot division; see effective_spawn_ctx).
     instance.capabilities.supports_streaming = true;
     instance.capabilities.supports_tools = true;
     instance.capabilities.supports_thinking = def.default_thinking;
-    instance.capabilities.max_context = effective_ctx;
+    instance.capabilities.max_context =
+        super::handlers::effective_spawn_ctx(cfg.port, effective_ctx).await;
+    // Same spawn-time vision stamp as spawn_builtin_server: /props is the
+    // authority, projector attachment the fallback for runtimes that don't
+    // report modalities. Source "runtime_api" keeps the observed value safe
+    // from ensure_instance_capabilities' name-heuristic rewrite (see the
+    // handlers.rs stamp for the full story).
+    let multimodal = super::handlers::query_server_modalities_vision(cfg.port)
+        .await
+        .unwrap_or(mmproj_attached);
+    instance.capabilities.supports_multimodal = multimodal;
+    instance.capabilities.multimodal_source = Some("runtime_api".to_string());
     let _ = manager.upsert_instance(instance).await;
 
     // 活跃策略:仅当没有任何活跃后端时设为活跃(「有后端不抢」)。
@@ -293,6 +439,15 @@ pub async fn bootstrap(
         let _ = manager.set_active(BUILTIN_INSTANCE_ID).await;
     }
 
+    // Vision companion AFTER the main model is fully up (ordering contract:
+    // main-first — a companion spawn/RAM contention must never delay or
+    // fail the chat model). Skip reasons logged, never fatal.
+    match super::handlers::ensure_companion(data_dir, cfg, manager).await {
+        Ok(_) => {}
+        Err(skip) => tracing::info!(reason = %skip, "builtin llm: vision companion not running"),
+    }
+
+    super::runtime_manager::record_bootstrap_error(None);
     BootstrapOutcome::ServerReady { endpoint }
 }
 
@@ -334,6 +489,24 @@ mod tests {
     fn pick_free_port() -> u16 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn deliberate_stop_skips_bootstrap_entirely() {
+        // stopped = 用户显式关闭:即使实例存在、模型在盘,也不得拉起。
+        // Disabled 早于一切 spawn/短路逻辑返回。
+        let manager = manager_with_builtin_instance("stopped").await;
+        let cfg = BuiltinConfig {
+            port: pick_free_port(),
+            stopped: true,
+            ..Default::default()
+        };
+        let data_dir =
+            std::env::temp_dir().join(format!("heramind-builtin-state-dir-{}", std::process::id()));
+        assert!(matches!(
+            bootstrap(&data_dir, &cfg, &manager).await,
+            BootstrapOutcome::Disabled
+        ));
     }
 
     #[tokio::test]
@@ -383,6 +556,19 @@ mod tests {
             matches!(outcome, BootstrapOutcome::ServerAlreadyRunning),
             "healthy server with instance record must short-circuit (got {:?})",
             outcome
+        );
+        // Regression (model-switch stale name): the refresh path must restamp
+        // the display name — the STABLE instance id otherwise keeps whatever
+        // name the first model stamped, and the chat picker showed the OLD
+        // model after a switch. Model "" resolves to the registry default
+        // (resolve via default_model_def so future default flips don't
+        // stale-proof this assertion).
+        let refreshed = manager
+            .get_instance(BUILTIN_INSTANCE_ID)
+            .expect("instance survived refresh");
+        assert_eq!(
+            refreshed.name,
+            heramind_core::builtin_llm::manifest::default_model_def().display_name
         );
     }
 }

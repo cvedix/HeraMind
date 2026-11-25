@@ -74,6 +74,11 @@ impl PromptBuilder {
         } else {
             prompt = strip_block(&prompt, THINKING_BEGIN, THINKING_END);
         }
+        // Host facts (OS/kernel/arch/CPU/RAM/LAN IP) — cached summary line
+        // from heramind-core; answers "what are you running on" without a
+        // tool round-trip (2026-10-15: the model had NO environment source
+        // and answered 我不确定 to "你不是运行在ubuntu上吗").
+        prompt = prompt.replace("{{HOST_FACTS}}", &heramind_core::host::host_summary());
         prompt
     }
 
@@ -81,7 +86,7 @@ impl PromptBuilder {
     pub fn get_intent_prompt_addon(&self, intent: &str) -> String {
         match intent {
             "device" => "\n\n## Current Task: Device Management\nFocus on device queries and control operations.".to_string(),
-            "data" => "\n\n## Current Task: Data Analysis\nGather real data via tools, then provide insights, root-cause analysis, and actionable recommendations.\n\nUse `heramind device history <id> --metric <name>` for time-series data — never fabricate values.".to_string(),
+            "data" => "\n\n## Current Task: Data Analysis\nGather real data via tools, then provide insights, root-cause analysis, and actionable recommendations.\n\nRun read-only analytics immediately. Find the device and metric in the dashboard binding or device metadata. For adjacent hours, use `heramind device history <id> --metric <name> --time-range 1h --aggregate sum` and add `--offset 1h --aggregate sum` for the prior hour. Report both time windows and measured values. Change a dashboard only when asked.".to_string(),
             "rule" => "\n\n## Current Task: Rule Management\nFocus on creating and modifying automation rules.".to_string(),
             "alert" | "message" => "\n\n## Current Task: Message Management\nFocus on message queries, sending, and status updates.".to_string(),
             "system" => "\n\n## Current Task: System Status\nFocus on system health checks and status queries.".to_string(),
@@ -137,7 +142,7 @@ mod tests {
         let prompt = builder.build_system_prompt();
         assert!(prompt.contains("HeraMind"));
         assert!(prompt.contains("IoT"));
-        assert!(prompt.contains("Principles"));
+        assert!(prompt.contains("Task and execution"));
         assert!(!prompt.contains("Visual Understanding"));
     }
 
@@ -145,7 +150,7 @@ mod tests {
     fn test_prompt_without_examples() {
         let builder = PromptBuilder::new();
         let prompt = builder.build_system_prompt();
-        assert!(prompt.contains("Principles"));
+        assert!(prompt.contains("Task and execution"));
         assert!(!prompt.contains("Example Dialogs"));
     }
 
@@ -153,7 +158,7 @@ mod tests {
     fn test_prompt_without_thinking() {
         let builder = PromptBuilder::new().with_thinking(false);
         let prompt = builder.build_system_prompt();
-        assert!(prompt.contains("Principles"));
+        assert!(prompt.contains("Task and execution"));
         assert!(!prompt.contains("Thinking Mode"));
     }
 
@@ -162,26 +167,27 @@ mod tests {
         let builder = PromptBuilder::new();
         let addon = builder.get_intent_prompt_addon("data");
         assert!(addon.contains("Data Analysis"));
+        assert!(addon.contains("--offset 1h --aggregate sum"));
     }
 
     #[test]
     fn test_language_policy_in_prompt() {
         let builder = PromptBuilder::new();
         let prompt = builder.build_system_prompt();
-        assert!(prompt.contains("Language Policy"));
-        assert!(prompt.contains("Highest Priority"));
+        assert!(prompt.contains("Identity and language"));
         let prompt_lower = prompt.to_lowercase();
         assert!(prompt_lower.contains("same language"));
-        assert!(prompt.contains("User writes in Vietnamese → respond in Vietnamese"));
     }
 
     #[test]
     fn test_no_cli_reference_table() {
-        // The canonical slim prompt drops the CLI reference table AND the
-        // --help guidance (saved tokens) — details live in skills/--help.
+        // Keep syntax discovery without embedding the CLI reference table.
         let prompt = PromptBuilder::new().build_system_prompt();
         assert!(!prompt.contains("CLI Command Reference"));
-        assert!(!prompt.contains("--help"), "slim drops --help guidance");
+        assert!(
+            prompt.contains("--help"),
+            "unfamiliar syntax has an on-demand discovery path"
+        );
     }
 
     #[test]
@@ -211,12 +217,29 @@ mod tests {
         let builder = PromptBuilder::new();
         let prompt = builder.build_system_prompt();
         // Tier 1 rules must remain
-        assert!(prompt.contains("No Hallucinated Operations"));
-        assert!(prompt.contains("Task Workflow"));
-        assert!(prompt.contains("BATCH RULE"));
-        assert!(prompt.contains("Domain Boundaries"));
-        assert!(prompt.contains("Read-only analytics execute immediately"));
-        assert!(prompt.contains("--offset 1h --aggregate sum"));
+        assert!(prompt.contains("Do not invent resources"));
+        assert!(prompt.contains("gather missing facts"));
+        assert!(prompt.contains("Parallelize independent reads"));
+        assert!(prompt.contains("Platform data comes from the CLI"));
+    }
+
+    /// NM-249: do not treat every `accepted` as pending; distinguish async agent
+    /// poll-by-ref from device adapter_accepted (report dispatched; verify only on ask).
+    #[test]
+    fn nm249_accepted_copy_distinguishes_agent_vs_device() {
+        let prompt = PromptBuilder::new().build_system_prompt();
+        assert!(prompt.contains("adapter_accepted"));
+        assert!(prompt.contains("report as dispatched"));
+        assert!(prompt.contains("device acknowledgment none"));
+        assert!(prompt.contains("physical effect unverified"));
+        assert!(prompt.contains("Check device feedback only if the user asked"));
+        assert!(!prompt.contains("dispatched to the broker"));
+        assert!(prompt.contains("poll by the returned execution reference"));
+        assert!(!prompt.contains("Executing/accepted means still pending"));
+        assert!(!prompt.contains("weather-forecast-v2_get_weather"));
+        // NM-252: capability discovery is task-search first, then schema by id.
+        assert!(prompt.contains("extension commands --search"));
+        assert!(prompt.contains("extension commands <id>"));
     }
 
     #[test]
@@ -250,12 +273,43 @@ mod tests {
     fn test_default_prompt_preserves_rules() {
         // The canonical prompt must keep every hard constraint.
         let prompt = PromptBuilder::new().build_system_prompt();
-        assert!(prompt.contains("Language Policy"));
-        assert!(prompt.contains("No Hallucinated Operations"));
-        assert!(prompt.contains("BATCH RULE"));
-        assert!(prompt.contains("Tool-First"));
-        assert!(prompt.contains("{{CURRENT_TIME}}")); // KV-cache boundary preserved
+        assert!(prompt.contains("Identity and language"));
+        assert!(prompt.contains("Do not invent resources"));
+        assert!(prompt.contains("Parallelize independent reads"));
+        assert!(prompt.contains("Live checks and actual operations require evidence"));
+        // Base template must stay static (KV-cache friendly); `## Current time`
+        // is appended at the tail after assembly in `LlmInterface`.
+        assert!(!prompt.contains("{{CURRENT_TIME}}"));
+        assert!(!prompt.contains("## Current time"));
         assert!(prompt.contains("## Environment"));
-        assert!(prompt.contains("Device Onboarding Guidance")); // guided onboarding
+        assert!(prompt.contains("load device-onboarding")); // guided onboarding
+    }
+
+    #[test]
+    fn test_image_delivery_and_exact_edit_rules_in_prompt() {
+        // Regression guards for the watermark-session failure modes:
+        // the model replied with `ls` output instead of showing the image,
+        // and added unrequested annotations instead of the named text.
+        let prompt = PromptBuilder::new().build_system_prompt();
+        assert!(
+            prompt.contains("Show images you produce"),
+            "must instruct embedding tool-produced images via ![...](url)"
+        );
+        assert!(
+            prompt.contains("![short description](url)"),
+            "must show the exact markdown image syntax"
+        );
+        assert!(
+            prompt.contains("Edits are exact"),
+            "must instruct applying exactly the requested edit"
+        );
+    }
+
+    #[test]
+    fn test_language_policy_covers_reports() {
+        // The model answered a Chinese question with an English technical
+        // report — the policy must explicitly cover non-conversational replies.
+        let prompt = PromptBuilder::new().build_system_prompt();
+        assert!(prompt.contains("tool-result summaries included"));
     }
 }

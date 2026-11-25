@@ -155,6 +155,12 @@ pub enum MessageStatus {
     Resolved,
     /// Message has been archived
     Archived,
+    /// An operator dismissed this alert as a false positive (002 §3.4). Not a
+    /// lifecycle step like the others: it is a verdict on the alert's quality,
+    /// and it is what the feedback loop counts when it suggests a threshold
+    /// change. Appended LAST — the wire form is a string, but stored rows are
+    /// read back by name and the order has always been append-only.
+    FalsePositive,
 }
 
 impl MessageStatus {
@@ -164,6 +170,7 @@ impl MessageStatus {
             Self::Acknowledged => "acknowledged",
             Self::Resolved => "resolved",
             Self::Archived => "archived",
+            Self::FalsePositive => "false_positive",
         }
     }
 
@@ -191,6 +198,7 @@ impl MessageStatus {
             Self::Acknowledged => "Acknowledged",
             Self::Resolved => "Resolved",
             Self::Archived => "Archived",
+            Self::FalsePositive => "False Positive",
         }
     }
 
@@ -200,6 +208,7 @@ impl MessageStatus {
             "acknowledged" | "已确认" => Some(Self::Acknowledged),
             "resolved" | "已解决" => Some(Self::Resolved),
             "archived" | "已归档" => Some(Self::Archived),
+            "false_positive" | "误报" => Some(Self::FalsePositive),
             _ => None,
         }
     }
@@ -240,9 +249,22 @@ pub struct Message {
         deserialize_with = "MessageStatus::deserialize"
     )]
     pub status: MessageStatus,
+    /// When/by whom this alert was acknowledged — persisted since the
+    /// state-machine guard rework (these used to exist only in the stored
+    /// row and were nulled on every store round-trip).
+    pub acknowledged_at: Option<i64>,
+    pub acknowledged_by: Option<String>,
+    pub resolved_at: Option<i64>,
     /// Additional metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Explicit channel routing. `None` (the default) keeps broadcast
+    /// semantics: every channel whose filter accepts the message gets it.
+    /// `Some(names)` narrows delivery to exactly those channels (still
+    /// respecting enabled state and per-channel filters) — the primitive
+    /// per-agent notification routing builds on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_channels: Option<Vec<String>>,
     /// Associated tags
     #[serde(default)]
     pub tags: Vec<String>,
@@ -268,7 +290,11 @@ impl Message {
             source_type: "system".to_string(),
             timestamp: now,
             status: MessageStatus::Active,
+            acknowledged_at: None,
+            acknowledged_by: None,
+            resolved_at: None,
             metadata: None,
+            target_channels: None,
             tags: Vec::new(),
         }
     }
@@ -349,18 +375,60 @@ impl Message {
     }
 
     /// Acknowledge the message.
-    pub fn acknowledge(&mut self) {
+    /// Acknowledge the message — only from Active. Illegal transitions are
+    /// REJECTED (return false, status untouched): a Resolved alert could be
+    /// demoted back to Acknowledged, and an ack/resolve on a FalsePositive
+    /// SILENTLY DESTROYED the feedback-loop sample (the false-alarm
+    /// statistics key on that status).
+    pub fn acknowledge(&mut self) -> bool {
+        if self.status != MessageStatus::Active {
+            return false;
+        }
         self.status = MessageStatus::Acknowledged;
+        self.acknowledged_at = Some(chrono::Utc::now().timestamp());
+        true
     }
 
-    /// Resolve the message.
-    pub fn resolve(&mut self) {
+    /// Resolve the message — from Active or Acknowledged.
+    pub fn resolve(&mut self) -> bool {
+        if !matches!(
+            self.status,
+            MessageStatus::Active | MessageStatus::Acknowledged
+        ) {
+            return false;
+        }
         self.status = MessageStatus::Resolved;
+        self.resolved_at = Some(chrono::Utc::now().timestamp());
+        true
     }
 
-    /// Archive the message.
-    pub fn archive(&mut self) {
+    /// Mark this alert as a false positive — from Active or Acknowledged.
+    /// Terminal: the verdict the feedback loop counts (002 §3.4 turns "this
+    /// should not have fired" into a correction sample, and enough of them
+    /// into a suggested threshold change), so it must not be reversible by
+    /// a late ack.
+    pub fn mark_false_positive(&mut self) -> bool {
+        if !matches!(
+            self.status,
+            MessageStatus::Active | MessageStatus::Acknowledged
+        ) {
+            return false;
+        }
+        self.status = MessageStatus::FalsePositive;
+        true
+    }
+
+    /// Archive the message — allowed from any non-archived status, but
+    /// never out of FalsePositive (same sample-protection reason).
+    pub fn archive(&mut self) -> bool {
+        if matches!(
+            self.status,
+            MessageStatus::Archived | MessageStatus::FalsePositive
+        ) {
+            return false;
+        }
         self.status = MessageStatus::Archived;
+        true
     }
 
     /// Check if the message is active.
@@ -370,7 +438,125 @@ impl Message {
 }
 
 #[cfg(test)]
+mod transition_matrix_tests {
+    use super::*;
+
+    /// The FULL action × status matrix for the guarded alert state machine.
+    /// Legal: ack only from Active; resolve from Active/Acknowledged;
+    /// false-positive from Active/Acknowledged (terminal after); archive
+    /// from anything except Archived/FalsePositive. Everything else must be
+    /// refused WITH THE STATUS UNTOUCHED — a refused transition that also
+    /// mutated would be worse than the unguarded original.
+    #[test]
+    fn transition_matrix_is_exactly_the_legal_set() {
+        let mut legal: Vec<(MessageStatus, &str)> = Vec::new();
+        for start in [
+            MessageStatus::Active,
+            MessageStatus::Acknowledged,
+            MessageStatus::Resolved,
+            MessageStatus::FalsePositive,
+            MessageStatus::Archived,
+        ] {
+            let (ack, res, fp, arch) = (
+                start == MessageStatus::Active,
+                matches!(start, MessageStatus::Active | MessageStatus::Acknowledged),
+                matches!(start, MessageStatus::Active | MessageStatus::Acknowledged),
+                !matches!(
+                    start,
+                    MessageStatus::Archived | MessageStatus::FalsePositive
+                ),
+            );
+            {
+                let mut m0 =
+                    Message::alert(MessageSeverity::Warning, "t".into(), "b".into(), "s".into());
+                m0.status = start;
+                let mut m = m0.clone();
+                assert_eq!(m.acknowledge(), ack, "acknowledge from {start:?}");
+                if !ack {
+                    assert_eq!(m.status, start, "refused ack must not mutate: {start:?}");
+                } else {
+                    legal.push((start, "ack"));
+                }
+
+                let mut m = m0.clone();
+                assert_eq!(m.resolve(), res, "resolve from {start:?}");
+                if !res {
+                    assert_eq!(
+                        m.status, start,
+                        "refused resolve must not mutate: {start:?}"
+                    );
+                } else {
+                    legal.push((start, "resolve"));
+                }
+
+                let mut m = m0.clone();
+                assert_eq!(m.mark_false_positive(), fp, "false-positive from {start:?}");
+                if !fp {
+                    assert_eq!(m.status, start, "refused fp must not mutate: {start:?}");
+                } else {
+                    legal.push((start, "fp"));
+                }
+
+                let mut m = m0;
+                assert_eq!(m.archive(), arch, "archive from {start:?}");
+                if !arch {
+                    assert_eq!(
+                        m.status, start,
+                        "refused archive must not mutate: {start:?}"
+                    );
+                } else {
+                    legal.push((start, "archive"));
+                }
+            }
+        }
+        // 8 legal transitions: ack(Active) + resolve(Active, Ack) +
+        // fp(Active, Ack) + archive(Active, Ack, Resolved).
+        assert_eq!(legal.len(), 8, "exactly the designed legal set: {legal:?}");
+    }
+
+    /// The audit stamps land exactly on the transitions that own them.
+    #[test]
+    fn audit_fields_stamp_on_their_own_transitions_only() {
+        let mut m = Message::alert(MessageSeverity::Warning, "t".into(), "b".into(), "s".into());
+        assert!(m.acknowledge());
+        assert!(m.acknowledged_at.is_some(), "ack stamps acknowledged_at");
+        assert!(m.resolve());
+        assert!(m.resolved_at.is_some(), "resolve stamps resolved_at");
+        assert!(m.acknowledged_at.is_some(), "resolve keeps the ack stamp");
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    /// M2-5 / 002 §3.4: the alert-level feedback loop needs a verdict that
+    /// means "this should not have fired". It is its own status rather than a
+    /// flag, because it replaces the alert's lifecycle state the way
+    /// acknowledge/resolve do — and the web UI has been carrying a
+    /// `false_positive` label for it since before the status existed.
+    #[test]
+    fn a_false_positive_is_its_own_status() {
+        let mut message = Message::new(
+            "alert",
+            MessageSeverity::Warning,
+            "Cold room".to_string(),
+            "out of range".to_string(),
+            "rule_engine".to_string(),
+        );
+        assert_eq!(message.status, MessageStatus::Active);
+
+        message.mark_false_positive();
+        assert_eq!(message.status, MessageStatus::FalsePositive);
+
+        // The wire name is what every other consumer keys on: the i18n label,
+        // the frontend status map, and the stored rows.
+        assert_eq!(MessageStatus::FalsePositive.as_str(), "false_positive");
+        assert_eq!(
+            MessageStatus::from_string("false_positive"),
+            Some(MessageStatus::FalsePositive),
+            "a stored verdict must read back"
+        );
+    }
+
     use super::*;
 
     #[test]

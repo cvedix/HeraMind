@@ -37,6 +37,23 @@ impl Default for MessageManager {
     }
 }
 
+/// Delivery outcome of [`MessageManager::try_create_message`].
+///
+/// `create_message` returns `Ok` even when every channel failed (the
+/// message is stored; only the push was lost) — callers that keep their own
+/// audit records, like the rule engine's history rows, need this report to
+/// distinguish "alert delivered" from "alert accepted, delivery lost".
+#[derive(Debug, Clone)]
+pub struct DeliveryReport {
+    /// At least one channel attempted delivery (enabled, passed filter,
+    /// routed). False = deduped or no channel was tried.
+    pub attempted: bool,
+    /// At least one channel acknowledged the send.
+    pub delivered_any: bool,
+    /// Per-channel failure reasons, "name: error" — empty on success.
+    pub failures: Vec<String>,
+}
+
 impl MessageManager {
     /// Create a new in-memory message manager (no persistence).
     pub fn new() -> Self {
@@ -187,7 +204,9 @@ impl MessageManager {
                 }
                 _ => {
                     tracing::warn!("Unknown channel type: {}, skipping", stored.channel_type);
-                    Ok(None)
+                    // Type pinned here so a build with every channel feature
+                    // disabled (only this arm survives) still infers.
+                    Ok::<_, Error>(None)
                 }
             };
 
@@ -250,8 +269,13 @@ impl MessageManager {
             timestamp: chrono::DateTime::from_timestamp(stored.timestamp, 0)
                 .unwrap_or_else(chrono::Utc::now),
             status: MessageStatus::from_string(&stored.status).unwrap_or(MessageStatus::Active),
+            // Hydrate the audit trail back from storage.
+            acknowledged_at: stored.acknowledged_at,
+            acknowledged_by: stored.acknowledged_by,
+            resolved_at: stored.resolved_at,
             metadata: stored.metadata,
             tags: stored.tags.unwrap_or_default(),
+            target_channels: None,
         }
     }
 
@@ -273,9 +297,11 @@ impl MessageManager {
             },
             metadata: msg.metadata.clone(),
             timestamp: msg.timestamp.timestamp(),
-            acknowledged_at: None,
-            resolved_at: None,
-            acknowledged_by: None,
+            // Audit trail: these used to be nulled on EVERY store round-trip,
+            // so "who acknowledged this and when" never survived persistence.
+            acknowledged_at: msg.acknowledged_at,
+            resolved_at: msg.resolved_at,
+            acknowledged_by: msg.acknowledged_by.clone(),
         }
     }
 
@@ -297,20 +323,48 @@ impl MessageManager {
     }
 
     /// Create and send a message.
+    ///
+    /// Returns `Ok` even when every channel failed — the message IS stored;
+    /// only the push was lost (that distinction used to live solely in
+    /// logs). Callers that need the delivery outcome to keep their own
+    /// records honest (the rule engine's history rows) use
+    /// [`MessageManager::try_create_message`].
     pub async fn create_message(&self, message: Message) -> Result<Message> {
+        self.try_create_message(message).await.map(|(m, _)| m)
+    }
+
+    /// Create and send a message, reporting the delivery outcome.
+    pub async fn try_create_message(&self, message: Message) -> Result<(Message, DeliveryReport)> {
         let id = message.id.clone();
         let _is_active = message.is_active();
         let severity = message.severity;
 
-        // Deduplication: skip if same title+source+severity was sent recently
-        let dedup_key = format!(
-            "{}|{}|{}",
-            message.title,
-            message.source,
-            message.severity.as_str()
-        );
+        // Deduplication: skip if the same alert was sent recently.
+        //
+        // The fallback key is title+source+severity, but that is not enough
+        // for rule alerts: every one of them is titled "Rule Triggered" with
+        // source "rule_engine", so two different rules firing seconds apart
+        // collapsed into a single key and the second one's push was silently
+        // dropped. When the message carries the triggering rule's identity,
+        // that identity — not the boilerplate title — is what gets deduped.
+        let dedup_key = match alert_identity(&message) {
+            Some(identity) => format!("{}|{}", identity, message.severity.as_str()),
+            None => format!(
+                "{}|{}|{}",
+                message.title,
+                message.source,
+                message.severity.as_str()
+            ),
+        };
         {
-            let cache = self.dedup_cache.read().await;
+            // Check-and-MARK in ONE lock scope: the old read-check here and
+            // the write-back AFTER the fan-out left a window in which two
+            // concurrent same-key alerts both passed dedup and both pushed
+            // (a window the concurrent fan-out rework lengthened to the sum
+            // of channel timeouts). Marking up front closes it; the mark
+            // also covers the send duration, which is exactly the interval
+            // a duplicate would arrive over.
+            let cache = self.dedup_cache.write().await;
             if let Some(last_sent) = cache.get(&dedup_key) {
                 let elapsed = (chrono::Utc::now() - *last_sent).num_seconds();
                 if elapsed < DEDUP_INTERVAL_SECS {
@@ -328,9 +382,23 @@ impl MessageManager {
                         let stored = Self::message_to_stored(&message);
                         let _ = store.insert_async(stored).await;
                     }
-                    return Ok(message);
+                    return Ok((
+                        message,
+                        DeliveryReport {
+                            attempted: false,
+                            delivered_any: false,
+                            failures: Vec::new(),
+                        },
+                    ));
                 }
             }
+        }
+
+        // Reserve the key NOW (covers the in-flight send window): concurrent
+        // same-key alerts see the mark and take the dedup path above.
+        {
+            let mut cache = self.dedup_cache.write().await;
+            cache.insert(dedup_key.clone(), chrono::Utc::now());
         }
 
         // Store in memory for all message types (Notification and DataPush)
@@ -353,60 +421,153 @@ impl MessageManager {
         let channel_names = channels.list_names().await;
         let mut send_results: Vec<(String, std::result::Result<(), String>)> = Vec::new();
 
-        for channel_name in &channel_names {
-            if let Some(channel) = channels.get(channel_name).await {
-                // Use the registry's effective enabled state — this honors
-                // the `set_enabled` override (`PUT /channels/:name/enabled`).
-                // Calling `channel.is_enabled()` directly would bypass the
-                // override and keep delivering to "disabled" channels.
-                if channels.is_enabled_effective(channel_name).await {
-                    // Apply filter before sending
-                    let filter = channels.get_filter(channel_name).await;
-                    if !filter.matches(&message) {
-                        tracing::debug!(
-                            "Channel '{}' filter rejected message '{}'",
-                            channel_name,
-                            message.title
-                        );
-                        continue;
-                    }
-
-                    tracing::info!(
-                        "Sending message through channel '{}' (type: {})",
-                        channel_name,
-                        channel.channel_type()
+        // Fan out concurrently. Sends used to be awaited sequentially, so one
+        // slow channel (a webhook eating its full 30s timeout) delayed alert
+        // delivery to every channel behind it — and a hung SMTP server, which
+        // has no timeout of its own, stalled the rule engine's notify action.
+        let mut tasks: Vec<(String, tokio::task::JoinHandle<Result<()>>)> = Vec::new();
+        for channel_name in channel_names {
+            let Some(channel) = channels.get(&channel_name).await else {
+                continue;
+            };
+            // Use the registry's effective enabled state — this honors
+            // the `set_enabled` override (`PUT /channels/:name/enabled`).
+            // Calling `channel.is_enabled()` directly would bypass the
+            // override and keep delivering to "disabled" channels.
+            if !channels.is_enabled_effective(&channel_name).await {
+                continue;
+            }
+            // Explicit routing narrows delivery; None broadcasts.
+            if let Some(targets) = &message.target_channels {
+                if !targets.iter().any(|t| t == &channel_name) {
+                    tracing::debug!(
+                        "Channel '{}' not in target_channels, skipping",
+                        channel_name
                     );
+                    continue;
+                }
+            }
+            // Apply filter before sending
+            let filter = channels.get_filter(&channel_name).await;
+            if !filter.matches(&message) {
+                tracing::debug!(
+                    "Channel '{}' filter rejected message '{}'",
+                    channel_name,
+                    message.title
+                );
+                continue;
+            }
 
-                    match channel.send(&message).await {
-                        Ok(()) => {
-                            tracing::info!(
-                                "Successfully sent message through channel '{}'",
-                                channel_name
-                            );
-                            send_results.push((channel_name.clone(), Ok(())));
-                        }
-                        Err(e) => {
-                            // Log channel failure but don't fail the entire
-                            // operation. Scrub first: reqwest errors embed the
-                            // request URL, and channel tokens live in URLs.
-                            let scrubbed = scrub_credentials(&e.to_string());
-                            tracing::warn!(
-                                "Failed to send message through channel '{}': {}",
-                                channel_name,
-                                scrubbed
-                            );
-                            send_results.push((channel_name.clone(), Err(scrubbed)));
+            tracing::info!(
+                "Sending message through channel '{}' (type: {})",
+                channel_name,
+                channel.channel_type()
+            );
+
+            let msg = message.clone();
+            tasks.push((
+                channel_name,
+                tokio::spawn(async move {
+                    // [bounded retry] a single transient failure (429, a
+                    // 5s network blip) used to permanently drop the alert
+                    // on that channel — notifications were at-most-once
+                    // while the sibling data-push subsystem retries with
+                    // backoff. Three attempts, short backoffs; a channel
+                    // that still fails is reported to the aggregate below.
+                    let mut last_err = None;
+                    for attempt in 1..=3 {
+                        match channel.send(&msg).await {
+                            Ok(()) => return Ok(()),
+                            Err(e) => {
+                                tracing::warn!(
+                                    attempt,
+                                    error = %crate::manager::scrub_credentials(&e.to_string()),
+                                    "channel send attempt failed"
+                                );
+                                last_err = Some(e);
+                                if attempt < 3 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(
+                                        attempt as u64,
+                                    ))
+                                    .await;
+                                }
+                            }
                         }
                     }
+                    Err(last_err.unwrap_or_else(|| {
+                        Error::Other(anyhow::anyhow!("send failed without error"))
+                    }))
+                }),
+            ));
+        }
+
+        for (channel_name, handle) in tasks {
+            match handle.await {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        "Successfully sent message through channel '{}'",
+                        channel_name
+                    );
+                    send_results.push((channel_name, Ok(())));
+                }
+                Ok(Err(e)) => {
+                    // Log channel failure but don't fail the entire
+                    // operation. Scrub first: reqwest errors embed the
+                    // request URL, and channel tokens live in URLs.
+                    let scrubbed = scrub_credentials(&e.to_string());
+                    tracing::warn!(
+                        "Failed to send message through channel '{}': {}",
+                        channel_name,
+                        scrubbed
+                    );
+                    send_results.push((channel_name, Err(scrubbed)));
+                }
+                Err(join_err) => {
+                    let scrubbed = scrub_credentials(&join_err.to_string());
+                    tracing::warn!(
+                        "Channel '{}' send task panicked: {}",
+                        channel_name,
+                        scrubbed
+                    );
+                    send_results.push((channel_name, Err(scrubbed)));
                 }
             }
         }
 
+        // Delivery outcome for the caller (see DeliveryReport): computed
+        // once here, reused by the all-failed log below and the return.
+        let report = DeliveryReport {
+            attempted: !send_results.is_empty(),
+            delivered_any: send_results.iter().any(|r| r.1.is_ok()),
+            failures: send_results
+                .iter()
+                .filter_map(|(name, r)| r.as_ref().err().map(|e| format!("{name}: {e}")))
+                .collect(),
+        };
+
         // Log if all channels failed (but message was still created successfully)
-        let any_success = send_results.iter().any(|r| r.1.is_ok());
-        if !any_success && !send_results.is_empty() {
-            tracing::warn!(
-                "All channels failed for message '{}', but message was stored successfully",
+        if !report.delivered_any && report.attempted {
+            // Release the dedup key: it was marked BEFORE the fan-out to
+            // close the concurrent-duplicate window, but with EVERY channel
+            // dead the mark now only suppresses the NEXT legitimate alert
+            // for the whole DEDUP_INTERVAL — the outage goes quiet exactly
+            // when it should be loudest. The in-flight-send window already
+            // passed; concurrent duplicates at this point are far less
+            // costly than a 60s black hole.
+            {
+                let mut cache = self.dedup_cache.write().await;
+                cache.remove(&dedup_key);
+                tracing::warn!(
+                    key = %dedup_key,
+                    "All channels failed — dedup key released so the next occurrence can retry"
+                );
+            }
+            // Escalated to error with the per-channel reasons: "all channels
+            // failed" used to be a single anonymous warn line — the operator
+            // could not tell a dead webhook from a revoked token.
+            tracing::error!(
+                channels = %report.failures.join("; "),
+                "ALL notification channels failed for message '{}' (after retries) — message stored, delivery lost",
                 message.title
             );
         }
@@ -444,7 +605,7 @@ impl MessageManager {
             message.category
         );
 
-        Ok(message)
+        Ok((message, report))
     }
 
     /// Create a simple alert message.
@@ -528,6 +689,32 @@ impl MessageManager {
     }
 
     /// Acknowledge a message.
+    /// Dismiss an alert as a false positive (002 §3.4).
+    pub async fn mark_false_positive(&self, id: &MessageId) -> Result<()> {
+        let stored_msg = {
+            let mut messages = self.messages.write().await;
+            let message = messages
+                .get_mut(id)
+                .ok_or_else(|| Error::NotFound(format!("Message not found: {}", id)))?;
+            if !message.mark_false_positive() {
+                return Err(Error::Validation(format!(
+                    "cannot mark message {} as false positive in status {:?}",
+                    id, message.status
+                )));
+            }
+            Self::message_to_stored(message)
+        };
+
+        if let Some(store) = self.storage.read().await.as_ref() {
+            store
+                .update_async(stored_msg)
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to update message: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
     pub async fn acknowledge(&self, id: &MessageId) -> Result<()> {
         // Mutate in-memory, then drop write lock before I/O
         let stored_msg = {
@@ -535,7 +722,15 @@ impl MessageManager {
             let message = messages
                 .get_mut(id)
                 .ok_or_else(|| Error::NotFound(format!("Message not found: {}", id)))?;
-            message.acknowledge();
+            if !message.acknowledge() {
+                // Illegal transition (e.g. already Resolved/FalsePositive) —
+                // refuse instead of silently overwriting the status.
+                return Err(Error::Validation(format!(
+                    "cannot acknowledge message {} in status {:?}",
+                    id, message.status
+                )));
+            }
+            message.acknowledged_by = Some("api".to_string());
             Self::message_to_stored(message)
         };
 
@@ -569,7 +764,12 @@ impl MessageManager {
             let message = messages
                 .get_mut(id)
                 .ok_or_else(|| Error::NotFound(format!("Message not found: {}", id)))?;
-            message.resolve();
+            if !message.resolve() {
+                return Err(Error::Validation(format!(
+                    "cannot resolve message {} in status {:?}",
+                    id, message.status
+                )));
+            }
             Self::message_to_stored(message)
         };
 
@@ -600,7 +800,12 @@ impl MessageManager {
             let message = messages
                 .get_mut(id)
                 .ok_or_else(|| Error::NotFound(format!("Message not found: {}", id)))?;
-            message.archive();
+            if !message.archive() {
+                return Err(Error::Validation(format!(
+                    "cannot archive message {} in status {:?}",
+                    id, message.status
+                )));
+            }
             Self::message_to_stored(message)
         };
 
@@ -671,9 +876,15 @@ impl MessageManager {
 
             for id in ids {
                 if let Some(message) = messages.get_mut(id) {
-                    message.acknowledge();
-                    count += 1;
-                    to_persist.push(Self::message_to_stored(message));
+                    // Guarded transition (review catch: the single-action
+                    // paths got guards, this bulk path was missed) — an
+                    // already-Resolved/FalsePositive entry is skipped, not
+                    // counted.
+                    if message.acknowledge() {
+                        message.acknowledged_by = Some("api".to_string());
+                        count += 1;
+                        to_persist.push(Self::message_to_stored(message));
+                    }
                 }
             }
             (count, to_persist)
@@ -698,9 +909,12 @@ impl MessageManager {
 
             for id in ids {
                 if let Some(message) = messages.get_mut(id) {
-                    message.resolve();
-                    count += 1;
-                    to_persist.push(Self::message_to_stored(message));
+                    // Guarded transition: an already-Resolved/FalsePositive
+                    // entry is skipped, not counted as resolved.
+                    if message.resolve() {
+                        count += 1;
+                        to_persist.push(Self::message_to_stored(message));
+                    }
                 }
             }
             (count, to_persist)
@@ -858,6 +1072,28 @@ where
     }
 }
 
+/// The identity of the *event* behind a message, when its producer supplies
+/// one. Rule alerts are the case that needs it: they all share the title
+/// "Rule Triggered" and the source "rule_engine", so a title+source dedup key
+/// cannot tell two rules apart and drops the second rule's push.
+///
+/// The `rule_id` / `trigger_source` keys are written by
+/// `heramind_rules::chain` (`RULE_ID_KEY`, `TRIGGER_SOURCE_KEY`) and cannot be
+/// imported here — heramind-rules depends on this crate, not the other way
+/// round. The pair is what makes two alerts distinct: the rule that fired and
+/// the source that satisfied its condition, so one rule flapping across ten
+/// devices still reports each device while a single device's repeats are
+/// suppressed.
+fn alert_identity(message: &Message) -> Option<String> {
+    let metadata = message.metadata.as_ref()?;
+    let rule_id = metadata.get("rule_id")?.as_str()?;
+    let trigger_source = metadata
+        .get("trigger_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    Some(format!("rule:{rule_id}|{trigger_source}"))
+}
+
 /// Scrub credential-looking substrings from a channel error text before it
 /// is logged or returned to an API client. reqwest error Display embeds the
 /// full request URL, and the notification channels carry their tokens in
@@ -867,6 +1103,33 @@ where
 pub(crate) fn scrub_credentials(text: &str) -> String {
     // Credential-bearing query parameters (value runs to the next & or quote).
     let mut out = text.to_string();
+
+    // PATH-embedded tokens first: Telegram puts the bot credential in the
+    // URL path (`.../bot<id>:<secret>/...`), which the query-parameter pass
+    // below never sees — caught by the test-endpoint impact test, where the
+    // working token survived the scrub and crossed the API boundary intact.
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SCAN: AtomicUsize = AtomicUsize::new(0);
+        let mut cursor = 0usize;
+        while let Some(rel) = out[cursor..].find("/bot") {
+            let start = cursor + rel + "/bot".len();
+            let end = out[start..]
+                .find('/')
+                .map(|e| start + e)
+                .unwrap_or(out.len());
+            if end > start && out[start..end].contains(':') {
+                out.replace_range(start..end, "***");
+                SCAN.fetch_add(1, Ordering::Relaxed);
+                cursor = start + 3;
+            } else {
+                cursor = start;
+            }
+            if cursor >= out.len() {
+                break;
+            }
+        }
+    }
     for key in [
         "token",
         "key",
@@ -1037,6 +1300,322 @@ mod tests {
         assert_eq!(stats.total, 0);
     }
 
+    /// Two different rules firing within the dedup window must both be pushed;
+    /// repeats of the SAME rule on the same source must still be suppressed.
+    /// The rule engine titles every alert "Rule Triggered" from "rule_engine",
+    /// so keying on title+source dropped the second rule's notification —
+    /// an alarm that exists in the list but never reaches anyone.
+    #[tokio::test]
+    async fn distinct_rules_are_not_deduped_against_each_other() {
+        use crate::channels::MessageChannel;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingChannel {
+            name: String,
+            sends: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl MessageChannel for CountingChannel {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn channel_type(&self) -> &str {
+                "counting"
+            }
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            async fn send(&self, _message: &Message) -> Result<()> {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        /// A rule alert exactly as `RuleEngine::execute_action` builds one.
+        fn rule_alert(rule_id: &str, trigger_source: &str) -> Message {
+            let mut msg = Message::alert(
+                MessageSeverity::Warning,
+                "Rule Triggered".to_string(),
+                format!("{rule_id} fired on {trigger_source}"),
+                "rule_engine".to_string(),
+            );
+            msg.metadata = Some(serde_json::json!({
+                "rule_id": rule_id,
+                "trigger_source": trigger_source,
+            }));
+            msg
+        }
+
+        let manager = MessageManager::new();
+        let sends = Arc::new(AtomicUsize::new(0));
+        {
+            let registry = manager.channels.read().await;
+            registry
+                .register(Arc::new(CountingChannel {
+                    name: "counter".to_string(),
+                    sends: sends.clone(),
+                }))
+                .await;
+        }
+
+        // Two different rules, same severity, seconds apart.
+        manager
+            .create_message(rule_alert("rule-a", "sensor_1"))
+            .await
+            .unwrap();
+        manager
+            .create_message(rule_alert("rule-b", "sensor_1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            2,
+            "the second rule's alert was swallowed by the first rule's dedup key"
+        );
+
+        // The same rule on the same source right after: still suppressed.
+        manager
+            .create_message(rule_alert("rule-a", "sensor_1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            2,
+            "a repeating alert from one rule/source must stay suppressed"
+        );
+
+        // The same rule on a different device is a different alarm.
+        manager
+            .create_message(rule_alert("rule-a", "sensor_2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            3,
+            "a second device satisfying the same rule is its own alarm"
+        );
+
+        // All four are recorded regardless of what was pushed.
+        assert_eq!(manager.list_messages().await.len(), 4);
+    }
+
+    use crate::channels::MessageChannel;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A channel that ALWAYS fails — the retry loop must make exactly
+    /// 3 attempts (one transient 429 no longer drops the alert
+    /// permanently, and the retries themselves stay bounded).
+    struct AlwaysFailingChannel {
+        sends: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageChannel for AlwaysFailingChannel {
+        fn name(&self) -> &str {
+            "always-fail"
+        }
+        fn channel_type(&self) -> &str {
+            "fail"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        async fn send(&self, _message: &Message) -> Result<()> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Other(anyhow::anyhow!("simulated 429")))
+        }
+    }
+
+    /// A channel that fails TWICE then succeeds — the retry loop must
+    /// recover the delivery on the third attempt.
+    struct FlakyChannel {
+        sends: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageChannel for FlakyChannel {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+        fn channel_type(&self) -> &str {
+            "flaky"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        async fn send(&self, _message: &Message) -> Result<()> {
+            let n = self.sends.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(Error::Other(anyhow::anyhow!("transient blip")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Audit fields survive the FULL manager→storage→manager round trip:
+    /// acknowledged_at/by were nulled on every store write before the fix.
+    #[tokio::test]
+    async fn audit_fields_survive_storage_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = MessageManager::with_storage(dir.path()).unwrap();
+
+        let msg = Message::alert(
+            MessageSeverity::Warning,
+            "audit".into(),
+            "body".into(),
+            "rule_engine".into(),
+        );
+        let id = msg.id.clone();
+        manager.create_message(msg).await.unwrap();
+        manager.acknowledge(&id).await.unwrap();
+
+        // Same store, read via the SAME manager (redb is single-writer per
+        // process: a second open of the same file fails on the lock — the
+        // round-trip proof is that stored_to_message rehydrates the fields,
+        // which load_messages exercises on construction).
+        drop(manager);
+        let reloaded = MessageManager::with_storage(dir.path()).unwrap();
+        let all = reloaded.list_messages().await;
+        let stored = all.iter().find(|m| m.id == id).expect("message persisted");
+        assert_eq!(stored.status, MessageStatus::Acknowledged);
+        assert!(
+            stored.acknowledged_at.is_some(),
+            "acknowledged_at must survive the round trip"
+        );
+        assert_eq!(
+            stored.acknowledged_by.as_deref(),
+            Some("api"),
+            "acknowledged_by must survive the round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_send_retries_three_times_then_gives_up() {
+        let manager = MessageManager::new();
+        let sends = Arc::new(AtomicUsize::new(0));
+        {
+            let registry = manager.channels.read().await;
+            registry
+                .register(Arc::new(AlwaysFailingChannel {
+                    sends: sends.clone(),
+                }))
+                .await;
+        }
+
+        let created = manager
+            .create_message(Message::alert(
+                MessageSeverity::Warning,
+                "Retry test".to_string(),
+                "body".to_string(),
+                "test".to_string(),
+            ))
+            .await;
+
+        // The message is stored and returned even when delivery fails.
+        assert!(
+            created.is_ok(),
+            "storage success must not fail with delivery"
+        );
+        // Backoff sleeps: 1s + 2s = 3s of waits between 3 attempts.
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            3,
+            "exactly 3 attempts — bounded, not forever, not 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_send_recovers_after_transient_failures() {
+        let manager = MessageManager::new();
+        let sends = Arc::new(AtomicUsize::new(0));
+        {
+            let registry = manager.channels.read().await;
+            registry
+                .register(Arc::new(FlakyChannel {
+                    sends: sends.clone(),
+                }))
+                .await;
+        }
+
+        manager
+            .create_message(Message::alert(
+                MessageSeverity::Warning,
+                "Flaky test".to_string(),
+                "body".to_string(),
+                "test".to_string(),
+            ))
+            .await
+            .expect("create succeeds");
+
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            3,
+            "two failures then success on attempt 3 — recovered, not dropped"
+        );
+    }
+
+    /// Delivery must fan out concurrently. Both channels here block until the
+    /// other one has entered `send()`, so a sequential loop deadlocks and the
+    /// timeout fires — which is exactly what one slow channel used to do to
+    /// every channel behind it (and to the rule engine's notify action).
+    #[tokio::test]
+    async fn test_channel_sends_run_concurrently() {
+        use crate::channels::MessageChannel;
+
+        struct BarrierChannel {
+            name: String,
+            barrier: Arc<tokio::sync::Barrier>,
+        }
+
+        #[async_trait::async_trait]
+        impl MessageChannel for BarrierChannel {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn channel_type(&self) -> &str {
+                "barrier"
+            }
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            async fn send(&self, _message: &Message) -> Result<()> {
+                self.barrier.wait().await;
+                Ok(())
+            }
+        }
+
+        let manager = MessageManager::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        {
+            let registry = manager.channels.read().await;
+            for name in ["a", "b"] {
+                registry
+                    .register(Arc::new(BarrierChannel {
+                        name: name.to_string(),
+                        barrier: barrier.clone(),
+                    }))
+                    .await;
+            }
+        }
+
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.create_message(Message::system(
+                "Concurrent".to_string(),
+                "Both channels must be in flight".to_string(),
+            )),
+        )
+        .await;
+
+        assert!(
+            sent.is_ok(),
+            "channel sends did not overlap — delivery is sequential again"
+        );
+        assert!(sent.unwrap().is_ok());
+    }
+
     #[tokio::test]
     async fn test_create_message() {
         let manager = MessageManager::new();
@@ -1092,6 +1671,24 @@ mod tests {
 
         let retrieved = manager.get_message(&created.id).await.unwrap();
         assert_eq!(retrieved.status, MessageStatus::Resolved);
+    }
+
+    /// The verdict has to survive the manager round trip, not just the
+    /// in-memory object: the feedback loop counts these by reading messages
+    /// back (`list_messages_by_status`), so a status that only lives in RAM
+    /// would lose every sample on restart.
+    #[tokio::test]
+    async fn test_mark_false_positive() {
+        let manager = MessageManager::new();
+        let msg = Message::system("Test".to_string(), "Test message".to_string());
+
+        let created = manager.create_message(msg).await.unwrap();
+        assert!(created.is_active());
+
+        manager.mark_false_positive(&created.id).await.unwrap();
+
+        let retrieved = manager.get_message(&created.id).await.unwrap();
+        assert_eq!(retrieved.status, MessageStatus::FalsePositive);
     }
 
     #[tokio::test]

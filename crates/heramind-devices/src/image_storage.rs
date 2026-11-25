@@ -527,6 +527,96 @@ pub fn resolve_internal_image_to_data_url(url: &str, data_dir: &Path) -> Option<
     Some(format!("data:{mime};base64,{b64}"))
 }
 
+/// Parameter names that carry image payloads into extension / vision commands.
+const IMAGE_PARAM_KEYS: &[&str] = &[
+    "image",
+    "images",
+    "image_base64",
+    "base64_data",
+    "image_data",
+    "img",
+];
+
+fn is_image_param_key(key: &str) -> bool {
+    IMAGE_PARAM_KEYS.contains(&key)
+}
+
+/// Materialize platform image handles inside a JSON value for process-isolated
+/// consumers (extension IPC, CLI-only `extension invoke`).
+///
+/// - Only **declared image input params** ([`IMAGE_PARAM_KEYS`] and nested
+///   values under them) resolve `/api/images/...` to **raw** base64 (no
+///   `data:` prefix). Prose fields (`prompt`, `notes`, …) that happen to equal
+///   a path string are left untouched.
+/// - On those image keys, `data:image/...;base64,...` prefixes are stripped so
+///   extensions do not choke on `:` in the data-URI header.
+/// - Failures (missing file, traversal, too large, non-image) return `Err` —
+///   never forward a hostless URL the child process cannot fetch.
+///
+/// Call this **after** PreparedInvoke claim/fingerprint (mint stays on the
+/// short `/api/images/` form) and **before** `execute_command` / IPC.
+pub fn materialize_internal_image_refs_in_value(
+    args: &serde_json::Value,
+    data_dir: &Path,
+) -> std::result::Result<serde_json::Value, String> {
+    materialize_image_value(args, data_dir, false)
+}
+
+fn materialize_image_value(
+    args: &serde_json::Value,
+    data_dir: &Path,
+    in_image_field: bool,
+) -> std::result::Result<serde_json::Value, String> {
+    use base64::Engine as _;
+    use serde_json::Value;
+
+    match args {
+        Value::String(s) => {
+            if in_image_field && s.starts_with("/api/images/") {
+                let (bytes, _) = read_internal_image_url(s, data_dir).map_err(|e| {
+                    format!(
+                        "Cannot read internal image reference {s}: {e}. \
+                         Pass the /api/images/... reference unchanged; the host \
+                         resolves it before extension dispatch (no curl / domain)."
+                    )
+                })?;
+                return Ok(Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                ));
+            }
+            if in_image_field {
+                if let Some(comma_pos) = s.find(";base64,") {
+                    let data = &s[comma_pos + 8..];
+                    if !data.is_empty() {
+                        return Ok(Value::String(data.to_string()));
+                    }
+                }
+            }
+            Ok(args.clone())
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                let image_field = is_image_param_key(k) || in_image_field;
+                let value = if image_field || v.is_object() || v.is_array() {
+                    materialize_image_value(v, data_dir, image_field)?
+                } else {
+                    v.clone()
+                };
+                out.insert(k.clone(), value);
+            }
+            Ok(Value::Object(out))
+        }
+        Value::Array(items) => Ok(Value::Array(
+            items
+                .iter()
+                .map(|v| materialize_image_value(v, data_dir, in_image_field))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        )),
+        _ => Ok(args.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,6 +995,76 @@ mod tests {
             res,
             Err(ImageStorageError::InvalidPathComponent(_))
         ));
+    }
+
+    #[test]
+    fn test_materialize_internal_image_refs_only_declared_image_keys() {
+        use base64::Engine as _;
+        use serde_json::json;
+
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path();
+        let png = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52,
+        ];
+        let images = data_dir.join("images").join("cam").join("frame");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(images.join("1.png"), png).unwrap();
+        let path = "/api/images/cam/frame/1.png";
+
+        let args = json!({
+            "image": path,
+            "url": path,
+            "prompt": path,
+            "notes": [path],
+            "city": "Xiamen",
+        });
+        let out = materialize_internal_image_refs_in_value(&args, data_dir).unwrap();
+        assert_eq!(out["city"], "Xiamen");
+        assert_eq!(
+            out["url"], path,
+            "url is outbound-advertise, not base64 materialize"
+        );
+        assert_eq!(out["prompt"], path);
+        assert_eq!(out["notes"][0], path);
+        let got = out["image"].as_str().unwrap();
+        assert!(!got.starts_with("/api/images/"), "image: {got}");
+        assert!(!got.starts_with("data:"), "image: {got}");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(got)
+                .unwrap(),
+            png
+        );
+    }
+
+    #[test]
+    fn test_materialize_internal_image_refs_strips_data_uri_on_image_fields() {
+        use serde_json::json;
+
+        let args = json!({
+            "image": "data:image/png;base64,abc123",
+            "notes": "data:image/png;base64,leave-me",
+        });
+        let out = materialize_internal_image_refs_in_value(&args, TempDir::new().unwrap().path())
+            .unwrap();
+        assert_eq!(out["image"], "abc123");
+        // Non-image keys keep a data-URI-shaped prose string untouched.
+        assert_eq!(out["notes"], "data:image/png;base64,leave-me");
+    }
+
+    #[test]
+    fn test_materialize_internal_image_refs_missing_fails_closed() {
+        use serde_json::json;
+
+        let temp_dir = TempDir::new().unwrap();
+        let args = json!({ "image": "/api/images/missing/image/0.png" });
+        let err = materialize_internal_image_refs_in_value(&args, temp_dir.path()).unwrap_err();
+        assert!(
+            err.contains("Cannot read internal image reference"),
+            "got: {err}"
+        );
     }
 
     #[test]

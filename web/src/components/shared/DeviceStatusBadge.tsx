@@ -36,7 +36,9 @@ export function DeviceStatusBadge({ device, className, hideDot }: DeviceStatusBa
     success: 'badge-success',
     info: 'badge-info',
     warning: 'badge-warning',
-    muted: 'bg-muted-50 text-muted-foreground border border-border',
+    // No border — all four states are borderless tinted pills; the hollow
+    // dot below already carries the "never reported" semantic.
+    muted: 'bg-muted-50 text-muted-foreground',
   }[color]
 
   const dotClass = {
@@ -45,7 +47,7 @@ export function DeviceStatusBadge({ device, className, hideDot }: DeviceStatusBa
     warning: 'bg-warning',
     // Hollow dot = never reported; filled gray = was online, now offline.
     muted: info.state === 'disconnected'
-      ? 'border-2 border-muted-foreground/70 bg-transparent'
+      ? 'border-2 border-muted-foreground bg-transparent opacity-70'
       : 'bg-muted-foreground',
   }[color]
 

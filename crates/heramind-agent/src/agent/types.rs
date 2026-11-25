@@ -8,6 +8,32 @@ use heramind_core::{
     Message,
 };
 
+/// Marker for a trusted conversation summary inserted by the context builder.
+pub(crate) const CONVERSATION_SUMMARY_PREFIX: &str = "[Summary of previous conversation]\n";
+
+/// Internal hard-budget lineage stamp (`feedback_src=<index>`).
+///
+/// Lives on `AgentMessage.tool_call_id` of a tool message in a built request
+/// window — never in the body, which stays byte-identical to what the tool
+/// returned.
+pub(crate) const FEEDBACK_SRC_MARKER: &str = "feedback_src=";
+
+pub(crate) fn feedback_src_marker(src_index: usize) -> String {
+    format!("{FEEDBACK_SRC_MARKER}{src_index}")
+}
+
+/// Stamp call-position lineage onto `tool_call_id` without mutating body.
+pub(crate) fn stamp_feedback_src_id(msg: &mut AgentMessage, src_index: usize) {
+    if msg.role != "tool" {
+        return;
+    }
+    msg.tool_call_id = Some(feedback_src_marker(src_index));
+}
+
+pub(crate) fn message_carries_feedback_src(msg: &AgentMessage, marker: &str) -> bool {
+    msg.role == "tool" && msg.tool_call_id.as_deref() == Some(marker)
+}
+
 /// Agent event emitted during streaming processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -54,6 +80,13 @@ pub enum AgentEvent {
         /// Warning message
         message: String,
     },
+    /// Snapshot of one completed model request, never cumulative turn usage.
+    ContextUsage {
+        prompt_tokens: u32,
+        system_prompt_tokens: usize,
+        tool_tokens: usize,
+        max_context_tokens: usize,
+    },
     /// Stream ended
     End {
         /// Prompt tokens used in this request (from LLM backend)
@@ -66,6 +99,13 @@ pub enum AgentEvent {
         /// Tool-definition portion of the prompt (estimated)
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_tokens: Option<u32>,
+        /// System-judged goal status (evidence only — not model NL).
+        /// `not_applicable` is **not** verified success.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_status: Option<super::task_continuity::SystemGoalStatus>,
+        /// Why this End was emitted (normal / interrupted / timeout / …).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_reason: Option<super::task_continuity::StreamEndReason>,
     },
     /// Intermediate end (for multi-round tool calling)
     /// Indicates the current round is complete but more processing is coming
@@ -105,6 +145,38 @@ pub enum AgentEvent {
         /// Elapsed time in ms
         #[serde(rename = "elapsedMs", skip_serializing_if = "Option::is_none")]
         elapsed_ms: Option<u64>,
+    },
+    /// System note for the USER — runtime guard output (incomplete action,
+    /// guard budget spent, …). NOT part of the assistant's message text:
+    /// the frontend renders it as a distinct callout below the message, and
+    /// the note is persisted on the message as `system_notes` so restored
+    /// sessions keep the labeling. Single-language (matched to the user's
+    /// message language by the emitter).
+    SystemNote {
+        /// Note body (no header/footer markup — presentation is the UI's job)
+        note: String,
+    },
+    /// Unknown re-run confirm request — structured JSON fields for the host/UI.
+    /// Fingerprints travel here (may contain spaces); never via text KV parse.
+    AuthorizeConfirmRequest {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "priorOperationId")]
+        prior_operation_id: String,
+        #[serde(rename = "writeFingerprint")]
+        write_fingerprint: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(rename = "validUntilMs")]
+        valid_until_ms: u64,
+    },
+    /// Pending confirm removed (consumed / expired / cancelled).
+    AuthorizeConfirmRemoved {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        reason: String,
     },
 }
 
@@ -184,12 +256,43 @@ impl AgentEvent {
         }
     }
 
+    /// Structured Unknown re-run confirm for the host/UI (JSON fields).
+    pub fn authorize_confirm_request(confirm: &super::task_continuity::ConfirmRequest) -> Self {
+        Self::AuthorizeConfirmRequest {
+            request_id: confirm.request_id.clone(),
+            prior_operation_id: confirm.prior_operation_id.clone(),
+            write_fingerprint: confirm.write_fingerprint.clone(),
+            tool_name: confirm.tool_name.clone(),
+            target: confirm.target.clone(),
+            valid_until_ms: confirm.valid_until_ms,
+        }
+    }
+
+    /// Pending confirm removed (consumed / expired / cancelled).
+    pub fn authorize_confirm_removed(
+        request_id: impl Into<String>,
+        reason: super::task_continuity::ConfirmRemoveReason,
+    ) -> Self {
+        let reason = match reason {
+            super::task_continuity::ConfirmRemoveReason::Consumed => "consumed",
+            super::task_continuity::ConfirmRemoveReason::Expired => "expired",
+            super::task_continuity::ConfirmRemoveReason::Cancelled => "cancelled",
+            super::task_continuity::ConfirmRemoveReason::Rejected => "rejected",
+        };
+        Self::AuthorizeConfirmRemoved {
+            request_id: request_id.into(),
+            reason: reason.to_string(),
+        }
+    }
+
     /// Create an end event.
     pub fn end() -> Self {
         Self::End {
             prompt_tokens: None,
             system_prompt_tokens: None,
             tool_tokens: None,
+            goal_status: None,
+            end_reason: None,
         }
     }
 
@@ -204,7 +307,48 @@ impl AgentEvent {
             prompt_tokens: Some(prompt_tokens),
             system_prompt_tokens: Some(system_prompt_tokens as u32),
             tool_tokens: Some(tool_tokens as u32),
+            goal_status: None,
+            end_reason: None,
         }
+    }
+
+    /// Attach system-judged goal status to a final End event.
+    pub fn with_goal_status(mut self, status: super::task_continuity::SystemGoalStatus) -> Self {
+        if let Self::End {
+            goal_status: slot, ..
+        } = &mut self
+        {
+            *slot = Some(status);
+        }
+        self
+    }
+
+    /// Attach stream end reason (normal / interrupted / …).
+    pub fn with_end_reason(mut self, reason: super::task_continuity::StreamEndReason) -> Self {
+        if let Self::End {
+            end_reason: slot, ..
+        } = &mut self
+        {
+            *slot = Some(reason);
+        }
+        self
+    }
+
+    /// Unified final End: always carries system goal status + end reason.
+    ///
+    /// Use for normal completion, early interrupt, timeout, error, cancel,
+    /// and cannot-continue paths — never bare [`Self::end`] on those exits.
+    pub fn final_end(
+        task: &super::task_continuity::TaskState,
+        reason: super::task_continuity::StreamEndReason,
+        usage: Option<(u32, usize, usize)>,
+    ) -> Self {
+        let goal_status = task.system_goal_status();
+        let base = match usage {
+            Some((pt, sys, tools)) => Self::end_with_usage(pt, sys, tools),
+            None => Self::end(),
+        };
+        base.with_goal_status(goal_status).with_end_reason(reason)
     }
 
     /// Create an intent event.
@@ -238,6 +382,12 @@ impl AgentEvent {
     }
 
     /// Create a progress event.
+    /// Create a user-facing system note event (guard output rendered as a
+    /// callout by the frontend, never part of the reply text).
+    pub fn system_note(note: impl Into<String>) -> Self {
+        Self::SystemNote { note: note.into() }
+    }
+
     pub fn progress(message: impl Into<String>, stage: impl Into<String>, elapsed: u64) -> Self {
         Self::Progress {
             message: message.into(),
@@ -371,6 +521,38 @@ pub struct AgentMessage {
     /// Per-round thinking content for grouped rendering
     #[serde(skip_serializing_if = "Option::is_none")]
     pub round_thinking: Option<Value>,
+    /// Runtime guard notes for the user (incomplete action, guard budget
+    /// spent, …) — rendered as callouts, never merged into `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_notes: Option<Vec<String>>,
+    /// Final End.goalStatus snapshot for this assistant turn (evidence only).
+    /// Persisted so history reload shows the same panel callout — never
+    /// recomputed from live TaskState.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "goalStatus"
+    )]
+    pub goal_status: Option<super::task_continuity::SystemGoalStatus>,
+    /// Final End.endReason for this assistant turn.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "endReason")]
+    pub end_reason: Option<super::task_continuity::StreamEndReason>,
+    /// Ordered content nodes (v1) — opaque JSON matching API ChatContentNode.
+    /// Persisted via SessionMessage; not injected into the LLM prompt
+    /// (model sees the prepared plain/`【type `id`】` text instead).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "contentNodes"
+    )]
+    pub content_nodes: Option<Vec<Value>>,
+    /// Protocol version for `content_nodes` (currently `1`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "contentVersion"
+    )]
+    pub content_version: Option<u32>,
     /// Timestamp
     pub timestamp: i64,
 }
@@ -378,11 +560,57 @@ pub struct AgentMessage {
 /// An image attached to a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMessageImage {
-    /// Base64 data URL (e.g., "data:image/png;base64,...")
+    /// Either a base64 data URL (`data:image/...;base64,...`, the in-memory
+    /// form) or a served file reference (`/api/images/<file>`, the persisted
+    /// form — see session's `save_history`). Consumers that need actual
+    /// bytes must resolve references via [`load_image_reference`].
     pub data: String,
     /// MIME type (e.g., "image/png")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Optional companion / VLM caption bound to this durable image (persisted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+}
+
+/// Resolve a persisted `/api/images/<file>` reference back to a data URL
+/// (the form the LLM and tool arguments need).
+///
+/// Returns `None` for non-references, unsafe paths, or read failures —
+/// callers fall back to their existing behavior instead of passing a URL
+/// string where base64 is expected.
+pub(crate) fn load_image_reference(url: &str) -> Option<String> {
+    load_image_reference_from(url, &heramind_core::paths::data_dir().join("images"))
+}
+
+/// Testable core: resolve against an explicit images dir.
+pub(crate) fn load_image_reference_from(url: &str, images_dir: &std::path::Path) -> Option<String> {
+    let rel = url.strip_prefix("/api/images/")?;
+    // Flat layout only: a single safe filename segment (matches the images
+    // handler's contract). Structured device paths and traversal are refused.
+    if rel.is_empty()
+        || rel.contains('/')
+        || rel.contains('\\')
+        || rel.contains("..")
+        || rel.starts_with('.')
+    {
+        return None;
+    }
+    let path = images_dir.join(rel);
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mime = match path.extension().and_then(|e| e.to_str()) {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("tiff") => "image/tiff",
+        _ => "image/png",
+    };
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    Some(format!("data:{};base64,{}", mime, b64))
 }
 
 impl AgentMessage {
@@ -398,6 +626,11 @@ impl AgentMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -414,6 +647,11 @@ impl AgentMessage {
             images: Some(images),
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -430,6 +668,11 @@ impl AgentMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -449,6 +692,11 @@ impl AgentMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -465,6 +713,11 @@ impl AgentMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -481,6 +734,11 @@ impl AgentMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -497,6 +755,11 @@ impl AgentMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -517,6 +780,11 @@ impl AgentMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -549,14 +817,7 @@ impl AgentMessage {
                                 let result_preview = tc
                                     .result
                                     .as_ref()
-                                    .map(|r| {
-                                        if let Some(s) = r.as_str() {
-                                            s.chars().take(120).collect::<String>()
-                                        } else {
-                                            let s = r.to_string();
-                                            s.chars().take(120).collect::<String>()
-                                        }
-                                    })
+                                    .map(tool_result_preview)
                                     .unwrap_or_default();
                                 if result_preview.is_empty() {
                                     format!("the {} tool with {}", tc.name, args_summary)
@@ -575,9 +836,12 @@ impl AgentMessage {
             }
             "system" => Message::system(self.content.as_ref()),
             "tool" => {
-                // Tool result messages - include which tool was called
+                // Tool result messages - include which tool was called.
+                // The body is passed through untouched: a lineage stamp lives
+                // on `tool_call_id` only, so a tool result whose text merely
+                // resembles one is never rewritten.
                 if let Some(ref tool_name) = self.tool_call_name {
-                    let tool_content = format!("[Tool: {} returned]\n{}", tool_name, self.content);
+                    let tool_content = format!("[Tool: {tool_name} returned]\n{}", self.content);
                     Message::user(&tool_content)
                 } else {
                     Message::user(self.content.as_ref())
@@ -597,21 +861,67 @@ impl AgentMessage {
             _ => return Message::user(self.content.as_ref()),
         };
 
+        // Ensure durable `/api/images/…` handles stay in the text part so
+        // text-only primaries (NM-231 strip) still see tool-usable paths.
+        let durable_paths: Vec<(Option<u32>, String)> = images
+            .iter()
+            .filter_map(|img| {
+                crate::agent::session_album::durable_image_path(&img.data)
+                    .map(|p| (None, p.to_string()))
+            })
+            .collect();
+        let text = crate::agent::session_album::append_attached_handles(
+            self.content.as_ref(),
+            durable_paths,
+        );
+
         // Build content parts: text + images
-        let mut parts = vec![ContentPart::text(self.content.to_string())];
+        let mut parts = vec![ContentPart::text(text)];
+        let mut unresolvable = 0usize;
 
         for image in images {
+            // Persisted references must resolve to real bytes — a URL string
+            // passed as base64 is garbage the backend may silently accept.
+            let data = if image.data.starts_with("/api/images/") {
+                match load_image_reference(&image.data) {
+                    Some(data_url) => data_url,
+                    None => {
+                        // Drop the bytes part; text already carries the durable
+                        // handle from `append_attached_handles` above.
+                        unresolvable += 1;
+                        continue;
+                    }
+                }
+            } else {
+                image.data.clone()
+            };
             // Prefer the mime type stored with the message (set at upload time).
             // If missing, parse from the data URL header or infer from magic bytes.
-            let parsed = crate::image_utils::parse_image_data(&image.data);
+            let parsed = crate::image_utils::parse_image_data(&data);
             let mime_type = image
                 .mime_type
                 .clone()
                 .or_else(|| parsed.map(|p| p.mime_type.to_string()))
                 .unwrap_or_else(|| "image/png".to_string());
-            let base64_data = parsed.map(|p| p.base64).unwrap_or(image.data.as_str());
+            let base64_data = parsed.map(|p| p.base64).unwrap_or(data.as_str());
 
             parts.push(ContentPart::image_base64(base64_data, mime_type));
+        }
+
+        if unresolvable > 0 {
+            let note = format!(
+                "\n[image could not be loaded — {} attached {} no longer available; \
+                 ask the user to re-send if the image matters]",
+                unresolvable,
+                if unresolvable == 1 {
+                    "image is"
+                } else {
+                    "images are"
+                }
+            );
+            if let Some(ContentPart::Text { text }) = parts.first_mut() {
+                text.push_str(&note);
+            }
         }
 
         Message::new(MessageRole::User, Content::Parts(parts))
@@ -629,6 +939,11 @@ impl AgentMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -723,6 +1038,20 @@ fn find_json_list<'a>(
         .or_else(|| val.as_array())
 }
 
+/// The part of a stored tool-call result that reaches the model: its first
+/// 120 characters, as rendered by [`AgentMessage::to_core`].
+///
+/// The full body travels in the paired `role=tool` message. The token
+/// estimate must price exactly this much of the stored copy — no more (a
+/// 310K-char result priced in full read a 28K-token history as 180K and
+/// cost the turn its tools), no less.
+pub fn tool_result_preview(result: &Value) -> String {
+    match result.as_str() {
+        Some(s) => s.chars().take(120).collect(),
+        None => result.to_string().chars().take(120).collect(),
+    }
+}
+
 /// Summarize tool call arguments into a concise string.
 /// E.g., `{"action":"list"}` → `"list"`,
 ///       `{"action":"history","device_id":"b626d0","metric":"battery"}` → `"history b626d0/battery"`
@@ -791,6 +1120,18 @@ pub struct CachedLargeResult {
     pub size_bytes: usize,
     /// Timestamp when cached
     pub cached_at: i64,
+    /// Monotonic insertion sequence. Eviction order is FIFO by `seq`:
+    /// `cached_at` is second-granular, so same-second insertions tied under
+    /// the old min-by-timestamp eviction and HashMap iteration order picked
+    /// the victim — "newest survives" was luck, not a contract.
+    pub seq: u64,
+}
+
+/// Source of monotonic cache insertion sequence numbers.
+static CACHED_ENTRY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_cache_seq() -> u64 {
+    CACHED_ENTRY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Cache for large tool results that must not enter LLM context.
@@ -801,9 +1142,37 @@ pub struct LargeDataCache {
     entries: std::collections::HashMap<String, CachedLargeResult>,
 }
 
+/// One character window of a cached blob, read back via
+/// `file_read(path="$cached:…")`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedReadWindow {
+    pub content: String,
+    /// Total chars of the cached blob (windows concatenate to this).
+    pub total_chars: usize,
+    pub returned_chars: usize,
+    /// Offset for the next window; `None` when this window reached the end.
+    pub next_offset: Option<usize>,
+    pub content_type: String,
+}
+
+/// Default character window for cached-text read-back. 8K (down from the
+/// original 16K): with results retained in history, two 16K windows alone
+/// overflowed a 32K-context session in the 2026-11-09 A2 replay. 8K keeps
+/// a useful window while several reads + history still fit; oversized
+/// history results are additionally previewed by `compact_tool_results`.
+const CACHED_READ_DEFAULT_CHARS: usize = 8_000;
+/// Hard cap on a single read-back window, regardless of what the caller
+/// asks for.
+const CACHED_READ_MAX_CHARS: usize = 64_000;
+/// Hard BYTE cap on a single read-back window. Chars alone under-bound
+/// the payload: 64,000 CJK chars ≈ 192KB of UTF-8 — the read-back fix
+/// must not reintroduce context bloat through multi-byte text. The window
+/// stops at whichever limit binds first.
+const CACHED_READ_MAX_BYTES: usize = 64 * 1024;
+
 /// Threshold below which we don't cache — just pass through.
 /// Set to 32KB: compact time-series format (2000 points ≈ 14KB) should reach LLM intact.
-/// Only truly large payloads (images, huge JSON) get cached with a summary reference.
+/// Only truly large payloads (images, huge base64) get cached with a summary reference.
 const CACHE_THRESHOLD_BYTES: usize = 32 * 1024;
 
 /// Threshold used by `slim_large_strings_in_json` to decide when a
@@ -828,14 +1197,29 @@ impl LargeDataCache {
         Self::default()
     }
 
-    /// Evict oldest entries if cache exceeds limits.
+    /// Cache entry keys, sorted by insertion sequence — test/introspection
+    /// accessor so integration tests can extract the REAL `$cached:` key
+    /// the slim layer generated instead of reconstructing key derivation.
+    pub fn entry_keys(&self) -> Vec<String> {
+        let mut keys: Vec<(String, u64)> = self
+            .entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.seq))
+            .collect();
+        keys.sort_by_key(|(_, seq)| *seq);
+        keys.into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// Evict oldest entries if cache exceeds limits. FIFO by insertion
+    /// `seq` — deterministic regardless of HashMap iteration order or
+    /// same-second timestamps.
     fn evict_if_needed(&mut self) {
         // Evict by count
         while self.entries.len() > MAX_CACHE_ENTRIES {
             if let Some(oldest_key) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, v)| v.cached_at)
+                .min_by_key(|(_, v)| v.seq)
                 .map(|(k, _)| k.clone())
             {
                 tracing::debug!("Evicting cache entry '{}' (count limit)", oldest_key);
@@ -848,13 +1232,13 @@ impl LargeDataCache {
         // Evict by total size
         let total_size: usize = self.entries.values().map(|e| e.size_bytes).sum();
         if total_size > MAX_CACHE_TOTAL_BYTES {
-            // Sort by age (oldest first) and evict until under budget
-            let mut sorted: Vec<(String, i64)> = self
+            // Sort by insertion age (oldest first) and evict until under budget
+            let mut sorted: Vec<(String, u64)> = self
                 .entries
                 .iter()
-                .map(|(k, v)| (k.clone(), v.cached_at))
+                .map(|(k, v)| (k.clone(), v.seq))
                 .collect();
-            sorted.sort_by_key(|(_, ts)| *ts);
+            sorted.sort_by_key(|(_, seq)| *seq);
 
             let mut current_size = total_size;
             for (key, _) in sorted {
@@ -871,6 +1255,31 @@ impl LargeDataCache {
                 }
             }
         }
+    }
+
+    /// Store an Operation body under key `op:<operation_id>` and return
+    /// `$cached:op:<id>`. Bypasses the normal size threshold so Round-3
+    /// `details_ref` always round-trips through this session cache (eviction
+    /// / other-session → clear fail on read). Full body stays here; model
+    /// summaries must not treat a truncated prefix as the sole fact.
+    pub fn store_operation_body(&mut self, operation_id: &str, body: &str) -> String {
+        let key = format!("op:{operation_id}");
+        let size_bytes = body.len();
+        let cached = CachedLargeResult {
+            content_type: Self::detect_content_type(body),
+            data: body.to_string(),
+            size_bytes,
+            cached_at: chrono::Utc::now().timestamp(),
+            seq: next_cache_seq(),
+        };
+        self.entries.insert(key.clone(), cached);
+        self.evict_if_needed();
+        format!("$cached:{key}")
+    }
+
+    /// Drop a previously stored Operation body (test / expiry simulation).
+    pub fn drop_operation_body(&mut self, operation_id: &str) -> bool {
+        self.entries.remove(&format!("op:{operation_id}")).is_some()
     }
 
     /// Store a tool result. Returns a summary string to use in message history.
@@ -892,6 +1301,7 @@ impl LargeDataCache {
             data: result.to_string(),
             size_bytes,
             cached_at: chrono::Utc::now().timestamp(),
+            seq: next_cache_seq(),
         };
         self.entries.insert(tool_name.to_string(), cached);
 
@@ -912,13 +1322,13 @@ impl LargeDataCache {
             // JSON data: extract key summary values for LLM context
             let summary = Self::smart_json_summary(tool_name, result, 500);
             format!(
-                "[Data: {}, {}. Use \"{}\" to reference. {}]",
+                "[Data: {}, {}. Read it back with file_read(path=\"{}\", char_offset=0) — windows of char_offset/char_length. {}]",
                 content_type, human_size, cached_ref, summary
             )
         } else {
             let preview: String = result.chars().take(300).collect();
             format!(
-                "[Data: {}, {}. Use \"{}\" to reference. Preview: {}]",
+                "[Data: {}, {}. Read it back with file_read(path=\"{}\", char_offset=0) — windows of char_offset/char_length. Preview: {}]",
                 content_type, human_size, cached_ref, preview
             )
         }
@@ -985,6 +1395,7 @@ impl LargeDataCache {
             data: data_url.to_string(),
             size_bytes: data_url.len(),
             cached_at: chrono::Utc::now().timestamp(),
+            seq: next_cache_seq(),
         };
         self.entries.insert("agent_image".to_string(), cached);
         self.evict_if_needed();
@@ -1002,6 +1413,12 @@ impl LargeDataCache {
     /// image in the prompt, but every image tool call failed — mirroring the
     /// agent-path lesson already encoded in `seed_bound_image` ("must work
     /// even for a small bound image").
+    /// Drop chat-upload image keys (`user_image`, `user_image_N`). Used when
+    /// an accept is rolled back after turn-start save failure.
+    pub fn clear_user_images(&mut self) {
+        self.entries.retain(|k, _| !k.starts_with("user_image"));
+    }
+
     pub fn store_user_image(&mut self, key: &str, data_url: &str) {
         if !data_url.starts_with("data:image/") {
             tracing::warn!(
@@ -1016,6 +1433,7 @@ impl LargeDataCache {
             data: data_url.to_string(),
             size_bytes: data_url.len(),
             cached_at: chrono::Utc::now().timestamp(),
+            seq: next_cache_seq(),
         };
         self.entries.insert(key.to_string(), cached);
         self.evict_if_needed();
@@ -1079,6 +1497,128 @@ impl LargeDataCache {
         ))
     }
 
+    /// Read a CHARACTER window of a cached blob — the text read-back half
+    /// of the `$cached:` contract (`file_read(path="$cached:…")`).
+    ///
+    /// Unlike [`resolve_reference`](Self::resolve_reference) (which digs
+    /// for image data), this returns the RAW cached text so the model can
+    /// actually read what a large tool produced. Slicing is char-based, so
+    /// multi-byte text (中文) never splits mid-character and concatenated
+    /// windows reproduce the original exactly.
+    ///
+    /// Refs are looked up in THIS cache only — a ref from another
+    /// session/execution, or one evicted by size/count limits, is an
+    /// explicit ERROR, never empty content ("cannot read" must not be
+    /// answered as "nothing there").
+    pub fn read_cached_window(
+        &self,
+        reference: &str,
+        char_offset: usize,
+        char_length: Option<usize>,
+    ) -> Result<CachedReadWindow, String> {
+        let key = reference
+            .strip_prefix("$cached:")
+            .ok_or_else(|| format!("not a $cached: reference: {}", reference))?;
+        let entry = self.entries.get(key).ok_or_else(|| {
+            format!(
+                "Unknown $cached reference '{}' — it was evicted (size/count limits), belongs to another session, or never existed. Re-run the command that produced the original output.",
+                reference
+            )
+        })?;
+        let total_chars = entry.data.chars().count();
+        if char_offset > total_chars {
+            return Err(format!(
+                "char_offset {} is beyond the end of the cached content (total_chars {})",
+                char_offset, total_chars
+            ));
+        }
+        let requested = char_length
+            .unwrap_or(CACHED_READ_DEFAULT_CHARS)
+            .clamp(1, CACHED_READ_MAX_CHARS);
+        // Dual cap: `requested` bounds chars, the byte budget bounds the
+        // UTF-8 payload (CJK is 3 bytes/char). Always admit at least one
+        // char so a window can never come back empty while data remains
+        // (an empty-but-truncated window would loop the model).
+        let mut content = String::new();
+        let mut used_bytes = 0usize;
+        for ch in entry.data.chars().skip(char_offset).take(requested) {
+            let ch_bytes = ch.len_utf8();
+            if !content.is_empty() && used_bytes + ch_bytes > CACHED_READ_MAX_BYTES {
+                break;
+            }
+            used_bytes += ch_bytes;
+            content.push(ch);
+        }
+        let returned_chars = content.chars().count();
+        let next_offset = if char_offset + returned_chars < total_chars {
+            Some(char_offset + returned_chars)
+        } else {
+            None
+        };
+        Ok(CachedReadWindow {
+            content,
+            total_chars,
+            returned_chars,
+            next_offset,
+            content_type: entry.content_type.clone(),
+        })
+    }
+
+    /// Serve `file_read(path="$cached:…")` from this cache, shaping the
+    /// window as a file_read-style tool result. Cached content is NOT a
+    /// file: no `state` snapshot is returned, and the message says so —
+    /// it must not be passed to file_edit/file_write.
+    pub fn file_read_cached(
+        &self,
+        reference: &str,
+        char_offset: usize,
+        char_length: Option<usize>,
+    ) -> crate::toolkit::ToolOutput {
+        match self.read_cached_window(reference, char_offset, char_length) {
+            Ok(window) => {
+                // Audit parity: a served cached read-back must be visible
+                // in logs exactly like a regular tool execution.
+                tracing::info!(
+                    reference = %reference,
+                    char_offset = char_offset,
+                    returned_chars = window.returned_chars,
+                    total_chars = window.total_chars,
+                    "Served $cached read-back via file_read"
+                );
+                let tail = match window.next_offset {
+                    Some(next) => format!(" More exists — continue with char_offset={}.", next),
+                    None => " (complete).".to_string(),
+                };
+                crate::toolkit::ToolOutput::success(serde_json::json!({
+                    "reference": reference,
+                    "content_type": window.content_type,
+                    "total_chars": window.total_chars,
+                    "char_offset": char_offset,
+                    "returned_chars": window.returned_chars,
+                    "content": window.content,
+                    "next_char_offset": window.next_offset,
+                    "truncated": window.next_offset.is_some(),
+                    "message": format!(
+                        "Cached tool output, chars {}..{} of {}.{} Cached content is not a file: no state snapshot, and it cannot be edited (do not pass to file_edit/file_write).",
+                        char_offset,
+                        char_offset + window.returned_chars,
+                        window.total_chars,
+                        tail
+                    ),
+                }))
+            }
+            Err(message) => {
+                tracing::warn!(
+                    reference = %reference,
+                    char_offset = char_offset,
+                    "Failed $cached read-back via file_read: {}",
+                    message
+                );
+                crate::toolkit::ToolOutput::error(message)
+            }
+        }
+    }
+
     /// Extract image/base64 data from a cached result string.
     /// Recursively walks the JSON tree to find base64_data regardless of nesting depth,
     /// so it works for any tool response structure (device get, query, extensions, etc.).
@@ -1096,7 +1636,9 @@ impl LargeDataCache {
     /// Resolve the data dir for internal image lookups.
     /// Mirrors the agent data collector / extension tool normalization.
     fn image_data_dir() -> String {
-        std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string())
+        heramind_core::paths::data_dir()
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Resolve an internal `/api/images/` URL to raw base64 (no `data:` prefix),
@@ -1129,7 +1671,7 @@ impl LargeDataCache {
                     return Some(b64.to_string());
                 }
                 // data:image URL (extract base64 portion)
-                for key in &["data", "image", "content", "url"] {
+                for key in &["latest_value", "data", "image", "content", "url"] {
                     if let Some(s) = map.get(*key).and_then(|v| v.as_str()) {
                         // Internal /api/images/ URL → resolve to raw base64.
                         if let Some(b64) = Self::resolve_api_images_url(s, data_dir) {
@@ -1166,6 +1708,12 @@ impl LargeDataCache {
                     }
                 }
                 None
+            }
+            serde_json::Value::String(s) => {
+                if let Some(b64) = Self::resolve_api_images_url(s, data_dir) {
+                    return Some(b64);
+                }
+                crate::image_utils::parse_data_image_url(s).map(|image| image.base64.to_string())
             }
             _ => None,
         }
@@ -1511,6 +2059,7 @@ impl LargeDataCache {
                         data: s.clone(),
                         size_bytes: bytes,
                         cached_at: chrono::Utc::now().timestamp(),
+                        seq: next_cache_seq(),
                     };
                     self.entries.insert(key, cached);
 
@@ -1529,7 +2078,7 @@ impl LargeDataCache {
                         )
                     } else {
                         format!(
-                            "{kind} ({size}) cached as {ref} — pass this reference to downstream tools that accept `$cached:` references to access the full data.",
+                            "{kind} ({size}) cached as {ref} — read it back with file_read(path=\"{ref}\", char_offset=0) in char_offset/char_length windows.",
                             kind = kind,
                             size = size_str,
                             ref = cached_ref
@@ -1631,7 +2180,7 @@ impl LargeDataCache {
 
 /// Unified internal state for the agent.
 /// Combines session state with LLM readiness and other runtime state.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentInternalState {
     /// Session ID
     pub session_id: String,
@@ -1651,6 +2200,84 @@ pub struct AgentInternalState {
     /// Cached compaction: (message_count_at_cache_time, max_tokens, compacted_messages)
     /// Invalidated when messages change or max_tokens differs.
     pub compaction_cache: Option<(usize, usize, Vec<AgentMessage>)>,
+    /// Cross-turn task continuity (G2): goal/object/evidence steps; Continue
+    /// must not replay completed writes. Loop halts (G3) mark Halted, never Completed.
+    pub task_state: super::task_continuity::TaskState,
+    /// When true, disk ledger could not be trusted (deserialize/load fail).
+    /// Mutating tools fail closed — never treat empty memory as authoritative.
+    /// Durable persist is refused until explicit clear/recover so empty memory
+    /// cannot overwrite the on-disk failure.
+    pub op_ledger_untrusted: bool,
+    /// Last successfully committed op-ledger generation (restored from disk).
+    /// Each durable commit bumps this and embeds it in
+    /// [`super::task_continuity::PersistedOpLedger::version`].
+    pub op_ledger_version: u64,
+    /// Bumped on explicit history clear. Stale stream `persist_history` /
+    /// turn-start snapshots that observed an older generation must not
+    /// rewrite history or the op ledger after clear.
+    pub history_generation: u64,
+    /// Optional durable sink. Production SessionManager always wires one;
+    /// unit tests may leave `None` (no crash-window coverage required).
+    pub op_ledger_commit: Option<std::sync::Arc<dyn super::task_continuity::OpLedgerCommit>>,
+    /// Pre-accept snapshot for the latest [`Self::accept_user_message`].
+    /// Cleared when turn-start history save succeeds; applied on save failure
+    /// so client `rejected` ≡ server state (no duplicate user msg / auth consume).
+    pending_accept_rollback: Option<AcceptRollback>,
+}
+
+impl std::fmt::Debug for AgentInternalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentInternalState")
+            .field("session_id", &self.session_id)
+            .field("llm_ready", &self.llm_ready)
+            .field("session", &self.session)
+            .field("memory_len", &self.memory.len())
+            .field("recent_response_hashes", &self.recent_response_hashes)
+            .field("large_data_cache", &self.large_data_cache)
+            .field("compaction_cache_is_some", &self.compaction_cache.is_some())
+            .field("task_state", &self.task_state)
+            .field("op_ledger_untrusted", &self.op_ledger_untrusted)
+            .field("op_ledger_version", &self.op_ledger_version)
+            .field("history_generation", &self.history_generation)
+            .field(
+                "op_ledger_commit",
+                &self.op_ledger_commit.as_ref().map(|_| "Some"),
+            )
+            .field(
+                "pending_accept_rollback",
+                &self.pending_accept_rollback.is_some(),
+            )
+            .finish()
+    }
+}
+
+/// Immutable call-site context for one accepted user Turn.
+///
+/// Created only by [`AgentInternalState::accept_user_message`] under the same
+/// lock as message save + Turn alloc + authorization apply. Streams receive
+/// this **by value** — never via shared hop fields on `AgentInternalState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedTurnContext {
+    /// Turn ID allocated for this user message (tool-gate call-site).
+    pub call_site_turn: u64,
+}
+
+/// Pre-[`AgentInternalState::accept_user_message`] snapshot so a failed
+/// turn-start history save can restore memory / Turn / auth exactly.
+///
+/// Bound to history generation and the accept's `call_site_turn`.
+/// [`AgentInternalState::clear_memory`] invalidates the pending token; rollback
+/// also refuses when generation/Turn no longer match so a clear mid-flight
+/// never restores pre-clear ops/auth.
+#[derive(Debug, Clone)]
+struct AcceptRollback {
+    memory_len: usize,
+    message_count: usize,
+    task_state: super::task_continuity::TaskState,
+    /// [`AgentInternalState::history_generation`] at accept time.
+    history_generation: u64,
+    /// Turn allocated by this accept (`note_user_turn`).
+    call_site_turn: u64,
 }
 
 impl AgentInternalState {
@@ -1668,6 +2295,155 @@ impl AgentInternalState {
                 super::streaming::ToolResultCache::new(std::time::Duration::from_secs(300)),
             )),
             compaction_cache: None,
+            task_state: super::task_continuity::TaskState::default(),
+            op_ledger_untrusted: false,
+            op_ledger_version: 0,
+            history_generation: 0,
+            op_ledger_commit: None,
+            pending_accept_rollback: None,
+        }
+    }
+
+    /// Wire (or clear) the durable op-ledger commit sink.
+    pub fn set_op_ledger_commit(
+        &mut self,
+        commit: Option<std::sync::Arc<dyn super::task_continuity::OpLedgerCommit>>,
+    ) {
+        self.op_ledger_commit = commit;
+    }
+
+    /// Mark ledger untrusted after deserialize/load failure (fail closed).
+    pub fn mark_op_ledger_untrusted(&mut self) {
+        self.op_ledger_untrusted = true;
+    }
+
+    /// Persist current sanitized op ledger via the wired commit sink.
+    ///
+    /// Bumps [`Self::op_ledger_version`] and embeds it so the store can reject
+    /// stale snapshots. Refuses entirely when untrusted (empty memory must not
+    /// overwrite a failed on-disk ledger). `Ok(())` when no sink is configured
+    /// (test agents). `Err` on serialize or sink failure — write-intent callers
+    /// must fail closed.
+    pub fn commit_op_ledger_now(&mut self) -> Result<(), String> {
+        if self.op_ledger_untrusted {
+            return Err("op ledger untrusted — durable persist refused until clear/recover".into());
+        }
+        let Some(commit) = self.op_ledger_commit.as_ref() else {
+            return Ok(());
+        };
+        self.op_ledger_version = self.op_ledger_version.saturating_add(1);
+        let mut snap = self.task_state.snapshot_op_ledger();
+        snap.version = self.op_ledger_version;
+        let bytes = serde_json::to_vec(&snap).map_err(|e| {
+            // Roll back the bump so a serialize failure can retry at the same gen.
+            self.op_ledger_version = self.op_ledger_version.saturating_sub(1);
+            format!("serialize op ledger: {e}")
+        })?;
+        match commit.commit(&bytes) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.op_ledger_version = self.op_ledger_version.saturating_sub(1);
+                Err(e)
+            }
+        }
+    }
+
+    /// Best-effort terminal persist after a mutating tool settles.
+    pub fn persist_op_ledger_terminal_best_effort(&mut self) {
+        if self.op_ledger_untrusted {
+            return;
+        }
+        if let Err(e) = self.commit_op_ledger_now() {
+            tracing::warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "Failed to persist op ledger terminal state after side-effect tool"
+            );
+        }
+    }
+
+    /// After Prepared→Running: durable-commit write intent before the tool.
+    ///
+    /// On failure marks the op Failed (releases the lease) and returns Err so
+    /// the stream path does **not** execute the side-effect tool.
+    pub fn persist_write_intent_or_fail_closed(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        if self.op_ledger_untrusted {
+            self.task_state.complete_operation_failed(
+                operation_id,
+                super::task_continuity::StructuredResult::with_body(
+                    false,
+                    "op ledger untrusted",
+                    super::task_continuity::OP_LEDGER_UNTRUSTED_MESSAGE,
+                    None,
+                ),
+            );
+            // Do NOT durable-commit: empty/untrusted memory must not overwrite
+            // the on-disk failure (explicit clear/recover only).
+            return Err(super::task_continuity::OP_LEDGER_UNTRUSTED_MESSAGE.into());
+        }
+        match self.commit_op_ledger_now() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = format!(
+                    "{}: {e}",
+                    super::task_continuity::WRITE_INTENT_COMMIT_FAILED_PREFIX
+                );
+                self.task_state.complete_operation_failed(
+                    operation_id,
+                    super::task_continuity::StructuredResult::with_body(
+                        false,
+                        "durable write-intent commit failed",
+                        msg.clone(),
+                        None,
+                    ),
+                );
+                // Best-effort: record the Failed terminal if the sink recovers.
+                let _ = self.commit_op_ledger_now();
+                Err(msg)
+            }
+        }
+    }
+
+    /// Mutating write gate + durable write-intent commit (fail closed).
+    ///
+    /// Replaces bare [`super::task_continuity::evaluate_mutating_gate`] on
+    /// stream paths that may execute side-effect tools.
+    pub fn evaluate_mutating_gate_durable(
+        &mut self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        write_fingerprint: &str,
+        stream_owner: Option<&str>,
+        call_site_turn: u64,
+    ) -> super::task_continuity::MutatingGateOutcome {
+        use super::task_continuity::MutatingGateOutcome;
+        if self.op_ledger_untrusted {
+            return MutatingGateOutcome::Block {
+                message: super::task_continuity::OP_LEDGER_UNTRUSTED_MESSAGE.into(),
+                confirm: None,
+            };
+        }
+        match super::task_continuity::evaluate_mutating_gate(
+            &mut self.task_state,
+            tool_name,
+            arguments,
+            write_fingerprint,
+            stream_owner,
+            call_site_turn,
+        ) {
+            MutatingGateOutcome::Proceed { operation_id } => {
+                match self.persist_write_intent_or_fail_closed(&operation_id) {
+                    Ok(()) => MutatingGateOutcome::Proceed { operation_id },
+                    Err(message) => MutatingGateOutcome::Block {
+                        message,
+                        confirm: None,
+                    },
+                }
+            }
+            other => other,
         }
     }
 
@@ -1712,20 +2488,247 @@ impl AgentInternalState {
         self.session.touch();
     }
 
+    /// Atomically accept a user message: save + allocate Turn + apply
+    /// authorization + attach content nodes under one lock, returning an
+    /// immutable [`AcceptedTurnContext`] for the stream / tool gate.
+    ///
+    /// Every Unknown re-run grant **consumes a confirm request**:
+    /// - Button / structured submit → validate + consume by `request_id`
+    /// - Plain-text confirm phrase → only when exactly one valid pending
+    ///   confirm exists, then consume that request
+    /// - No request / expired / already consumed / incomplete structured
+    ///   fields → refuse (no op-level Unique-Unknown grant fallback)
+    ///
+    /// `content_nodes` travels with this message (same pattern as
+    /// `authorization`) — never via a shared pending hop on agent state.
+    /// When `Some`, nodes+version overwrite any nodes already on `message`.
+    pub fn accept_user_message(
+        &mut self,
+        message: AgentMessage,
+        authorization: Option<super::task_continuity::AuthorizeNewOpSubmit>,
+        content_nodes: Option<(Vec<Value>, u32)>,
+    ) -> AcceptedTurnContext {
+        let mut message = message;
+        debug_assert_eq!(
+            message.role, "user",
+            "accept_user_message is for user Turns only"
+        );
+        // Capture pre-accept memory/auth + generation; Turn id filled after
+        // note_user_turn so rollback can refuse a stale (cleared / later) accept.
+        let snap_memory_len = self.memory.len();
+        let snap_message_count = self.session.message_count;
+        let snap_task_state = self.task_state.clone();
+        let snap_generation = self.history_generation;
+        if let Some((nodes, ver)) = content_nodes {
+            message.content_nodes = Some(nodes);
+            message.content_version = Some(ver);
+        }
+        // Round 1: every user message is a Turn; do not invent SetGoal /
+        // re-execute from utterance length or phrase whitelists.
+        let call_site_turn = self.task_state.note_user_turn();
+        match authorization {
+            Some(submit)
+                if !submit.request_id.is_empty()
+                    && !submit.prior_operation_id.is_empty()
+                    && !submit.write_fingerprint.is_empty() =>
+            {
+                match self.task_state.submit_confirm_request(&submit, None) {
+                    Ok((op_id, fp)) => {
+                        let _ = self.task_state.apply_directive(
+                            super::task_continuity::TaskDirective::AuthorizeNewOperation {
+                                prior_operation_id: Some(op_id),
+                                write_fingerprint: Some(fp),
+                            },
+                        );
+                    }
+                    Err(reason) => {
+                        // Visible reject — never silent "message accepted, no grant".
+                        self.task_state.pending_system_notes.push(format!(
+                            "Authorization was not applied ({reason}). The write was not re-authorized."
+                        ));
+                        if reason == "confirm_request_not_found" && !submit.request_id.is_empty() {
+                            self.task_state.confirm_lifecycle_notices.push(
+                                super::task_continuity::ConfirmLifecycleNotice::Removed {
+                                    request_id: submit.request_id.clone(),
+                                    reason: super::task_continuity::ConfirmRemoveReason::Rejected,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                // Incomplete structured fields — refuse visibly. Do not fall
+                // through to phrase or Unique-Unknown grant.
+                self.task_state.pending_system_notes.push(
+                    "Authorization was not applied (incomplete_authorization_target). The write was not re-authorized."
+                        .into(),
+                );
+            }
+            None => {
+                let content = message.content.as_ref();
+                if super::task_continuity::is_authorize_new_operation_phrase(content) {
+                    // Phrase only when exactly one valid pending confirm;
+                    // consume it — never grant from Unknown ops alone.
+                    if let Ok((op_id, fp)) = self.task_state.consume_unique_pending_confirm(None) {
+                        let _ = self.task_state.apply_directive(
+                            super::task_continuity::TaskDirective::AuthorizeNewOperation {
+                                prior_operation_id: Some(op_id),
+                                write_fingerprint: Some(fp),
+                            },
+                        );
+                    }
+                } else if let Some(directive) =
+                    super::task_continuity::parse_user_directive(content)
+                {
+                    let _ = self.task_state.apply_directive(directive);
+                }
+            }
+        }
+        self.memory.push(message);
+        self.session.increment_messages();
+        self.pending_accept_rollback = Some(AcceptRollback {
+            memory_len: snap_memory_len,
+            message_count: snap_message_count,
+            task_state: snap_task_state,
+            history_generation: snap_generation,
+            call_site_turn,
+        });
+        AcceptedTurnContext { call_site_turn }
+    }
+
+    /// Drop the pending accept snapshot after turn-start history save succeeds.
+    pub fn clear_pending_accept_rollback(&mut self) {
+        self.pending_accept_rollback = None;
+    }
+
+    /// Restore memory / Turn / auth to the pre-accept snapshot (save failure).
+    ///
+    /// Applies only when the snapshot is still current: same
+    /// [`Self::history_generation`] and `call_site_turn == turn_count`. After
+    /// [`Self::clear_memory`] the pending token is cleared and generation
+    /// advances — rollback must not revive pre-clear state.
+    ///
+    /// Also clears chat `user_image*` large-data entries so a multimodal retry
+    /// does not keep a half-applied accept cache. Returns whether a snapshot
+    /// was applied.
+    pub fn rollback_pending_accept(&mut self) -> bool {
+        let Some(snap) = self.pending_accept_rollback.take() else {
+            return false;
+        };
+        if snap.history_generation != self.history_generation
+            || snap.call_site_turn != self.task_state.turn_count
+        {
+            tracing::debug!(
+                session_id = %self.session_id,
+                snap_generation = snap.history_generation,
+                live_generation = self.history_generation,
+                snap_turn = snap.call_site_turn,
+                live_turn = self.task_state.turn_count,
+                "accept rollback refused — snapshot not current (cleared or superseded)"
+            );
+            return false;
+        }
+        self.memory.truncate(snap.memory_len);
+        self.session.message_count = snap.message_count;
+        self.task_state = snap.task_state;
+        self.compaction_cache = None;
+        self.large_data_cache.clear_user_images();
+        true
+    }
+
     /// Push a message to the memory.
+    ///
+    /// User messages go through [`Self::accept_user_message`] with no host
+    /// authorization / content-nodes arg (nodes already on `message` are kept;
+    /// phrase may still consume a unique pending confirm). Prefer
+    /// `accept_user_message` when a stream needs the returned
+    /// [`AcceptedTurnContext`].
     pub fn push_message(&mut self, message: AgentMessage) {
+        if message.role == "user" {
+            let _ = self.accept_user_message(message, None, None);
+            return;
+        }
         self.memory.push(message);
         self.session.increment_messages();
     }
 
+    /// Persist the final End goal snapshot onto this turn's last assistant
+    /// message (after the latest user). History reload reads these fields
+    /// as-is — never recomputes from live [`Self::task_state`].
+    ///
+    /// When cancel/fail ends the turn **before** any assistant row exists,
+    /// creates a minimal terminal assistant record so reload keeps the panel
+    /// status (live End alone would otherwise be lost).
+    pub fn stamp_final_goal_on_last_assistant(
+        &mut self,
+        goal_status: super::task_continuity::SystemGoalStatus,
+        end_reason: super::task_continuity::StreamEndReason,
+    ) {
+        let last_user_idx = self.memory.iter().rposition(|m| m.role == "user");
+        let start = last_user_idx.map(|i| i + 1).unwrap_or(0);
+        if let Some(msg) = self.memory[start..]
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == "assistant")
+        {
+            msg.goal_status = Some(goal_status);
+            msg.end_reason = Some(end_reason);
+            return;
+        }
+        let content = match end_reason {
+            super::task_continuity::StreamEndReason::Interrupted
+            | super::task_continuity::StreamEndReason::Cancelled => "[Interrupted]",
+            super::task_continuity::StreamEndReason::Timeout => "[Timeout]",
+            super::task_continuity::StreamEndReason::Error => "[Error]",
+            super::task_continuity::StreamEndReason::CannotContinue => "[Cannot continue]",
+            super::task_continuity::StreamEndReason::Normal => "",
+        };
+        let mut terminal = AgentMessage::assistant(content);
+        terminal.goal_status = Some(goal_status);
+        terminal.end_reason = Some(end_reason);
+        self.memory.push(terminal);
+        self.session.increment_messages();
+    }
+
     /// Restore memory from a list of messages.
+    ///
+    /// Does **not** restore [`Self::task_state`] — callers that reload a
+    /// session after process restart must also apply
+    /// [`Self::restore_op_ledger`] so Succeeded / Unknown ops survive and
+    /// Running leases become Unknown (no auto re-side-effect).
     pub fn restore_memory(&mut self, messages: Vec<AgentMessage>) {
         self.memory = messages;
     }
 
+    /// Restore the persisted Operation + write ledger (no auth / leases).
+    pub fn restore_op_ledger(&mut self, ledger: super::task_continuity::PersistedOpLedger) {
+        self.op_ledger_version = ledger.version;
+        self.task_state.restore_op_ledger(ledger);
+    }
+
+    /// Snapshot the minimal op ledger for durable storage.
+    pub fn snapshot_op_ledger(&self) -> super::task_continuity::PersistedOpLedger {
+        let mut snap = self.task_state.snapshot_op_ledger();
+        snap.version = self.op_ledger_version;
+        snap
+    }
+
     /// Clear the memory.
+    ///
+    /// Bumps [`Self::history_generation`] first so any in-flight persist that
+    /// snapshotted the pre-clear generation is rejected. Also drops
+    /// [`Self::pending_accept_rollback`] so a later save-fail path cannot
+    /// restore pre-clear ops/auth.
     pub fn clear_memory(&mut self) {
+        self.history_generation = self.history_generation.saturating_add(1);
+        self.pending_accept_rollback = None;
         self.memory.clear();
+        self.task_state = super::task_continuity::TaskState::default();
+        // Fresh empty ledger after explicit clear is authoritative again.
+        self.op_ledger_untrusted = false;
+        self.op_ledger_version = 0;
+        self.large_data_cache = LargeDataCache::new();
     }
 }
 
@@ -1805,6 +2808,19 @@ pub enum LlmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cache_extracts_history_latest_value_instead_of_json() {
+        let image = "data:image/png;base64,iVBORw0KGgo=";
+        let payload = serde_json::json!({"success":true,"data":{"data":{"image_data":{"_image_history_summary":true,"latest_value":image}}}});
+        let actual =
+            LargeDataCache::extract_image_data(&payload.to_string(), std::path::Path::new("data"));
+        assert_eq!(actual, "iVBORw0KGgo=");
+        let ordinary = r#"{"value":"ordinary text","description":"not an image"}"#;
+        assert_eq!(
+            LargeDataCache::extract_image_data(ordinary, std::path::Path::new("data")),
+            ordinary
+        );
+    }
 
     #[test]
     fn test_agent_event_creation() {
@@ -1816,6 +2832,123 @@ mod tests {
 
         let end = AgentEvent::end();
         assert!(end.is_end());
+    }
+
+    #[test]
+    fn final_end_event_carries_goal_status_and_reason() {
+        use super::super::task_continuity::{
+            ExcludedRoute, ExecutionMethod, StreamEndReason, SystemGoalStatus, TaskDirective,
+            TaskState,
+        };
+
+        let mut task = TaskState::default();
+        task.apply_directive(TaskDirective::SetGoal {
+            goal: "update cam-1".into(),
+            object: Some("cam-1".into()),
+            content: None,
+        });
+        task.apply_directive(TaskDirective::Correct {
+            goal: "device-native".into(),
+            object: None,
+            content: None,
+            method: Some(ExecutionMethod::DeviceNativeCommand),
+            exclude_routes: vec![ExcludedRoute::NotificationOrWebhook],
+        });
+
+        let end = AgentEvent::final_end(&task, StreamEndReason::Interrupted, None);
+        match &end {
+            AgentEvent::End {
+                goal_status: Some(SystemGoalStatus::Incomplete { .. }),
+                end_reason: Some(StreamEndReason::Interrupted),
+                ..
+            } => {}
+            other => panic!("expected Incomplete+Interrupted End, got {other:?}"),
+        }
+        let json = serde_json::to_value(&end).unwrap();
+        assert_eq!(json["type"], "End");
+        assert_eq!(json["end_reason"], "interrupted");
+        assert_eq!(json["goal_status"]["status"], "incomplete");
+        // NotApplicable must not be implied as success on unconstrained early error.
+        let na = AgentEvent::end()
+            .with_goal_status(SystemGoalStatus::NotApplicable)
+            .with_end_reason(StreamEndReason::Error);
+        let na_json = serde_json::to_value(&na).unwrap();
+        assert_eq!(na_json["goal_status"]["status"], "not_applicable");
+        assert_ne!(na_json["goal_status"]["status"], "completed");
+    }
+
+    #[test]
+    fn final_end_normal_not_applicable_is_not_verified_success() {
+        use super::super::task_continuity::{StreamEndReason, SystemGoalStatus, TaskState};
+        let task = TaskState::default();
+        let end = AgentEvent::final_end(&task, StreamEndReason::Normal, Some((10, 1, 2)));
+        match end {
+            AgentEvent::End {
+                goal_status: Some(SystemGoalStatus::NotApplicable),
+                end_reason: Some(StreamEndReason::Normal),
+                prompt_tokens: Some(10),
+                ..
+            } => {}
+            other => panic!("expected NotApplicable normal End, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stamp_final_goal_on_current_turn_assistant_only() {
+        use super::super::task_continuity::{GoalEvidenceLevel, StreamEndReason, SystemGoalStatus};
+
+        let mut state = AgentInternalState::new("s-stamp".into());
+        state.push_message(AgentMessage::user("prev"));
+        state.push_message(AgentMessage::assistant("prev reply"));
+        state.push_message(AgentMessage::user("now"));
+        // No assistant yet this turn — create a terminal row; never touch previous turn.
+        state.stamp_final_goal_on_last_assistant(
+            SystemGoalStatus::NotApplicable,
+            StreamEndReason::Interrupted,
+        );
+        assert!(
+            state.memory[1].goal_status.is_none(),
+            "must not stamp previous turn"
+        );
+        assert_eq!(
+            state.memory.len(),
+            4,
+            "early End creates a terminal assistant"
+        );
+        assert_eq!(state.memory[3].role, "assistant");
+        assert_eq!(&*state.memory[3].content, "[Interrupted]");
+        assert_eq!(
+            state.memory[3].goal_status,
+            Some(SystemGoalStatus::NotApplicable)
+        );
+        assert_eq!(
+            state.memory[3].end_reason,
+            Some(StreamEndReason::Interrupted)
+        );
+
+        // A later assistant on the same turn is stamped in place (no second terminal).
+        state.push_message(AgentMessage::assistant("trying"));
+        let incomplete = SystemGoalStatus::Incomplete {
+            reason: "no delivery".into(),
+            level: GoalEvidenceLevel::None,
+            operation_id: Some("op-1".into()),
+            task_complete_ok: false,
+            physical_ok: false,
+        };
+        state.stamp_final_goal_on_last_assistant(incomplete.clone(), StreamEndReason::Normal);
+        assert_eq!(state.memory[4].goal_status.as_ref(), Some(&incomplete));
+        assert_eq!(state.memory[4].end_reason, Some(StreamEndReason::Normal));
+        assert!(state.memory[1].goal_status.is_none());
+        // Prior early-terminal keeps its Interrupted snapshot.
+        assert_eq!(
+            state.memory[3].end_reason,
+            Some(StreamEndReason::Interrupted)
+        );
+
+        // Wire shape on AgentMessage uses camelCase keys.
+        let wire = serde_json::to_value(&state.memory[4]).unwrap();
+        assert_eq!(wire["goalStatus"]["status"], "incomplete");
+        assert_eq!(wire["endReason"], "normal");
     }
 
     #[test]
@@ -1845,6 +2978,156 @@ mod tests {
 
         state.touch();
         assert!(state.last_activity > 0);
+    }
+
+    /// Accept rollback restores memory / Turn / confirm auth after a failed
+    /// turn-start save (client rejected ≡ server).
+    #[test]
+    fn accept_rollback_restores_memory_turn_and_confirm_auth() {
+        use super::super::task_continuity::{
+            write_fingerprint, AuthorizeNewOpSubmit, StructuredResult,
+        };
+
+        let mut state = AgentInternalState::new("rollback".into());
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = state.task_state.begin_new_operation(
+            "run_now",
+            None,
+            r#"{"agent_id":"A"}"#,
+            Some(fp.clone()),
+        );
+        state.task_state.mark_operation_running(&op);
+        state.task_state.complete_operation_unknown(
+            &op,
+            StructuredResult {
+                success: false,
+                summary: "interrupted".into(),
+                body: String::new(),
+                details_ref: None,
+            },
+        );
+        let req = state
+            .task_state
+            .issue_or_reuse_confirm_request(&op, &fp, "run_now", None);
+        let submit = AuthorizeNewOpSubmit {
+            request_id: req.request_id.clone(),
+            prior_operation_id: req.prior_operation_id.clone(),
+            write_fingerprint: req.write_fingerprint.clone(),
+        };
+        let turns_before = state.task_state.turn_count;
+        let mem_before = state.memory.len();
+
+        let _ = state.accept_user_message(
+            AgentMessage::user("confirm re-run"),
+            Some(submit.clone()),
+            None,
+        );
+        assert_eq!(state.memory.len(), mem_before + 1);
+        assert!(state.task_state.user_authorized_new_op.is_some());
+        assert!(state
+            .task_state
+            .pending_confirm(&submit.request_id)
+            .is_none());
+
+        assert!(state.rollback_pending_accept());
+        assert_eq!(state.memory.len(), mem_before);
+        assert_eq!(state.task_state.turn_count, turns_before);
+        assert!(state.task_state.user_authorized_new_op.is_none());
+        assert!(
+            state
+                .task_state
+                .pending_confirm(&submit.request_id)
+                .is_some(),
+            "confirm must be restored for retry"
+        );
+        assert!(!state.rollback_pending_accept(), "pending consumed once");
+    }
+
+    /// accept confirm → clear history → save-fail rollback must stay cleared
+    /// (never restore pre-clear ops/auth).
+    #[test]
+    fn accept_rollback_refuses_after_clear_history() {
+        use super::super::task_continuity::{
+            write_fingerprint, AuthorizeNewOpSubmit, StructuredResult,
+        };
+
+        let mut state = AgentInternalState::new("rollback-clear".into());
+        let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+        let op = state.task_state.begin_new_operation(
+            "run_now",
+            None,
+            r#"{"agent_id":"A"}"#,
+            Some(fp.clone()),
+        );
+        state.task_state.mark_operation_running(&op);
+        state.task_state.complete_operation_unknown(
+            &op,
+            StructuredResult {
+                success: false,
+                summary: "interrupted".into(),
+                body: String::new(),
+                details_ref: None,
+            },
+        );
+        let req = state
+            .task_state
+            .issue_or_reuse_confirm_request(&op, &fp, "run_now", None);
+        let submit = AuthorizeNewOpSubmit {
+            request_id: req.request_id.clone(),
+            prior_operation_id: req.prior_operation_id.clone(),
+            write_fingerprint: req.write_fingerprint.clone(),
+        };
+
+        let _ = state.accept_user_message(AgentMessage::user("confirm re-run"), Some(submit), None);
+        assert!(state.task_state.user_authorized_new_op.is_some());
+        assert_eq!(state.memory.len(), 1);
+
+        let gen_after_accept = state.history_generation;
+        state.clear_memory();
+        assert!(state.memory.is_empty());
+        assert!(state.task_state.operations.is_empty());
+        assert!(state.task_state.user_authorized_new_op.is_none());
+        assert!(state.task_state.pending_confirm_requests.is_empty());
+        assert!(state.history_generation > gen_after_accept);
+
+        // SessionManager save-fail path would call this next — must no-op.
+        assert!(
+            !state.rollback_pending_accept(),
+            "clear must invalidate accept rollback"
+        );
+        assert!(state.memory.is_empty(), "history must stay cleared");
+        assert!(
+            state.task_state.operations.is_empty(),
+            "ops must stay cleared"
+        );
+        assert!(
+            state.task_state.user_authorized_new_op.is_none(),
+            "auth must stay cleared"
+        );
+        assert!(state.task_state.pending_confirm_requests.is_empty());
+        assert_eq!(state.task_state.turn_count, 0);
+    }
+
+    /// Generation/Turn gate: stale snapshot must not apply even if pending
+    /// was not explicitly cleared (defensive vs clear-invalidate).
+    #[test]
+    fn accept_rollback_refuses_when_generation_or_turn_stale() {
+        let mut state = AgentInternalState::new("rollback-stale".into());
+        let _ = state.accept_user_message(AgentMessage::user("hello"), None, None);
+        assert_eq!(state.memory.len(), 1);
+        // Simulate clear bumping generation without going through clear_memory's
+        // pending drop (generation gate alone must refuse).
+        state.history_generation = state.history_generation.saturating_add(1);
+        assert!(!state.rollback_pending_accept());
+        assert_eq!(state.memory.len(), 1, "stale rollback must not truncate");
+
+        let mut state2 = AgentInternalState::new("rollback-turn".into());
+        let accepted = state2.accept_user_message(AgentMessage::user("t1"), None, None);
+        // Later Turn without a fresh accept overwrite of pending.
+        let later = state2.task_state.note_user_turn();
+        assert_ne!(accepted.call_site_turn, later);
+        assert!(!state2.rollback_pending_accept());
+        assert_eq!(state2.memory.len(), 1);
     }
 
     #[test]
@@ -2171,6 +3454,234 @@ mod tests {
         assert!(value["success"].is_boolean());
     }
 
+    // ===== $cached read-back (file_read door, 2026-11-09 round) =====
+
+    /// Acceptance 1+2: a real large single-line JSON (with multi-byte
+    /// text) is cached, then read back via file_read windows — the
+    /// concatenated windows reproduce the original exactly, with no loss
+    /// and no duplication, even where a window edge lands mid-中文.
+    #[test]
+    fn cached_read_back_roundtrip_single_line_json_with_cjk() {
+        let mut cache = LargeDataCache::new();
+        // ~45KB single-line JSON with Chinese values — the shape that made
+        // line-windowed reads useless.
+        let mut payload = String::from(r#"{"events":[""#);
+        while payload.chars().count() < 45_000 {
+            payload.push_str("温度传感器读数升高警报，");
+        }
+        payload.push_str(r#""]}"#);
+
+        let summary = cache.store("shell.stdout", &payload);
+        assert!(summary.contains("$cached:shell.stdout"), "{}", summary);
+
+        // Walk the windows via next_char_offset and concatenate.
+        let mut rebuilt = String::new();
+        let mut offset = 0usize;
+        loop {
+            let out = cache.file_read_cached("$cached:shell.stdout", offset, Some(977));
+            assert!(out.success, "read-back must succeed");
+            let data = &out.data;
+            let content = data["content"].as_str().unwrap();
+            rebuilt.push_str(content);
+            match data["next_char_offset"].as_u64() {
+                Some(next) => {
+                    assert_eq!(data["truncated"], serde_json::json!(true));
+                    assert_eq!(next as usize, offset + content.chars().count());
+                    offset = next as usize;
+                }
+                None => {
+                    assert_eq!(data["truncated"], serde_json::json!(false));
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            rebuilt.chars().count(),
+            payload.chars().count(),
+            "no loss, no duplication across windows"
+        );
+        assert_eq!(rebuilt, payload, "char-exact reconstruction incl. CJK");
+        // Shape: totals, no file state, not-editable warning.
+        let first_out = cache.file_read_cached("$cached:shell.stdout", 0, None);
+        assert!(first_out.success);
+        let first = &first_out.data;
+        assert_eq!(
+            first["total_chars"],
+            serde_json::json!(payload.chars().count())
+        );
+        assert_eq!(first["char_offset"], serde_json::json!(0));
+        assert!(
+            first.get("state").is_none(),
+            "cached content carries no file state"
+        );
+        let message = first["message"].as_str().unwrap();
+        assert!(
+            message.contains("not a file"),
+            "message must disclaim file semantics: {}",
+            message
+        );
+    }
+
+    /// Acceptance 3: hard cap clamps oversized requests; offsets beyond
+    /// the end error instead of returning empty "nothing there".
+    #[test]
+    fn cached_read_window_cap_and_boundaries() {
+        let mut cache = LargeDataCache::new();
+        let payload = "烫".repeat(80_000); // 240KB of 3-byte chars
+        cache.store("big", &payload);
+
+        // Hard cap: an absurd request is clamped, not honored.
+        let capped = cache
+            .read_cached_window("$cached:big", 0, Some(1_000_000))
+            .unwrap();
+        assert!(
+            capped.returned_chars <= 64_000,
+            "hard cap respected: {}",
+            capped.returned_chars
+        );
+        assert!(capped.next_offset.is_some(), "capped window is truncated");
+
+        // Default window when char_length is omitted (8K — see the A2
+        // overflow note on CACHED_READ_DEFAULT_CHARS).
+        let default = cache.read_cached_window("$cached:big", 0, None).unwrap();
+        assert_eq!(default.returned_chars, 8_000);
+
+        // Offset exactly at the end → empty window, no next.
+        let total = default.total_chars;
+        let tail = cache
+            .read_cached_window("$cached:big", total, None)
+            .unwrap();
+        assert_eq!(tail.returned_chars, 0);
+        assert!(tail.next_offset.is_none());
+
+        // Offset BEYOND the end → explicit error (never silent empty).
+        let err = cache
+            .read_cached_window("$cached:big", total + 1, None)
+            .unwrap_err();
+        assert!(err.contains("beyond the end"), "{}", err);
+    }
+
+    /// Acceptance 3 (stale/cross-session): an unknown reference — evicted,
+    /// from another session, or never existed — is an explicit error
+    /// result, never empty content.
+    #[test]
+    fn cached_read_unknown_ref_is_explicit_error() {
+        let cache = LargeDataCache::new(); // fresh session: nothing cached
+        let out = cache.file_read_cached("$cached:shell.stdout#deadbeef", 0, None);
+        assert!(!out.success, "unknown ref must fail loudly");
+        let err = out.error.unwrap_or_default();
+        assert!(err.contains("Unknown $cached reference"), "error: {}", err);
+        assert!(
+            err.contains("Re-run the command"),
+            "error tells the model how to recover: {}",
+            err
+        );
+
+        // Not a reference at all → rejected too.
+        let out = cache.file_read_cached("not-a-ref", 0, None);
+        assert!(!out.success);
+    }
+
+    /// Eviction is DETERMINISTIC FIFO by insertion sequence (2026-11-09
+    /// review fix): 21 stores into 20 slots evict EXACTLY the oldest
+    /// entry — not "some same-second entry picked by HashMap order" — and
+    /// the evicted read is an EXPLICIT error, never a silent empty
+    /// success.
+    #[test]
+    fn cached_read_eviction_is_deterministic_fifo() {
+        let mut cache = LargeDataCache::new();
+        let payload = "x".repeat(33_000); // over the 32KB store() threshold
+        for i in 0..21 {
+            // MAX_CACHE_ENTRIES = 20 → exactly one entry was evicted.
+            cache.store(&format!("t{i}"), &payload);
+        }
+        // Exactly t0 (the oldest) is gone, with an explicit error.
+        let evicted = cache.file_read_cached("$cached:t0", 0, Some(10));
+        assert!(!evicted.success, "oldest entry must be evicted");
+        assert!(
+            evicted
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Unknown $cached reference"),
+            "evicted read says so explicitly"
+        );
+        // Everything else survives — including all same-second siblings.
+        for i in 1..21 {
+            let out = cache.file_read_cached(&format!("$cached:t{i}"), 0, Some(10));
+            assert!(out.success, "t{i} must survive FIFO eviction");
+            assert_eq!(out.data["returned_chars"], serde_json::json!(10));
+        }
+        // Introspection accessor agrees: insertion order, oldest first.
+        assert_eq!(
+            cache.entry_keys().first().map(String::as_str),
+            Some("t1"),
+            "survivors keep insertion order"
+        );
+    }
+
+    /// Acceptance (same-session lifetime): a reference created in one
+    /// round stays readable in later rounds of the SAME session/execution
+    /// — the continuation case. Only a different session (fresh cache)
+    /// loses it.
+    #[test]
+    fn cached_refs_survive_across_rounds_in_same_session() {
+        let mut session = LargeDataCache::new();
+        session.store("round1", &("a".repeat(40_000)));
+        // Rounds 2-3 do other work (entries stay ≤ 20 → no eviction).
+        session.store("round2", &("b".repeat(40_000)));
+        session.store("round3", &("c".repeat(40_000)));
+        let out = session.file_read_cached("$cached:round1", 0, Some(50));
+        assert!(out.success, "same-session ref stays valid across rounds");
+        assert_eq!(out.data["content"].as_str().unwrap(), "a".repeat(50));
+
+        // A DIFFERENT session is a fresh cache → explicit rejection.
+        let other = LargeDataCache::new();
+        let denied = other.file_read_cached("$cached:round1", 0, None);
+        assert!(!denied.success, "cross-session ref must be rejected");
+    }
+
+    /// Acceptance (byte budget): 64K chars of CJK ≈ 192KB of UTF-8 — the
+    /// window must stop at the BYTE cap for multi-byte text and at the
+    /// CHAR cap for ASCII, whichever binds first.
+    #[test]
+    fn cached_read_window_dual_char_and_byte_caps() {
+        let mut cache = LargeDataCache::new();
+        let cjk = "烫".repeat(80_000); // 240KB
+        cache.store("cjk", &cjk);
+
+        // CJK regime: requesting 60,000 chars (180KB) is byte-capped.
+        let w = cache
+            .read_cached_window("$cached:cjk", 0, Some(60_000))
+            .unwrap();
+        assert!(
+            w.content.len() <= 64 * 1024,
+            "byte cap binds for CJK: {} bytes",
+            w.content.len()
+        );
+        assert!(
+            w.returned_chars < 60_000,
+            "char request was not honored past bytes"
+        );
+        assert!(w.next_offset.is_some(), "byte-capped window is truncated");
+        assert!(
+            w.returned_chars >= 1,
+            "never an empty truncated window (loop guard)"
+        );
+
+        // ASCII regime: the char cap binds instead.
+        cache.store("ascii", &"z".repeat(100_000));
+        let w = cache
+            .read_cached_window("$cached:ascii", 0, Some(1_000_000))
+            .unwrap();
+        assert_eq!(w.returned_chars, 64_000, "char cap binds for ASCII");
+        assert_eq!(
+            w.content.len(),
+            64_000,
+            "64,000 ASCII chars = 64,000 bytes < 65,536 (64 KiB) — char cap binds first, byte cap does not"
+        );
+    }
+
     /// Arrays of images (e.g. a tool returning a list of frames) all get
     /// slimmed, each with its own cache entry.
     #[test]
@@ -2314,5 +3825,146 @@ mod tests {
         assert!(cache
             .resolve_reference(&format!("$cached:{}", ref2))
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod image_reference_tests {
+    use super::*;
+
+    fn tiny_png_data_url() -> String {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buf.into_inner());
+        format!("data:image/png;base64,{}", b64)
+    }
+
+    /// Full round trip: persist a data URL to a file, resolve the reference
+    /// back — byte-identical payload and mime.
+    #[test]
+    fn persist_then_resolve_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let images_dir = dir.path().join("images");
+        let data_url = tiny_png_data_url();
+
+        let reference =
+            crate::session::SessionManager::persist_image_to_file(&data_url, &images_dir)
+                .expect("persist should succeed");
+        assert!(reference.starts_with("/api/images/"), "got: {reference}");
+        assert!(reference.ends_with(".png"));
+
+        let resolved =
+            load_image_reference_from(&reference, &images_dir).expect("reference should resolve");
+        assert_eq!(resolved, data_url, "round trip must be byte-identical");
+    }
+
+    /// Re-persisting the same image must produce the SAME file — save_history
+    /// runs every turn over the full history (review finding: uuid names
+    /// orphaned one file per image per turn).
+    #[test]
+    fn persist_is_idempotent_per_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let images_dir = dir.path().join("images");
+        let data_url = tiny_png_data_url();
+
+        let first = crate::session::SessionManager::persist_image_to_file(&data_url, &images_dir)
+            .expect("first persist");
+        let second = crate::session::SessionManager::persist_image_to_file(&data_url, &images_dir)
+            .expect("second persist");
+        assert_eq!(first, second, "same content must map to the same file");
+
+        // Different content → different file.
+        let img2 = image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img2.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buf.into_inner());
+        let other = format!("data:image/png;base64,{}", b64);
+        let third = crate::session::SessionManager::persist_image_to_file(&other, &images_dir)
+            .expect("other persist");
+        assert_ne!(
+            first, third,
+            "different content must map to different files"
+        );
+
+        // And exactly two files exist on disk.
+        let count = std::fs::read_dir(&images_dir).unwrap().count();
+        assert_eq!(count, 2, "no orphan duplicates expected, got {count}");
+    }
+
+    #[test]
+    fn resolve_rejects_unsafe_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let images_dir = dir.path().join("images");
+        std::fs::create_dir_all(&images_dir).unwrap();
+        for bad in [
+            "/api/images/../../etc/passwd",
+            "/api/images/a/b.png",
+            "/api/images/",
+            "/api/images/.hidden.png",
+            "/api/images/x..png",
+            "http://evil/x.png",
+        ] {
+            assert!(
+                load_image_reference_from(bad, &images_dir).is_none(),
+                "must reject: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_image_reference_from("/api/images/nope.png", dir.path()).is_none());
+    }
+
+    /// to_core_multimodal must drop (not mangle) image parts whose reference
+    /// cannot be resolved — sending a URL as base64 produces garbage the
+    /// backend may accept silently.
+    #[test]
+    fn to_core_multimodal_drops_unresolvable_reference() {
+        let mut msg = AgentMessage::user("看这张图");
+        msg.images = Some(vec![AgentMessageImage {
+            data: "/api/images/definitely-missing.png".to_string(),
+            mime_type: Some("image/png".to_string()),
+            caption: None,
+        }]);
+        let core = msg.to_core();
+        let parts = match core.content {
+            heramind_core::Content::Parts(parts) => parts,
+            other => panic!("expected parts, got {:?}", other),
+        };
+        // Text part only — the broken image must not appear as an image part.
+        assert_eq!(parts.len(), 1, "unresolvable image must be dropped");
+        // But the drop must be VISIBLE to the model — a silently vanished
+        // image makes follow-up questions ("who is third person in the
+        // picture?") get confident hallucinated answers.
+        match &parts[0] {
+            heramind_core::ContentPart::Text { text } => assert!(
+                text.contains("image could not be loaded"),
+                "dropped image must leave a note in the text, got: {text}"
+            ),
+            other => panic!("expected text part, got {:?}", other),
+        }
+    }
+
+    /// A well-formed data URL message keeps its image part (regression guard
+    /// for the reference-handling change).
+    #[test]
+    fn to_core_multimodal_keeps_data_url_image() {
+        let mut msg = AgentMessage::user("看这张图");
+        msg.images = Some(vec![AgentMessageImage {
+            data: tiny_png_data_url(),
+            mime_type: None,
+            caption: None,
+        }]);
+        let core = msg.to_core();
+        let parts = match core.content {
+            heramind_core::Content::Parts(parts) => parts,
+            other => panic!("expected parts, got {:?}", other),
+        };
+        assert_eq!(parts.len(), 2, "text + one image part");
     }
 }

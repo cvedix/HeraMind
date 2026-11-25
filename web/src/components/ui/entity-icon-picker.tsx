@@ -20,7 +20,6 @@ import {
 import { cn } from '@/lib/utils'
 import { entityIcons, getIconForEntity } from '@/design-system/icons'
 import { textNano } from "@/design-system/tokens/typography"
-import type { EntityIcon } from '@/design-system/icons'
 
 export interface EntityIconPickerProps {
   value?: string
@@ -121,7 +120,7 @@ export function EntityIconPicker({
           </div>
 
           {/* Icon grid */}
-          <div className="p-3 max-h-80 overflow-y-auto scrollbar-thin scrollbar-thumb-muted-foreground/20 scrollbar-track-transparent hover:scrollbar-thumb-muted-foreground/40">
+          <div className="p-3 max-h-80 overflow-y-auto scrollbar-thin scrollbar-thumb-muted scrollbar-track-transparent hover:scrollbar-thumb-muted-foreground">
             {filteredIcons.length === 0 ? (
               <div className="text-center py-8 text-muted-foreground text-sm">
                 {t('entityIconPicker.notFound')}
@@ -164,7 +163,7 @@ export function EntityIconPicker({
                 variant="ghost"
                 size="sm"
                 onClick={handleClear}
-                className="h-7 px-2 text-xs"
+                className="h-7 px-2 text-xs sm:h-7"
               >
                 <X className="h-4 w-4 mr-1" />
                 {t('entityIconPicker.clear')}

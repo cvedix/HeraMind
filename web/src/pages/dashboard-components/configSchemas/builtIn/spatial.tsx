@@ -1,11 +1,9 @@
 import React from 'react'
-import { cn } from '@/lib/utils'
 import { compressImageFile } from '@/lib/imageUtils'
 import { chartColorsHex } from '@/design-system/tokens/color'
 import { Field } from '@/components/ui/field'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
 import {
   Select,
   SelectContent,
@@ -13,23 +11,22 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Checkbox } from '@/components/ui/checkbox'
-import { ColorPicker } from '@/components/ui/color-picker'
-import { IconPicker } from '@/components/ui/icon-picker'
-import { EntityIconPicker } from '@/components/ui/entity-icon-picker'
-import { DataMappingConfig } from '@/components/dashboard/config/UIConfigSections'
-import { LEDStateRulesConfig } from '@/components/dashboard/config/LEDStateRulesConfig'
-import type { StateRule } from '@/components/dashboard/generic/LEDIndicator'
-import type { SingleValueMappingConfig, TimeSeriesMappingConfig, CategoricalMappingConfig } from '@/lib/dataMapping'
-import { DualModeSourceField } from '@/components/dashboard/config'
 import type { ComponentConfigSchema } from '@/components/dashboard/config/ComponentConfigBuilder'
 import { SelectField } from '../../ConfigFieldComponents'
 import type { SchemaContext, Updaters } from '../types'
+
+/** Binding dataSource as stored — metricId/command/etc are read per binding
+ *  kind; the canonical DataSource type is a wide union. */
+type BindingDataSource = Record<string, unknown> & {
+  metricId?: string
+  command?: string
+  property?: string
+}
+
 import { useStore } from '@/store'
 import { getSourceId } from '@/types/dashboard'
 import type { DataSource } from '@/types/dashboard'
 import { Button } from '@/components/ui/button'
-import { DeviceBindingConfig } from '@/components/dashboard/config/DeviceBindingConfig'
 import type { MapBinding, MapBindingType } from '@/components/dashboard/generic/MapEditorDialog'
 import type { LayerBinding, LayerBindingType } from '@/components/dashboard/generic/CustomLayer'
 import { BindingDataSourceSelector } from '../../BindingDataSourceSelector'
@@ -45,9 +42,10 @@ import {
   Upload,
 } from 'lucide-react'
 
-export function getMapDisplaySchema(config: any, ctx: SchemaContext, u: Updaters): ComponentConfigSchema {
-  const { t, setCenterPickerOpen, setMapEditorBindings, setMapEditorOpen, currentDashboard, selectedComponent } = ctx
-  const { updateConfig, updateDataSource, updateDataMapping, updateNestedConfig } = u
+export function getMapDisplaySchema// eslint-disable-next-line @typescript-eslint/no-explicit-any -- form-values bag: keys are per-widget, values feed heterogeneous field props
+(config: any, ctx: SchemaContext, u: Updaters): ComponentConfigSchema {
+  const { t, setCenterPickerOpen, setMapEditorBindings, setMapEditorOpen, currentDashboard: _currentDashboard, selectedComponent } = ctx
+  const { updateConfig, updateDataSource, updateDataMapping: _updateDataMapping, updateNestedConfig: _updateNestedConfig } = u
   return {
           dataSourceSections: [],
           styleSections: [
@@ -84,7 +82,7 @@ export function getMapDisplaySchema(config: any, ctx: SchemaContext, u: Updaters
                       variant="outline"
                       size="sm"
                       onClick={() => setCenterPickerOpen(true)}
-                      className="h-9 px-3 shrink-0"
+                      className="h-9 px-3 shrink-0 sm:h-9"
                       title={t('mapDisplay.visualSelectCenter', '可视化选择中心点')}
                     >
                       <MapPin className="h-4 w-4" />
@@ -165,21 +163,6 @@ export function getMapDisplaySchema(config: any, ctx: SchemaContext, u: Updaters
                         </SelectContent>
                       </Select>
                     </Field>
-                    <Field>
-                      <Label>{t('visualDashboard.showLayerControl')}</Label>
-                      <Select
-                        value={String(config.showLayers ?? true)}
-                        onValueChange={(value) => updateConfig('showLayers')(value === 'true')}
-                      >
-                        <SelectTrigger className="w-full h-9">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="true">{t('visualDashboard.showCard')}</SelectItem>
-                          <SelectItem value="false">{t('visualDashboard.hide')}</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </Field>
                   </div>
 
                   <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
@@ -236,7 +219,7 @@ export function getMapDisplaySchema(config: any, ctx: SchemaContext, u: Updaters
 
                           const existingBinding = (config.bindings as MapBinding[])?.find(b => {
                             if (!b.dataSource) return false
-                            const bDs = b.dataSource as any
+                            const bDs = b.dataSource as DataSource & BindingDataSource
                             if (bindingType === 'metric' || ds.type === 'telemetry') {
                               return (getSourceId(bDs) === getSourceId(ds)) && (
                                 bDs.metricId === ds.metricId ||
@@ -302,12 +285,12 @@ export function getMapDisplaySchema(config: any, ctx: SchemaContext, u: Updaters
                         // Get the latest bindings from the store, not just local state
                         const latestDashboard = useStore.getState().currentDashboard
                         const latestComponent = latestDashboard?.components.find(c => c.id === selectedComponent?.id)
-                        let latestBindings = (latestComponent as any)?.config?.bindings as MapBinding[] || []
+                        let latestBindings = ((latestComponent as { config?: { bindings?: MapBinding[] } })?.config?.bindings) || [] || []
 
                         // Fix duplicate IDs - regenerate IDs for bindings with duplicate IDs
                         const idCount = new Map<string, number>()
                         latestBindings = latestBindings.map((binding, index) => {
-                          const ds = binding.dataSource as any
+                          const ds = binding.dataSource as DataSource & BindingDataSource
                           const currentId = binding.id
 
                           // Check if this ID is duplicated
@@ -345,12 +328,12 @@ export function getMapDisplaySchema(config: any, ctx: SchemaContext, u: Updaters
                       // Get the latest bindings from the store for display
                       const latestDashboard = useStore.getState().currentDashboard
                       const latestComponent = latestDashboard?.components.find(c => c.id === selectedComponent?.id)
-                      let displayBindings = (latestComponent as any)?.config?.bindings as MapBinding[] || []
+                      let displayBindings = ((latestComponent as { config?: { bindings?: MapBinding[] } })?.config?.bindings) || [] || []
 
                       // Fix duplicate IDs for display and interaction
                       const idCount = new Map<string, number>()
                       displayBindings = displayBindings.map((binding, index) => {
-                        const ds = binding.dataSource as any
+                        const ds = binding.dataSource as DataSource & BindingDataSource
                         const currentId = binding.id
                         idCount.set(currentId, (idCount.get(currentId) || 0) + 1)
 
@@ -371,7 +354,7 @@ export function getMapDisplaySchema(config: any, ctx: SchemaContext, u: Updaters
                           } else {
                             newId = `device-${getSourceId(ds)}-${index}`
                           }
-                                                    return { ...binding, id: newId, type: newType as any, icon: newType as any }
+                                                    return { ...binding, id: newId, type: newType, icon: newType }
                         }
                         return binding
                       })
@@ -463,8 +446,8 @@ export function getMapDisplaySchema(config: any, ctx: SchemaContext, u: Updaters
 
                                 // Get device/metric info from dataSource
                                 const deviceId = getSourceId((binding.dataSource as DataSource))
-                                const metricId = (binding.dataSource as any)?.metricId
-                                const command = (binding.dataSource as any)?.command
+                                const metricId = (binding.dataSource as DataSource & BindingDataSource)?.metricId
+                                const command = (binding.dataSource as DataSource & BindingDataSource)?.command
 
                                 return (
                                   <div
@@ -519,9 +502,10 @@ export function getMapDisplaySchema(config: any, ctx: SchemaContext, u: Updaters
         }
 }
 
-export function getCustomLayerSchema(config: any, ctx: SchemaContext, u: Updaters): ComponentConfigSchema {
-  const { t, setLayerEditorBindings, setLayerEditorOpen, currentDashboard, selectedComponent } = ctx
-  const { updateConfig, updateDataSource, updateDataMapping, updateNestedConfig } = u
+export function getCustomLayerSchema// eslint-disable-next-line @typescript-eslint/no-explicit-any -- form-values bag: keys are per-widget, values feed heterogeneous field props
+(config: any, ctx: SchemaContext, u: Updaters): ComponentConfigSchema {
+  const { t, setLayerEditorBindings, setLayerEditorOpen, currentDashboard: _currentDashboard, selectedComponent } = ctx
+  const { updateConfig, updateDataSource: _updateDataSource, updateDataMapping: _updateDataMapping, updateNestedConfig: _updateNestedConfig } = u
   return {
           dataSourceSections: [],
           styleSections: [
@@ -583,7 +567,7 @@ export function getCustomLayerSchema(config: any, ctx: SchemaContext, u: Updater
                               }
                               input.click()
                             }}
-                            className="h-9 px-3 shrink-0"
+                            className="h-9 px-3 shrink-0 sm:h-9"
                           >
                             <Upload className="h-4 w-4 mr-1.5" />
                             {t('visualDashboard.upload')}
@@ -604,7 +588,7 @@ export function getCustomLayerSchema(config: any, ctx: SchemaContext, u: Updater
                             variant="ghost"
                             size="sm"
                             onClick={() => updateConfig('backgroundImage')('')}
-                            className="h-8 text-error hover:text-error"
+                            className="h-8 text-error hover:text-error sm:h-8"
                           >
                             {t('visualDashboard.clear')}
                           </Button>
@@ -670,7 +654,7 @@ export function getCustomLayerSchema(config: any, ctx: SchemaContext, u: Updater
                 <div className="space-y-4">
                   {/* Data source selection — merged from Data Source tab */}
                   <BindingDataSourceSelector
-                    dataSource={config.bindings as any}
+                    dataSource={config.bindings as never}
                     onConfirm={(newDataSources) => {
                       const sourcesArray = newDataSources
                         ? Array.isArray(newDataSources)
@@ -678,14 +662,14 @@ export function getCustomLayerSchema(config: any, ctx: SchemaContext, u: Updater
                           : [newDataSources]
                         : []
 
-                      const newBindings = sourcesArray.map((ds: any, index: number) => {
+                      const newBindings = sourcesArray.map((ds: DataSource, index: number) => {
                         let bindingType: LayerBindingType = 'device'
                         if (ds.type === 'metric' || ds.type === 'telemetry') bindingType = 'metric'
                         else if (ds.type === 'command') bindingType = 'command'
 
                         const existingBinding = (config.bindings as LayerBinding[])?.find(b => {
                           if (!b.dataSource) return false
-                          const bDs = b.dataSource as any
+                          const bDs = b.dataSource as DataSource & BindingDataSource
                           return getSourceId(bDs) === getSourceId(ds) &&
                             bDs.metricId === ds.metricId &&
                             bDs.property === ds.property &&
@@ -724,9 +708,9 @@ export function getCustomLayerSchema(config: any, ctx: SchemaContext, u: Updater
 
                       const existingTextIconBindings = (config.bindings as LayerBinding[])?.filter(b => {
                         if (b.type === 'text' || b.type === 'icon') return true
-                        const ds = b.dataSource as any
+                        const ds = b.dataSource as DataSource & BindingDataSource
                         if (ds && getSourceId(ds)) {
-                          return !sourcesArray.some((s: any) => getSourceId(s) === getSourceId(ds))
+                          return !sourcesArray.some((s) => getSourceId(s) === getSourceId(ds))
                         }
                         return false
                       }) || []
@@ -752,7 +736,7 @@ export function getCustomLayerSchema(config: any, ctx: SchemaContext, u: Updater
                       onClick={() => {
                         const latestDashboard = useStore.getState().currentDashboard
                         const latestComponent = latestDashboard?.components.find(c => c.id === selectedComponent?.id)
-                        const latestBindings = (latestComponent as any)?.config?.bindings as LayerBinding[] || []
+                        const latestBindings = ((latestComponent as { config?: { bindings?: LayerBinding[] } })?.config?.bindings) || [] || []
                         setLayerEditorBindings(latestBindings)
                         setLayerEditorOpen(true)
                       }}
@@ -767,7 +751,7 @@ export function getCustomLayerSchema(config: any, ctx: SchemaContext, u: Updater
                     {(() => {
                       const latestDashboard = useStore.getState().currentDashboard
                       const latestComponent = latestDashboard?.components.find(c => c.id === selectedComponent?.id)
-                      const displayBindings = (latestComponent as any)?.config?.bindings as LayerBinding[] || []
+                      const displayBindings = ((latestComponent as { config?: { bindings?: LayerBinding[] } })?.config?.bindings) || [] || []
 
                       // Group by type
                       const groupedBindings = {
@@ -862,7 +846,7 @@ export function getCustomLayerSchema(config: any, ctx: SchemaContext, u: Updater
                                   ? `(${binding.position.x.toFixed(0)}%, ${binding.position.y.toFixed(0)}%)`
                                   : t('visualDashboard.center')
 
-                                const ds = binding.dataSource as any
+                                const ds = binding.dataSource as DataSource & BindingDataSource
                                 const deviceId = getSourceId(ds)
                                 const metricId = ds?.metricId || ds?.property
                                 const command = ds?.command

@@ -156,7 +156,17 @@ pub static ROUTES: &[RouteDoc] = &[
     },
     RouteDoc {
         method: "GET",
+        path: "/api/extensions/pages",
+        auth: "public",
+    },
+    RouteDoc {
+        method: "GET",
         path: "/api/extensions/capabilities",
+        auth: "public",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/extensions/commands/search",
         auth: "public",
     },
     RouteDoc {
@@ -365,6 +375,11 @@ pub static ROUTES: &[RouteDoc] = &[
         auth: "jwt-or-api-key",
     },
     RouteDoc {
+        method: "POST",
+        path: "/api/stats/data-dir/refresh",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
         method: "GET",
         path: "/api/logs/download",
         auth: "jwt-or-api-key",
@@ -515,6 +530,11 @@ pub static ROUTES: &[RouteDoc] = &[
         auth: "jwt-or-api-key",
     },
     RouteDoc {
+        method: "GET",
+        path: "/api/sessions/pending",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
         method: "POST",
         path: "/api/sessions/cleanup",
         auth: "jwt-or-api-key",
@@ -546,7 +566,27 @@ pub static ROUTES: &[RouteDoc] = &[
     },
     RouteDoc {
         method: "POST",
+        path: "/api/sessions/:id/compact",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/sessions/:id/clear",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "POST",
         path: "/api/sessions/:id/chat",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/mentions/search",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/mentions/resolve",
         auth: "jwt-or-api-key",
     },
     RouteDoc {
@@ -577,6 +617,26 @@ pub static ROUTES: &[RouteDoc] = &[
     RouteDoc {
         method: "DELETE",
         path: "/api/sessions/:id/pending",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/v1/operations",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/v1/operations/:id",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/operations",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/operations/:id",
         auth: "jwt-or-api-key",
     },
     RouteDoc {
@@ -701,6 +761,11 @@ pub static ROUTES: &[RouteDoc] = &[
     },
     RouteDoc {
         method: "POST",
+        path: "/api/devices/drafts/:device_id/confirm-association",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "POST",
         path: "/api/devices/drafts/:device_id/reject",
         auth: "jwt-or-api-key",
     },
@@ -811,6 +876,11 @@ pub static ROUTES: &[RouteDoc] = &[
     },
     RouteDoc {
         method: "GET",
+        path: "/api/rules/:id/explain",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "GET",
         path: "/api/messages",
         auth: "jwt-or-api-key",
     },
@@ -847,6 +917,16 @@ pub static ROUTES: &[RouteDoc] = &[
     RouteDoc {
         method: "GET",
         path: "/api/messages/:id",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/messages/:id/chain",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/messages/:id/false-positive",
         auth: "jwt-or-api-key",
     },
     RouteDoc {
@@ -1175,6 +1255,11 @@ pub static ROUTES: &[RouteDoc] = &[
         auth: "jwt-or-api-key",
     },
     RouteDoc {
+        method: "POST",
+        path: "/api/agents/test-preview",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
         method: "GET",
         path: "/api/agents/:id",
         auth: "jwt-or-api-key",
@@ -1197,6 +1282,11 @@ pub static ROUTES: &[RouteDoc] = &[
     RouteDoc {
         method: "POST",
         path: "/api/agents/:id/invoke",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/agents/:id/test",
         auth: "jwt-or-api-key",
     },
     RouteDoc {
@@ -1605,6 +1695,11 @@ pub static ROUTES: &[RouteDoc] = &[
         auth: "jwt-or-api-key",
     },
     RouteDoc {
+        method: "PATCH",
+        path: "/api/extensions/:id/ai-enabled",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
         method: "POST",
         path: "/api/extensions/market/install",
         auth: "jwt-or-api-key",
@@ -1691,8 +1786,38 @@ pub static ROUTES: &[RouteDoc] = &[
     },
     RouteDoc {
         method: "POST",
+        path: "/api/builtin-llm/stop",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "POST",
         path: "/api/builtin-llm/activate",
         auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/builtin-llm/runtime",
+        auth: "jwt-or-api-key",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/builtin-llm/runtime/check",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/builtin-llm/runtime/variant",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/builtin-llm/runtime/upgrade",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/builtin-llm/runtime/revert",
+        auth: "jwt-only",
     },
     RouteDoc {
         method: "GET",
@@ -1797,6 +1922,16 @@ pub static ROUTES: &[RouteDoc] = &[
     RouteDoc {
         method: "PUT",
         path: "/api/settings/market",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/settings/llm-sources",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "PUT",
+        path: "/api/settings/llm-sources",
         auth: "jwt-only",
     },
     RouteDoc {

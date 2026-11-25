@@ -1,10 +1,25 @@
 // WebSocket Manager for Chat
-import type { ServerMessage, ClientChatMessage, ChatImage } from '@/types'
+import type { ServerMessage, ClientChatMessage, ChatImage, ChatReference } from '@/types'
 import { tokenManager } from './auth'
 import { storage } from './utils/storage'
-import { isTauriEnv, getApiKey } from './api'
+import { getApiKey } from './api'
 import { buildWsUrl } from './urls'
 import { getServerOrigin } from './api'
+import { generateId } from './id'
+import { DRAFT_ACK_TIMEOUT_MS } from './chat/contentProtocol'
+
+/** Result of handing a chat frame to the wire or pending queue. */
+export type SendResult = {
+  /** true when sent or queued locally — NOT a server receive-ack. */
+  wireOk: boolean
+  /** Echoed by MessageReceived; draft lifecycle keys on this. */
+  requestId: string
+}
+
+export type ReceiveAckResult = {
+  status: 'accepted' | 'rejected' | 'timeout'
+  reason?: string
+}
 
 type MessageHandler = (message: ServerMessage) => void
 type ConnectionHandler = (connected: boolean, isReconnect?: boolean) => void
@@ -59,6 +74,14 @@ export class ChatWebSocket {
   private lastToken: string | null = null
   private currentState: ConnectionState = { status: 'disconnected' }
   private onlineHandler: (() => void) | null = null
+  /** Waiters for server MessageReceived keyed by clientRequestId. */
+  private receiveAckWaiters = new Map<
+    string,
+    {
+      resolve: (result: ReceiveAckResult) => void
+      timer: ReturnType<typeof setTimeout>
+    }
+  >()
 
   constructor() {
     this.loadPendingMessages()
@@ -160,8 +183,22 @@ export class ChatWebSocket {
       return
     }
 
-    // Close existing WebSocket if it's in a bad state
+    // A connect attempt to the same URL is already in flight — let it
+    // finish. Killing a CONNECTING socket here was the connect-livelock:
+    // double-mounted effects (React StrictMode in dev) call connect()
+    // twice; the second call closed the first socket mid-handshake, its
+    // onclose scheduled a reconnect, which closed the NEXT one… none ever
+    // reached OPEN, cycling ~1 reconnect interval forever.
+    if (this.ws && this.ws.readyState === WebSocket.CONNECTING && this.ws.url === wsUrl) {
+      return
+    }
+
+    // Close existing WebSocket if it's in a bad state. Handlers on the old
+    // socket are stale — the guards in onclose/onmessage ignore them.
     if (this.ws) {
+      this.ws.onclose = null
+      this.ws.onerror = null
+      this.ws.onmessage = null
       this.ws.close()
       this.ws = null
     }
@@ -189,6 +226,11 @@ export class ChatWebSocket {
     }
 
     this.ws.onclose = (event) => {
+      // Stale-socket guard: only the CURRENT socket's lifecycle drives state.
+      // (Pre-replacement sockets fire close asynchronously; reacting to them
+      // double-schedules reconnects and resurrects "disconnected" badges
+      // while the new connection is healthy.)
+      if (this.ws !== event.target) return
       this.notifyConnection(false)
       // Only stop reconnecting on auth rejection (4001)
       // Reconnect on everything else including normal close (server restart)
@@ -205,6 +247,14 @@ export class ChatWebSocket {
             .map(m => (typeof m.message === 'string' ? m.message.slice(0, 50) : '(non-text)'))
             .join('", "')
           console.warn(`[WebSocket] Auth error, dropping ${droppedCount} queued message(s)`)
+          for (const dropped of this.pendingMessages) {
+            if (dropped.clientRequestId) {
+              this.settleReceiveAck(dropped.clientRequestId, {
+                status: 'rejected',
+                reason: 'queue_drop',
+              })
+            }
+          }
           this.pendingMessages = []
           storage.remove(STORAGE_KEY)
           this.setState({
@@ -220,11 +270,13 @@ export class ChatWebSocket {
       }
     }
 
-    this.ws.onerror = () => {
+    this.ws.onerror = (event) => {
+      if (this.ws !== event.target) return
       this.setState({ status: 'error', errorMessage: 'Connection error' })
     }
 
     this.ws.onmessage = (event) => {
+      if (this.ws !== event.target) return
       try {
         const data = JSON.parse(event.data) as ServerMessage
 
@@ -234,6 +286,14 @@ export class ChatWebSocket {
             this.ws.send(JSON.stringify({ type: 'pong' }))
           }
           return // Don't notify handlers about ping/pong
+        }
+
+        // Server receive-ack for composer draft lifecycle.
+        if (data.type === 'MessageReceived') {
+          this.settleReceiveAck(data.requestId, {
+            status: data.status === 'accepted' ? 'accepted' : 'rejected',
+            reason: data.reason,
+          })
         }
 
         // Handle auth error message from server
@@ -269,42 +329,142 @@ export class ChatWebSocket {
     }
   }
 
-  sendRequest(request: ClientChatMessage) {
+  /**
+   * Hand a chat request to the wire or the pending queue.
+   * @returns true when the request was sent or queued locally; false when the
+   *   send itself threw. Local success is NOT a server receive-ack.
+   */
+  sendRequest(request: ClientChatMessage): boolean {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(request))
-      this.removeFromStorage(request)  // Remove from storage on successful send
-    } else {
-      // Queue message for when connected
-      // P0: Prevent unbounded growth - evict oldest if limit reached
-      if (this.pendingMessages.length >= this.MAX_PENDING_MESSAGES) {
-        // Remove oldest message (FIFO)
-        const dropped = this.pendingMessages.shift()
-        if (dropped) {
-          const preview = typeof dropped.message === 'string'
-            ? dropped.message.slice(0, 50)
-            : '(non-text message)'
-          console.warn(`[WebSocket] Pending limit (${this.MAX_PENDING_MESSAGES}) reached, dropping oldest: "${preview}..."`)
-          // Notify UI that a message was dropped
-          this.setState({
-            ...this.currentState,
-            errorMessage: `A queued message was dropped due to connection issues: "${preview}"`,
+      try {
+        this.ws.send(JSON.stringify(request))
+        this.removeFromStorage(request)  // Remove from storage on successful send
+        return true
+      } catch (err) {
+        console.warn('[WebSocket] send failed:', err)
+        this.setState({
+          ...this.currentState,
+          status: 'error',
+          errorMessage: 'Failed to send message',
+        })
+        return false
+      }
+    }
+    // Queue message for when connected
+    // P0: Prevent unbounded growth - evict oldest if limit reached
+    if (this.pendingMessages.length >= this.MAX_PENDING_MESSAGES) {
+      // Remove oldest message (FIFO)
+      const dropped = this.pendingMessages.shift()
+      if (dropped) {
+        const preview = typeof dropped.message === 'string'
+          ? dropped.message.slice(0, 50)
+          : '(non-text message)'
+        console.warn(`[WebSocket] Pending limit (${this.MAX_PENDING_MESSAGES}) reached, dropping oldest: "${preview}..."`)
+        if (dropped.clientRequestId) {
+          this.settleReceiveAck(dropped.clientRequestId, {
+            status: 'rejected',
+            reason: 'queue_drop',
           })
         }
+        // Notify UI that a message was dropped
+        this.setState({
+          ...this.currentState,
+          errorMessage: `A queued message was dropped due to connection issues: "${preview}"`,
+        })
       }
-      this.pendingMessages.push(request)
-      this.persistPendingMessages()  // Immediately persist to storage
     }
+    this.pendingMessages.push(request)
+    this.persistPendingMessages()  // Immediately persist to storage
+    return true
   }
 
-  sendMessage(content: string, images?: ChatImage[], selectedSkills?: string[], pageContext?: string) {
-    this.sendRequest({
+  /**
+   * Send a chat turn. Always stamps `clientRequestId`.
+   * `wireOk` means sent or queued locally — wait for `waitForReceiveAck` before
+   * clearing the composer draft.
+   */
+  sendMessage(
+    content: string,
+    images?: ChatImage[],
+    selectedSkills?: string[],
+    pageContext?: string,
+    references?: ChatReference[],
+    contentNodes?: import("@/types").ChatContentNode[],
+    authorizeNewOperation?: import("@/types").AuthorizeNewOperationRequest,
+  ): SendResult {
+    const requestId = generateId()
+    const wireOk = this.sendRequest({
       message: content,
       images: images,
       sessionId: this.sessionId || undefined,
       backendId: this.activeBackendId || undefined,
       selectedSkills: selectedSkills && selectedSkills.length > 0 ? selectedSkills : undefined,
       pageContext: pageContext || undefined,
+      references: references && references.length > 0 ? references : undefined,
+      contentVersion:
+        contentNodes && contentNodes.length > 0
+          ? (1 as const)
+          : undefined,
+      contentNodes:
+        contentNodes && contentNodes.length > 0 ? contentNodes : undefined,
+      authorizeNewOperation: authorizeNewOperation || undefined,
+      clientRequestId: requestId,
     })
+    return { wireOk, requestId }
+  }
+
+  /**
+   * Wait for the server `MessageReceived` for `requestId`, or timeout / queue drop.
+   * Cancel / authorize-only sends can skip this.
+   */
+  waitForReceiveAck(
+    requestId: string,
+    timeoutMs: number = DRAFT_ACK_TIMEOUT_MS,
+  ): Promise<ReceiveAckResult> {
+    const existing = this.receiveAckWaiters.get(requestId)
+    if (existing) {
+      // Replace a stale waiter (should not happen in normal flow).
+      clearTimeout(existing.timer)
+      this.receiveAckWaiters.delete(requestId)
+      existing.resolve({ status: 'rejected', reason: 'replaced' })
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.receiveAckWaiters.delete(requestId)
+        resolve({ status: 'timeout' })
+      }, timeoutMs)
+      this.receiveAckWaiters.set(requestId, { resolve, timer })
+    })
+  }
+
+  private settleReceiveAck(requestId: string, result: ReceiveAckResult): void {
+    const waiter = this.receiveAckWaiters.get(requestId)
+    if (!waiter) return
+    clearTimeout(waiter.timer)
+    this.receiveAckWaiters.delete(requestId)
+    waiter.resolve(result)
+  }
+
+  /**
+   * Drop a still-queued outbound frame by clientRequestId.
+   * Used when an ACK timeout restores the draft: leaving the frame in the
+   * offline queue would resend it on reconnect (no server-side dedupe by
+   * clientRequestId yet) while the user also retries from the restored draft.
+   * @returns true when a queued frame was removed.
+   */
+  dropPendingByRequestId(requestId: string): boolean {
+    const before = this.pendingMessages.length
+    this.pendingMessages = this.pendingMessages.filter(
+      (m) => m.clientRequestId !== requestId,
+    )
+    if (this.pendingMessages.length !== before) {
+      this.persistPendingMessages()
+      if (this.pendingMessages.length === 0) {
+        storage.remove(STORAGE_KEY)
+      }
+      return true
+    }
+    return false
   }
 
   setActiveBackend(backendId: string | null) {

@@ -1,13 +1,16 @@
 ---
 id: extension-development
+summary: Write extension code from scratch.
+not_for: [installing/uninstalling from the market (extension-management)]
 name: Extension Development Guide
+aliases: [extension-dev]
 description: Use when the user wants to DEVELOP a custom extension — creating/building a .nep package, using the extension SDK, FFI/native extensions, capability registration, extension Rust code. Covers extension create/build/validate even without saying 'extension' (e.g. '写个自定义扩展', '开发一个 .nep'). Includes 扩展开发/构建/SDK/FFI.
 category: extension
 origin: builtin
 priority: 85
 token_budget: 14000
 triggers:
-  keywords: [extension development, create extension, build extension, extension sdk, heramind extension, 扩展开发, 开发扩展, extension create, extension build, custom extension, heramind_export, Extension trait, capability, FFI, native extension, .nep]
+  keywords: [extension development, create extension, build extension, extension sdk, heramind extension, 扩展开发, 开发扩展, extension create, extension build, custom extension, heramind_export, Extension trait, capability, FFI, native extension, .nep, from scratch, extension from scratch, write extension, extension source code, 编写扩展, 扩展源码]
   tool_target:
     - tool: extension
       actions: [create, build, validate, install, uninstall, list, get, status, logs, config, reload]
@@ -15,7 +18,22 @@ anti_triggers:
   keywords: [widget, component, IIFE, bundle.js, dashboard component]
 ---
 
+# extension-development
+
+Use this guide for coding a new extension, not routine installation/configuration. Inspect existing SDK examples and current ABI before writing code.
+Define the extension's commands, parameter schemas, output fields and metric provenance. Use the official SDK and package format; do not invent ABI or platform binary keys.
+Implement, build and test in an isolated directory. Treat external calls and physical actions according to their actual effects.
+Package only validated artifacts; install/publish when requested. Preserve build failures and verification limitations. Load relevant Rust/Python, manifest, packaging and example sections on demand.
+
+## Detailed reference
+Use skill(action="load", id="extension-development", section="<exact returned title>") only for the needed detail. Section titles are returned with this overview.
+
+<!-- SKILL_REFERENCE -->
+
+
 # Extension Development Guide
+
+Write/build extension SOURCE CODE. NOT for installing existing extensions from the marketplace — that is the `extension-management` skill (market-install). If the user said 安装/install and the extension exists in the market, you are in the wrong skill.
 
 HeraMind extensions are Rust programs running in isolated processes. They communicate with the platform via FFI (ABI version 3).
 
@@ -84,12 +102,24 @@ name = "heramind-extension-my-extension"
 version = "1.0.0"
 edition = "2021"
 
+# REQUIRED for standalone projects: the empty [workspace] table detaches
+# this crate from any parent workspace. Without it, a project created
+# inside the heramind repo tree tries to JOIN the main workspace and cargo
+# fails with "not listed in workspace members". `heramind extension create`
+# scaffolds the same shape.
+[workspace]
+
 [lib]
 name = "heramind_extension_my_extension"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-heramind-extension-sdk = { path = "../../crates/heramind-extension-sdk" }
+# Registry form — works ANYWHERE (`heramind extension create` scaffolds the
+# current SDK version). Use the path form ONLY for in-repo development
+# against unreleased SDK changes, and then ONLY with the [workspace]
+# detach above plus the correct relative path:
+#   heramind-extension-sdk = { path = "../../crates/heramind-extension-sdk" }
+heramind-extension-sdk = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
@@ -101,6 +131,10 @@ opt-level = 3
 lto = "thin"
 panic = "unwind"    # Required for safe extension unloading
 ```
+
+⚠️ **SDK version**: keep it at (or above) the version `heramind extension
+create` scaffolds — an older SDK can fail to load with "ABI version
+mismatch" against the running platform.
 
 **`src/lib.rs`:**
 ```rust
@@ -412,7 +446,7 @@ fn fetch_weather(&self, city: &str) -> Result<serde_json::Value> {
 | `heramind extension list` | List all installed extensions |
 | `heramind extension get <ID>` | Get extension details (alias: `info`) |
 | `heramind extension status <ID>` | Get runtime status |
-| `heramind extension logs <ID> [--limit <N>]` | View extension logs |
+| `heramind extension logs <ID> [--lines <N>]` | View extension logs (⚠️ `--lines`, not `--limit`) |
 | `heramind extension reload <ID>` | Reload (pick up code changes) |
 | `heramind extension config <ID>` | View current config |
 | `heramind extension config <ID> --set '<JSON>'` | Update config |

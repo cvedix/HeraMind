@@ -8,6 +8,7 @@
 
 import { getPortalRoot } from '@/lib/portal'
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
 import { createPortal } from 'react-dom'
 import type Hls from 'hls.js'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -37,7 +38,7 @@ import {
   X,
 } from 'lucide-react'
 import type { DataSource } from '@/types/dashboard'
-import { EmptyState, ErrorState } from '../shared'
+import { EmptyState } from '../shared'
 
 // ============================================================================
 // Types
@@ -62,6 +63,9 @@ export interface VideoDisplayProps {
   rounded?: boolean
   showFullscreen?: boolean
 
+  /** Poster frame shown before the video loads (native video poster attr). */
+  poster?: string
+
   className?: string
 }
 
@@ -77,6 +81,7 @@ interface VideoPlayerProps {
   controls: boolean
   loop: boolean
   fit: string
+  poster?: string
   onLoadingChange: (loading: boolean) => void
   onError: (error: boolean, message?: string) => void
 }
@@ -144,6 +149,7 @@ function VideoPlayer({
   controls,
   loop,
   fit,
+  poster,
   onLoadingChange,
   onError,
 }: VideoPlayerProps) {
@@ -496,6 +502,7 @@ function VideoPlayer({
         muted={isMuted}
         loop={loop}
         playsInline
+        poster={poster}
         className={cn(
           'w-full h-full',
           fit === 'contain' && 'object-contain',
@@ -524,7 +531,7 @@ function VideoPlayer({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-6 w-6 text-white hover:text-white hover:bg-white/20"
+                className="h-6 w-6 text-white hover:text-white hover:bg-white/20 sm:h-6 sm:w-6"
                 onClick={togglePlay}
               >
                 {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
@@ -532,7 +539,7 @@ function VideoPlayer({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-6 w-6 text-white hover:text-white hover:bg-white/20"
+                className="h-6 w-6 text-white hover:text-white hover:bg-white/20 sm:h-6 sm:w-6"
                 onClick={toggleMute}
               >
                 {isMuted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
@@ -633,9 +640,11 @@ export function VideoDisplay({
   fit = 'contain',
   rounded = true,
   showFullscreen = true,
+  poster,
   className,
   title,
 }: VideoDisplayProps & { title?: string }) {
+  const { t } = useTranslation('dashboardComponents')
   const { data, loading, error } = useDataSource<string>(dataSource, {
     fallback: propSrc,
   })
@@ -693,8 +702,8 @@ export function VideoDisplay({
         size={size}
         className={className}
         icon={<Webcam />}
-        message="No Video Source"
-        subMessage="Configure a video URL or camera"
+        message={t('videoDisplay.noSource')}
+        subMessage={t('videoDisplay.configureSource')}
       />
     )
   }
@@ -720,14 +729,14 @@ export function VideoDisplay({
       )}>
         <AlertCircle className="h-10 w-10 text-muted-foreground" />
         <div className="text-center">
-          <p className="text-muted-foreground text-sm font-medium">Video Load Error</p>
+          <p className="text-muted-foreground text-sm font-medium">{t('videoDisplay.loadError')}</p>
           <p className="text-muted-foreground text-xs mt-1">
-            {errorMessage || 'Could not load video source'}
+            {errorMessage || t('videoDisplay.couldNotLoad')}
           </p>
         </div>
         <Button variant="outline" size="sm" onClick={handleRetry}>
           <RefreshCw className="h-4 w-4 mr-1.5" />
-          Retry
+          {t('videoDisplay.retry')}
         </Button>
       </div>
     )
@@ -755,6 +764,7 @@ export function VideoDisplay({
               controls={controls}
               loop={loop}
               fit={fit}
+              poster={poster}
               onLoadingChange={setIsLoading}
               onError={handleVideoError}
             />
@@ -766,7 +776,7 @@ export function VideoDisplay({
           <Button
             variant="secondary"
             size="icon"
-            className="absolute top-2 right-2 h-6 w-6 bg-bg-80"
+            className="absolute top-2 right-2 h-6 w-6 bg-glass-heavy sm:h-6 sm:w-6"
             onClick={() => setIsFullscreen(true)}
           >
             <Maximize2 className="h-4 w-4" />
@@ -775,7 +785,7 @@ export function VideoDisplay({
 
         {/* Type indicator */}
         {rawSrc && (
-          <div className="absolute top-2 left-2 px-2 py-0.5 bg-bg-80 rounded text-xs text-muted-foreground">
+          <div className="absolute top-2 left-2 px-2 py-0.5 bg-glass-heavy rounded text-xs text-muted-foreground">
             {detectedType === 'hls' && 'HLS'}
             {detectedType === 'device-camera' && 'Camera'}
             {detectedType === 'file' && 'Video'}
@@ -802,7 +812,7 @@ export function VideoDisplay({
         <Button
           variant="ghost"
           size="icon"
-          className="h-8 w-8"
+          className="h-8 w-8 sm:h-8 sm:w-8"
           onClick={() => setIsFullscreen(false)}
         >
           <X className="h-4 w-4" />
@@ -827,6 +837,7 @@ export function VideoDisplay({
             controls={controls}
             loop={loop}
             fit={fit}
+            poster={poster}
             onLoadingChange={setIsLoading}
             onError={handleVideoError}
           />

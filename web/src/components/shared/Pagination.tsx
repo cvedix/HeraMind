@@ -51,17 +51,18 @@ function MobileInfiniteSentinel({
 }) {
   const [mountNode, setMountNode] = useState<HTMLElement | null>(null)
 
-  // Locate the scroll container's inner content wrapper.
-  // PageLayout renders: [data-page-scroll-container] > div.mx-auto (inner).
-  // Retry for ~30 frames (~500ms) to handle conditional rendering timing.
+  // Locate the infinite-scroll mount node. PageLayout renders
+  // [data-infinite-scroll-mount] inside the page inner wrapper, BEFORE the
+  // bottom spacer — portaling into it keeps the hint clear of the fixed
+  // bottom nav. Retry for ~30 frames (~500ms) to handle conditional
+  // rendering timing.
   useEffect(() => {
     let raf = 0
     let n = 0
     const find = () => {
       const container = document.querySelector(containerSelector) as HTMLElement | null
-      const inner = (container?.firstElementChild as HTMLElement | null) ?? null
-      if (inner) {
-        setMountNode(inner)
+      if (container) {
+        setMountNode(container)
         return true
       }
       return false
@@ -87,7 +88,7 @@ function MobileInfiniteSentinel({
   if (!mountNode) return null
 
   return createPortal(
-    <div className="py-4 flex items-center justify-center gap-2 text-sm text-muted-foreground">
+    <div className="relative py-4 flex items-center justify-center gap-2 text-sm text-muted-foreground">
       {showLoadingIndicator && hasMore && (
         <>
           <Loader2 className="h-4 w-4 animate-spin" />
@@ -95,8 +96,9 @@ function MobileInfiniteSentinel({
         </>
       )}
       {!hasMore && total > 0 && <span>{t('pagination.noMore')}</span>}
-      {/* 1px sentinel — IntersectionObserver target */}
-      <div ref={loadMoreRef} aria-hidden className="h-px w-full" />
+      {/* 1px IntersectionObserver sentinel — absolutely positioned so its
+          w-full never shoves the hint text off-center. */}
+      <div ref={loadMoreRef} aria-hidden className="absolute bottom-0 left-0 h-px w-full" />
     </div>,
     mountNode,
   )
@@ -146,7 +148,7 @@ export function Pagination({
         isLoading={isLoading}
         hasMore={hasMore}
         onLoadMore={onLoadMore || (() => hasMore && onPageChange(currentPage + 1))}
-        containerSelector="[data-page-scroll-container]"
+        containerSelector="[data-infinite-scroll-mount]"
         total={total}
         t={t}
       />
@@ -209,7 +211,7 @@ export function Pagination({
           size="icon"
           onClick={() => onPageChange(currentPage - 1)}
           disabled={currentPage === 1}
-          className="h-8 w-8"
+          className="h-8 w-8 sm:h-8 sm:w-8"
         >
           <ChevronLeft className="h-4 w-4" />
         </Button>
@@ -221,7 +223,7 @@ export function Pagination({
               variant={page === currentPage ? 'default' : 'outline'}
               size="icon"
               onClick={() => onPageChange(page)}
-              className="h-8 w-8"
+              className="h-8 w-8 sm:h-8 sm:w-8"
             >
               {page}
             </Button>
@@ -237,7 +239,7 @@ export function Pagination({
           size="icon"
           onClick={() => onPageChange(currentPage + 1)}
           disabled={currentPage === totalPages}
-          className="h-8 w-8"
+          className="h-8 w-8 sm:h-8 sm:w-8"
         >
           <ChevronRight className="h-4 w-4" />
         </Button>

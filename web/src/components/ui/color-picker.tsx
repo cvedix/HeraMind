@@ -4,10 +4,11 @@
  * Color picker with preset palette, custom color input, and transparency support.
  * Follows system UI standards.
  */
+import { COLOR_PRESETS } from './color-picker.presets'
 
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Check, ChevronDown, Palette, Sun } from 'lucide-react'
+import { Check, Palette, Sun } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -21,43 +22,15 @@ import { cn } from '@/lib/utils'
 
 // Theme-aware special colors
 const THEME_FOREGROUND = 'hsl(var(--foreground))'
-const THEME_CARD_FOREGROUND = 'hsl(var(--card-foreground))'
+const _THEME_CARD_FOREGROUND = 'hsl(var(--card-foreground))'
 
 // Check if a color is theme-aware
 function isThemeColor(color: string): boolean {
   return color.startsWith('hsl(var(')
 }
 
-// Preset color palettes — harmonized with the blue / white / black theme
-export const COLOR_PRESETS = {
-  primary: [
-    THEME_FOREGROUND, // Theme foreground (black in light, white in dark)
-    '#005bea', // HeraMind blue
-    '#0a66ff', // Bright blue
-    '#2563eb', // Royal blue
-    '#1d4ed8', // Deep blue
-    '#38bdf8', // Sky blue
-    '#93c5fd', // Ice blue
-    '#0f172a', // Navy black
-  ],
-  neutral: [
-    THEME_FOREGROUND, // Theme foreground (black in light, white in dark)
-    '#171717', // Zinc 950
-    '#404040', // Zinc 700
-    '#737373', // Zinc 500
-    '#a3a3a3', // Zinc 400
-    '#d4d4d4', // Zinc 300
-    '#e5e5e5', // Zinc 200
-    '#f5f5f5', // Zinc 100
-  ],
-  semantic: [
-    '#005bea', // Primary/info
-    '#2563eb', // Success
-    '#1d4ed8', // Warning
-    '#0f172a', // Strong emphasis
-    '#93c5fd', // Light emphasis
-  ],
-}
+// Preset color palettes — harmonized with design system
+
 
 export interface ColorPickerProps {
   value?: string
@@ -85,7 +58,7 @@ export function ColorPicker({
   onChange,
   label,
   presets = 'primary',
-  showAlpha = false,
+  showAlpha: _showAlpha = false,
   disabled = false,
   className,
 }: ColorPickerProps) {

@@ -32,5 +32,15 @@
       },
       "expected": true
     }
-  ]
+  ],
+  "expect": {
+    "tools": [
+      "shell"
+    ],
+    "commands": [
+      "heramind push create",
+      "heramind push list"
+    ]
+  },
+  "requires_network": true
 }

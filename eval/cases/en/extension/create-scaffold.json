@@ -23,5 +23,13 @@
       "Turn 1: Scaffold a new extension (covers `heramind extension create`)"
     ],
     "overall": "Scaffold a new extension (covers `heramind extension create`)"
+  },
+  "expect": {
+    "tools": [
+      "shell"
+    ],
+    "commands": [
+      "heramind extension create"
+    ]
   }
 }

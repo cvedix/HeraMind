@@ -1,4 +1,4 @@
-use crate::types::{BuildMeta, CliResponse};
+use crate::types::CliResponse;
 use crate::ApiClient;
 use anyhow::Result;
 use serde_json::json;
@@ -23,8 +23,11 @@ pub async fn list_transforms(client: &ApiClient) -> Result<CliResponse> {
             json!({
                 "id": t.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
                 "name": t.get("name").and_then(|v| v.as_str()).unwrap_or("(unnamed)"),
-                "scope": t.get("scope"),
-                "output_prefix": t.get("output_prefix").and_then(|v| v.as_str()).unwrap_or(""),
+                "scope": t.get("scope").cloned().unwrap_or(serde_json::Value::Null),
+                "output_prefix": t.get("output_prefix").cloned().unwrap_or(serde_json::Value::Null),
+                "enabled": t.get("enabled").cloned().unwrap_or(serde_json::Value::Null),
+                "execution_count": t.get("execution_count").cloned().unwrap_or(serde_json::Value::Null),
+                "last_executed": t.get("last_executed").cloned().unwrap_or(serde_json::Value::Null),
             })
         })
         .collect();
@@ -66,8 +69,8 @@ pub async fn get_transform_executions(
         .get(&format!("/automations/{}/executions?limit={}", id, lim))
         .await?;
     let count = data
-        .get("data")
-        .and_then(|d| d.get("count"))
+        .get("count")
+        .or_else(|| data.get("data").and_then(|d| d.get("count")))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     Ok(CliResponse::success(
@@ -76,20 +79,69 @@ pub async fn get_transform_executions(
     ))
 }
 
-/// Parse scope string to JSON matching API's TransformScope serde format
-/// "global" → "global"
-/// "device_type:TH" → {"device_type": "TH"}
-/// "device:TH_8f072f7d" → {"device": "TH_8f072f7d"}
-fn scope_to_json(scope: &str) -> serde_json::Value {
-    if scope.starts_with("device_type:") {
-        let parts: Vec<&str> = scope.splitn(2, ':').collect();
-        json!({"device_type": parts[1]})
-    } else if scope.starts_with("device:") {
-        let parts: Vec<&str> = scope.splitn(2, ':').collect();
-        json!({"device": parts[1]})
-    } else {
-        json!(scope)
+/// Parse scope string to JSON matching API's TransformScope serde format.
+///
+/// Accepted forms:
+/// - `"global"` → `"global"`
+/// - `"device_type:TH"` → `{"device_type": "TH"}`
+/// - `"device:TH_8f072f7d"` → `{"device": "TH_8f072f7d"}`
+///
+/// Bare `"device"` / `"device_type"` (no id after `:`) are rejected — that
+/// pattern burned an entire eval case wall-clock on Spark overnight
+/// (NM-322 `sr-clear-transform[zh]`): the model kept mutating `--code`
+/// while the opaque API deserialize error never named the bad scope.
+fn parse_transform_scope(scope: &str) -> Result<serde_json::Value, String> {
+    let s = scope.trim();
+    if s.is_empty() {
+        return Err(
+            "Invalid --scope (empty). Use `global`, `device:<device_id>`, or `device_type:<type>`."
+                .to_string(),
+        );
     }
+    if s.eq_ignore_ascii_case("global") {
+        return Ok(json!("global"));
+    }
+    if let Some((prefix, rest)) = s.split_once(':') {
+        if prefix.eq_ignore_ascii_case("device_type") {
+            if rest.is_empty() {
+                return Err(
+                    "Invalid --scope `device_type:` (missing type). Example: --scope device_type:ne101_camera."
+                        .to_string(),
+                );
+            }
+            return Ok(json!({ "device_type": rest }));
+        }
+        if prefix.eq_ignore_ascii_case("device") {
+            if rest.is_empty() {
+                return Err(
+                    "Invalid --scope `device:` (missing device id). Example: --scope device:sensor-001."
+                        .to_string(),
+                );
+            }
+            return Ok(json!({ "device": rest }));
+        }
+    }
+    // Overnight wedge: `--scope device` / `--scope device_type` with no id.
+    if s.eq_ignore_ascii_case("device") || s.eq_ignore_ascii_case("device_type") {
+        return Err(format!(
+            "Invalid --scope `{s}`. Bare `{s}` is not a scope — use `device:<device_id>` \
+             (e.g. --scope device:sensor-001), `device_type:<type>`, or `global`. \
+             Do not keep rewriting --code for this error; fix --scope first."
+        ));
+    }
+    Err(format!(
+        "Invalid --scope `{s}`. Expected `global`, `device:<device_id>`, or `device_type:<type>`."
+    ))
+}
+
+fn invalid_scope_response(err: String) -> CliResponse {
+    CliResponse::error_with_suggestion(
+        err,
+        "INVALID_SCOPE",
+        "Fix --scope to one of: global | device:<id> | device_type:<type>. \
+         Example: heramind transform create --name batt100 --scope device:sensor-001 \
+         --code \"return input.battery * 100\" --output-prefix thousands",
+    )
 }
 
 /// Create a new transform
@@ -102,8 +154,12 @@ pub async fn create_transform(
     description: Option<&str>,
     enabled: Option<bool>,
 ) -> Result<CliResponse> {
+    let scope_json = match parse_transform_scope(scope) {
+        Ok(v) => v,
+        Err(e) => return Ok(invalid_scope_response(e)),
+    };
     let definition = json!({
-        "scope": scope_to_json(scope),
+        "scope": scope_json,
         "js_code": js_code,
         "output_prefix": output_prefix.unwrap_or("transform"),
     });
@@ -116,21 +172,22 @@ pub async fn create_transform(
     });
     let data = client.post("/automations", &body).await?;
     let transform_id = data
-        .get("data")
-        .and_then(|d| d.get("automation"))
-        .and_then(|a| a.get("metadata"))
-        .and_then(|m| m.get("id"))
-        .and_then(|v| v.as_str())
+        .get("automation")
+        .or_else(|| data.get("data").and_then(|d| d.get("automation")))
+        // The create response carries the id directly under `automation`
+        // ({"automation":{"id":...}}); the metadata path was legacy. Prefer
+        // both before giving up — "unknown" in the success hint sent users
+        // (and models) to `transform executions unknown`.
+        .and_then(|a| {
+            a.get("id").and_then(|v| v.as_str()).or_else(|| {
+                a.get("metadata")
+                    .and_then(|m| m.get("id"))
+                    .and_then(|v| v.as_str())
+            })
+        })
         .unwrap_or("unknown")
         .to_string();
-    let meta = BuildMeta {
-        r#type: "transform".to_string(),
-        action: "create".to_string(),
-        entity_id: transform_id.to_string(),
-        entity_name: Some(name.to_string()),
-        undo_command: format!("heramind transform delete {}", transform_id),
-    };
-    Ok(CliResponse::success_with_meta(
+    Ok(CliResponse::success(
         data,
         // Transforms only run when data flows — teach where to look instead
         // of leaving the workflow at "created, now what".
@@ -138,7 +195,6 @@ pub async fn create_transform(
             "Transform created. It runs on new data points; check results with: heramind transform executions {}",
             transform_id
         ),
-        meta,
     ))
 }
 
@@ -159,7 +215,10 @@ pub async fn update_transform(
         definition["js_code"] = json!(code);
     }
     if let Some(s) = scope {
-        definition["scope"] = scope_to_json(s);
+        match parse_transform_scope(s) {
+            Ok(v) => definition["scope"] = v,
+            Err(e) => return Ok(invalid_scope_response(e)),
+        }
     }
     if let Some(op) = output_prefix {
         definition["output_prefix"] = json!(op);
@@ -227,15 +286,6 @@ pub async fn test_transform_code(
     let data = client
         .post("/automations/transforms/test-code", &body)
         .await?;
-    // Flatten: API returns {success:false, error:"..."} on execution failure
-    // wrapped inside the outer success response — detect and surface as error
-    if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
-        let error_msg = data
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Transform code execution failed");
-        return Ok(CliResponse::error(error_msg, "TRANSFORM_TEST_FAILED"));
-    }
     Ok(CliResponse::success(data, "Transform code tested"))
 }
 
@@ -243,4 +293,59 @@ pub async fn test_transform_code(
 pub async fn list_transform_data_sources(client: &ApiClient) -> Result<CliResponse> {
     let data = client.get("/automations/transforms/data-sources").await?;
     Ok(CliResponse::success(data, "Transform data sources listed"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_scope_accepts_global_device_and_device_type() {
+        assert_eq!(parse_transform_scope("global").unwrap(), json!("global"));
+        assert_eq!(
+            parse_transform_scope("device:sensor-001").unwrap(),
+            json!({ "device": "sensor-001" })
+        );
+        assert_eq!(
+            parse_transform_scope("device_type:ne101_camera").unwrap(),
+            json!({ "device_type": "ne101_camera" })
+        );
+        // Prefix case is ignored; id casing is preserved.
+        assert_eq!(
+            parse_transform_scope("Device:sensor-001").unwrap(),
+            json!({ "device": "sensor-001" })
+        );
+        assert_eq!(
+            parse_transform_scope("DEVICE_TYPE:Ne101_Camera").unwrap(),
+            json!({ "device_type": "Ne101_Camera" })
+        );
+    }
+
+    #[test]
+    fn parse_scope_rejects_bare_device_overnight_wedge() {
+        // Positive: overnight failure mode must be caught before API.
+        let err = parse_transform_scope("device").unwrap_err();
+        assert!(err.contains("Bare `device`"), "{err}");
+        assert!(
+            err.contains("device:sensor-001") || err.contains("device:<"),
+            "{err}"
+        );
+
+        let err2 = parse_transform_scope("device_type").unwrap_err();
+        assert!(err2.contains("Bare `device_type`"), "{err2}");
+    }
+
+    #[test]
+    fn parse_scope_rejects_empty_suffix_and_unknown() {
+        assert!(parse_transform_scope("device:")
+            .unwrap_err()
+            .contains("missing"));
+        assert!(parse_transform_scope("device_type:")
+            .unwrap_err()
+            .contains("missing"));
+        assert!(parse_transform_scope("fleet")
+            .unwrap_err()
+            .contains("Expected"));
+        assert!(parse_transform_scope("").unwrap_err().contains("empty"));
+    }
 }

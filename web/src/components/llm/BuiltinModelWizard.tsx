@@ -31,13 +31,15 @@ import {
 } from '@/components/automation/dialog'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { fetchCache } from '@/lib/utils/async'
 import { Progress } from '@/components/ui/progress'
 import {
   AlertCircle,
   BrainCircuit,
   Info,
   CheckCircle2,
-  Cpu,
+  Eye,
+  RefreshCw,
   Download,
   HardDrive,
   Loader2,
@@ -47,6 +49,7 @@ import {
   Zap,
   AlertTriangle,
 } from 'lucide-react'
+import { notifySuccess } from '@/lib/notify'
 import { api, isTauriEnv } from '@/lib/api'
 import { useEvents } from '@/hooks/useEvents'
 import type { ModelDownloadProgressEvent } from '@/lib/events'
@@ -80,6 +83,9 @@ function detectPlatformHint(): PlatformHintKey {
 }
 
 const STATUS_POLL_MS = 2000
+/** Error text that smells like a restricted/unreachable network — guides the
+ * user toward mirrors or the offline import path instead of a blind retry. */
+const NETWORK_ERROR_RE = /dns|timed? out|timeout|connection|connect|refused|unreachable|tls|proxy|network/i
 
 type WizardPhase = 'loading' | 'idle' | 'downloading' | 'starting' | 'activating' | 'ready' | 'error'
 
@@ -142,6 +148,13 @@ export function BuiltinModelWizard({
   const [phase, setPhase] = useState<WizardPhase>('loading')
   const [status, setStatus] = useState<BuiltinLlmStatus | null>(null)
   const [models, setModels] = useState<BuiltinModelDef[]>([])
+  // Whether a models fetch has ever settled — the empty picker shows a
+  // loading spinner (not the no-models default state) until then, so the
+  // first open doesn't flash the retry placeholder before the list lands.
+  const [modelsLoaded, setModelsLoaded] = useState(false)
+  const [catalogFallback, setCatalogFallback] = useState(false)
+  const [importBusy, setImportBusy] = useState(false)
+  const importFileRef = useRef<HTMLInputElement | null>(null)
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
   // Model the ready-phase tiles describe: the installed one, else selection.
   const shownModel = models.find((m) => m.id === (status?.model_id ?? selectedModelId))
@@ -171,6 +184,13 @@ export function BuiltinModelWizard({
   // would otherwise yank an installed model's user straight back to 'ready'
   // before they can pick another one.
   const browsingPickerRef = useRef(false)
+  // Monotonic download-session counter. Incremented on every download click;
+  // in-flight status polls stamp the session they started under and their
+  // responses are dropped when a NEWER session exists. Without this, a poll
+  // that left before the click can land right after it and render the stale
+  // pre-download snapshot — e.g. installed models report downloaded=total
+  // (100%), which used to flash the bar 100% → 0% at re-download.
+  const downloadSessionRef = useRef(0)
 
   const failWith = (action: RetryAction, error: unknown) => {
     setRetryAction(action)
@@ -194,10 +214,16 @@ export function BuiltinModelWizard({
     }
   }, [onActivated])
 
-  // Reset per-open-session state. If the model is already installed when the
-  // wizard reopens, jump straight to ready instead of re-downloading —
-  // unless the switch-model entry asked for the picker directly.
-  useEffect(() => {
+  // Reset per-open-session state DURING RENDER (the "adjust state on prop
+  // change" pattern) — an effect runs after the first paint, so the dialog
+  // used to flash one frame of the previous close-time phase (e.g. the
+  // 已就绪 screen) before flipping to the picker. If the model is already
+  // installed when the wizard reopens, jump straight to ready instead of
+  // re-downloading — unless the switch-model entry asked for the picker
+  // directly.
+  const [prevOpen, setPrevOpen] = useState(open)
+  if (open !== prevOpen) {
+    setPrevOpen(open)
     if (open) {
       activatedRef.current = false
       sawDownloadingRef.current = false
@@ -207,8 +233,7 @@ export function BuiltinModelWizard({
       setErrorMsg(null)
       setPhase(startInPicker ? 'idle' : status?.installed ? 'ready' : 'loading')
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+  }
 
   // Live download progress over WS/SSE (Task 15). ModelDownloadProgress is in
   // NO is_*_event() category, so the 'llm' category filter would never deliver
@@ -265,9 +290,13 @@ export function BuiltinModelWizard({
     if (!open) return
     let cancelled = false
     const poll = async () => {
+      // Stamp the session this request belongs to; a response that lands
+      // after a newer download click is a stale pre-click snapshot — apply
+      // it and the wizard renders the old state (100% flash / ready bounce).
+      const session = downloadSessionRef.current
       try {
         const s = await api.getBuiltinLlmStatus()
-        if (!cancelled) setStatus(s)
+        if (!cancelled && session === downloadSessionRef.current) setStatus(s)
       } catch {
         // Transient poll failure: keep the last good status rather than
         // flipping the wizard into error (a download may be mid-flight).
@@ -277,7 +306,9 @@ export function BuiltinModelWizard({
     api
       .getBuiltinModels()
       .then((r) => {
+        setModelsLoaded(true)
         setModels(r.models)
+        setCatalogFallback(r.catalog_fallback === true)
         // Pre-select: already-installed → recommended → default id → first.
         const preferred =
           r.models.find((m) => m.installed) ??
@@ -287,7 +318,9 @@ export function BuiltinModelWizard({
         if (preferred) setSelectedModelId(preferred.id)
       })
       .catch(() => {
-        // Transient — the picker just stays empty and the poll retries status.
+        // Transient — surface the retry state only after the fetch has
+        // actually settled; until then the picker keeps its loading look.
+        setModelsLoaded(true)
       })
     const timer = window.setInterval(poll, STATUS_POLL_MS)
     return () => {
@@ -295,6 +328,53 @@ export function BuiltinModelWizard({
       window.clearInterval(timer)
     }
   }, [open])
+
+  // Re-fetch the model list (the empty state's retry button — the list is
+  // otherwise fetched once per wizard open).
+  const reloadModels = useCallback(() => {
+    setModelsLoaded(false)
+    api
+      .getBuiltinModels()
+      .then((r) => {
+        setModelsLoaded(true)
+        setModels(r.models)
+        setCatalogFallback(r.catalog_fallback === true)
+      })
+      .catch(() => {
+        setModelsLoaded(true)
+      })
+  }, [])
+
+  // Offline paths: import a GGUF already on the server, or upload one. Both
+  // run the shared validated pipeline (GGUF header check, rollback on spawn
+  // failure) and leave the engine running on the imported model.
+  const importLocalModel = useCallback(async () => {
+    const path = window.prompt(t('plugins:llm.builtinImportLocalPrompt'))
+    if (!path || !path.trim()) return
+    setImportBusy(true)
+    try {
+      const r = await api.importBuiltinModelLocal(path.trim())
+      notifySuccess(t('plugins:llm.builtinImported', { name: r.name }))
+      reloadModels()
+    } catch (e) {
+      failWith('download', e)
+    } finally {
+      setImportBusy(false)
+    }
+  }, [t, reloadModels])
+
+  const uploadModelFile = useCallback(async (file: File) => {
+    setImportBusy(true)
+    try {
+      const r = await api.uploadBuiltinModel(file)
+      notifySuccess(t('plugins:llm.builtinImported', { name: r.name }))
+      reloadModels()
+    } catch (e) {
+      failWith('download', e)
+    } finally {
+      setImportBusy(false)
+    }
+  }, [t, reloadModels])
 
   // Derive phase + progress from the polled status.
   useEffect(() => {
@@ -344,11 +424,14 @@ export function BuiltinModelWizard({
       // still in flight. Show "starting" for at most 90s; a spawn that failed
       // permanently leaves status at 'stopped' forever, and an endless
       // spinner with no error is worse than landing on ready (which carries
-      // the restart-engine button for exactly this case).
+      // the restart-engine button for exactly this case). A deliberately
+      // stopped engine never enters this window — there is no spawn to wait
+      // for; ready (with its start button) is the destination immediately.
       if (
         sawDownloadingRef.current &&
         !activatedRef.current &&
         s.server_state !== 'running' &&
+        !s.deliberately_stopped &&
         Date.now() - completedAtRef.current < 90_000
       ) {
         setPhase('starting')
@@ -381,13 +464,49 @@ export function BuiltinModelWizard({
     downloadFailedRef.current = false
     browsingPickerRef.current = false
     try {
-      await api.downloadBuiltinLlm(modelId)
-      // Optimistically switch to the downloading phase; live WS events supply
-      // real progress numbers (and the poll confirms/resumes if the socket is
-      // not delivering).
+      const res = await api.downloadBuiltinLlm(modelId)
+      // Already-installed model: the server declines to re-run the download
+      // (which used to cycle a fake "downloading 0%" ceremony). Jump straight
+      // to ready — a true re-download is delete-model + download. Fetch
+      // status directly so the ready transition is immediate, not poll-lagged.
+      if (res.already_installed) {
+        sawDownloadingRef.current = false
+        // A switch may have happened (files on disk → pointer + respawn) —
+        // drop the chat dropdown's cached backend list.
+        fetchCache.invalidate('llmBackends')
+        setStatus(await api.getBuiltinLlmStatus())
+        return
+      }
+      // New/resumed download: bump the session (in-flight polls from before
+      // the click are dropped as stale), clear the previous session's
+      // progress, and optimistically switch to the downloading phase; live
+      // WS events supply real progress numbers (and the poll confirms/resumes
+      // if the socket is not delivering).
+      downloadSessionRef.current += 1
+      setProgress({ percent: null, downloadedBytes: 0, totalBytes: null })
       sawDownloadingRef.current = true
       setPhase('downloading')
     } catch (error) {
+      failWith('download', error)
+    }
+  }
+
+  // Multi-model coexistence: switching to an already-downloaded model is
+  // pointer + respawn (seconds, zero bytes re-downloaded) — never the old
+  // "download & replace" path that deleted the other model's files.
+  const handleSwitchModel = async (modelId: string) => {
+    setErrorMsg(null)
+    try {
+      setPhase('starting')
+      await api.switchBuiltinModel(modelId)
+      // The chat header's model dropdown caches the backend list (10s
+      // fetchCache) — the switch is fast enough that returning to chat
+      // lands inside that window and shows the OLD model name. Invalidate.
+      fetchCache.invalidate('llmBackends')
+      setStatus(await api.getBuiltinLlmStatus())
+      setPhase('ready')
+    } catch (error) {
+      setPhase('idle')
       failWith('download', error)
     }
   }
@@ -487,21 +606,42 @@ export function BuiltinModelWizard({
                   return hint ? (
                     <div className="flex items-start gap-1.5 rounded-md bg-muted-30 px-2.5 py-2">
                       <Info className="h-3.5 w-3.5 shrink-0 mt-0.5 text-muted-foreground" />
-                      <span className="text-[11px] leading-snug text-muted-foreground">
+                      <span className="text-mini leading-snug text-muted-foreground">
                         {t(`plugins:llm.${hint}`)}
                       </span>
                     </div>
                   ) : null
                 })()}
                 {/* Model picker — one builtin model at a time; pick then
-                    download (installed model is marked and pre-selected). */}
+                    download (installed model is marked and pre-selected).
+                    Vision companions (role=vlm) group apart: they run
+                    alongside the main model, never replace it. */}
+                {catalogFallback && models.length > 0 && (
+                  <div className="flex items-center gap-1.5 rounded bg-warning-light px-2 py-1 text-xs text-warning">
+                    <WifiOff className="h-3.5 w-3.5 shrink-0" />
+                    {t('plugins:llm.builtinCatalogFallback')}
+                  </div>
+                )}
                 <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                   {models.length === 0 && (
-                    <div className="col-span-full text-xs text-muted-foreground text-center py-2">
-                      {t('plugins:llm.builtinWizardNoModels')}
+                    <div className="col-span-full flex flex-col items-center gap-2 py-2 text-xs text-muted-foreground">
+                      {modelsLoaded ? (
+                        <>
+                          <span>{t('plugins:llm.builtinWizardNoModels')}</span>
+                          <Button size="sm" variant="outline" onClick={reloadModels}>
+                            <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
+                            {t('common:retry')}
+                          </Button>
+                        </>
+                      ) : (
+                        <>
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          <span>{t('common:loading')}</span>
+                        </>
+                      )}
                     </div>
                   )}
-                  {models.map((m) => {
+                  {models.filter((m) => m.role !== 'vlm').map((m) => {
                     const selected = selectedModelId === m.id
                     // Display copy is i18n'd on the frontend (fall back to the
                     // backend's notes for non-i18n API consumers).
@@ -520,17 +660,39 @@ export function BuiltinModelWizard({
                       >
                         <div className="flex items-center gap-2 min-w-0">
                           <span className="min-w-0 flex-1 truncate text-sm font-medium">{modelName}</span>
+                          {m.vision && (
+                            <span
+                              className="flex shrink-0 items-center gap-1 rounded-full bg-info-light px-1.5 py-0.5 text-nano font-medium text-info"
+                              title={t('plugins:llm.builtinVisionHint')}
+                            >
+                              <Eye className="h-3 w-3" />
+                              {t('plugins:llm.builtinVision')}
+                            </span>
+                          )}
                           {m.recommended && (
-                            <span className="shrink-0 rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-medium text-primary-foreground">
+                            <span className="shrink-0 rounded-full bg-primary px-1.5 py-0.5 text-nano font-medium text-primary-foreground">
                               {t('common:llmGuide.recommended')}
                             </span>
                           )}
                           {m.custom && (
-                            <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                            <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-nano font-medium text-muted-foreground">
+                              {t('plugins:llm.customModel')}
+                            </span>
+                          )}
+                          {m.min_runtime && (
+                            <span
+                              className="shrink-0 rounded-full bg-warning-light px-1.5 py-0.5 text-nano font-medium text-warning"
+                              title={t('plugins:llm.builtinMinRuntimeHint', { tag: m.min_runtime })}
+                            >
+                              {t('plugins:llm.builtinMinRuntime', { tag: m.min_runtime })}
                             </span>
                           )}
                         </div>
-                        <p className="text-xs text-muted-foreground leading-relaxed">
+                        {/* Fixed 2-line description: capped AND floored so
+                            every card is exactly the same height regardless
+                            of notes length (one-liners would otherwise make
+                            shorter cards in the same grid row). */}
+                        <p className="min-h-10 line-clamp-2 text-xs text-muted-foreground leading-relaxed">
                           {modelNotes}
                         </p>
                         <div className="mt-auto flex items-center gap-2">
@@ -538,7 +700,7 @@ export function BuiltinModelWizard({
                             {(m.size_bytes / 1e9).toFixed(1)} GB · {m.quant}
                           </span>
                           {m.installed && (
-                            <span className="rounded-full bg-success-light px-1.5 py-0.5 text-[10px] font-medium text-success">
+                            <span className="rounded-full bg-success-light px-1.5 py-0.5 text-nano font-medium text-success">
                               {t('plugins:llm.installed')}
                             </span>
                           )}
@@ -546,7 +708,7 @@ export function BuiltinModelWizard({
                         {m.memory_ok === false && (
                           <div className="flex items-start gap-1.5 rounded-md bg-warning-light px-2 py-1.5 text-warning">
                             <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-                            <span className="text-[11px] leading-snug">
+                            <span className="text-mini leading-snug">
                               {t('plugins:llm.builtinMemLow', {
                                 min: (m.min_ram_mb / 1024).toFixed(0),
                               })}
@@ -557,17 +719,176 @@ export function BuiltinModelWizard({
                     )
                   })}
                 </div>
-                <Button
-                  size="lg"
-                  className="w-full"
-                  disabled={!selectedModelId}
-                  onClick={() => handleStartDownload(selectedModelId ?? undefined)}
-                >
-                  <Download className="mr-2 h-4 w-4" />
-                  {status?.installed
-                    ? t('plugins:llm.switchModelCta')
-                    : t('plugins:llm.builtinWizardStart')}
-                </Button>
+
+                {/* Vision companion: runs alongside the main model to see
+                    images; the main CTA below never applies to it (a
+                    companion is never "active"). A vision-capable MAIN
+                    model makes it redundant — collapse to a one-line hint
+                    unless one is already installed (state/delete stay
+                    reachable). */}
+                {(() => {
+                  const vlmEntries = models.filter((m) => m.role === 'vlm')
+                  if (vlmEntries.length === 0) return null
+                  const selMainHasVision =
+                    models.find((m) => m.id === selectedModelId && m.role !== 'vlm')
+                      ?.vision === true
+                  const companionInstalled = vlmEntries.some((m) => m.installed)
+                  if (selMainHasVision && !companionInstalled) {
+                    return (
+                      <div className="flex items-center gap-1.5 rounded-lg bg-muted-30 px-3 py-2 text-xs text-muted-foreground">
+                        <Eye className="h-3.5 w-3.5 shrink-0 text-info" />
+                        {t('plugins:llm.companionNotNeeded')}
+                      </div>
+                    )
+                  }
+                  return (
+                  <div className="space-y-2 rounded-lg border border-border bg-muted-30 p-3">
+                    <div className="flex items-center gap-2">
+                      <Eye className="h-4 w-4 text-info" />
+                      <span className="text-xs font-medium text-foreground">
+                        {t('plugins:llm.companionGroup')}
+                      </span>
+                      <span className="text-nano text-muted-foreground">
+                        {t('plugins:llm.companionHint')}
+                      </span>
+                    </div>
+                    {models
+                      .filter((m) => m.role === 'vlm')
+                      .map((m) => {
+                        const isInstalledCompanion = m.installed
+                        const running = status?.companion?.model_id === m.id && status.companion.running
+                        return (
+                          <div
+                            key={m.id}
+                            className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <span className="truncate text-sm font-medium">
+                                  {t(`plugins:llm.models.${m.id}.name`, { defaultValue: m.name })}
+                                </span>
+                                {isInstalledCompanion && (
+                                  <span className="rounded-full bg-success-light px-1.5 py-0.5 text-nano font-medium text-success">
+                                    {t('plugins:llm.installed')}
+                                  </span>
+                                )}
+                                {running && (
+                                  <span className="rounded-full bg-info-light px-1.5 py-0.5 text-nano font-medium text-info">
+                                    {t('plugins:llm.companionRunning')}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="mt-0.5 line-clamp-1 text-xs text-muted-foreground">
+                                {t(`plugins:llm.models.${m.id}.notes`, { defaultValue: m.notes })}
+                              </p>
+                            </div>
+                            {isInstalledCompanion ? (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 px-2 text-xs text-destructive hover:text-destructive sm:h-7"
+                                onClick={() => {
+                                  api
+                                    .deleteBuiltinLlmModel(m.id)
+                                    .then(async () => {
+                                      // Refresh BOTH surfaces: status drives the running pill, the
+                                      // models list drives the installed badge — updating only one
+                                      // left the card showing a deleted companion until reopen.
+                                      setStatus(await api.getBuiltinLlmStatus())
+                                      const r = await api.getBuiltinModels()
+                                      setModels(r.models)
+                                    })
+                                    .catch(() => {})
+                                }}
+                              >
+                                {t('common:delete', 'Delete')}
+                              </Button>
+                            ) : (
+                              <Button
+                                size="sm"
+                                className="h-7 px-3 text-xs sm:h-7"
+                                onClick={() => handleStartDownload(m.id)}
+                              >
+                                <Download className="mr-1 h-3 w-3" />
+                                {t('plugins:llm.companionInstall')}
+                              </Button>
+                            )}
+                          </div>
+                        )
+                      })}
+                  </div>
+                  )
+                })()}
+
+                {(() => {
+                  // Three states per SELECTED model (the old check —
+                  // "any model installed?" — showed 下载并替换 for an
+                  // already-downloaded model, sending users down the
+                  // delete-and-redownload path that no longer exists).
+                  const sel = models.find((m) => m.id === selectedModelId)
+                  const activeId = status?.active_model ?? status?.model_id
+                  if (sel?.installed && sel.id === activeId) {
+                    return (
+                      <Button size="lg" className="w-full" disabled>
+                        <CheckCircle2 className="mr-2 h-4 w-4" />
+                        {t('plugins:llm.builtinActiveNow')}
+                      </Button>
+                    )
+                  }
+                  if (sel?.installed) {
+                    return (
+                      <Button size="lg" className="w-full" onClick={() => handleSwitchModel(sel.id)}>
+                        <RefreshCw className="mr-2 h-4 w-4" />
+                        {t('plugins:llm.builtinSwitchCta')}
+                      </Button>
+                    )
+                  }
+                  return (
+                    <div className="space-y-2">
+                      <Button
+                        size="lg"
+                        className="w-full"
+                        disabled={!selectedModelId}
+                        onClick={() => handleStartDownload(selectedModelId ?? undefined)}
+                      >
+                        <Download className="mr-2 h-4 w-4" />
+                        {t('plugins:llm.builtinWizardStart')}
+                      </Button>
+                      {/* Offline paths — the network-restricted escape hatch:
+                          import a GGUF already on the server, or upload one. */}
+                      <div className="flex items-center justify-center gap-3 text-xs">
+                        <button
+                          className="text-muted-foreground underline-offset-2 hover:underline disabled:opacity-50"
+                          disabled={importBusy}
+                          onClick={() => void importLocalModel()}
+                        >
+                          {t('plugins:llm.builtinImportLocal')}
+                        </button>
+                        <span className="text-border">·</span>
+                        <button
+                          className="text-muted-foreground underline-offset-2 hover:underline disabled:opacity-50"
+                          disabled={importBusy}
+                          onClick={() => importFileRef.current?.click()}
+                        >
+                          {importBusy
+                            ? t('plugins:llm.builtinImportBusy')
+                            : t('plugins:llm.builtinImportUpload')}
+                        </button>
+                        <input
+                          ref={importFileRef}
+                          type="file"
+                          accept=".gguf"
+                          className="hidden"
+                          onChange={(e) => {
+                            const f = e.target.files?.[0]
+                            e.target.value = ''
+                            if (f) void uploadModelFile(f)
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )
+                })()}
               </div>
             )}
 
@@ -584,7 +905,7 @@ export function BuiltinModelWizard({
                     <Button
                       size="sm"
                       variant="ghost"
-                      className="h-7 px-2 text-xs"
+                      className="h-7 px-2 text-xs sm:h-7"
                       onClick={() => {
                         api.cancelModelDownload().catch(() => {})
                       }}
@@ -660,6 +981,12 @@ export function BuiltinModelWizard({
                     {errorMsg && (
                       <p className="mt-1 text-xs text-muted-foreground break-words">
                         {t('plugins:llm.builtinWizardErrorDesc', { message: errorMsg })}
+                      </p>
+                    )}
+                    {errorMsg && NETWORK_ERROR_RE.test(errorMsg) && (
+                      <p className="mt-1.5 flex items-center gap-1.5 text-xs text-warning">
+                        <WifiOff className="h-3.5 w-3.5 shrink-0" />
+                        {t('plugins:llm.builtinNetworkHint')}
                       </p>
                     )}
                   </div>

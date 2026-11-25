@@ -9,9 +9,9 @@ import { useDataVersion } from '@/hooks/useDataVersion'
 import { useTranslation } from 'react-i18next'
 import { useIsMobile } from '@/hooks/useMobile'
 import { ResponsiveTable, type TableColumn, type TableRowAction, EmptyState, Pagination } from '@/components/shared'
-import { Send, Play, Square, FlaskConical, FileText, Pencil, Trash2, Loader2, Globe, Radio } from 'lucide-react'
+import { Play, FlaskConical, FileText, Pencil, Trash2, Loader2, Globe, Radio } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
-import { textMini, textNano } from '@/design-system/tokens/typography'
+import { textMini } from '@/design-system/tokens/typography'
 import { cn } from '@/lib/utils'
 import { notifySuccess, notifyError } from '@/lib/notify'
 import { confirm } from '@/components/ui/use-confirm'
@@ -21,7 +21,7 @@ import { PushTargetDialog } from './PushTargetDialog'
 
 const PAGE_SIZE = 10
 
-export function PushTargetsTab() {
+export function PushTargetsTab({ searchQuery = '' }: { searchQuery?: string } = {}) {
   const { t } = useTranslation()
   const isMobile = useIsMobile()
   const {
@@ -33,7 +33,7 @@ export function PushTargetsTab() {
     stopPushTarget,
     testPushTarget,
     setEditingPushTarget,
-    setPushTargetDialogOpen,
+    setPushTargetDialogOpen: _setPushTargetDialogOpen,
   } = useStore()
 
   const [logsTargetId, setLogsTargetId] = useState<string | null>(null)
@@ -138,9 +138,9 @@ export function PushTargetsTab() {
                 ? <Globe className="h-4 w-4" />
                 : <Radio className="h-4 w-4" />}
             </div>
-            <div className="min-w-0">
-              <div className="font-medium text-sm truncate">{target.name}</div>
-              <code className={cn(textMini, "text-muted-foreground font-mono truncate")}>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-medium" title={target.name}>{target.name}</div>
+              <code className={cn(textMini, "block min-w-0 truncate font-mono text-muted-foreground")}>
                 {target.id.slice(0, 8)}
               </code>
             </div>
@@ -226,11 +226,26 @@ export function PushTargetsTab() {
     if (page > maxPage) setPage(maxPage)
   }, [pushTargets.length])
 
+  // List search — client-side over the full target array (the table is
+  // client-paginated, so the filter sits BEFORE the pagination slice).
+  // The input lives in the page tab bar, to the left of the create button.
+  const filteredTargets = (() => {
+    const q = searchQuery.trim().toLowerCase()
+    if (!q) return pushTargets
+    return pushTargets.filter((target) => {
+      const endpoint = typeof target.config?.endpoint === 'string' ? target.config.endpoint : ''
+      const patterns = target.data_filter?.source_patterns?.join(' ') ?? ''
+      return [target.name, target.target_type, endpoint, patterns]
+        .some((field) => field?.toLowerCase().includes(q))
+    })
+  })()
+  useEffect(() => { setPage(1) }, [searchQuery])
+
   // Mobile infinite scroll: cumulative slice (0 to current page) so previous items stay
   // visible as the user scrolls. Desktop: current-page slice only. Matches automation.tsx.
   const paginatedTargets = isMobile
-    ? pushTargets.slice(0, page * PAGE_SIZE)
-    : pushTargets.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+    ? filteredTargets.slice(0, page * PAGE_SIZE)
+    : filteredTargets.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
 
   return (
     <div className="space-y-4">
@@ -244,9 +259,45 @@ export function PushTargetsTab() {
         actions={actions}
         loading={pushTargetsLoading}
         flexHeight
+        renderMobileBody={(rowData) => {
+          // Tailored mobile body: type + status + updated as one meta row,
+          // schedule + source patterns below — not a key-value dump.
+          const target = rowData as PushTarget
+          return (
+            <div className="space-y-2">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <Badge variant="outline" className={cn(textMini, "h-6 uppercase")}>
+                  {target.target_type}
+                </Badge>
+                <span className={cn("flex items-center gap-1.5", textMini, target.enabled ? "text-success" : "text-muted-foreground")}>
+                  <span className={cn(
+                    "h-2 w-2 rounded-full",
+                    target.enabled ? "bg-success" : "bg-muted-foreground"
+                  )} />
+                  {target.enabled ? t('common:dataPush.running', 'Running') : t('common:dataPush.stopped', 'Stopped')}
+                </span>
+                <span className={cn(textMini, "text-muted-foreground ml-auto")}>
+                  {new Date(target.updated_at * 1000).toLocaleDateString()}
+                </span>
+              </div>
+              <div className="flex min-w-0 items-center gap-1.5">
+                <span className={cn(textMini, "shrink-0 text-muted-foreground")}>
+                  {target.schedule.type === 'event_driven'
+                    ? t('common:dataPush.eventDriven', 'Event-driven')
+                    : t('common:dataPush.interval', { defaultValue: 'Every {{secs}}s', secs: target.schedule.interval_secs })}
+                </span>
+                <span className="shrink-0 text-muted-foreground">·</span>
+                <span className={cn(textMini, "min-w-0 flex-1 truncate text-muted-foreground")}>
+                  {target.data_filter.source_patterns.length > 0
+                    ? target.data_filter.source_patterns.join(', ')
+                    : t('common:dataPush.allSources', 'All sources')}
+                </span>
+              </div>
+            </div>
+          )
+        }}
         emptyState={
           <EmptyState
-            icon={<Send className="h-12 w-12" />}
             title={t('common:dataPush.empty', 'No push targets configured')}
             description={t('common:dataPush.emptyHint', 'Create a push target to forward data to external systems')}
           />
@@ -254,9 +305,9 @@ export function PushTargetsTab() {
       />
 
       {/* Pagination */}
-      {pushTargets.length > PAGE_SIZE && (
+      {filteredTargets.length > PAGE_SIZE && (
         <Pagination
-          total={pushTargets.length}
+          total={filteredTargets.length}
           pageSize={PAGE_SIZE}
           currentPage={page}
           onPageChange={setPage}

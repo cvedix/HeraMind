@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
-  Bluetooth, Pencil, Search, RefreshCw, Cpu, Plus,
-  Wifi, Globe, Radio,
+  Bluetooth, Pencil, Search, RefreshCw, Cpu,
+  Wifi, Radio, Puzzle, Plug, Network,
   CheckCircle2, XCircle, Loader2,
   Copy, LucideIcon, KeyRound, Download, Lock, ShieldCheck,
 } from 'lucide-react'
@@ -19,6 +19,7 @@ import {
   FullScreenDialogFooter,
 } from '@/components/automation/dialog/FullScreenDialog'
 import { Button } from '@/components/ui/button'
+import { MobileTabStrip } from '@/components/shared/MobileTabStrip'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -30,8 +31,15 @@ import {
 import { FormField } from '@/components/ui/field'
 import { FormSection, FormSectionGroup } from '@/components/ui/form-section'
 import { BleProvisionTab } from './BleProvisionTab'
+import { ApProvisionTab } from './ApProvisionTab'
+const EXT_TAB_ICONS: Record<string, typeof Puzzle> = {
+  wifi: Wifi, radio: Radio, plug: Plug, network: Network, puzzle: Puzzle,
+}
+import { useExtensionPages } from '@/hooks/useExtensionPages'
+import { ExtensionPageHost } from '@/components/extensions/ExtensionPageHost'
 import { toast } from '@/components/ui/use-toast'
 import { api } from '@/lib/api'
+import { CT_PROV_SOFTAP_UI_ENABLED, releaseActiveBleSession } from '@/lib/ct-prov'
 import { useServerUrl } from '@/lib/server-url'
 import { useStore } from '@/store'
 import { fetchCache } from '@/lib/utils/async'
@@ -50,7 +58,7 @@ interface AddDeviceGlobalDialogProps {
   adding: boolean
 }
 
-type TabValue = 'ble' | 'manual' | 'auto'
+type TabValue = 'ble' | 'ap' | 'manual' | 'auto' | string
 
 interface TabItem {
   value: TabValue
@@ -65,6 +73,10 @@ interface TabItem {
 
 const TABS: TabItem[] = [
   { value: 'ble', icon: Bluetooth, labelKey: 'devices:ble.tabTitle', descKey: 'devices:ble.tabDesc' },
+  // SoftAP tab kept in code; gated off until NM-222 SoftAP scan iteration.
+  ...(CT_PROV_SOFTAP_UI_ENABLED
+    ? [{ value: 'ap' as const, icon: Wifi, labelKey: 'devices:ap.tabTitle', descKey: 'devices:ap.tabDesc' }]
+    : []),
   { value: 'manual', icon: Pencil, labelKey: 'devices:add.title', descKey: 'devices:add.tabDesc' },
   { value: 'auto', icon: Search, labelKey: 'devices:auto.title', descKey: 'devices:auto.tabDesc' },
 ]
@@ -103,15 +115,49 @@ export function AddDeviceGlobalDialog({
   const fetchDevices = useStore((s) => s.fetchDevices)
   const fetchDeviceTypes = useStore((s) => s.fetchDeviceTypes)
   const [activeTab, setActiveTab] = useState<TabValue>('ble')
+  // Bumped on intentional dismiss so BLE/SoftAP tabs drop their live sessions.
+  const [dismissSignal, setDismissSignal] = useState(0)
+  const { pages: extensionPages } = useExtensionPages()
+  // Extension-contributed tabs: pages that opt into the add-device dialog
+  // via nav_section "add-device" render as a tab hosting their bundle.
+  const extensionTabs: TabItem[] = extensionPages
+    .filter((pg) => pg.nav_section === 'add-device')
+    .map((pg) => ({
+      value: `ext:${pg.extension_id}:${pg.type}`,
+      icon: EXT_TAB_ICONS[pg.icon?.toLowerCase() ?? ''] ?? Puzzle,
+      labelKey: pg.nav_label ?? pg.title,
+      descKey: pg.description,
+    }))
+  const allTabs = [...TABS, ...extensionTabs]
 
   // Footer content supplied by the active tab
   const [footer, setFooter] = useState<ReactNode>(null)
   const setTabFooter = useCallback((node: ReactNode) => setFooter(node), [])
 
+  const handleOpenChange = useCallback(
+    (next: boolean) => {
+      if (!next) {
+        setDismissSignal((n) => n + 1)
+        // Explicit — don't rely only on BleProvisionTab unmount timing.
+        releaseActiveBleSession()
+      }
+      onOpenChange(next)
+    },
+    [onOpenChange],
+  )
+
   // Ensure device types are loaded when dialog opens
   useEffect(() => {
     if (open) fetchDeviceTypes()
   }, [open, fetchDeviceTypes])
+
+  // Leaving the BLE tab (or closing the dialog) must free the GATT link so the
+  // device is not left BUSY while Manual/Auto stay open.
+  useEffect(() => {
+    if (!open || activeTab !== 'ble') {
+      releaseActiveBleSession()
+    }
+  }, [open, activeTab])
 
   // Reset footer when switching tabs (old tab unmounts, new tab hasn't set its footer yet)
   useEffect(() => {
@@ -119,21 +165,21 @@ export function AddDeviceGlobalDialog({
   }, [activeTab])
 
   return (
-    <FullScreenDialog open={open} onOpenChange={onOpenChange}>
+    <FullScreenDialog open={open} onOpenChange={handleOpenChange}>
       <FullScreenDialogHeader
         icon={<Cpu className="w-5 h-5" />}
         iconBg="bg-info-light"
         iconColor="text-info"
         title={t('devices:addDevice')}
         subtitle={t('devices:globalDialog.subtitle')}
-        onClose={() => onOpenChange(false)}
+        onClose={() => handleOpenChange(false)}
       />
 
       <FullScreenDialogContent>
         {/* Sidebar: tab navigation (hidden on mobile) */}
         <FullScreenDialogSidebar>
           <nav className="flex flex-col py-2 gap-0.5 px-2">
-            {TABS.map((tab) => {
+            {allTabs.map((tab) => {
               const Icon = tab.icon
               const isActive = activeTab === tab.value
               return (
@@ -166,44 +212,61 @@ export function AddDeviceGlobalDialog({
         </FullScreenDialogSidebar>
 
         {/* Center column: main + footer stacked vertically */}
-        <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          {isMobile && (
+            <MobileTabStrip
+              items={allTabs.map((tab) => ({ value: tab.value, label: t(tab.labelKey) }))}
+              value={activeTab}
+              onValueChange={setActiveTab}
+              ariaLabel={t('devices:addDevice')}
+            />
+          )}
           {/* Main scrollable content */}
-          <FullScreenDialogMain>
-            <div className={cn("max-w-2xl mx-auto py-6", isMobile ? "px-3" : "px-5 md:px-8")}>
-              {/* Mobile tab bar - grid layout for equal width */}
-              {isMobile && (
-                <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)] gap-2 mb-5">
-                  {TABS.map((tab) => {
-                    const Icon = tab.icon
-                    const isActive = activeTab === tab.value
-                    return (
-                      <button
-                        key={tab.value}
-                        onClick={() => setActiveTab(tab.value)}
-                        className={cn(
-                          'flex flex-col items-center gap-1.5 py-3 rounded-lg text-xs font-medium transition-all',
-                          isActive
-                            ? 'bg-primary text-primary-foreground'
-                            : 'bg-muted-30 text-muted-foreground active:bg-muted'
-                        )}
-                      >
-                        <Icon className="h-5 w-5" />
-                        <span className="leading-tight">{t(tab.labelKey)}</span>
-                      </button>
-                    )
-                  })}
-                </div>
+          {/* BLE/AP own their scroll + sticky step actions; Main must not scroll.
+              Center the content column with items-center (more reliable than mx-auto
+              alone on a flex-1 child in WKWebView). min-h-0 keeps the flex child
+              shrinkable so inner overflow-y-auto can scroll instead of clipping. */}
+          <FullScreenDialogMain
+            className={cn(
+              // Full pane width — Manual/Auto/BLE share the right column.
+              // BLE wizard uses a soft max-w-3xl inside; no outer max-w-2xl squeeze.
+              'flex flex-col',
+              (activeTab === 'ble' || activeTab === 'ap') && 'min-h-0 overflow-hidden',
+            )}
+          >
+            <div
+              className={cn(
+                'flex w-full flex-1 flex-col',
+                isMobile ? 'px-3 py-4' : 'px-5 py-6 md:px-8',
+                (activeTab === 'ble' || activeTab === 'ap') && 'min-h-0 py-0 md:py-0',
               )}
+            >
 
               {/* Tab content */}
               {activeTab === 'ble' && open && (
-                <BleProvisionTab
-                  onComplete={() => {
-                    fetchCache.invalidate('devices')
-                    fetchDevices()
-                    onOpenChange(false)
-                  }}
-                />
+                <div className="flex min-h-0 w-full flex-1 flex-col items-center">
+                  <BleProvisionTab
+                    dismissSignal={dismissSignal}
+                    onComplete={() => {
+                      fetchCache.invalidate('devices')
+                      fetchDevices()
+                      handleOpenChange(false)
+                    }}
+                  />
+                </div>
+              )}
+
+              {CT_PROV_SOFTAP_UI_ENABLED && activeTab === 'ap' && open && (
+                <div className="flex min-h-0 w-full flex-1 flex-col items-center">
+                  <ApProvisionTab
+                    dismissSignal={dismissSignal}
+                    onComplete={() => {
+                      fetchCache.invalidate('devices')
+                      fetchDevices()
+                      handleOpenChange(false)
+                    }}
+                  />
+                </div>
               )}
 
               {activeTab === 'manual' && open && (
@@ -211,13 +274,32 @@ export function AddDeviceGlobalDialog({
                   deviceTypes={deviceTypes}
                   onAdd={onAdd}
                   adding={adding}
-                  onSuccess={() => onOpenChange(false)}
+                  onSuccess={() => handleOpenChange(false)}
                   renderFooter={setTabFooter}
                 />
               )}
 
               {activeTab === 'auto' && open && (
                 <AutoDiscoveryTab renderFooter={setTabFooter} />
+              )}
+
+              {extensionTabs.length > 0 && open && extensionTabs.some((et) => et.value === activeTab) && (
+                (() => {
+                  const pg = extensionPages.find(
+                    (p2) => `ext:${p2.extension_id}:${p2.type}` === activeTab,
+                  )
+                  if (!pg) return null
+                  return (
+                    <div className='flex-1 overflow-auto -mx-4 px-4 md:-mx-6 md:px-6'>
+                      <ExtensionPageHost
+                        bundleUrl={pg.bundle_url}
+                        exportName={pg.export_name}
+                        globalName={pg.global_name}
+                        title={pg.title}
+                      />
+                    </div>
+                  )
+                })()
               )}
             </div>
           </FullScreenDialogMain>
@@ -244,27 +326,30 @@ interface StepCardProps {
 
 function StepCard({ step, icon: Icon, title, description, status = 'pending' }: StepCardProps) {
   return (
-    <div className={cn(
-      'relative flex gap-4 p-4 rounded-xl border transition-colors',
-      status === 'done' && 'border-success bg-success-light',
-      status === 'active' && 'border-primary bg-card',
-      status === 'pending' && 'border-border bg-card',
-    )}>
-      {/* Step number */}
-      <div className={cn(
-        'w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold shrink-0',
-        status === 'done' && 'bg-success text-primary-foreground',
-        status === 'active' && 'bg-primary text-primary-foreground',
-        status === 'pending' && 'bg-muted-30 text-muted-foreground',
-      )}>
-        {status === 'done' ? <CheckCircle2 className="h-4 w-4" /> : step}
+    <div className="flex gap-3 py-2.5">
+      {/* Fixed size-8 badge for every status — success-light is translucent and
+          CheckCircle2 vs digit looked like different chip sizes. */}
+      <div
+        className={cn(
+          'flex size-8 shrink-0 items-center justify-center rounded-lg text-xs font-medium tabular-nums',
+          status === 'done' && 'bg-card text-success ring-1 ring-inset ring-success',
+          status === 'active' && 'bg-primary text-primary-foreground',
+          status === 'pending' && 'bg-card text-muted-foreground ring-1 ring-inset ring-border',
+        )}
+        aria-hidden={status !== 'active'}
+      >
+        {status === 'done' ? (
+          <CheckCircle2 className="size-4 shrink-0" aria-hidden />
+        ) : (
+          <span className="leading-none">{step}</span>
+        )}
       </div>
-      <div className="flex-1 min-w-0 space-y-1">
+      <div className="min-w-0 flex-1 space-y-0.5 pt-0.5">
         <div className="flex items-center gap-2">
-          <Icon className="h-4 w-4 text-muted-foreground shrink-0" />
+          <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
           <h4 className="text-sm font-medium">{title}</h4>
         </div>
-        <p className="text-xs text-muted-foreground leading-relaxed">{description}</p>
+        <p className="text-xs leading-relaxed text-muted-foreground">{description}</p>
       </div>
     </div>
   )
@@ -325,20 +410,30 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-12">
-        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      <div className="min-h-[320px] flex flex-col items-center justify-center gap-3">
+        <Loader2 className="h-6 w-6 animate-spin text-primary" />
+        <p className="text-sm text-muted-foreground">{t('common:loading')}</p>
       </div>
     )
   }
 
   return (
-    <FormSectionGroup>
-      {/* How it works — Step cards */}
+    <div className="space-y-6">
+      <div className="text-center max-w-md mx-auto space-y-2">
+        <div className="w-14 h-14 mx-auto rounded-xl bg-primary-light flex items-center justify-center">
+          <Search className="w-7 h-7 text-primary" />
+        </div>
+        <h3 className="text-lg font-medium">{t('devices:auto.title')}</h3>
+        <p className="text-sm text-muted-foreground">{t('devices:auto.tabDesc')}</p>
+      </div>
+
+      <FormSectionGroup>
+      {/* How it works — calm step list (MQTT pending drafts ≠ SoftAP) */}
       <FormSection
         title={t('devices:auto.howItWorks')}
         description={t('devices:auto.howItWorksDesc')}
       >
-        <div className="space-y-3">
+        <div className="rounded-xl border bg-card px-4 py-2 divide-y divide-border">
           <StepCard
             step={1}
             icon={Radio}
@@ -368,26 +463,23 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
         title={t('devices:auto.brokerInfo')}
         description={t('devices:auto.brokerInfoDesc')}
       >
-        {/* Method toggle */}
-        <div className="flex gap-2 mb-4">
+        {/* Method toggle — segmented, matches Manual / CT-Prov calm controls */}
+        <div className="grid grid-cols-2 rounded-lg bg-muted p-1 mb-4">
           {([
-            { key: 'mqtt' as const, icon: Radio, color: 'text-accent-orange', bg: 'bg-accent-orange-light' },
-            { key: 'webhook' as const, icon: Globe, color: 'text-accent-purple', bg: 'bg-accent-purple-light' },
-          ]).map(({ key, icon: MethodIcon, color, bg }) => (
+            { key: 'mqtt' as const },
+            { key: 'webhook' as const },
+          ]).map(({ key }) => (
             <button
               key={key}
               type="button"
               onClick={() => setActiveMethod(key)}
               className={cn(
-                'flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all',
+                'min-h-11 rounded-md px-3 text-sm font-medium transition-colors',
                 activeMethod === key
-                  ? 'bg-card border border-primary shadow-sm'
-                  : 'bg-muted-30 text-muted-foreground hover:bg-card'
+                  ? 'bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground',
               )}
             >
-              <div className={cn('w-6 h-6 rounded flex items-center justify-center', bg)}>
-                <MethodIcon className={cn('h-3.5 w-3.5', color)} />
-              </div>
               {t(`devices:auto.method${key.charAt(0).toUpperCase() + key.slice(1)}`)}
             </button>
           ))}
@@ -416,13 +508,13 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
                 <div className={cn("gap-3", isMobile ? "grid grid-cols-1" : "grid grid-cols-2")}>
                   <div className="space-y-1">
                     <span className="text-xs text-muted-foreground">{t('devices:auto.protocol')}</span>
-                    <code className="block text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                    <code className="block min-w-0 break-all text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                       {embeddedConfig?.tls_enabled ? 'mqtts://' : 'mqtt://'}{serverIp}:{brokerPort}
                     </code>
                   </div>
                   <div className="space-y-1">
                     <span className="text-xs text-muted-foreground">{t('devices:auto.brokerAddress')}</span>
-                    <code className="block text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                    <code className="block min-w-0 break-all text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                       {serverIp}:{brokerPort}
                     </code>
                   </div>
@@ -469,13 +561,13 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
                     <span className="text-xs text-muted-foreground">{t('devices:auto.authInfo')}</span>
                     {embeddedConfig.credentials.map((cred) => (
                       <div key={cred.username} className="flex items-center gap-2">
-                        <code className="flex-1 text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                        <code className="min-w-0 flex-1 truncate text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                           {cred.username} / {cred.password}
                         </code>
                         <Button
                           variant="ghost"
                           size="icon"
-                          className="shrink-0 h-7 w-7"
+                          className="shrink-0 h-7 w-7 sm:h-7 sm:w-7"
                           onClick={() => {
                             copyToClipboard(`${cred.username}:${cred.password}`)
                             toast({ title: t('common:copied') })
@@ -520,7 +612,7 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
                     </div>
                     <div className="space-y-1">
                       <span className="text-xs text-muted-foreground">{t('devices:auto.brokerPort')}</span>
-                      <code className="block text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                      <code className="block min-w-0 break-all text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                         {broker.port}
                       </code>
                     </div>
@@ -530,13 +622,13 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
                     <div className="space-y-1">
                       <span className="text-xs text-muted-foreground">{t('devices:auto.authInfo')}</span>
                       <div className="flex items-center gap-2">
-                        <code className="flex-1 text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                        <code className="min-w-0 flex-1 truncate text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                           {broker.username} / ••••••••
                         </code>
                         <Button
                           variant="ghost"
                           size="icon"
-                          className="shrink-0 h-7 w-7"
+                          className="shrink-0 h-7 w-7 sm:h-7 sm:w-7"
                           onClick={() => {
                             broker.username && copyToClipboard(broker.username)
                             toast({ title: t('common:copied') })
@@ -555,13 +647,13 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
                       <div className="space-y-1">
                         {broker.subscribe_topics.map((topic, i) => (
                           <div key={i} className="flex items-center gap-2">
-                            <code className="flex-1 text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5 break-all">
+                            <code className="min-w-0 flex-1 break-all text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                               {topic}
                             </code>
                             <Button
                               variant="ghost"
                               size="icon"
-                              className="shrink-0 h-7 w-7"
+                              className="shrink-0 h-7 w-7 sm:h-7 sm:w-7"
                               onClick={() => {
                                 copyToClipboard(topic)
                                 toast({ title: t('common:copied') })
@@ -583,7 +675,7 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
         {/* Webhook panel */}
         {activeMethod === 'webhook' && (
           <div className="rounded-xl border bg-card p-4 space-y-3">
-            <p className="text-sm text-muted-foreground">
+            <p className="text-xs text-muted-foreground leading-relaxed">
               {t('devices:auto.webhookEndpointDesc')}
             </p>
             <div className="space-y-1">
@@ -592,7 +684,7 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
                 {webhookBaseUrl}
               </code>
             </div>
-            <p className="xs text-muted-foreground">
+            <p className="text-xs text-muted-foreground leading-relaxed">
               {t('devices:auto.webhookUrlHint')}
             </p>
             <div className="space-y-1">
@@ -601,7 +693,7 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="h-7 w-7 shrink-0"
+                  className="h-7 w-7 shrink-0 sm:h-7 sm:w-7"
                   onClick={() => {
                     const cmd = `curl -X POST ${serverUrl}/api/devices/my-sensor-001/webhook \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "data": {\n      "temperature": 23.5,\n      "humidity": 65.2\n    }\n  }'`
                     copyToClipboard(cmd)
@@ -635,7 +727,8 @@ function AutoDiscoveryTab({ renderFooter }: { renderFooter: (node: ReactNode) =>
           ))}
         </div>
       </FormSection>
-    </FormSectionGroup>
+      </FormSectionGroup>
+    </div>
   )
 }
 
@@ -648,7 +741,7 @@ const ADAPTER_TYPES = [
   { value: 'webhook' as const, icon: Wifi, color: 'text-accent-purple', bg: 'bg-accent-purple-light' },
 ]
 
-function ManualAddForm({
+export function ManualAddForm({
   deviceTypes,
   onAdd,
   adding,
@@ -668,6 +761,7 @@ function ManualAddForm({
   const [selectedDeviceType, setSelectedDeviceType] = useState('')
   const [deviceId, setDeviceId] = useState('')
   const [deviceName, setDeviceName] = useState('')
+  const [offlineTimeout, setOfflineTimeout] = useState('')
   const [adapterType, setAdapterType] = useState<'mqtt' | 'webhook'>('mqtt')
   const [connectionConfig, setConnectionConfig] = useState<ConnectionConfig>({})
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -736,6 +830,12 @@ function ManualAddForm({
     if (!selectedDeviceType) {
       newErrors.deviceType = t('devices:deviceType') + ' is required'
     }
+    if (deviceId && !/^[A-Za-z0-9_-]+$/.test(deviceId)) {
+      newErrors.deviceId = t('devices:id.invalid', '设备 ID 只能包含字母、数字、- 和 _')
+    }
+    if (offlineTimeout && (!Number.isFinite(Number(offlineTimeout)) || Number(offlineTimeout) <= 0)) {
+      newErrors.offlineTimeout = t('devices:offlineTimeoutInvalid', '请输入大于 0 的秒数')
+    }
     setErrors(newErrors)
     if (Object.keys(newErrors).length > 0) return
 
@@ -748,6 +848,7 @@ function ManualAddForm({
         ...connectionConfig,
         ...(adapterType === 'webhook' && webhookToken ? { webhook_token: webhookToken } : {}),
       },
+      offline_timeout_secs: offlineTimeout ? Number(offlineTimeout) : undefined,
     }
 
     const success = await onAdd(request)
@@ -764,7 +865,7 @@ function ManualAddForm({
         variant: 'destructive',
       })
     }
-  }, [selectedDeviceType, adapterType, connectionConfig, deviceId, deviceName, onAdd, onSuccess, t])
+  }, [selectedDeviceType, adapterType, connectionConfig, deviceId, deviceName, offlineTimeout, onAdd, onSuccess, t])
 
   // Push footer button to parent
   useEffect(() => {
@@ -776,6 +877,15 @@ function ManualAddForm({
   }, [selectedDeviceType, adding, handleSubmit, renderFooter, t])
 
   return (
+    <div className="space-y-6">
+      <div className="text-center max-w-md mx-auto space-y-2">
+        <div className="w-14 h-14 mx-auto rounded-xl bg-primary-light flex items-center justify-center">
+          <Pencil className="w-7 h-7 text-primary" />
+        </div>
+        <h3 className="text-lg font-medium">{t('devices:add.title')}</h3>
+        <p className="text-sm text-muted-foreground">{t('devices:add.tabDesc')}</p>
+      </div>
+
     <FormSectionGroup>
       {/* Basic Info */}
       <FormSection>
@@ -797,18 +907,22 @@ function ManualAddForm({
 
         {/* Device ID & Name */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <FormField label={t('devices:deviceId')}>
-            <div className="flex gap-2">
+          <FormField label={t('devices:deviceId')} error={errors.deviceId} helpText={t('devices:id.autoGenerate')}>
+            <div className="flex items-center gap-2">
               <Input
                 value={deviceId}
-                onChange={(e) => setDeviceId(e.target.value)}
+                onChange={(e) => {
+                  setDeviceId(e.target.value)
+                  setErrors((prev) => { const next = { ...prev }; delete next.deviceId; return next })
+                }}
                 placeholder={t('devices:id.autoGenerate')}
-                className="font-mono"
+                className="min-w-0 flex-1 font-mono"
               />
               <Button
                 type="button"
                 variant="outline"
                 size="icon"
+                className="shrink-0 h-11 w-11 sm:h-10 sm:w-10"
                 onClick={() => setDeviceId(generateRandomId())}
                 title={t('devices:id.regenerate')}
               >
@@ -831,9 +945,10 @@ function ManualAddForm({
         title={t('devices:add.connectionSettings')}
         description={t('devices:add.connectionSettingsDesc')}
       >
-        {/* Adapter type — visual cards */}
-        <div className={cn("gap-2", isMobile ? "grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)]" : "grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)]")}>
-          {ADAPTER_TYPES.map(({ value, icon: AdapterIcon, color, bg }) => {
+        {/* Adapter type — compact segmented choice; the labels carry enough
+            meaning without two decorative icon cards. */}
+        <div className="grid grid-cols-2 rounded-lg bg-muted p-1">
+          {ADAPTER_TYPES.map(({ value }) => {
             const isActive = adapterType === value
             return (
               <button
@@ -841,29 +956,13 @@ function ManualAddForm({
                 type="button"
                 onClick={() => setAdapterType(value)}
                 className={cn(
-                  'flex flex-col items-center gap-2 p-3 rounded-xl border-2 transition-all text-center',
+                  'min-h-11 rounded-md px-3 text-sm font-medium transition-colors',
                   isActive
-                    ? 'border-primary bg-card'
-                    : 'border-transparent bg-muted-30 hover:bg-card hover:border-border'
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground'
                 )}
               >
-                <div className={cn(
-                  'w-9 h-9 rounded-lg flex items-center justify-center',
-                  bg
-                )}>
-                  <AdapterIcon className={cn('h-4 w-4', color)} />
-                </div>
-                <div className="min-w-0">
-                  <span className={cn(
-                    'text-sm font-medium block',
-                    isActive ? 'text-foreground' : 'text-muted-foreground'
-                  )}>
-                    {t(`devices:add.adapterLabel_${value}`)}
-                  </span>
-                  <span className={cn(textMini, "text-muted-foreground leading-tight block mt-0.5 truncate max-w-[140px]")}>
-                    {t(`devices:add.adapterDesc_${value}`)}
-                  </span>
-                </div>
+                {t(`devices:add.adapterLabel_${value}`)}
               </button>
             )
           })}
@@ -921,13 +1020,13 @@ function ManualAddForm({
                   <div className={cn("gap-3", isMobile ? "grid grid-cols-1" : "grid grid-cols-2")}>
                     <div className="space-y-1">
                       <span className="text-xs text-muted-foreground">{t('devices:add.protocol')}</span>
-                      <code className="block text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                      <code className="block min-w-0 break-all text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                         {embeddedConfig.tls_enabled ? 'mqtts' : 'mqtt'}
                       </code>
                     </div>
                     <div className="space-y-1">
                       <span className="text-xs text-muted-foreground">{t('devices:add.serverAddress')}</span>
-                      <code className="block text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                      <code className="block min-w-0 break-all text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                         {serverIp || mqttStatus?.server_ip || 'localhost'}:{embeddedConfig.port}
                       </code>
                     </div>
@@ -972,13 +1071,13 @@ function ManualAddForm({
                       <span className="text-xs text-muted-foreground">{t('devices:auto.authInfo')}</span>
                       {embeddedConfig.credentials.map((cred) => (
                         <div key={cred.username} className="flex items-center gap-2">
-                          <code className="flex-1 text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                          <code className="min-w-0 flex-1 truncate text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                             {cred.username} / {cred.password}
                           </code>
                           <Button
                             variant="ghost"
                             size="icon"
-                            className="shrink-0 h-7 w-7"
+                            className="shrink-0 h-7 w-7 sm:h-7 sm:w-7"
                             onClick={() => {
                               copyToClipboard(`${cred.username}:${cred.password}`)
                               toast({ title: t('common:copied') })
@@ -1001,13 +1100,13 @@ function ManualAddForm({
                     <div className={cn("gap-3", isMobile ? "grid grid-cols-1" : "grid grid-cols-2")}>
                       <div className="space-y-1">
                         <span className="text-xs text-muted-foreground">{t('devices:add.protocol')}</span>
-                        <code className="block text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                        <code className="block min-w-0 break-all text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                           {broker.tls ? 'mqtts' : 'mqtt'}
                         </code>
                       </div>
                       <div className="space-y-1">
                         <span className="text-xs text-muted-foreground">{t('devices:add.serverAddress')}</span>
-                        <code className="block text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                        <code className="block min-w-0 break-all text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                           {broker.broker}:{broker.port}
                         </code>
                       </div>
@@ -1035,14 +1134,14 @@ function ManualAddForm({
                       <div className="space-y-1">
                         <span className="text-xs text-muted-foreground">{t('devices:auto.authInfo')}</span>
                         <div className="flex items-center gap-2">
-                          <code className="flex-1 text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
+                          <code className="min-w-0 flex-1 truncate text-sm font-mono bg-muted-30 rounded-md px-3 py-1.5">
                             {broker.username}{broker.password ? ` / ${broker.password}` : ' / ••••••••'}
                           </code>
                           {broker.password && (
                             <Button
                               variant="ghost"
                               size="icon"
-                              className="shrink-0 h-7 w-7"
+                              className="shrink-0 h-7 w-7 sm:h-7 sm:w-7"
                               onClick={() => {
                                 copyToClipboard(`${broker.username}:${broker.password}`)
                                 toast({ title: t('common:copied') })
@@ -1090,17 +1189,18 @@ function ManualAddForm({
               </code>
             </div>
             <FormField label={t('devices:add.webhookToken')}>
-              <div className="flex gap-2">
+              <div className="flex items-center gap-2">
                 <Input
                   value={webhookToken}
                   onChange={(e) => setWebhookToken(e.target.value)}
                   placeholder={t('devices:add.webhookTokenPlaceholder')}
-                  className="font-mono text-sm"
+                  className="min-w-0 flex-1 font-mono text-sm"
                 />
                 <Button
                   type="button"
                   variant="outline"
                   size="icon"
+                  className="shrink-0 h-11 w-11 sm:h-10 sm:w-10"
                   onClick={() => setWebhookToken(generateWebhookToken())}
                   title={t('devices:add.webhookTokenGenerate')}
                 >
@@ -1115,6 +1215,27 @@ function ManualAddForm({
         )}
 
       </FormSection>
+
+      <FormSection title={t('devices:advanced', '高级')}>
+        <FormField
+          label={t('devices:detailPage.offlineTimeout', '离线判定时间')}
+          helpText={t('devices:offlineTimeoutHelp', '留空时使用设备类型或系统默认值')}
+          error={errors.offlineTimeout}
+        >
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={1}
+            value={offlineTimeout}
+            onChange={(e) => {
+              setOfflineTimeout(e.target.value)
+              setErrors((prev) => { const next = { ...prev }; delete next.offlineTimeout; return next })
+            }}
+            placeholder="300"
+          />
+        </FormField>
+      </FormSection>
     </FormSectionGroup>
+    </div>
   )
 }

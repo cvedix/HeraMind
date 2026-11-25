@@ -54,9 +54,9 @@
 
 <br/>
 
-## HeraMind 0.9.24
+## HeraMind 1.3.3
 
-This source update integrates [NeoMind v0.9.24](https://github.com/camthink-ai/NeoMind/releases/tag/v0.9.24): built-in local LLM support, IM bridges, OpenAPI, storage safeguards, and extension SDK 0.7.1. HeraMind keeps Vietnamese as the default language, its blue theme and logos, HeraCam/bodycam analytics, and its own data paths and update channel. See the [integration and validation notes](docs/upstream-sync-0.9.24.md). The source version does not imply a published HeraMind binary release.
+This source update integrates [NeoMind v1.3.3](https://github.com/camthink-ai/NeoMind/releases/tag/v1.3.3). It brings a redesigned mobile interface, inline chat mentions, improved agent execution and notifications, MQTT connection diagnostics, and storage-side pagination for sparse telemetry. HeraMind retains Vietnamese by default, its blue theme and logos, HeraCam and bodycam dashboards, its data directory, and its own update channel. See the [integration notes](docs/upstream-sync-1.3.3.md) and [configuration reference](docs/configuration.md).
 
 ## What is HeraMind?
 

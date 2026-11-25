@@ -1,6 +1,6 @@
 [package]
 name = "heramind-tauri"
-version = "0.9.24"
+version = "1.3.3"
 description = "HeraMind Edge AI Platform"
 authors = ["HeraMind Team"]
 license = "MIT"
@@ -30,6 +30,9 @@ chrono = "0.4"
 # Local workspace crates - relative to web/src-tauri/ directory
 # heramind-api pulls in all other required crates as dependencies
 edge-api = { path = "../../crates/heramind-api", package = "heramind-api", features = ["embedded-broker"] }
+# CLI dispatch surface for main()'s pre-dispatch (the desktop binary doubles
+# as the `heramind` CLI entry on this platform).
+heramind-cli-ops = { path = "../../crates/heramind-cli-ops" }
 tauri-plugin-notification = "2"
 tauri-plugin-blec = "0.8"
 

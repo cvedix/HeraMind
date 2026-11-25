@@ -13,7 +13,7 @@
     <img src="https://github.com/CVEDIX/HeraMind/actions/workflows/build.yml/badge.svg" alt="构建状态">
   </a>
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="许可证">
-  <img src="https://img.shields.io/badge/v-0.9.24-information.svg" alt="版本">
+  <img src="https://img.shields.io/badge/v-1.3.3-information.svg" alt="版本">
   <img src="https://img.shields.io/badge/Rust-1.85+-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/平台-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg" alt="平台支持">
 </p>
@@ -48,9 +48,9 @@
 
 <br/>
 
-## HeraMind 0.9.24
+## HeraMind 1.3.3
 
-本次源码更新集成 [NeoMind v0.9.24](https://github.com/camthink-ai/NeoMind/releases/tag/v0.9.24)：内置本地 LLM、即时通讯桥接、OpenAPI、数据库保护和扩展 SDK 0.7.1。保留 HeraMind 的越南语默认设置、蓝色主题和标志、HeraCam/bodycam 分析、数据目录及更新渠道。参见[集成与验证记录](docs/upstream-sync-0.9.24.md)。源码版本不代表 HeraMind 二进制版本已发布。
+本次源码更新集成 [NeoMind v1.3.3](https://github.com/camthink-ai/NeoMind/releases/tag/v1.3.3)，引入新版移动界面、聊天内联提及、智能体执行与通知改进、MQTT 诊断和遥测存储分页。HeraMind 保留默认越南语、蓝色主题和标志、HeraCam/bodycam 仪表板、数据目录和更新渠道。参见[集成记录](docs/upstream-sync-1.3.3.md)与[配置参考](docs/configuration.md)。
 
 ## HeraMind 是什么？
 

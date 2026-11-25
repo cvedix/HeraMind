@@ -5,12 +5,13 @@
  * Used for complex forms like TransformBuilder, RuleBuilder, AgentEditor.
  */
 
-import { ReactNode, useEffect } from 'react'
+import { ReactNode, createContext, useContext, useEffect, useId } from 'react'
 import { createPortal } from 'react-dom'
-import { X } from 'lucide-react'
+import { ChevronLeft, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useBodyScrollLock } from '@/hooks/useBodyScrollLock'
 import { useIsMobile, useSafeAreaInsets } from '@/hooks/useMobile'
+import { useTranslation } from 'react-i18next'
 
 export interface FullScreenDialogProps {
   open: boolean
@@ -24,6 +25,8 @@ export interface FullScreenDialogProps {
   zIndex?: number
 }
 
+const FullScreenDialogTitleContext = createContext<string | undefined>(undefined)
+
 export function FullScreenDialog({
   open,
   onOpenChange,
@@ -33,7 +36,8 @@ export function FullScreenDialog({
   zIndex = 100,
 }: FullScreenDialogProps) {
   const isMobile = useIsMobile()
-  const insets = useSafeAreaInsets()
+  const _insets = useSafeAreaInsets()
+  const titleId = useId()
 
   // Lock body scroll when dialog is open
   useBodyScrollLock(open, { mobileOnly: true })
@@ -60,6 +64,9 @@ export function FullScreenDialog({
 
   return createPortal(
     <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
       className={cn(
         "fixed inset-0 flex flex-col",
         // Glassmorphism background - lower opacity to show content behind
@@ -68,15 +75,16 @@ export function FullScreenDialog({
         !open && "hidden"
       )}
       style={{ zIndex }}
-      onClick={() => !disableBackdropClose && onOpenChange(false)}
+      onClick={() => !isMobile && !disableBackdropClose && onOpenChange(false)}
     >
       {/* Inner container - prevents click propagation */}
       <div
         className={cn(
-          "flex flex-col flex-1 overflow-hidden",
-          // Full-bleed: opaque bg-background on desktop (page-like, max space
-          // for heavy editors); --chrome on mobile via inline style.
-          isMobile ? "" : "bg-popover",
+          "flex min-h-0 flex-1 flex-col overflow-hidden",
+          // Keep the whole mobile surface on one background token. Using
+          // --chrome here made the header/footer visibly lighter than scroll
+          // content in dark mode.
+          isMobile ? "bg-background" : "bg-popover",
           className
         )}
         onClick={(e) => e.stopPropagation()}
@@ -84,15 +92,12 @@ export function FullScreenDialog({
           // Reserve the macOS title-bar (traffic-light) inset so the
           // header/content isn't covered by the overlay traffic lights.
           paddingTop: "calc(env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px))",
-          ...(isMobile
-            ? {
-                backgroundColor: "var(--chrome)",
-                paddingBottom: "env(safe-area-inset-bottom, 0px)",
-              }
-            : {}),
+          ...(isMobile ? { paddingBottom: "env(safe-area-inset-bottom, 0px)" } : {}),
         }}
       >
-        {children}
+        <FullScreenDialogTitleContext.Provider value={titleId}>
+          {children}
+        </FullScreenDialogTitleContext.Provider>
       </div>
     </div>,
     dialogRoot
@@ -114,7 +119,7 @@ export interface FullScreenDialogHeaderProps {
   iconBg?: string
   /** @deprecated */
   iconColor?: string
-  /** @deprecated */
+  /** Secondary line under the title. Omitted on the compact mobile header. */
   subtitle?: string
 }
 
@@ -124,28 +129,52 @@ export function FullScreenDialogHeader({
   onClose,
   actions,
 }: FullScreenDialogHeaderProps) {
+  const isMobile = useIsMobile()
+  const { t } = useTranslation('common')
+  const titleId = useContext(FullScreenDialogTitleContext)
+
+  if (isMobile) {
+    return (
+      <header className="grid h-16 shrink-0 grid-cols-[1fr_auto_1fr] items-center bg-background px-3">
+        <button
+          type="button"
+          onClick={onClose}
+          className="flex h-11 w-11 items-center justify-center justify-self-start rounded-full text-foreground active:bg-muted"
+          aria-label={t('cancel')}
+        >
+          <ChevronLeft className="h-5 w-5" />
+        </button>
+        <h1 id={titleId} className="max-w-[56vw] truncate text-center text-base font-semibold text-foreground">{title}</h1>
+        <div className="flex min-w-0 items-center justify-self-end gap-2 [&>button]:h-10 [&>button]:w-10 [&>button]:rounded-full [&>button]:px-0 [&>button]:text-[0px] [&>button>svg]:m-0">
+          {actions}
+        </div>
+      </header>
+    )
+  }
+
   return (
-    <header className="shrink-0 flex items-center justify-between gap-3 px-4 md:px-6 h-14 border-b border-border">
+    <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-2.5 md:px-6">
       <div className="min-w-0 flex-1">
-        <h1 className="text-base md:text-lg font-semibold truncate text-foreground">
+        <h1 id={titleId} className="truncate text-base font-semibold text-foreground md:text-lg">
           {title}
         </h1>
         {subtitle && (
-          <p className="text-nano text-muted-foreground truncate">{subtitle}</p>
+          <p className="truncate text-xs text-muted-foreground">{subtitle}</p>
         )}
       </div>
-      <div className="flex items-center gap-2 shrink-0">
+      <div className="flex shrink-0 items-center gap-2">
         {actions}
         <button
+          type="button"
           onClick={onClose}
+          aria-label={t('cancel')}
           className={cn(
-            "shrink-0 flex items-center justify-center w-8 h-8 md:w-9 md:h-9",
-            "rounded-lg text-muted-foreground hover:text-foreground",
-            "bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10",
-            "transition-all"
+            "flex h-8 w-8 shrink-0 items-center justify-center md:h-9 md:w-9",
+            "rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground",
+            "transition-colors"
           )}
         >
-          <X className="w-5 h-5" />
+          <X className="h-5 w-5" />
         </button>
       </div>
     </header>
@@ -166,7 +195,7 @@ export function FullScreenDialogContent({
   className,
 }: FullScreenDialogContentProps) {
   return (
-    <div className={cn("flex-1 overflow-hidden flex", className)}>
+    <div className={cn("flex min-h-0 flex-1 overflow-hidden", className)}>
       {children}
     </div>
   )
@@ -191,6 +220,8 @@ export function FullScreenDialogFooter({
         "shrink-0 flex items-center justify-end gap-2 md:gap-3",
         "px-3 md:px-5 lg:px-6 py-3 md:py-4",
         "border-t border-border",
+        "max-md:[&>button]:min-h-11 max-md:[&>button]:flex-1",
+        "max-md:[&>button]:rounded-xl",
         // No bg: footer inherits the container's bg-popover (white) so it
         // matches the body. A bg-black/[0.02] tint here read as #FBFBFC,
         // a visible mismatch vs the white content (the old "glassmorphism

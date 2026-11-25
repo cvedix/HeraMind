@@ -29,9 +29,9 @@ import {
   LayoutDashboard,
   Plus,
   Minimize,
-  Hash,
+
   Monitor,
-  Grid,
+
   Settings2,
   Sparkles,
   ChevronRight,
@@ -52,6 +52,7 @@ import {
 } from '@/components/dashboard/config'
 
 // Dashboard components
+import type { LayoutItem as Layout } from 'react-grid-layout'
 import { DashboardGrid } from '@/components/dashboard/DashboardGrid'
 import { LayerEditorDialog } from '@/components/dashboard/generic/LayerEditorDialog'
 import { MapEditorDialog, type MapBinding } from '@/components/dashboard/generic/MapEditorDialog'
@@ -60,7 +61,7 @@ import type { LayerBinding } from '@/components/dashboard/generic/CustomLayer'
 import { DashboardListSidebar } from '@/components/dashboard/DashboardListSidebar'
 import { ShareManagerDialog } from '@/components/dashboard/ShareManagerDialog'
 import { MobileEditBar } from '@/components/dashboard/MobileEditBar'
-import type { DashboardComponent, DataSource, GenericComponent } from '@/types/dashboard'
+import type { ComponentSizeConstraints, DashboardComponent, DataSource, DataSourceOrList, GenericComponent, GenericComponentType } from '@/types/dashboard'
 import type { Device } from '@/types'
 import { COMPONENT_SIZE_CONSTRAINTS } from '@/types/dashboard'
 import { dynamicRegistry } from '@/components/dashboard/registry/DynamicRegistry'
@@ -93,7 +94,7 @@ function isTitleInDisplayComponent(_componentType?: string): boolean {
 const VisualDashboardMemo = memo(function VisualDashboard() {
   const { dashboardId } = useParams<{ dashboardId?: string }>()
   const navigate = useNavigate()
-  const { t, i18n } = useTranslation('dashboardComponents')
+  const { t, _i18n } = useTranslation('dashboardComponents')
   const { handleError } = useErrorHandler()
 
   // Dashboard state — split subscriptions to avoid cascade:
@@ -302,7 +303,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
   }, [setCurrentDashboard])
 
   // Dashboard interaction handlers
-  const handleDeviceClick = useCallback(async (deviceId: string) => {
+  const _handleDeviceClick = useCallback(async (deviceId: string) => {
     const device = devicesRef.current.find(d => d.id === deviceId || d.device_id === deviceId)
     if (device) {
       // Navigate to device detail page
@@ -316,7 +317,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
     }
   }, [navigate, t])
 
-  const handleMetricClick = useCallback(async (metricId: string, deviceId?: string) => {
+  const _handleMetricClick = useCallback(async (metricId: string, deviceId?: string) => {
     // Show metric info in toast
     toast({
       title: t('visualDashboard.metricInfo'),
@@ -324,13 +325,15 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
     })
   }, [t])
 
-  const handleCommandClick = useCallback(async (deviceId: string, command: string) => {
+  const _handleCommandClick = useCallback(async (deviceId: string, command: string) => {
     try {
-      const success = await sendCommand(deviceId, command)
-      if (success) {
+      const result = await sendCommand(deviceId, command)
+      if (result) {
         toast({
           title: t('visualDashboard.commandSent'),
-          description: `${t('visualDashboard.command')}: ${command}\n${t('visualDashboard.device')}: ${deviceId.slice(0, 8)}...`,
+          description:
+            result.delivery_note ||
+            `${t('visualDashboard.command')}: ${command}\n${t('visualDashboard.device')}: ${deviceId.slice(0, 8)}...`,
         })
       } else {
         toast({
@@ -412,7 +415,11 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
       const gc = c as GenericComponent
       // Hash dataSource identity (use _saveTs stamp if present for forced refresh)
       const ds = gc.dataSource
-      const dsKey = ds ? (Array.isArray(ds) ? ds.map((d: any) => `${d.type}:${d.sourceId ?? d.extensionId ?? ''}:${d.metricId ?? ''}:${d._saveTs ?? ''}`).join(',') : `${(ds as any).type}:${(ds as any).sourceId ?? (ds as any).extensionId ?? ''}:${(ds as any).metricId ?? ''}:${(ds as any)._saveTs ?? ''}`) : ''
+      const dsKeyOf = (d: DataSource) =>
+        `${d.type}:${d.sourceId ?? d.extensionId ?? ''}:${d.metricId ?? ''}:${(d as unknown as Record<string, unknown>)._saveTs ?? ''}`
+      const dsKey = ds
+        ? (Array.isArray(ds) ? ds.map(dsKeyOf).join(',') : dsKeyOf(ds))
+        : ''
       // Hash config — use full JSON content to detect ALL value changes,
       // not just structural changes (length/keys).
       const configHash = gc.config ? JSON.stringify(gc.config) : ''
@@ -610,12 +617,12 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
     if (!constraints) {
       const extensionDto = dynamicRegistry.getMeta(componentType)
       if (extensionDto?.size_constraints) {
-        constraints = extensionDto.size_constraints as any
+        constraints = extensionDto.size_constraints as unknown as ComponentSizeConstraints
       }
     }
 
     // Build appropriate default config based on component type
-    let defaultConfig: any = {}
+    let defaultConfig: Record<string, unknown> = {}
 
     // For extension components, use their default config from DTO
     const extensionDto = dynamicRegistry.getMeta(componentType)
@@ -624,7 +631,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
     }
 
     // For extension components, set up dataSource with extensionId
-    let dataSource: any = undefined
+    let dataSource: DataSource | undefined = undefined
     if (extensionDto?.extension_id) {
       dataSource = {
         type: 'extension' as const,
@@ -790,7 +797,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
     }
 
     const newComponent: Omit<DashboardComponent, 'id'> = {
-      type: componentType as any,
+      type: componentType as GenericComponentType,
       position: {
         x: 0,
         y: maxY,
@@ -812,7 +819,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
 
   // Handle layout change - batch update all changed positions in a single store update
   // to prevent infinite re-render loops (store update → grid recalc → onLayoutChange → ...)
-  const handleLayoutChange = useCallback((layout: readonly any[]) => {
+  const handleLayoutChange = useCallback((layout: readonly Layout[]) => {
     const components = currentDashboard?.components ?? []
     const changed: Array<{ id: string; position: { x: number; y: number; w: number; h: number } }> = []
 
@@ -847,14 +854,14 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
   const gridComponents = useMemo(() => {
     return (currentDashboard?.components ?? []).map((component) => {
       // Get dataSource from component (it should be a separate property, not in config)
-      const componentDataSource = (component as any).dataSource
+      const _componentDataSource = (component as GenericComponent).dataSource
 
       // Create callbacks for this component to persist configuration changes
-      const handleDataSourceChange = (newDataSource: any) => {
-        updateComponent(component.id, { dataSource: newDataSource as DataSource }, false)
+      const handleDataSourceChange = (newDataSource: Record<string, unknown>) => {
+        updateComponent(component.id, { dataSource: newDataSource as unknown as DataSource }, false)
       }
 
-      const handleConfigChange = (newConfig: Record<string, any>) => {
+      const handleConfigChange = (newConfig: Record<string, unknown>) => {
         updateComponent(component.id, { config: newConfig }, false)
       }
 
@@ -883,7 +890,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
         ),
       }
     }) ?? []
-  }, [componentsStableKey, editMode, isMobile, installedComponents.length])
+  }, [componentsStableKey, editMode, isMobile, installedComponents.length, mobileSelectedId])
 
   if (!currentDashboard) {
     // Show loading skeleton while dashboards are loading OR
@@ -944,9 +951,17 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
     // "let AI build it" opens the in-page side chat panel (the floating
     // button's panel) instead of navigating away to /chat.
     return (
-      <div className="flex items-center justify-center h-screen bg-background">
-        <div className="text-center max-w-md px-6">
-          <div className="mx-auto mb-5 flex size-14 items-center justify-center rounded-xl bg-primary-light text-primary">
+      <div className="flex h-full flex-col bg-background">
+        {isMobile && <MobilePageHeader title={t('common:nav.visual-dashboard')} />}
+        <div
+          className={cn(
+            "flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-5 py-8",
+            // Clear Chat|System capsule (same clearance as SystemPage / DeviceDetail).
+            isMobile && "pb-[calc(6rem+env(safe-area-inset-bottom,0px))]",
+          )}
+        >
+        <div className="max-w-md text-center">
+          <div className="mx-auto mb-5 hidden size-14 items-center justify-center rounded-xl bg-primary-light text-primary sm:flex">
             <LayoutDashboard className="size-7" />
           </div>
           <h2 className="mb-2 text-lg font-semibold tracking-tight">
@@ -955,7 +970,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
           <p className="text-sm text-muted-foreground mb-6 leading-relaxed">
             {t('visualDashboard.emptyGuideDesc')}
           </p>
-          <div className="flex items-center justify-center gap-3">
+          <div className="flex flex-col items-stretch justify-center gap-2 sm:flex-row sm:items-center sm:gap-3">
             <Button
               className="h-11 sm:h-10"
               onClick={() => {
@@ -978,7 +993,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
           </div>
           {/* Three-step path so a first-time user knows what "building a
               dashboard" involves before clicking. */}
-          <div className="mt-6 flex items-center justify-center gap-x-2 text-xs text-muted-foreground">
+          <div className="mt-6 hidden items-center justify-center gap-x-2 text-xs text-muted-foreground sm:flex">
             {[
               t('visualDashboard.emptyStep1'),
               t('visualDashboard.emptyStep2'),
@@ -986,13 +1001,14 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
             ].map((label, i) => (
               <span key={label} className="flex items-center gap-1.5 whitespace-nowrap">
                 {i > 0 && <ChevronRight className="size-3 opacity-50 mr-1" />}
-                <span className="flex size-4 items-center justify-center rounded-full bg-muted text-[10px] font-medium">
+                <span className="flex size-4 items-center justify-center rounded-full bg-muted text-nano font-medium">
                   {i + 1}
                 </span>
                 {label}
               </span>
             ))}
           </div>
+        </div>
         </div>
       </div>
     )
@@ -1008,7 +1024,8 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
               variant="outline"
               size="icon"
               onClick={toggleFullscreen}
-              className="absolute top-4 right-4 z-50 shadow-lg bg-bg-90 backdrop-blur"
+              className="absolute right-4 z-50 shadow-lg bg-bg-90 backdrop-blur"
+              style={{ top: 'max(1rem, env(safe-area-inset-top, 0px))' }}
               title={t('visualDashboard.exitFullscreen')}
             >
               <Minimize className="h-4 w-4" />
@@ -1084,7 +1101,10 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
               {layoutMode === 'sidebar' && currentDashboard ? (
                 <h1
                   key={currentDashboard.id}
-                  className="animate-in fade-in duration-200 truncate text-xl font-bold tracking-tight sm:text-2xl"
+                  // font-semibold matches PageHeader's title weight — this
+                  // hand-rolled row renders the same hierarchy as every
+                  // PageLayout page.
+                  className="animate-in fade-in duration-200 truncate text-xl font-semibold tracking-tight sm:text-2xl"
                 >
                   {currentDashboard.name}
                 </h1>
@@ -1134,8 +1154,13 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
           onImportDialogOpenChange={setImportDialogOpen}
         />
 
-        {/* Dashboard Grid */}
-        <div className="flex-1 overflow-auto p-4 relative">
+        {/* Dashboard Grid — mobile pb clears MobilePrimaryNav capsule */}
+        <div
+          className={cn(
+            "flex-1 overflow-auto p-4 relative",
+            isMobile && "pb-[calc(6rem+env(safe-area-inset-bottom,0px))]",
+          )}
+        >
           {(currentDashboard.components?.length ?? 0) === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-muted-foreground">
               <LayoutDashboard className="h-16 w-16 mb-4 opacity-50" />
@@ -1170,7 +1195,16 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
               components={gridComponents}
               editMode={editMode}
               onLayoutChange={handleLayoutChange}
+              selectedId={mobileSelectedId}
             />
+          )}
+          {/* Lightweight edit affordance — toolbar Edit is tooltip-only on touch */}
+          {isMobile && editMode && !mobileSelectedId && (currentDashboard.components?.length ?? 0) > 0 && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-[calc(5.5rem+env(safe-area-inset-bottom,0px))] z-30 flex justify-center px-4">
+              <div className="rounded-full border border-border bg-bg-95 px-3 py-1.5 text-mini text-muted-foreground shadow-sm backdrop-blur-md">
+                {t('visualDashboard.tapToEditHint')}
+              </div>
+            </div>
           )}
         </div>
       </div>
@@ -1184,7 +1218,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
         onTitleChange={handleTitleChange}
         configSchema={configSchema}
         componentType={selectedComponent?.type || ''}
-        previewDataSource={componentConfig.dataSource}
+        previewDataSource={componentConfig.dataSource as DataSource | undefined}
         previewConfig={componentConfig}
         showTitleInDisplay={isTitleInDisplayComponent(selectedComponent?.type)}
         position={selectedComponent?.position}
@@ -1270,7 +1304,7 @@ const VisualDashboardMemo = memo(function VisualDashboard() {
       >
         <FullScreenDialogHeader
           icon={<Monitor className="w-5 h-5" />}
-          title="Edit Content"
+          title={t('visualDashboard.editContent')}
           onClose={closeExtFullscreen}
         />
         <FullScreenDialogContent>

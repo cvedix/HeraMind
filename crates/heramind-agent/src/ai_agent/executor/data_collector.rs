@@ -1,5 +1,16 @@
 use super::*;
 
+/// How far back collection reaches for a source whose `config.data_collection`
+/// carries no `time_range_minutes` — i.e. an agent created through the CLI/API,
+/// or one predating the field. The editor's "Look back" control writes an
+/// explicit value, so this only decides what a *silent* source is read over.
+///
+/// MUST stay equal to `DEFAULT_LOOKBACK_MINUTES` in
+/// `web/src/pages/agents-components/agent-editor/types.ts`. The editor shows
+/// that number; this is the one execution actually applies. A drift test below
+/// locks the pair.
+pub(crate) const DEFAULT_TIME_RANGE_MINUTES: u64 = 60;
+
 fn metric_value_to_json(
     v: &heramind_core::extension::system::ParamMetricValue,
 ) -> serde_json::Value {
@@ -56,8 +67,58 @@ pub(crate) fn get_time_context() -> String {
     )
 }
 
+/// Whether a collected entry is an observation — something a bound source
+/// actually reported.
+///
+/// `memory` is the agent's own past conclusions and `system` is the collector's
+/// own placeholder for "found nothing". Neither is something the world told us,
+/// and a structured inference fed only those is reasoning in a circle.
+pub(super) fn is_observation(data: &DataCollected) -> bool {
+    data.source != "memory" && data.source != "system"
+}
+
+/// Source name the collector's own placeholder carries.
+const SYSTEM_PLACEHOLDER_SOURCE: &str = "system";
+
+/// Options for bound-source collection when an event already supplies input.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BoundCollectionOpts {
+    /// Event trigger already carried an embeddable image this turn. Empty
+    /// bound resources must not be phrased as "NO DATA COLLECTED" — the model
+    /// still has visual input (T4 200366: JPEG loaded, then misleading empty
+    /// placeholder 111µs later).
+    pub event_image_provided: bool,
+}
+
+/// True when a collected entry is an event-carried image for this turn.
+pub(crate) fn is_event_carried_image(data: &DataCollected) -> bool {
+    let is_image = data
+        .values
+        .get("_is_image")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let is_event = data
+        .values
+        .get("_is_event_data")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    is_image && is_event
+}
+
 impl AgentExecutor {
     pub(crate) async fn collect_data(&self, agent: &AiAgent) -> AgentResult<Vec<DataCollected>> {
+        self.collect_bound_source_data(agent, BoundCollectionOpts::default())
+            .await
+    }
+
+    /// Collect from bound resources. When `event_image_provided`, an empty
+    /// observation set yields an honest input-status row instead of the
+    /// misleading "NO DATA COLLECTED" placeholder.
+    pub(crate) async fn collect_bound_source_data(
+        &self,
+        agent: &AiAgent,
+        opts: BoundCollectionOpts,
+    ) -> AgentResult<Vec<DataCollected>> {
         let timestamp = chrono::Utc::now().timestamp();
 
         // DEBUG: Log data collection start
@@ -66,6 +127,7 @@ impl AgentExecutor {
             agent_name = %agent.name,
             total_resources = agent.resources.len(),
             has_time_series_storage = self.time_series_storage.is_some(),
+            event_image_provided = opts.event_image_provided,
             "[COLLECT] Starting data collection"
         );
 
@@ -174,6 +236,11 @@ impl AgentExecutor {
             }
         }
         let deduped_count = data.len();
+        // Counted before memory is mixed in. The guard below is about what the
+        // bound sources gave us, and the memory summary exists for any agent
+        // with history — appending it first meant `is_empty` could never be
+        // true and an empty collection read as a successful one (2026-09-23).
+        let observations = data.len();
 
         // Add condensed memory context
         let memory_data = self.collect_memory_summary(agent, timestamp)?;
@@ -188,20 +255,40 @@ impl AgentExecutor {
             "[COLLECT] Data collection summary"
         );
 
-        // If no data collected, add a placeholder
-        if data.is_empty() {
-            tracing::warn!(
-                agent_id = %agent.id,
-                "[COLLECT] NO DATA COLLECTED - adding placeholder"
-            );
-            data.push(DataCollected {
-                source: "system".to_string(),
-                data_type: "info".to_string(),
-                values: serde_json::json!({
-                    "message": "No pre-collected data available. Use available tools to query device data as needed, or analyze based on user instructions and historical patterns."
-                }),
-                timestamp,
-            });
+        // Nothing from the bound sources: say so honestly. When this turn
+        // already carries an event image, that is input — do not claim
+        // "NO DATA COLLECTED" (misleading for free/event vision agents with
+        // resources=[]).
+        if observations == 0 {
+            if opts.event_image_provided {
+                tracing::info!(
+                    agent_id = %agent.id,
+                    "[COLLECT] Event-carried image present; no metrics from bound resources"
+                );
+                data.push(DataCollected {
+                    source: SYSTEM_PLACEHOLDER_SOURCE.to_string(),
+                    data_type: "input_status".to_string(),
+                    values: serde_json::json!({
+                        "event_image": "provided",
+                        "bound_metrics": "none",
+                        "message": "Event-carried image provided this turn; no metrics from bound resources."
+                    }),
+                    timestamp,
+                });
+            } else {
+                tracing::warn!(
+                    agent_id = %agent.id,
+                    "[COLLECT] NO DATA COLLECTED from bound sources - adding placeholder"
+                );
+                data.push(DataCollected {
+                    source: SYSTEM_PLACEHOLDER_SOURCE.to_string(),
+                    data_type: "info".to_string(),
+                    values: serde_json::json!({
+                        "message": "No pre-collected data available. Use available tools to query device data as needed, or analyze based on user instructions and historical patterns."
+                    }),
+                    timestamp,
+                });
+            }
         }
 
         Ok(data)
@@ -243,7 +330,7 @@ impl AgentExecutor {
                     .get("data_collection")
                     .and_then(|dc| dc.get("time_range_minutes"))
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(60);
+                    .unwrap_or(DEFAULT_TIME_RANGE_MINUTES);
 
                 let include_history = resource
                     .config
@@ -362,28 +449,53 @@ impl AgentExecutor {
             "[COLLECT] Querying metric"
         );
 
-        let result = storage
-            .query_range(device_id, metric_name, start_time, end_time, None)
-            .await
-            .map_err(|e| HeraMindError::Storage(format!("Query failed: {}", e)))?;
-
-        if result.points.is_empty() {
-            tracing::debug!(
-                device_id = %device_id,
-                metric_name = %metric_name,
-                "[COLLECT] No data points found"
-            );
-            return Ok(None);
-        }
-
-        tracing::debug!(
-            device_id = %device_id,
-            metric_name = %metric_name,
-            points_count = result.points.len(),
-            "[COLLECT] Data points found"
-        );
-
-        let latest = &result.points[result.points.len() - 1];
+        // Telemetry is written under `device:{id}` (DeviceService and the
+        // capability provider — every write path). Querying the bare id read
+        // a key that never exists, so bound-metric agents collected nothing.
+        let storage_key = format!("device:{}", device_id);
+        // A no-history collection only needs the newest value — and the
+        // newest value may still be in the write buffer: a device report
+        // triggers execution within milliseconds, while `query_range` reads
+        // only flushed redb. `query_latest` goes through the latest-value
+        // cache, which is updated synchronously on write.
+        let mut range_points: Option<heramind_storage::timeseries::TimeSeriesResult> = None;
+        let (latest, points_count) = if include_history {
+            let result = storage
+                .query_range(&storage_key, metric_name, start_time, end_time, None)
+                .await
+                .map_err(|e| HeraMindError::Storage(format!("Query failed: {}", e)))?;
+            if result.points.is_empty() {
+                tracing::debug!(
+                    device_id = %device_id,
+                    metric_name = %metric_name,
+                    "[COLLECT] No data points found"
+                );
+                return Ok(None);
+            }
+            let n = result.points.len();
+            let latest = result.points[n - 1].clone();
+            range_points = Some(result);
+            (latest, n)
+        } else {
+            // Age-gated like the device path: cache-first must not decay into
+            // latest-ever — the range query it replaced excluded points older
+            // than the window, and so must this.
+            match storage
+                .query_latest(&storage_key, metric_name)
+                .await
+                .map(|p| p.filter(|p| p.timestamp >= start_time))
+            {
+                Ok(Some(point)) => (point, 1),
+                Ok(None) | Err(_) => {
+                    tracing::debug!(
+                        device_id = %device_id,
+                        metric_name = %metric_name,
+                        "[COLLECT] No data points found"
+                    );
+                    return Ok(None);
+                }
+            }
+        };
 
         // Check if this is an image metric
         let is_image = is_image_metric(metric_name, &latest.value);
@@ -397,7 +509,7 @@ impl AgentExecutor {
         let mut values_json = serde_json::json!({
             "value": latest.value,
             "timestamp": latest.timestamp,
-            "points_count": result.points.len(),
+            "points_count": points_count,
             "time_range_minutes": time_range_minutes,
             "_is_image": is_image,
         });
@@ -414,13 +526,10 @@ impl AgentExecutor {
         }
 
         // Include history if configured and not an image
-        if include_history && !is_image && result.points.len() > 1 {
-            let history_limit = max_points.min(result.points.len());
-            let start_idx = if result.points.len() > history_limit {
-                result.points.len() - history_limit
-            } else {
-                0
-            };
+        if include_history && !is_image && points_count > 1 {
+            let result = range_points.as_ref().expect("history requested");
+            let history_limit = max_points.min(points_count);
+            let start_idx = points_count.saturating_sub(history_limit);
 
             let history_points = &result.points[start_idx..];
 
@@ -514,6 +623,28 @@ impl AgentExecutor {
         Ok(collected)
     }
 
+    /// Newest point for `device:{id}/{metric}` within `window_start..=now`.
+    ///
+    /// Cache-first: the latest-value cache is updated synchronously on write,
+    /// so a report that triggered this very execution is visible before its
+    /// buffered write flushes to redb. Age-gated: cache-first must not decay
+    /// into latest-ever — a point older than the window stays excluded, as
+    /// the old range query excluded it.
+    pub(crate) async fn latest_point_in_window(
+        storage: &Arc<heramind_storage::TimeSeriesStore>,
+        device_id: &str,
+        metric: &str,
+        window_start: i64,
+    ) -> AgentResult<Option<heramind_storage::timeseries::DataPoint>> {
+        let storage_key = format!("device:{}", device_id);
+        Ok(storage
+            .query_latest(&storage_key, metric)
+            .await
+            .ok()
+            .flatten()
+            .filter(|p| p.timestamp >= window_start))
+    }
+
     /// Collect data from a single device resource.
     ///
     /// This collects:
@@ -603,18 +734,22 @@ impl AgentExecutor {
                 }
 
                 // Query for data points
-                let time_range = if image_metric_names.contains(&metric_name.as_str()) {
-                    (end_time - 300, end_time) // 5 minutes for images
+                // Windowed-latest through the cache: a report that triggered
+                // this execution is still in the write buffer, and the old
+                // range query read only flushed redb — 12 metrics bound, 0
+                // collected, every time the freshest report is the point.
+                // Images get a tighter window (5 min) than regular (1 h).
+                let window_start = if image_metric_names.contains(&metric_name.as_str()) {
+                    end_time - 300
                 } else {
-                    (start_time, end_time) // 1 hour for regular metrics
+                    start_time
                 };
 
-                if let Ok(result) = storage
-                    .query_range(device_id, &metric_name, time_range.0, time_range.1, None)
-                    .await
+                if let Ok(Some(latest)) =
+                    Self::latest_point_in_window(&storage, device_id, &metric_name, window_start)
+                        .await
                 {
-                    if !result.points.is_empty() {
-                        let latest = &result.points[result.points.len() - 1];
+                    {
                         let is_image = is_image_metric(&metric_name, &latest.value);
 
                         if is_image {
@@ -624,7 +759,7 @@ impl AgentExecutor {
                             let values_json = serde_json::json!({
                                 "value": latest.value,
                                 "timestamp": latest.timestamp,
-                                "points_count": result.points.len(),
+                                "points_count": 1,
                                 "_is_image": true,
                                 "image_url": image_url,
                                 "image_base64": image_base64,
@@ -645,7 +780,7 @@ impl AgentExecutor {
                             let values_json = serde_json::json!({
                                 "value": latest.value,
                                 "timestamp": latest.timestamp,
-                                "points_count": result.points.len(),
+                                "points_count": 1,
                             });
 
                             data.push(DataCollected {
@@ -1180,8 +1315,18 @@ impl AgentExecutor {
             }
         }
 
-        // Then collect other data from regular sources
-        let regular_data = self.collect_data(agent).await?;
+        // Event image successfully extracted counts as input even when
+        // resources=[] — collect_bound_source_data must not emit the
+        // misleading NO DATA COLLECTED placeholder in that case.
+        let event_image_provided = is_image && (image_url.is_some() || image_base64.is_some());
+        let regular_data = self
+            .collect_bound_source_data(
+                agent,
+                BoundCollectionOpts {
+                    event_image_provided,
+                },
+            )
+            .await?;
 
         // Build the set of source keys already covered by the event data.
         // The event value's image may be expanded into sub-fields (e.g.
@@ -1192,7 +1337,8 @@ impl AgentExecutor {
 
         // Add regular data (excluding duplicates)
         for item in regular_data {
-            // Skip if it's the placeholder guidance from collect_data
+            // Skip the legacy empty-sources placeholder from collect_data —
+            // keep `input_status` (honest event-image / no-metrics row).
             if item.data_type == "info" && item.source == "system" {
                 continue;
             }
@@ -1483,6 +1629,39 @@ pub(crate) fn is_image_metric(metric_name: &str, value: &serde_json::Value) -> b
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Read `export const <name> = <digits>` out of the editor's shared
+    /// constants module. `None` when the file is absent (source tarball without
+    /// `web/`) or the constant is not declared.
+    fn editor_constant(name: &str) -> Option<u64> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/src/pages/agents-components/agent-editor/constants.ts");
+        let text = std::fs::read_to_string(path).ok()?;
+        let marker = format!("export const {} =", name);
+        let start = text.find(&marker)? + marker.len();
+        let rest = &text[start..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '_' && c != ' ')
+            .unwrap_or(rest.len());
+        rest[..end].trim().replace('_', "").parse().ok()
+    }
+
+    /// The editor *displays* this number; the executor *applies* it. If the
+    /// two literals drift, the editor silently lies about how far back the
+    /// agent will read — which is exactly the failure that made the window
+    /// configurable in the first place. There is no shared constant to import
+    /// across the Rust/TS boundary, so the invariant is held by test.
+    #[test]
+    fn default_time_range_minutes_matches_the_editor_constant() {
+        let Some(editor) = editor_constant("DEFAULT_LOOKBACK_MINUTES") else {
+            return; // no web/ tree to compare against
+        };
+        assert_eq!(
+            editor, DEFAULT_TIME_RANGE_MINUTES,
+            "DEFAULT_LOOKBACK_MINUTES (web/.../agent-editor/constants.ts) drifted from \
+             DEFAULT_TIME_RANGE_MINUTES (data_collector.rs) — update both"
+        );
+    }
 
     #[serial_test::serial]
     #[test]

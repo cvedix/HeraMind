@@ -1,19 +1,35 @@
 ---
 id: widget-development
+summary: Write custom widget code.
+not_for: [installing widgets from the market (widget-management)]
 name: Custom Widget Development
+aliases: [widget-dev]
 description: Use when the user wants to DEVELOP a custom dashboard widget — creating a component bundle (IIFE/JSX/manifest), custom charts/gauges. Distinct from INSTALLING widgets (that's widget-management). Covers widget create/install even without saying 'widget' (e.g. '写个自定义图表组件'). Includes 组件开发/自定义图表/widget 开发.
 category: widget
 origin: builtin
 priority: 85
 token_budget: 14000
 triggers:
-  keywords: [widget, custom widget, 自定义组件, widget create, 组件开发, component, IIFE, bundle.js, manifest, 仪表盘组件, dashboard widget, 自定义图表, custom chart, jsxRuntime, device binding]
+  keywords: [widget, custom widget, 自定义组件, widget create, 组件开发, component, IIFE, bundle.js, manifest, 仪表盘组件, dashboard widget, 自定义图表, custom chart, jsxRuntime, device binding, build widget, create widget, 构建组件, 制作组件, widget 开发]
   tool_target:
     - tool: widget
       actions: [create, install, get, list, uninstall, market-list, market-install]
 anti_triggers:
   keywords: [extension develop, 扩展开发, rule, 规则, device connect, 设备连接, agent, 代理]
 ---
+
+# widget-development
+
+Use this guide to develop a reusable dashboard component. Routine dashboard composition uses dashboard-management; package installation uses widget-management.
+Inspect the component contract, props/schema and data binding conventions. Use existing design-system primitives and exact asset/data-source identifiers.
+Build and preview the component, verify empty/loading/error states and realistic data, then package/install if requested.
+Load the relevant API, manifest, build, or example reference section before coding. Do not copy a large unrelated example into the task context.
+
+## Detailed reference
+Use skill(action="load", id="widget-development", section="<exact returned title>") only for the needed detail. Section titles are returned with this overview.
+
+<!-- SKILL_REFERENCE -->
+
 
 # Custom Widget Development
 
@@ -22,11 +38,17 @@ Custom widgets are React components for HeraMind dashboards. No build tools — 
 ## CRITICAL: Widget Development Workflow
 
 ```bash
-# Step 1: Scaffold
+# Step 1: Scaffold (TEMPLATE code — the generated bundle.js is a generic
+# placeholder for the chosen type, NOT your component yet)
 heramind widget create "My Widget" --widget-type chart
 # Creates: data/frontend-components/<widget-id>/manifest.json + bundle.js
+# (--install scaffolds AND registers in one step — but you still MUST edit
+# bundle.js afterwards and re-install to apply your code)
 
 # Step 2: Edit both files — use file_write or file_edit tools (preferred over shell commands)
+# NOTE: file_write/file_read paths are relative to the server data dir — write
+# `frontend-components/<widget-id>/manifest.json`, NEVER `data/frontend-...`
+# (a `data/` prefix lands it in <data>/data/, where no tool will find it).
 ```
 
 **Editing files (use file_write / file_edit instead of shell):**
@@ -42,13 +64,19 @@ file_edit(path="frontend-components/<widget-id>/bundle.js", old_string="Hello", 
 ```
 
 ```bash
-# Step 3: Install (re-run after each edit to apply changes)
-heramind widget install data/frontend-components/<widget-id>
+# Step 3: Install (re-run after each edit to apply changes; the bare
+# widget-id from `widget create`/`widget list` output also works)
+heramind widget install frontend-components/<widget-id>
+  (data-relative — NEVER paste the absolute ~/Library/Application Support/... path: it contains a space and an unquoted space splits the command; relative is the canonical form)
 
-# Step 4: Use in dashboard
+# Step 4: Use in dashboard — ⚠️ for a CUSTOM widget, `type` IS the widget's
+# ID (what `widget create` returned / `widget list` shows), NEVER "custom":
+# "custom" is the manifest's CATEGORY field and the server rejects it as an
+# unknown type
+# Prefer shell {command, params:[…]} — string flag is Human CLI fallback
 heramind dashboard add-components <DASHBOARD_ID> --components '[{
   "id": "my-widget-1",
-  "type": "custom",
+  "type": "<widget-id>",
   "title": "My Widget",
   "position": {"x": 0, "y": 0, "w": 6, "h": 4},
   "data_source": {"type": "telemetry","source":"device","id":"DEVICE_ID","field":"temperature","mode":"latest","sourceId":"DEVICE_ID","metricId":"temperature","timeRange":1,"limit":50}

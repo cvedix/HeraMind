@@ -1,0 +1,41 @@
+{
+  "id": "config-export-validate",
+  "lang": "en",
+  "category": "system",
+  "workflow": "system-admin",
+  "scenario_type": "single_turn",
+  "description": "Config backup hygiene (covers `heramind config export` + `heramind config validate`).",
+  "setup": {
+    "fixture": "seed-default"
+  },
+  "turns": [
+    {
+      "user": "Run `heramind config export` to export the current system configuration to /tmp/eval-config-backup.json, then run `heramind config validate` on that exported file to check it is well-formed."
+    }
+  ],
+  "applies": [
+    "tool_accuracy",
+    "task_completion",
+    "language_adherence"
+  ],
+  "expectations": {
+    "per_turn": [
+      "T1: `heramind config export` to the exact path, then `heramind config validate /tmp/eval-config-backup.json`"
+    ],
+    "overall": "Config exported and validation ran against the file"
+  },
+  "expect": {
+    "tools": [
+      "shell"
+    ],
+    "commands": [
+      "heramind config export",
+      "heramind config validate"
+    ],
+    "substrings": {
+      "heramind config validate": [
+        "/tmp/eval-config-backup.json"
+      ]
+    }
+  }
+}

@@ -1,6 +1,6 @@
-import { MapPin, Server, Zap, Activity, Puzzle, Workflow } from 'lucide-react'
+import { MapPin, Server, Zap, Activity, Puzzle, Workflow, Database } from 'lucide-react'
 
-export type CategoryType = 'device-metric' | 'device-command' | 'device' | 'system' | 'extension' | 'extension-command' | 'transform'
+export type CategoryType = 'device-metric' | 'device-command' | 'device' | 'system' | 'extension' | 'extension-command' | 'transform' | 'ai' | 'ai'
 
 // Device info property definitions factory (uses translations)
 export function getDeviceInfoProperties(t: (key: string) => string) {
@@ -41,14 +41,15 @@ export function getCategories(t: (key: string) => string) {
     { id: 'extension' as const, name: t('extensions:dataSource.extensionSource') || 'Extension Metrics', icon: Puzzle, description: t('extensions:dataSource.selectExtension') || 'Select extension metrics' },
     { id: 'extension-command' as const, name: t('extensions:dataSource.extensionCommand') || 'Extension Commands', icon: Zap, description: t('extensions:dataSource.selectExtensionCommand') || 'Select extension commands' },
     { id: 'transform' as const, name: t('dataSource.transform'), icon: Workflow, description: t('dataSource.transformDesc') },
+    { id: 'ai' as const, name: t('dataSource.aiAgent'), icon: Database, description: t('dataSource.aiAgentDesc') },
   ]
 }
 
 // Convert old allowedTypes format to new format
 export function normalizeAllowedTypes(
-  allowedTypes?: Array<'device-metric' | 'device-command' | 'device-info' | 'device' | 'metric' | 'command' | 'system' | 'extension' | 'extension-command' | 'transform'>
+  allowedTypes?: Array<'device-metric' | 'device-command' | 'device-info' | 'device' | 'metric' | 'command' | 'system' | 'extension' | 'extension-command' | 'transform' | 'ai'>
 ): CategoryType[] {
-  if (!allowedTypes) return ['device', 'device-metric', 'device-command', 'system', 'extension', 'extension-command', 'transform']
+  if (!allowedTypes) return ['device', 'device-metric', 'device-command', 'system', 'extension', 'extension-command', 'transform', 'ai']
 
   const result: CategoryType[] = []
 
@@ -62,6 +63,9 @@ export function normalizeAllowedTypes(
   if (allowedTypes.includes('extension')) result.push('extension')
   if (allowedTypes.includes('extension-command')) result.push('extension-command')
   if (allowedTypes.includes('transform')) result.push('transform')
+  // ai was silently dropped here: every widget passes an explicit list, so
+  // schemas could allow 'ai' forever and the category would never appear.
+  if (allowedTypes.includes('ai')) result.push('ai')
 
   // Old format types - map to new format (but not 'device' since it's distinct now)
   if (allowedTypes.includes('metric')) {
@@ -73,5 +77,5 @@ export function normalizeAllowedTypes(
     if (!result.includes('extension-command')) result.push('extension-command')
   }
 
-  return result.length > 0 ? result : ['device', 'device-metric', 'device-command', 'system', 'extension', 'extension-command', 'transform']
+  return result.length > 0 ? result : ['device', 'device-metric', 'device-command', 'system', 'extension', 'extension-command', 'transform', 'ai']
 }

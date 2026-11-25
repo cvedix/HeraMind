@@ -29,7 +29,10 @@
       "shell"
     ],
     "commands": [
-      "heramind device list"
+      [
+        "heramind system info",
+        "heramind device list"
+      ]
     ]
   }
 }

@@ -362,7 +362,7 @@ export function DashboardTabBar({
               variant="ghost"
               size="icon"
               onClick={onSwitchToSidebar}
-              className="h-7 w-7 shrink-0"
+              className="h-7 w-7 sm:h-7 sm:w-7 shrink-0"
               aria-label={t('tabBar.switchToSidebar')}
             >
               <PanelLeft className="h-4 w-4" />
@@ -377,7 +377,7 @@ export function DashboardTabBar({
               variant="ghost"
               size="icon"
               onClick={() => setShowCreateInput(true)}
-              className="h-7 w-7 shrink-0"
+              className="h-7 w-7 sm:h-7 sm:w-7 shrink-0"
               aria-label={t('tabBar.newDashboard')}
               disabled={showCreateInput}
             >
@@ -396,11 +396,15 @@ export function DashboardTabBar({
           Radix ScrollArea WITHOUT a ScrollBar child disables scrolling entirely
           (Radix gates the viewport's overflow on ScrollBar presence) — so we
           use native scrolling instead. pr-7 keeps the rightmost tab's hover-
-          reveal ⋮ (28px) inside the padded region instead of clipping. */}
-      <div className="flex-1 min-w-0 h-11 overflow-x-auto scrollbar-none">
+          reveal ⋮ (28px) inside the padded region instead of clipping.
+          Content-sized (h-8 tabs, no extra py) — with the header's own py-2
+          this row is 48px total, same height as sidebar mode's action-only
+          header, so the dashboard canvas starts at the same place in both
+          layout modes. */}
+      <div className="flex-1 min-w-0 overflow-x-auto scrollbar-none">
         <div
           ref={tabsViewportRef}
-          className="flex items-center gap-0.5 py-1.5 pr-7"
+          className="flex items-center gap-0.5 pr-7"
         >
           {dashboards.flatMap((dashboard) => {
             const isActive = dashboard.id === currentDashboardId
@@ -480,15 +484,16 @@ export function DashboardTabBar({
                   >
                     <DropdownMenu open={moreMenuOpen} onOpenChange={setMoreMenuOpen}>
                       <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7 rounded-md mr-1"
+                        {/* Plain button — Button size="icon" is h-10/h-11 and its
+                            hover bg overflows the h-8 tab even with h-7 override. */}
+                        <button
+                          type="button"
+                          className="h-6 w-6 shrink-0 flex items-center justify-center rounded-sm mr-1 text-background hover:bg-background hover:text-foreground transition-colors"
                           aria-label={t('sidebar.moreActions')}
                           onClick={(e) => e.stopPropagation()}
                         >
                           <MoreVertical className="h-3.5 w-3.5" />
-                        </Button>
+                        </button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
                         {canReorder && (

@@ -62,6 +62,7 @@ pub mod secret;
 pub mod session;
 pub mod settings;
 pub mod system_memory;
+pub mod task_understanding;
 pub mod timeseries;
 pub mod vector;
 
@@ -73,7 +74,8 @@ pub use timeseries::{compress_series_adaptive, DataPoint, TimeSeriesStore};
 pub use vector::{VectorDocument, VectorStore};
 
 pub use session::{
-    PendingStreamState, SessionMessage, SessionMessageImage, SessionStore, StreamStage,
+    PendingStreamState, PersistedOperationRecord, SessionMessage, SessionMessageImage,
+    SessionStore, StreamStage,
 };
 
 pub use messages::{MessageStore, StoredMessage};
@@ -93,11 +95,12 @@ pub use instances::InstanceRecord;
 pub use extensions::{ExtensionRecord, ExtensionStore};
 
 pub use agents::{
-    ActionExecuted, AgentExecutionRecord, AgentFilter, AgentMemory, AgentResource, AgentSchedule,
-    AgentStats, AgentStatus, AgentStore, AgentToolConfig, AiAgent, DataCollected, DataSummary,
-    Decision, DecisionProcess, ExecutionJournal, ExecutionMode, ExecutionRecord, ExecutionResult,
-    ExecutionStatus, GeneratedReport, IntentType, KnowledgeFileRef, NotificationSent, ParsedIntent,
-    ReasoningStep, ResourceType, ScheduleType, UserMessage,
+    ActionExecuted, AgentExecutionRecord, AgentFilter, AgentMemory, AgentNotify, AgentResource,
+    AgentSchedule, AgentStats, AgentStatus, AgentStore, AgentToolConfig, AiAgent, DataCollected,
+    DataSummary, Decision, DecisionProcess, ExecutionJournal, ExecutionMode, ExecutionRecord,
+    ExecutionResult, ExecutionStatus, GeneratedReport, IntentType, KnowledgeFileRef, MemoryMode,
+    NotificationSent, NotifyOn, OperatorConfig, OperatorField, OperatorFieldType, ParsedIntent,
+    ReasoningStep, ResourceType, ScheduleType, UserMessage, DEFAULT_MAX_CHAIN_DEPTH,
 };
 
 pub use device_registry::DeviceRegistryStore;
@@ -108,11 +111,56 @@ pub use system_memory::{CategoryStats, MarkdownMemoryStore, MemoryCategory, Memo
 // Memory configuration exports
 pub use memory_config::MemoryConfig;
 
+// Task-understanding knowledge file (the agent's task definition)
+pub use task_understanding::{
+    task_understanding_mission, task_understanding_repair, MissionRepair, TASK_UNDERSTANDING_FILE,
+};
+
 /// Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// # Changelog
 ///
+/// Remove leftovers from earlier runs of a test helper that parks a store in
+/// the temp directory.
+///
+/// Those helpers open a database by path and nothing removes it afterwards.
+/// A `TempDir` would not fix it either: its cleanup runs in `Drop`, which a
+/// killed process never reaches — and this suite gets killed. Pruning by age
+/// bounds the temp directory however a run ends, and the age gate keeps
+/// concurrent runs from deleting each other's live directories.
+#[cfg(test)]
+pub(crate) fn prune_stale_temp_entries(prefix: &str, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if !now
+            .duration_since(modified)
+            .map(|age| age > max_age)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if meta.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
 /// ## v0.2.0 (2026-01) - Storage Migration
 ///
 /// ### Breaking Changes

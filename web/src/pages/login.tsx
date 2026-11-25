@@ -17,7 +17,7 @@ import { BrandLogoHorizontal } from "@/components/shared/BrandName"
 import { LoadingState } from "@/components/shared/LoadingState"
 import { forceViewportReset } from "@/hooks/useVisualViewport"
 import { textNano } from '@/design-system/tokens/typography'
-import { tokenManager, getApiBase, getApiKey, setApiBase, clearApiKey, setApiKey } from "@/lib/api"
+import { tokenManager, getApiBase, getApiKey, setApiBase, clearApiKey } from "@/lib/api"
 import { handleWindowDragMouseDown } from "@/lib/windowDrag"
 import { INSTANCE_CACHE_KEY, CURRENT_INSTANCE_KEY, PENDING_SWITCH_KEY } from "@/lib/instance-constants"
 import { getFullApiKey } from "@/store/slices/instanceSlice"
@@ -92,7 +92,7 @@ export function LoginPage() {
   const [rememberMe, setRememberMe] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState("")
-  const [isFirstSetup, setIsFirstSetup] = useState<boolean | null>(null)
+  const [_isFirstSetup, setIsFirstSetup] = useState<boolean | null>(null)
   const [checkingAuth, setCheckingAuth] = useState(true)
   const [hasLoadedCredentials, setHasLoadedCredentials] = useState(false)
   const [showInstancePicker, setShowInstancePicker] = useState(false)
@@ -117,7 +117,7 @@ export function LoginPage() {
     })
   }, [showInstancePicker])
   const apiBase = getApiBase()
-  const isRemote = !!(apiBase && apiBase !== '/api' && !apiBase.includes('localhost') && !apiBase.includes('127.0.0.1'))
+  const _isRemote = !!(apiBase && apiBase !== '/api' && !apiBase.includes('localhost') && !apiBase.includes('127.0.0.1'))
 
   // Handle instance switch — the full key comes from the per-browser key
   // store (saved when the user entered it); the backend never returns it.
@@ -158,7 +158,7 @@ export function LoginPage() {
     window.location.reload()
   }
 
-  const handleBackToLocal = () => {
+  const _handleBackToLocal = () => {
     localStorage.setItem(CURRENT_INSTANCE_KEY, 'local-default')
     setApiBase('')
     clearApiKey()
@@ -295,11 +295,15 @@ export function LoginPage() {
   // Full-screen instance picker
   if (showInstancePicker) {
     return (
-      <div className="flex flex-col bg-popover viewport-full">
-        {/* Header */}
+      <div className="flex flex-col bg-background viewport-full">
+        {/* Header paints bg-background into the notch (same token as
+            MobilePageHeader / ThemeColorSync). Single top pad — no safe-top
+            class on top of this inline padding. */}
         <header
-          className="flex items-center gap-3 px-4 sm:px-6 py-3.5 border-b border-border"
-          style={{ paddingTop: "calc(0.875rem + env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px))" }}
+          className="flex items-center gap-3 border-b border-border bg-background px-4 py-3.5 sm:px-6"
+          style={{
+            paddingTop: "calc(0.875rem + env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px))",
+          }}
         >
           <Button variant="ghost" size="sm" onClick={() => setShowInstancePicker(false)}>
             <ArrowLeft className="h-4 w-4 mr-1" />
@@ -461,7 +465,7 @@ export function LoginPage() {
                   placeholder={t('auth:username')}
                   autoComplete="username"
                   required
-                  className="pl-9 h-11 bg-bg-70 border-border focus:bg-background dark:focus:bg-bg-50 focus:border-primary transition-colors text-base scroll-mb-32"
+                  className="pl-9 h-11 bg-bg-70 border-border focus:bg-background dark:focus:bg-glass focus:border-primary transition-colors text-base scroll-mb-32"
                 />
               </div>
               <div className="relative">
@@ -474,7 +478,7 @@ export function LoginPage() {
                   placeholder={t('auth:password')}
                   autoComplete="current-password"
                   required
-                  className="pl-9 pr-10 h-11 bg-bg-70 border-border focus:bg-background dark:focus:bg-bg-50 focus:border-primary transition-colors text-base scroll-mb-32"
+                  className="pl-9 pr-10 h-11 bg-bg-70 border-border focus:bg-background dark:focus:bg-glass focus:border-primary transition-colors text-base scroll-mb-32"
                 />
                 <button
                   type="button"

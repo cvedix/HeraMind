@@ -1285,25 +1285,39 @@ impl LlmRuntime for OllamaRuntime {
                                                     ollama_chunk.eval_count
                                                 );
 
-                                            // Send token usage as in-band marker before closing
+                                            // Emit usage even when 0/MAX so End can
+                                            // distinguish invalid meters from missing usage.
                                             if let Some(prompt_tokens) =
                                                 ollama_chunk.prompt_eval_count
                                             {
+                                                let pt = prompt_tokens as u32;
                                                 let _ = tx
                                                     .send(Ok((
                                                         format!(
                                                             "\n__HERAMIND_TOKEN_PROMPT:{}__",
-                                                            prompt_tokens
+                                                            pt
                                                         ),
                                                         false,
                                                     )))
                                                     .await;
                                             }
 
-                                            // Warn if no content was generated (possible token budget issue)
+                                            // A round that ends in tool calls and no prose is
+                                            // the ordinary shape of an agentic turn: the model
+                                            // went straight to the tool. Two reasons this is not
+                                            // the "token budget" warning the comment here used to
+                                            // claim — that is the branch below, where nothing at
+                                            // all came back. First, this branch is only reached
+                                            // when tool calls were parsed and sent, so the model
+                                            // did produce something. Second, the code above
+                                            // deliberately drops content that arrives *after*
+                                            // the tool calls, so a zero here is partly this
+                                            // function's own doing. It is logged at debug; the
+                                            // tool execution that follows is logged at info, and
+                                            // that is the line worth reading.
                                             if actual_content_len == 0 && tool_calls_sent {
-                                                tracing::warn!(
-                                                        "⚠️  Stream ended with tool calls but no content. Tool execution will follow."
+                                                tracing::debug!(
+                                                        "Stream ended with tool calls and no prose — the ordinary shape of a tool round"
                                                     );
                                             } else if actual_content_len == 0 {
                                                 tracing::warn!(

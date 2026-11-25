@@ -1,0 +1,55 @@
+{
+  "id": "agent-runnow-delegation",
+  "lang": "zh",
+  "category": "agent",
+  "workflow": "agent-configure",
+  "scenario_type": "single_turn",
+  "description": "Chat-side delegation: ask an existing agent to run now via CLI `heramind agent invoke`(非计划内运行;input 可选,agent 通常已知道要看什么)。",
+  "setup": {
+    "fixture": "seed-default",
+    "extras": {
+      "agents": [
+        {
+          "name": "coldroom-watch",
+          "user_prompt": "Check the cold room temperature and summarize",
+          "schedule": {
+            "schedule_type": "manual"
+          }
+        }
+      ]
+    }
+  },
+  "turns": [
+    {
+      "user": "让 coldroom-watch 这个 agent 现在立刻跑一次,把它得出的结论告诉我。"
+    }
+  ],
+  "applies": [
+    "tool_accuracy",
+    "task_completion",
+    "language_adherence"
+  ],
+  "expectations": {
+    "per_turn": [
+      "T1: 通过 `heramind agent invoke`(可带可选 input)委托执行;若返回 Executing,用 `heramind agent latest-execution` 轮询结果,然后向用户报告该 agent 的结论"
+    ],
+    "overall": "coldroom-watch has at least one execution and the answer reflects its conclusion"
+  },
+  "expect": {
+    "tools": [
+      "shell"
+    ],
+    "commands": [
+      "heramind agent invoke"
+    ]
+  },
+  "state_queries": [
+    {
+      "type": "agent_execution_count",
+      "params": {
+        "name": "coldroom-watch"
+      },
+      "expected_min": 1
+    }
+  ]
+}

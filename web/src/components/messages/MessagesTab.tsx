@@ -14,7 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { EmptyState } from '@/components/shared/EmptyState'
+import { EmptyState, EmptyStateCard } from '@/components/shared/EmptyState'
 import { LoadingState } from '@/components/shared/LoadingState'
 import {
   Check,
@@ -63,6 +63,7 @@ const STATUS_CONFIG: Record<MessageStatus, { label: string; variant: 'default' |
   acknowledged: { label: 'messages.status.acknowledged', variant: 'secondary' as const },
   resolved: { label: 'messages.status.resolved', variant: 'outline' as const },
   archived: { label: 'messages.status.archived', variant: 'outline' as const },
+  false_positive: { label: 'messages.status.false_positive', variant: 'outline' as const },
 }
 
 // Category badge mapping
@@ -145,12 +146,14 @@ export function MessagesTab({
   if (error) {
     return (
       <div className="p-6">
-        <EmptyState
-          icon={<AlertCircle className="h-12 w-12" />}
-          title={t('messages.error')}
-          description={error.message}
-          action={{ label: t('retry'), onClick: onRefresh }}
-        />
+        <EmptyStateCard>
+          <EmptyState
+            icon={<AlertCircle className="h-12 w-12" />}
+            title={t('messages.error')}
+            description={error.message}
+            action={{ label: t('retry'), onClick: onRefresh }}
+          />
+        </EmptyStateCard>
       </div>
     )
   }
@@ -245,11 +248,12 @@ export function MessagesTab({
       {isLoading ? (
         <LoadingState variant="page" />
       ) : messages.length === 0 ? (
-        <EmptyState
-          icon={<Check className="h-12 w-12" />}
-          title={t('messages.empty.title')}
-          description={t('messages.empty.description')}
-        />
+        <EmptyStateCard>
+          <EmptyState
+            title={t('messages.empty.title')}
+            description={t('messages.empty.description')}
+          />
+        </EmptyStateCard>
       ) : (
         <div className="space-y-2">
           {/* Header with select all */}

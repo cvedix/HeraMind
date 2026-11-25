@@ -6,9 +6,10 @@
 //! - Data querying
 //! - Integration with adapters and telemetry storage
 
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
 
 use super::adapter::{ConnectionStatus, DeviceAdapter};
@@ -40,6 +41,28 @@ pub type ExtensionCommandRouterFn = Arc<
         + Send
         + Sync,
 >;
+
+/// How a command param should carry a platform image to the device (NM-314).
+///
+/// Gated by **param name** (device-type schema signal), not by guessing a
+/// hostname from the operator's browser:
+/// - URL-shaped (`url`, `display_url`, …): device HTTP-fetches — absolute
+///   advertise base + `/api/images/...` via
+///   [`heramind_core::advertise::resolve_advertise_base_url`] (never coerce to
+///   data-URL).
+/// - Image / base64-shaped (default): embed `data:<mime>;base64,...`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageOutboundForm {
+    AbsoluteHttp,
+    DataUrl,
+}
+
+fn image_outbound_form(param_name: &str) -> ImageOutboundForm {
+    match param_name {
+        "url" | "display_url" | "image_url" | "src" | "href" => ImageOutboundForm::AbsoluteHttp,
+        _ => ImageOutboundForm::DataUrl,
+    }
+}
 
 // Import storage types for command history persistence
 use heramind_storage::device_registry::{
@@ -304,16 +327,16 @@ impl DeviceStatus {
 /// Provides unified interface for device operations
 pub struct DeviceService {
     /// Device registry for templates and configurations
-    registry: Arc<DeviceRegistry>,
+    pub(crate) registry: Arc<DeviceRegistry>,
     /// Event bus for publishing events
     event_bus: EventBus,
     /// Telemetry storage (optional)
     telemetry_storage: Arc<RwLock<Option<Arc<TimeSeriesStorage>>>>,
     /// Adapter registry for command sending (plugin registry will provide this)
     /// This will be populated by device adapters that register themselves
-    adapters: Arc<RwLock<HashMap<String, Arc<dyn DeviceAdapter>>>>,
+    pub(crate) adapters: Arc<RwLock<HashMap<String, Arc<dyn DeviceAdapter>>>>,
     /// Device status cache (device_id -> DeviceStatus)
-    device_status: Arc<RwLock<HashMap<String, DeviceStatus>>>,
+    pub(crate) device_status: Arc<RwLock<HashMap<String, DeviceStatus>>>,
     /// Command history (device_id -> Vec<CommandHistoryRecord>)
     command_history: Arc<RwLock<HashMap<String, Vec<CommandHistoryRecord>>>>,
     /// Command ID counter
@@ -327,6 +350,49 @@ pub struct DeviceService {
     /// Extension command router for extension-registered devices
     /// When set, commands for devices with adapter_type="extension" are routed through this callback
     extension_command_router: Arc<RwLock<Option<ExtensionCommandRouterFn>>>,
+    /// Per-device association-bind locks (serialize concurrent confirms / binds).
+    pub(crate) association_bind_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    /// Test hook: next persist of `mqtt_pending_unsub_adapters` fails once.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fail_next_pending_unsub_persist: std::sync::atomic::AtomicBool,
+}
+
+/// What a successful [`DeviceService::send_command`] actually proves about
+/// the physical world. A ~2B agent (and the user) must not read "broker
+/// publish" as "the device did it" — the plan's truthfulness contract
+/// requires the delivery level to travel WITH the success.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandDelivery {
+    /// Payload was accepted by N adapter(s) (e.g. published to the MQTT
+    /// broker). The DEVICE has not acknowledged; physical effect unverified.
+    AdapterAccepted { adapters: u32 },
+    /// The extension command router returned Ok — the extension ACCEPTED and
+    /// processed the request. That is NOT a device acknowledgment: unless an
+    /// explicit, verifiable device ACK is surfaced (as
+    /// [`CommandDelivery::DeviceAcknowledged`]), the device has not confirmed
+    /// and the physical effect is unverified.
+    ExtensionAccepted,
+    /// The device explicitly acknowledged receipt (verifiable ACK surfaced by
+    /// the transport/extension). Physical effect still unverified.
+    DeviceAcknowledged,
+    /// Physical effect verified through state feedback (reserved — no
+    /// current path claims this).
+    PhysicalEffectVerified,
+}
+
+impl CommandDelivery {
+    /// Honest one-line description for user/agent-facing surfaces.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::AdapterAccepted { adapters } => format!(
+                "delivered to {adapters} adapter(s) (broker publish); device acknowledgment: none; physical effect unverified"
+            ),
+            Self::ExtensionAccepted => "extension accepted the command; device acknowledgment: none (extension Ok is not a device ACK); physical effect unverified".to_string(),
+            Self::DeviceAcknowledged => "device acknowledged receipt; physical effect unverified".to_string(),
+            Self::PhysicalEffectVerified => "physical effect verified via state feedback".to_string(),
+        }
+    }
 }
 
 impl DeviceService {
@@ -344,6 +410,9 @@ impl DeviceService {
             heartbeat_config: HeartbeatConfig::default(),
             heartbeat_running: Arc::new(RwLock::new(false)),
             extension_command_router: Arc::new(RwLock::new(None)),
+            association_bind_locks: Arc::new(DashMap::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            fail_next_pending_unsub_persist: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -365,7 +434,17 @@ impl DeviceService {
             heartbeat_config,
             heartbeat_running: Arc::new(RwLock::new(false)),
             extension_command_router: Arc::new(RwLock::new(None)),
+            association_bind_locks: Arc::new(DashMap::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            fail_next_pending_unsub_persist: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Test hook: force the next `mqtt_pending_unsub_adapters` persist to fail.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_next_pending_unsub_persist_for_test(&self) {
+        self.fail_next_pending_unsub_persist
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Set the extension command router for routing commands to extensions
@@ -426,6 +505,10 @@ impl DeviceService {
 
         // Migrate last_seen for old devices that have telemetry data but last_seen == 1 (sentinel)
         self.migrate_last_seen_from_telemetry().await;
+
+        // 1.2.11 → 1.3.0: stamp explicit 1:1 MQTT topic binds that never got an
+        // identity rule so upgrade keeps sole-topic ownership (not discovery).
+        self.migrate_legacy_mqtt_topic_binds().await;
 
         let event_bus = self.event_bus.clone();
         let device_status = self.device_status.clone();
@@ -501,16 +584,30 @@ impl DeviceService {
                         metric,
                         value,
                         timestamp,
-                        quality: _,
+                        // Carried into the storage re-write below: this
+                        // consumer re-writes the SAME (device, metric, ts)
+                        // key the adapter's direct write landed on, and a
+                        // hardcoded None made redb's last-wins semantics
+                        // erase payload.quality on every uplink.
+                        quality,
                         is_virtual,
                         ..
                     } => {
-                        // Skip virtual metrics for device status tracking.
-                        // Virtual metrics come from extensions/transforms, not real devices.
+                        // Device status tracking. Extension-relayed metrics
+                        // (written through the `device_metrics_write`
+                        // capability) are tagged `is_virtual` purely for
+                        // feedback-loop prevention in extension event
+                        // subscriptions — they are REAL device data and MUST
+                        // refresh status, or every extension-managed device
+                        // shows offline forever while its telemetry flows.
+                        // Only derived transform metrics (rule-engine
+                        // transforms, "transform.*" metric namespace /
+                        // "transform:" device namespace) are synthetic and
+                        // don't count as device liveness.
                         // We still write them to telemetry storage below.
-                        if !heramind_core::HeraMindEvent::is_virtual_device_metric(
-                            is_virtual, &metric,
-                        ) {
+                        let synthetic =
+                            metric.starts_with("transform.") || device_id.starts_with("transform:");
+                        if !synthetic {
                             let mut status = device_status.write().await;
                             let entry = status.entry(device_id.clone()).or_default();
                             let now_ts = chrono::Utc::now().timestamp();
@@ -539,48 +636,106 @@ impl DeviceService {
                             registry.update_last_seen(&device_id, now_ts).await;
                         }
 
-                        // Write to telemetry storage if available.
+                        // Write to telemetry storage if available — but only
+                        // for REAL device metrics:
+                        //
+                        // 1. Virtual metrics (ai:*, transform aliases) are
+                        //    already dual-written by the publisher
+                        //    (metric_publish), each under its own namespace.
+                        //    Re-writing here under `device:<primary>` stored
+                        //    a THIRD copy under a third key — 3x storage
+                        //    growth at transform output rate, and
+                        //    inconsistent results across namespace queries.
+                        // 2. Bus values of Json(null) mean "binary payload,
+                        //    not representable on the bus" (e.g. a webhook
+                        //    image whose disk persistence failed). The
+                        //    adapter's direct write is authoritative;
+                        //    re-writing here replaced the real base64 value
+                        //    with the literal string "null" — data loss.
+                        //
                         // Use the event's timestamp (not Utc::now()) so we don't create duplicate
                         // data points. Adapters (MQTT, HTTP, Webhook) already write with their
                         // receive time; using the same timestamp here causes the second write to
                         // overwrite the first (same key), avoiding duplicate entries with ~2s gap.
+                        let bus_null =
+                            matches!(&value, heramind_core::MetricValue::Json(j) if j.is_null());
+                        let virtual_metric = heramind_core::HeraMindEvent::is_virtual_device_metric(
+                            is_virtual, &metric,
+                        );
                         let ts_storage = telemetry_storage.read().await;
                         if let Some(storage) = ts_storage.as_ref() {
-                            // Convert core MetricValue to devices MetricValue
-                            let metric_value: MetricValue = match &value {
-                                heramind_core::MetricValue::Integer(i) => MetricValue::Integer(*i),
-                                heramind_core::MetricValue::Float(f) => MetricValue::Float(*f),
-                                heramind_core::MetricValue::String(s) => {
-                                    MetricValue::String(s.clone())
-                                }
-                                heramind_core::MetricValue::Boolean(b) => MetricValue::Boolean(*b),
-                                heramind_core::MetricValue::Json(j) => {
-                                    // Try to convert JSON to appropriate type
-                                    if let Some(n) = j.as_i64() {
-                                        MetricValue::Integer(n)
-                                    } else if let Some(f) = j.as_f64() {
-                                        MetricValue::Float(f)
-                                    } else if let Some(s) = j.as_str() {
-                                        MetricValue::String(s.to_string())
-                                    } else if let Some(b) = j.as_bool() {
-                                        MetricValue::Boolean(b)
-                                    } else {
-                                        MetricValue::String(j.to_string())
+                            if virtual_metric {
+                                tracing::trace!(
+                                    device_id = %device_id,
+                                    metric = %metric,
+                                    "virtual metric already stored by its publisher — skipping bus-consumer write"
+                                );
+                            } else if bus_null {
+                                tracing::debug!(
+                                    device_id = %device_id,
+                                    metric = %metric,
+                                    "bus value is null (binary payload) — adapter's direct write is authoritative, skipping re-write"
+                                );
+                            } else {
+                                // Convert core MetricValue to devices MetricValue
+                                let metric_value: MetricValue = match &value {
+                                    heramind_core::MetricValue::Integer(i) => {
+                                        MetricValue::Integer(*i)
                                     }
+                                    heramind_core::MetricValue::Float(f) => MetricValue::Float(*f),
+                                    heramind_core::MetricValue::String(s) => {
+                                        MetricValue::String(s.clone())
+                                    }
+                                    heramind_core::MetricValue::Boolean(b) => {
+                                        MetricValue::Boolean(*b)
+                                    }
+                                    heramind_core::MetricValue::Json(j) => {
+                                        // $binary tag first: the bus encodes
+                                        // Binary as this exact shape (see
+                                        // convert_metric_value) — falling
+                                        // through the scalar probes used to
+                                        // stringify it, losing the type.
+                                        let tagged_binary = j
+                                            .get("$binary")
+                                            .and_then(|b| b.as_str())
+                                            .and_then(|b| {
+                                                use base64::Engine;
+                                                base64::engine::general_purpose::STANDARD
+                                                    .decode(b)
+                                                    .ok()
+                                            })
+                                            .map(MetricValue::Binary);
+                                        if let Some(binary) = tagged_binary {
+                                            binary
+                                        }
+                                        // Try to convert JSON to appropriate type
+                                        else if let Some(n) = j.as_i64() {
+                                            MetricValue::Integer(n)
+                                        } else if let Some(f) = j.as_f64() {
+                                            MetricValue::Float(f)
+                                        } else if let Some(s) = j.as_str() {
+                                            MetricValue::String(s.to_string())
+                                        } else if let Some(b) = j.as_bool() {
+                                            MetricValue::Boolean(b)
+                                        } else {
+                                            MetricValue::String(j.to_string())
+                                        }
+                                    }
+                                };
+
+                                let data_point = super::telemetry::DataPoint {
+                                    timestamp,
+                                    value: metric_value,
+                                    quality,
+                                    metadata: None,
+                                };
+
+                                if let Err(e) = storage
+                                    .write(&format!("device:{}", device_id), &metric, data_point)
+                                    .await
+                                {
+                                    tracing::warn!("Failed to write telemetry to storage: {}", e);
                                 }
-                            };
-
-                            let data_point = super::telemetry::DataPoint {
-                                timestamp,
-                                value: metric_value,
-                                quality: None,
-                            };
-
-                            if let Err(e) = storage
-                                .write(&format!("device:{}", device_id), &metric, data_point)
-                                .await
-                            {
-                                tracing::warn!("Failed to write telemetry to storage: {}", e);
                             }
                         } else {
                             tracing::warn!(
@@ -833,6 +988,68 @@ pub struct DeviceHealth {
 }
 
 impl DeviceService {
+    /// Stamp pre-1.3.0 MQTT devices that have an explicit telemetry topic but
+    /// no `mqtt_identity_*` rule with `legacy_topic_bind`, so upgrade keeps
+    /// 1.2.11 sole-topic ownership (payload `device_id=…` must not force discovery).
+    async fn migrate_legacy_mqtt_topic_binds(&self) {
+        use crate::adapters::mqtt::{MqttIdentitySource, MQTT_IDENTITY_SOURCE_KEY};
+
+        let mut stamped = 0u32;
+        for mut device in self.registry.list_devices() {
+            if device.adapter_type != "mqtt" {
+                continue;
+            }
+            let topic = match device
+                .connection_config
+                .telemetry_topic
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                Some(t) => t.to_string(),
+                None => continue,
+            };
+            if device
+                .connection_config
+                .extra
+                .get(MQTT_IDENTITY_SOURCE_KEY)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
+                continue;
+            }
+            device.connection_config.extra.insert(
+                MQTT_IDENTITY_SOURCE_KEY.to_string(),
+                serde_json::Value::String(MqttIdentitySource::LegacyTopicBind.as_str().into()),
+            );
+            let device_id = device.device_id.clone();
+            if let Err(e) = self.registry.update_device(&device_id, device).await {
+                tracing::warn!(
+                    device_id = %device_id,
+                    error = %e,
+                    "Failed to stamp legacy_topic_bind on 1.2.11 MQTT upgrade"
+                );
+                continue;
+            }
+            stamped += 1;
+            tracing::info!(
+                category = "upgrade",
+                device_id = %device_id,
+                telemetry_topic = %topic,
+                "1.2.11 upgrade: MQTT device keeps legacy 1:1 topic bind (stamped mqtt_identity_source=legacy_topic_bind); payload identity fields will not divert sole-topic ingest to discovery"
+            );
+        }
+        if stamped > 0 {
+            tracing::info!(
+                category = "upgrade",
+                stamped,
+                "1.2.11 → 1.3.0 MQTT legacy 1:1 topic-bind upgrade complete"
+            );
+        }
+    }
+
     /// Migrate last_seen for old devices: if last_seen == 1 (sentinel from registry migration),
     /// try to get the real timestamp from telemetry storage.
     async fn migrate_last_seen_from_telemetry(&self) {
@@ -1145,7 +1362,22 @@ impl DeviceService {
                     adapter_type,
                     target_adapter_id
                 );
+                // MQTT (and other transport adapters): config saved but no live
+                // subscribe path — same honesty as association confirm.
+                if adapter_type == "mqtt" {
+                    return Err(DeviceError::BindIncomplete {
+                        message: format!(
+                            "No MQTT adapter found to subscribe device '{device_id}' (adapter_id: {target_adapter_id:?})"
+                        ),
+                        config_applied: true,
+                        retry_hint: format!(
+                            "Device '{device_id}' is registered. Connect/register the MQTT adapter and retry approve — draft should be kept until subscribe succeeds."
+                        ),
+                    });
+                }
             } else {
+                let mut any_ok = false;
+                let mut last_err: Option<String> = None;
                 for (adapter_id, adapter) in &matched {
                     tracing::info!(
                         "Notifying adapter '{}' to subscribe to device '{}'",
@@ -1154,14 +1386,30 @@ impl DeviceService {
                     );
                     // No `break`: notify ALL matching adapters so a device with a
                     // custom telemetry_topic is subscribed on every connected broker.
-                    if let Err(e) = adapter.subscribe_device(&device_id).await {
-                        tracing::warn!(
-                            device_id = %device_id,
-                            adapter = %adapter_id,
-                            error = %e,
-                            "Adapter failed to subscribe to device during register (continuing)"
-                        );
+                    match adapter.subscribe_device(&device_id).await {
+                        Ok(()) => any_ok = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                device_id = %device_id,
+                                adapter = %adapter_id,
+                                error = %e,
+                                "Adapter failed to subscribe to device during register"
+                            );
+                            last_err = Some(format!("{adapter_id}: {e}"));
+                        }
                     }
+                }
+                if adapter_type == "mqtt" && !any_ok {
+                    let detail = last_err.unwrap_or_else(|| "unknown subscribe error".into());
+                    return Err(DeviceError::BindIncomplete {
+                        message: format!(
+                            "MQTT subscribe failed for device '{device_id}': {detail}"
+                        ),
+                        config_applied: true,
+                        retry_hint: format!(
+                            "Device '{device_id}' config is saved. Fix broker/ACL and retry — draft kept until subscribe succeeds; no double-register."
+                        ),
+                    });
                 }
             }
         } else {
@@ -1364,6 +1612,97 @@ impl DeviceService {
         self.registry.update_device(device_id, config).await
     }
 
+    /// Persist a full device config update and refresh adapter subscriptions /
+    /// runtime topic maps so MQTT routing picks up new `telemetry_topic` +
+    /// identity rules. Plain [`Self::update_device`] only touches the registry
+    /// and leaves adapters on the old topic mapping.
+    pub async fn update_device_and_refresh_adapters(
+        &self,
+        device_id: &str,
+        config: DeviceConfig,
+    ) -> Result<(), DeviceError> {
+        // Prefer the unified association bind when only topic/identity/adapter
+        // change is intended — this path remains for general config edits but
+        // now fails closed on missing adapter / subscribe errors (no silent
+        // "DB new, runtime old").
+        let adapter_type = config.adapter_type.clone();
+        let target_adapter_id = config.adapter_id.clone();
+
+        self.registry.update_device(device_id, config).await?;
+
+        if adapter_type == "extension" {
+            return Ok(());
+        }
+
+        let matched = {
+            let adapters = self.adapters.read().await;
+            let mut result = Vec::new();
+            for (adapter_id, adapter) in adapters.iter() {
+                let is_match = if let Some(ref target_id) = target_adapter_id {
+                    adapter.adapter_type() == adapter_type && adapter_id == target_id
+                } else {
+                    adapter.adapter_type() == adapter_type
+                };
+                if is_match {
+                    result.push((adapter_id.clone(), adapter.clone()));
+                }
+            }
+            result
+        };
+
+        if matched.is_empty() {
+            return Err(DeviceError::BindIncomplete {
+                message: format!(
+                    "No adapter found to refresh for device '{device_id}' (type: {adapter_type}, adapter_id: {target_adapter_id:?})"
+                ),
+                config_applied: true,
+                retry_hint: format!(
+                    "Device '{device_id}' config is saved. Register/connect adapter {target_adapter_id:?} and retry the update — runtime maps will rebuild."
+                ),
+            });
+        }
+
+        let mut any_ok = false;
+        let mut last_err: Option<String> = None;
+        for (adapter_id, adapter) in &matched {
+            // Drop old topic-map entries first; subscribe rebuilds from registry.
+            if let Err(e) = adapter.unsubscribe_device(device_id).await {
+                tracing::warn!(
+                    device_id = %device_id,
+                    adapter = %adapter_id,
+                    error = %e,
+                    "Adapter failed to unsubscribe during config refresh"
+                );
+            }
+            tracing::info!(
+                "Refreshing adapter '{}' subscription for device '{}'",
+                adapter_id,
+                device_id
+            );
+            match adapter.subscribe_device(device_id).await {
+                Ok(()) => any_ok = true,
+                Err(e) => {
+                    last_err = Some(format!("{adapter_id}: {e}"));
+                }
+            }
+        }
+
+        if !any_ok {
+            let detail = last_err.unwrap_or_else(|| "unknown subscribe error".into());
+            return Err(DeviceError::BindIncomplete {
+                message: format!(
+                    "Adapter resubscribe failed for device '{device_id}': {detail}"
+                ),
+                config_applied: true,
+                retry_hint: format!(
+                    "Device '{device_id}' config is saved. Fix adapter/broker connectivity and retry — maps rebuild without re-registering."
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
     // ========== Command Sending ==========
 
     /// Send a command to a device.
@@ -1375,6 +1714,19 @@ impl DeviceService {
         command_name: &str,
         params: HashMap<String, serde_json::Value>,
     ) -> Result<Option<MetricValue>, DeviceError> {
+        self.send_command_reported(device_id, command_name, params)
+            .await
+            .map(|(value, _report)| value)
+    }
+
+    /// [`send_command`] plus an honest report of what the Ok actually
+    /// proves: broker publish ≠ device acknowledgment ≠ physical effect.
+    pub async fn send_command_reported(
+        &self,
+        device_id: &str,
+        command_name: &str,
+        params: HashMap<String, serde_json::Value>,
+    ) -> Result<(Option<MetricValue>, CommandDelivery), DeviceError> {
         // Get device config and template
         let (config, template) = self.get_device_with_template(device_id).await?;
 
@@ -1430,7 +1782,7 @@ impl DeviceService {
                             None,
                         )
                         .await;
-                        return Ok(None);
+                        return Ok((None, CommandDelivery::ExtensionAccepted));
                     }
                     Err(e) => {
                         self.update_command_status(
@@ -1538,7 +1890,12 @@ impl DeviceService {
                 None,
             )
             .await;
-            Ok(None)
+            Ok((
+                None,
+                CommandDelivery::AdapterAccepted {
+                    adapters: success_count,
+                },
+            ))
         } else {
             let err_msg =
                 last_error.unwrap_or_else(|| "Failed to send command on any adapter".to_string());
@@ -1563,13 +1920,28 @@ impl DeviceService {
         let mut validated = HashMap::new();
 
         for param_def in &command_def.parameters {
-            // Check if parameter is provided or has default
+            // Check if parameter is provided or has default. Optional params
+            // without a value/default are omitted (not forced empty).
             let value = if let Some(param_value) = params.get(&param_def.name) {
-                // Convert JSON value to MetricValue
-                self.json_to_metric_value(param_value, &param_def.data_type)?
+                // Treat JSON null as "not provided" so optional clears omit.
+                if param_value.is_null() {
+                    if let Some(default) = &param_def.default_value {
+                        default.clone()
+                    } else if !param_def.required {
+                        continue;
+                    } else {
+                        return Err(DeviceError::InvalidParameter(format!(
+                            "Required parameter '{}' not provided and has no default",
+                            param_def.name
+                        )));
+                    }
+                } else {
+                    self.json_to_metric_value(param_value, &param_def.data_type)?
+                }
             } else if let Some(default) = &param_def.default_value {
-                // Use default value
                 default.clone()
+            } else if !param_def.required {
+                continue;
             } else {
                 return Err(DeviceError::InvalidParameter(format!(
                     "Required parameter '{}' not provided and has no default",
@@ -1577,27 +1949,60 @@ impl DeviceService {
                 )));
             };
 
-            // Validate min/max if applicable
-            if let (Some(min), Some(max)) = (param_def.min, param_def.max) {
+            // Validate min/max independently (either bound may be absent).
+            if let Some(min) = param_def.min {
                 match &value {
-                    MetricValue::Integer(i) => {
-                        let i_f64 = *i as f64;
-                        if i_f64 < min || i_f64 > max {
-                            return Err(DeviceError::InvalidParameter(format!(
-                                "Parameter '{}' value {} out of range [{}, {}]",
-                                param_def.name, i, min, max
-                            )));
-                        }
-                    }
-                    MetricValue::Float(f) if (*f < min || *f > max) => {
+                    MetricValue::Integer(i) if (*i as f64) < min => {
                         return Err(DeviceError::InvalidParameter(format!(
-                            "Parameter '{}' value {} out of range [{}, {}]",
-                            param_def.name, f, min, max
+                            "Parameter '{}' value {} below minimum {}",
+                            param_def.name, i, min
+                        )));
+                    }
+                    MetricValue::Float(f) if *f < min => {
+                        return Err(DeviceError::InvalidParameter(format!(
+                            "Parameter '{}' value {} below minimum {}",
+                            param_def.name, f, min
                         )));
                     }
                     _ => {}
                 }
             }
+            if let Some(max) = param_def.max {
+                match &value {
+                    MetricValue::Integer(i) if (*i as f64) > max => {
+                        return Err(DeviceError::InvalidParameter(format!(
+                            "Parameter '{}' value {} above maximum {}",
+                            param_def.name, i, max
+                        )));
+                    }
+                    MetricValue::Float(f) if *f > max => {
+                        return Err(DeviceError::InvalidParameter(format!(
+                            "Parameter '{}' value {} above maximum {}",
+                            param_def.name, f, max
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+
+            // allowed_values membership (plain MetricValue equality via to_json_value
+            // so Integer(1) can match a JSON `1` that deserialized as Integer).
+            if !param_def.allowed_values.is_empty() {
+                let ok = param_def.allowed_values.iter().any(|allowed| {
+                    allowed.to_json_value() == value.to_json_value()
+                        || Self::metric_values_loosely_equal(allowed, &value)
+                });
+                if !ok {
+                    return Err(DeviceError::InvalidParameter(format!(
+                        "Parameter '{}' value not in allowed_values",
+                        param_def.name
+                    )));
+                }
+            }
+
+            // Schema validation[] — pattern / range / length; custom is skipped
+            // (no host-injected validators) with a warning so templates don't hard-fail.
+            Self::apply_validation_rules(&param_def.name, &value, &param_def.validation)?;
 
             validated.insert(param_def.name.clone(), value);
         }
@@ -1605,12 +2010,163 @@ impl DeviceService {
         Ok(validated)
     }
 
-    /// Convert JSON value to MetricValue based on expected type
+    /// Loose equality for allowed_values (string/number coercion like the UI).
+    fn metric_values_loosely_equal(a: &MetricValue, b: &MetricValue) -> bool {
+        if a == b {
+            return true;
+        }
+        match (a, b) {
+            (MetricValue::String(s), MetricValue::Integer(i))
+            | (MetricValue::Integer(i), MetricValue::String(s)) => {
+                s.parse::<i64>().ok() == Some(*i)
+            }
+            (MetricValue::String(s), MetricValue::Float(f))
+            | (MetricValue::Float(f), MetricValue::String(s)) => s
+                .parse::<f64>()
+                .ok()
+                .is_some_and(|n| (n - *f).abs() < f64::EPSILON),
+            (MetricValue::Integer(i), MetricValue::Float(f))
+            | (MetricValue::Float(f), MetricValue::Integer(i)) => {
+                (*i as f64 - *f).abs() < f64::EPSILON
+            }
+            (MetricValue::String(s), MetricValue::Boolean(b))
+            | (MetricValue::Boolean(b), MetricValue::String(s)) => {
+                matches!(
+                    (s.to_lowercase().as_str(), *b),
+                    ("true" | "1" | "yes" | "on", true) | ("false" | "0" | "no" | "off", false)
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn apply_validation_rules(
+        name: &str,
+        value: &MetricValue,
+        rules: &[super::mdl_format::ValidationRule],
+    ) -> Result<(), DeviceError> {
+        use super::mdl_format::ValidationRule;
+        for rule in rules {
+            match rule {
+                ValidationRule::Pattern {
+                    regex,
+                    error_message,
+                } => {
+                    if let MetricValue::String(s) = value {
+                        let re = regex::Regex::new(regex).map_err(|e| {
+                            DeviceError::InvalidParameter(format!(
+                                "Parameter '{}': invalid validation regex: {e}",
+                                name
+                            ))
+                        })?;
+                        if !re.is_match(s) {
+                            return Err(DeviceError::InvalidParameter(
+                                if error_message.is_empty() {
+                                    format!("Parameter '{}' failed pattern validation", name)
+                                } else {
+                                    error_message.clone()
+                                },
+                            ));
+                        }
+                    }
+                }
+                ValidationRule::Range {
+                    min,
+                    max,
+                    error_message,
+                } => {
+                    let n = match value {
+                        MetricValue::Integer(i) => Some(*i as f64),
+                        MetricValue::Float(f) => Some(*f),
+                        _ => None,
+                    };
+                    if let Some(n) = n {
+                        if n < *min || n > *max {
+                            return Err(DeviceError::InvalidParameter(
+                                if error_message.is_empty() {
+                                    format!(
+                                        "Parameter '{}' value {} out of validation range [{}, {}]",
+                                        name, n, min, max
+                                    )
+                                } else {
+                                    error_message.clone()
+                                },
+                            ));
+                        }
+                    }
+                }
+                ValidationRule::Length {
+                    min,
+                    max,
+                    error_message,
+                } => {
+                    // Unicode scalar count — matches frontend `[...s].length`
+                    // (not UTF-8 bytes; CJK "你好世界啊" is 5, not 15).
+                    let len = match value {
+                        MetricValue::String(s) => Some(s.chars().count()),
+                        MetricValue::Array(a) => Some(a.len()),
+                        _ => None,
+                    };
+                    if let Some(len) = len {
+                        if len < *min || len > *max {
+                            return Err(DeviceError::InvalidParameter(
+                                if error_message.is_empty() {
+                                    format!(
+                                        "Parameter '{}' length {} out of range [{}, {}]",
+                                        name, len, min, max
+                                    )
+                                } else {
+                                    error_message.clone()
+                                },
+                            ));
+                        }
+                    }
+                }
+                ValidationRule::Custom { validator, .. } => {
+                    tracing::warn!(
+                        parameter = %name,
+                        validator = %validator,
+                        "command parameter custom validation skipped (no host validators)"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Infer a `MetricDataType` from a JSON value when Array `element_type`
+    /// is unset (schema `"Array"` without typed elements).
+    fn infer_metric_data_type_from_json(json: &serde_json::Value) -> super::mdl::MetricDataType {
+        use super::mdl::MetricDataType;
+        match json {
+            serde_json::Value::Bool(_) => MetricDataType::Boolean,
+            serde_json::Value::Number(n) => {
+                if n.is_i64() || n.is_u64() {
+                    MetricDataType::Integer
+                } else {
+                    MetricDataType::Float
+                }
+            }
+            serde_json::Value::String(_) => MetricDataType::String,
+            serde_json::Value::Array(_) => MetricDataType::Array { element_type: None },
+            // Objects / null have no dedicated command param type — String
+            // keeps conversion failure-open via the Null / catch-all arms.
+            _ => MetricDataType::String,
+        }
+    }
+
+    /// Convert JSON value to MetricValue based on expected type.
+    ///
+    /// Never uses `serde_json::Value::to_string()` for string-typed results —
+    /// that Display form wraps JSON strings in quotes (`"white"` → `"\"white\""`)
+    /// and was the Enum/Array command-send corruption path.
     fn json_to_metric_value(
         &self,
         json: &serde_json::Value,
         expected_type: &super::mdl::MetricDataType,
     ) -> Result<MetricValue, DeviceError> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
         match (json, expected_type) {
             (serde_json::Value::Number(n), super::mdl::MetricDataType::Integer) => {
                 if let Some(i) = n.as_i64() {
@@ -1638,6 +2194,39 @@ impl DeviceService {
             (serde_json::Value::String(s), super::mdl::MetricDataType::String) => {
                 Ok(MetricValue::String(s.clone()))
             }
+            (serde_json::Value::String(s), super::mdl::MetricDataType::Enum { options }) => {
+                if !options.is_empty() && !options.iter().any(|o| o == s) {
+                    return Err(DeviceError::InvalidParameter(format!(
+                        "Value '{}' is not in enum options {:?}",
+                        s, options
+                    )));
+                }
+                Ok(MetricValue::String(s.clone()))
+            }
+            (serde_json::Value::Array(arr), super::mdl::MetricDataType::Array { element_type }) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let inferred;
+                    let elem_ty = match element_type.as_deref() {
+                        Some(ty) => ty,
+                        None => {
+                            // Plain `"Array"` / `{ Array: {} }` leaves element_type
+                            // unset — infer from each JSON item so `[1,2]` becomes
+                            // integers instead of failing String conversion.
+                            inferred = Self::infer_metric_data_type_from_json(item);
+                            &inferred
+                        }
+                    };
+                    out.push(self.json_to_metric_value(item, elem_ty)?);
+                }
+                Ok(MetricValue::Array(out))
+            }
+            (serde_json::Value::String(s), super::mdl::MetricDataType::Binary) => STANDARD
+                .decode(s.trim())
+                .map(MetricValue::Binary)
+                .map_err(|e| {
+                    DeviceError::InvalidParameter(format!("Invalid base64 for Binary: {e}"))
+                }),
             (serde_json::Value::Null, _) => Ok(MetricValue::Null),
             (serde_json::Value::String(s), super::mdl::MetricDataType::Integer) => s
                 .trim()
@@ -1664,10 +2253,18 @@ impl DeviceService {
                     ))),
                 }
             }
-            (v, _) => {
-                // Try to convert to string as fallback
-                Ok(MetricValue::String(v.to_string()))
-            }
+            (v, expected) => Err(DeviceError::InvalidParameter(format!(
+                "Type mismatch: expected {:?}, got {}",
+                expected,
+                match v {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                }
+            ))),
         }
     }
 
@@ -1736,13 +2333,12 @@ impl DeviceService {
             );
         }
 
-        // Resolve any `/api/images/` internal URLs in the merged params to
-        // base64 data URLs before rendering. Devices are external targets and
-        // cannot read hostless internal paths, so an unresolved `/api/images/`
-        // string would arrive as an unusable value. Mirrors the data-push
-        // outbound fix (scheduler.rs::resolve_image_urls_in_value).
-        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
-        Self::resolve_command_image_urls(&mut merged, std::path::Path::new(&data_dir));
+        // Resolve platform image handles at the **device outbound** boundary
+        // only (Chat / tool-to-tool keep relative `/api/images/`). NM-314:
+        // URL-shaped params → absolute via HERAMIND_SERVER_URL; image/base64
+        // params → data-URL. Mirrors data-push outbound for the base64 path.
+        let data_dir = heramind_core::paths::data_dir();
+        Self::resolve_command_image_urls(&mut merged, data_dir.as_path())?;
 
         // Delegate to the structured JSON-aware renderer. See
         // `payload_template` module docs for why string substitution
@@ -1756,22 +2352,74 @@ impl DeviceService {
 
     // ========== Data Querying ==========
 
-    /// Resolve `/api/images/` internal URLs in command params to base64 data URLs.
+    /// Externally-reachable API origin for device HTTP pulls.
     ///
-    /// Devices are external targets (separate MQTT client / HTTP endpoint) and
-    /// cannot resolve a hostless `/api/images/` path. Walk every string param and,
-    /// if it is an internal image URL, replace it with a self-contained
-    /// `data:<mime>;base64,...` string via the shared helper (same symlink/size/
-    /// magic guards as `GET /api/images/`). Unresolvable values (missing file, too
-    /// large, non-image) are left untouched so the device surfaces its own error
-    /// rather than receiving an empty value.
+    /// Uses [`heramind_core::advertise::resolve_device_advertise_base_url`]:
+    /// `HERAMIND_SERVER_URL` → `HERAMIND_PUBLIC_HOST` → primary LAN IPv4.
+    /// **Never** localhost / 127.0.0.1 (devices like EK410 cannot fetch the
+    /// host's loopback). Never the browser Host header.
+    fn advertise_server_base_url() -> Option<(String, heramind_core::advertise::AdvertiseUrlSource)>
+    {
+        heramind_core::advertise::resolve_device_advertise_base_url()
+    }
+
+    /// Resolve `/api/images/` handles in command params for device downlink.
+    ///
+    /// - URL-capable params (`url` / `display_url` / …) → absolute
+    ///   `{advertise_base}/api/images/...` via
+    ///   [`heramind_core::advertise::resolve_device_advertise_base_url`].
+    ///   Hard-fail with an actionable “configure a device-reachable URL”
+    ///   error when only loopback would apply — never send `127.0.0.1` or a
+    ///   relative path to the device.
+    /// - Other image params → data-URL via [`resolve_internal_image_to_data_url`].
+    /// - Missing / unreadable files on the data-URL path: leave the original
+    ///   string so the device surfaces its own error.
     fn resolve_command_image_urls(
         params: &mut HashMap<String, MetricValue>,
         data_dir: &std::path::Path,
-    ) {
-        for value in params.values_mut() {
-            if let MetricValue::String(s) = value {
-                if s.starts_with("/api/images/") {
+    ) -> Result<(), DeviceError> {
+        let advertise = Self::advertise_server_base_url();
+        for (key, value) in params.iter_mut() {
+            let MetricValue::String(s) = value else {
+                continue;
+            };
+            if !s.starts_with("/api/images/") {
+                continue;
+            }
+            match image_outbound_form(key) {
+                ImageOutboundForm::AbsoluteHttp => {
+                    let Some((ref base, src)) = advertise else {
+                        return Err(DeviceError::InvalidParameter(format!(
+                            "Param `{key}` needs a device-reachable absolute HTTP URL, but none \
+                             was configured. Set HERAMIND_SERVER_URL (e.g. https://edge.example.com) \
+                             or HERAMIND_PUBLIC_HOST to an address the device can fetch (LAN IP / \
+                             public hostname) — do not rely on localhost/127.0.0.1 (unreachable \
+                             from EK410 and other remotes) or send relative `{s}`."
+                        )));
+                    };
+                    // Defense in depth: reject by **host**, not source enum —
+                    // HERAMIND_SERVER_URL=http://127.0.0.1:… / PUBLIC_HOST=localhost
+                    // must not reach the device even if tagged Env/PublicHost.
+                    if heramind_core::advertise::origin_host_is_loopback(base) {
+                        return Err(DeviceError::InvalidParameter(format!(
+                            "Param `{key}` refuses loopback advertise origin `{base}` — configure \
+                             a device-reachable URL via HERAMIND_SERVER_URL or HERAMIND_PUBLIC_HOST \
+                             (not localhost/127.0.0.1)."
+                        )));
+                    }
+                    if src != heramind_core::advertise::AdvertiseUrlSource::Env {
+                        tracing::debug!(
+                            target: "heramind::devices",
+                            param = %key,
+                            advertise_source = src.as_str(),
+                            base = %base,
+                            "AbsoluteHttp image param using auto-detected advertise base \
+                             (prefer HERAMIND_SERVER_URL for production devices)"
+                        );
+                    }
+                    *s = format!("{base}{s}");
+                }
+                ImageOutboundForm::DataUrl => {
                     if let Some(data_url) =
                         crate::image_storage::resolve_internal_image_to_data_url(s, data_dir)
                     {
@@ -1780,9 +2428,13 @@ impl DeviceService {
                 }
             }
         }
+        Ok(())
     }
 
-    /// Query telemetry data for a device metric
+    /// Query telemetry data for a device metric.
+    ///
+    /// `offset` skips the newest N points (newest-first pagination). Pass 0
+    /// for the first page.
     pub async fn query_telemetry(
         &self,
         device_id: &str,
@@ -1790,7 +2442,8 @@ impl DeviceService {
         start_time: Option<i64>,
         end_time: Option<i64>,
         limit: Option<usize>,
-    ) -> Result<Vec<(i64, MetricValue)>, DeviceError> {
+        offset: usize,
+    ) -> Result<(Vec<(i64, MetricValue)>, usize), DeviceError> {
         // Get device config and template
         let (_config, template) = self.get_device_with_template(device_id).await?;
 
@@ -1827,13 +2480,14 @@ impl DeviceService {
             let start = start_time.unwrap_or(i64::MIN);
             let end = end_time.unwrap_or(i64::MAX);
 
-            let points = storage
-                .query_limited(
+            let (points, total) = storage
+                .query_limited_with_total(
                     &format!("device:{}", device_id),
                     metric_name,
                     start,
                     end,
                     limit,
+                    offset,
                 )
                 .await
                 .map_err(|e| {
@@ -1846,7 +2500,10 @@ impl DeviceService {
                     DeviceError::Communication(format!("Telemetry query failed: {}", e))
                 })?;
 
-            Ok(points.into_iter().map(|p| (p.timestamp, p.value)).collect())
+            Ok((
+                points.into_iter().map(|p| (p.timestamp, p.value)).collect(),
+                total,
+            ))
         } else {
             tracing::warn!(
                 "Telemetry storage not configured when querying {}/{}",
@@ -2192,8 +2849,201 @@ impl DeviceService {
 
 #[cfg(test)]
 mod tests {
+    mod command_delivery_tests {
+        use super::*;
+        use crate::adapter::{DeviceAdapter, DeviceEvent};
+        use crate::registry::{ConnectionConfig, DeviceConfig, DeviceTypeTemplate};
+        use crate::AdapterResult;
+        use futures::Stream;
+        use std::pin::Pin;
+
+        struct StubAdapter;
+        #[async_trait::async_trait]
+        impl DeviceAdapter for StubAdapter {
+            fn name(&self) -> &str {
+                "stub"
+            }
+            fn adapter_type(&self) -> &'static str {
+                "stub-mqtt"
+            }
+            fn is_running(&self) -> bool {
+                true
+            }
+            async fn start(&self) -> AdapterResult<()> {
+                Ok(())
+            }
+            async fn stop(&self) -> AdapterResult<()> {
+                Ok(())
+            }
+            fn subscribe(&self) -> Pin<Box<dyn Stream<Item = DeviceEvent> + Send + '_>> {
+                Box::pin(futures::stream::empty())
+            }
+            fn device_count(&self) -> usize {
+                0
+            }
+            fn list_devices(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            async fn send_command(
+                &self,
+                _device_id: &str,
+                _command_name: &str,
+                _payload: String,
+                _topic: Option<String>,
+            ) -> AdapterResult<()> {
+                // Broker-style publish: accepted, no device acknowledgment.
+                Ok(())
+            }
+            fn connection_status(&self) -> crate::adapter::ConnectionStatus {
+                crate::adapter::ConnectionStatus::Connected
+            }
+            async fn subscribe_device(&self, _device_id: &str) -> AdapterResult<()> {
+                Ok(())
+            }
+            async fn unsubscribe_device(&self, _device_id: &str) -> AdapterResult<()> {
+                Ok(())
+            }
+        }
+
+        fn service() -> Arc<DeviceService> {
+            Arc::new(DeviceService::new(
+                Arc::new(DeviceRegistry::new()),
+                EventBus::new(),
+            ))
+        }
+
+        async fn seed_template(svc: &DeviceService) {
+            let tpl: DeviceTypeTemplate = serde_json::from_value(serde_json::json!({
+                "device_type": "actuator_x",
+                "name": "Actuator X",
+                "commands": [
+                    {"name": "open_valve", "parameters": []}
+                ]
+            }))
+            .unwrap();
+            svc.register_template(tpl).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn describe_levels_do_not_claim_physical_completion() {
+            let broker = CommandDelivery::AdapterAccepted { adapters: 2 };
+            assert!(broker.describe().contains("broker publish"));
+            assert!(broker.describe().contains("device acknowledgment: none"));
+            assert!(broker.describe().contains("physical effect unverified"));
+            let ext = CommandDelivery::ExtensionAccepted;
+            assert!(ext.describe().contains("extension accepted"));
+            assert!(ext.describe().contains("physical effect unverified"));
+        }
+
+        #[tokio::test]
+        async fn mqtt_style_command_reports_adapter_accepted_not_confirmed() {
+            let svc = service();
+            seed_template(&svc).await;
+            svc.register_device(DeviceConfig {
+                device_id: "act-1".into(),
+                name: "Act 1".into(),
+                device_type: "actuator_x".into(),
+                adapter_type: "stub-mqtt".into(),
+                connection_config: ConnectionConfig::new(),
+                adapter_id: None,
+                last_seen: 0,
+                offline_timeout_secs: None,
+            })
+            .await
+            .unwrap();
+            svc.register_adapter("stub-1".into(), Arc::new(StubAdapter))
+                .await;
+
+            let (_v, delivery) = svc
+                .send_command_reported("act-1", "open_valve", HashMap::new())
+                .await
+                .unwrap();
+            assert_eq!(delivery, CommandDelivery::AdapterAccepted { adapters: 1 });
+        }
+
+        #[tokio::test]
+        async fn extension_command_reports_extension_confirmed() {
+            let svc = service();
+            seed_template(&svc).await;
+            svc.register_device(DeviceConfig {
+                device_id: "act-ext".into(),
+                name: "Act ext".into(),
+                device_type: "actuator_x".into(),
+                adapter_type: "extension".into(),
+                connection_config: ConnectionConfig::new(),
+                adapter_id: Some("ext-9".into()),
+                last_seen: 0,
+                offline_timeout_secs: None,
+            })
+            .await
+            .unwrap();
+            svc.set_extension_command_router(Arc::new(move |_ext, _dev, _cmd, _params| {
+                Box::pin(async { Ok(()) })
+            }))
+            .await;
+
+            let (_v, delivery) = svc
+                .send_command_reported("act-ext", "open_valve", HashMap::new())
+                .await
+                .unwrap();
+            // Extension router Ok = ACCEPTED, not device-acknowledged.
+            assert_eq!(delivery, CommandDelivery::ExtensionAccepted);
+            assert!(delivery.describe().contains("extension accepted"));
+            assert!(
+                delivery.describe().contains("not a device ACK"),
+                "the wording must not overclaim: {}",
+                delivery.describe()
+            );
+        }
+
+        #[tokio::test]
+        async fn higher_delivery_levels_are_never_overclaimed() {
+            // DeviceAcknowledged keeps physical-effect honesty; nothing below
+            // a real ACK path may report it (no current path produces it).
+            assert!(CommandDelivery::DeviceAcknowledged
+                .describe()
+                .contains("physical effect unverified"));
+            assert!(CommandDelivery::PhysicalEffectVerified
+                .describe()
+                .contains("verified via state feedback"));
+            assert!(CommandDelivery::AdapterAccepted { adapters: 1 }
+                .describe()
+                .contains("device acknowledgment: none"));
+        }
+
+        #[tokio::test]
+        async fn no_adapter_is_explicit_failure_not_silent_send() {
+            let svc = service();
+            seed_template(&svc).await;
+            svc.register_device(DeviceConfig {
+                device_id: "act-2".into(),
+                name: "Act 2".into(),
+                device_type: "actuator_x".into(),
+                adapter_type: "stub-mqtt".into(),
+                connection_config: ConnectionConfig::new(),
+                adapter_id: None,
+                last_seen: 0,
+                offline_timeout_secs: None,
+            })
+            .await
+            .unwrap();
+            // No adapter registered → Err, never "sent".
+            assert!(svc
+                .send_command_reported("act-2", "open_valve", HashMap::new())
+                .await
+                .is_err());
+        }
+    }
+
     use super::*;
     use crate::registry::ConnectionConfig;
+    use std::sync::Mutex;
+
+    /// Serialize tests that mutate process-global advertise env knobs.
+    static ADVERTISE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[tokio::test]
     async fn test_service_template_registration() {
@@ -2210,6 +3060,61 @@ mod tests {
 
     #[tokio::test]
     async fn test_service_device_registration() {
+        use crate::adapter::{ConnectionStatus, DeviceAdapter, DeviceEvent};
+        use crate::AdapterResult;
+        use futures::Stream;
+        use std::pin::Pin;
+
+        struct MqttStub;
+        #[async_trait::async_trait]
+        impl DeviceAdapter for MqttStub {
+            fn name(&self) -> &str {
+                "mqtt-stub"
+            }
+            fn adapter_type(&self) -> &'static str {
+                "mqtt"
+            }
+            fn is_running(&self) -> bool {
+                true
+            }
+            async fn start(&self) -> AdapterResult<()> {
+                Ok(())
+            }
+            async fn stop(&self) -> AdapterResult<()> {
+                Ok(())
+            }
+            fn subscribe(&self) -> Pin<Box<dyn Stream<Item = DeviceEvent> + Send + '_>> {
+                Box::pin(futures::stream::empty())
+            }
+            fn device_count(&self) -> usize {
+                0
+            }
+            fn list_devices(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            async fn send_command(
+                &self,
+                _device_id: &str,
+                _command_name: &str,
+                _payload: String,
+                _topic: Option<String>,
+            ) -> AdapterResult<()> {
+                Ok(())
+            }
+            fn connection_status(&self) -> ConnectionStatus {
+                ConnectionStatus::Connected
+            }
+            async fn subscribe_device(&self, _device_id: &str) -> AdapterResult<()> {
+                Ok(())
+            }
+            async fn unsubscribe_device(&self, _device_id: &str) -> AdapterResult<()> {
+                Ok(())
+            }
+        }
+
         let event_bus = EventBus::new();
         let registry = Arc::new(DeviceRegistry::new());
         let service = DeviceService::new(registry.clone(), event_bus);
@@ -2217,6 +3122,12 @@ mod tests {
         // Register template first
         let template = DeviceTypeTemplate::new("test_sensor", "Test Sensor");
         service.register_template(template).await.unwrap();
+
+        // MQTT register requires a live adapter for subscribe honesty
+        // (BindIncomplete when none — config may still be applied).
+        service
+            .register_adapter("mqtt-stub".into(), Arc::new(MqttStub))
+            .await;
 
         // Register device
         let config = DeviceConfig {
@@ -2290,6 +3201,251 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_json_to_metric_value_enum_and_array() {
+        let event_bus = EventBus::new();
+        let registry = Arc::new(DeviceRegistry::new());
+        let service = DeviceService::new(registry.clone(), event_bus);
+
+        use crate::mdl::MetricDataType;
+
+        // Enum: plain JSON string must NOT pick up Display quotes.
+        let enum_ty = MetricDataType::Enum {
+            options: vec!["white".into(), "black".into()],
+        };
+        let got = service
+            .json_to_metric_value(&serde_json::json!("white"), &enum_ty)
+            .unwrap();
+        assert_eq!(got, MetricValue::String("white".into()));
+
+        let bad = service.json_to_metric_value(&serde_json::json!("red"), &enum_ty);
+        assert!(bad.is_err());
+
+        // Array of strings
+        let arr_ty = MetricDataType::Array {
+            element_type: Some(Box::new(MetricDataType::String)),
+        };
+        let got = service
+            .json_to_metric_value(&serde_json::json!(["a", "b"]), &arr_ty)
+            .unwrap();
+        assert_eq!(
+            got,
+            MetricValue::Array(vec![
+                MetricValue::String("a".into()),
+                MetricValue::String("b".into()),
+            ])
+        );
+
+        // Untyped Array: infer element types from JSON (`[1,2]` → integers).
+        let untyped = MetricDataType::Array { element_type: None };
+        let got = service
+            .json_to_metric_value(&serde_json::json!([1, 2]), &untyped)
+            .unwrap();
+        assert_eq!(
+            got,
+            MetricValue::Array(vec![MetricValue::Integer(1), MetricValue::Integer(2),])
+        );
+        let got = service
+            .json_to_metric_value(&serde_json::json!([1.5, 2.25]), &untyped)
+            .unwrap();
+        assert_eq!(
+            got,
+            MetricValue::Array(vec![MetricValue::Float(1.5), MetricValue::Float(2.25),])
+        );
+
+        // Catch-all must not stringify a JSON string into "\"white\""
+        let mismatch =
+            service.json_to_metric_value(&serde_json::json!("white"), &MetricDataType::Integer);
+        assert!(mismatch.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_length_rule_counts_unicode_scalars() {
+        let event_bus = EventBus::new();
+        let registry = Arc::new(DeviceRegistry::new());
+        let service = DeviceService::new(registry.clone(), event_bus);
+
+        use crate::mdl::MetricDataType;
+        use crate::mdl_format::{CommandDefinition, ParameterDefinition, ValidationRule};
+
+        let command_def = CommandDefinition {
+            name: "label".to_string(),
+            display_name: "Label".to_string(),
+            payload_template: r#"{"text":"${text}"}"#.to_string(),
+            parameters: vec![ParameterDefinition {
+                name: "text".to_string(),
+                display_name: "Text".to_string(),
+                data_type: MetricDataType::String,
+                default_value: None,
+                min: None,
+                max: None,
+                unit: String::new(),
+                allowed_values: vec![],
+                required: true,
+                visible_when: None,
+                group: None,
+                help_text: String::new(),
+                validation: vec![ValidationRule::Length {
+                    min: 1,
+                    max: 5,
+                    error_message: "max 5 chars".into(),
+                }],
+            }],
+            samples: vec![],
+            description: String::new(),
+            fixed_values: std::collections::HashMap::new(),
+            parameter_groups: vec![],
+        };
+
+        // Five CJK characters = 5 Unicode scalars (15 UTF-8 bytes) → OK.
+        let mut ok = HashMap::new();
+        ok.insert("text".to_string(), serde_json::json!("你好世界啊"));
+        assert!(service.validate_command_params(&command_def, ok).is_ok());
+
+        // Supplementary plane emoji: one scalar (may be 2 UTF-16 units).
+        let mut emoji = HashMap::new();
+        emoji.insert("text".to_string(), serde_json::json!("😀😀😀😀😀"));
+        assert!(service.validate_command_params(&command_def, emoji).is_ok());
+
+        let mut too_long = HashMap::new();
+        too_long.insert("text".to_string(), serde_json::json!("你好世界啊六"));
+        assert!(service
+            .validate_command_params(&command_def, too_long)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_allowed_values_and_validation_rules() {
+        let event_bus = EventBus::new();
+        let registry = Arc::new(DeviceRegistry::new());
+        let service = DeviceService::new(registry.clone(), event_bus);
+
+        use crate::mdl::MetricDataType;
+        use crate::mdl_format::{CommandDefinition, ParameterDefinition, ValidationRule};
+
+        let command_def = CommandDefinition {
+            name: "set_mode".to_string(),
+            display_name: "Set Mode".to_string(),
+            payload_template: r#"{"mode":"${mode}","note":"${note}"}"#.to_string(),
+            parameters: vec![
+                ParameterDefinition {
+                    name: "mode".to_string(),
+                    display_name: "Mode".to_string(),
+                    data_type: MetricDataType::String,
+                    default_value: None,
+                    min: None,
+                    max: None,
+                    unit: String::new(),
+                    allowed_values: vec![
+                        MetricValue::String("on".into()),
+                        MetricValue::String("off".into()),
+                    ],
+                    required: true,
+                    visible_when: None,
+                    group: None,
+                    help_text: String::new(),
+                    validation: vec![],
+                },
+                ParameterDefinition {
+                    name: "note".to_string(),
+                    display_name: "Note".to_string(),
+                    data_type: MetricDataType::String,
+                    default_value: Some(MetricValue::String(String::new())),
+                    min: None,
+                    max: None,
+                    unit: String::new(),
+                    allowed_values: vec![],
+                    required: false,
+                    visible_when: None,
+                    group: None,
+                    help_text: String::new(),
+                    validation: vec![ValidationRule::Pattern {
+                        regex: r"^[a-z0-9_]*$".into(),
+                        error_message: "note must be lowercase slug".into(),
+                    }],
+                },
+            ],
+            samples: vec![],
+            description: String::new(),
+            fixed_values: std::collections::HashMap::new(),
+            parameter_groups: vec![],
+        };
+
+        let mut bad = HashMap::new();
+        bad.insert("mode".to_string(), serde_json::json!("maybe"));
+        assert!(service.validate_command_params(&command_def, bad).is_err());
+
+        let mut bad_note = HashMap::new();
+        bad_note.insert("mode".to_string(), serde_json::json!("on"));
+        bad_note.insert("note".to_string(), serde_json::json!("Hello!"));
+        assert!(service
+            .validate_command_params(&command_def, bad_note)
+            .is_err());
+
+        let mut ok = HashMap::new();
+        ok.insert("mode".to_string(), serde_json::json!("off"));
+        ok.insert("note".to_string(), serde_json::json!("ok_1"));
+        assert!(service.validate_command_params(&command_def, ok).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_optional_param_may_be_omitted() {
+        let event_bus = EventBus::new();
+        let registry = Arc::new(DeviceRegistry::new());
+        let service = DeviceService::new(registry.clone(), event_bus);
+
+        use crate::mdl::MetricDataType;
+        use crate::mdl_format::CommandDefinition;
+        use crate::mdl_format::ParameterDefinition;
+
+        let command_def = CommandDefinition {
+            name: "clear".to_string(),
+            display_name: "Clear".to_string(),
+            payload_template: r#"{"cmd":"clear","color":"${color}"}"#.to_string(),
+            parameters: vec![ParameterDefinition {
+                name: "color".to_string(),
+                display_name: "Color".to_string(),
+                data_type: MetricDataType::Enum {
+                    options: vec!["white".into(), "black".into()],
+                },
+                default_value: Some(MetricValue::String("white".into())),
+                min: None,
+                max: None,
+                unit: String::new(),
+                allowed_values: vec![],
+                required: false,
+                visible_when: None,
+                group: None,
+                help_text: String::new(),
+                validation: vec![],
+            }],
+            samples: vec![],
+            description: String::new(),
+            fixed_values: std::collections::HashMap::new(),
+            parameter_groups: vec![],
+        };
+
+        // Omitted → schema default
+        let result = service
+            .validate_command_params(&command_def, HashMap::new())
+            .unwrap();
+        assert_eq!(
+            result.get("color"),
+            Some(&MetricValue::String("white".into()))
+        );
+
+        // Explicit enum value
+        let mut params = HashMap::new();
+        params.insert("color".to_string(), serde_json::json!("black"));
+        let result = service
+            .validate_command_params(&command_def, params)
+            .unwrap();
+        assert_eq!(
+            result.get("color"),
+            Some(&MetricValue::String("black".into()))
+        );
+    }
+
+    #[tokio::test]
     async fn test_build_command_payload() {
         let event_bus = EventBus::new();
         let registry = Arc::new(DeviceRegistry::new());
@@ -2319,9 +3475,7 @@ mod tests {
 
     #[test]
     fn test_resolve_command_image_urls_resolves_api_images() {
-        // A command param carrying an /api/images/ internal URL must be resolved
-        // to a base64 data URL before rendering — devices are external targets
-        // and can't read hostless internal paths. Mirrors the data-push fix.
+        // Image/base64-shaped params → data-URL (device embeds bytes).
         let temp =
             std::env::temp_dir().join(format!("heramind_test_cmd_img_{}", std::process::id()));
         let images_dir = temp.join("images").join("dev").join("overlay");
@@ -2339,7 +3493,7 @@ mod tests {
         );
         params.insert("label".to_string(), MetricValue::String("hi".to_string()));
 
-        DeviceService::resolve_command_image_urls(&mut params, &temp);
+        DeviceService::resolve_command_image_urls(&mut params, &temp).unwrap();
 
         let img = match &params["image"] {
             MetricValue::String(s) => s.clone(),
@@ -2347,7 +3501,6 @@ mod tests {
         };
         assert!(img.starts_with("data:image/png;base64,"), "got: {img}");
         assert!(!img.contains("/api/images/"), "got: {img}");
-        // Non-image params are left untouched.
         match &params["label"] {
             MetricValue::String(s) => assert_eq!(s, "hi"),
             other => panic!("label should be untouched, got {other:?}"),
@@ -2368,12 +3521,305 @@ mod tests {
             "image".to_string(),
             MetricValue::String("/api/images/nope/overlay/0.png".to_string()),
         );
-        DeviceService::resolve_command_image_urls(&mut params, &temp);
+        DeviceService::resolve_command_image_urls(&mut params, &temp).unwrap();
         match &params["image"] {
             MetricValue::String(s) => {
                 assert_eq!(s, "/api/images/nope/overlay/0.png")
             }
             other => panic!("should fall back to original URL, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_resolve_command_url_param_advertise_gating() {
+        // Serial: touches process-global advertise env knobs.
+        let _lock = ADVERTISE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, value: Option<&str>) -> Self {
+                let prev = std::env::var(key).ok();
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+        let _g1 = EnvGuard::set("HERAMIND_SERVER_URL", None);
+        let _g2 = EnvGuard::set("HERAMIND_PUBLIC_HOST", None);
+
+        let temp =
+            std::env::temp_dir().join(format!("heramind_test_cmd_abs_{}", std::process::id()));
+        let images = temp.join("images").join("cam").join("frame");
+        std::fs::create_dir_all(&images).unwrap();
+        let jpg = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        std::fs::write(images.join("1.jpg"), jpg).unwrap();
+        let rel = "/api/images/cam/frame/1.jpg".to_string();
+
+        // With HERAMIND_SERVER_URL → absolute HTTP for `url`; data-URL for `image`.
+        let _env = EnvGuard::set("HERAMIND_SERVER_URL", Some("https://edge.example.com/"));
+        let mut params = HashMap::new();
+        params.insert("url".to_string(), MetricValue::String(rel.clone()));
+        params.insert("image".to_string(), MetricValue::String(rel.clone()));
+        DeviceService::resolve_command_image_urls(&mut params, &temp).unwrap();
+        match &params["url"] {
+            MetricValue::String(s) => {
+                assert_eq!(s, "https://edge.example.com/api/images/cam/frame/1.jpg");
+                assert!(!s.starts_with("data:"), "url must not become data-URL");
+            }
+            other => panic!("url should be string, got {other:?}"),
+        }
+        match &params["image"] {
+            MetricValue::String(s) => {
+                assert!(s.starts_with("data:image/jpeg;base64,"), "got: {s}");
+            }
+            other => panic!("image should be data-URL, got {other:?}"),
+        }
+        drop(_env);
+
+        // Without SERVER_URL but with PUBLIC_HOST → absolute via public host +
+        // recorded listen port (not a stale hardcoded 9375).
+        let _pub = EnvGuard::set("HERAMIND_PUBLIC_HOST", Some("edge.lan"));
+        let _port_env = EnvGuard::set("HERAMIND_PORT", None);
+        let prev_listen = heramind_core::advertise::http_listen_port();
+        heramind_core::advertise::set_http_listen_port(9444);
+        let mut params_pub = HashMap::new();
+        params_pub.insert("display_url".to_string(), MetricValue::String(rel.clone()));
+        DeviceService::resolve_command_image_urls(&mut params_pub, &temp).unwrap();
+        match &params_pub["display_url"] {
+            MetricValue::String(s) => {
+                assert_eq!(s, "http://edge.lan:9444/api/images/cam/frame/1.jpg");
+            }
+            other => panic!("display_url should be absolute, got {other:?}"),
+        }
+        heramind_core::advertise::set_http_listen_port(prev_listen);
+        drop(_pub);
+        drop(_port_env);
+
+        // Without overrides → LAN absolute if available; never localhost/127.0.0.1
+        // (device-unreachable). If no device-reachable origin, hard-fail.
+        let mut params2 = HashMap::new();
+        params2.insert("display_url".to_string(), MetricValue::String(rel.clone()));
+        match DeviceService::resolve_command_image_urls(&mut params2, &temp) {
+            Ok(()) => match &params2["display_url"] {
+                MetricValue::String(s) => {
+                    assert!(
+                        s.starts_with("http://") && s.ends_with("/api/images/cam/frame/1.jpg"),
+                        "expected auto-detected absolute URL, got: {s}"
+                    );
+                    assert!(
+                        !s.contains("127.0.0.1") && !s.contains("localhost"),
+                        "device path must not advertise loopback: {s}"
+                    );
+                    assert!(!s.starts_with("/api/images/"), "must not leave relative");
+                }
+                other => panic!("expected absolute string, got {other:?}"),
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("device-reachable")
+                        || msg.contains("HERAMIND_SERVER_URL")
+                        || msg.contains("HERAMIND_PUBLIC_HOST"),
+                    "expected actionable device-reachable error, got: {msg}"
+                );
+                match &params2["display_url"] {
+                    MetricValue::String(s) => assert_eq!(s, &rel, "must not mutate on failure"),
+                    other => panic!("expected relative left as-is on error, got {other:?}"),
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_resolve_command_rejects_localhost_advertise_for_devices() {
+        // Force the device path past PUBLIC_HOST/SERVER_URL; if only loopback
+        // would apply, AbsoluteHttp must hard-fail (never send 127.0.0.1).
+        let _lock = ADVERTISE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, value: Option<&str>) -> Self {
+                let prev = std::env::var(key).ok();
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        let _g1 = EnvGuard::set("HERAMIND_SERVER_URL", None);
+        let _g2 = EnvGuard::set("HERAMIND_PUBLIC_HOST", None);
+        // Device audience uses resolve_device_advertise_base_url — when it
+        // returns None (no LAN), error; when LanIp, URL must not be loopback.
+        // Explicitly assert Localhost is never accepted even if a caller
+        // somehow got that source (defense in depth already in resolve).
+        let temp =
+            std::env::temp_dir().join(format!("heramind_test_cmd_loop_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let rel = "/api/images/cam/frame/1.jpg".to_string();
+        let mut params = HashMap::new();
+        params.insert("display_url".to_string(), MetricValue::String(rel.clone()));
+
+        match DeviceService::resolve_command_image_urls(&mut params, &temp) {
+            Ok(()) => {
+                let MetricValue::String(s) = &params["display_url"] else {
+                    panic!("expected string");
+                };
+                assert!(
+                    !s.contains("127.0.0.1") && !s.contains("localhost"),
+                    "must not send loopback to device: {s}"
+                );
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("device-reachable") || msg.contains("HERAMIND_SERVER_URL"),
+                    "{msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_resolve_command_rejects_loopback_server_url_config() {
+        let _lock = ADVERTISE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, value: Option<&str>) -> Self {
+                let prev = std::env::var(key).ok();
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        // Loopback SERVER_URL must not win; fall through to LAN or hard-fail —
+        // never 127.0.0.1 in the final AbsoluteHttp URL.
+        let _g1 = EnvGuard::set("HERAMIND_SERVER_URL", Some("http://127.0.0.1:9375"));
+        let _g2 = EnvGuard::set("HERAMIND_PUBLIC_HOST", None);
+        let temp =
+            std::env::temp_dir().join(format!("heramind_test_cmd_envloop_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let rel = "/api/images/cam/frame/1.jpg".to_string();
+        let mut params = HashMap::new();
+        params.insert("display_url".to_string(), MetricValue::String(rel.clone()));
+        match DeviceService::resolve_command_image_urls(&mut params, &temp) {
+            Ok(()) => {
+                let MetricValue::String(s) = &params["display_url"] else {
+                    panic!("expected string");
+                };
+                assert!(
+                    !s.contains("127.0.0.1") && !s.contains("localhost"),
+                    "SERVER_URL loopback must not reach device: {s}"
+                );
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("device-reachable")
+                        || msg.contains("loopback")
+                        || msg.contains("HERAMIND_SERVER_URL"),
+                    "{msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_resolve_command_rejects_loopback_public_host_config() {
+        let _lock = ADVERTISE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, value: Option<&str>) -> Self {
+                let prev = std::env::var(key).ok();
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        let _g1 = EnvGuard::set("HERAMIND_SERVER_URL", None);
+        let _g2 = EnvGuard::set("HERAMIND_PUBLIC_HOST", Some("localhost"));
+        let temp =
+            std::env::temp_dir().join(format!("heramind_test_cmd_publoop_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let rel = "/api/images/cam/frame/1.jpg".to_string();
+        let mut params = HashMap::new();
+        params.insert("display_url".to_string(), MetricValue::String(rel.clone()));
+        match DeviceService::resolve_command_image_urls(&mut params, &temp) {
+            Ok(()) => {
+                let MetricValue::String(s) = &params["display_url"] else {
+                    panic!("expected string");
+                };
+                assert!(
+                    !s.contains("127.0.0.1") && !s.contains("localhost"),
+                    "PUBLIC_HOST=localhost must not reach device: {s}"
+                );
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("device-reachable")
+                        || msg.contains("loopback")
+                        || msg.contains("HERAMIND_PUBLIC_HOST")
+                        || msg.contains("HERAMIND_SERVER_URL"),
+                    "{msg}"
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&temp);
     }

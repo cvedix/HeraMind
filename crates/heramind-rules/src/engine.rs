@@ -107,31 +107,45 @@ pub struct RuleEngine {
     // tokio lock forced try_read in the sync rebuild path, which silently
     // SKIPPED the rebuild under trigger-path contention — a rule added in
     // that window never entered subscription_index until the next CRUD.
-    rules: Arc<StdRwLock<HashMap<RuleId, CompiledRule>>>,
+    pub(crate) rules: Arc<StdRwLock<HashMap<RuleId, CompiledRule>>>,
     /// Subscription index: DataSourceId → Vec<RuleId>
     subscription_index: Arc<StdRwLock<HashMap<String, Arc<Vec<RuleId>>>>>,
     /// Cooldown tracking: RuleId → last trigger Instant
-    cooldowns: Arc<StdRwLock<HashMap<RuleId, Instant>>>,
+    pub(crate) cooldowns: Arc<StdRwLock<HashMap<RuleId, Instant>>>,
     /// Consecutive all-actions-failed count per rule. Gates the cooldown
     /// refund so a persistently-failing rule paces itself instead of re-firing
     /// on every matching data point.
     consecutive_action_failures: Arc<StdRwLock<HashMap<RuleId, u32>>>,
     /// Value provider for condition evaluation.
-    value_provider: Arc<dyn ValueProvider>,
+    pub(crate) value_provider: Arc<dyn ValueProvider>,
     /// In-memory execution history.
-    history: Arc<RwLock<VecDeque<RuleExecutionResult>>>,
+    pub(crate) history: Arc<RwLock<VecDeque<RuleExecutionResult>>>,
     // Optional executors
     message_manager: OptionMessageManager,
     device_action_executor: OptionDeviceActionExecutor,
     extension_action_executor: OptionExtensionActionExecutor,
     agent_trigger: OptionAgentTriggerCallback,
     /// Persistent rule store.
-    rule_store: Arc<StdRwLock<Option<Arc<RuleStore>>>>,
+    pub(crate) rule_store: Arc<StdRwLock<Option<Arc<RuleStore>>>>,
     /// Optional EventBus — publishes RuleEvaluated/RuleTriggered/RuleExecuted
     /// so the frontend / extension subscriptions / agents can react in real
     /// time instead of polling the history API. Wired at construction; the
     /// engine degrades gracefully to no-publish when absent.
     event_bus: Arc<tokio::sync::RwLock<Option<Arc<heramind_core::EventBus>>>>,
+}
+
+/// Identifies the rule execution an action is running under.
+///
+/// `(rule_id, triggered_at)` *is* this execution's identity: that pair is what
+/// `RuleStore::save_history` keys the history row by. Pointing the artifacts an
+/// action leaves behind at their execution therefore needs no new id field and
+/// no storage format change — and the timestamp used here must be the same one
+/// the history row is written with, or the reference dangles.
+#[derive(Debug, Clone)]
+struct RuleExecutionRef {
+    rule_id: RuleId,
+    triggered_at: chrono::DateTime<chrono::Utc>,
+    rule_name: String,
 }
 
 impl RuleEngine {
@@ -460,9 +474,19 @@ impl RuleEngine {
         let mut actions_executed = Vec::new();
         let mut error = None;
 
+        let execution = RuleExecutionRef {
+            rule_id: id.clone(),
+            triggered_at: now,
+            rule_name: rule.name.clone(),
+        };
         for action in &rule.actions {
             match self
-                .execute_action(action, trigger_value.as_deref(), trigger_source.as_deref())
+                .execute_action(
+                    action,
+                    &execution,
+                    trigger_value.as_deref(),
+                    trigger_source.as_deref(),
+                )
                 .await
             {
                 Ok(name) => actions_executed.push(name),
@@ -620,14 +644,23 @@ impl RuleEngine {
         })
         .await;
 
-        // Fire actions
+        // Fire actions. The instant is captured once and reused for the
+        // history row below: it is the execution's identity, so the reference
+        // stamped on the artifacts must be the same one the row is keyed by.
         let start = Instant::now();
+        let triggered_at = Utc::now();
+        let execution = RuleExecutionRef {
+            rule_id: rule_id.clone(),
+            triggered_at,
+            rule_name: rule.name.clone(),
+        };
         let mut actions_executed = Vec::new();
         let mut first_error = None;
         for action in &rule.actions {
             match self
                 .execute_action(
                     action,
+                    &execution,
                     trigger_value_display.as_deref(),
                     trigger_source.as_deref(),
                 )
@@ -659,7 +692,7 @@ impl RuleEngine {
             actions_executed,
             error: first_error,
             duration_ms: start.elapsed().as_millis() as u64,
-            triggered_at: Utc::now(),
+            triggered_at,
         })
         .await;
 
@@ -730,9 +763,71 @@ impl RuleEngine {
         find_first(condition, provider)
     }
 
+    /// Overwrite the recorded outcome of an execution whose action was
+    /// SPAWNED (accepted) and later failed for real. `RuleStore::save_history`
+    /// keys rows by (triggered_at, rule_id), so re-saving the same identity
+    /// REPLACES the optimistic "(spawned)" row — durable history never claims
+    /// a delivery that did not happen. The in-memory deque entry is updated
+    /// in place so the API matches the store. (Process death between spawn
+    /// and this correction still leaves only the optimistic row; that
+    /// residual window is accepted and noted at the spawn sites.)
+    async fn correct_spawned_outcome(
+        history: &Arc<RwLock<VecDeque<RuleExecutionResult>>>,
+        store: Option<Arc<RuleStore>>,
+        execution: &RuleExecutionRef,
+        action_label: String,
+        failure: String,
+    ) {
+        let corrected = RuleExecutionResult {
+            rule_id: execution.rule_id.clone(),
+            rule_name: execution.rule_name.clone(),
+            success: false,
+            actions_executed: vec![action_label],
+            error: Some(format!("delivery failed: {failure}")),
+            // Delivery time, not rule-eval time — the row corrects the
+            // OUTCOME of the accepted execution, not its timing.
+            duration_ms: 0,
+            triggered_at: execution.triggered_at,
+        };
+        if let Some(store) = store {
+            // The optimistic row is written by `record_history` AFTER this
+            // spawn returns — a fast-failing delivery can reach this point
+            // first, and the optimistic save (same identity key) would then
+            // clobber the correction. Wait, bounded, for the identity to
+            // appear in the in-memory deque; record_history pushes to the
+            // deque immediately after its store save, so presence here
+            // means the optimistic row is durable and safe to overwrite.
+            // (All-channels-failed deliveries take ≥ seconds of retries and
+            // never wait; only hard errors can land in this window.)
+            for _ in 0..40 {
+                if history.read().await.iter().any(|r| {
+                    r.rule_id == corrected.rule_id && r.triggered_at == corrected.triggered_at
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if let Err(e) = store.save_history(&corrected) {
+                tracing::warn!(
+                    rule_id = %corrected.rule_id,
+                    error = %e,
+                    "Failed to correct rule history after delivery failure"
+                );
+            }
+        }
+        let mut history = history.write().await;
+        if let Some(entry) = history
+            .iter_mut()
+            .find(|r| r.rule_id == corrected.rule_id && r.triggered_at == corrected.triggered_at)
+        {
+            *entry = corrected;
+        }
+    }
+
     async fn execute_action(
         &self,
         action: &RuleAction,
+        execution: &RuleExecutionRef,
         trigger_value_display: Option<&str>,
         trigger_source: Option<&str>,
     ) -> Result<String, String> {
@@ -745,26 +840,78 @@ impl RuleEngine {
                     NotifySeverity::Info => heramind_messages::MessageSeverity::Info,
                     NotifySeverity::Warning => heramind_messages::MessageSeverity::Warning,
                     NotifySeverity::Critical => heramind_messages::MessageSeverity::Critical,
-                    NotifySeverity::Emergency => {
-                        tracing::warn!(
-                            "Emergency severity mapped to Critical (MessageManager has no Emergency level)"
-                        );
-                        heramind_messages::MessageSeverity::Critical
-                    }
+                    NotifySeverity::Emergency => heramind_messages::MessageSeverity::Emergency,
                 };
 
-                let mgr = self.message_manager.read().await;
-                if let Some(manager) = mgr.as_ref() {
-                    let msg = heramind_messages::Message::alert(
+                let manager = self.message_manager.read().await.clone();
+                if let Some(manager) = manager {
+                    let mut msg = heramind_messages::Message::alert(
                         msg_sev,
                         "Rule Triggered".to_string(),
                         formatted.clone(),
                         "rule_engine".to_string(),
                     );
-                    match manager.create_message(msg).await {
-                        Ok(_) => Ok(format!("NOTIFY: {}", formatted)),
-                        Err(e) => Err(format!("Failed to create message: {}", e)),
-                    }
+                    // M2-5: an alert has to be able to say which execution
+                    // produced it, and on what evidence. The identity is the
+                    // history key; the source and value are what satisfied the
+                    // condition — cheap here, and they make the alert
+                    // self-explanatory without a second lookup.
+                    msg.metadata = Some(serde_json::json!({
+                        (crate::chain::RULE_ID_KEY): execution.rule_id,
+                        (crate::chain::RULE_EXECUTION_MS_KEY): execution.triggered_at.timestamp_millis(),
+                        (crate::chain::TRIGGER_SOURCE_KEY): trigger_source,
+                        (crate::chain::TRIGGER_VALUE_KEY): trigger_value_display,
+                    }));
+                    // [decoupled] Delivery runs through channel senders that
+                    // can block for their own timeout (SMTP, webhooks, IM
+                    // APIs). This arm used to await inline in the single
+                    // rule-consumer loop, so one slow channel delivery
+                    // stalled every other rule's evaluation and the EventBus
+                    // lagged past its buffer — silently DROPPING threshold
+                    // crossings (missed alerts). Rule history records the
+                    // action as spawned; a real delivery failure CORRECTS
+                    // that row here (same identity key, overwrite).
+                    let history = Arc::clone(&self.history);
+                    let store = self.rule_store.read().as_ref().cloned();
+                    let execution_ref = execution.clone();
+                    let accepted = format!("NOTIFY: {}", formatted);
+                    let accepted_for_correction = accepted.clone();
+                    tokio::spawn(async move {
+                        // try_create_message (not create_message): the plain
+                        // call returns Ok even when EVERY channel failed —
+                        // the message is stored, only the push is lost — and
+                        // that lost-alert case is exactly what the history
+                        // correction exists to record.
+                        match manager.try_create_message(msg).await {
+                            Err(e) => {
+                                tracing::warn!(error = %e, "NOTIFY action failed (spawned)");
+                                Self::correct_spawned_outcome(
+                                    &history,
+                                    store,
+                                    &execution_ref,
+                                    accepted_for_correction,
+                                    format!("persist failed: {e}"),
+                                )
+                                .await;
+                            }
+                            Ok((_, report)) if report.delivered_any || !report.attempted => {}
+                            Ok((_, report)) => {
+                                tracing::warn!(
+                                    channels = %report.failures.join("; "),
+                                    "NOTIFY delivery lost on every channel (message stored)"
+                                );
+                                Self::correct_spawned_outcome(
+                                    &history,
+                                    store,
+                                    &execution_ref,
+                                    accepted_for_correction,
+                                    format!("all channels failed: {}", report.failures.join("; ")),
+                                )
+                                .await;
+                            }
+                        }
+                    });
+                    Ok(format!("{accepted} (spawned)"))
                 } else {
                     tracing::info!("NOTIFY: {} (no MessageManager)", formatted);
                     Ok(format!("NOTIFY: {} (logged only)", formatted))
@@ -778,39 +925,86 @@ impl RuleEngine {
                 params,
             } => match target_type {
                 ExecuteTarget::Device => {
-                    let executor = self.device_action_executor.read().await;
-                    if let Some(ex) = executor.as_ref() {
+                    let executor = self.device_action_executor.read().await.clone();
+                    if let Some(ex) = executor {
                         let params_map: HashMap<String, serde_json::Value> = params
                             .as_object()
                             .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                             .unwrap_or_default();
-                        match ex
-                            .execute_command_with_retry(target, command, &params_map)
-                            .await
-                        {
-                            Ok(_) => Ok(format!("EXECUTE: {}.{}", target, command)),
-                            Err(e) => Err(format!("EXECUTE failed: {}", e)),
-                        }
+                        // [decoupled] execute_command_with_retry sleeps
+                        // 1s/2s/4s between attempts on an offline device —
+                        // awaited inline that was ~10s per rule firing during
+                        // which the single consumer loop could not drain the
+                        // EventBus (dropped threshold crossings). Spawned, per
+                        // the same reasoning as TriggerAgent below.
+                        let label = format!("EXECUTE: {}.{}", target, command);
+                        let label_for_correction = label.clone();
+                        let history = Arc::clone(&self.history);
+                        let store = self.rule_store.read().as_ref().cloned();
+                        let execution_ref = execution.clone();
+                        let (target, command) = (target.clone(), command.clone());
+                        tokio::spawn(async move {
+                            if let Err(e) = ex
+                                .execute_command_with_retry(&target, &command, &params_map)
+                                .await
+                            {
+                                tracing::warn!(error = %e, "EXECUTE device action failed (spawned)");
+                                Self::correct_spawned_outcome(
+                                    &history,
+                                    store,
+                                    &execution_ref,
+                                    label_for_correction,
+                                    e.to_string(),
+                                )
+                                .await;
+                            }
+                        });
+                        Ok(format!("{label} (spawned)"))
                     } else {
                         tracing::info!("EXECUTE device {}.{} (no executor)", target, command);
                         Ok(format!("EXECUTE: {}.{} (logged only)", target, command))
                     }
                 }
                 ExecuteTarget::Extension => {
-                    let executor = self.extension_action_executor.read().await;
-                    if let Some(ex) = executor.as_ref() {
+                    let executor = self.extension_action_executor.read().await.clone();
+                    if let Some(ex) = executor {
                         let ext_action = crate::extension_integration::ExtensionCommandAction::new(
                             target, command,
                         )
                         .with_args(params.clone());
-                        match ex.execute(&ext_action).await {
-                            Ok(result) if result.success => Ok(format!(
-                                "EXTENSION: {}.{}",
-                                result.extension_id, result.command
-                            )),
-                            Ok(result) => Err(result.error.unwrap_or_else(|| "Failed".to_string())),
-                            Err(e) => Err(e),
-                        }
+                        // [decoupled] extension processes run out-of-process
+                        // with their own timeouts; same consumer-loop stall
+                        // risk as the device arm above.
+                        let label = format!("EXTENSION: {}.{}", target, command);
+                        let label_for_correction = label.clone();
+                        let history = Arc::clone(&self.history);
+                        let store = self.rule_store.read().as_ref().cloned();
+                        let execution_ref = execution.clone();
+                        tokio::spawn(async move {
+                            let failure = match ex.execute(&ext_action).await {
+                                Ok(result) if result.success => None,
+                                Ok(result) => {
+                                    let e = result.error.unwrap_or_else(|| "Failed".to_string());
+                                    tracing::warn!(error = %e, "EXTENSION action failed (spawned)");
+                                    Some(e)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "EXTENSION action failed (spawned)");
+                                    Some(e.to_string())
+                                }
+                            };
+                            if let Some(failure) = failure {
+                                Self::correct_spawned_outcome(
+                                    &history,
+                                    store,
+                                    &execution_ref,
+                                    label_for_correction,
+                                    failure,
+                                )
+                                .await;
+                            }
+                        });
+                        Ok(format!("{label} (spawned)"))
                     } else {
                         tracing::info!("EXECUTE extension {}.{} (no executor)", target, command);
                         Ok(format!("EXTENSION: {}.{} (logged only)", target, command))
@@ -823,39 +1017,69 @@ impl RuleEngine {
                 input,
                 data,
             } => {
-                let trigger = self.agent_trigger.read().await;
-                if let Some(cb) = trigger.as_ref() {
-                    // [decoupled] The full agent run used to be awaited INLINE
-                    // here — one rule with a TriggerAgent action stalled every
-                    // other rule's evaluation platform-wide for the entire
-                    // agent execution (bounded only by the global 5-min cap),
-                    // because on_data_update awaits evaluate_and_fire
-                    // sequentially per affected rule. Spawn it: rule
-                    // processing continues, and the agent's own executor
-                    // (semaphores, timeout, journaling) governs the run.
-                    let cb = cb.clone();
-                    let (spawn_id, spawn_input, spawn_data, log_id) = (
-                        agent_id.clone(),
-                        input.clone(),
-                        data.clone(),
-                        agent_id.clone(),
-                    );
-                    tokio::spawn(async move {
-                        if let Err(e) = cb(spawn_id, spawn_input, spawn_data).await {
-                            tracing::warn!(
-                                agent_id = %log_id,
-                                error = %e,
-                                "TRIGGER_AGENT execution failed"
-                            );
-                        }
-                    });
-                    Ok(format!("TRIGGER_AGENT: {} (spawned)", agent_id))
-                } else {
-                    tracing::warn!("TRIGGER_AGENT: {} (no callback wired)", agent_id);
-                    Err("TRIGGER_AGENT failed: agent trigger callback not initialized".to_string())
-                }
+                self.spawn_agent_run(agent_id, input.clone(), data.clone(), "TRIGGER_AGENT")
+                    .await
+            }
+
+            RuleAction::RunOperator { agent_id } => {
+                // No input: an operator collects its own bound sources and
+                // answers with schema-validated fields — there is no prompt to
+                // hand it. Which execution branch actually runs is decided by
+                // the agent's own mode downstream, not here.
+                self.spawn_agent_run(agent_id, None, None, "RUN_OPERATOR")
+                    .await
             }
         }
+    }
+
+    /// Spawn a run through the wired agent-trigger callback and return the
+    /// action summary the engine logs.
+    ///
+    /// [decoupled] The full agent run used to be awaited INLINE in the
+    /// `TriggerAgent` arm — one rule with that action stalled every other
+    /// rule's evaluation platform-wide for the entire agent execution (bounded
+    /// only by the global 5-min cap), because `on_data_update` awaits
+    /// `evaluate_and_fire` sequentially per affected rule. Every agent-running
+    /// action spawns instead: rule processing continues, and the agent's own
+    /// executor (semaphores, timeout, journaling) governs the run.
+    async fn spawn_agent_run(
+        &self,
+        agent_id: &str,
+        input: Option<String>,
+        data: Option<serde_json::Value>,
+        label: &str,
+    ) -> Result<String, String> {
+        let cb = {
+            let trigger = self.agent_trigger.read().await;
+            match trigger.as_ref() {
+                Some(cb) => cb.clone(),
+                None => {
+                    tracing::warn!("{}: {} (no callback wired)", label, agent_id);
+                    return Err(format!(
+                        "{} failed: agent trigger callback not initialized",
+                        label
+                    ));
+                }
+            }
+        };
+
+        let (spawn_id, log_id, spawn_label) = (
+            agent_id.to_string(),
+            agent_id.to_string(),
+            label.to_string(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = cb(spawn_id, input, data).await {
+                tracing::warn!(
+                    agent_id = %log_id,
+                    error = %e,
+                    "{} execution failed",
+                    spawn_label
+                );
+            }
+        });
+
+        Ok(format!("{}: {} (spawned)", label, agent_id))
     }
 
     // -- State helpers --
@@ -1016,6 +1240,179 @@ impl RuleEngine {
 mod tests {
     use super::*;
     use crate::models::*;
+
+    /// M2-5, first hop: an alert has to say which rule execution produced it.
+    /// The message carries that execution's identity — the same
+    /// `(rule_id, triggered_at)` pair its history row is keyed by — so the
+    /// chain needs no new id and no storage format change.
+    /// Notify delivery is spawned (see the [decoupled] note on the Notify
+    /// arm) — poll briefly for the message to land instead of assuming
+    /// synchronous delivery.
+    async fn await_message_count(
+        messages: &Arc<heramind_messages::MessageManager>,
+        expected: usize,
+    ) -> usize {
+        for _ in 0..100 {
+            let n = messages.list_messages().await.len();
+            if n >= expected {
+                return n;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        messages.list_messages().await.len()
+    }
+
+    #[tokio::test]
+    async fn a_notification_identifies_the_rule_execution_that_sent_it() {
+        let provider = Arc::new(InMemoryValueProvider::new());
+        let engine = RuleEngine::new(provider);
+        let messages = Arc::new(heramind_messages::MessageManager::new());
+        engine.set_message_manager(messages.clone()).await;
+
+        let mut rule = CompiledRule::new("Freezer watch");
+        rule.trigger = RuleTrigger::Manual;
+        rule.actions = vec![RuleAction::Notify {
+            message: "Cold room out of range".to_string(),
+            severity: NotifySeverity::Warning,
+        }];
+        rule.finalize();
+        let rule_id = rule.id.clone();
+        engine.add_rule(rule).await.unwrap();
+
+        let result = engine.execute_rule(&rule_id).await;
+        assert!(result.success, "the notify action must run");
+
+        let n = await_message_count(&messages, 1).await;
+        let sent = messages.list_messages().await;
+        assert_eq!(sent.len(), n.max(1), "one notify action, one message");
+        assert_eq!(sent.len(), 1, "one notify action, one message");
+
+        let metadata = sent[0]
+            .metadata
+            .as_ref()
+            .expect("an alert must record which rule execution sent it");
+        let expected_rule = rule_id.to_string();
+        assert_eq!(metadata["rule_id"].as_str(), Some(expected_rule.as_str()));
+        assert_eq!(
+            metadata["rule_execution_ms"].as_i64(),
+            Some(result.triggered_at.timestamp_millis()),
+            "the chain key must be the one the history row is stored under"
+        );
+    }
+
+    /// The operator picks a severity in the rule editor and it must survive to
+    /// the delivered message. Emergency used to be downgraded to Critical on
+    /// the way out ("MessageManager has no Emergency level" — a claim that
+    /// stopped being true when the severity was added), so a rule configured
+    /// as Emergency alerted as Critical: wrong label, wrong emoji, and it
+    /// ranked below nothing in the emergency filter.
+    #[tokio::test]
+    async fn emergency_severity_reaches_the_message_unchanged() {
+        let provider = Arc::new(InMemoryValueProvider::new());
+        let engine = RuleEngine::new(provider);
+        let messages = Arc::new(heramind_messages::MessageManager::new());
+        engine.set_message_manager(messages.clone()).await;
+
+        for (configured, expected) in [
+            (
+                NotifySeverity::Emergency,
+                heramind_messages::MessageSeverity::Emergency,
+            ),
+            (
+                NotifySeverity::Critical,
+                heramind_messages::MessageSeverity::Critical,
+            ),
+        ] {
+            let mut rule = CompiledRule::new("Alarm");
+            rule.trigger = RuleTrigger::Manual;
+            rule.actions = vec![RuleAction::Notify {
+                message: format!("{configured:?} alarm"),
+                severity: configured,
+            }];
+            rule.finalize();
+            let rule_id = rule.id.clone();
+            engine.add_rule(rule).await.unwrap();
+
+            let result = engine.execute_rule(&rule_id).await;
+            assert!(result.success, "the notify action must run");
+
+            let expected_label = format!("{configured:?} alarm");
+            let mut msg = None;
+            for _ in 0..100 {
+                if let Some(m) = messages
+                    .list_messages()
+                    .await
+                    .iter()
+                    .find(|m| m.message == expected_label)
+                    .cloned()
+                {
+                    msg = Some(m);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let msg = msg.expect("each notify action must produce its own message");
+            assert_eq!(
+                msg.severity, expected,
+                "{configured:?} must arrive as {expected:?}, not be silently downgraded"
+            );
+        }
+    }
+
+    /// M2-4: a rule that runs an operator must actually invoke it — and with
+    /// no prompt input, because an operator collects its own bound sources
+    /// rather than being told what to look at.
+    #[tokio::test]
+    async fn run_operator_action_invokes_the_operator_without_input() {
+        let provider = Arc::new(InMemoryValueProvider::new());
+        let engine = RuleEngine::new(provider);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+        engine
+            .set_agent_trigger_callback(Arc::new(
+                move |agent_id: String, input: Option<String>, data: Option<serde_json::Value>| {
+                    let tx = tx.clone();
+                    Box::pin(async move {
+                        let _ = tx
+                            .send(format!(
+                                "{agent_id}|in={}|data={}",
+                                input.is_some(),
+                                data.is_some()
+                            ))
+                            .await;
+                        Ok(())
+                    })
+                },
+            ))
+            .await;
+
+        let summary = engine
+            .execute_action(
+                &RuleAction::RunOperator {
+                    agent_id: "cam01-view".to_string(),
+                },
+                &RuleExecutionRef {
+                    rule_id: RuleId::new(),
+                    triggered_at: Utc::now(),
+                    rule_name: "test-rule".to_string(),
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("running an operator must not error");
+
+        assert!(summary.contains("cam01-view"), "summary: {summary}");
+
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the operator must be invoked")
+            .expect("callback channel must stay open");
+        assert_eq!(
+            seen, "cam01-view|in=false|data=false",
+            "an operator takes no input — it collects its own sources"
+        );
+    }
 
     #[tokio::test]
     async fn test_add_and_list_rules() {

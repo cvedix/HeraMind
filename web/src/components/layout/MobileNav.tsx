@@ -7,16 +7,16 @@
  * is shared via the `useMobileNav` store.
  *
  * Sections (top → bottom):
- *   1. User card — avatar + name + role (tap → preferences)
- *   2. Primary nav
- *   3. System nav
- *   4. Account & System entries — instance, onboarding, theme, language
- *   5. Logout
+ *   1. Nav destinations — one flat list
+ *   2. Utility zone (divided) — theme, language, onboarding guide
+ *   3. User card + Logout anchored at the bottom
  *
  * Desktop layout is unchanged.
  */
 
-import { useEffect, useMemo, useState, type ReactNode } from "react"
+import { useEffect, useMemo, useState } from "react"
+import { useExtensionPages as useExtensionPagesHook } from "@/hooks/useExtensionPages"
+import { mergeExtensionNavItems } from "./navItems"
 import { useNavigate, useLocation } from "react-router-dom"
 import { useTranslation } from "react-i18next"
 import {
@@ -36,6 +36,7 @@ import {
   Moon,
   Monitor,
   Globe,
+  ChevronDown,
   type LucideIcon,
 } from "lucide-react"
 import { useStore } from "@/store"
@@ -46,6 +47,13 @@ import { useTheme } from "@/components/ui/theme"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Sheet,
   SheetContent,
@@ -61,7 +69,7 @@ interface NavEntry {
   labelKey: string
 }
 
-const PRIMARY: NavEntry[] = [
+const BASE_PRIMARY: NavEntry[] = [
   { id: "chat", path: "/chat", icon: MessageSquare, labelKey: "nav.dashboard" },
   { id: "agents", path: "/agents", icon: Bot, labelKey: "nav.agents" },
   { id: "devices", path: "/devices", icon: Cpu, labelKey: "nav.devices" },
@@ -84,9 +92,14 @@ export function MobileNav() {
   const isMobile = useIsMobile()
   const { t, i18n } = useTranslation("common")
   const navigate = useNavigate()
+  const { pages: extensionPages } = useExtensionPagesHook()
   const openSettings = useStore((state) => state.openSettings)
   const location = useLocation()
   const user = useStore((s) => s.user)
+  const PRIMARY = useMemo(
+    () => mergeExtensionNavItems(BASE_PRIMARY as never, extensionPages) as NavEntry[],
+    [extensionPages],
+  )
   const logout = useStore((s) => s.logout)
   const alerts = useStore((s) => s.alerts)
   const { open, setOpen } = useMobileNav()
@@ -170,7 +183,7 @@ export function MobileNav() {
         />
         <span
           className={cn(
-            "flex-1 truncate text-sm",
+            "min-w-0 flex-1 truncate text-sm",
             active ? "font-medium text-foreground" : "text-muted-foreground",
           )}
         >
@@ -184,30 +197,6 @@ export function MobileNav() {
       </button>
     )
   }
-
-  // Compact icon-button row used for the Account section's quick toggles.
-  const renderIconButton = (
-    label: string,
-    icon: ReactNode,
-    onClick: () => void,
-    opts: { active?: boolean; badge?: boolean } = {},
-  ) => (
-    <Button
-      key={label}
-      variant="ghost"
-      size="icon"
-      onClick={onClick}
-      className={cn(
-        "h-9 w-9 shrink-0 rounded-lg",
-        opts.active ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground hover:bg-muted-50",
-      )}
-      aria-label={label}
-      title={label}
-    >
-      {icon}
-      {opts.badge && <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-primary" />}
-    </Button>
-  )
 
   return (
     <Sheet open={open} onOpenChange={setOpen}>
@@ -232,7 +221,7 @@ export function MobileNav() {
               variant="ghost"
               size="icon"
               onClick={() => setOpen(false)}
-              className="h-8 w-8 rounded-lg"
+              className="h-8 w-8 rounded-lg sm:h-8 sm:w-8"
               aria-label={t("system.back")}
             >
               <X className="h-4 w-4" />
@@ -244,42 +233,63 @@ export function MobileNav() {
             Radix ScrollArea's pointer-event handling on iOS swallows tap
             events that land during momentum-scroll settle, which made menu
             items feel unresponsive ("tap doesn't navigate"). Native scroll
-            has no such interception. */}
+            has no such interception. One flat destination list — the nav
+            split reads as noise; only the utility zone below is separated. */}
         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
           <div className="space-y-1 px-2 pb-2 pt-1">
             {PRIMARY.map(renderItem)}
-
             {SYSTEM_ENTRIES.map(renderItem)}
+          </div>
 
-            {/* Quick toggles + guides */}
-
-            {/* Theme quick toggle row — label on left, three icon buttons on right */}
-            <div className="flex items-center gap-1 rounded-lg p-2">
-              <Sun className="h-4 w-4 shrink-0 text-muted-foreground" />
-              <span className="flex-1 truncate text-sm text-muted-foreground">
-                {t("theme.label", "Theme")}
-              </span>
-              <div className="flex shrink-0 items-center gap-0.5">
-                {renderIconButton(
-                  t("theme.light", "Light"),
-                  <Sun className="h-4 w-4" />,
-                  () => setTheme("light"),
-                  { active: theme === "light" },
-                )}
-                {renderIconButton(
-                  t("theme.dark", "Dark"),
-                  <Moon className="h-4 w-4" />,
-                  () => setTheme("dark"),
-                  { active: theme === "dark" },
-                )}
-                {renderIconButton(
-                  t("theme.system", "System"),
-                  <Monitor className="h-4 w-4" />,
-                  () => setTheme("system"),
-                  { active: theme === "system" },
-                )}
-              </div>
-            </div>
+          {/* Utility zone — theme / language / guide. Divider separates it
+              from the nav destinations; rows reuse the nav-row geometry
+              (p-3, icon column) so the three zones read as one list. */}
+          <div className="border-t border-border px-2 pb-2 pt-2">
+            {/* Theme row — one tap target opening a labelled menu. The old
+                three-icon strip made you decode glyphs and hunt the active
+                state; a value row reads like the Language row below it. */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="group relative flex w-full items-center gap-3 rounded-lg p-3 text-left transition-all hover:bg-muted-50"
+                  aria-label={t("theme.label", "Theme")}
+                >
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+                    {theme === "light" ? (
+                      <Sun className="h-4 w-4 text-muted-foreground" />
+                    ) : theme === "dark" ? (
+                      <Moon className="h-4 w-4 text-muted-foreground" />
+                    ) : (
+                      <Monitor className="h-4 w-4 text-muted-foreground" />
+                    )}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">
+                    {t("theme.label", "Theme")}
+                  </span>
+                  <span className="shrink-0 text-xs font-medium text-muted-foreground">
+                    {theme === "light"
+                      ? t("theme.light", "Light")
+                      : theme === "dark"
+                        ? t("theme.dark", "Dark")
+                        : t("theme.system", "System")}
+                  </span>
+                  <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+                </button>
+              </DropdownMenuTrigger>
+              {/* Anchor to the row's right edge — the value + chevron is the
+                  affordance the menu belongs to, Select-style. */}
+              <DropdownMenuContent align="end" className="min-w-40">
+                <DropdownMenuRadioGroup
+                  value={theme}
+                  onValueChange={(v) => setTheme(v as "light" | "dark" | "system")}
+                >
+                  <DropdownMenuRadioItem value="light">{t("theme.light", "Light")}</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="dark">{t("theme.dark", "Dark")}</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="system">{t("theme.system", "System")}</DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
 
             {/* Language toggle row — same shape as other nav rows */}
             <button
@@ -291,10 +301,12 @@ export function MobileNav() {
                 const next = languageCycle[(currentIndex + 1) % languageCycle.length]
                 i18n.changeLanguage(next)
               }}
-              className="group relative flex w-full items-center gap-2 rounded-lg p-2 text-left transition-all hover:bg-muted-50"
+              className="group relative flex w-full items-center gap-3 rounded-lg p-3 text-left transition-all hover:bg-muted-50"
             >
-              <Globe className="h-4 w-4 shrink-0 text-muted-foreground" />
-              <span className="flex-1 truncate text-sm text-muted-foreground">
+              <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+                <Globe className="h-4 w-4 text-muted-foreground" />
+              </span>
+              <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">
                 {t("system.language")}
               </span>
               <span className="shrink-0 text-xs font-medium text-muted-foreground">
@@ -315,11 +327,13 @@ export function MobileNav() {
                 setOnboardingOpen(true)
               }}
               className={cn(
-                "group relative flex w-full items-center gap-2 rounded-lg p-2 text-left transition-all hover:bg-muted-50",
+                "group relative flex w-full items-center gap-3 rounded-lg p-3 text-left transition-all hover:bg-muted-50",
               )}
             >
-              <Rocket className="h-4 w-4 shrink-0 text-muted-foreground" />
-              <span className="flex-1 truncate text-sm text-muted-foreground">
+              <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+                <Rocket className="h-4 w-4 text-muted-foreground" />
+              </span>
+              <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">
                 {t("onboarding.title")}
               </span>
               {onboardingIncomplete && (
@@ -364,7 +378,7 @@ export function MobileNav() {
                   setOpen(false)
                   logout()
                 }}
-                className="h-9 w-9 shrink-0 rounded-lg text-error hover:text-error hover:bg-error-light"
+                className="h-9 w-9 shrink-0 rounded-lg text-error hover:text-error hover:bg-error-light sm:h-9 sm:w-9"
                 aria-label={t("logout")}
               >
                 <LogOut className="h-4 w-4" />

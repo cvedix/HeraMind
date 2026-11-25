@@ -8,45 +8,46 @@ import { useState, useEffect, useRef } from "react"
 import { useTranslation } from "react-i18next"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
 import { LoadingState } from "@/components/shared/LoadingState"
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 import { Badge } from "@/components/ui/badge"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { Separator } from "@/components/ui/separator"
 import {
+  Database,
+  Eye,
+  Workflow,
+  BrainCircuit,
+  Wrench,
   Bot,
   Clock,
   Activity,
   Brain,
-  Eye,
   Zap,
   BarChart3,
-  Loader2,
-  CheckCircle2,
-  XCircle,
-  Settings,
   FileText,
-  TrendingUp,
-  Database,
+
+
   MessageSquare,
   History,
-  Lightbulb,
-  BookOpen,
+
+
   ChevronDown,
+  ChevronRight,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { formatRelativeTime } from "@/lib/utils/format"
 import { textNano } from "@/design-system/tokens/typography"
 import { useIsMobile } from "@/hooks/useMobile"
 import { api } from "@/lib/api"
-import type { AiAgentDetail, AgentAvailableResources, AgentExecution, AgentMemory, KnowledgeFileRef, JournalExecutionRecord } from "@/types"
+import type { AiAgentDetail, AgentAvailableResources, AgentExecution, AgentMemory, KnowledgeFileRef, JournalExecutionRecord, LlmBackendInstance } from "@/types"
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { AgentExecutionStartedEvent, AgentExecutionCompletedEvent } from "@/lib/events"
+import { FullScreenDialogSidebar } from "@/components/automation/dialog/FullScreenDialog"
 import { useEvents } from "@/hooks/useEvents"
+import { MobileTabStrip } from "@/components/shared/MobileTabStrip"
 
 // Import sub-components
 import { AgentExecutionTimeline } from "./AgentExecutionTimeline"
-import { AgentThinkingPanel } from "./AgentThinkingPanel"
-import { AgentUserMessages } from "./AgentUserMessages"
+import { AgentUserMessages, AgentUserMessagesComposer } from "./AgentUserMessages"
 
 interface AgentDetailPanelProps {
   agent: AiAgentDetail | null
@@ -57,10 +58,8 @@ interface AgentDetailPanelProps {
   inlineMode?: boolean  // When true, used inside dialog (no empty state)
 }
 
-type DetailTab = 'overview' | 'history' | 'memory' | 'messages'
-
 // Role configuration - labels use i18n
-const ROLE_CONFIG: Record<string, { icon: typeof Activity; color: string }> = {
+const _ROLE_CONFIG: Record<string, { icon: typeof Activity; color: string }> = {
   Monitor: { icon: Activity, color: 'text-info' },
   Executor: { icon: Zap, color: 'text-accent-orange' },
   Analyst: { icon: BarChart3, color: 'text-accent-purple' },
@@ -68,8 +67,8 @@ const ROLE_CONFIG: Record<string, { icon: typeof Activity; color: string }> = {
 
 export function AgentDetailPanel({
   agent,
-  onEdit,
-  onExecute,
+  onEdit: _onEdit,
+  onExecute: _onExecute,
   onViewExecutionDetail,
   onRefresh,
   inlineMode = false,
@@ -77,15 +76,19 @@ export function AgentDetailPanel({
   const { t } = useTranslation(['common', 'agents'])
   const { handleError } = useErrorHandler()
   const isMobile = useIsMobile()
-  const [activeTab, setActiveTab] = useState<DetailTab>('overview')
   const [executions, setExecutions] = useState<AgentExecution[]>([])
   const [executionsLoading, setExecutionsLoading] = useState(false)
   const [memory, setMemory] = useState<AgentMemory | null>(null)
   const [memoryLoading, setMemoryLoading] = useState(false)
-  const [availableResources, setAvailableResources] = useState<AgentAvailableResources | null>(null)
+  const [_availableResources, setAvailableResources] = useState<AgentAvailableResources | null>(null)
 
   // Real-time status from WebSocket events
   const [realtimeStatus, setRealtimeStatus] = useState<string | null>(null)
+  // Backend id → human-readable name/model (the raw id means nothing to users)
+  const [llmBackends, setLlmBackends] = useState<LlmBackendInstance[]>([])
+  const [section, setSection] = useState<'overview' | 'history' | 'memory' | 'messages'>('overview')
+  // Bumped by the pinned composer so the message list refetches after a send
+  const [messagesVersion, setMessagesVersion] = useState(0)
 
   // Load executions immediately when agent is selected (preload)
   // and when switching back to history tab with stale data
@@ -95,12 +98,21 @@ export function AgentDetailPanel({
     }
   }, [agent?.id])
 
-  // Load memory when memory tab is active
+  // Backends for id→name resolution (cheap, cached by the API layer)
   useEffect(() => {
-    if (agent && activeTab === 'memory') {
+    let cancelled = false
+    api.listLlmBackends()
+      .then((res) => { if (!cancelled) setLlmBackends(res.backends) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+
+  // Memory loads with the agent — the panel is a single page now
+  useEffect(() => {
+    if (agent?.id) {
       loadMemory()
     }
-  }, [agent, activeTab])
+  }, [agent?.id])
 
   // Load available resources
   useEffect(() => {
@@ -142,9 +154,7 @@ export function AgentDetailPanel({
             // Clear realtime status - agent's original status will be used
             setRealtimeStatus(null)
             // Reload executions silently to include the just-completed one
-            if (activeTab === 'history') {
-              loadExecutions()
-            }
+            loadExecutions()
             // Reload agent data to get updated stats
             api.getAgent(currentAgentId).then(() => {
               // Notify parent to refresh if needed
@@ -229,241 +239,315 @@ export function AgentDetailPanel({
   }
 
   return (
-    <div className="flex flex-col gap-3 h-full">
-      {/* Real-time Thinking Panel - shows during execution */}
-      {agent.id && (
-        <AgentThinkingPanel
-          agentId={agent.id}
-          isExecuting={currentStatus === 'Executing'}
-        />
-      )}
+    <div className="flex h-full min-h-0 flex-col">
+      {/* Left-rail section nav + content — matches the app's quiet list language.
+          Mobile stacks: the section chips must sit ABOVE the content, never
+          beside it — as a row child they were squeezing content into a sliver. */}
+      <div className={cn("flex min-h-0 flex-1", isMobile ? "flex-col" : "flex-row")}>
+        <FullScreenDialogSidebar>
+          <div className="p-2 space-y-1">
+            {([
+              { value: 'overview', Icon: Eye, label: t('agents:detail.overview'), desc: t('agents:detail.sectionsDesc.overview') },
+              { value: 'history', Icon: History, label: t('agents:detail.history'), desc: t('agents:detail.sectionsDesc.history') },
+              { value: 'memory', Icon: Brain, label: t('agents:detail.memory'), desc: t('agents:detail.sectionsDesc.memory') },
+              { value: 'messages', Icon: MessageSquare, label: t('agents:detail.messages'), desc: t('agents:detail.sectionsDesc.messages') },
+            ] as const).map(({ value, Icon, label, desc }) => {
+              const isActive = section === value
+              return (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setSection(value)}
+                  className={cn(
+                    "flex w-full items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-left",
+                    isActive
+                      ? "bg-primary-light text-primary font-medium"
+                      : "text-muted-foreground hover:bg-muted-50 hover:text-foreground"
+                  )}
+                >
+                  <div className={cn(
+                    "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
+                    isActive ? "bg-primary-light text-primary" : "bg-muted-50"
+                  )}>
+                    <Icon className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className={cn("truncate text-sm", isActive ? "text-foreground" : "")}>{label}</div>
+                    <div className="truncate text-xs text-muted-foreground">{desc}</div>
+                  </div>
+                </button>
+              )
+            })}
+          </div>
+        </FullScreenDialogSidebar>
 
-      {/* Tabs */}
-      <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as DetailTab)} className="flex flex-col flex-1 min-h-0">
-        <div className={cn("pt-3", isMobile ? "px-2" : "px-4")}>
-          <TabsList className={cn(
-            isMobile
-              ? "grid grid-cols-4 gap-1 h-auto w-full p-0.5 rounded-lg border border-border bg-card"
-              : "h-9 p-0.5 rounded-lg border border-border bg-card"
+        {/* Mobile: horizontal section chips */}
+        {isMobile && (
+          <MobileTabStrip
+            items={[
+              { value: 'overview', label: t('agents:detail.overview') },
+              { value: 'history', label: t('agents:detail.history') },
+              { value: 'memory', label: t('agents:detail.memory') },
+              { value: 'messages', label: t('agents:detail.messages') },
+            ] as const}
+            value={section}
+            onValueChange={setSection}
+            ariaLabel={t('agents:detailTitle')}
+          />
+        )}
+
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {/* Messages owns its own scroll container — a native overflow div with a
+            definite height (flex-1 in this column) lets h-full/min-h-full work,
+            so the empty state can flex-centre. Radix ScrollArea's inner content
+            div is height-auto and defeats that. */}
+        {section === 'messages' ? (
+          <div className="min-h-0 flex-1 overflow-y-auto bg-muted-20">
+            <div className={cn(
+              "flex h-full flex-col",
+              isMobile ? "px-3 py-3" : "px-5 py-4"
+            )}>
+              <AgentUserMessages
+                agentId={agent.id}
+                refreshToken={messagesVersion}
+                onMessageAdded={onRefresh}
+              />
+            </div>
+          </div>
+        ) : (
+        <ScrollArea className="h-0 min-h-0 flex-1 bg-muted-20">
+          <div className={cn(
+            "space-y-5",
+            isMobile ? "px-3 py-3" : "px-5 py-4"
           )}>
-            <TabsTrigger
-              value="overview"
-              className={cn(
-                isMobile
-                  ? "flex flex-col items-center justify-center gap-1 py-1.5 px-1 min-w-0 rounded-md text-mini leading-none data-[state=active]:bg-foreground data-[state=active]:text-background data-[state=active]:shadow-none"
-                  : "h-7 px-3 rounded-md text-sm data-[state=active]:bg-foreground data-[state=active]:text-background data-[state=active]:shadow-none data-[state=active]:hover:bg-foreground hover:bg-muted"
-              )}
-            >
-              <Eye className={cn(isMobile ? "h-4 w-4" : "h-4 w-4 mr-1")} />
-              <span className={cn(isMobile && "truncate w-full text-center")}>{t('agents:detail.overview')}</span>
-            </TabsTrigger>
-            <TabsTrigger
-              value="history"
-              className={cn(
-                isMobile
-                  ? "flex flex-col items-center justify-center gap-1 py-1.5 px-1 min-w-0 rounded-md text-mini leading-none data-[state=active]:bg-foreground data-[state=active]:text-background data-[state=active]:shadow-none"
-                  : "h-7 px-3 rounded-md text-sm data-[state=active]:bg-foreground data-[state=active]:text-background data-[state=active]:shadow-none data-[state=active]:hover:bg-foreground hover:bg-muted"
-              )}
-            >
-              <Clock className={cn(isMobile ? "h-4 w-4" : "h-4 w-4 mr-1")} />
-              <span className={cn(isMobile && "truncate w-full text-center")}>{t('agents:detail.history')}</span>
-            </TabsTrigger>
-            <TabsTrigger
-              value="memory"
-              className={cn(
-                isMobile
-                  ? "flex flex-col items-center justify-center gap-1 py-1.5 px-1 min-w-0 rounded-md text-mini leading-none data-[state=active]:bg-foreground data-[state=active]:text-background data-[state=active]:shadow-none"
-                  : "h-7 px-3 rounded-md text-sm data-[state=active]:bg-foreground data-[state=active]:text-background data-[state=active]:shadow-none data-[state=active]:hover:bg-foreground hover:bg-muted"
-              )}
-            >
-              <Brain className={cn(isMobile ? "h-4 w-4" : "h-4 w-4 mr-1")} />
-              <span className={cn(isMobile && "truncate w-full text-center")}>{t('agents:detail.memory')}</span>
-            </TabsTrigger>
-            <TabsTrigger
-              value="messages"
-              className={cn(
-                isMobile
-                  ? "flex flex-col items-center justify-center gap-1 py-1.5 px-1 min-w-0 rounded-md text-mini leading-none data-[state=active]:bg-foreground data-[state=active]:text-background data-[state=active]:shadow-none"
-                  : "h-7 px-3 rounded-md text-sm data-[state=active]:bg-foreground data-[state=active]:text-background data-[state=active]:shadow-none data-[state=active]:hover:bg-foreground hover:bg-muted"
-              )}
-            >
-              <MessageSquare className={cn(isMobile ? "h-4 w-4" : "h-4 w-4 mr-1")} />
-              <span className={cn(isMobile && "truncate w-full text-center")}>{t('agents:detail.messages')}</span>
-            </TabsTrigger>
-          </TabsList>
-        </div>
+            {section === 'overview' && (
+              <>
+                              <div className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+                                {(() => {
+                                  const hasContract = (agent.output_schema?.length ?? 0) > 0
+                                  const role = agent.execution_mode === 'structured' && hasContract
+                                    ? 'recordData'
+                                    : agent.execution_mode === 'free' ? 'actOrInvestigate' : 'answer'
+                                  const RoleIcon = role === 'recordData' ? BarChart3 : role === 'actOrInvestigate' ? Workflow : MessageSquare
+                                  const isTool = (agent.memory_mode ?? (agent.execution_mode === 'structured' ? 'tool' : 'assistant')) === 'tool'
+                                  const MemIcon = isTool ? Wrench : BrainCircuit
+                                  return (
+                                    <>
+                                      <span className="inline-flex items-center gap-1 rounded-md bg-muted-30 px-1.5 py-0.5">
+                                        <RoleIcon className="h-3.5 w-3.5" />{t(`agents:card.role.${role}`)}
+                                      </span>
+                                      <span className="inline-flex items-center gap-1 rounded-md bg-muted-30 px-1.5 py-0.5">
+                                        <MemIcon className="h-3.5 w-3.5" />{t(`agents:card.memory.${isTool ? 'tool' : 'assistant'}`)}
+                                      </span>
+                                    </>
+                                  )
+                                })()}
+                                <span className={cn("text-xs text-muted-foreground tabular-nums", isMobile ? "w-full" : "ml-auto")}>
+                                  {t('common:updatedAt')} {new Date(agent.updated_at).toLocaleDateString()}
+                                  {agent.last_execution_at && (
+                                    <> · {t('agents:lastExecution')} {new Date(agent.last_execution_at).toLocaleString()}</>
+                                  )}
+                                </span>
+                              </div>
 
-        {/* Tab Contents */}
-        <div className="flex-1 min-h-0">
-          {/* Overview Tab */}
-          <TabsContent value="overview" className={cn("h-full m-0 pt-2", isMobile ? "p-2" : "p-4")}>
-            <ScrollArea className="h-full">
-              <div className="space-y-4 pr-2">
-                {/* Stats Grid - Top section */}
-                <DetailSection title="" icon={null}>
-                  <div className={cn("gap-2", isMobile ? "grid grid-cols-1" : "grid grid-cols-4")}>
-                    <StatItem
-                      icon={<Activity className="h-4 w-4" />}
-                      label={t('agents:detail.executions')}
-                      value={formatCount(agent.stats?.total_executions ?? agent.execution_count)}
-                      color="text-info"
-                    />
-                    <StatItem
-                      icon={<CheckCircle2 className="h-4 w-4" />}
-                      label={t('agents:detail.success')}
-                      value={formatCount(agent.stats?.successful_executions ?? agent.success_count)}
-                      color="text-success"
-                    />
-                    <StatItem
-                      icon={<XCircle className="h-4 w-4" />}
-                      label={t('agents:detail.failed')}
-                      value={formatCount(agent.stats?.failed_executions ?? agent.error_count)}
-                      color="text-error"
-                    />
-                    <StatItem
-                      icon={<Clock className="h-4 w-4" />}
-                      label={t('agents:detail.avgDuration')}
-                      value={formatDuration(agent.stats?.avg_duration_ms ?? agent.avg_duration_ms)}
-                      color="text-accent-orange"
-                    />
-                  </div>
-                </DetailSection>
+                              <div className="grid grid-cols-2 gap-3 rounded-2xl border border-border bg-card p-4 md:grid-cols-4 md:rounded-lg md:p-3">
+                                <div>
+                                  <div className="text-base font-semibold tabular-nums leading-tight">{formatCount(agent.stats?.total_executions ?? agent.execution_count)}</div>
+                                  <div className="text-xs text-muted-foreground">{t('agents:detail.executions')}</div>
+                                </div>
+                                <div>
+                                  <div className="text-base font-semibold tabular-nums leading-tight text-success">{formatCount(agent.stats?.successful_executions ?? agent.success_count)}</div>
+                                  <div className="text-xs text-muted-foreground">{t('agents:detail.success')}</div>
+                                </div>
+                                <div>
+                                  <div className={cn(
+                                    "text-base font-semibold tabular-nums leading-tight",
+                                    (agent.stats?.failed_executions ?? agent.error_count) > 0 ? "text-error" : ""
+                                  )}>{formatCount(agent.stats?.failed_executions ?? agent.error_count)}</div>
+                                  <div className="text-xs text-muted-foreground">{t('agents:detail.failed')}</div>
+                                </div>
+                                <div>
+                                  <div className="text-base font-semibold tabular-nums leading-tight">{formatDuration(agent.stats?.avg_duration_ms ?? agent.avg_duration_ms)}</div>
+                                  <div className="text-xs text-muted-foreground">{t('agents:detail.avgDuration')}</div>
+                                </div>
+                              </div>
 
-                {/* User Intent */}
-                <DetailSection title={t('agents:userPrompt')} icon={FileText}>
-                  <div className="text-sm leading-relaxed whitespace-pre-wrap text-foreground">
-                    {agent.user_prompt || t('agents:card.noDescription')}
-                  </div>
-                  {agent.parsed_intent && (
-                    <div className="mt-3 pt-3 border-t border-border">
-                      <div className="text-xs text-muted-foreground mb-1.5">{t('agents:creator.basicInfo.requirement')}</div>
-                      <div className="text-sm">
-                        <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-info-light text-info">
-                          {agent.parsed_intent.intent_type || '-'}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-                </DetailSection>
+                              <DetailSection title={t('agents:userPrompt')} icon={FileText}>
+                                <div className="text-sm leading-relaxed whitespace-pre-wrap text-foreground">
+                                  {agent.user_prompt || t('agents:card.noDescription')}
+                                </div>
+                              </DetailSection>
 
-                {/* Schedule & Config - Two columns */}
-                <div className={cn("gap-4", isMobile ? "grid grid-cols-1" : "grid grid-cols-2")}>
-                  {/* Schedule */}
-                  <DetailSection title={t('agents:detail.schedule')} icon={Clock}>
-                    <div className="space-y-1.5">
-                      <InfoRow label={t('agents:detail.type')} value={agent.schedule.schedule_type} />
-                      {agent.schedule.interval_seconds && (
-                        <InfoRow label={t('agents:detail.interval')} value={`${agent.schedule.interval_seconds}s`} />
-                      )}
-                      {agent.schedule.cron_expression && (
-                        <InfoRow label={t('agents:detail.cron')} value={agent.schedule.cron_expression} mono />
-                      )}
-                      {agent.schedule.event_filter && (
-                        <InfoRow label={t('agents:creator.schedule.event.triggerEvent')} value={agent.schedule.event_filter} mono />
-                      )}
-                    </div>
-                  </DetailSection>
+                              {(agent.output_schema?.length ?? 0) > 0 && (
+                                <DetailSection title={t('agents:detail.outputFields')} icon={Database}>
+                                  <div className="space-y-1">
+                                    {agent.output_schema!.map((f) => {
+                                      // The rich state when the backend sends
+                                      // it; the bare value map is the fallback.
+                                      const state = agent.latest_output_state?.[f.name]
+                                      const latest = state?.value ?? agent.latest_output?.[f.name]
+                                      return (
+                                        <div key={f.name} className="border-b border-border py-1.5 last:border-0">
+                                          <div className="flex items-baseline gap-2">
+                                            <span className="font-mono text-xs">{f.name}</span>
+                                            <span className="text-xs text-muted-foreground truncate">
+                                              {f.field_type.type === 'enum' ? `enum(${f.field_type.values.join('/')})` : t(`agents:detail.fieldType.${f.field_type.type}`)}
+                                              {f.unit ? ` · ${f.unit}` : ''}
+                                            </span>
+                                            <span className="ml-auto shrink-0 text-sm font-medium tabular-nums">
+                                              {latest !== undefined ? String(latest) : '—'}
+                                            </span>
+                                          </div>
+                                          {/* When it was published, how sure the
+                                              model was, and the way back to the
+                                              run behind the reading (002 §4.2). */}
+                                          {latest !== undefined && (
+                                            <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
+                                              {state && <span>{formatRelativeTime(state.at)}</span>}
+                                              {state?.confidence !== undefined && (
+                                                <span>{Math.round(state.confidence * 100)}%</span>
+                                              )}
+                                              {state?.execution_id && (
+                                                <button
+                                                  type="button"
+                                                  onClick={() =>
+                                                    onViewExecutionDetail(agent.id, state.execution_id!)
+                                                  }
+                                                  className="ml-auto inline-flex items-center gap-0.5 text-primary transition-colors hover:underline"
+                                                >
+                                                  {t('agents:detail.viewEvidence')}
+                                                  <ChevronRight className="h-3 w-3" />
+                                                </button>
+                                              )}
+                                            </div>
+                                          )}
+                                        </div>
+                                      )
+                                    })}
+                                    <p className="pt-1 text-xs text-muted-foreground">{t('agents:detail.outputFieldsHint')}</p>
+                                  </div>
+                                </DetailSection>
+                              )}
 
-                  {/* LLM Config */}
-                  {agent.llm_backend_id ? (
-                    <DetailSection title={t('agents:creator.basicInfo.llmBackend')} icon={Brain}>
-                      <InfoRow label={t('agents:creator.basicInfo.llmBackend')} value={agent.llm_backend_id} mono />
-                    </DetailSection>
-                  ) : (
-                    <DetailSection title={t('common:info')} icon={Settings}>
-                      <div className="space-y-1.5">
-                        <InfoRow label={t('common:createdAt')} value={new Date(agent.created_at).toLocaleString()} />
-                        <InfoRow label={t('common:updatedAt')} value={new Date(agent.updated_at).toLocaleString()} />
-                        {agent.last_execution_at && (
-                          <InfoRow label={t('agents:lastExecution')} value={new Date(agent.last_execution_at).toLocaleString()} />
-                        )}
-                      </div>
-                    </DetailSection>
-                  )}
+                              <div className="rounded-2xl border border-border bg-card p-4 md:rounded-lg">
+                                <div className="space-y-1.5">
+                                  <h4 className="text-sm font-medium">{t('agents:detail.schedule')}</h4>
+                                  <InfoRow label={t('agents:detail.type')} value={agent.schedule.schedule_type} />
+                                  {agent.schedule.interval_seconds && (
+                                    <InfoRow label={t('agents:detail.interval')} value={`${agent.schedule.interval_seconds}s`} />
+                                  )}
+                                  {agent.schedule.cron_expression && (
+                                    <InfoRow label={t('agents:detail.cron')} value={agent.schedule.cron_expression} mono />
+                                  )}
+                                  {agent.schedule.event_filter && (
+                                    <InfoRow label={t('agents:creator.schedule.event.triggerEvent')} value={agent.schedule.event_filter} mono />
+                                  )}
+                                </div>
+
+                                <div className="mt-4 space-y-1.5 border-t border-border pt-4">
+                                  <h4 className="text-sm font-medium">{t('agents:creator.basicInfo.llmBackend')}</h4>
+                                  {(() => {
+                                    const backend = llmBackends.find((b) => b.id === agent.llm_backend_id)
+                                    if (backend) {
+                                      return (
+                                        <>
+                                          <InfoRow label={t('agents:detail.model')} value={backend.name} />
+                                          {backend.model && (
+                                            <InfoRow label={t('agents:detail.modelId', 'Model')} value={backend.model} mono />
+                                          )}
+                                        </>
+                                      )
+                                    }
+                                    return (
+                                      <InfoRow
+                                        label={t('agents:detail.model')}
+                                        value={agent.llm_backend_id
+                                          ? `${agent.llm_backend_id.slice(0, 8)}…`
+                                          : t('agents:creator.basicInfo.useActiveBackend')}
+                                        mono={!!agent.llm_backend_id}
+                                      />
+                                    )
+                                  })()}
+                                  <InfoRow label={t('common:priority')} value={agent.priority ?? '-'} />
+                                </div>
+                              </div>
+
+                              <div className="md:rounded-lg md:border md:border-border md:bg-card md:p-4">
+                <DetailSection title={`${t('agents:detail.resources')} (${(agent.resources || []).length})`} icon={Zap}>
+                                <div className="space-y-2">
+                                  {(agent.resources || []).length > 0 && (
+                                    <p className="text-xs text-muted-foreground">
+                                      {Object.entries(
+                                        (agent.resources || []).reduce((acc, r) => {
+                                          const type = r.resource_type.toLowerCase()
+                                          acc[type] = (acc[type] || 0) + 1
+                                          return acc
+                                        }, {} as Record<string, number>)
+                                      ).map(([type, count]) => `${count} × ${type}`).join(' · ')}
+                                    </p>
+                                  )}
+                                  <div className={cn("gap-x-4 gap-y-1", isMobile ? "grid grid-cols-1" : "grid grid-cols-2")}>
+                                    {(agent.resources || []).slice(0, 8).map((resource, idx) => (
+                                      <div key={idx} className="flex items-baseline gap-2 border-b border-border py-1 last:border-0">
+                                        <span className="min-w-0 flex-1 truncate text-sm" title={resource.resource_id}>
+                                          {resource.name || resource.resource_id}
+                                        </span>
+                                        <span className="shrink-0 text-xs text-muted-foreground">{resource.resource_type}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                  {(agent.resources || []).length > 8 && (
+                                    <div className="text-xs text-muted-foreground pt-0.5">
+                                      {t('agents:detail.moreResources', { count: (agent.resources || []).length - 8 })}
+                                    </div>
+                                  )}
+                                </div>
+                              </DetailSection>
                 </div>
 
-                {/* Resources - Full width */}
-                <DetailSection title={`${t('agents:detail.resources')} (${(agent.resources || []).length})`} icon={Zap}>
-                  <div className="space-y-3">
-                    {/* Resource summary counts - group by actual types */}
-                    <div className="flex flex-wrap gap-3">
-                      {Object.entries(
-                        (agent.resources || []).reduce((acc, r) => {
-                          const type = r.resource_type.toLowerCase()
-                          acc[type] = (acc[type] || 0) + 1
-                          return acc
-                        }, {} as Record<string, number>)
-                      ).map(([type, count]) => (
-                        <div key={type} className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-muted text-foreground text-sm">
-                          <span className="capitalize text-muted-foreground">{type}:</span>
-                          <span className="font-semibold">{count}</span>
-                        </div>
-                      ))}
-                    </div>
-                    {/* Resource list */}
-                    <div className={cn("gap-2", isMobile ? "grid grid-cols-1" : "grid grid-cols-2")}>
-                      {(agent.resources || []).slice(0, 8).map((resource, idx) => (
-                        <div key={idx} className="flex items-center justify-between px-2.5 py-1.5 rounded-md bg-muted">
-                          <span className="text-sm truncate flex-1 mr-2" title={resource.resource_id}>
-                            {resource.name || resource.resource_id}
-                          </span>
-                          <Badge variant="secondary" className="text-xs shrink-0">
-                            {resource.resource_type}
-                          </Badge>
-                        </div>
-                      ))}
-                    </div>
-                    {(agent.resources || []).length > 8 && (
-                      <div className="text-xs text-muted-foreground text-center pt-1">
-                        {t('agents:detail.moreResources', { count: (agent.resources || []).length - 8 })}
-                      </div>
-                    )}
-                  </div>
-                </DetailSection>
-
-                {/* Timestamps - if LLM backend was shown above */}
-                {agent.llm_backend_id && (
-                  <DetailSection title={t('common:info')} icon={Settings}>
-                    <div className={cn("gap-2", isMobile ? "grid grid-cols-1" : "grid grid-cols-3")}>
-                      <InfoRow label={t('common:createdAt')} value={new Date(agent.created_at).toLocaleString()} />
-                      <InfoRow label={t('common:updatedAt')} value={new Date(agent.updated_at).toLocaleString()} />
-                      {agent.last_execution_at && (
-                        <InfoRow label={t('agents:lastExecution')} value={new Date(agent.last_execution_at).toLocaleString()} />
-                      )}
-                    </div>
-                  </DetailSection>
-                )}
-              </div>
-            </ScrollArea>
-          </TabsContent>
-
-          {/* History Tab */}
-          <TabsContent value="history" className="h-full m-0">
-            <AgentExecutionTimeline
-              executions={executions}
-              loading={executionsLoading}
+              </>
+            )}
+            {section === 'history' && (
+              <AgentExecutionTimeline
+                            executions={executions}
+                            loading={executionsLoading}
+                            agentId={agent.id}
+                            onViewExecutionDetail={onViewExecutionDetail}
+                          />
+            )}
+            {section === 'memory' && (
+              <>
+              <div className="mb-3 flex items-center gap-1.5 rounded-md bg-muted-30 px-2 py-1.5 text-xs text-muted-foreground">
+                            {(() => {
+                              const isTool = (agent.memory_mode ?? (agent.execution_mode === 'structured' ? 'tool' : 'assistant')) === 'tool'
+                              const MemIcon = isTool ? Wrench : BrainCircuit
+                              return (
+                                <>
+                                  <MemIcon className="h-3.5 w-3.5 shrink-0" />
+                                  <span>{t(`agents:detail.memoryModeNote.${isTool ? 'tool' : 'assistant'}`)}</span>
+                                </>
+                              )
+                            })()}
+                          </div>
+                          <MemoryContent memory={memory} loading={memoryLoading} />
+              </>
+            )}
+          </div>
+        </ScrollArea>
+        )}
+        {section === 'messages' && (
+          <div className={cn(
+            "shrink-0 border-t border-border bg-muted-20",
+            isMobile ? "px-3 py-2.5" : "px-5 py-3"
+          )}>
+            <AgentUserMessagesComposer
               agentId={agent.id}
-              onViewExecutionDetail={onViewExecutionDetail}
+              onSent={() => setMessagesVersion(v => v + 1)}
             />
-          </TabsContent>
-
-          {/* Memory Tab */}
-          <TabsContent value="memory" className={cn("h-full m-0 pt-2", isMobile ? "p-2" : "p-4")}>
-            <MemoryContent memory={memory} loading={memoryLoading} />
-          </TabsContent>
-
-          {/* Messages Tab */}
-          <TabsContent value="messages" className="h-full m-0">
-            <AgentUserMessages
-              agentId={agent.id}
-              onMessageAdded={() => {
-                // Refresh agent data to show updated message count
-                onRefresh()
-              }}
-            />
-          </TabsContent>
+          </div>
+        )}
         </div>
-      </Tabs>
+      </div>
     </div>
   )
 }
@@ -481,7 +565,7 @@ interface DetailSectionProps {
 
 function DetailSection({ title, icon: Icon, children }: DetailSectionProps) {
   return (
-    <div>
+    <div className="rounded-2xl border border-border bg-card p-4 md:rounded-none md:border-0 md:bg-transparent md:p-0">
       {title && Icon && (
         <h3 className="text-sm font-medium flex items-center gap-2 mb-3 text-foreground">
           <Icon className="h-4 w-4" />
@@ -493,27 +577,8 @@ function DetailSection({ title, icon: Icon, children }: DetailSectionProps) {
   )
 }
 
-// Compact Stat Item for stats grid
-interface StatItemProps {
-  icon: React.ReactNode
-  label: string
-  value: string | number
-  color: string
-}
 
-function StatItem({ icon, label, value, color }: StatItemProps) {
-  return (
-    <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg bg-card shadow-sm">
-      <div className={cn("shrink-0", color)}>{icon}</div>
-      <div className="flex-1 min-w-0">
-        <div className="text-xs text-muted-foreground truncate">{label}</div>
-        <div className="text-sm font-semibold truncate">{value}</div>
-      </div>
-    </div>
-  )
-}
-
-// Info Row Component
+// Info Row Component — definition-list row: muted label left, value right
 interface InfoRowProps {
   label: string
   value: string | number
@@ -522,9 +587,9 @@ interface InfoRowProps {
 
 function InfoRow({ label, value, mono }: InfoRowProps) {
   return (
-    <div className="flex items-baseline gap-2 py-1 text-sm">
-      <span className="text-muted-foreground text-xs shrink-0">{label}</span>
-      <span className={cn("font-medium text-xs truncate", mono && "font-mono")}>{value}</span>
+    <div className="flex items-baseline justify-between gap-3 py-1">
+      <span className="shrink-0 text-xs text-muted-foreground">{label}</span>
+      <span className={cn("truncate text-sm font-medium", mono && "font-mono")}>{value}</span>
     </div>
   )
 }
@@ -589,15 +654,15 @@ function MemoryContent({ memory, loading }: MemoryContentProps) {
 
   if (loading) {
     return (
-      <LoadingState size="md" className="h-full" />
+      <LoadingState size="md" className="py-12" />
     )
   }
 
   if (!memory) {
     return (
-      <div className="h-full flex flex-col items-center justify-center text-muted-foreground">
-        <Brain className="h-12 w-12 mb-3 opacity-20" />
-        <p className="text-sm">{t('agents:detail.noMemory')}</p>
+      <div className="flex flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed border-border py-12 text-center">
+        <Brain className="h-8 w-8 text-muted-foreground opacity-40" />
+        <p className="text-sm text-muted-foreground">{t('agents:detail.noMemory')}</p>
       </div>
     )
   }
@@ -608,10 +673,10 @@ function MemoryContent({ memory, loading }: MemoryContentProps) {
 
   if (isEmptyMemory) {
     return (
-      <div className="h-full flex flex-col items-center justify-center text-muted-foreground">
-        <Brain className="h-12 w-12 mb-3 opacity-20" />
-        <p className="text-sm">{t('agents:detail.noMemory')}</p>
-        <p className="text-xs mt-1 opacity-60">{t('agents:memory.emptyHint')}</p>
+      <div className="flex flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed border-border py-12 text-center">
+        <Brain className="h-8 w-8 text-muted-foreground opacity-40" />
+        <p className="text-sm text-muted-foreground">{t('agents:detail.noMemory')}</p>
+        <p className="text-xs text-muted-foreground opacity-70">{t('agents:memory.emptyHint')}</p>
       </div>
     )
   }
@@ -632,33 +697,25 @@ function MemoryContent({ memory, loading }: MemoryContentProps) {
   }
 
   return (
-    <ScrollArea className="h-full">
-      <div className="space-y-4 pr-2">
+      <div className="space-y-4">
         {/* Stats */}
-        <div className={cn("gap-2", isMobile ? "grid grid-cols-1" : "grid grid-cols-3")}>
-          {journalRecords.length > 0 && (
-            <div className="flex flex-col items-center p-3 rounded-lg bg-card shadow-sm">
-              <History className="h-4 w-4 text-muted-foreground mb-1" />
-              <span className="text-lg font-semibold text-foreground">{journalRecords.length}</span>
-              <span className={cn(textNano, "text-muted-foreground uppercase tracking-wide")}>{t('agents:memory.executions')}</span>
+        <div className="rounded-lg bg-card border border-border p-4">
+          <div className={cn("grid gap-4", isMobile ? "grid-cols-2" : "grid-cols-3")}>
+            <div>
+              <div className="text-base font-semibold tabular-nums leading-tight">{journalRecords.length}</div>
+              <div className="text-xs text-muted-foreground">{t('agents:memory.executions')}</div>
             </div>
-          )}
-          {knowledgeFiles.length > 0 && (
-            <div className="flex flex-col items-center p-3 rounded-lg bg-card shadow-sm">
-              <FileText className="h-4 w-4 text-muted-foreground mb-1" />
-              <span className="text-lg font-semibold text-foreground">{knowledgeFiles.length}</span>
-              <span className={cn(textNano, "text-muted-foreground uppercase tracking-wide")}>{t('agents:memory.knowledgeFiles')}</span>
+            <div>
+              <div className="text-base font-semibold tabular-nums leading-tight">{knowledgeFiles.length}</div>
+              <div className="text-xs text-muted-foreground">{t('agents:memory.knowledgeFiles')}</div>
             </div>
-          )}
-          {memory.updated_at && (
-            <div className="flex flex-col items-center p-3 rounded-lg bg-card shadow-sm">
-              <Clock className="h-4 w-4 text-muted-foreground mb-1" />
-              <span className="text-sm font-medium text-foreground">
-                {formatTime(memory.updated_at)}
-              </span>
-              <span className={cn(textNano, "text-muted-foreground uppercase tracking-wide")}>{t('agents:memory.lastUpdate')}</span>
-            </div>
-          )}
+            {memory.updated_at && (
+              <div>
+                <div className="text-base font-semibold leading-tight">{formatTime(memory.updated_at)}</div>
+                <div className="text-xs text-muted-foreground">{t('agents:memory.lastUpdate')}</div>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Knowledge Files */}
@@ -683,7 +740,7 @@ function MemoryContent({ memory, loading }: MemoryContentProps) {
           >
             <div className="space-y-2">
               {journalRecords.map((record: JournalExecutionRecord, idx: number) => (
-                <div key={idx} className="group rounded-lg border border-border hover:border-foreground/25 transition-colors">
+                <div key={idx} className="group rounded-lg border border-border bg-card hover:border-foreground/25 transition-colors">
                   <div className="pl-4 pr-3 py-3">
                     <div className="flex items-center justify-between mb-1">
                       <div className="flex items-center gap-2">
@@ -707,21 +764,9 @@ function MemoryContent({ memory, loading }: MemoryContentProps) {
                 </div>
               ))}
             </div>
+
           </DetailSection>
         )}
-
-        {/* Updated At footer */}
-        {memory.updated_at && (
-          <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground py-3 border-t border-border">
-            <Clock className="h-4 w-4" />
-            <span>{t('agents:memory.updatedAt')}: {
-              typeof memory.updated_at === 'number'
-                ? new Date(memory.updated_at * 1000).toLocaleString()
-                : new Date(memory.updated_at).toLocaleString()
-            }</span>
-          </div>
-        )}
       </div>
-    </ScrollArea>
   )
 }

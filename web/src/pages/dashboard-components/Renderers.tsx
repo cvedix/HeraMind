@@ -6,7 +6,7 @@
  * Also used by SharedDashboard.tsx.
  */
 
-import { useState, useCallback, useMemo, memo } from 'react'
+import { useState, useCallback, memo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 import { createStableKey as createStableCacheKey } from '@/lib/stable-key'
@@ -171,7 +171,7 @@ export function scheduleDashboardIdleTask(task: () => void, timeout = 1500): () 
   return () => window.clearTimeout(timer)
 }
 
-function getTelemetryDataSource(dataSource: DataSourceOrList | undefined): DataSourceOrList | undefined {
+function _getTelemetryDataSource(dataSource: DataSourceOrList | undefined): DataSourceOrList | undefined {
   if (!dataSource) return undefined
   // Sort array data sources by a stable key to avoid cache misses from different orderings
   const sortedSource = Array.isArray(dataSource)
@@ -242,7 +242,7 @@ export function getCommonDisplayProps(component: DashboardComponent) {
   }
 }
 
-function getSpreadableProps(componentType: string, commonProps: Record<string, unknown>): Record<string, unknown> {
+function _getSpreadableProps(componentType: string, commonProps: Record<string, unknown>): Record<string, unknown> {
   const noStandardSize = ['led-indicator', 'toggle-switch', 'heading', 'tabs', 'agent-monitor-widget', 'ai-analyst']
   const noShowCard = ['value-card', 'led-indicator', 'sparkline', 'progress-bar', 'toggle-switch', 'heading', 'alert-banner', 'agent-monitor-widget', 'ai-analyst', 'tabs']
   const noTitle = ['sparkline', 'led-indicator', 'progress-bar', 'toggle-switch', 'heading', 'alert-banner', 'tabs', 'agent-monitor-widget']
@@ -346,8 +346,8 @@ const ComponentWrapper = memo(function ComponentWrapper({
   const { t } = useTranslation('dashboardComponents')
   const { isHovered: isTouchHovered, hoverProps } = useTouchHover({ enabled: editMode && !isMobile })
 
-  const handleMouseEnter = useCallback(() => setIsHovered(true), [])
-  const handleMouseLeave = useCallback(() => setIsHovered(false), [])
+  const _handleMouseEnter = useCallback(() => setIsHovered(true), [])
+  const _handleMouseLeave = useCallback(() => setIsHovered(false), [])
   const handleConfigClick = useCallback(() => onOpenConfig(component.id), [component.id, onOpenConfig])
   const handleDuplicateClick = useCallback(() => onDuplicate(component.id), [component.id, onDuplicate])
 
@@ -381,21 +381,7 @@ const ComponentWrapper = memo(function ComponentWrapper({
         <div className={cn('absolute inset-0 z-10 flex items-center justify-center rounded-lg', isSelected ? 'bg-transparent' : 'bg-muted-30')}>
           {onSelect && (
             <button className={cn('absolute inset-0', isSelected ? 'pointer-events-none' : 'cursor-pointer')}
-              onClick={handleEditButtonMouseEvent} onTouchEnd={handleEditButtonTouchEvent} aria-label="Select component" />
-          )}
-          {isSelected && (
-            <div className="absolute bottom-2 right-2 z-20 flex gap-1">
-              <Button variant="secondary" size="xs" onClick={handleConfigClick}>
-                <Settings2 className="h-3 w-3 mr-1" />{t('componentWrapper.config')}
-              </Button>
-              <Button variant="secondary" size="xs" onClick={handleDuplicateClick}>
-                <Copy className="h-3 w-3 mr-1" />{t('componentWrapper.copy')}
-              </Button>
-              <Button variant="secondary" size="xs" className="hover:bg-destructive hover:text-destructive-foreground"
-                onClick={() => { confirm({ title: t('componentWrapper.remove'), description: t('componentWrapper.removeConfirm'), confirmText: t('componentWrapper.remove'), variant: 'destructive' }).then(ok => { if (ok) onRemove(component.id) }) }}>
-                <Trash2 className="h-3 w-3 mr-1" />{t('componentWrapper.remove')}
-              </Button>
-            </div>
+              onClick={handleEditButtonMouseEvent} onTouchEnd={handleEditButtonTouchEvent} aria-label={t('componentWrapper.select')} />
           )}
         </div>
       )}

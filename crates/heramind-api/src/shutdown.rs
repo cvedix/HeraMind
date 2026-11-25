@@ -99,7 +99,12 @@ pub async fn cleanup_resources(state: &ServerState) {
     // 3. Stop embedded broker (feature-gated)
     #[cfg(feature = "embedded-broker")]
     {
-        let broker = state.devices.embedded_broker.read().unwrap().clone();
+        let broker = state
+            .devices
+            .embedded_broker
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(broker) = broker.as_ref() {
             if broker.is_running() {
                 tracing::info!("Stopping embedded MQTT broker...");
@@ -113,8 +118,46 @@ pub async fn cleanup_resources(state: &ServerState) {
     // 4. Flush any pending database writes
     tracing::info!("Flushing storage...");
 
-    // Note: TimeSeriesStorage doesn't have explicit flush/close
-    // The redb database handles this via Drop
+    // The timeseries WriteBuffer is a plain in-memory Vec — redb's Drop
+    // knows nothing about it. Without this flush, Ctrl+C / SIGTERM lost
+    // every point still sitting in the 200-point / 500ms buffer even
+    // though write() had already reported success for them. open() hits
+    // the process-wide singleton for the live path, so this flushes the
+    // SAME buffer the server has been writing through.
+    // Route through the LIVE telemetry wrapper, not a fresh open(): the
+    // persistent store opens DEFERRED in the background, and when shutdown
+    // races that open the singleton is unset — open() here would create a
+    // second redb handle, hit the exclusive file lock, and fail, leaving the
+    // placeholder store that actually holds the buffered points undrained.
+    // state.devices.telemetry always addresses the store currently receiving
+    // writes (placeholder or persistent), whichever won the race.
+    match state.devices.telemetry.flush() {
+        Ok(()) => {
+            tracing::info!("Telemetry write buffer flushed");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Telemetry final flush failed");
+            // Fallback for paths that bypass the wrapper (tests, embedded use).
+            if let Ok(ts) = heramind_storage::TimeSeriesStore::open(
+                heramind_core::paths::store_path("telemetry.redb"),
+            ) {
+                ts.shutdown();
+                tracing::info!("Telemetry write buffer flushed (singleton fallback)");
+            }
+        }
+    }
+
+    // 4b. Stale atomic-write temps: unique per process now, so a crashed
+    // run's leftovers are pure garbage — sweep them at shutdown (the fn's
+    // own doc suggested init-time, but shutdown is when the directory is
+    // guaranteed quiescent for OUR writes).
+    {
+        let dir = heramind_core::paths::data_dir();
+        let removed = heramind_storage::atomic_write::cleanup_stale_temps(&dir);
+        if removed > 0 {
+            tracing::info!(count = removed, "Swept stale atomic-write temp files");
+        }
+    }
 
     // 5. Log session counts
     let sessions = state.agents.session_manager.list_sessions().await;

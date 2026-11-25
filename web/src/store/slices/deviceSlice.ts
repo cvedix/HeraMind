@@ -44,7 +44,16 @@ export interface DeviceSlice extends DeviceState, TelemetryState {
   addDevice: (request: AddDeviceRequest) => Promise<boolean>
   updateDevice: (id: string, request: Partial<AddDeviceRequest>) => Promise<boolean>
   deleteDevice: (id: string) => Promise<boolean>
-  sendCommand: (deviceId: string, command: string, params?: Record<string, unknown>) => Promise<boolean>
+  /**
+   * Returns a truthy delivery result when the backend accepted the send,
+   * or `false` on failure. Callers must not treat truthy as device ACK —
+   * inspect `delivery` / use `deriveCommandDeliveryLadder`.
+   */
+  sendCommand: (
+    deviceId: string,
+    command: string,
+    params?: Record<string, unknown>,
+  ) => Promise<import('@/lib/commandDeliveryLadder').SendCommandDeliveryResult | false>
 
   addDeviceType: (definition: DeviceType) => Promise<boolean>
   deleteDeviceType: (id: string) => Promise<boolean>
@@ -55,7 +64,7 @@ export interface DeviceSlice extends DeviceState, TelemetryState {
   fetchDeviceDetails: (id: string) => Promise<Device | null>
   fetchDeviceTypeDetails: (deviceType: string) => Promise<DeviceType | null>
 
-  fetchTelemetryData: (deviceId: string, metric?: string, start?: number, end?: number, limit?: number, offset?: number) => Promise<void>
+  fetchTelemetryData: (deviceId: string, metric?: string, start?: number, end?: number, limit?: number, offset?: number, cursor?: number | null) => Promise<void>
   fetchTelemetrySummary: (deviceId: string, hours?: number) => Promise<void>
   fetchDeviceCurrentState: (deviceId: string) => Promise<void>  // New: unified device + metrics
   fetchDevicesCurrentBatch: (deviceIds: string[], signal?: AbortSignal) => Promise<void>  // Batch fetch for dashboard
@@ -298,11 +307,15 @@ export const createDeviceSlice: StateCreator<
   sendCommand: async (deviceId, command, params) => {
     try {
       const result = await api.sendCommand(deviceId, command, params)
-      // Backend returns { device_id, command, sent: true } after unwrap
+      // Backend returns { sent, delivery, delivery_note } after unwrap
       if (result.sent) {
         fetchCache.invalidate('devices')
         await get().fetchDevices()
-        return true
+        return {
+          sent: true,
+          delivery: result.delivery ?? null,
+          delivery_note: result.delivery_note ?? null,
+        }
       }
       return false
     } catch (error) {
@@ -413,10 +426,19 @@ export const createDeviceSlice: StateCreator<
   },
 
   // Telemetry
-  fetchTelemetryData: async (deviceId, metric, start, end, limit, offset) => {
+  fetchTelemetryData: async (deviceId, metric, start, end, limit, offset, cursor) => {
     set({ telemetryLoading: true })
     try {
-      const data = await api.getDeviceTelemetry(deviceId, metric, start, end, limit, offset)
+      const data = await api.getDeviceTelemetry(
+        deviceId,
+        metric,
+        start,
+        end,
+        limit,
+        offset,
+        undefined,
+        cursor,
+      )
       set({ telemetryData: data })
     } catch (error) {
       logError(error, { operation: 'Fetch telemetry data' })
@@ -449,7 +471,9 @@ export const createDeviceSlice: StateCreator<
       const newValues = buildNestedValues(data.metrics || {})
       // Sync status fields (online/status/last_seen/transport_*) back to the
       // devices list cache — same rationale as fetchDeviceDetails above.
-      const frag = data as Partial<DeviceStatusFragment>
+      // These fields live under `data.device` in the /current envelope; reading
+      // them from the top level left every field undefined (silent no-op).
+      const frag = data.device as Partial<DeviceStatusFragment>
       const online = frag.online
       const status = frag.status
       const lastSeen = frag.last_seen
@@ -705,9 +729,13 @@ export const createDeviceSlice: StateCreator<
 
           const now = new Date().toISOString()
           for (const [devId, props] of deviceUpdates) {
-            // Skip devices that no longer exist (deleted between push and flush)
+            // Skip devices that no longer exist (deleted between push and flush).
+            // Derived namespaces (ai:{agent} / transform:{id}) are exempt: they
+            // are not registered devices, but their events ARE the realtime
+            // feed for bindings on those sources.
+            const isDerivedNamespace = devId.startsWith('ai:') || devId.startsWith('transform:')
             const device = findDevice(state.devices, devId)
-            if (!device && !state.deviceTelemetry[devId]) continue
+            if (!isDerivedNamespace && !device && !state.deviceTelemetry[devId]) continue
 
             const existing = state.deviceTelemetry[devId] || {}
             let merged = { ...existing }
@@ -767,7 +795,7 @@ export const createDeviceSlice: StateCreator<
 
   // Apply current_values batch from fetchDeviceTelemetry directly via set(),
   // bypassing BatchUpdater RAF so store subscribers are notified immediately.
-  _applyCurrentValuesBatch: (results, deviceIds) => {
+  _applyCurrentValuesBatch: (results, _deviceIds) => {
     set((state) => {
       let changed = false
       const telemetryPatch: Record<string, Record<string, unknown>> = {}

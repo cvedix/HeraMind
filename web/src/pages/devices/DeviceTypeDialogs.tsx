@@ -43,14 +43,13 @@ import {
   MoreVertical,
   Download,
   Loader2,
-  FileJson,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { textMini } from "@/design-system/tokens/typography"
 import { api, fetchAPI } from "@/lib/api"
 import { useIsMobile } from "@/hooks/useMobile"
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from "@/components/ui/collapsible"
-import type { DeviceType, MetricDefinition, CommandDefinition } from "@/types"
+import type { DeviceType, MetricDefinition, CommandDefinition, ParameterDefinition, TransformAutomation } from "@/types"
 import {
   FullScreenDialog,
   FullScreenDialogHeader,
@@ -58,6 +57,7 @@ import {
   FullScreenDialogFooter,
   FullScreenDialogMain,
 } from "@/components/automation/dialog"
+import { normalizeDataType } from "@/components/devices/parameterOptions"
 
 /**
  * Helper function to safely format data_type for display
@@ -65,16 +65,25 @@ import {
  */
 function formatDataType(dataType: string | Record<string, unknown> | undefined): string {
   if (!dataType) return 'unknown'
-  if (typeof dataType === 'string') return dataType
-  // If data_type is an object (e.g., { array: true }), format it
-  if (typeof dataType === 'object') {
-    const keys = Object.keys(dataType)
-    if (keys.length === 1) {
-      return keys[0]  // e.g., "array"
-    }
-    return JSON.stringify(dataType)
+  const n = normalizeDataType(dataType)
+  if (typeof n === 'string') return n
+  if (typeof n === 'object') {
+    const keys = Object.keys(n)
+    if (keys.length === 1) return keys[0]
+    return JSON.stringify(n)
   }
   return String(dataType)
+}
+
+/** Normalize command parameters after JSON import (TitleCase / enum-object). */
+function normalizeImportedParameters(
+  parameters: ParameterDefinition[] | undefined,
+): ParameterDefinition[] {
+  if (!parameters) return []
+  return parameters.map((p) => ({
+    ...p,
+    data_type: normalizeDataType(p.data_type),
+  }))
 }
 
 // Validation result type
@@ -496,7 +505,7 @@ function DataDefinitionStep({
 }: DataDefinitionStepProps) {
   const { t } = useTranslation(['devices'])
   const { toast } = useToast()
-  const isMobile = useIsMobile()
+  const _isMobile = useIsMobile()
   const isRawMode = data.mode === 'simple'
   const [showImportDialog, setShowImportDialog] = useState(false)
   const [jsonInput, setJsonInput] = useState('')
@@ -635,8 +644,26 @@ function DataDefinitionStep({
       // Handle array of samples
       const samples = Array.isArray(parsed) ? parsed : [parsed]
 
+      // Guard: a firmware config export is not telemetry. Devices like the
+      // NE302 camera can export their whole config tree as JSON; flattening
+      // it turns hundreds of settings into "metrics" that no uplink ever
+      // matches (this exact case produced a 269-metric ne302_camera type).
+      const looksLikeConfigDump = samples.some(
+        (s) =>
+          s &&
+          typeof s === 'object' &&
+          !Array.isArray(s) &&
+          (('config' in s && s.config && typeof s.config === 'object') ||
+            'export_version' in s ||
+            'config_magic_number' in s)
+      )
+      if (looksLikeConfigDump) {
+        setImportError(t('devices:metricEditor.configDumpDetected'))
+        return
+      }
+
       // Collect all unique keys and their values using flattenJson for nested support
-      const valueMap = new Map<string, Set<any>>()
+      const valueMap = new Map<string, Set<unknown>>()
       for (const sample of samples) {
         if (typeof sample === 'object' && sample !== null) {
           // Use flattenJson to get all nested paths
@@ -692,8 +719,11 @@ function DataDefinitionStep({
         }
 
         metricsToAdd.push({
-          // Convert dotted path to snake_case (e.g., "sensor.temperature" -> "sensor_temperature")
-          name: key.replace(/\./g, '_'),
+          // Keep the dotted path as the metric name: template metric names
+          // double as extraction paths — extract_by_path resolves dots and
+          // [index] segments (snake_case names made every imported metric
+          // permanently unextractable).
+          name: key,
           display_name: finalDisplayName,
           data_type: dataType,
           unit: '',
@@ -787,9 +817,9 @@ function DataDefinitionStep({
                   variant="outline"
                   size="sm"
                   onClick={() => setShowImportDialog(true)}
-                  className="h-8 text-xs"
+                  className="gap-1"
                 >
-                  <Code className="mr-1 h-4 w-4" />
+                  <Code className="h-4 w-4" />
                   {t('devices:metricEditor.generateFromJson')}
                 </Button>
               </div>
@@ -802,18 +832,20 @@ function DataDefinitionStep({
               <h4 className="text-sm font-medium">
                 {t('devices:metricEditor.metricCount', { count: data.metrics?.length || 0 })}
               </h4>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {/* No bare h-8 — size="sm" is h-11 on mobile / h-9 on sm+;
+                    a fixed h-8 made Import JSON shorter than Add Metric. */}
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={() => setShowImportDialog(true)}
-                  className="gap-1 h-8"
+                  className="gap-1"
                 >
                   <Code className="h-4 w-4" />
                   {t('devices:metricEditor.importJson')}
                 </Button>
-                <Button onClick={addMetric} size="sm" variant="outline">
-                  <Plus className="mr-1 h-4 w-4" />
+                <Button onClick={addMetric} size="sm" variant="outline" className="gap-1">
+                  <Plus className="h-4 w-4" />
                   {t('devices:metricEditor.addMetric')}
                 </Button>
               </div>
@@ -976,11 +1008,11 @@ function CommandsStep({
       const commandsToAdd = Array.isArray(imported) ? imported : [imported]
 
       // Convert to CommandDefinition format
-      const newCommands = commandsToAdd.map((cmd: any) => ({
-        name: cmd.name || `cmd_${Date.now()}`,
-        display_name: cmd.display_name || cmd.name || t('devices:commandsStep.importedCommand', 'Imported Command'),
-        payload_template: cmd.payload_template || cmd.payload || JSON.stringify(cmd),
-        parameters: cmd.parameters || [],
+      const newCommands = (commandsToAdd as Array<Record<string, unknown>>).map((cmd) => ({
+        name: (cmd.name as string) || `cmd_${Date.now()}`,
+        display_name: (cmd.display_name as string) || (cmd.name as string) || t('devices:commandsStep.importedCommand', 'Imported Command'),
+        payload_template: (cmd.payload_template as string) || (cmd.payload as string) || JSON.stringify(cmd),
+        parameters: normalizeImportedParameters(cmd.parameters as ParameterDefinition[] | undefined),
       }))
 
       onChange({
@@ -1014,11 +1046,11 @@ function CommandsStep({
         const imported = JSON.parse(event.target?.result as string)
         const commandsToAdd = Array.isArray(imported) ? imported : [imported]
 
-        const newCommands = commandsToAdd.map((cmd: any) => ({
-          name: cmd.name || `cmd_${Date.now()}`,
-          display_name: cmd.display_name || cmd.name || t('devices:commandsStep.importedCommand', 'Imported Command'),
-          payload_template: cmd.payload_template || cmd.payload || JSON.stringify(cmd),
-          parameters: cmd.parameters || [],
+        const newCommands = (commandsToAdd as Array<Record<string, unknown>>).map((cmd) => ({
+          name: (cmd.name as string) || `cmd_${Date.now()}`,
+          display_name: (cmd.display_name as string) || (cmd.name as string) || t('devices:commandsStep.importedCommand', 'Imported Command'),
+          payload_template: (cmd.payload_template as string) || (cmd.payload as string) || JSON.stringify(cmd),
+          parameters: normalizeImportedParameters(cmd.parameters as ParameterDefinition[] | undefined),
         }))
 
         onChange({
@@ -1179,7 +1211,7 @@ function MetricEditorCompact({
               <Label className="text-xs text-muted-foreground">{t('devices:metricEditor.dataType')}</Label>
               <Select
                 value={metric.data_type}
-                onValueChange={(value) => onChange({ ...metric, data_type: value as any })}
+                onValueChange={(value) => onChange({ ...metric, data_type: value as MetricDefinition['data_type'] })}
               >
                 <SelectTrigger className="h-9 text-sm">
                   <SelectValue />
@@ -1305,7 +1337,7 @@ function CommandEditorCompact({
   }
 
   // Update a parameter
-  const updateParameter = (index: number, param: any) => {
+  const updateParameter = (index: number, param: Partial<ParameterDefinition>) => {
     const params = command.parameters || []
     const newParams = [...params]
     newParams[index] = { ...newParams[index], ...param }
@@ -1373,7 +1405,7 @@ function CommandEditorCompact({
   const formatDataType = (dt: string | Record<string, unknown>): string => {
     if (typeof dt === 'string') return dt
     if (typeof dt === 'object' && dt !== null) {
-      if ('enum' in dt) return `enum: ${JSON.stringify((dt as any).enum)}`
+      if ('enum' in dt) return `enum: ${JSON.stringify((dt as { enum: unknown }).enum)}`
       return JSON.stringify(dt)
     }
     return String(dt)
@@ -1434,7 +1466,7 @@ function CommandEditorCompact({
                     variant="outline"
                     size="sm"
                     onClick={() => applyTemplate(tmpl.template)}
-                    className="h-7 text-xs justify-start"
+                    className="h-7 text-xs justify-start sm:h-7"
                   >
                     {tmpl.name}
                   </Button>
@@ -1476,7 +1508,7 @@ function CommandEditorCompact({
                   variant={previewMode === 'visual' ? 'secondary' : 'ghost'}
                   size="sm"
                   onClick={() => setPreviewMode('visual')}
-                  className="h-6 text-xs"
+                  className="h-6 text-xs sm:h-6"
                 >
                   {t('devices:commandEditor.visual')}
                 </Button>
@@ -1484,7 +1516,7 @@ function CommandEditorCompact({
                   variant={previewMode === 'json' ? 'secondary' : 'ghost'}
                   size="sm"
                   onClick={() => setPreviewMode('json')}
-                  className="h-6 text-xs"
+                  className="h-6 text-xs sm:h-6"
                 >
                   {t('devices:commandEditor.json')}
                 </Button>
@@ -1523,8 +1555,8 @@ function CommandEditorCompact({
                       {idx < arr.length - 1 && <span className="text-muted-foreground">,</span>}
                       {item.type === 'param' && (
                         <div className="ml-4 text-xs text-muted-foreground">
-                          {(item as any).param?.display_name || (item as any).param?.name}
-                          {(item as any).param?.data_type !== 'string' && ` (${formatDataType((item as any).param?.data_type || 'string')})`}
+                          {(item as { param?: ParameterDefinition }).param?.display_name || (item as { param?: ParameterDefinition }).param?.name}
+                          {(item as { param?: ParameterDefinition }).param?.data_type !== 'string' && ` (${formatDataType((item as { param?: ParameterDefinition }).param?.data_type || 'string')})`}
                         </div>
                       )}
                     </div>
@@ -1566,7 +1598,7 @@ function CommandEditorCompact({
                 variant="outline"
                 size="sm"
                 onClick={addParameter}
-                className="h-7 text-xs"
+                className="h-7 text-xs sm:h-7"
               >
                 <Plus className="mr-1 h-4 w-4" />
                 {t('devices:commandEditor.addParam')}
@@ -1612,7 +1644,7 @@ function CommandEditorCompact({
                         <td className="px-2 py-1">
                           <Select
                             value={typeof param.data_type === 'string' ? param.data_type : 'string'}
-                            onValueChange={(value) => updateParameter(pIdx, { data_type: value })}
+                            onValueChange={(value) => updateParameter(pIdx, { data_type: value as ParameterDefinition['data_type'] })}
                           >
                             <SelectTrigger className="h-7 text-xs px-2">
                               <SelectValue />
@@ -1672,7 +1704,7 @@ function CommandEditorCompact({
                             variant="ghost"
                             size="icon"
                             onClick={() => removeParameter(pIdx)}
-                            className="h-6 w-6"
+                            className="h-6 w-6 sm:h-6 sm:w-6"
                           >
                             <Trash2 className="h-4 w-4 text-destructive" />
                           </Button>
@@ -1691,7 +1723,7 @@ function CommandEditorCompact({
               variant="ghost"
               size="sm"
               onClick={() => setShowAdvanced(!showAdvanced)}
-              className="h-7 text-xs text-muted-foreground"
+              className="h-7 text-xs text-muted-foreground sm:h-7"
             >
               {showAdvanced ? t('devices:commandEditor.hideAdvanced') : t('devices:commandEditor.advancedOptions')}
             </Button>
@@ -1709,7 +1741,7 @@ function CommandEditorCompact({
                     variant="outline"
                     size="sm"
                     onClick={addFixedValue}
-                    className="h-6 text-xs"
+                    className="h-6 text-xs sm:h-6"
                   >
                     <Plus className="mr-1 h-4 w-4" />
                     {t('devices:commandEditor.add')}
@@ -1741,7 +1773,7 @@ function CommandEditorCompact({
                       variant="ghost"
                       size="icon"
                       onClick={() => removeFixedValue(key)}
-                      className="h-6 w-6"
+                      className="h-6 w-6 sm:h-6 sm:w-6"
                     >
                       <Trash2 className="h-4 w-4 text-destructive" />
                     </Button>
@@ -1773,6 +1805,7 @@ interface ViewDeviceTypeDialogProps {
 }
 
 export function ViewDeviceTypeDialog({ open, onOpenChange, deviceType }: ViewDeviceTypeDialogProps) {
+  const { t } = useTranslation(['common', 'devices'])
   // Hooks must be called before any early returns
   // Fetch transforms that apply to this device type
   const [virtualMetrics, setVirtualMetrics] = React.useState<Array<{
@@ -1790,11 +1823,11 @@ export function ViewDeviceTypeDialog({ open, onOpenChange, deviceType }: ViewDev
       setLoadingVirtual(true)
       api.listTransforms()
         .then(data => {
-          const transforms: any[] = data.transforms || []
+          const transforms: TransformAutomation[] = data.transforms || []
 
           // Filter transforms that apply to this device type
           const matching = transforms
-            .filter((t: any) => {
+            .filter((t) => {
               if (!t.enabled) return false
 
               // Handle scope - might be string or already parsed object
@@ -1813,12 +1846,14 @@ export function ViewDeviceTypeDialog({ open, onOpenChange, deviceType }: ViewDev
               }
               return false
             })
-            .map((t: any) => {
+            .map((t) => {
               // Parse js_code to extract output metrics
               const prefix = t.output_prefix || 'transform'
-              const outputs = parseTransformOutputs(t.js_code, prefix)
-              return outputs.map((out: any) => ({
-                ...out,
+              const outputs = parseTransformOutputs(t.js_code || '', prefix)
+              return outputs.map((out) => ({
+                name: out.name ?? '',
+                display_name: out.display_name ?? out.name ?? '',
+                data_type: 'string',
                 transform_id: t.id,
                 transform_name: t.name,
               }))
@@ -1918,7 +1953,7 @@ export function ViewDeviceTypeDialog({ open, onOpenChange, deviceType }: ViewDev
 
     return outputs.length > 0 ? outputs : [{
       name: `${prefix}.*`,
-      display_name: 'Virtual Metric',
+      display_name: t('devices:types.virtualMetric'),
       data_type: 'float',
     }]
   }
@@ -1928,7 +1963,7 @@ export function ViewDeviceTypeDialog({ open, onOpenChange, deviceType }: ViewDev
       open={open}
       onOpenChange={onOpenChange}
       title={deviceType.name}
-      description="Device type details and capabilities"
+      description={t('devices:types.viewDescription')}
       width="3xl"
       contentClassName="flex-1 overflow-y-auto"
       footer={
@@ -1939,12 +1974,12 @@ export function ViewDeviceTypeDialog({ open, onOpenChange, deviceType }: ViewDev
           {isRawMode && (
             <Badge variant="secondary" className="text-xs">
               <Zap className="h-4 w-4 mr-1" />
-              Raw Data Mode
+              {t('devices:types.rawDataModeBadge')}
             </Badge>
           )}
           <div className="flex-1" />
           <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Close
+            {t('common:close')}
           </Button>
         </div>
       }
@@ -2025,7 +2060,7 @@ export function ViewDeviceTypeDialog({ open, onOpenChange, deviceType }: ViewDev
                 {isRawMode && (
                   <Badge variant="secondary" className="text-xs">
                     <Zap className="h-4 w-4 mr-1" />
-                    Raw Data Mode
+                    {t('devices:types.rawDataModeBadge')}
                   </Badge>
                 )}
               </div>
@@ -2313,10 +2348,10 @@ export function CloudImportDialog({ open, onOpenChange, onImportComplete }: Clou
         onOpenChange(false)
         setSelectedIds(new Set())
       }, 1000)
-    } catch (e: any) {
+    } catch (e) {
       toast({
         title: t('devices:cloud.importFailed', "导入失败"),
-        description: e?.message || t('devices:cloud.importFailedDesc', "导入设备类型失败"),
+        description: (e instanceof Error ? e.message : null) || t('devices:cloud.importFailedDesc', "导入设备类型失败"),
         variant: "destructive"
       })
     } finally {
@@ -2338,7 +2373,6 @@ export function CloudImportDialog({ open, onOpenChange, onImportComplete }: Clou
             <LoadingState size="lg" className="h-64" />
           ) : deviceTypes.length === 0 ? (
             <EmptyStateCompact
-              icon={<FileJson className="h-5 w-5" />}
               title={t('devices:cloud.noDeviceTypes', "暂无可用设备类型")}
             />
           ) : (

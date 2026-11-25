@@ -93,8 +93,8 @@ pub(crate) fn build_history_context(
             if !sections.is_empty() {
                 parts.push(format!(
                     "### Your Knowledge (loaded)\n{}\n\
-                     → Update: `memory(action='add', target='custom:{{name}}', content='...')`\n\
-                     → Create new: `memory(action='create', target='custom:{{name}}', content='...')`",
+                     → New findings: `memory(action='create', target='custom:{{name}}', content='...')`\n\
+                     → Append to a notes file: `memory(action='add', target='custom:{{name}}', content='...')` — never to `custom:task-understanding`, which mirrors the task prompt.",
                     sections.join("\n\n")
                 ));
             } else {
@@ -115,8 +115,19 @@ pub(crate) fn build_history_context(
         );
     }
 
-    // 3. Execution Journal
-    if !agent.memory.journal.records.is_empty() {
+    // 3. Execution Journal — omitted for stateless agents (MemoryMode::Tool):
+    // what happened last time is cost, not context, for a scanner. The user's
+    // instructions and knowledge files above are standards, and still apply.
+    //
+    // Also omitted for judgment-notify agents. Each event is judged on its
+    // own, and "what I did last time" reads as a template to repeat: on T4 a
+    // send made the next send 14× likelier (42% against 3%), and the failed
+    // runs listed first taught the agent to keep hunting for an image path.
+    // Learned thresholds belong in a knowledge file, not in a run log.
+    if agent.effective_memory_mode() == heramind_storage::MemoryMode::Assistant
+        && !super::judgment_notify::agent_uses_judgment_notify(agent)
+        && !agent.memory.journal.records.is_empty()
+    {
         // The full `action_taken` (up to 5×150 chars) is the key learning
         // signal for FAILED runs; for successes a short preview keeps the
         // journal from dominating a small model's window (5 entries × ~1100
@@ -180,8 +191,8 @@ fn build_knowledge_index(files: &[heramind_storage::KnowledgeFileRef]) -> String
     format!(
         "### Your Knowledge Files\n{}\n\
          → Read: `memory(action='read', target='custom:{{name}}')`\n\
-         → Update: `memory(action='add', target='custom:{{name}}', content='...')`\n\
-         → Create new: `memory(action='create', target='custom:{{name}}', content='...')`",
+         → New findings: `memory(action='create', target='custom:{{name}}', content='...')`\n\
+         → Append to a notes file: `memory(action='add', target='custom:{{name}}', content='...')` — never to `custom:task-understanding`, which mirrors the task prompt.",
         items.join("\n")
     )
 }
@@ -206,6 +217,152 @@ pub(crate) fn truncate_to(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent whose prompt would carry every context section: a past run, a
+    /// user correction, and a knowledge file.
+    fn agent_with_history(memory_mode: Option<heramind_storage::MemoryMode>) -> AiAgent {
+        serde_json::from_value(serde_json::json!({
+            "id": "a1",
+            "name": "n",
+            "user_prompt": "p",
+            "parsed_intent": null,
+            "status": "active",
+            "created_at": 0,
+            "updated_at": 0,
+            "last_execution_at": null,
+            "stats": {
+                "total_executions": 0, "successful_executions": 0,
+                "failed_executions": 0, "avg_duration_ms": 0, "last_duration_ms": 0
+            },
+            "error_message": null,
+            "resources": [],
+            "schedule": { "schedule_type": "interval", "interval_seconds": 60 },
+            "execution_mode": "focused",
+            "memory_mode": memory_mode.map(|m| serde_json::to_value(m).unwrap()),
+            "user_messages": [
+                { "id": "m1", "timestamp": 0, "content": "STANDARD_错装记成待检" }
+            ],
+            "memory": {
+                "journal": { "records": [ {
+                    "timestamp": 0,
+                    "execution_id": "e1",
+                    "outcome": "HISTORY_上次读数28度",
+                    "action_taken": "alert",
+                    "success": true
+                } ] },
+                "knowledge_files": [],
+                "updated_at": 0
+            }
+        }))
+        .expect("fixture deserialises")
+    }
+
+    /// A scanner is judged on this run's input alone. Past runs are cost, not
+    /// context — while the user's own rules still apply.
+    #[test]
+    fn tool_mode_drops_past_runs_but_keeps_the_users_rules() {
+        let agent = agent_with_history(Some(heramind_storage::MemoryMode::Tool));
+        let ctx = build_history_context(&agent, &HistoryConfig::focused(10), None);
+
+        assert!(
+            !ctx.contains("HISTORY_"),
+            "a stateless agent must not carry past runs into its prompt: {ctx}"
+        );
+        assert!(
+            ctx.contains("STANDARD_"),
+            "the user's corrections are standards, not history: {ctx}"
+        );
+    }
+
+    /// Regression guard: an agent that never chose a memory mode must keep
+    /// exactly today's prompt. The derivation decides the default — it must
+    /// not silently strip history from every agent that predates the field.
+    #[test]
+    fn unset_memory_mode_keeps_todays_behaviour() {
+        let agent = agent_with_history(None);
+        let ctx = build_history_context(&agent, &HistoryConfig::focused(10), None);
+
+        assert!(ctx.contains("HISTORY_"), "expected the journal in: {ctx}");
+        assert!(ctx.contains("STANDARD_"), "expected the rules in: {ctx}");
+    }
+
+    #[test]
+    fn assistant_mode_keeps_past_runs() {
+        let agent = agent_with_history(Some(heramind_storage::MemoryMode::Assistant));
+        let ctx = build_history_context(&agent, &HistoryConfig::focused(10), None);
+
+        assert!(ctx.contains("HISTORY_"), "expected the journal in: {ctx}");
+    }
+
+    /// A judgment-notify agent decides each event on its own. A past send in
+    /// its prompt reads as the thing to do again (T4: 42% repeat rate against
+    /// 3%), so the run log stays out even in Assistant mode — while the
+    /// user's own rules still go in.
+    #[test]
+    fn judgment_notify_agent_drops_past_runs_even_in_assistant_mode() {
+        let mut agent = agent_with_history(Some(heramind_storage::MemoryMode::Assistant));
+        agent.notify = Some(heramind_storage::AgentNotify {
+            channels: vec!["webhook:ops".into()],
+            on: heramind_storage::NotifyOn::Judgment,
+        });
+        let ctx = build_history_context(&agent, &HistoryConfig::focused(10), None);
+
+        assert!(
+            !ctx.contains("HISTORY_"),
+            "a judgment-notify agent must not see its own past runs: {ctx}"
+        );
+        assert!(!ctx.contains("adjust thresholds"), "{ctx}");
+        assert!(
+            ctx.contains("STANDARD_"),
+            "the user's corrections are standards, not history: {ctx}"
+        );
+
+        // Any other notify trigger keeps today's behaviour.
+        agent.notify.as_mut().expect("notify").on = heramind_storage::NotifyOn::Always;
+        let ctx = build_history_context(&agent, &HistoryConfig::focused(10), None);
+        assert!(ctx.contains("HISTORY_"), "expected the journal in: {ctx}");
+    }
+
+    /// The loaded-knowledge hints must not point the agent at its own task
+    /// definition: T4's 200366 rewrote `custom:task-understanding` into a
+    /// per-run observation and then reasoned from that note on every run.
+    #[test]
+    fn knowledge_hints_send_new_findings_somewhere_else() {
+        let mut agent = agent_with_history(None);
+        agent
+            .memory
+            .knowledge_files
+            .push(heramind_storage::KnowledgeFileRef {
+                name: "task-understanding".into(),
+                description: String::new(),
+                created_at: 0,
+                updated_at: 0,
+            });
+        let loaded = std::collections::HashMap::from([(
+            "task-understanding".to_string(),
+            "# Task Understanding\n\n## Mission\np\n".to_string(),
+        )]);
+        let inline = build_history_context(&agent, &HistoryConfig::focused(10), Some(&loaded));
+        let index = build_history_context(&agent, &HistoryConfig::focused(10), None);
+        for (label, ctx) in [("inline", inline.as_str()), ("index", index.as_str())] {
+            assert!(
+                ctx.contains("never to `custom:task-understanding`"),
+                "{label}: hints must steer appends away from the task definition: {ctx}"
+            );
+            assert!(
+                ctx.contains("memory(action='create'"),
+                "{label}: the model must still be told how to record findings: {ctx}"
+            );
+            assert!(
+                !ctx.contains("→ Update:"),
+                "{label}: an open-ended update hint invites overwriting: {ctx}"
+            );
+        }
+        assert!(
+            inline.contains("#### custom:task-understanding"),
+            "{inline}"
+        );
+    }
 
     #[test]
     fn test_truncate_to_short_text() {

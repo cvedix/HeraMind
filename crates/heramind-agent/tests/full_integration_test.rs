@@ -23,6 +23,15 @@ use heramind_storage::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The model the real-backend tests drive. These tests are `#[ignore]`d because
+/// they need a live server; hard-coding the model made them unrunnable the
+/// moment that tag moved. Override with `HERAMIND_TEST_MODEL`.
+fn test_model() -> String {
+    std::env::var("HERAMIND_TEST_MODEL")
+        .or_else(|_| std::env::var("MODEL"))
+        .unwrap_or_else(|_| "qwen3.5:4b".to_string())
+}
+
 // ============================================================================
 // Test Context with All Components
 // ============================================================================
@@ -44,7 +53,7 @@ impl FullTestContext {
         // Create LLM runtime
         let ollama_config = OllamaConfig {
             endpoint: "http://localhost:11434".to_string(),
-            model: "qwen3.5:2b".to_string(),
+            model: test_model(),
             timeout_secs: 120,
         };
         let llm_runtime = Arc::new(OllamaRuntime::new(ollama_config)?);
@@ -65,8 +74,9 @@ impl FullTestContext {
             device_service: None,
             event_bus: Some(event_bus.clone()),
             message_manager: Some(message_manager.clone()),
-            llm_runtime: Some(llm_runtime.clone()
-                as Arc<dyn heramind_core::llm::backend::LlmRuntime + Send + Sync>),
+            llm_runtime: Some(
+                llm_runtime.clone() as Arc<dyn heramind_core::llm::backend::LlmRuntime>
+            ),
             llm_backend_store: None,
             extension_registry: None,
             tool_registry: None,
@@ -200,6 +210,10 @@ impl FullTestContext {
             system_prompt: None,
             max_retries: 0,
             consecutive_failures: 0,
+            output_schema: None,
+            operator_config: None,
+            memory_mode: None,
+            notify: None,
             priority: 128,
             conversation_history: vec![],
             user_messages: vec![],
@@ -207,6 +221,7 @@ impl FullTestContext {
             context_window_size: 10,
             enable_tool_chaining: false,
             max_chain_depth: 3,
+            max_tokens_per_run: None,
         };
 
         self.store.save_agent(&agent).await?;
@@ -281,6 +296,10 @@ impl FullTestContext {
             system_prompt: None,
             max_retries: 0,
             consecutive_failures: 0,
+            output_schema: None,
+            operator_config: None,
+            memory_mode: None,
+            notify: None,
             priority: 128,
             conversation_history: vec![],
             user_messages: vec![],
@@ -288,6 +307,7 @@ impl FullTestContext {
             context_window_size: 10,
             enable_tool_chaining: false,
             max_chain_depth: 3,
+            max_tokens_per_run: None,
         };
 
         self.store.save_agent(&agent).await?;
@@ -328,7 +348,7 @@ impl FullTestContext {
                 max_tokens: Some(500),
                 ..Default::default()
             },
-            model: Some("qwen3.5:2b".to_string()),
+            model: Some(test_model()),
             stream: false,
             tools: None,
         };

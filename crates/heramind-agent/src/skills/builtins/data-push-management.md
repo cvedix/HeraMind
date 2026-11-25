@@ -1,6 +1,9 @@
 ---
 id: data-push-management
+summary: Push platform data out to external systems (webhook/mqtt).
+not_for: [in-platform notifications (message-management)]
 name: Data Push Management & Target Configuration
+aliases: [push, data-push]
 description: Use when the user wants to forward or export data to external systems — webhook/MQTT push targets, push schedules, delivery history, test pushes. Covers push create/update/test/logs even without saying 'push' (e.g. '把数据转发到我的服务器', '数据导出'). Includes 数据推送/转发/导出/webhook 推送.
 category: push
 origin: builtin
@@ -14,6 +17,33 @@ triggers:
 anti_triggers:
   keywords: [dashboard, 仪表盘, agent, 代理, extension develop, 扩展开发, rule, 规则, message send, 发消息, channel, 通道, notification, 通知]
 ---
+
+# data-push-management
+
+Inspect existing push targets and available data sources. Configure the requested destination, payload mapping, authentication and cadence.
+Preserve source identity and distinguish device fields from transform/AI output fields. Use discovered schema and exact fields.
+Create/update, enable if requested, and test when authorized. Verify delivery results; saved configuration or enabled state alone does not prove receipt.
+After timeout/unknown delivery, inspect records before sending again. Load target-specific and mapping reference sections as needed.
+
+## Commands
+| Command | Purpose |
+|---|---|
+| `heramind push list` | List push targets |
+| `heramind push get <id>` | Push target details |
+| `heramind push create` | Create a push target |
+| `heramind push update <id>` | Update a push target |
+| `heramind push delete <id>` | Delete a push target |
+| `heramind push enable <id>` | Enable a target (alias for `push start`) |
+| `heramind push disable <id>` | Disable a target (alias for `push stop`) |
+| `heramind push test <id>` | Test a push target |
+| `heramind push logs <id>` | Delivery logs for a target |
+| `heramind push stats` | Push statistics |
+
+## Detailed reference
+Use skill(action="load", id="data-push-management", section="<exact returned title>") only for the needed detail. Section titles are returned with this overview.
+
+<!-- SKILL_REFERENCE -->
+
 
 # Data Push Management & Target Configuration
 
@@ -39,10 +69,10 @@ Always RUN the command yourself and report the real output. The CLI group is `he
 ## CRITICAL Rules
 
 1. **`--name` is required** for creating push targets
-2. **`--type` is required**: `webhook` or `mqtt`
+2. **`--type` defaults to `webhook`**; specify `--type mqtt` for MQTT targets.
 3. **`--config` must be valid JSON** with type-specific fields
-4. **Targets start in stopped state** — must `push enable <ID>` after creation
-5. **Always test** with `push test <ID>` before relying on delivery
+4. **New targets are enabled by default**. Inspect the returned `enabled` state; `push enable <ID>` is for a target that was disabled.
+5. **Verify the requested outcome** with `push list` / `push get <ID>`. `push test <ID>` sends sample data: use it when delivery testing is part of the task, and distinguish a registered target from verified delivery.
 6. **Use `--sources`** to filter which data gets forwarded (comma-separated patterns)
 
 ## Command Reference
@@ -59,13 +89,13 @@ heramind push logs <ID> [--limit 20]              # Delivery history for a targe
 ### Create Push Target
 
 ```bash
-heramind push create --name <NAME> --type <TYPE> --config '<JSON>' [--schedule <SCHEDULE>] [--sources <PATTERNS>]
+heramind push create --name <NAME> [--type <TYPE>] --config '<JSON>' [--schedule <SCHEDULE>] [--sources <PATTERNS>]
 ```
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--name` | Yes | — | Target name (unique identifier) |
-| `--type` | Yes | webhook | Target type: `webhook` or `mqtt` |
+| `--type` | No | webhook | Target type: `webhook` or `mqtt` |
 | `--config` | Yes | — | Type-specific config as JSON |
 | `--schedule` | No | event | Schedule: `event` (real-time) or `interval` (every 60s) |
 | `--sources` | No | (all) | Comma-separated source patterns to filter |
@@ -167,8 +197,8 @@ heramind push create --name sensor-webhook --type webhook \
   --config '{"url": "https://myapp.example.com/api/heramind-data", "headers": {"Authorization": "Bearer my-token"}}' \
   --sources "device:sensor-001:temperature"
 
-# Step 2: Start the target
-heramind push enable <ID>
+# Step 2: Verify the created target (enabled by default)
+heramind push get <ID>
 
 # Step 3: Test delivery
 heramind push test <ID>
@@ -185,8 +215,8 @@ heramind push create --name cloud-mqtt --type mqtt \
   --config '{"broker": "tcp://mqtt.cloud.example.com:1883", "topic": "heramind/telemetry", "username": "user", "password": "pass", "qos": 1}' \
   --schedule event
 
-# Start and test
-heramind push enable <ID>
+# Verify, then test delivery when requested
+heramind push get <ID>
 heramind push test <ID>
 ```
 

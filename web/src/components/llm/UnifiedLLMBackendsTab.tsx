@@ -14,22 +14,26 @@ import {
   Wrench,
   Brain,
   Download,
-  Power,
-  RotateCcw,
+
   Zap,
   Cpu,
   BrainCircuit,
   Cloud,
-  ChevronRight,
+
   Settings2,
   AlertTriangle,
+  Play,
+  Power,
 } from 'lucide-react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
+import { badgeSize } from '@/design-system/tokens/typography'
 import { UnifiedFormDialog } from '@/components/dialog/UnifiedFormDialog'
+import { RuntimeUpgradeDialog } from '@/components/llm/RuntimeUpgradeDialog'
 import { FormField } from '@/components/ui/field'
 import { EmptyState, LoadingState, ListToolbar } from '@/components/shared'
 import { cn } from '@/lib/utils'
@@ -47,6 +51,7 @@ import type {
   PluginConfigSchema,
   BackendCapabilities,
   BuiltinLlmStatus,
+  GpuOffloadDecision,
 } from '@/types'
 
 type View = 'list' | 'detail'
@@ -121,7 +126,7 @@ const LLM_PROVIDER_CONFIG: Record<string, {
   },
   llamacpp: {
     icon: <Server className="h-6 w-6" />,
-    iconBg: 'bg-warning-light text-warning',
+    iconBg: 'bg-accent-indigo-light text-accent-indigo',
   },
   cloudai: {
     icon: <Cloud className="h-6 w-6" />,
@@ -152,10 +157,10 @@ const PROTOCOL_TYPE_IDS = ['ollama', 'llamacpp'] as const
 // Cloud AI is one card whose protocol paths (OpenAI-compatible / Anthropic)
 // are chosen inside it — other vendors ride the OpenAI path via their
 // compatible endpoint.
-const CLOUD_AI_PROTOCOLS = ['openai', 'anthropic'] as const
+const _CLOUD_AI_PROTOCOLS = ['openai', 'anthropic'] as const
 
 // Built-in bundled LLM (LFM2.5-2.6B) card actions.
-type BuiltinAction = 'download' | 'restart' | 'activate' | 'delete'
+type BuiltinAction = 'download' | 'restart' | 'activate' | 'delete' | 'stop'
 
 interface BuiltinStatusInfo {
   text: string
@@ -314,6 +319,12 @@ function toPluginInstance(instance: LlmBackendInstance, activeId: string | null)
   }
 }
 
+// Builtin-engine ctx presets. 16K is the practical floor for 7-8 GB edge
+// boxes: the NG4520 incident box OOM-killed llama-server roughly every
+// 1-1.5 h at 32K (10 kills over two days) and settled stable at 16K.
+const BUILTIN_CTX_PRESETS = [16384, 32768, 65536, 131072]
+
+
 export function UnifiedLLMBackendsTab({
   onCreateBackend,
   onUpdateBackend,
@@ -341,12 +352,32 @@ export function UnifiedLLMBackendsTab({
 
   // First-run wizard (empty-state strong guidance)
   const [wizardOpen, setWizardOpen] = useState(false)
+  const [runtimeDialogOpen, setRuntimeDialogOpen] = useState(false)
   // The card's 切换模型 button opens the wizard straight at the model
   // picker; first-run CTAs (banner / empty state) use the default entry.
   const [wizardStartInPicker, setWizardStartInPicker] = useState(false)
   // Builtin engine-settings dialog (ctx today; port and friends later).
   const [ctxDialogOpen, setCtxDialogOpen] = useState(false)
+  const [vlmDialogOpen, setVlmDialogOpen] = useState(false)
+  const [vlmDialogInput, setVlmDialogInput] = useState<number | null>(null)
+  const [vlmKvInput, setVlmKvInput] = useState<'q8_0' | 'f16'>('q8_0')
+  const [vlmDialogSaving, setVlmDialogSaving] = useState(false)
+  const [vlmDialogError, setVlmDialogError] = useState<string | null>(null)
   const [ctxDialogInput, setCtxDialogInput] = useState<number | null>(null)
+  // Engine knobs exposed alongside ctx (1.2.1): slot count and KV quant.
+  const [parallelInput, setParallelInput] = useState<number | 'auto'>('auto')
+  const [kvInput, setKvInput] = useState<'q8_0' | 'f16'>('q8_0')
+  // Free-form ctx + GPU-layer pin: the restart API accepts any
+  // 1024..=1,048,576 ctx and ngl/vlm_ngl=auto|N — the preset Select alone
+  // could not express either (256K, 4096, a pin inherited from env, …).
+  const [ctxCustomMode, setCtxCustomMode] = useState(false)
+  const [ctxCustomText, setCtxCustomText] = useState('')
+  const [nglMode, setNglMode] = useState<'auto' | 'custom'>('auto')
+  const [nglText, setNglText] = useState('')
+  const [vlmCustomMode, setVlmCustomMode] = useState(false)
+  const [vlmCustomText, setVlmCustomText] = useState('')
+  const [vlmNglMode, setVlmNglMode] = useState<'auto' | 'custom'>('auto')
+  const [vlmNglText, setVlmNglText] = useState('')
   const [ctxDialogSaving, setCtxDialogSaving] = useState(false)
   const [ctxDialogError, setCtxDialogError] = useState<string | null>(null)
   const [cloudAddOpen, setCloudAddOpen] = useState(false)
@@ -419,7 +450,7 @@ export function UnifiedLLMBackendsTab({
     }
   }
 
-  const openTypeDetail = (typeId: string) => {
+  const _openTypeDetail = (typeId: string) => {
     const type = backendTypes.find((b) => b.id === typeId)
     if (type) {
       setSelectedType(toUnifiedPluginType(type, t))
@@ -439,6 +470,17 @@ export function UnifiedLLMBackendsTab({
       })
       if (!confirmed) return
     }
+    if (action === 'stop') {
+      // Non-destructive but disruptive: chats pointed at the builtin model
+      // fail while it is off, and it stays off until deliberately started.
+      const confirmed = await confirm({
+        title: t('plugins:llm.builtinStopConfirmTitle', { defaultValue: 'Stop the builtin engine?' }),
+        description: t('plugins:llm.builtinStopConfirmDesc'),
+        confirmText: t('plugins:llm.builtinStop', { defaultValue: 'Stop' }),
+        cancelText: t('common:cancel', { defaultValue: 'Cancel' }),
+      })
+      if (!confirmed) return
+    }
 
     builtinBusyActionRef.current = action
     setBuiltinBusyAction(action)
@@ -454,7 +496,14 @@ export function UnifiedLLMBackendsTab({
         }
         case 'restart':
           await api.restartBuiltinLlm()
-          successMsg = t('plugins:llm.builtinRestarted')
+          // The same endpoint doubles as START after a deliberate stop.
+          successMsg = builtinStatus?.deliberately_stopped
+            ? t('plugins:llm.builtinStarted')
+            : t('plugins:llm.builtinRestarted')
+          break
+        case 'stop':
+          await api.stopBuiltinLlm()
+          successMsg = t('plugins:llm.builtinStopped')
           break
         case 'activate':
           await api.activateBuiltinLlm()
@@ -470,6 +519,12 @@ export function UnifiedLLMBackendsTab({
       // and the builtin status after each action.
       await loadData()
       await refreshBuiltinStatus()
+      // The chat model picker reads the STORE's llmBackends (10s fetchCache
+      // guarded) — after delete/activate the global list/activeId must be
+      // invalidated + reloaded too, or the removed model stays selectable.
+      const { fetchCache } = await import('@/lib/utils/async')
+      fetchCache.invalidate('llmBackends')
+      await useStore.getState().loadBackends()
     } catch (error) {
       handleError(error, { operation: 'Builtin LLM action' })
     } finally {
@@ -602,14 +657,32 @@ export function UnifiedLLMBackendsTab({
     // Built-in bundled LLM card (top of the list, above the provider grid).
     const builtinInstance = instances.find(i => i.is_builtin)
     const builtinIsActive = !!builtinInstance && builtinInstance.id === activeBackendId
+    // Context sizes read as buckets, not ledger numbers: "128K" beats
+    // "131,072" at a glance in a card this dense.
+    const fmtCtx = (n: number | null | undefined) =>
+      n == null ? '—' : n >= 1024 ? `${Math.round(n / 1024)}K` : String(n)
+    // GPU offload facts of the last spawn: a compact "GPU 8/34" rides the
+    // engine row (hidden when no flag was passed); the decision's why
+    // (pin / budget arithmetic / skip reason) rides the row's hover title.
+    const gpuSeg = (g?: GpuOffloadDecision | null) =>
+      g && g.ngl != null
+        ? ` · GPU ${g.ngl}${g.total_layers != null ? `/${g.total_layers}` : ''}`
+        : ''
+    const gpuTitle = (g?: GpuOffloadDecision | null) =>
+      g ? `${g.note}${g.free_mib != null ? ` — free ${g.free_mib} MiB` : ''}` : undefined
     const BUILTIN_MODEL_NAMES: Record<string, string> = {
+      'minicpm5-2b': 'MiniCPM5-2B',
       'lfm25-2.6b': 'LFM2.5-2.6B',
       'qwen3.5-4b': 'Qwen3.5-4B',
       'gemma4-e2b': 'Gemma4-E2B',
     }
-    const installedModelName = builtinStatus?.model_id
-      ? (BUILTIN_MODEL_NAMES[builtinStatus.model_id] ?? builtinStatus.model_id)
-      : null
+    // Prefer the registry-provided name; the map is the fallback for older
+    // backends that don't return model_name.
+    const installedModelName = builtinStatus?.model_name
+      ? builtinStatus.model_name
+      : builtinStatus?.model_id
+        ? (BUILTIN_MODEL_NAMES[builtinStatus.model_id] ?? builtinStatus.model_id)
+        : null
     const builtinInfo = builtinStatus ? getBuiltinStatusInfo(builtinStatus, t) : null
     const builtinCard = builtinStatus && builtinInfo ? (
       <Card
@@ -618,34 +691,60 @@ export function UnifiedLLMBackendsTab({
           builtinIsActive && 'border-success'
         )}
       >
+        {/* ── Zone 1 · identity: ONE status voice (the engine pill), the
+            model NAME as the title, category demoted to the subline. */}
         <CardHeader className="pb-3">
-          <div className="flex items-start justify-between gap-2">
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2 mb-1 min-w-0">
-                <div className="flex items-center justify-center h-8 w-8 rounded-lg shrink-0 bg-warning-light text-warning">
-                  <BrainCircuit className="h-4 w-4" />
-                </div>
-                <CardTitle className="text-base truncate min-w-0">
-                  {t('plugins:llm.builtinTitle')}
-                  {installedModelName && <span className="text-muted-foreground"> · {installedModelName}</span>}
-                </CardTitle>
-                <Badge variant="outline" className="text-xs shrink-0">{t('plugins:llm.builtinBadge')}</Badge>
-                {builtinIsActive && <Badge variant="default" className="text-xs shrink-0">{t('plugins:llm.active')}</Badge>}
-              </div>
-              <CardDescription className="text-xs line-clamp-1">
-                {t('plugins:llm.builtinDesc')}
-              </CardDescription>
+          <div className="flex items-center gap-2.5">
+            {/* Identity tile — accent-indigo like every sibling backend card.
+                Warning-yellow misused the "attention" semantic on a healthy
+                engine's identity icon. */}
+            <div className="flex items-center justify-center h-8 w-8 rounded-lg shrink-0 bg-accent-indigo-light text-accent-indigo">
+              <BrainCircuit className="h-4 w-4" />
             </div>
-            <span className={cn('inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium shrink-0', builtinInfo.pillClass)}>
-              {builtinInfo.text}
-            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <CardTitle className="text-sm font-medium truncate min-w-0">
+                  {installedModelName ?? t('plugins:llm.builtinTitle')}
+                </CardTitle>
+                {builtinIsActive && (
+                  <Badge variant="default" className={cn(badgeSize.small, 'shrink-0')}>
+                    {t('plugins:llm.active')}
+                  </Badge>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground truncate">
+                {t('plugins:llm.builtinDesc')}
+              </p>
+            </div>
+            {/* Card-level pill speaks only for states without an engine row
+                (downloading / not configured); once the engine zone renders,
+                the per-row pills are the single voice. */}
+            {!(builtinStatus.installed && builtinStatus.server_state !== 'downloading') && (
+              <span
+                className={cn(
+                  'inline-flex h-5 items-center gap-1 px-2 rounded-md text-xs font-medium shrink-0',
+                  builtinInfo.pillClass,
+                )}
+              >
+                {builtinInfo.text}
+              </span>
+            )}
           </div>
         </CardHeader>
+
         <CardContent className="pb-3 space-y-3">
           {builtinStatus.server_state === 'downloading' && (
             <div className="space-y-1">
               <Progress value={builtinInfo.percent ?? 0} />
               <p className="text-xs text-muted-foreground">{builtinInfo.text}</p>
+            </div>
+          )}
+          {builtinStatus.server_state === 'error' && builtinStatus.error && (
+            <div className="flex items-start gap-2 rounded-md bg-error-light px-3 py-2 text-error">
+              <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+              <span className="text-xs leading-snug break-all" title={builtinStatus.error}>
+                {t('plugins:llm.builtinEngineError', { message: builtinStatus.error })}
+              </span>
             </div>
           )}
           {builtinStatus.installed && builtinStatus.memory_ok === false && (
@@ -659,49 +758,185 @@ export function UnifiedLLMBackendsTab({
               </span>
             </div>
           )}
+
+          {/* ── Zone 2 · engines: main + companion as the SAME row template
+              inside one bordered list — siblings by structure, not by prose. */}
           {builtinStatus.installed && builtinStatus.server_state !== 'downloading' && (
-            <div className="flex items-center gap-2 text-xs">
-              <span className="text-muted-foreground">
-                {t('plugins:llm.builtinCtx')}:
-                <span className="font-mono text-foreground ml-1">{(builtinStatus.ctx ?? builtinStatus.default_ctx ?? 0).toLocaleString()}</span>
-              </span>
-              {builtinStatus.ctx_override != null && (
-                <Badge variant="outline" className="text-[10px] shrink-0">
-                  {t('plugins:llm.builtinCtxOverride', { def: (builtinStatus.default_ctx ?? 0).toLocaleString() })}
-                </Badge>
+            <div className="rounded-md border border-border divide-y divide-border">
+              <div className="flex h-9 items-center gap-2 px-3">
+                {/* Identity icon — accent-indigo, matching the card tile above.
+                    State lives in the pill on the right, not the icon hue. */}
+                <BrainCircuit className="h-3.5 w-3.5 shrink-0 text-accent-indigo" />
+                <span className="w-28 shrink-0 truncate text-xs font-medium">
+                  {t('plugins:llm.builtinMainEngine')}
+                </span>
+                <span
+                  className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
+                  title={gpuTitle(builtinStatus.gpu_offload)}
+                >
+                  {installedModelName ?? builtinStatus.model_id} · ctx {fmtCtx(builtinStatus.ctx ?? builtinStatus.default_ctx)}
+                  {builtinStatus.kv_cache && ` · KV ${builtinStatus.kv_cache}`}
+                  {builtinStatus.parallel != null && ` · ×${builtinStatus.parallel}`}
+                  {gpuSeg(builtinStatus.gpu_offload)}
+                </span>
+                {/* Same status pill template as the companion row below. */}
+                <span
+                  className={cn(
+                    badgeSize.small,
+                    'shrink-0 rounded font-medium',
+                    builtinStatus.server_state === 'running'
+                      ? 'bg-success-light text-success'
+                      : builtinStatus.deliberately_stopped
+                        ? 'bg-warning-light text-warning'
+                        : 'bg-muted text-muted-foreground',
+                  )}
+                >
+                  {builtinStatus.server_state === 'running'
+                    ? t('plugins:llm.companionRunning')
+                    : builtinStatus.deliberately_stopped
+                      ? t('plugins:llm.builtinStopped')
+                      : t('plugins:llm.companionStopped')}
+                </span>
+                <button
+                  className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
+                  title={t('plugins:llm.builtinEngineSettings')}
+                  disabled={!!builtinBusyAction}
+                  onClick={() => {
+                    const cur = builtinStatus.ctx_override ?? builtinStatus.ctx ?? builtinStatus.default_ctx ?? 32768
+                    const presets = BUILTIN_CTX_PRESETS
+                    // Off-preset values (256K, 4096, env pins) open in custom
+                    // mode instead of silently snapping to the nearest tier.
+                    const onPreset = presets.includes(cur)
+                    setCtxCustomMode(!onPreset)
+                    setCtxCustomText(onPreset ? '' : String(cur))
+                    setCtxDialogInput(onPreset ? cur : null)
+                    // A pinned GPU layer shows as the pin; auto/planned stays auto.
+                    const gpu = builtinStatus.gpu_offload
+                    const gpuPinned = gpu?.ngl != null && (gpu.note ?? '').includes('pinned')
+                    setNglMode(gpuPinned ? 'custom' : 'auto')
+                    setNglText(gpuPinned ? String(gpu!.ngl) : '')
+                    setParallelInput(builtinStatus.parallel == null ? 'auto' : (builtinStatus.parallel as number))
+                    setKvInput(builtinStatus.kv_cache === 'f16' ? 'f16' : 'q8_0')
+                    setCtxDialogOpen(true)
+                  }}
+                >
+                  <Settings2 className="h-3 w-3" />
+                </button>
+              </div>
+              {builtinStatus.companion && (
+                <div className="flex h-9 items-center gap-2 px-3">
+                  <Eye className="h-3.5 w-3.5 shrink-0 text-accent-indigo" />
+                  <span className="w-28 shrink-0 truncate text-xs font-medium">
+                    {t('plugins:llm.companionLabel')}
+                  </span>
+                  <span
+                    className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
+                    title={gpuTitle(builtinStatus.companion.gpu_offload)}
+                  >
+                    {builtinStatus.companion.name} · ctx {fmtCtx(builtinStatus.companion.ctx)}
+                    {builtinStatus.companion.kv_cache && ` · KV ${builtinStatus.companion.kv_cache}`}
+                    {builtinStatus.companion.parallel != null && ` · ×${builtinStatus.companion.parallel}`}
+                    {gpuSeg(builtinStatus.companion.gpu_offload)}
+                  </span>
+                  <span
+                    className={cn(
+                      badgeSize.small,
+                      'shrink-0 rounded font-medium',
+                      builtinStatus.companion.running
+                        ? 'bg-success-light text-success'
+                        : 'bg-muted text-muted-foreground',
+                    )}
+                  >
+                    {builtinStatus.companion.running
+                      ? t('plugins:llm.companionRunning')
+                      : t('plugins:llm.companionStopped')}
+                  </span>
+                  <button
+                    className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                    title={t('plugins:llm.companionSettings')}
+                    onClick={() => {
+                      const cur = builtinStatus.companion?.ctx ?? 32768
+                      const onPreset = BUILTIN_CTX_PRESETS.includes(cur)
+                      setVlmCustomMode(!onPreset)
+                      setVlmCustomText(onPreset ? '' : String(cur))
+                      setVlmDialogInput(onPreset ? cur : null)
+                      const gpu = builtinStatus.companion?.gpu_offload
+                      const gpuPinned = gpu?.ngl != null && (gpu.note ?? '').includes('pinned')
+                      setVlmNglMode(gpuPinned ? 'custom' : 'auto')
+                      setVlmNglText(gpuPinned ? String(gpu!.ngl) : '')
+                      setVlmKvInput('q8_0')
+                      setVlmDialogOpen(true)
+                    }}
+                  >
+                    <Settings2 className="h-3 w-3" />
+                  </button>
+                </div>
               )}
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 gap-1.5 px-2"
-                disabled={!!builtinBusyAction}
-                onClick={() => {
-                  // Snap to the nearest preset (the Select only offers presets).
-                  const cur = builtinStatus.ctx_override ?? builtinStatus.ctx ?? builtinStatus.default_ctx ?? 32768
-                  const presets = [32768, 65536, 131072]
-                  setCtxDialogInput(presets.reduce((a, b) => Math.abs(b - cur) < Math.abs(a - cur) ? b : a, presets[0]))
-                  setCtxDialogOpen(true)
-                }}
-              >
-                <Settings2 className="h-3.5 w-3.5" />
-                {t('plugins:llm.builtinEngineSettings')}
-              </Button>
             </div>
           )}
+
+          {/* ── Zone 2b · llama.cpp runtime row (newer backends; absent on
+              old servers — the row simply doesn't render). Same row template
+              as the engines list above. */}
+          {builtinStatus.runtime && (
+            <div className="rounded-md border border-border divide-y divide-border">
+              <div className="flex h-9 items-center gap-2 px-3">
+                <Cpu className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <span className="w-28 shrink-0 truncate text-xs font-medium">
+                  {t('plugins:llm.runtimeLabel')}
+                </span>
+                <span
+                  className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
+                  title={builtinStatus.runtime.active.path ?? undefined}
+                >
+                  {(builtinStatus.runtime.override_variant ?? builtinStatus.runtime.detected_variant).toUpperCase()}
+                  {' · '}
+                  <span className="font-mono">{builtinStatus.runtime.active.tag}</span>
+                  {builtinStatus.runtime.channel === 'unreachable' && ` · ${t('plugins:llm.runtimeChannelUnreachableShort')}`}
+                </span>
+                {builtinStatus.runtime.upgrading ? (
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+                ) : builtinStatus.runtime.update_available ? (
+                  <button
+                    // h-5 is load-bearing: the global 44px touch-target rule
+                    // inflates any <button> without an h-* class (h-4/h-5 are
+                    // in its exemption list) and overflows the h-9 row.
+                    className={cn(
+                      badgeSize.small,
+                      'flex h-5 shrink-0 items-center gap-1 rounded bg-primary px-1.5 font-medium text-primary-foreground hover:opacity-90',
+                    )}
+                    onClick={() => setRuntimeDialogOpen(true)}
+                  >
+                    <Download className="h-3 w-3" />
+                    {t('plugins:llm.runtimeUpdateBadge')}
+                  </button>
+                ) : null}
+                <button
+                  className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                  title={t('plugins:llm.runtimeSettings')}
+                  onClick={() => setRuntimeDialogOpen(true)}
+                >
+                  <Settings2 className="h-3 w-3" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ── Zone 3 · actions: navigation left, state + destructive right. */}
           <div className="flex flex-wrap items-center gap-2">
             {builtinStatus.server_state === 'downloading' ? (
-              // Progress shown above; no actions while a download is in flight.
               null
             ) : !builtinStatus.installed ? (
-              <Button onClick={() => handleBuiltinAction('download')} disabled={!!builtinBusyAction}>
+              <Button size="sm" onClick={() => handleBuiltinAction('download')} disabled={!!builtinBusyAction}>
                 {builtinBusyAction === 'download'
-                  ? <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  : <Download className="mr-2 h-4 w-4" />}
+                  ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                  : <Download className="mr-1.5 h-3.5 w-3.5" />}
                 {t('plugins:llm.builtinDownload')}
               </Button>
             ) : (
               <>
                 <Button
+                  size="sm"
                   variant="outline"
                   onClick={() => {
                     setWizardStartInPicker(true)
@@ -709,46 +944,64 @@ export function UnifiedLLMBackendsTab({
                   }}
                   disabled={!!builtinBusyAction}
                 >
-                  <Download className="mr-2 h-4 w-4" />
+                  <Download className="mr-1.5 h-3.5 w-3.5" />
                   {t('plugins:llm.switchModel')}
                 </Button>
-                <Button
-                  onClick={() => handleBuiltinAction('activate')}
-                  // Activate only makes sense while the bundled server is
-                  // healthy — activating a stopped server would point chat at a
-                  // dead endpoint. Use 重启引擎 to bring it up first.
-                  disabled={!!builtinBusyAction || builtinIsActive || builtinStatus.server_state !== 'running'}
-                  variant={builtinIsActive ? 'secondary' : 'default'}
-                >
-                  {builtinBusyAction === 'activate'
-                    ? <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    : builtinIsActive
-                      ? <CheckCircle2 className="mr-2 h-4 w-4" />
-                      : <Zap className="mr-2 h-4 w-4" />}
-                  {builtinIsActive ? t('plugins:llm.builtinActive') : t('plugins:llm.builtinActivate')}
-                </Button>
-                {builtinStatus.server_state === 'stopped' && (
+                <div className="ml-auto flex items-center gap-2">
+                  {builtinStatus.deliberately_stopped ? (
+                    // Start = restart with no params: it clears the persisted
+                    // stop flag and spawns (main + companion).
+                    <Button
+                      size="sm"
+                      onClick={() => handleBuiltinAction('restart')}
+                      disabled={!!builtinBusyAction}
+                    >
+                      {builtinBusyAction === 'restart'
+                        ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        : <Play className="mr-1.5 h-3.5 w-3.5" />}
+                      {t('plugins:llm.builtinStart')}
+                    </Button>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => handleBuiltinAction('stop')}
+                      disabled={!!builtinBusyAction || builtinStatus.server_state !== 'running'}
+                    >
+                      {builtinBusyAction === 'stop'
+                        ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        : <Power className="mr-1.5 h-3.5 w-3.5" />}
+                      {t('plugins:llm.builtinStop')}
+                    </Button>
+                  )}
                   <Button
-                    onClick={() => handleBuiltinAction('restart')}
-                    disabled={!!builtinBusyAction}
-                    variant="secondary"
+                    size="sm"
+                    onClick={() => handleBuiltinAction('activate')}
+                    // Activate only makes sense while the bundled server is
+                    // healthy — activating a stopped server would point chat
+                    // at a dead endpoint.
+                    disabled={!!builtinBusyAction || builtinIsActive || builtinStatus.server_state !== 'running'}
+                    variant={builtinIsActive ? 'secondary' : 'default'}
                   >
-                    {builtinBusyAction === 'restart'
-                      ? <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      : <RotateCcw className="mr-2 h-4 w-4" />}
-                    {t('plugins:llm.builtinRestart')}
+                    {builtinBusyAction === 'activate'
+                      ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      : builtinIsActive
+                        ? <CheckCircle2 className="mr-1.5 h-3.5 w-3.5" />
+                        : <Zap className="mr-1.5 h-3.5 w-3.5" />}
+                    {builtinIsActive ? t('plugins:llm.builtinActive') : t('plugins:llm.builtinActivate')}
                   </Button>
-                )}
-                <Button
-                  onClick={() => handleBuiltinAction('delete')}
-                  disabled={!!builtinBusyAction}
-                  variant="destructive"
-                >
-                  {builtinBusyAction === 'delete'
-                    ? <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    : <Trash2 className="mr-2 h-4 w-4" />}
-                  {t('plugins:llm.builtinDelete')}
-                </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => handleBuiltinAction('delete')}
+                    disabled={!!builtinBusyAction}
+                    variant="destructive"
+                  >
+                    {builtinBusyAction === 'delete'
+                      ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      : <Trash2 className="mr-1.5 h-3.5 w-3.5" />}
+                    {t('plugins:llm.builtinDelete')}
+                  </Button>
+                </div>
               </>
             )}
           </div>
@@ -756,9 +1009,21 @@ export function UnifiedLLMBackendsTab({
       </Card>
     ) : null
 
+    // Runtime upgrade dialog (opened from the runtime row / its badge).
+    const runtimeDialogElement = (
+      <RuntimeUpgradeDialog
+        open={runtimeDialogOpen}
+        onClose={() => setRuntimeDialogOpen(false)}
+        runtime={builtinStatus?.runtime ?? null}
+        onChanged={() => { void refreshBuiltinStatus() }}
+      />
+    )
+
     // First-run wizard. Mounted in the list view so it survives the
     // empty-state ↔ provider-grid branch switch (a quiet reload after
     // activation may finally populate backendTypes). open={false} hides it.
+
+
     const wizardElement = (
       <BuiltinModelWizard
         open={wizardOpen}
@@ -785,7 +1050,6 @@ export function UnifiedLLMBackendsTab({
           {/* No builtinCard here — the CTA buttons below already pitch the
               built-in model; stacking both was the duplicate CTA users saw. */}
           <EmptyState
-            icon="plugin"
             title={t('plugins:llm.noBackends')}
             description={t('plugins:llm.noBackendsDesc')}
           />
@@ -803,6 +1067,7 @@ export function UnifiedLLMBackendsTab({
             </Button>
           </div>
         {wizardElement}
+        {runtimeDialogElement}
         {/* This branch returns early — the shared dialogs below must be
             duplicated here, or "Add your own API backend" sets state for a
             dialog that is never mounted (click does nothing). */}
@@ -878,8 +1143,21 @@ export function UnifiedLLMBackendsTab({
             // Protocol label overrides the raw vendor name (Cloud AI buckets).
             const protocolName = t(`plugins:llm.protocol.${type.id}.name`, { defaultValue: info.name })
             const protocolDesc = t(`plugins:llm.protocol.${type.id}.desc`, { defaultValue: type.description })
-            const activeInstance = typeInstances.find(i => i.id === activeBackendId)
-            const hasActive = !!activeInstance
+            // Badge is NOT "has any instance" — HeraMind has one global active
+            // backend. Instances on this card with another type active →
+            // "Configured"; only the active type shows "Running".
+            const hasActive = typeInstances.some(i => i.id === activeBackendId)
+            const hasInstances = typeInstances.length > 0
+            const statusLabel = hasActive
+              ? t('plugins:llm.running')
+              : hasInstances
+                ? t('plugins:llm.configured')
+                : t('plugins:llm.notConfigured')
+            const statusClass = hasActive
+              ? 'text-success'
+              : hasInstances
+                ? 'text-info'
+                : 'text-muted-foreground'
 
             return (
               <Card
@@ -901,8 +1179,8 @@ export function UnifiedLLMBackendsTab({
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between gap-2">
                         <CardTitle className="text-base truncate min-w-0">{protocolName}</CardTitle>
-                        <span className={cn("text-xs font-medium shrink-0", hasActive ? "text-success" : "text-muted-foreground")}>
-                          {hasActive ? t('plugins:llm.running') : t('plugins:llm.notConfigured')}
+                        <span className={cn("text-xs font-medium shrink-0", statusClass)}>
+                          {statusLabel}
                         </span>
                       </div>
                       <CardDescription className="mt-1 text-xs line-clamp-1">
@@ -928,6 +1206,17 @@ export function UnifiedLLMBackendsTab({
               i => !i.is_builtin && i.backend_type !== 'ollama' && i.backend_type !== 'llamacpp'
             )
             const hasActive = cloudInstances.some(i => i.id === activeBackendId)
+            const hasInstances = cloudInstances.length > 0
+            const statusLabel = hasActive
+              ? t('plugins:llm.running')
+              : hasInstances
+                ? t('plugins:llm.configured')
+                : t('plugins:llm.notConfigured')
+            const statusClass = hasActive
+              ? 'text-success'
+              : hasInstances
+                ? 'text-info'
+                : 'text-muted-foreground'
             return (
               <Card
                 className={cn(
@@ -947,8 +1236,8 @@ export function UnifiedLLMBackendsTab({
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between gap-2">
                         <CardTitle className="text-base truncate min-w-0">{t('plugins:llm.protocol.cloudai.name')}</CardTitle>
-                        <span className={cn("text-xs font-medium shrink-0", hasActive ? "text-success" : "text-muted-foreground")}>
-                          {hasActive ? t('plugins:llm.running') : t('plugins:llm.notConfigured')}
+                        <span className={cn("text-xs font-medium shrink-0", statusClass)}>
+                          {statusLabel}
                         </span>
                       </div>
                       <CardDescription className="mt-1 text-xs line-clamp-1">
@@ -970,24 +1259,30 @@ export function UnifiedLLMBackendsTab({
           open={ctxDialogOpen}
           onOpenChange={(o) => { setCtxDialogOpen(o); if (!o) setCtxDialogError(null) }}
           title={t('plugins:llm.builtinEngineSettings')}
-          description={t('plugins:llm.builtinEngineSettingsDesc', {
-            def: (builtinStatus?.default_ctx ?? 0).toLocaleString(),
-            model: builtinStatus?.model_id ?? '',
-          })}
           icon={<BrainCircuit className="h-5 w-5 text-muted-foreground" />}
           className="z-[110]"
           isSubmitting={ctxDialogSaving}
           onSubmit={async () => {
-            const v = ctxDialogInput
-            if (v == null || !Number.isFinite(v) || v < 1024 || v > 131_072) {
+            // Preset pick or free-form value — both funnel through the same
+            // backend validation range (1024..=1M).
+            const v = ctxCustomMode ? Number(ctxCustomText) : ctxDialogInput
+            if (v == null || !Number.isFinite(v) || v < 1024 || v > 1_048_576) {
               setCtxDialogError(t('plugins:llm.builtinCtxInvalid'))
               return
             }
+            if (nglMode === 'custom') {
+              const pin = Number(nglText)
+              if (nglText.trim() === '' || !Number.isInteger(pin) || pin < 0 || pin > 65_535) {
+                setCtxDialogError(t('plugins:llm.builtinNglInvalid'))
+                return
+              }
+            }
+            const ngl: number | 'auto' = nglMode === 'custom' ? Number(nglText) : 'auto'
             setCtxDialogSaving(true)
             setCtxDialogError(null)
             try {
-              await api.restartBuiltinLlm(v)
-              toast({ title: t('plugins:llm.builtinCtxApplied', { ctx: v.toLocaleString() }) })
+              await api.restartBuiltinLlm({ ctx: v, parallel: parallelInput, kv: kvInput, ngl })
+              toast({ title: t('plugins:llm.builtinEngineApplied') })
               setCtxDialogOpen(false)
               await refreshBuiltinStatus()
               await loadData(true)
@@ -1007,29 +1302,14 @@ export function UnifiedLLMBackendsTab({
           submitLabel={t('plugins:llm.builtinCtxApply')}
           submitDisabled={ctxDialogSaving}
           submitError={ctxDialogError ?? undefined}
-        >
-          <div className="space-y-4">
-            <FormField label={t('plugins:llm.builtinCtx')} helpText={t('plugins:llm.builtinCtxHelp')}>
-              <Select
-                value={String(ctxDialogInput ?? '')}
-                onValueChange={(v) => setCtxDialogInput(Number(v))}
-              >
-                <SelectTrigger className="w-full font-mono">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {[32768, 65536, 131072].map((n) => {
-                    const def = builtinStatus?.default_ctx ?? 32768
-                    return (
-                      <SelectItem key={n} value={String(n)}>
-                        {(n / 1024).toFixed(0)}K{n === def ? ` · ${t('plugins:llm.builtinCtxDefault')}` : ''}
-                      </SelectItem>
-                    )
-                  })}
-                </SelectContent>
-              </Select>
-            </FormField>
-            {builtinStatus?.ctx_override != null && (
+          footerPrefix={
+            // Reset lives in the footer, left of Apply (operator muscle
+            // memory); resets all three engine knobs to product defaults.
+            builtinStatus != null &&
+            (builtinStatus.ctx_override != null ||
+              builtinStatus.parallel == null ||
+              builtinStatus.parallel !== 1 ||
+              builtinStatus.kv_cache === 'f16') ? (
               <Button
                 size="sm"
                 variant="ghost"
@@ -1038,7 +1318,12 @@ export function UnifiedLLMBackendsTab({
                 onClick={async () => {
                   setCtxDialogSaving(true)
                   try {
-                    await api.restartBuiltinLlm(builtinStatus!.default_ctx!)
+                    await api.restartBuiltinLlm({
+                      ctx: builtinStatus.default_ctx!,
+                      parallel: 1,
+                      kv: 'q8_0',
+                      ngl: 'auto',
+                    })
                     toast({ title: t('plugins:llm.builtinCtxReset') })
                     setCtxDialogOpen(false)
                     setCtxDialogInput(null)
@@ -1056,11 +1341,248 @@ export function UnifiedLLMBackendsTab({
               >
                 {t('plugins:llm.builtinCtxResetBtn')}
               </Button>
-            )}
+            ) : undefined
+          }
+        >
+          <div className="space-y-4">
+            <FormField label={t('plugins:llm.builtinCtx')} helpText={t('plugins:llm.builtinCtxHelp')}>
+              <Select
+                value={ctxCustomMode ? 'custom' : String(ctxDialogInput ?? '')}
+                onValueChange={(v) => {
+                  if (v === 'custom') {
+                    // Seed the input with the current value so switching to
+                    // custom mode never starts from a blank.
+                    if (ctxCustomText === '') setCtxCustomText(String(ctxDialogInput ?? ''))
+                    setCtxCustomMode(true)
+                  } else {
+                    setCtxCustomMode(false)
+                    setCtxDialogInput(Number(v))
+                  }
+                }}
+              >
+                <SelectTrigger className="w-full font-mono">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {BUILTIN_CTX_PRESETS.map((n) => {
+                    const def = builtinStatus?.default_ctx ?? 32768
+                    return (
+                      <SelectItem key={n} value={String(n)}>
+                        {(n / 1024).toFixed(0)}K{n === def ? ` · ${t('plugins:llm.builtinCtxDefault')}` : ''}
+                      </SelectItem>
+                    )
+                  })}
+                  <SelectItem value="custom">
+                    {ctxCustomMode && ctxCustomText
+                      ? `${t('plugins:llm.builtinCtxCustom')} · ${(Number(ctxCustomText) / 1024).toFixed(1)}K`
+                      : t('plugins:llm.builtinCtxCustom')}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              {ctxCustomMode && (
+                <Input
+                  type="number"
+                  min={1024}
+                  max={1_048_576}
+                  step={1024}
+                  value={ctxCustomText}
+                  onChange={(e) => setCtxCustomText(e.target.value)}
+                  className="mt-2 font-mono"
+                  placeholder="1024 – 1048576"
+                />
+              )}
+            </FormField>
+            <FormField label={t('plugins:llm.builtinParallel')} helpText={t('plugins:llm.builtinParallelHelp')}>
+              <Select
+                value={String(parallelInput)}
+                onValueChange={(v) => setParallelInput(v === 'auto' ? 'auto' : Number(v))}
+              >
+                <SelectTrigger className="w-full font-mono">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">{t('plugins:llm.builtinParallelAuto')}</SelectItem>
+                  {[1, 2, 4].map((n) => (
+                    <SelectItem key={n} value={String(n)}>{String(n)}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </FormField>
+            <FormField label={t('plugins:llm.builtinKv')} helpText={t('plugins:llm.builtinKvHelp')}>
+              <Select value={kvInput} onValueChange={(v) => setKvInput(v as 'q8_0' | 'f16')}>
+                <SelectTrigger className="w-full font-mono">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="q8_0">q8_0</SelectItem>
+                  <SelectItem value="f16">f16</SelectItem>
+                </SelectContent>
+              </Select>
+            </FormField>
+            <FormField label={t('plugins:llm.builtinNgl')} helpText={t('plugins:llm.builtinNglHelp')}>
+              <Select
+                value={nglMode}
+                onValueChange={(v) => {
+                  const mode = v as 'auto' | 'custom'
+                  setNglMode(mode)
+                  if (mode === 'custom' && nglText === '' && builtinStatus?.gpu_offload?.ngl != null) {
+                    setNglText(String(builtinStatus.gpu_offload.ngl))
+                  }
+                }}
+              >
+                <SelectTrigger className="w-full font-mono">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">{t('plugins:llm.builtinNglAuto')}</SelectItem>
+                  <SelectItem value="custom">{t('plugins:llm.builtinNglCustom')}</SelectItem>
+                </SelectContent>
+              </Select>
+              {nglMode === 'custom' && (
+                <Input
+                  type="number"
+                  min={0}
+                  max={65_535}
+                  value={nglText}
+                  onChange={(e) => setNglText(e.target.value)}
+                  className="mt-2 font-mono"
+                  placeholder="0 – 65535"
+                />
+              )}
+            </FormField>
+          </div>
+        </UnifiedFormDialog>
+
+        {/* Companion engine settings — same dialog pattern as the main
+            engine settings above (ctx presets + KV). */}
+        <UnifiedFormDialog
+          open={vlmDialogOpen}
+          onOpenChange={(o) => { setVlmDialogOpen(o); if (!o) setVlmDialogError(null) }}
+          title={t('plugins:llm.companionSettings')}
+          icon={<Eye className="h-5 w-5 text-muted-foreground" />}
+          className="z-[110]"
+          isSubmitting={vlmDialogSaving}
+          onSubmit={async () => {
+            const v = vlmCustomMode ? Number(vlmCustomText) : vlmDialogInput
+            if (v == null || !Number.isFinite(v) || v < 1024 || v > 1_048_576) {
+              setVlmDialogError(t('plugins:llm.builtinCtxInvalid'))
+              return
+            }
+            if (vlmNglMode === 'custom') {
+              const pin = Number(vlmNglText)
+              if (vlmNglText.trim() === '' || !Number.isInteger(pin) || pin < 0 || pin > 65_535) {
+                setVlmDialogError(t('plugins:llm.builtinNglInvalid'))
+                return
+              }
+            }
+            const vlmNgll: number | 'auto' = vlmNglMode === 'custom' ? Number(vlmNglText) : 'auto'
+            setVlmDialogSaving(true)
+            setVlmDialogError(null)
+            try {
+              await api.restartBuiltinLlm({ vlm_ctx: v, vlm_kv: vlmKvInput, vlm_ngl: vlmNgll })
+              toast({ title: t('plugins:llm.builtinEngineApplied') })
+              setVlmDialogOpen(false)
+              await refreshBuiltinStatus()
+            } catch (e) {
+              setVlmDialogError(e instanceof Error ? e.message : String(e))
+            } finally {
+              setVlmDialogSaving(false)
+            }
+          }}
+          submitLabel={t('plugins:llm.companionApply')}
+          submitDisabled={vlmDialogSaving}
+          submitError={vlmDialogError ?? undefined}
+        >
+          <div className="space-y-4">
+            <FormField label={t('plugins:llm.builtinCtx')} helpText={t('plugins:llm.builtinCtxHelp')}>
+              <Select
+                value={vlmCustomMode ? 'custom' : String(vlmDialogInput ?? '')}
+                onValueChange={(v) => {
+                  if (v === 'custom') {
+                    if (vlmCustomText === '') setVlmCustomText(String(vlmDialogInput ?? ''))
+                    setVlmCustomMode(true)
+                  } else {
+                    setVlmCustomMode(false)
+                    setVlmDialogInput(Number(v))
+                  }
+                }}
+              >
+                <SelectTrigger className="w-full font-mono">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {BUILTIN_CTX_PRESETS.map((n) => (
+                    <SelectItem key={n} value={String(n)}>
+                      {(n / 1024).toFixed(0)}K
+                    </SelectItem>
+                  ))}
+                  <SelectItem value="custom">
+                    {vlmCustomMode && vlmCustomText
+                      ? `${t('plugins:llm.builtinCtxCustom')} · ${(Number(vlmCustomText) / 1024).toFixed(1)}K`
+                      : t('plugins:llm.builtinCtxCustom')}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              {vlmCustomMode && (
+                <Input
+                  type="number"
+                  min={1024}
+                  max={1_048_576}
+                  step={1024}
+                  value={vlmCustomText}
+                  onChange={(e) => setVlmCustomText(e.target.value)}
+                  className="mt-2 font-mono"
+                  placeholder="1024 – 1048576"
+                />
+              )}
+            </FormField>
+            <FormField label={t('plugins:llm.builtinKv')} helpText={t('plugins:llm.builtinKvHelp')}>
+              <Select value={vlmKvInput} onValueChange={(v) => setVlmKvInput(v as 'q8_0' | 'f16')}>
+                <SelectTrigger className="w-full font-mono">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="q8_0">q8_0</SelectItem>
+                  <SelectItem value="f16">f16</SelectItem>
+                </SelectContent>
+              </Select>
+            </FormField>
+            <FormField label={t('plugins:llm.builtinNgl')} helpText={t('plugins:llm.builtinNglHelp')}>
+              <Select
+                value={vlmNglMode}
+                onValueChange={(v) => {
+                  const mode = v as 'auto' | 'custom'
+                  setVlmNglMode(mode)
+                  if (mode === 'custom' && vlmNglText === '' && builtinStatus?.companion?.gpu_offload?.ngl != null) {
+                    setVlmNglText(String(builtinStatus.companion.gpu_offload.ngl))
+                  }
+                }}
+              >
+                <SelectTrigger className="w-full font-mono">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">{t('plugins:llm.builtinNglAuto')}</SelectItem>
+                  <SelectItem value="custom">{t('plugins:llm.builtinNglCustom')}</SelectItem>
+                </SelectContent>
+              </Select>
+              {vlmNglMode === 'custom' && (
+                <Input
+                  type="number"
+                  min={0}
+                  max={65_535}
+                  value={vlmNglText}
+                  onChange={(e) => setVlmNglText(e.target.value)}
+                  className="mt-2 font-mono"
+                  placeholder="0 – 65535"
+                />
+              )}
+            </FormField>
           </div>
         </UnifiedFormDialog>
 
         {wizardElement}
+        {runtimeDialogElement}
       </>
     )
   }
@@ -1164,16 +1686,16 @@ export function UnifiedLLMBackendsTab({
                   )}
                 >
                   <CardHeader className="pb-3">
-                    <div className="flex items-start justify-between">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1 min-w-0">
-                          <CardTitle className="text-base truncate min-w-0">{instance.name}</CardTitle>
+                    <div className="flex min-w-0 items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="mb-1 flex min-w-0 items-center gap-2">
+                          <CardTitle className="min-w-0 truncate text-base">{instance.name}</CardTitle>
                           {isCloudAi && (
-                            <Badge variant="outline" className="text-xs shrink-0">{protocolLabel}</Badge>
+                            <Badge variant="outline" className="shrink-0 text-xs">{protocolLabel}</Badge>
                           )}
-                          {isActive && <Badge variant="default" className="text-xs">{t('plugins:llm.active')}</Badge>}
+                          {isActive && <Badge variant="default" className="shrink-0 text-xs">{t('plugins:llm.active')}</Badge>}
                         </div>
-                        <CardDescription className="font-mono text-xs">
+                        <CardDescription className="truncate font-mono text-xs" title={String(instance.config?.model || '-')}>
                           {instance.config?.model as string || '-'}
                         </CardDescription>
                         {/* Capability icons — same monochrome style as chat model dropdown */}
@@ -1213,7 +1735,7 @@ export function UnifiedLLMBackendsTab({
                         <Button
                           variant="ghost"
                           size="sm"
-                          className="h-8 w-8 p-0"
+                          className="h-8 w-8 p-0 sm:h-8 sm:w-8"
                           onClick={() => handleTest(instance.id)}
                         >
                           <TestTube className="h-4 w-4" />
@@ -1221,7 +1743,7 @@ export function UnifiedLLMBackendsTab({
                         <Button
                           variant="ghost"
                           size="sm"
-                          className="h-8 w-8 p-0"
+                          className="h-8 w-8 p-0 sm:h-8 sm:w-8"
                           onClick={() => {
                             if (isCloudAi) {
                               // Cloud AI edits go through the add dialog in
@@ -1247,7 +1769,7 @@ export function UnifiedLLMBackendsTab({
                         <Button
                           variant="ghost"
                           size="sm"
-                          className="h-8 w-8 p-0 text-error hover:text-error"
+                          className="h-8 w-8 p-0 text-error hover:text-error sm:h-8 sm:w-8"
                           onClick={() => handleDelete(instance.id)}
                         >
                           <Trash2 className="h-4 w-4" />

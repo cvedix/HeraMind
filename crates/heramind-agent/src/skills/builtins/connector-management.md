@@ -1,13 +1,16 @@
 ---
 id: connector-management
+summary: Configure and diagnose external broker connections.
+not_for: [registering devices onto a broker (device-onboarding)]
 name: Connector Management & MQTT Configuration
+aliases: [connector, broker]
 description: Use when the user wants to configure external MQTT brokers or connectors — adding/removing external brokers, subscriptions, testing connections, remote/cloud brokers. Covers connector create/list/update/enable/disable/test/subscriptions even without saying 'connector' (e.g. '连到远程 MQTT', '订阅一个外部主题'). Includes 连接器/外部 broker/远程 MQTT/订阅. NOT notification channels — use message-management for those.
 category: connector
 origin: builtin
 priority: 80
 token_budget: 8000
 triggers:
-  keywords: [connector, 连接器, MQTT, broker, 代理, 订阅, subscribe, topic, 主题, webhook, 外部, external, broker, 远程, remote, 订阅主题, connector create, connector test, subscription]
+  keywords: [connector, 连接器, MQTT, broker, 代理, 订阅, subscribe, topic, 主题, webhook, 外部, external, broker, 远程, remote, 订阅主题, connector create, connector test, subscription, connect broker, mqtt broker, broker connection, broker 配置, 连接 broker, MQTT broker 连接]
   tool_target:
     - tool: connector
       actions: [list, get, create, update, delete, test, subscriptions, subscribe, unsubscribe]
@@ -15,7 +18,38 @@ anti_triggers:
   keywords: [dashboard, 仪表盘, agent, 代理, extension develop, 扩展开发, rule, 规则]
 ---
 
+# connector-management
+
+Connectors describe broker connections; devices and their approved identity bindings are separate resources.
+Inspect existing connectors before creating duplicates. Configure the specified host/port/TLS/auth, enable when requested, and test the connection. A saved connector is not a live session or accepted subscription.
+Keep discovery permissive: shared topics and JSON identity fields are normal. Do not add topic-name restrictions. Subscription rejection/timeout requires a visible retry path.
+Use subscription commands for requested topic changes. Read back configuration and verify actual connection/subscription state; preserve unrelated settings and credentials.
+Load TLS, subscription, or recovery reference sections for detailed flags.
+
+## Commands
+| Command | Purpose |
+|---|---|
+| `heramind connector list` | List all data connectors |
+| `heramind connector get <id>` | Connector details + connection status |
+| `heramind connector create` | Create a new data connector |
+| `heramind connector update <id>` | Update connector configuration |
+| `heramind connector delete <id>` | Delete a connector |
+| `heramind connector enable <id>` | Enable a connector |
+| `heramind connector disable <id>` | Disable a connector |
+| `heramind connector test <id>` | Test connectivity (real MQTT handshake) |
+| `heramind connector subscriptions` | List MQTT topic subscriptions |
+| `heramind connector subscribe --topic <TOPIC> [--qos 0-2]` | Subscribe to a custom MQTT topic (⚠️ `--topic` is a flag, not positional) |
+| `heramind connector unsubscribe --topic <TOPIC>` | Unsubscribe from a topic |
+
+## Detailed reference
+Use skill(action="load", id="connector-management", section="<exact returned title>") only for the needed detail. Section titles are returned with this overview.
+
+<!-- SKILL_REFERENCE -->
+
+
 # Connector Management & MQTT Configuration
+
+Connectors receive data from external MQTT brokers into HeraMind. `connector create` supports `mqtt` only. A webhook/MQTT data push target forwards data OUT of HeraMind: use `data-push-management` and `heramind push`. Message/alert notification channels use `message-management` and `heramind message`. Choose by the requested purpose and direction, not the transport word alone.
 
 ## Command Cheat-Sheet (run these via `shell`)
 
@@ -31,9 +65,9 @@ Always RUN the command yourself and report the real output.
 | `heramind connector enable <id>` | Enable a connector |
 | `heramind connector disable <id>` | Disable a connector |
 | `heramind connector test <id>` | Test connectivity (real MQTT handshake) |
-| `heramind connector subscriptions <id>` | List MQTT topic subscriptions |
-| `heramind connector subscribe <id>` | Subscribe to a custom MQTT topic |
-| `heramind connector unsubscribe <id>` | Unsubscribe from a topic |
+| `heramind connector subscriptions` | List MQTT topic subscriptions |
+| `heramind connector subscribe --topic <TOPIC> [--qos 0-2]` | Subscribe to a custom MQTT topic (⚠️ `--topic` is a flag, not positional) |
+| `heramind connector unsubscribe --topic <TOPIC>` | Unsubscribe from a topic |
 
 Connectors link HeraMind to external MQTT brokers and data sources. They allow subscribing to topics and bridging data from remote systems.
 
@@ -58,7 +92,7 @@ heramind connector create --name <NAME> --host <HOST> [--port <PORT>] [options]
 | `--name` | Yes | — | Connector display name |
 | `--host` | Yes | — | Broker hostname or IP |
 | `--port` | No | 1883 | Broker port |
-| `--connector-type` | No | mqtt | Connector type (mqtt, webhook, http) |
+| `--connector-type` | No | mqtt | Connector type (mqtt only) |
 | `--tls` | No | false | Enable TLS (flag, no value) |
 | `--username` | No | — | Auth username |
 | `--password` | No | — | Auth password |
@@ -124,7 +158,7 @@ heramind connector subscribe --topic 'factory/sensors/#'
 heramind connector create --name 'Cloud Broker' \
   --host broker.example.com \
   --port 8883 \
-  --tls \
+  --tls true \
   --username myuser \
   --password mypass \
   --topics "devices/telemetry,devices/status"

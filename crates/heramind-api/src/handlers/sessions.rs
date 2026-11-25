@@ -4,7 +4,7 @@ use super::ws::create_connection_metadata;
 
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::Json,
 };
 use futures::stream::{Stream, StreamExt};
@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use heramind_agent::AgentEvent;
+use heramind_agent::{AgentEvent, AgentMessage};
 use heramind_storage::{PendingStreamState, StreamStage};
 
 /// Stream event sent from the LLM processing task to the WebSocket handler.
@@ -56,6 +56,25 @@ async fn process_stream_to_channel(
 
     // Track stream start time for progress reporting
     let stream_start = std::time::Instant::now();
+
+    // Round counter for the pending snapshot's round_contents — mirrors
+    // the client's IntermediateEnd counting.
+    let mut pending_round: u32 = 1;
+
+    // Immediate pending-state save. Tool events and round boundaries must
+    // persist AT ONCE, not on the Thinking/Content debounce: a tool can run
+    // for minutes (shell, extension inference), and the last debounce-saved
+    // snapshot then predates the call — restoring mid-execution showed a
+    // bubble with no tool process (live-test: first-round tools vanished
+    // on switch-back, later rounds did not).
+    let save_pending_now = {
+        let store = session_store.clone();
+        move |st: &PendingStreamState| {
+            if let Err(e) = store.save_pending_stream(st) {
+                tracing::warn!(error = %e, "Failed to update pending stream (event)");
+            }
+        }
+    };
 
     // [detached-delivery] A failed channel send means the WS forwarding
     // loop is gone — the client navigated away or the connection dropped.
@@ -133,6 +152,16 @@ async fn process_stream_to_channel(
                         arguments,
                         round,
                     } => {
+                        // Pending snapshot: register the call so a restored
+                        // bubble shows the tool process (result arrives on End).
+                        pending_state.push_tool_call(json!({
+                            "name": tool,
+                            "id": "",
+                            "arguments": arguments,
+                            "result": serde_json::Value::Null,
+                            "round": round.unwrap_or(1),
+                        }));
+                        save_pending_now(&pending_state);
                         let mut json = json!({
                             "type": "ToolCallStart",
                             "tool": tool,
@@ -150,6 +179,12 @@ async fn process_stream_to_channel(
                         success,
                         round,
                     } => {
+                        pending_state.complete_tool_call(
+                            tool,
+                            round.map(|r| r as u32),
+                            &json!(result),
+                        );
+                        save_pending_now(&pending_state);
                         let mut json = json!({
                             "type": "ToolCallEnd",
                             "tool": tool,
@@ -196,6 +231,9 @@ async fn process_stream_to_channel(
                         // Intermediate end - for multi-round tool calling
                         // This indicates the current round is complete but more processing is coming
                         // Send this to frontend but don't exit the loop
+                        pending_state.rotate_round(pending_round);
+                        pending_round += 1;
+                        save_pending_now(&pending_state);
                         tracing::debug!(
                             "*** Sending IntermediateEnd event (round {}) ***",
                             event_count
@@ -209,6 +247,8 @@ async fn process_stream_to_channel(
                         prompt_tokens,
                         system_prompt_tokens,
                         tool_tokens,
+                        goal_status,
+                        end_reason,
                     } => {
                         // P0.3: Delete pending state on successful completion
                         let _ = session_store.delete_pending_stream(&session_id);
@@ -231,21 +271,90 @@ async fn process_stream_to_channel(
                         }
 
                         // === Context Summarization ===
-                        // If context usage exceeds 60%, trigger background summarization
-                        if let Some(pt) = prompt_tokens {
-                            let pt_val = *pt; // Copy to owned value for 'static spawn
+                        // Trigger on the normal 60% threshold OR on actual
+                        // history truncation — the latter is the only signal
+                        // that works when prompt/tool overhead makes the 60%
+                        // of-window mark unreachable (2026-10-30).
+                        let (history_truncated, force_budget_recover) = match state
+                            .agents
+                            .session_manager
+                            .get_agent_llm(&session_id)
+                            .await
+                        {
+                            Some(llm) => (
+                                llm.take_history_truncated(),
+                                // One auto-recover already failed in-turn: force
+                                // digest even when usage_known=false / meter is 0
+                                // (T4 hard_budget → no_tools follow-ups).
+                                llm.take_hard_budget_auto_recover_exhausted(),
+                            ),
+                            None => (false, false),
+                        };
+                        // Meter kinds:
+                        // - Some(plausible) → bill-first gate
+                        // - None (usage omitted) + truncated → still compact
+                        // - Some(0/MAX) → never compact (corrupt ≠ missing),
+                        //   EXCEPT force_budget_recover after exhausted auto-recover
+                        let pt_for_summary: Option<Option<u32>> = match prompt_tokens {
+                            Some(pt) if heramind_core::plausible_prompt_token_meter(*pt) => {
+                                Some(Some(*pt))
+                            }
+                            Some(pt) if force_budget_recover => {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    prompt_tokens = pt,
+                                    truncated = history_truncated,
+                                    "Summarization spawn with unavailable meter after hard-budget recover"
+                                );
+                                Some(None)
+                            }
+                            Some(pt) => {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    prompt_tokens = pt,
+                                    truncated = history_truncated,
+                                    "Skipping summarization spawn: corrupt prompt_tokens meter"
+                                );
+                                None
+                            }
+                            None if history_truncated || force_budget_recover => Some(None),
+                            None => None,
+                        };
+                        if let Some(meter) = pt_for_summary {
                             let sum_session_id = session_id.clone();
                             let sum_state = state.clone();
+                            let summary_tx = tx.clone();
+                            let force_summarize = force_budget_recover;
                             tokio::spawn(async move {
-                                if let Err(e) =
-                                    crate::handlers::summarization::trigger_summarization(
-                                        &sum_session_id,
-                                        &sum_state,
-                                        pt_val,
-                                    )
-                                    .await
+                                match crate::handlers::summarization::trigger_summarization(
+                                    &sum_session_id,
+                                    &sum_state,
+                                    meter,
+                                    force_summarize,
+                                    history_truncated || force_summarize,
+                                )
+                                .await
                                 {
-                                    tracing::warn!("Background summarization failed: {}", e);
+                                    Ok(outcome) if outcome.summarized_messages > 0 => {
+                                        let mut event = json!({
+                                            "type": "ContextCompacted",
+                                            "sessionId": sum_session_id,
+                                            "summarizedMessages": outcome.summarized_messages,
+                                            "fallbackUsed": outcome.fallback_used,
+                                        });
+                                        if let Some(usage) = outcome.token_usage {
+                                            event["tokenUsage"] = json!(usage);
+                                        }
+                                        let _ = summary_tx
+                                            .send(StreamEvent {
+                                                json: event.to_string(),
+                                            })
+                                            .await;
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::warn!("Background summarization failed: {}", e)
+                                    }
                                 }
                             });
                         }
@@ -255,15 +364,99 @@ async fn process_stream_to_channel(
                         let mut end_json = json!({
                             "type": "end",
                             "sessionId": session_id,
+                            // The LLM context dropped history this turn — the
+                            // UI shows a one-shot notice instead of leaving
+                            // the user to wonder why old facts are forgotten.
+                            "historyTruncated": history_truncated,
                         });
-                        if let Some(pt) = prompt_tokens {
+                        // Compact gate above keeps invalid meters as Some(0/MAX);
+                        // the UI ring must not — omit tokenUsage for implausible.
+                        if let Some(pt) = prompt_tokens
+                            .as_ref()
+                            .copied()
+                            .filter(|pt| heramind_core::plausible_prompt_token_meter(*pt))
+                        {
+                            // Context meter denominator: the session model's
+                            // real window, so the UI can show usage as a
+                            // ratio instead of a raw token count.
+                            let max_ctx = match state
+                                .agents
+                                .session_manager
+                                .get_agent_llm(&session_id)
+                                .await
+                            {
+                                Some(llm) => llm.max_context_length().await,
+                                None => 0,
+                            };
+                            let ratio = if max_ctx > 0 {
+                                (pt as f64 / max_ctx as f64 * 1000.0).round() / 1000.0
+                            } else {
+                                0.0
+                            };
                             end_json["tokenUsage"] = json!({
                                 "promptTokens": pt,
                                 "systemPromptTokens": system_prompt_tokens,
                                 "toolTokens": tool_tokens,
+                                "maxContextTokens": max_ctx,
+                                "usageRatio": ratio,
                             });
                         }
+                        // System-judged goal status (evidence only — not model NL).
+                        if let Some(gs) = goal_status {
+                            end_json["goalStatus"] = serde_json::to_value(gs)
+                                .unwrap_or_else(|_| json!({"status": "incomplete"}));
+                        }
+                        if let Some(reason) = end_reason {
+                            end_json["endReason"] = json!(reason.as_str());
+                        }
                         end_json
+                    }
+                    AgentEvent::ContextUsage {
+                        prompt_tokens,
+                        system_prompt_tokens,
+                        tool_tokens,
+                        max_context_tokens,
+                    } => json!({
+                        "type": "ContextUsage", "sessionId": session_id,
+                        "tokenUsage": {"promptTokens":prompt_tokens, "systemPromptTokens":system_prompt_tokens,
+                            "toolTokens":tool_tokens, "maxContextTokens":max_context_tokens},
+                    }),
+                    AgentEvent::SystemNote { note } => {
+                        json!({
+                            "type": "SystemNote",
+                            "note": note,
+                            "sessionId": session_id,
+                        })
+                    }
+                    AgentEvent::AuthorizeConfirmRequest {
+                        request_id,
+                        prior_operation_id,
+                        write_fingerprint,
+                        tool_name,
+                        target,
+                        valid_until_ms,
+                    } => {
+                        let mut json = json!({
+                            "type": "AuthorizeConfirmRequest",
+                            "requestId": request_id,
+                            "priorOperationId": prior_operation_id,
+                            "writeFingerprint": write_fingerprint,
+                            "toolName": tool_name,
+                            "validUntilMs": valid_until_ms,
+                            "sessionId": session_id,
+                        });
+                        if let Some(t) = target {
+                            json["target"] = json!(t);
+                        }
+                        json
+                    }
+                    AgentEvent::AuthorizeConfirmRemoved { request_id, reason } => {
+                        json!({
+                            "type": "AuthorizeConfirmRemoved",
+                            "requestId": request_id,
+                            "reason": reason,
+                            "sessionId": session_id,
+                        })
                     }
                     AgentEvent::Progress {
                         message,
@@ -356,6 +549,10 @@ async fn process_stream_to_channel(
                 );
                 let _ = session_store.delete_pending_stream(&session_id);
 
+                // Do NOT session-wide abandon here: that would clear sibling
+                // streams' Running leases. Owner-scoped StreamLeaseGuard fires
+                // when this function returns and drops `stream`.
+
                 let timeout_json = json!({
                     "type": "Error",
                     "message": "Stream timeout: response took too long",
@@ -402,6 +599,37 @@ use super::ServerState;
 
 /// Heartbeat interval for WebSocket connections (seconds)
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// Create the session's pending-stream snapshot at FRAME RECEIPT — before
+/// the awaited stream-creation chain (backend reconfig, memory snapshot
+/// load, decision pipeline, first LLM request) that precedes
+/// `process_stream_to_channel`. That function's own snapshot comes too late
+/// for a client that remounts right after sending (the welcome-page send
+/// navigates /chat → /chat/:id and polls /sessions/:id/pending within
+/// ~300ms): `hasPending: false` read as "turn already finished" killed the
+/// client's optimistic spinner, leaving an empty reply area for the whole
+/// model-load window (2026-10-19: "ai回复UI为空需要刷新页面才看得到正在回复中").
+///
+/// Create-if-absent: an existing snapshot belongs to a live turn on this
+/// session — overwriting it would reset the recovery view mid-turn. Callers
+/// whose stream creation FAILS must delete the snapshot themselves (the
+/// non-streaming fallback never runs `process_stream_to_channel`'s
+/// end-of-turn cleanup); the "already being generated" rejection keeps the
+/// live turn's snapshot as-is.
+fn create_initial_pending_snapshot(
+    state: &super::ServerState,
+    session_id: &str,
+    user_message: &str,
+) {
+    let session_store = state.agents.session_manager.session_store();
+    if matches!(session_store.get_pending_stream(session_id), Ok(Some(_))) {
+        return;
+    }
+    let pending_state = PendingStreamState::new(session_id.to_string(), user_message.to_string());
+    if let Err(e) = session_store.save_pending_stream(&pending_state) {
+        tracing::warn!(error = %e, session_id, "Failed to save frame-receipt pending stream state");
+    }
+}
 
 /// Session list item.
 #[derive(Debug, Clone, Serialize)]
@@ -581,22 +809,92 @@ pub async fn get_session_handler(
     }))))
 }
 
+/// Query parameters for paging session history (backward-compatible:
+/// absent params return the full history).
+#[derive(Debug, Deserialize)]
+pub struct HistoryQuery {
+    /// Page size — returns the most recent `limit` messages ending at `before`.
+    pub limit: Option<u32>,
+    /// Exclusive end index (0-based, chronological) into the full history.
+    pub before: Option<u32>,
+}
+
+/// Slice a full history for pagination: with `limit`, the most recent
+/// `limit` messages ending at exclusive index `before` (default: end).
+/// Returns the slice (chronological) and whether older messages remain.
+///
+/// Fragment guard: an assistant turn is stored as several adjacent records
+/// (thinking+tools, tool results, content-only). A page boundary inside such
+/// a group would render a broken partial turn until the next full reload —
+/// the start walks back to the last user message (bounded so a pathological
+/// all-assistant history cannot degenerate into a full scan).
+/// Same pagination contract as [`slice_history`], over the persisted
+/// client form (image references instead of base64).
+fn slice_session_history(
+    history: &[heramind_storage::SessionMessage],
+    limit: Option<u32>,
+    before: Option<u32>,
+) -> (Vec<heramind_storage::SessionMessage>, bool) {
+    let total = history.len();
+    let Some(limit) = limit.filter(|l| *l > 0) else {
+        return (history.to_vec(), false);
+    };
+    let end = before.map_or(total, |b| (b as usize).min(total));
+    let mut start = end.saturating_sub(limit as usize);
+    let floor = start.saturating_sub(50);
+    while start > floor && !history[start].role.eq_ignore_ascii_case("user") {
+        start -= 1;
+    }
+    (history[start..end].to_vec(), start > 0)
+}
+
+/// In-memory-form pagination (kept for the unit tests below; the endpoint
+/// now serves the persisted client form).
+#[cfg_attr(not(test), allow(dead_code))]
+fn slice_history(
+    history: &[AgentMessage],
+    limit: Option<u32>,
+    before: Option<u32>,
+) -> (Vec<AgentMessage>, bool) {
+    let total = history.len();
+    let Some(limit) = limit.filter(|l| *l > 0) else {
+        return (history.to_vec(), false);
+    };
+    let end = before.map_or(total, |b| (b as usize).min(total));
+    let mut start = end.saturating_sub(limit as usize);
+    let floor = start.saturating_sub(50);
+    while start > floor && !history[start].role.eq_ignore_ascii_case("user") {
+        start -= 1;
+    }
+    (history[start..end].to_vec(), start > 0)
+}
+
 /// Get session history.
+///
+/// Pagination is opt-in and backward-compatible: with no query params the
+/// full history is returned (count == total). With `limit`, the MOST RECENT
+/// `limit` messages ending at the exclusive index `before` (default: end of
+/// history) are returned, plus `total` and `has_more` so the client can page
+/// backwards (`before = total - loaded_so_far`).
 #[utoipa::path(
     get,
     path = "/api/sessions/{id}/history",
     tag = "sessions",
     params(
         ("id" = String, Path, description = "Session id"),
+        ("limit" = Option<u32>, Query, description = "Page size — most recent N messages ending at `before`"),
+        ("before" = Option<u32>, Query, description = "Exclusive end index (0-based, chronological) into the full history; default = end"),
     ),
     responses(
-        (status = 200, description = "Message history of a session"),
+        (status = 200, description = "Message history of a session (paginated slice when `limit` is given)"),
         (status = 404, description = "Not found"),
     )
 )]
 pub async fn get_session_history_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+    user: Option<Extension<crate::auth_users::SessionInfo>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ErrorResponse> {
     // First check if session exists (get_history returns empty for NotFound)
     let _agent = state
@@ -606,16 +904,43 @@ pub async fn get_session_history_handler(
         .await
         .map_err(|_| ErrorResponse::not_found("Session"))?;
 
+    // Ownership: same first-claim rule as the WS attach path (this read is
+    // how a page replays history — it must not outrank the attach guard).
+    // NOTE on GET purity: the client-form conversion below persists image
+    // payloads to the served /api/images directory (content-hash file
+    // names, idempotent re-runs) — a GET that can materialize files it
+    // already decided to serve. Accepted: without it, every replay would
+    // re-ship megabytes of base64 that the images endpoint exists to avoid.
+    if session_read_forbidden(
+        &state.agents.session_manager,
+        &id,
+        &rest_principal(user.as_deref()),
+    ) {
+        return Err(ErrorResponse::new(
+            "SESSION_FORBIDDEN",
+            "Session owned by another principal",
+            axum::http::StatusCode::FORBIDDEN,
+        ));
+    }
+
+    // Client form: image payloads become served `/api/images/<file>`
+    // references (content-hash persisted, idempotent). The old endpoint
+    // returned in-memory base64 data URLs — a photo-heavy session was a
+    // multi-megabyte payload per pull.
     let history = state
         .agents
         .session_manager
-        .get_history(&id)
+        .get_history_for_client(&id)
         .await
         .map_err(|e| ErrorResponse::internal(format!("Failed to get history: {}", e)))?;
 
+    let (slice, has_more) = slice_session_history(&history, query.limit, query.before);
+
     Ok(Json(ApiResponse::success(json!({
-        "messages": history,
-        "count": history.len(),
+        "messages": slice,
+        "count": slice.len(),
+        "total": history.len(),
+        "has_more": has_more,
     }))))
 }
 
@@ -635,7 +960,30 @@ pub async fn get_session_history_handler(
 pub async fn delete_session_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
+    user: Option<Extension<crate::auth_users::SessionInfo>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ErrorResponse> {
+    if session_read_forbidden(
+        &state.agents.session_manager,
+        &id,
+        &rest_principal(user.as_deref()),
+    ) {
+        return Err(ErrorResponse::new(
+            "SESSION_FORBIDDEN",
+            "Session owned by another principal",
+            axum::http::StatusCode::FORBIDDEN,
+        ));
+    }
+    // A deleted session may still be GENERATING server-side (detached
+    // delivery) — cancel the turn and drop its pending snapshot, or the
+    // sidebar keeps listing a ghost "generating" session and the poll
+    // chases a snapshot whose owner no longer exists.
+    state.agents.session_manager.cancel_session(&id).await;
+    let _ = state
+        .agents
+        .session_manager
+        .session_store()
+        .delete_pending_stream(&id);
+
     state
         .agents
         .session_manager
@@ -657,6 +1005,82 @@ pub async fn delete_session_handler(
     }))))
 }
 
+/// Manually compact a session's context: force a conversation summary now,
+/// regardless of the 60% auto threshold. The user-facing counterpart of
+/// Claude Code's `/compact` — when the model starts forgetting, the user can
+/// do something about it instead of recreating the session.
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{id}/compact",
+    responses(
+        (status = 200, description = "Compaction result"),
+        (status = 500, description = "Compaction failed"),
+    )
+)]
+pub async fn compact_session_handler(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ErrorResponse> {
+    // Force mode: threshold and min-message gates bypassed. Do NOT pass
+    // u32::MAX as a fake meter — that value poisoned auto-compact logs and
+    // was treated as a real occupancy on T4 (2026-11-13).
+    let outcome =
+        crate::handlers::summarization::trigger_summarization(&id, &state, None, true, false)
+            .await
+            .map_err(ErrorResponse::with_message)?;
+
+    let mut data = json!({
+        "sessionId": id,
+        "summarizedMessages": outcome.summarized_messages,
+        "newUpToIndex": outcome.new_up_to_index,
+        "fallbackUsed": outcome.fallback_used,
+    });
+    if let Some(usage) = outcome.token_usage {
+        data["tokenUsage"] = json!(usage);
+    }
+    Ok(Json(ApiResponse::success(data)))
+}
+
+/// Clear a session's conversation history and reset any stored summary —
+/// fresh context, same session id (Claude Code's `/clear`). Distinct from
+/// DELETE /api/sessions/:id, which removes the session entirely.
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{id}/clear",
+    responses(
+        (status = 200, description = "History cleared"),
+        (status = 500, description = "Clear failed"),
+    )
+)]
+pub async fn clear_session_history_handler(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    user: Option<Extension<crate::auth_users::SessionInfo>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ErrorResponse> {
+    if session_read_forbidden(
+        &state.agents.session_manager,
+        &id,
+        &rest_principal(user.as_deref()),
+    ) {
+        return Err(ErrorResponse::new(
+            "SESSION_FORBIDDEN",
+            "Session owned by another principal",
+            axum::http::StatusCode::FORBIDDEN,
+        ));
+    }
+    state
+        .agents
+        .session_manager
+        .clear_history(&id)
+        .await
+        .map_err(|e| ErrorResponse::with_message(e.to_string()))?;
+
+    Ok(Json(ApiResponse::success(json!({
+        "sessionId": id,
+        "cleared": true,
+    }))))
+}
+
 /// P0.3: Get pending stream state for a session (for recovery after disconnection).
 #[utoipa::path(
     get,
@@ -673,16 +1097,38 @@ pub async fn delete_session_handler(
 pub async fn get_pending_stream_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
+    user: Option<Extension<crate::auth_users::SessionInfo>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ErrorResponse> {
+    if session_read_forbidden(
+        &state.agents.session_manager,
+        &id,
+        &rest_principal(user.as_deref()),
+    ) {
+        return Err(ErrorResponse::new(
+            "SESSION_FORBIDDEN",
+            "Session owned by another principal",
+            axum::http::StatusCode::FORBIDDEN,
+        ));
+    }
     let session_store = state.agents.session_manager.session_store();
 
-    match session_store.get_pending_stream(&id) {
+    match session_store
+        .get_pending_stream(&id)
+        // Same staleness rule as the list endpoint: a >10-minute-old
+        // snapshot is hidden from the sidebar's generating indicator, and
+        // entering the session must agree — recovering a snapshot the list
+        // says doesn't exist left the enter-path spinning on a dead turn.
+        .map(|p| p.filter(|p| !p.is_stale()))
+    {
         Ok(Some(pending)) => Ok(Json(ApiResponse::success(json!({
             "hasPending": true,
             "sessionId": id,
             "userMessage": pending.user_message,
             "content": pending.content,
             "thinking": pending.thinking,
+            "toolCalls": pending.tool_calls.clone().unwrap_or_default(),
+            "roundContents": pending.round_contents.clone().unwrap_or_default(),
+            "currentRound": pending.current_round,
             "stage": pending.stage,
             "elapsed": pending.elapsed_secs(),
             "startedAt": pending.started_at,
@@ -696,6 +1142,35 @@ pub async fn get_pending_stream_handler(
             e
         ))),
     }
+}
+
+/// List sessions with an in-flight (pending) generation — for the session
+/// list's live "generating" indicator. Stale entries (>10 min without an
+/// update — a hard-killed server leaves them behind) are excluded: a
+/// spinner that never resolves is worse than no spinner.
+#[utoipa::path(
+    get,
+    path = "/api/sessions/pending",
+    tag = "sessions",
+    responses(
+        (status = 200, description = "Session ids with an in-flight generation"),
+    ),
+)]
+pub async fn list_pending_sessions_handler(
+    State(state): State<ServerState>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ErrorResponse> {
+    let store = state.agents.session_manager.session_store();
+    let ids = store
+        .get_all_pending_streams()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.is_stale())
+        .map(|p| p.session_id)
+        .collect::<Vec<_>>();
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "sessionIds": ids,
+        "count": ids.len(),
+    }))))
 }
 
 /// P0.3: Clear pending stream state for a session (user chose to discard).
@@ -714,7 +1189,19 @@ pub async fn get_pending_stream_handler(
 pub async fn clear_pending_stream_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
+    user: Option<Extension<crate::auth_users::SessionInfo>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ErrorResponse> {
+    if session_read_forbidden(
+        &state.agents.session_manager,
+        &id,
+        &rest_principal(user.as_deref()),
+    ) {
+        return Err(ErrorResponse::new(
+            "SESSION_FORBIDDEN",
+            "Session owned by another principal",
+            axum::http::StatusCode::FORBIDDEN,
+        ));
+    }
     let session_store = state.agents.session_manager.session_store();
 
     session_store.delete_pending_stream(&id).map_err(|e| {
@@ -875,15 +1362,45 @@ pub async fn chat_handler(
     // + selected_skills, which the old handler dropped on the floor.
     // Prepend page context if provided (mirrors the WS path; the old single-round
     // HTTP handler dropped this).
-    let final_message = if let Some(ref ctx) = req.page_context {
-        if !ctx.is_empty() {
-            format!("{}\n\n{}", ctx, req.message)
-        } else {
-            req.message.clone()
+    // Structured references: contentNodes (v1 in-place) preferred; legacy
+    // `references` preamble otherwise. Caps on the nodes path are hard 400s.
+    let prepared = match super::chat_refs::prepare_chat_input(
+        &state,
+        &req.message,
+        req.page_context.as_deref(),
+        req.references.as_deref(),
+        req.content_version,
+        req.content_nodes.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(err) => {
+            return Err(crate::models::error::ErrorResponse::new(
+                err.code.clone(),
+                err.message.clone(),
+                axum::http::StatusCode::BAD_REQUEST,
+            )
+            .with_hint(format!(
+                "contentNodes caps: nodes≤{}, refs≤{}, textChars≤{}; legacy references path still truncates with a note",
+                super::chat_refs::MAX_CONTENT_NODES,
+                super::chat_refs::MAX_REFERENCES,
+                super::chat_refs::MAX_CONTENT_TEXT_CHARS
+            )));
         }
-    } else {
-        req.message.clone()
     };
+    let final_message = prepared.model_message;
+
+    // Content nodes travel with the message into atomic accept (like auth) —
+    // prepare only shapes the model text.
+    let content_nodes_arg = super::chat_refs::content_nodes_for_accept(
+        &req.message,
+        req.content_nodes.as_deref(),
+        req.content_version,
+        req.references.as_deref(),
+    );
+    let authorize_submit =
+        super::chat_refs::authorize_new_op_submit(req.authorize_new_operation.as_ref());
 
     // Branch on multimodal input for REST parity with WS. The old HTTP handler
     // dropped req.images entirely, so a REST vision client silently degraded to
@@ -908,11 +1425,13 @@ pub async fn chat_handler(
         state
             .agents
             .session_manager
-            .process_message_multimodal_with_backend_stream(
+            .process_message_multimodal_with_backend_stream_authorize(
                 &id,
                 &final_message,
                 images,
                 req.backend_id.as_deref(),
+                authorize_submit,
+                content_nodes_arg,
             )
             .await
     } else {
@@ -924,6 +1443,8 @@ pub async fn chat_handler(
                 &final_message,
                 req.backend_id.as_deref(),
                 req.selected_skills.as_deref(),
+                authorize_submit,
+                content_nodes_arg,
             )
             .await
     };
@@ -1040,6 +1561,170 @@ pub async fn chat_handler(
     }))
 }
 
+/// Build a `MessageReceived` receive-ack frame for a client-supplied
+/// `clientRequestId`. Local `ws.send` / queue success is NOT a server accept —
+/// the composer draft lifecycle waits for this frame (or a reject/timeout).
+/// `accepted` must only be sent AFTER busy/clearing checks and the user
+/// message is successfully saved; rejects always echo the same `requestId`.
+fn message_received_frame(
+    request_id: &str,
+    status: &str,
+    session_id: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    message_received_frame_with_resolutions(request_id, status, session_id, reason, None)
+}
+
+/// Same as [`message_received_frame`], optionally attaching per-reference
+/// resolutions from prepare so the client can mark stale @ chips without a
+/// separate preflight race.
+fn message_received_frame_with_resolutions(
+    request_id: &str,
+    status: &str,
+    session_id: Option<&str>,
+    reason: Option<&str>,
+    resolutions: Option<&[super::chat_refs::RefResolution]>,
+) -> String {
+    let mut body = json!({
+        "type": "MessageReceived",
+        "requestId": request_id,
+        "status": status,
+    });
+    if let Some(sid) = session_id {
+        body["sessionId"] = json!(sid);
+    }
+    if let Some(r) = reason {
+        body["reason"] = json!(r);
+    }
+    if let Some(res) = resolutions {
+        if !res.is_empty() {
+            body["refResolutions"] = json!(res);
+        }
+    }
+    body.to_string()
+}
+
+/// Stable reject reason for composer draft restore (matched by tests).
+fn receive_ack_reject_reason(err: &dyn std::fmt::Display) -> &'static str {
+    let s = err.to_string().to_lowercase();
+    if s.contains("already being generated") {
+        "session_busy"
+    } else if s.contains("being cleared") || s.contains("cleared during turn") {
+        "session_clearing"
+    } else if s.contains("failed to save user message") || s.contains("storage error") {
+        "save_failed"
+    } else {
+        "rejected"
+    }
+}
+
+/// After `MessageReceived:rejected`, the client stream machine only resets on
+/// a terminal `Error` + `end` (Error alone still spins). Callers must emit both
+/// and must NOT continue into a tool-capable non-stream fallback — that path
+/// used raw `task_user_message` and bypassed structured refs / authorize.
+fn ws_reject_terminal_frames(session_id: &str, message: &str) -> (String, String) {
+    let err = json!({
+        "type": "Error",
+        "message": message,
+        "sessionId": session_id,
+    })
+    .to_string();
+    let end = json!({
+        "type": "end",
+        "sessionId": session_id,
+    })
+    .to_string();
+    (err, end)
+}
+
+/// Policy pin: a receive-ack `rejected` never continues into non-stream tools.
+fn ws_rejected_blocks_nonstream_fallback() -> bool {
+    true
+}
+
+#[cfg(test)]
+mod receive_ack_reason_tests {
+    use super::{
+        message_received_frame, message_received_frame_with_resolutions, receive_ack_reject_reason,
+        ws_reject_terminal_frames, ws_rejected_blocks_nonstream_fallback,
+    };
+    use crate::handlers::chat_refs::RefResolution;
+    use serde_json::Value;
+
+    #[test]
+    fn maps_busy_clearing_save_and_protocol() {
+        assert_eq!(
+            receive_ack_reject_reason(
+                &"A response is already being generated for this session — wait"
+            ),
+            "session_busy"
+        );
+        assert_eq!(
+            receive_ack_reject_reason(
+                &"Session history is being cleared — wait for clear to finish"
+            ),
+            "session_clearing"
+        );
+        assert_eq!(
+            receive_ack_reject_reason(&"Storage error: Failed to save user message: disk full"),
+            "save_failed"
+        );
+        // prepare_chat_input / protocol codes fall through as generic rejected
+        // at the WS layer (those paths pass err.code directly, not this helper).
+        assert_eq!(
+            receive_ack_reject_reason(&"Validation error: contentNodes exceed cap"),
+            "rejected"
+        );
+    }
+
+    #[test]
+    fn rejected_ack_requires_terminal_error_and_end_no_nonstream() {
+        assert!(
+            ws_rejected_blocks_nonstream_fallback(),
+            "after MessageReceived:rejected must not fall into non-stream tool execution"
+        );
+        let (err, end) = ws_reject_terminal_frames("sess-1", "stream setup failed");
+        let err_v: Value = serde_json::from_str(&err).expect("Error frame JSON");
+        let end_v: Value = serde_json::from_str(&end).expect("end frame JSON");
+        assert_eq!(err_v["type"], "Error");
+        assert_eq!(err_v["sessionId"], "sess-1");
+        assert_eq!(err_v["message"], "stream setup failed");
+        assert_eq!(end_v["type"], "end");
+        assert_eq!(end_v["sessionId"], "sess-1");
+
+        // Rejected ack + terminal pair is the only allowed closeout after reject
+        // (busy/save already used Error+end; empty/prepare/generic reject must too).
+        let ack: Value = serde_json::from_str(&message_received_frame(
+            "req-1",
+            "rejected",
+            Some("sess-1"),
+            Some("rejected"),
+        ))
+        .expect("ack JSON");
+        assert_eq!(ack["status"], "rejected");
+        assert_eq!(ack["requestId"], "req-1");
+
+        let resolutions = vec![RefResolution {
+            index: 0,
+            r#type: "device".into(),
+            id: "sensor-001".into(),
+            ok: false,
+            detail: "not_found".into(),
+        }];
+        let accepted: Value = serde_json::from_str(&message_received_frame_with_resolutions(
+            "req-2",
+            "accepted",
+            Some("sess-1"),
+            None,
+            Some(resolutions.as_slice()),
+        ))
+        .expect("accepted ack JSON");
+        assert_eq!(accepted["status"], "accepted");
+        assert_eq!(accepted["refResolutions"][0]["id"], "sensor-001");
+        assert_eq!(accepted["refResolutions"][0]["ok"], false);
+    }
+}
+
 /// WebSocket chat handler.
 ///
 /// Supports two authentication methods:
@@ -1125,8 +1810,17 @@ pub async fn ws_chat_handler(
         }
     }
 
+    // Principal for session ownership: which authenticated identity does
+    // this connection speak for? JWT → the user; API key → the shared
+    // "apikey" bucket (single-tenant admin credential). Without a principal
+    // we never get here — unauthenticated upgrades are closed above.
+    let principal = session_info
+        .as_ref()
+        .map(|info| format!("user:{}", info.username))
+        .unwrap_or_else(|| "apikey".to_string());
+
     let session_id = params.get("sessionId").cloned();
-    ws.on_upgrade(|socket| handle_ws_socket(socket, state, session_id, session_info))
+    ws.on_upgrade(|socket| handle_ws_socket(socket, state, session_id, principal))
 }
 
 /// Send session history to the client.
@@ -1170,6 +1864,40 @@ async fn send_session_history(
                             obj.insert("round_thinking".to_string(), rt.clone());
                         }
                     }
+                    // Include system_notes if present (guard callouts)
+                    if let Some(ref sn) = msg.system_notes {
+                        if let Some(obj) = history_json.as_object_mut() {
+                            obj.insert("system_notes".to_string(), serde_json::json!(sn));
+                        }
+                    }
+                    // Stored End snapshot — return as-is (do not recompute TaskState)
+                    if let Some(ref gs) = msg.goal_status {
+                        if let Some(obj) = history_json.as_object_mut() {
+                            obj.insert(
+                                "goalStatus".to_string(),
+                                serde_json::to_value(gs).unwrap_or(serde_json::Value::Null),
+                            );
+                        }
+                    }
+                    if let Some(ref er) = msg.end_reason {
+                        if let Some(obj) = history_json.as_object_mut() {
+                            obj.insert(
+                                "endReason".to_string(),
+                                serde_json::to_value(er).unwrap_or(serde_json::Value::Null),
+                            );
+                        }
+                    }
+                    // Match HTTP history: contentNodes + contentVersion
+                    if let Some(ref nodes) = msg.content_nodes {
+                        if let Some(obj) = history_json.as_object_mut() {
+                            obj.insert("contentNodes".to_string(), json!(nodes));
+                        }
+                    }
+                    if let Some(ver) = msg.content_version {
+                        if let Some(obj) = history_json.as_object_mut() {
+                            obj.insert("contentVersion".to_string(), json!(ver));
+                        }
+                    }
                     let history_msg = history_json.to_string();
 
                     if socket.send(AxumMessage::Text(history_msg)).await.is_err() {
@@ -1200,13 +1928,63 @@ async fn send_session_history(
     }
 }
 
+/// May `principal` attach to `session_id`? The FIRST attachment claims the
+/// session (stamps the owner); a different principal is refused. Unclaimed
+/// sessions (created before ownership tracking, or outside WS) are
+/// claimable exactly once. Extracted so the ownership decision itself is
+/// unit-testable without a live WebSocket.
+fn session_attach_allowed(
+    manager: &heramind_agent::SessionManager,
+    sid: &str,
+    principal: &str,
+) -> bool {
+    // Atomic first-claim: the unlocked read-check-write raced concurrent
+    // first attachments (WS + REST) into double-stamping.
+    manager.claim_session_owner(sid, principal)
+}
+
+/// Principal for a REST caller — same grammar as the WS path: JWT →
+/// `user:<name>`, API-key auth → the shared "apikey" bucket.
+fn rest_principal(user: Option<&crate::auth_users::SessionInfo>) -> String {
+    match user {
+        // The auth middleware inserts a service-account SessionInfo
+        // (user_id "apikey:<id>", username = key name) for API-key callers;
+        // without this arm they'd land in `user:<key-name>` while the WS
+        // path stamps the same caller "apikey" — a REST history read would
+        // claim the session for a principal the socket can never match.
+        Some(u) if u.user_id.starts_with("apikey:") => "apikey".to_string(),
+        Some(u) => format!("user:{}", u.username),
+        None => "apikey".to_string(),
+    }
+}
+
+/// Ownership guard for session-scoped REST endpoints (history / pending /
+/// delete). The WS attach path enforces first-claim ownership; these HTTP
+/// reads used to bypass it entirely — any authenticated principal could
+/// replay another user's history or delete their sessions. Same decision
+/// function, same semantics: unstamped sessions are claimed by first touch.
+fn session_read_forbidden(
+    manager: &heramind_agent::SessionManager,
+    sid: &str,
+    principal: &str,
+) -> bool {
+    !session_attach_allowed(manager, sid, principal)
+}
+
 /// Handle WebSocket connection.
 async fn handle_ws_socket(
     mut socket: WebSocket,
     state: ServerState,
     session_id: Option<String>,
-    _session_info: Option<crate::auth_users::SessionInfo>,
+    principal: String,
 ) {
+    // Session ownership: a session stamped to a DIFFERENT principal must not
+    // be attachable — pre-fix, any valid token could pass ?sessionId=<other
+    // user's session> and the socket would replay its entire history. An
+    // unstamped session is claimable exactly once (first attachment stamps).
+    let session_allowed = |sid: &str, principal: &str| -> bool {
+        session_attach_allowed(&state.agents.session_manager, sid, principal)
+    };
     // Create connection metadata for tracking state and heartbeat
     let conn_meta = create_connection_metadata();
     conn_meta
@@ -1243,9 +2021,26 @@ async fn handle_ws_socket(
         return;
     }
 
-    // Send session history if reconnecting with an existing session
+    // Send session history if reconnecting with an existing session —
+    // but only if this connection's principal owns (or may claim) it.
     if let Some(ref sid) = session_id {
         if !sid.is_empty() {
+            if !session_allowed(sid, &principal) {
+                tracing::warn!(
+                    session_id = %sid,
+                    principal = %principal,
+                    "WS attach rejected — session belongs to another principal"
+                );
+                let _ = socket
+                    .send(AxumMessage::Text(
+                        json!({"type": "Error", "message": "Session belongs to another user."})
+                            .to_string(),
+                    ))
+                    .await;
+                let _ = socket.close().await;
+                conn_meta.mark_closed().await;
+                return;
+            }
             let _ = send_session_history(&mut socket, sid, &state).await;
         }
     }
@@ -1261,6 +2056,12 @@ async fn handle_ws_socket(
                             AxumMessage::Text(text) => {
                                 // Track message received
                                 conn_meta.increment_received();
+                                // ANY inbound frame proves the client is
+                                // alive — liveness used to be pong-only, so
+                                // a third-party client that chats steadily
+                                // but never implements the pong frame was
+                                // cut off ~60-90s into the connection.
+                                conn_meta.record_pong().await;
 
                                 // Check for pong response to our heartbeat ping
                                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -1271,7 +2072,7 @@ async fn handle_ws_socket(
                                     }
                                 }
 
-                                if let Ok(chat_req) = serde_json::from_str::<ChatRequest>(&text) {
+                                if let Ok(mut chat_req) = serde_json::from_str::<ChatRequest>(&text) {
                                     // Check for cancel request
                                     if chat_req.message == "__CANCEL__" {
                                         tracing::info!("Received cancel request from client");
@@ -1285,13 +2086,31 @@ async fn handle_ws_socket(
                                         };
 
                                         // Send interrupt signal to the active stream
-                                        if !cancel_session_id.is_empty() {
+                                        if !cancel_session_id.is_empty()
+                                            && session_allowed(&cancel_session_id, &principal)
+                                        {
                                             state.agents.session_manager.cancel_session(&cancel_session_id).await;
+                                            // The cancelled turn is dead — drop its pending-stream
+                                            // snapshot too. The End/timeout paths delete it, but a
+                                            // cancel that terminates via a non-End event (Error /
+                                            // dropped channel) leaves a FROZEN snapshot that the
+                                            // detached-page 3s poll would otherwise resurrect as a
+                                            // ghost stream, spinner and all, until the stall cap.
+                                            let _ = state.agents.session_manager.session_store()
+                                                .delete_pending_stream(&cancel_session_id);
                                         }
 
-                                        // Send acknowledgment
+                                        // Send acknowledgment. sessionId is
+                                        // load-bearing: the chat page and
+                                        // the side panel share this socket,
+                                        // and the client's event filter
+                                        // routes by sessionId — without it
+                                        // the ack passes every filter and
+                                        // hard-resets whichever OTHER view
+                                        // happens to be streaming.
                                         let cancel_msg = json!({
                                             "type": "cancelled",
+                                            "sessionId": cancel_session_id,
                                             "message": "Request cancelled by user"
                                         }).to_string();
                                         if socket.send(AxumMessage::Text(cancel_msg)).await.is_err() {
@@ -1322,6 +2141,33 @@ async fn handle_ws_socket(
                                         if needs_switch {
                                             // Switch to requested session
                                             let req_id = requested_session_id.as_ref().expect("requested_session_id validated in needs_switch check");
+                                            if !session_allowed(req_id, &principal) {
+                                                tracing::warn!(
+                                                    session_id = %req_id,
+                                                    principal = %principal,
+                                                    "WS switch rejected — session belongs to another principal"
+                                                );
+                                                if let Some(ref rid) = chat_req.client_request_id {
+                                                    let ack = message_received_frame(
+                                                        rid,
+                                                        "rejected",
+                                                        Some(req_id),
+                                                        Some("session_forbidden"),
+                                                    );
+                                                    if socket.send(AxumMessage::Text(ack)).await.is_err() {
+                                                        return;
+                                                    }
+                                                }
+                                                let msg = json!({
+                                                    "type": "Error",
+                                                    "message": "Session belongs to another user.",
+                                                    "sessionId": req_id,
+                                                }).to_string();
+                                                if socket.send(AxumMessage::Text(msg)).await.is_err() {
+                                                    return;
+                                                }
+                                                continue;
+                                            }
                                             {
                                                 let mut write_guard = current_session_id.write().await;
                                                 *write_guard = Some(req_id.clone());
@@ -1358,6 +2204,7 @@ async fn handle_ws_socket(
                                             };
 
                                             {
+                                                state.agents.session_manager.set_session_owner(&new_id, &principal);
                                                 let mut write_guard = current_session_id.write().await;
                                                 *write_guard = Some(new_id.clone());
                                             }
@@ -1377,39 +2224,134 @@ async fn handle_ws_socket(
                                         }
                                     };
 
-                                    // Filter out control messages (commands starting with '/')
-                                    // These are not user messages and should not be sent to the LLM
+                                    // [slash-filter removed] A legacy filter here dropped ANY
+                                    // message starting with '/' as a "control command" — but control
+                                    // traffic is structured (the sessionId field above), the frontend
+                                    // never sends slash commands over this socket, and a user message
+                                    // that begins with a file path ("/Users/…/x.png, 加上水印") is
+                                    // ordinary input in this product. It silently swallowed such turns
+                                    // (observed: chat stuck on loading…, log: "Ignoring control
+                                    // message"). Route everything to the LLM.
                                     let message = chat_req.message.trim();
-                                    if message.starts_with('/') {
-                                        tracing::info!(
-                                            "Ignoring control message: '{}', length={}",
-                                            message,
-                                            message.chars().count()
+                                    let has_content_nodes = chat_req
+                                        .content_nodes
+                                        .as_ref()
+                                        .is_some_and(|n| !n.is_empty());
+                                    if message.is_empty()
+                                        && chat_req.images.as_ref().is_none_or(|i| i.is_empty())
+                                        && !has_content_nodes
+                                    {
+                                        // Nothing to send (no text, images, or contentNodes)
+                                        // — reject with terminal Error+end so the client
+                                        // stream machine / draft ACK wait does not stick.
+                                        if let Some(ref rid) = chat_req.client_request_id {
+                                            let ack = message_received_frame(
+                                                rid,
+                                                "rejected",
+                                                Some(&session_id),
+                                                Some("empty_message"),
+                                            );
+                                            if socket.send(AxumMessage::Text(ack)).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                        let (err_frame, end_frame) = ws_reject_terminal_frames(
+                                            &session_id,
+                                            "empty_message",
                                         );
-                                        // Control messages are handled by the sessionId field above,
-                                        // no need to process them through the LLM
+                                        if socket.send(AxumMessage::Text(err_frame)).await.is_err() {
+                                            return;
+                                        }
+                                        if socket.send(AxumMessage::Text(end_frame)).await.is_err() {
+                                            return;
+                                        }
                                         continue;
                                     }
 
                                     // Try event streaming first (rich response with tool calls)
                                     // Spawn a task to process the stream asynchronously, keeping the main loop responsive
                                     let backend_id = chat_req.backend_id.as_deref();
+                                    let client_request_id = chat_req.client_request_id.clone();
 
                                     // Check if request contains images (multimodal input)
                                     let has_images = chat_req.images.as_ref().is_some_and(|i| !i.is_empty());
 
                                     if has_images {
                                         // Process multimodal message with images - now with streaming support!
-                                        let images: Vec<String> = chat_req.images
-                                            .as_ref()
-                                            .unwrap_or(&vec![])
-                                            .iter()
-                                            .map(|img| img.data.clone())
+                                        // [copy-avoidance] take() the images out of
+                                        // the request instead of cloning every base64
+                                        // payload — a single 5MB photo used to be
+                                        // duplicated here before the pipeline's own
+                                        // copies even started.
+                                        let images: Vec<String> = chat_req
+                                            .images
+                                            .take()
+                                            .unwrap_or_default()
+                                            .into_iter()
+                                            .map(|img| img.data)
                                             .collect();
 
                                         let backend_id_str = backend_id.map(|s| s.to_string());
                                         let task_session_id = session_id.clone();
                                         let task_state = state.clone();
+
+                                        // Validate+prepare BEFORE receive-ack / pending
+                                        // snapshot — an early accepted ack would clear the
+                                        // composer draft while prepare still fails.
+                                        let prepared = match super::chat_refs::prepare_chat_input(
+                                            &task_state,
+                                            &chat_req.message,
+                                            chat_req.page_context.as_deref(),
+                                            chat_req.references.as_deref(),
+                                            chat_req.content_version,
+                                            chat_req.content_nodes.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(p) => p,
+                                            Err(err) => {
+                                                if let Some(ref rid) = client_request_id {
+                                                    let ack = message_received_frame(
+                                                        rid,
+                                                        "rejected",
+                                                        Some(&session_id),
+                                                        Some(&err.code),
+                                                    );
+                                                    if socket.send(AxumMessage::Text(ack)).await.is_err() {
+                                                        return;
+                                                    }
+                                                }
+                                                let err_frame = json!({
+                                                    "type": "Error",
+                                                    "code": err.code,
+                                                    "message": err.message,
+                                                    "limit": err.limit,
+                                                    "actual": err.actual,
+                                                    "sessionId": session_id,
+                                                })
+                                                .to_string();
+                                                if socket.send(AxumMessage::Text(err_frame)).await.is_err() {
+                                                    return;
+                                                }
+                                                // Terminal end: Error alone left the client spinning.
+                                                let end = json!({
+                                                    "type": "end",
+                                                    "sessionId": session_id,
+                                                })
+                                                .to_string();
+                                                if socket.send(AxumMessage::Text(end)).await.is_err() {
+                                                    return;
+                                                }
+                                                continue;
+                                            }
+                                        };
+
+                                        // [frame-receipt pending snapshot] Born BEFORE the
+                                        // awaited stream creation below (and before the pinned-
+                                        // skills await) — see create_initial_pending_snapshot.
+                                        // MessageReceived:accepted waits until process_* returns
+                                        // Ok (busy/clearing/save already succeeded).
+                                        create_initial_pending_snapshot(&task_state, &task_session_id, &chat_req.message);
 
                                         // Set session ID on memory tool for session-scoped operations
                                         // (now handled inside Agent::process to avoid cross-session races)
@@ -1422,25 +2364,43 @@ async fn handle_ws_socket(
                                             }
                                         }
 
-                                        // Prepend page context if provided
-                                        let final_message = if let Some(ref ctx) = chat_req.page_context {
-                                            if !ctx.is_empty() {
-                                                format!("{}\n\n{}", ctx, chat_req.message)
-                                            } else {
-                                                chat_req.message.clone()
-                                            }
-                                        } else {
-                                            chat_req.message.clone()
-                                        };
+                                        let final_message = prepared.model_message;
 
-                                        // Use streaming for multimodal messages
-                                        match task_state.agents.session_manager.process_message_multimodal_with_backend_stream(
+                                        let content_nodes_arg = super::chat_refs::content_nodes_for_accept(
+                                            &chat_req.message,
+                                            chat_req.content_nodes.as_deref(),
+                                            chat_req.content_version,
+                                            chat_req.references.as_deref(),
+                                        );
+                                        let authorize_submit = super::chat_refs::authorize_new_op_submit(
+                                            chat_req.authorize_new_operation.as_ref(),
+                                        );
+
+                                        // Use streaming for multimodal messages.
+                                        // On stream-setup failure we reject + Error+end —
+                                        // no non-stream fallback (that bypassed refs/auth).
+                                        match task_state.agents.session_manager.process_message_multimodal_with_backend_stream_authorize(
                                             &task_session_id,
                                             &final_message,
-                                            images.clone(),
+                                            images,
                                             backend_id_str.as_deref(),
+                                            authorize_submit,
+                                            content_nodes_arg,
                                         ).await {
                                             Ok(stream) => {
+                                                // User message saved + busy/clearing passed.
+                                                if let Some(ref rid) = client_request_id {
+                                                    let ack = message_received_frame_with_resolutions(
+                                                        rid,
+                                                        "accepted",
+                                                        Some(&session_id),
+                                                        None,
+                                                        Some(prepared.resolutions.as_slice()),
+                                                    );
+                                                    if socket.send(AxumMessage::Text(ack)).await.is_err() {
+                                                        return;
+                                                    }
+                                                }
                                                 // Clone the channel sender and session ID for the spawned task
                                                 let task_tx = stream_tx.clone();
                                                 let task_session_id = session_id.clone();
@@ -1452,56 +2412,107 @@ async fn handle_ws_socket(
                                                 });
                                             }
                                             Err(e) => {
-                                                // Fallback to non-streaming on error
-                                                tracing::error!(error = %e, session_id = %task_session_id, backend_id = ?backend_id_str, "Streaming multimodal failed, falling back to non-streaming");
-                                                let response = match task_state.agents.session_manager.process_message_multimodal_with_backend(
-                                                    &task_session_id,
-                                                    &chat_req.message,
-                                                    images,
-                                                    backend_id_str.as_deref(),
-                                                ).await {
-                                                    Ok(resp) => json!({
-                                                        "type": "response",
-                                                        "content": resp.message.content,
-                                                        "sessionId": task_session_id,
-                                                        "toolsUsed": resp.tools_used,
-                                                        "processingTimeMs": resp.processing_time_ms,
-                                                    }).to_string(),
-                                                    Err(inner_e) => json!({
-                                                        "type": "Error",
-                                                        "message": inner_e.to_string(),
-                                                    }).to_string(),
-                                                };
-
-                                                if socket.send(AxumMessage::Text(response)).await.is_err() {
-                                                    break;
+                                                // Reject ack already implies no tool execution —
+                                                // never fall into non-stream (that path used raw
+                                                // chat_req.message and bypassed refs/authorize).
+                                                debug_assert!(ws_rejected_blocks_nonstream_fallback());
+                                                if let Some(ref rid) = client_request_id {
+                                                    let ack = message_received_frame(
+                                                        rid,
+                                                        "rejected",
+                                                        Some(&task_session_id),
+                                                        Some(receive_ack_reject_reason(&e)),
+                                                    );
+                                                    if socket.send(AxumMessage::Text(ack)).await.is_err() {
+                                                        return;
+                                                    }
+                                                }
+                                                let err_str = e.to_string();
+                                                tracing::error!(
+                                                    error = %e,
+                                                    session_id = %task_session_id,
+                                                    backend_id = ?backend_id_str,
+                                                    "Streaming multimodal failed — rejecting without non-stream fallback"
+                                                );
+                                                let _ = task_state
+                                                    .agents
+                                                    .session_manager
+                                                    .session_store()
+                                                    .delete_pending_stream(&task_session_id);
+                                                let (err_frame, end_frame) =
+                                                    ws_reject_terminal_frames(&task_session_id, &err_str);
+                                                if socket.send(AxumMessage::Text(err_frame)).await.is_err() {
+                                                    return;
+                                                }
+                                                if socket.send(AxumMessage::Text(end_frame)).await.is_err() {
+                                                    return;
                                                 }
                                             }
                                         }
                                     } else {
                                         // Regular text-only message - use streaming
                                         let selected_skills = chat_req.selected_skills.clone();
-                                        // Prepend page context if provided (only on first message per session)
-                                        let final_message = if let Some(ref ctx) = chat_req.page_context {
-                                            if !ctx.is_empty() {
-                                                format!("{}\n\n{}", ctx, chat_req.message)
-                                            } else {
-                                                chat_req.message.clone()
+                                        let prepared = match super::chat_refs::prepare_chat_input(
+                                            &state,
+                                            &chat_req.message,
+                                            chat_req.page_context.as_deref(),
+                                            chat_req.references.as_deref(),
+                                            chat_req.content_version,
+                                            chat_req.content_nodes.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(p) => p,
+                                            Err(err) => {
+                                                if let Some(ref rid) = client_request_id {
+                                                    let ack = message_received_frame(
+                                                        rid,
+                                                        "rejected",
+                                                        Some(&session_id),
+                                                        Some(&err.code),
+                                                    );
+                                                    if socket.send(AxumMessage::Text(ack)).await.is_err() {
+                                                        return;
+                                                    }
+                                                }
+                                                let err_frame = json!({
+                                                    "type": "Error",
+                                                    "code": err.code,
+                                                    "message": err.message,
+                                                    "limit": err.limit,
+                                                    "actual": err.actual,
+                                                    "sessionId": session_id,
+                                                })
+                                                .to_string();
+                                                if socket.send(AxumMessage::Text(err_frame)).await.is_err() {
+                                                    return;
+                                                }
+                                                let end = json!({
+                                                    "type": "end",
+                                                    "sessionId": session_id,
+                                                })
+                                                .to_string();
+                                                if socket.send(AxumMessage::Text(end)).await.is_err() {
+                                                    return;
+                                                }
+                                                continue;
                                             }
-                                        } else {
-                                            chat_req.message.clone()
                                         };
+
+                                        let final_message = prepared.model_message;
                                         // Set session ID on memory tool for session-scoped operations
                                         // (now handled inside Agent::process to avoid cross-session races)
                                         // [non-blocking stream creation] Stream creation used to
                                         // be awaited INLINE in this select arm: during the initial LLM
                                         // request (tens of seconds on local models before the first
                                         // chunk) no pings were sent and `__CANCEL__` frames could not
-                                        // be processed — the whole socket looked stalled. The entire
-                                        // creation + fallback path now runs in a spawned task; the
-                                        // fallback response is delivered through the event channel
-                                        // like any other stream event, so this loop keeps serving
+                                        // be processed — the whole socket looked stalled. Creation
+                                        // now runs in a spawned task so this loop keeps serving
                                         // ping/pong and cancel frames immediately.
+                                        // MessageReceived:accepted is emitted from the task only
+                                        // after process_* returns Ok (user message saved). On Err
+                                        // the task emits rejected + Error+end and never falls into
+                                        // a tool-capable non-stream path.
                                         {
                                             let task_tx = stream_tx.clone();
                                             let task_session_id = session_id.clone();
@@ -1510,8 +2521,35 @@ async fn handle_ws_socket(
                                             let task_backend_id = backend_id.map(|s| s.to_string());
                                             let task_skills = selected_skills.clone();
                                             let task_final_message = final_message;
+                                            let task_resolutions = prepared.resolutions.clone();
                                             let task_req_backend = chat_req.backend_id.clone();
+                                            let task_content_nodes = chat_req.content_nodes.clone();
+                                            let task_content_version = chat_req.content_version;
+                                            let task_references = chat_req.references.clone();
+                                            let task_authorize_new_op =
+                                                chat_req.authorize_new_operation.clone();
+                                            let task_client_request_id = client_request_id.clone();
+                                            // Decision-layer cascade (shadow → short-circuit →
+                                            // guidance → prefill) now lives INSIDE
+                                            // SessionManager's message chokepoint
+                                            // (ChatDecisionPipeline), so every entry point —
+                                            // this WS branch, the multimodal branch, REST chat,
+                                            // IM bridges, extension chat capability — gets
+                                            // identical coverage. Nothing to do here.
                                             tokio::spawn(async move {
+                                                // [frame-receipt pending snapshot] Born BEFORE the
+                                                // awaited stream creation below — see
+                                                // create_initial_pending_snapshot.
+                                                create_initial_pending_snapshot(&task_state, &task_session_id, &task_user_message);
+                                                let content_nodes_arg = super::chat_refs::content_nodes_for_accept(
+                                                    &task_user_message,
+                                                    task_content_nodes.as_deref(),
+                                                    task_content_version,
+                                                    task_references.as_deref(),
+                                                );
+                                                let authorize_submit = super::chat_refs::authorize_new_op_submit(
+                                                    task_authorize_new_op.as_ref(),
+                                                );
                                                 match task_state
                                                     .agents
                                                     .session_manager
@@ -1520,10 +2558,25 @@ async fn handle_ws_socket(
                                                         &task_final_message,
                                                         task_backend_id.as_deref(),
                                                         task_skills.as_deref(),
+                                                        authorize_submit,
+                                                        content_nodes_arg,
                                                     )
                                                     .await
                                                 {
                                                     Ok(stream) => {
+                                                        if let Some(ref rid) = task_client_request_id {
+                                                            let _ = task_tx
+                                                                .send(StreamEvent {
+                                                                    json: message_received_frame_with_resolutions(
+                                                                        rid,
+                                                                        "accepted",
+                                                                        Some(&task_session_id),
+                                                                        None,
+                                                                        Some(task_resolutions.as_slice()),
+                                                                    ),
+                                                                })
+                                                                .await;
+                                                        }
                                                         process_stream_to_channel(
                                                             stream,
                                                             task_session_id,
@@ -1534,61 +2587,72 @@ async fn handle_ws_socket(
                                                         .await;
                                                     }
                                                     Err(e) => {
-                                                        // [single-stream mutex] A rejection because a turn is
-                                                        // already running (e.g. the previous turn is still
-                                                        // completing in the background after the client
-                                                        // detached) must NOT fall into the non-streaming
-                                                        // fallback: that path bypasses the per-session mutex
-                                                        // and would run CONCURRENTLY on the same internal
-                                                        // state — interleaved history writes, out-of-order
-                                                        // replies. Surface an actionable error instead.
-                                                        let err_str = e.to_string();
-                                                        if err_str.contains("already being generated") {
+                                                        // Any stream-setup failure: reject + Error+end.
+                                                        // Never fall into non-stream tool execution —
+                                                        // that used raw task_user_message and bypassed
+                                                        // structured refs / authorize (and the busy
+                                                        // mutex). busy/save already terminated; other
+                                                        // rejects must too.
+                                                        debug_assert!(
+                                                            ws_rejected_blocks_nonstream_fallback()
+                                                        );
+                                                        if let Some(ref rid) = task_client_request_id {
                                                             let _ = task_tx
                                                                 .send(StreamEvent {
-                                                                    json: json!({
-                                                                        "type": "Error",
-                                                                        "message": err_str,
-                                                                        "sessionId": task_session_id,
-                                                                    })
-                                                                    .to_string(),
+                                                                    json: message_received_frame(
+                                                                        rid,
+                                                                        "rejected",
+                                                                        Some(&task_session_id),
+                                                                        Some(receive_ack_reject_reason(&e)),
+                                                                    ),
                                                                 })
                                                                 .await;
-                                                            return;
                                                         }
-                                                        // Fallback to non-streaming on error
-                                                        tracing::error!(error = %e, session_id = %task_session_id, backend_id = ?task_req_backend, "Streaming text failed, falling back to non-streaming");
-                                                        let response = match task_state
+                                                        let err_str = e.to_string();
+                                                        tracing::error!(
+                                                            error = %e,
+                                                            session_id = %task_session_id,
+                                                            backend_id = ?task_req_backend,
+                                                            "Streaming text failed — rejecting without non-stream fallback"
+                                                        );
+                                                        let snapshot_cleanup_id = task_session_id.clone();
+                                                        let (err_frame, end_frame) =
+                                                            ws_reject_terminal_frames(
+                                                                &task_session_id,
+                                                                &err_str,
+                                                            );
+                                                        let _ = task_tx
+                                                            .send(StreamEvent { json: err_frame })
+                                                            .await;
+                                                        let _ = task_tx
+                                                            .send(StreamEvent { json: end_frame })
+                                                            .await;
+                                                        let _ = task_state
                                                             .agents
                                                             .session_manager
-                                                            .process_message_with_backend(
-                                                                &task_session_id,
-                                                                &task_user_message,
-                                                                task_req_backend.as_deref(),
-                                                            )
-                                                            .await
-                                                        {
-                                                            Ok(resp) => json!({
-                                                                "type": "response",
-                                                                "content": resp.message.content,
-                                                                "sessionId": task_session_id,
-                                                                "toolsUsed": resp.tools_used,
-                                                                "processingTimeMs": resp.processing_time_ms,
-                                                            })
-                                                            .to_string(),
-                                                            Err(inner_e) => json!({
-                                                                "type": "Error",
-                                                                "message": inner_e.to_string(),
-                                                            })
-                                                            .to_string(),
-                                                        };
-                                                        let _ = task_tx
-                                                            .send(StreamEvent { json: response })
-                                                            .await;
+                                                            .session_store()
+                                                            .delete_pending_stream(&snapshot_cleanup_id);
                                                     }
                                                 }
                                             });
                                         }
+                                    }
+                                } else {
+                                    // [visible-failure fix] An unparseable frame used to fall through
+                                    // here SILENTLY — the client sat on loading… with no feedback, the
+                                    // same failure shape as the removed slash-command filter. Reply with
+                                    // an error frame and log at warn so both ends see it.
+                                    tracing::warn!(
+                                        length = text.chars().count(),
+                                        "Unparseable chat frame — replying with an error frame"
+                                    );
+                                    let err = json!({
+                                        "type": "Error",
+                                        "message": "Unparseable chat frame (expected a ChatRequest JSON object)",
+                                    })
+                                    .to_string();
+                                    if socket.send(AxumMessage::Text(err)).await.is_err() {
+                                        return;
                                     }
                                 }
                             }
@@ -1735,6 +2799,8 @@ mod detached_delivery_tests {
                 prompt_tokens: Some(42),
                 system_prompt_tokens: None,
                 tool_tokens: None,
+                goal_status: None,
+                end_reason: None,
             },
         ];
         let total = events.len();
@@ -1767,5 +2833,358 @@ mod detached_delivery_tests {
             "stream must be fully consumed after client detach — the final reply \
              only reaches history if consumption reaches End"
         );
+    }
+}
+
+#[cfg(test)]
+mod history_pagination_tests {
+    use super::*;
+
+    /// The WS ownership decision: first attachment claims, same principal
+    /// re-attaches, a different principal is refused. Pre-ownership, any
+    /// valid token could attach any sessionId and replay its history.
+    #[tokio::test]
+    async fn session_ownership_claims_once_and_refuses_others() {
+        let manager = heramind_agent::SessionManager::memory();
+        let sid = manager.create_session().await.unwrap();
+
+        // Unclaimed → first principal claims and attaches.
+        assert!(
+            session_attach_allowed(&manager, &sid, "user:alice"),
+            "first attachment must claim the session"
+        );
+        // Same principal keeps attaching.
+        assert!(
+            session_attach_allowed(&manager, &sid, "user:alice"),
+            "the owner re-attaches freely"
+        );
+        // Different principal is refused — no history replay.
+        assert!(
+            !session_attach_allowed(&manager, &sid, "user:bob"),
+            "another principal must not attach"
+        );
+        // Refusal must not RE-STAMP the owner to the attacker.
+        assert_eq!(
+            manager.session_owner(&sid).as_deref(),
+            Some("user:alice"),
+            "a refused attach must not steal ownership"
+        );
+        // API-key connections share the "apikey" bucket (single-tenant
+        // admin credential): they attach as one principal.
+        assert!(!session_attach_allowed(&manager, &sid, "apikey"));
+    }
+
+    /// The REST ownership guard (history/pending/delete/clear*) must give a
+    /// foreign principal the same refusal the WS attach path does — the
+    /// endpoints used to bypass ownership entirely. Positive test: claimed
+    /// by alice → bob's request maps to FORBIDDEN.
+    #[tokio::test]
+    async fn rest_guard_refuses_foreign_principal() {
+        let manager = heramind_agent::SessionManager::memory();
+        let sid = manager.create_session().await.unwrap();
+        assert!(session_attach_allowed(&manager, &sid, "user:alice"));
+
+        // The handlers take Option<Extension<SessionInfo>>; the guard logic
+        // itself is what decides FORBIDDEN — exercise it through the same
+        // principal derivation the handlers use.
+        assert!(
+            !session_read_forbidden(&manager, &sid, "user:alice"),
+            "the owner's own requests must pass"
+        );
+        assert!(
+            session_read_forbidden(&manager, &sid, "user:bob"),
+            "a foreign principal must be refused (403 path)"
+        );
+        // Unclaimed session: first REST touch claims it (same once-only
+        // semantics as attach).
+        let sid2 = manager.create_session().await.unwrap();
+        assert!(
+            !session_read_forbidden(&manager, &sid2, "user:bob"),
+            "an unclaimed session is claimable by first touch"
+        );
+    }
+
+    fn msg(role: &str, content: &str) -> AgentMessage {
+        match role {
+            "user" => AgentMessage::user(content),
+            _ => AgentMessage::assistant(content),
+        }
+    }
+
+    /// A realistic alternating history: user turn followed by an assistant
+    /// turn stored as THREE adjacent records (thinking+tools / tool result /
+    /// content-only) — the fragmentation `mergeMessagesForDisplay` heals on
+    /// the frontend and the fragment guard must not split here.
+    fn history(turns: usize) -> Vec<AgentMessage> {
+        let mut h = Vec::new();
+        for i in 0..turns {
+            h.push(msg("user", &format!("q{}", i)));
+            h.push(msg("assistant", &format!("a{}-tools", i)));
+            h.push(msg("assistant", &format!("a{}-result", i)));
+            h.push(msg("assistant", &format!("a{}-content", i)));
+        }
+        h
+    }
+
+    #[test]
+    fn no_params_returns_full_history() {
+        let h = history(3); // 12 records
+        let (slice, has_more) = slice_history(&h, None, None);
+        assert_eq!(slice.len(), 12);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn limit_returns_most_recent_tail() {
+        let h = history(3); // 12 records
+        let (slice, has_more) = slice_history(&h, Some(4), None);
+        // Last turn exactly (its user message sits 4 from the end)
+        assert_eq!(slice.len(), 4);
+        assert_eq!(slice[0].content.to_string(), "q2");
+        assert!(has_more);
+    }
+
+    #[test]
+    fn fragment_guard_never_splits_an_assistant_turn() {
+        let h = history(3);
+        // Raw boundary 6-from-the-end lands on the tool-result record of
+        // turn 1 — the guard walks back to that turn's user message.
+        let (slice, has_more) = slice_history(&h, Some(6), None);
+        assert_eq!(slice[0].role, "user");
+        assert_eq!(slice[0].content.to_string(), "q1");
+        // Walked-back boundary: turn 1 complete (4 records) + turn 2 complete (4)
+        assert_eq!(slice.len(), 8);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn before_pages_backwards_without_overlap() {
+        let h = history(10); // 40 records
+                             // Page 1: newest 8 (two whole turns)
+        let (p1, more1) = slice_history(&h, Some(8), None);
+        assert_eq!(p1.len(), 8);
+        assert!(more1);
+        // Page 2: before = total - loaded = 32 → records [24, 32)
+        let (p2, more2) = slice_history(&h, Some(8), Some(32));
+        assert_eq!(p2.len(), 8);
+        assert!(more2);
+        // No overlap between pages
+        assert_ne!(p1[0].content.to_string(), p2[0].content.to_string());
+        assert_eq!(p2[7].content.to_string(), "a7-content");
+        // Final page walks to the very start
+        let (p5, more5) = slice_history(&h, Some(8), Some(8));
+        assert_eq!(p5[0].content.to_string(), "q0");
+        assert!(!more5);
+    }
+
+    #[test]
+    fn before_clamps_past_end_and_zero_limit_means_full() {
+        let h = history(2);
+        let (slice, _) = slice_history(&h, Some(10), Some(9999)); // before > total
+        assert_eq!(slice.len(), 8); // everything (limit 10 > 8)
+        let (full, has_more) = slice_history(&h, Some(0), None); // 0 = no paging
+        assert_eq!(full.len(), 8);
+        assert!(!has_more);
+    }
+}
+
+#[cfg(test)]
+mod end_token_usage_ui_tests {
+    /// Mirror of the End JSON gate: only plausible meters become tokenUsage.
+    fn end_ui_prompt_tokens(prompt_tokens: Option<u32>) -> Option<u32> {
+        prompt_tokens.filter(|pt| heramind_core::plausible_prompt_token_meter(*pt))
+    }
+
+    #[test]
+    fn invalid_end_meters_omit_ui_token_usage() {
+        assert_eq!(end_ui_prompt_tokens(Some(0)), None);
+        assert_eq!(end_ui_prompt_tokens(Some(u32::MAX)), None);
+        assert_eq!(end_ui_prompt_tokens(None), None);
+        assert_eq!(end_ui_prompt_tokens(Some(4200)), Some(4200));
+    }
+}
+
+#[cfg(test)]
+mod compact_clear_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    /// Six alternating user/assistant turns. Users sit at even indices;
+    /// with the last-3 protection the 3rd-from-last user is at index 6.
+    async fn seeded_state() -> (crate::server::ServerState, String) {
+        let state = crate::server::ServerState::new_for_testing().await;
+        let manager = state.agents.session_manager.clone();
+        let sid = manager.create_session().await.expect("session");
+        let agent = manager.get_session(&sid).await.expect("agent");
+        let mut history = Vec::new();
+        for i in 0..6 {
+            history.push(AgentMessage::user(format!("user turn {i} wording")));
+            history.push(AgentMessage::assistant(format!("assistant reply {i}")));
+        }
+        agent.restore_history(history).await;
+        (state, sid)
+    }
+
+    async fn post_json(
+        state: crate::server::ServerState,
+        uri: String,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = Router::new()
+            .route("/api/sessions/:id/compact", post(compact_session_handler))
+            .route(
+                "/api/sessions/:id/clear",
+                post(clear_session_history_handler),
+            )
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn first_turn_pressure_writes_automatic_summary_below_usage_threshold() {
+        let state = crate::server::ServerState::new_for_testing().await;
+        let manager = state.agents.session_manager.clone();
+        let sid = manager.create_session().await.unwrap();
+        let agent = manager.get_session(&sid).await.unwrap();
+        let exact = "请在图上保留原文 厦门市集美区";
+        let mut history = vec![AgentMessage::user(exact)];
+        for _ in 0..12 {
+            history.push(AgentMessage::assistant("tool evidence ".repeat(100)));
+        }
+        agent.restore_history(history).await;
+        // Truncation bypass requires a plausible meter at ≥35% of the window
+        // (bill-first; not a 1-token stand-in that looks like the T4 0.5% spam).
+        let max_ctx = state
+            .agents
+            .session_manager
+            .get_agent_llm(&sid)
+            .await
+            .expect("session llm")
+            .max_context_length()
+            .await
+            .max(1);
+        let pt = ((max_ctx as f64) * 0.35).ceil() as u32;
+        let out = crate::handlers::summarization::trigger_summarization(
+            &sid,
+            &state,
+            Some(pt),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(out.summarized_messages > 0);
+        let metadata = manager.session_store().get_session_metadata(&sid).unwrap();
+        assert!(metadata.conversation_summary.is_some());
+        assert!(metadata.summary_up_to_index.unwrap() > 0);
+        let after = manager.get_history(&sid).await.unwrap();
+        assert_eq!(after[0].content.as_ref(), exact);
+        assert_eq!(
+            after.len(),
+            13,
+            "compaction changes context selection, not stored chat history"
+        );
+    }
+
+    /// Force-compact on a session with no LLM backend must still write a
+    /// (deterministic-fallback) summary, never cover the last 3 user
+    /// messages, and report the fallback.
+    #[tokio::test]
+    async fn compact_writes_fallback_and_respects_protection_floor() {
+        let (state, sid) = seeded_state().await;
+        let manager = state.agents.session_manager.clone();
+        let (status, body) = post_json(state, format!("/api/sessions/{}/compact", sid)).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = &body["data"];
+        assert!(
+            data["summarizedMessages"].as_u64().unwrap_or(0) > 0,
+            "force mode must summarize something: {data}"
+        );
+        assert_eq!(
+            data["fallbackUsed"],
+            serde_json::json!(true),
+            "no LLM backend in the test state → deterministic fallback"
+        );
+        let usage = data["tokenUsage"]
+            .as_object()
+            .expect("compact must return post-summary tokenUsage for the meter");
+        assert!(
+            usage["promptTokens"].as_u64().unwrap_or(0) > 0,
+            "post-compact usage must be a positive estimate: {usage:?}"
+        );
+        assert!(
+            usage["maxContextTokens"].as_u64().unwrap_or(0) > 0,
+            "maxContextTokens required for the ring denominator: {usage:?}"
+        );
+
+        // Boundary math: 12 messages, users at 0,2,4,6,8,10. keep=3 →
+        // protected_first=6. target = min(12/2, 6-0) = 6 → covers 0..=5.
+        let store = manager.session_store();
+        let meta = store.get_session_metadata(&sid).expect("metadata");
+        assert_eq!(
+            meta.summary_up_to_index,
+            Some(5),
+            "coverage must stop one below the protected boundary (index 6)"
+        );
+        let summary = meta.conversation_summary.expect("summary written");
+        assert!(
+            summary.contains("user turn 0 wording"),
+            "fallback digest carries user wording verbatim: {summary}"
+        );
+        assert!(
+            !summary.contains("user turn 3 wording"),
+            "the protected user turns (3..5) must NOT be summarized"
+        );
+
+        manager.remove_session(&sid).await.unwrap();
+    }
+
+    /// `/clear` keeps the session but empties history and resets any stored
+    /// summary — the ghost-summary invariant.
+    #[tokio::test]
+    async fn clear_resets_history_and_summary() {
+        let (state, sid) = seeded_state().await;
+        let manager = state.agents.session_manager.clone();
+
+        // Compact first so a summary exists to reset.
+        let (status, _) = post_json(state.clone(), format!("/api/sessions/{}/compact", sid)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(manager
+            .session_store()
+            .get_session_metadata(&sid)
+            .unwrap()
+            .conversation_summary
+            .is_some());
+
+        let (status, body) = post_json(state, format!("/api/sessions/{}/clear", sid)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["cleared"], serde_json::json!(true));
+
+        let history = manager.get_history(&sid).await.expect("history");
+        assert!(history.is_empty(), "history must be empty after clear");
+        let meta = manager.session_store().get_session_metadata(&sid).unwrap();
+        assert!(
+            meta.conversation_summary.is_none() && meta.summary_up_to_index.is_none(),
+            "stored summary must be reset with the history"
+        );
+
+        manager.remove_session(&sid).await.unwrap();
     }
 }

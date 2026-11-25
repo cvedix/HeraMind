@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="vi">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
@@ -9,15 +9,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
 
     <!-- PWA / standalone meta — improves "Add to Home Screen" on iOS & Android.
-         theme-color uses neutral app background (NOT brand orange) so the OS
-         chrome / Android title bar / desktop PWA frame matches the app surface. -->
-    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f7f7" />
-    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000000" />
-      <meta name="application-name" content="HeraMind" />
+         theme-color uses the app background so the OS
+         chrome / Android title bar / desktop PWA frame matches the app surface.
+         Values match --background (light oklch(1 0 0), dark oklch(0.135…));
+         ThemeProvider keeps them synced at runtime from the CSS token. -->
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#07080c" />
+    <meta name="application-name" content="HeraMind" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-      <meta name="apple-mobile-web-app-title" content="HeraMind" />
+    <meta name="apple-mobile-web-app-title" content="HeraMind" />
 
     <!-- iOS PWA splash screens — static PNG replicas of the Tauri StartupLoading
          visual (dark gradient + dot grid + horizontal logo). iOS doesn't execute
@@ -48,11 +50,12 @@
           media="(min-device-width: 1024px) and (min-device-height: 1366px) and (-webkit-min-device-pixel-ratio: 2) and (orientation: portrait)" />
     <meta name="format-detection" content="telephone=no" />
 
-      <title>HeraMind - Edge AI Agent</title>
+    <title>HeraMind - Edge AI Agent</title>
 
-      <!-- Preload brand logos for instant display in nav drawer -->
-      <link rel="preload" as="image" href="/logo-square.png" />
-      <link rel="preload" as="image" href="/logo-light.png" />
+    <!-- Preload brand logos for instant display in nav drawer -->
+    <link rel="preload" as="image" href="/logo-square.png" />
+    <link rel="preload" as="image" href="/logo-light.png" />
+    <link rel="preload" as="image" href="/logo-dark.png" />
 
     <!-- Plus Jakarta Sans + Noto Sans SC — loaded asynchronously to avoid render blocking -->
     <link rel="preconnect" href="https://fonts.googleapis.com">

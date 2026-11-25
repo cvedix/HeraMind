@@ -1,8 +1,9 @@
 /// Smoke tests for PageTabsBar — guards the toolbar-row contract:
-/// capsule styling (border + bg-card, no wrapping), black active tab,
+/// underline styling (no card surface, no full-width divider — the active
+/// tab's own underline is the only line), text + underline active tab,
 /// tab content left-aligned.
 import { describe, it, expect, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, fireEvent } from '@testing-library/react'
 import { PageTabsBar } from '@/components/shared/PageTabs'
 import { ThemeProvider } from '@/components/ui/theme'
 
@@ -25,44 +26,71 @@ function renderBar(active = 'a') {
 }
 
 describe('PageTabsBar (desktop)', () => {
-  it('renders every tab label as a button', () => {
+  it('renders every tab label as a tab', () => {
     renderBar()
-    expect(screen.getByRole('button', { name: 'Tab A' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Tab B' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Tab A' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Tab B' })).toBeInTheDocument()
+    // APG: exactly one tab stop — the active tab
+    expect(screen.getByRole('tab', { name: 'Tab A' }).tabIndex).toBe(0)
+    expect(screen.getByRole('tab', { name: 'Tab B' }).tabIndex).toBe(-1)
   })
 
-  it('capsule keeps the bordered card surface (no muted-30 regression)', () => {
+  it('tab strip drops the capsule card surface (underline style)', () => {
     const { container } = renderBar()
-    const capsule = container.querySelector('.overflow-x-auto')
-    expect(capsule).toBeTruthy()
-    expect(capsule!.className).toContain('border')
-    expect(capsule!.className).toContain('bg-card')
-    expect(capsule!.className).not.toContain('bg-muted-30')
+    const strip = container.querySelector('.overflow-x-auto')
+    expect(strip).toBeTruthy()
+    expect(strip!.className).not.toContain('bg-card')
+    expect(strip!.className).not.toContain('bg-muted-30')
   })
 
-  it('the toolbar row carries no bottom border (fewer-lines rule)', () => {
+  it('the toolbar row carries no full-width divider', () => {
     const { container } = renderBar()
-    const row = capsuleRow(container)
+    const row = stripRow(container)
     expect(row).toBeTruthy()
     expect(row!.className).not.toContain('border-b')
   })
 
-  it('active tab is the black-on-white state', () => {
+  it('active tab is text + the shared sliding indicator (no pill background)', () => {
+    const { container } = renderBar('b')
+    const active = screen.getByRole('tab', { name: 'Tab B' })
+    expect(active.className).toContain('text-foreground')
+    // the pill background is gone (the underline is the shared indicator
+    // bar, not the button's own background — match on the class boundary)
+    expect(active.className).not.toMatch(/(^|\s)bg-foreground/)
+    // exactly one shared indicator bar in the strip (jsdom can't measure
+    // layout, so presence is the contract — geometry is browser-only)
+    const indicators = container.querySelectorAll('[data-tab-indicator]')
+    expect(indicators.length).toBe(1)
+    expect(indicators[0].getAttribute('aria-hidden')).toBe('true')
+  })
+
+  it('inactive tab carries no underline styling of its own', () => {
     renderBar('b')
-    const active = screen.getByRole('button', { name: 'Tab B' })
-    expect(active.className).toContain('bg-foreground')
-    expect(active.className).toContain('text-background')
+    const inactive = screen.getByRole('tab', { name: 'Tab A' })
+    expect(inactive.className).not.toContain('after:')
   })
 
   it('tab buttons left-align their content', () => {
     renderBar()
-    const btn = screen.getByRole('button', { name: 'Tab A' })
+    const btn = screen.getByRole('tab', { name: 'Tab A' })
     expect(btn.className).toContain('justify-start')
+  })
+
+  it('ArrowRight activates the next tab (APG automatic activation)', () => {
+    // Controlled component: assert the activation callback, not state
+    const onTabChange = vi.fn()
+    render(
+      <ThemeProvider>
+        <PageTabsBar tabs={tabs} activeTab="a" onTabChange={onTabChange} />
+      </ThemeProvider>
+    )
+    fireEvent.keyDown(screen.getByRole('tab', { name: 'Tab A' }), { key: 'ArrowRight' })
+    expect(onTabChange).toHaveBeenCalledWith('b')
   })
 })
 
-function capsuleRow(container: HTMLElement) {
-  // the capsule's parent is the toolbar row
-  const capsule = container.querySelector('.overflow-x-auto')
-  return capsule ? capsule.parentElement : null
+function stripRow(container: HTMLElement) {
+  // the strip's parent is the toolbar row
+  const strip = container.querySelector('.overflow-x-auto')
+  return strip ? strip.parentElement : null
 }

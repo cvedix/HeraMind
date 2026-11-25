@@ -267,7 +267,9 @@
     "emptyAskAi": "Nhờ AI tạo dashboard",
     "emptyStep1": "Tạo dashboard",
     "emptyStep2": "Thêm widget",
-    "emptyStep3": "Liên kết dữ liệu thiết bị"
+    "emptyStep3": "Liên kết dữ liệu thiết bị",
+    "editContent": "Sửa nội dung",
+    "tapToEditHint": "Mở một thành phần cần sửa"
   },
   "mobileEditBar": {
     "component": "thành phần",
@@ -451,7 +453,8 @@
     "pause": "Tạm dừng",
     "resume": "Tiếp tục",
     "execute": "Thực hiện ngay",
-    "configureAgent": "Vui lòng chọn một tác nhân để theo dõi trong cài đặt thành phần"
+    "configureAgent": "Vui lòng chọn một tác nhân để theo dõi trong cài đặt thành phần",
+    "messagePlaceholder": "Thêm ngụ ý hay ngữ cảnh tác vụ..."
   },
   "aiAnalyst": {
     "systemPrompt": "Lời nhắc hệ thống",
@@ -542,7 +545,9 @@
       "camera": "Camera",
       "video": "Video"
     },
-    "retry": "Thử lại"
+    "retry": "Thử lại",
+    "noSource": "Không có nguồn phim",
+    "configureSource": "Cấu hình URL video hoặc camera"
   },
   "mapDisplay": {
     "device": "Thiết bị",
@@ -721,7 +726,11 @@
     "boundTo": "Liên kết với {{source}}",
     "selectMetrics": "Chọn chỉ số",
     "selectCommands": "Chọn lệnh",
-    "deviceRemoved": "Thiết bị đã liên kết không còn tồn tại"
+    "deviceRemoved": "Thiết bị đã liên kết không còn tồn tại",
+    "badgeRuntime": "Thời gian chạy",
+    "aiAgent": "Tác tử có đầu ra cấu trúc (ai)",
+    "aiAgentDesc": "Các trường do tác tử trích xuất và kiểm tra theo lược đồ",
+    "noAiAgents": "Chưa có công cụ cấu trúc nào — tạo ra một tác tử (domode: Cấu trúc)"
   },
   "systemDataSource": {
     "title": "Hệ thống",
@@ -1136,7 +1145,8 @@
     "config": "Cấu hình",
     "copy": "Sao chép",
     "remove": "Xóa",
-    "removeConfirm": "Xóa extension này khỏi trang tổng quan?"
+    "removeConfirm": "Xóa extension này khỏi trang tổng quan?",
+    "select": "Chọn thành phần"
   },
   "sharedDashboard": {
     "componentUnavailable": "Thành phần không có sẵn trong chế độ xem được chia sẻ",
@@ -1304,6 +1314,12 @@
   "staleDataDevices": "Thiết bị: {{names}}",
   "renderer": {
     "componentUnavailable": "Thành phần không khả dụng",
-    "componentUnavailableHint": "Tiện ích cung cấp thành phần này chưa chạy; thành phần sẽ xuất hiện lại khi tiện ích hoạt động"
+    "componentUnavailableHint": "Tiện ích cung cấp thành phần này chưa chạy; thành phần sẽ xuất hiện lại khi tiện ích hoạt động",
+    "componentLoadFailed": "Việc tải thành phần bị lỗi"
+  },
+  "defaultStates": {
+    "retry": "Thử lại",
+    "noData": "Không có dữ liệu sẵn sàng",
+    "failedToLoad": "Lỗi nạp dữ liệu"
   }
 }

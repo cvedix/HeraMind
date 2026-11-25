@@ -56,11 +56,13 @@ impl AgentExecutor {
 
         // Execute the command via DeviceService
         let execution_result = device_service
-            .send_command(device_id, command_name, params_map)
+            .send_command_reported(device_id, command_name, params_map)
             .await;
 
+        // The delivery level travels with the success so the agent (and the
+        // user) cannot read a broker publish as physical completion.
         let (success, result) = match execution_result {
-            Ok(_) => (true, Some("Command sent successfully".to_string())),
+            Ok((_value, delivery)) => (true, Some(delivery.describe())),
             Err(e) => {
                 tracing::warn!(
                     agent_id = %agent.id,
@@ -476,7 +478,11 @@ impl AgentExecutor {
             "Checking if alert should be sent"
         );
 
-        if should_send_alert {
+        // Same gate as alert-type decisions: an explicit `notify` config
+        // (including Judgment) owns delivery. Legacy keyword alerts only
+        // run when notify is unset — otherwise Judgment agents would get a
+        // second, ungated send via condition_met.
+        if should_send_alert && agent.notify.is_none() {
             self.send_alert_for_decision(agent, decision, notifications)
                 .await;
         }
@@ -580,10 +586,7 @@ impl AgentExecutor {
                         }
                     }
                     // 3. Extension tool format: action contains the full rid
-                    if action.contains(rid.as_str()) {
-                        return true;
-                    }
-                    false
+                    action.contains(rid.as_str())
                 });
 
                 if !is_allowed {
@@ -621,8 +624,15 @@ impl AgentExecutor {
                 continue;
             }
 
-            // Handle alert-type decisions
-            if Self::is_alert_decision(decision) {
+            // Handle alert-type decisions.
+            //
+            // Only for agents that route their own notifications: an explicit
+            // `notify` config means the operator (or, with `Judgment`, the
+            // agent itself) decides what is worth sending, and the keyword
+            // sniffing below would send a second, redundant copy. The comment
+            // here has claimed this gate since the routing landed; the code
+            // did not have it, so both paths ran.
+            if agent.notify.is_none() && Self::is_alert_decision(decision) {
                 self.handle_alert_decision(agent, decision, &mut notifications_sent)
                     .await;
             }
@@ -647,6 +657,109 @@ impl AgentExecutor {
         }
 
         Ok((actions_executed, notifications_sent))
+    }
+
+    /// Explicit per-agent notification routing: deliver the run outcome to
+    /// exactly the configured channels, when the configured trigger fires.
+    /// `None` config = legacy keyword path (see send_alert_for_decision).
+    /// `is_probe` marks a recovery probe of an already-Error agent — those
+    /// are silent (the demotion already notified; probes repeat at backoff
+    /// intervals and would ping all day otherwise).
+    pub(crate) async fn dispatch_agent_notifications(
+        &self,
+        agent_id: &str,
+        agent_name: &str,
+        record: &heramind_storage::AgentExecutionRecord,
+        is_probe: bool,
+    ) {
+        if is_probe {
+            tracing::debug!(
+                agent_id = %agent_id,
+                "Recovery probe run — notifications suppressed"
+            );
+            return;
+        }
+        let Some(agent) = self.store.get_agent(agent_id).await.ok().flatten() else {
+            return;
+        };
+        // A run that fails is not a judgement about the content — it is a
+        // status, and the one case where silence is unambiguously wrong. An
+        // agent with no routing at all predates the create-time floor, and the
+        // keyword path it falls back to runs off `Decision`s, which a failure
+        // does not produce (`decisions: vec![]` is the record). So those agents
+        // failed silently, every run, and nothing said so. Route the failure to
+        // the same floor a new agent would have been given; success keeps the
+        // legacy behaviour exactly as it was.
+        let failed = record.status != heramind_storage::ExecutionStatus::Completed;
+        let notify = match agent.notify.clone() {
+            Some(notify) => notify,
+            None if failed => super::super::notify::default_agent_notify(),
+            None => return,
+        };
+        // No channel is not "no alert". The message IS the record of the run —
+        // it is what the Messages page lists, what the judgment chain hangs
+        // off, and what the false-positive feedback acts on — while channels
+        // are only how it travels. Returning here meant turning notifications
+        // on with nowhere to push them told nobody at all, not even in-app; the
+        // rule path has always stored unconditionally and fanned out
+        // best-effort. With an empty target list the message is still created
+        // and simply reaches no external channel.
+        let should_send = match notify.on {
+            heramind_storage::NotifyOn::Always => true,
+            heramind_storage::NotifyOn::Failure => failed,
+            // The agent speaks for itself through its tools; a routed
+            // notification would be a second voice saying the same thing.
+            heramind_storage::NotifyOn::Judgment => false,
+        };
+        if !should_send {
+            return;
+        }
+
+        let title = if failed {
+            format!("Agent '{}' failed", agent_name)
+        } else {
+            format!("Agent '{}' completed", agent_name)
+        };
+        let body = notification_body(&agent, record);
+
+        tracing::info!(
+            agent_id = %agent_id,
+            channels = ?notify.channels,
+            failed,
+            "Agent notification routed"
+        );
+        if let Some(ref message_manager) = self.message_manager {
+            use heramind_messages::{Message, MessageId, MessageSeverity, MessageStatus};
+            let severity = if failed {
+                MessageSeverity::Warning
+            } else {
+                MessageSeverity::Info
+            };
+            let msg = Message {
+                id: MessageId::new(),
+                category: "agent".to_string(),
+                severity,
+                title,
+                message: body,
+                source: format!("agent:{}", agent_id),
+                source_type: "agent".to_string(),
+                timestamp: chrono::Utc::now(),
+                status: MessageStatus::Active,
+                acknowledged_at: None,
+                acknowledged_by: None,
+                resolved_at: None,
+                metadata: None,
+                tags: Vec::new(),
+                target_channels: Some(notify.channels.clone()),
+            };
+            if let Err(e) = message_manager.create_message(msg).await {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "Agent notification delivery failed"
+                );
+            }
+        }
     }
 
     pub(crate) async fn send_alert_for_decision(
@@ -835,5 +948,175 @@ impl AgentExecutor {
         report.push_str(&agent.user_prompt);
 
         Ok(report)
+    }
+}
+
+/// Keep the notification body readable: a full conclusion can be long.
+/// What a person actually reads in the notification.
+///
+/// A structured (L0) agent's conclusion is the JSON object it published —
+/// `{"status":"正常"}`. That shape is right for the `ai:*` data sources and the
+/// detail page, and wrong for a chat message. The fix belongs here, at the
+/// notification boundary, and NOT in `conclusion` itself: the API, the
+/// `query_conclusion` tool and the journal all read that same field.
+fn notification_body(
+    agent: &heramind_storage::AiAgent,
+    record: &heramind_storage::AgentExecutionRecord,
+) -> String {
+    if let Some(err) = &record.error {
+        return truncate_for_notify(err);
+    }
+    let conclusion = &record.decision_process.conclusion;
+    if agent.execution_mode == heramind_storage::ExecutionMode::Structured {
+        if let Some(schema) = agent.output_schema.as_deref() {
+            if let Some(prose) = prose_from_structured_conclusion(schema, conclusion) {
+                return truncate_for_notify(&prose);
+            }
+        }
+    }
+    truncate_for_notify(conclusion)
+}
+
+/// Render a structured conclusion against the agent's own schema:
+/// `{"status":"正常","night_temp":18}` -> `"运行状态: 正常\n夜间温度: 18℃"`.
+///
+/// `None` when the conclusion is not the JSON object we expect, so the caller
+/// sends it verbatim rather than replacing one unreadable form with an empty
+/// message.
+/// A JSON scalar as a person would write it. `Display` on `serde_json::Value`
+/// renders strings *with* their quotes, which is right for JSON and wrong for
+/// a sentence — `status: "正常"` reads as a code snippet.
+fn render_scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn prose_from_structured_conclusion(
+    schema: &[heramind_storage::OperatorField],
+    conclusion: &str,
+) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(conclusion).ok()?;
+    let fields = value.as_object()?;
+    if fields.is_empty() {
+        return None;
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for field in schema {
+        let Some(value) = fields.get(&field.name) else {
+            continue;
+        };
+        let with_unit = match field.unit.as_deref() {
+            Some(unit) if !unit.is_empty() => {
+                format!("{}{unit}", render_scalar(value))
+            }
+            _ => render_scalar(value),
+        };
+        // The schema's own words for the field when it has them — a
+        // notification is read by a person, and `description` is what the
+        // author wrote for one. `name` is for the data source, not for them.
+        let label = field
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .unwrap_or(&field.name);
+        lines.push(format!("{label}: {with_unit}"));
+    }
+
+    // A field the model emitted that the schema no longer lists would
+    // otherwise vanish from the notification without a trace.
+    for (name, value) in fields {
+        if schema.iter().all(|f| &f.name != name) {
+            lines.push(format!("{name}: {}", render_scalar(value)));
+        }
+    }
+
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn truncate_for_notify(s: &str) -> String {
+    const MAX: usize = 500;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(MAX).collect();
+        format!("{}…", cut)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use heramind_storage::{OperatorField, OperatorFieldType};
+
+    fn field(name: &str, unit: Option<&str>, description: Option<&str>) -> OperatorField {
+        OperatorField {
+            name: name.into(),
+            field_type: OperatorFieldType::Text,
+            unit: unit.map(Into::into),
+            description: description.map(Into::into),
+        }
+    }
+
+    /// The whole point of the renderer: a structured agent publishes a JSON
+    /// object, and a chat message is read by a person.
+    #[test]
+    fn a_structured_conclusion_reaches_the_chat_as_prose() {
+        let schema = vec![
+            field("status", None, Some("运行状态")),
+            field("night_temp", Some("℃"), Some("夜间温度")),
+        ];
+        let rendered =
+            prose_from_structured_conclusion(&schema, r#"{"status":"正常","night_temp":18}"#)
+                .expect("a well-formed conclusion renders");
+
+        assert!(
+            !rendered.contains('{') && !rendered.contains("\":"),
+            "JSON braces must not reach the user: {rendered}"
+        );
+        assert!(rendered.contains("运行状态: 正常"), "{rendered}");
+        assert!(rendered.contains("夜间温度: 18℃"), "{rendered}");
+    }
+
+    /// `description` is what the schema author wrote for a human to read;
+    /// `name` is the data-source key. Prefer the former.
+    #[test]
+    fn the_author_s_words_label_the_field_when_they_gave_any() {
+        let described = vec![field("t", None, Some("库温"))];
+        let bare = vec![field("t", None, None)];
+
+        let a = prose_from_structured_conclusion(&described, r#"{"t":"3"}"#).unwrap();
+        let b = prose_from_structured_conclusion(&bare, r#"{"t":"3"}"#).unwrap();
+        assert_eq!(a, "库温: 3");
+        assert_eq!(b, "t: 3", "falls back to the field name");
+    }
+
+    /// The model can emit a field the schema no longer lists (schema edited
+    /// after the run, or the model volunteered one). Dropping it silently
+    /// would hide data the agent actually produced.
+    #[test]
+    fn a_field_the_schema_does_not_list_still_survives() {
+        let schema = vec![field("status", None, None)];
+        let rendered =
+            prose_from_structured_conclusion(&schema, r#"{"status":"ok","extra":"kept"}"#).unwrap();
+
+        assert!(rendered.contains("status: ok"), "{rendered}");
+        assert!(rendered.contains("extra: kept"), "{rendered}");
+    }
+
+    /// Not every conclusion is the object we expect. Sending it verbatim beats
+    /// replacing an odd message with an empty one.
+    #[test]
+    fn an_unexpected_conclusion_falls_back_to_verbatim() {
+        let schema = vec![field("status", None, None)];
+        for weird in ["", "not json", "[1,2,3]", "{}"] {
+            assert!(
+                prose_from_structured_conclusion(&schema, weird).is_none(),
+                "{weird:?} should not render, so the caller sends it as-is"
+            );
+        }
     }
 }

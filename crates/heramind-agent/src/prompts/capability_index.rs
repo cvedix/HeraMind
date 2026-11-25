@@ -35,12 +35,36 @@ impl CapabilityIndex {
         let mut out = String::from("## System Capability Index\n");
         out.push_str(&Self::build_cli_tree());
         out.push_str(&Self::build_data_conventions());
+        // NM-252: fixed discovery rules (same length for 5 or 500 installs).
+        // Prefer --search then invoke; reuse known on follow-up. Transitional
+        // NM-247 catalog remains available but is not injected here.
+        out.push_str(&heramind_core::extension::format_extension_discovery_rules());
         let state = self.build_system_state_snapshot().await;
         if !state.is_empty() {
             out.push_str(&state);
         }
+        out.push_str(&Self::boundary_rules());
         tracing::debug!(bytes = out.len(), "capability index built");
         out
+    }
+
+    /// Boundary rules (negative capability map). Hot-updatable without a
+    /// rebuild: set `HERAMIND_BOUNDARY_RULES` to a file path whose contents
+    /// are appended verbatim under a `## Boundary Rules` heading. When the
+    /// env var is unset (the default) nothing is injected — the shipped
+    /// prompt is unchanged.
+    pub fn boundary_rules() -> String {
+        match std::env::var("HERAMIND_BOUNDARY_RULES") {
+            Ok(path) if !path.is_empty() => match std::fs::read_to_string(&path) {
+                Ok(rules) if !rules.trim().is_empty() => format!("\n{}", rules.trim()),
+                Ok(_) => String::new(),
+                Err(e) => {
+                    tracing::warn!(path = %path, error = %e, "HERAMIND_BOUNDARY_RULES unreadable");
+                    String::new()
+                }
+            },
+            _ => String::new(),
+        }
     }
 
     /// CLI command tree skeleton, auto-generated from clap. Filters to the
@@ -78,9 +102,9 @@ impl CapabilityIndex {
   - `--metric`: a field name from device list `metric_fields` (e.g. `values.battery`, `temperature`)
   - `--compress=true` for an AI-friendly compact series; image metrics are auto-summarized regardless
 - device get <id> [--metric <field>] — returns current metrics for one device (data.metrics.{name}.{value,unit,timestamp}). Pass `--metric values.battery` to get only that field's current value (avoids pulling all metrics, e.g. AI-camera inference fields); omit for all. For a metric's time series use `device history <id> --metric <field>`. For webhook devices, get the ingest URL with `device webhook-url <id>` (only for webhook adapter devices).
-- Image metrics (e.g. ne101 `values.image`, ne301 `image_data`): `device get <id>` returns image values as `/api/images/...` URLs. Pass the URL directly to `vision(image="/api/images/...", prompt=...)`. Do NOT pipe to python or save-to-file — the URL works as-is. If vision can't see the image, pass `model="minicpm-v4.6"` to force the right VLM.
+- Image metrics (e.g. ne101 `values.image`, ne301 `image_data`): `device get <id>` returns image values as `/api/images/...` URLs. Pass the URL directly to `vision(image="/api/images/...", prompt=...)`. Do NOT pipe to python or save-to-file — the URL works as-is.
 - Output is structured JSON (HERAMIND_JSON=1); errors carry a `suggestion` field with recovery hints
-- The shell tool runs heramind in-process — no shell pipes/redirects (`|`, `>`, `2>&1`, `head`). Filter/limit with command flags (`--device-type`, `--status`, `--limit`), not shell plumbing.
+- `heramind` commands run in-process with no shell pipes/redirects (`|`, `>`, `2>&1`) — filter/limit with built-in flags (`--device-type`, `--status`, `--limit`) instead of `| grep/jq`. Only native host commands support shell pipes and redirections.
 - For create/update commands with many unfamiliar fields, `skill load` the matching skill (rule-management, agent-management, etc.) — field schemas live there. For simple create/update with known fields, run the CLI directly.
 "###
             .to_string()
@@ -139,7 +163,15 @@ mod tests {
         );
         assert!(
             c.contains("no shell pipes"),
-            "must warn the shell tool has no pipes/redirects"
+            "must warn heramind in-process commands have no shell pipes/redirects"
+        );
+        assert!(
+            c.contains("native host commands support shell pipes"),
+            "must clarify native host commands still support pipes"
+        );
+        assert!(
+            !c.contains("minicpm-v4.6"),
+            "must not hardcode a specific VLM model name"
         );
         assert!(
             c.contains("devices.list"),
@@ -239,8 +271,29 @@ mod tests {
         assert!(out.starts_with("## System Capability Index"));
         assert!(out.contains("### CLI Commands"));
         assert!(out.contains("### Data Conventions"));
+        assert!(
+            out.contains("### Extension capability discovery"),
+            "NM-252 discovery rules must be resident: {out}"
+        );
+        assert!(
+            out.contains("--search"),
+            "must prefer commands --search for concrete tasks: {out}"
+        );
+        assert!(
+            out.contains("extension list"),
+            "overview must route to extension list: {out}"
+        );
+        assert!(
+            out.contains("shell_example") || out.contains("{command, params}"),
+            "must teach shell_example paste: {out}"
+        );
         // No skill list duplication
         assert!(!out.contains("device-onboarding"));
+        // Fixed discovery rules — must not grow with installs (no per-ext catalog).
+        assert!(
+            !out.contains("### AI Extensions"),
+            "transitional NM-247 catalog must not be injected: {out}"
+        );
         // ~1.2K token target ≈ well under 6KB chars
         assert!(
             out.len() <= 6000,

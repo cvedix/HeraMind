@@ -1,5 +1,4 @@
 import { Card, CardContent } from "@/components/ui/card"
-import { interactiveCardHover } from "@/design-system/tokens/size"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -22,7 +21,7 @@ import {
   Factory,
   Wifi,
   Camera,
-  Home,
+
   Brain,
   MonitorPlay,
   ScanText,
@@ -31,7 +30,7 @@ import {
 } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import { cn } from "@/lib/utils"
-import { textNano, textMini, textMicro } from "@/design-system/tokens/typography"
+import { textNano, textMini } from "@/design-system/tokens/typography"
 import type { Extension } from "@/types"
 
 /// Pick a scannable category icon from the extension id/name keywords.
@@ -48,7 +47,7 @@ function categoryIcon(id: string, name: string): LucideIcon {
     [/transcri|speech|voice|asr|tts/, Brain],
     [/scan|text|ocr/, ScanText],
     [/ident|recogn/, UserCheck],
-    [/wasm|demo|core|runtime/, Cpu],
+    [/demo|core|runtime/, Cpu],
     [/industrial|scada|plc/, Factory],
     [/wifi|sensor|iot/, Wifi],
     [/push|export|telemetry|notif/, Database],
@@ -83,7 +82,7 @@ export function ExtensionCard({
   // toolsEnabled = master toggle for exposing commands to the agent.
   // The card only shows state; toggling lives in the details dialog to keep
   // the card height stable across on/off (no extra line, no alignment drift).
-  const toolsEnabled = extension.enabled !== false
+  const toolsEnabled = extension.ai_enabled !== false
 
   const hasError = extension.state === "Error"
   // Crashed = stopped by crash-loop, not on purpose — error-tinted, with the
@@ -118,18 +117,20 @@ export function ExtensionCard({
       onClick={() => onDetails?.()}
       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onDetails?.() } }}
       className={cn(
-        "group h-full overflow-hidden flex flex-col cursor-pointer",
-        interactiveCardHover,
+        "group h-full overflow-hidden flex flex-col cursor-pointer rounded-2xl border bg-card shadow-none active:scale-[0.99] md:rounded-xl md:shadow-sm",
+        "md:transition-all md:duration-fast md:ease-out md:hover:border-[var(--border-hover)] md:hover:shadow-md",
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
       )}
     >
-      <CardContent className="p-4 flex flex-col flex-1">
-        {/* Header: status-tinted icon + name + state + actions */}
-        <div className="flex items-start justify-between mb-3">
-          <div className="flex items-center gap-3 min-w-0">
+      <CardContent className="flex flex-1 flex-col px-4 py-3.5 md:p-4">
+        {/* Header: status-tinted icon + name + state + actions.
+            On mobile the icon tile is hidden, so the state pill next to the
+            name is the only status indicator — keep both signals. */}
+        <div className="flex min-w-0 items-start justify-between gap-2 md:mb-3">
+          <div className="flex min-w-0 flex-1 items-center gap-3">
             {/* Icon with status-tinted background (mirrors AgentCard) */}
             <div className={cn(
-              "relative w-11 h-11 rounded-xl flex items-center justify-center shrink-0 transition-colors",
+              "relative hidden w-11 h-11 rounded-xl items-center justify-center shrink-0 transition-colors md:flex",
               hasError || hasCrashed ? "bg-error-light text-error" :
               hasWarning ? "bg-warning-light text-warning" :
               isFailed ? "bg-muted text-muted-foreground" :
@@ -146,7 +147,7 @@ export function ExtensionCard({
               <div className="flex items-center gap-2">
                 <h3 className="font-semibold text-sm truncate" title={extension.name}>{extension.name}</h3>
                 <span className={cn(
-                  textNano, "px-1.5 py-0.5 rounded-full shrink-0",
+                  textNano, "shrink-0 rounded-full px-1.5 py-0.5",
                   hasError || hasCrashed ? "bg-error-light text-error" :
                   hasWarning ? "bg-warning-light text-warning" :
                   isFailed ? "bg-muted-30 text-muted-foreground" :
@@ -156,7 +157,7 @@ export function ExtensionCard({
                 </span>
               </div>
               <div className="flex items-center gap-2 mt-0.5">
-                <span className={cn(textMini, "text-muted-foreground font-mono truncate max-w-[100px]")} title={extension.id}>{extension.id}</span>
+                <span className={cn(textMini, "text-muted-foreground font-mono truncate max-w-[160px]")} title={extension.id}>{extension.id}</span>
                 {extension.version && (
                   <span className={cn(textNano, "text-muted-foreground shrink-0")}>v{extension.version}</span>
                 )}
@@ -182,23 +183,35 @@ export function ExtensionCard({
           </DropdownMenu>
         </div>
 
-        {/* Description */}
-        {extension.description && (
-          <p className="text-xs text-muted-foreground line-clamp-2 mb-3 leading-relaxed">
-            {extension.description}
-          </p>
-        )}
+        {/* Description — the wrapper always reserves the two-line height
+            (min-h-10 ≈ 2 lines of text-xs/leading-relaxed) so every card in
+            the grid is equally tall whether the text is absent, one line, or
+            clamped at two; same pattern as BuiltinModelWizard's model cards.
+            The clamp needs display:-webkit-box, which a display utility on
+            the same element would override (responsive variants sort later
+            in the compiled CSS), so visibility lives on this wrapper and the
+            inner p keeps the same clamp classes as AgentCard's description. */}
+        <div className="mb-3 hidden min-h-10 md:block">
+          {extension.description && (
+            <p className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
+              {extension.description}
+            </p>
+          )}
+        </div>
 
-        {/* Error summary — the card shows WHY it's red without opening details */}
+        {/* Error summary — the card shows WHY it's red without opening
+            details; min-h-10 keeps error cards uniform among themselves. */}
         {hasError && extension.last_error && (
-          <p className="text-xs text-error line-clamp-2 mb-3 leading-relaxed break-words">
-            {extension.last_error}
-          </p>
+          <div className="mb-3 hidden min-h-10 md:block">
+            <p className="line-clamp-2 break-words text-xs leading-relaxed text-error">
+              {extension.last_error}
+            </p>
+          </div>
         )}
 
         {/* Footer: capabilities + (optional) AI-tools-off badge + author.
             Single line, stable height whether tools are on or off. */}
-        <div className="mt-auto flex items-center gap-2 pt-2">
+        <div className="mt-auto hidden items-center gap-2 pt-2 md:flex">
           {extension.commands?.length > 0 && (
             <span className={cn(textMini, "text-muted-foreground flex items-center gap-1 shrink-0")}>
               <Terminal className="h-3 w-3" />
@@ -216,7 +229,7 @@ export function ExtensionCard({
               className={cn(
                 textNano,
                 "flex items-center gap-1 px-1.5 py-0.5 rounded-full shrink-0",
-                "bg-warning-light text-warning border border-warning-light",
+                "bg-warning-light text-warning",
               )}
               title={t('card.aiToolsOff', { defaultValue: 'Hidden from agent' })}
             >

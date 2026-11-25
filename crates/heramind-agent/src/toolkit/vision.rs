@@ -129,6 +129,16 @@ impl VlmHealthTable {
     }
 }
 
+/// Id prefix marking the platform's LOCAL vision companion instance. The
+/// prefix is the cross-crate contract (defined in heramind-api's
+/// builtin_llm::handlers); duplicated here as a literal so this crate stays
+/// decoupled — keep the two in sync.
+const LOCAL_COMPANION_PREFIX: &str = "builtin-vlm-";
+
+fn is_local_companion(id: &str) -> bool {
+    id.starts_with(LOCAL_COMPANION_PREFIX)
+}
+
 pub struct VisionTool {
     llm_manager: Arc<LlmBackendInstanceManager>,
     config: VisionConfig,
@@ -229,12 +239,31 @@ impl VisionTool {
         //    active chat backend is the most common offender, so trying a
         //    dedicated VLM first avoids a wasted failed round before
         //    health-tracking demotes the fake-multimodal active backend.
-        for inst in self.llm_manager.list_instances() {
-            if inst.capabilities.supports_multimodal && !seen.contains(&inst.id) {
-                if let Ok(rt) = self.llm_manager.get_runtime(&inst.id).await {
-                    seen.insert(inst.id.clone());
-                    candidates.push((inst.id.clone(), rt));
-                }
+        //    Within this tier, LOCAL companions (`builtin-vlm-*`) come before
+        //    cloud VLMs — same-or-better quality for describe-the-image calls
+        //    at zero cost and LAN latency (the local-companion feature made
+        //    this tier routinely non-empty; keep the prefix literal in sync
+        //    with builtin_llm::handlers::companion_instance_id in
+        //    heramind-api).
+        // The active backend is EXCLUDED here even when it claims
+        // multimodal — tier 3 owns it, keeping "active last" deterministic
+        // (list_instances order is a DashMap artifact, not a priority).
+        let active_id = self.llm_manager.get_active_instance().map(|i| i.id);
+        let mut multimodal: Vec<_> = self
+            .llm_manager
+            .list_instances()
+            .into_iter()
+            .filter(|inst| {
+                inst.capabilities.supports_multimodal
+                    && !seen.contains(&inst.id)
+                    && Some(&inst.id) != active_id.as_ref()
+            })
+            .collect();
+        multimodal.sort_by_key(|inst| !is_local_companion(&inst.id));
+        for inst in multimodal {
+            if let Ok(rt) = self.llm_manager.get_runtime(&inst.id).await {
+                seen.insert(inst.id.clone());
+                candidates.push((inst.id.clone(), rt));
             }
         }
 
@@ -251,8 +280,8 @@ impl VisionTool {
         }
 
         if candidates.is_empty() {
-            return Err(ToolError::Execution(
-                "No vision model configured. Install a VLM (e.g., qwen2.5-vl, minicpm-v) via Ollama and `heramind llm activate` it.".into(),
+            return Err(ToolError::ConfigurationError(
+                "No vision model configured. Install the built-in vision companion (模型向导 → 视觉伴侣 / builtin-llm models with role vlm), or register any multimodal backend (cloud or Ollama) and it will be picked up automatically.".into(),
             ));
         }
         // Drop backends still inside a failure cool-down window, so we don't
@@ -396,7 +425,7 @@ impl VisionTool {
         }
 
         Err(ToolError::Execution(format!(
-            "VLM inference failed on all {} candidate backend(s) — {}. Activate a working multimodal backend via `heramind llm activate <id>` (its model must be installed in Ollama).",
+            "VLM inference failed on all {} candidate backend(s) — {}. Install the built-in vision companion (models with role vlm) or fix/activate a working multimodal backend.",
             candidates.len(),
             errors.join("; ")
         )))
@@ -409,27 +438,21 @@ impl Tool for VisionTool {
         "vision"
     }
 
+    /// Read-only analysis — re-running after an interruption cannot double-apply.
+    fn replay_safety(&self) -> crate::toolkit::tool::ReplaySafety {
+        crate::toolkit::tool::ReplaySafety::Safe
+    }
+
     fn description(&self) -> &str {
-        r#"Analyze images you CANNOT already see, using a vision-language model. Pass an image source and get back a description/analysis.
-
-Use this tool when you need to analyze images from sources other than the current message:
-- `$cached:xxx` — a cache ref returned by other tools (e.g. `device get --metric <image_field>` output, or extension image outputs). Pass it directly as `image`; it resolves to the full image bytes. Prefer this over base64-decoding/saving files yourself.
-- HTTP/HTTPS image URLs (e.g., camera snapshots, web images) — fetches automatically, private/local URLs blocked
-- /path/to/file.jpg — local image file on disk (must have an image extension)
-- data:image/...;base64,... — base64 data URL from extension outputs
-- raw base64 string — decoded as JPEG by default
-
-Do NOT call this for images you can already see — analyze those yourself directly (e.g. images uploaded by the user in chat, or embedded in the current message from bound data sources — those are already visible to you).
-
-Optional `model` param (e.g. "minicpm-v4.6") forces a specific VLM backend. Use it when the auto-picked model replies it can't see the image (a text-only model wrongly selected). Find available model names via `heramind llm list`."#
+        "Analyze images not inline in chat via VLM. Accepts /api/images/…, $cached:…, http(s) URL, path, or base64."
     }
 
     fn parameters(&self) -> Value {
         object_schema(
             serde_json::json!({
-                "image": string_property("Image source: base64 data URL, raw base64, local image file path, or public HTTP/HTTPS URL"),
-                "prompt": string_property("Analysis instructions for the image. Match the user's language and detail level from the conversation."),
-                "model": serde_json::json!({"type": "string", "description": "Optional VLM model name to force (e.g. `minicpm-v4.6`). Use when the auto-picked model says it can't see the image. Find names via `heramind llm list`."})
+                "image": string_property("Image ref (/api/images/…, $cached:…, URL, path, base64)."),
+                "prompt": string_property("Analysis instructions."),
+                "model": serde_json::json!({"type": "string", "description": "Optional VLM model name."})
             }),
             vec!["image".to_string(), "prompt".to_string()],
         )
@@ -526,8 +549,9 @@ fn validate_url(url: &reqwest::Url) -> Result<()> {
 
     if is_private_host(host) {
         return Err(ToolError::PermissionDenied(format!(
-            "Access to private address '{}' is not allowed",
-            host
+            "Access to private address '{}' is not allowed. {}",
+            host,
+            crate::image_utils::INTERNAL_IMAGE_INPUT_HINT
         )));
     }
 
@@ -723,5 +747,233 @@ mod tests {
         assert!(h.is_blocked("a"));
         h.clear("a");
         assert!(!h.is_blocked("a"));
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+    use crate::llm_backends::{set_instance_manager, LlmBackendInstanceManager};
+    use crate::toolkit::tool::Tool;
+    use heramind_storage::{LlmBackendInstance, LlmBackendStore, LlmBackendType};
+    use std::sync::Arc;
+
+    fn test_store(tag: &str) -> Arc<LlmBackendStore> {
+        let path = std::env::temp_dir().join(format!(
+            "heramind-vision-{}-{}.redb",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        LlmBackendStore::open(&path).expect("open test store")
+    }
+
+    /// Raw-socket OpenAI-compatible fake (this crate has no axum; same
+    /// pattern as the session delegation tests). Every request gets the
+    /// canned `content`.
+    async fn fake_vlm(content: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let body = format!(
+                    "{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":{content}}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}},\"created\":0,\"model\":\"fake\",\"id\":\"x\",\"object\":\"chat.completion\"}}"
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), h)
+    }
+
+    /// A multimodal OpenAI-type instance (default `cloud` feature builds its
+    /// runtime keyless against the fake endpoint). The runtime_api source
+    /// keeps ensure_instance_capabilities' name heuristic from flipping the
+    /// vision flag on read.
+    fn vlm_instance(id: &str, model: &str, endpoint: &str) -> LlmBackendInstance {
+        let mut inst = LlmBackendInstance::new(id.into(), id.into(), LlmBackendType::OpenAi);
+        inst.endpoint = Some(endpoint.into());
+        // Upsert validation requires a key for cloud types; the fake server
+        // never reads it.
+        inst.api_key = Some("test-key".into());
+        inst.model = model.into();
+        inst.capabilities.supports_multimodal = true;
+        inst.capabilities.multimodal_source = Some("runtime_api".into());
+        inst
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn existing_vision_tool_accepts_backend_added_after_construction() {
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("late-vlm")));
+        let tool = VisionTool::new(VisionConfig::default(), manager.clone());
+        assert!(matches!(
+            tool.resolve_vlm_candidates(None).await,
+            Err(ToolError::ConfigurationError(_))
+        ));
+        let (endpoint, task) = fake_vlm("\"late vision ready\"").await;
+        manager
+            .upsert_instance(vlm_instance("late-vlm", "gpt-4o", &endpoint))
+            .await
+            .unwrap();
+        let candidates = tool.resolve_vlm_candidates(None).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "late-vlm");
+        task.abort();
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn candidate_order_local_companion_first_then_cloud_then_active() {
+        let (ep_cloud, _h1) = fake_vlm("\"cloud says hi\"").await;
+        let (ep_local, _h2) = fake_vlm("\"local says hi\"").await;
+        let (ep_active, _h3) = fake_vlm("\"active says hi\"").await;
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("order")));
+        // Registration order deliberately hostile: cloud first, local last.
+        manager
+            .upsert_instance(vlm_instance("openai-cloud", "gpt-4o", &ep_cloud))
+            .await
+            .unwrap();
+        manager
+            .upsert_instance(vlm_instance(
+                &(LOCAL_COMPANION_PREFIX.to_string() + "x"),
+                "minicpm-v",
+                &ep_local,
+            ))
+            .await
+            .unwrap();
+        let mut active = vlm_instance("active-main", "main-model", &ep_active);
+        active.is_active = true;
+        manager.upsert_instance(active).await.unwrap();
+        // The candidates resolver reads the manager's ACTIVE POINTER (not the
+        // stored is_active flag) — set it the way the platform does.
+        manager.set_active("active-main").await.unwrap();
+        set_instance_manager(manager.clone());
+
+        let tool = VisionTool::new(VisionConfig::default(), manager);
+        let cands = tool.resolve_vlm_candidates(None).await.expect("candidates");
+        let ids: Vec<&str> = cands.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["builtin-vlm-x", "openai-cloud", "active-main"],
+            "local companion outranks cloud; the active backend is the last resort"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn candidate_order_explicit_pin_beats_everything() {
+        let (ep_a, _h1) = fake_vlm("\"a\"").await;
+        let (ep_b, _h2) = fake_vlm("\"b\"").await;
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("pin")));
+        manager
+            .upsert_instance(vlm_instance("vlm-a", "pinned-model", &ep_a))
+            .await
+            .unwrap();
+        manager
+            .upsert_instance(vlm_instance(
+                &(LOCAL_COMPANION_PREFIX.to_string() + "y"),
+                "minicpm-v",
+                &ep_b,
+            ))
+            .await
+            .unwrap();
+        set_instance_manager(manager.clone());
+
+        let tool = VisionTool::new(VisionConfig::default(), manager);
+        // `model` param pins by MODEL-NAME substring (not id); the pinned
+        // candidate must lead even past the local-first tier rule.
+        let cands = tool
+            .resolve_vlm_candidates(Some("pinned"))
+            .await
+            .expect("candidates");
+        assert_eq!(cands[0].0, "vlm-a", "explicit pin is tried first");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn analyze_falls_through_on_cant_see_and_demotes() {
+        // First candidate replies with the classic blind-model answer; the
+        // tool must fall through to the second and cool the first down.
+        let (ep_blind, _h1) = fake_vlm("\"Sorry, I cannot see the image.\"").await;
+        let (ep_good, _h2) = fake_vlm("\"a red square\"").await;
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("fallthrough")));
+        let mut blind = vlm_instance("vlm-blind", "blind-model", &ep_blind);
+        blind.capabilities.supports_multimodal = true;
+        manager.upsert_instance(blind).await.unwrap();
+        manager
+            .upsert_instance(vlm_instance("vlm-good", "good-model", &ep_good))
+            .await
+            .unwrap();
+        set_instance_manager(manager.clone());
+
+        let tool = VisionTool::new(VisionConfig::default(), manager);
+        let out = tool
+            .analyze("aGVsbG8=", "image/png", "describe", Some("blind-model"))
+            .await
+            .expect("must fall through to the good candidate");
+        assert_eq!(out, "a red square");
+        // The blind reply must now be inside a cool-down window: a fresh
+        // resolve skips it while a healthy alternative exists.
+        {
+            let h = tool.health.read().await;
+            assert!(
+                h.is_blocked("vlm-blind"),
+                "cant-see reply must demote the backend"
+            );
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn no_multimodal_backend_gives_actionable_error() {
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("empty")));
+        let mut text_only = LlmBackendInstance::new("t".into(), "t".into(), LlmBackendType::OpenAi);
+        text_only.endpoint = Some("http://127.0.0.1:1".into());
+        text_only.api_key = Some("test-key".into());
+        text_only.model = "text-model".into();
+        manager.upsert_instance(text_only).await.unwrap();
+        set_instance_manager(manager.clone());
+
+        let tool = VisionTool::new(VisionConfig::default(), manager);
+        let err = tool
+            .analyze("aGVsbG8=", "image/png", "describe", None)
+            .await
+            .expect_err("no candidates");
+        assert!(
+            err.to_string().contains("No vision model configured"),
+            "error should tell the user how to fix it: {err}"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn execute_validates_arguments() {
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("args")));
+        set_instance_manager(manager.clone());
+        let tool = VisionTool::new(VisionConfig::default(), manager);
+
+        let missing = serde_json::json!({ "prompt": "x" });
+        assert!(tool.execute(missing).await.is_err(), "image is required");
+        let empty_img = serde_json::json!({ "image": "  ", "prompt": "x" });
+        assert!(
+            tool.execute(empty_img).await.is_err(),
+            "image must be non-empty"
+        );
+        let empty_prompt = serde_json::json!({ "image": "abc", "prompt": "" });
+        assert!(
+            tool.execute(empty_prompt).await.is_err(),
+            "prompt must be non-empty"
+        );
     }
 }

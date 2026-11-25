@@ -151,7 +151,7 @@ fn test_config_default_values_valid() {
     assert!(agent::DEFAULT_CONCURRENT_LIMIT >= 1);
     assert!(agent::DEFAULT_CONCURRENT_LIMIT <= 100);
 }
-
+#[serial_test::serial]
 #[test]
 fn test_config_env_var_parsing_invalid() {
     // Test that invalid env var values fall back to defaults
@@ -173,7 +173,7 @@ fn test_config_env_var_parsing_invalid() {
         },
     }
 }
-
+#[serial_test::serial]
 #[test]
 fn test_config_env_var_parsing_zero() {
     // Test edge case of zero value
@@ -196,7 +196,7 @@ fn test_config_env_var_parsing_zero() {
         },
     }
 }
-
+#[serial_test::serial]
 #[test]
 fn test_config_env_var_parsing_overflow() {
     // Test very large values that might overflow
@@ -226,6 +226,7 @@ fn test_config_env_var_parsing_overflow() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_concurrent_state_access() {
     // Test that concurrent reads don't cause issues
     let state = Arc::new(RwLock::new(vec![1, 2, 3]));
@@ -250,6 +251,7 @@ async fn test_concurrent_state_access() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_concurrent_write_conflict() {
     // Test that concurrent writes are serialized correctly
     let state = Arc::new(RwLock::new(0));

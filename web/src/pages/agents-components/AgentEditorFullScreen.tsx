@@ -2,7 +2,7 @@
  * Agent Editor Full Screen (Single Page Layout)
  *
  * All configuration in one page:
- * - Left: Basic info (name, description, prompt, schedule)
+ * - Left: Basic info (name, model)
  * - Right: Selected resources with dialog to add more
  *
  * Features:
@@ -15,94 +15,97 @@
  */
 
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/components/ui/collapsible'
-import { getPortalRoot } from '@/lib/portal'
-import React, { useState, useEffect, useCallback, useMemo, useRef } from "react"
-import { useTranslation } from "react-i18next"
-import { createPortal } from "react-dom"
-import { api } from "@/lib/api"
-import { validateRequired, validateLength } from "@/lib/form-validation"
-import { useToast } from "@/hooks/use-toast"
-import { useErrorHandler } from "@/hooks/useErrorHandler"
-import { showErrorToast } from "@/lib/error-messages"
-import { useIsMobile, useSafeAreaInsets } from "@/hooks/useMobile"
-import { useBodyScrollLock } from "@/hooks/useBodyScrollLock"
-import { cn } from "@/lib/utils"
-import { textNano } from "@/design-system/tokens/typography"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-
-import { Checkbox } from "@/components/ui/checkbox"
-import { Slider } from "@/components/ui/slider"
-import { Textarea } from "@/components/ui/textarea"
-import { Badge } from "@/components/ui/badge"
-import { ScrollArea } from "@/components/ui/scroll-area"
-import { Switch } from "@/components/ui/switch"
+import { Switch } from '@/components/ui/switch'
+import { Checkbox } from '@/components/ui/checkbox'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
+import { api } from '@/lib/api'
+import { validateRequired, validateLength } from '@/lib/form-validation'
+import { useToast } from '@/hooks/use-toast'
+import { useErrorHandler } from '@/hooks/useErrorHandler'
+import { showErrorToast } from '@/lib/error-messages'
+import { useIsMobile } from '@/hooks/useMobile'
+import { cn } from '@/lib/utils'
+import { textNano } from '@/design-system/tokens/typography'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import { Badge } from '@/components/ui/badge'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { } from '@/components/ui/dialog'
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import {
-  Search,
   Loader2,
   Clock,
-  Zap,
   Check,
-  Target,
   Activity,
-  BarChart3,
   X,
   Sparkles,
   Puzzle,
   Plus,
   Info,
-  Wand2,
-  ChevronRight,
-  Bell,
-  Eye,
-  Brain,
-  Wrench,
-  MessageSquare,
   Database,
-  Workflow,
+  Brain,
   MousePointerClick,
   GitBranch,
-  Settings,
-} from "lucide-react"
-import type {
+  ArrowRight,
+} from 'lucide-react'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { Link } from 'react-router-dom'
+import { channelsApi } from '@/lib/api/channels'
+import type { AlertChannel } from '@/types/message'
+import type { AgentToolCatalogItem,
   AiAgentDetail,
   AgentSchedule,
   CreateAgentRequest,
+  AgentExecutionMode,
+  AgentMemoryMode,
+  AgentNotify,
+  OperatorField,
+  OperatorConfig,
+  DryRunResult,
   Device,
   DeviceType,
   Extension,
   ExtensionDataSourceInfo,
-  ExtensionCommandDescriptor,
   LlmBackendInstance,
   ResourceRequest,
   UnifiedDataSourceInfo,
-} from "@/types"
-// Unified dialog components
+} from '@/types'
+import { BuilderShell } from '@/components/automation/dialog/BuilderShell'
 import {
-  FullScreenDialog,
-  FullScreenDialogHeader,
-  FullScreenDialogContent,
-  FullScreenDialogFooter,
-  FullScreenDialogMain,
-} from '@/components/automation/dialog'
+  ResourceSelectionDialog,
+  PresetPickerDialog,
+  ScheduleCard,
+  INTERVALS,
+  HOURS,
+  deriveExecutionMode,
+  hasOutputContract,
+  FEATURED_PRESETS,
+  nextStepFor,
+  presetByKey,
+  DEFAULT_LOOKBACK_MINUTES,
+  DEFAULT_MAX_CHAIN_DEPTH,
+  DEFAULT_NOTIFY_CHANNEL,
+  DEFAULT_NOTIFY_ON,
+  parseTriggerFilter,
+  buildTriggerFilter,
+  reasonTriggerFilterInvalid,
+  type AgentPreset,
+  type TriggerFilter,
+  type TriggerSource,
+} from './agent-editor'
+import type {
+  MetricInfo,
+  CommandInfo,
+  DataCollectionConfig,
+  SelectedResource,
+  ResourceRecommendation,
+  ScheduleType,
+  TimerSubType,
+  AvailableResource,
+} from './agent-editor'
 
-// Shared className for inline link-styled buttons (not IconButton — these are
-// text links rendered as <button> for accessibility).
-const inlineLinkBtn = 'text-xs text-primary hover:underline'
 
 interface AgentEditorFullScreenProps {
   open: boolean
@@ -120,163 +123,55 @@ interface AgentEditorFullScreenProps {
 // Types
 // ============================================================================
 
-interface MetricInfo {
-  name: string
-  display_name: string
-  unit?: string
-  data_type?: string
-  source: 'device' | 'extension'
-  extensionId?: string
-}
-
-interface CommandInfo {
-  name: string
-  display_name: string
-  description?: string
-  source: 'device' | 'extension'
-  extensionId?: string
-  parameters?: Record<string, unknown>
-}
-
-interface DataCollectionConfig {
-  time_range_minutes: number
-  include_history: boolean
-  include_trend: boolean
-  include_baseline: boolean
-}
-
-interface SelectedResource {
-  id: string
-  name: string
-  type: 'device' | 'extension'
-  deviceType?: string
-  // All available metrics/commands
-  allMetrics: MetricInfo[]
-  allCommands: CommandInfo[]
-  // Selected metric/command names
-  selectedMetrics: Set<string>
-  selectedCommands: Set<string>
-  // Data collection config for Focused Mode
-  config?: {
-    data_collection?: DataCollectionConfig
-  }
-}
-
-interface ResourceRecommendation {
-  id: string
-  name: string
-  type: 'device' | 'extension'
-  reason: string
-  metrics?: MetricInfo[]
-  commands?: CommandInfo[]
-}
-
-type ScheduleType = 'timer' | 'reactive' | 'on-demand'
-type TimerSubType = 'interval' | 'daily' | 'weekly'
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-const INTERVALS = [5, 10, 15, 30, 60]
-const HOURS = Array.from({ length: 24 }, (_, i) => i)
-
-const PROMPT_TEMPLATES = [
-  { id: 'empty', label: 'Custom', icon: null, description: 'Write your own prompt', template: '' },
-  {
-    id: 'monitor',
-    label: 'Monitor',
-    icon: <Activity className="h-4 w-4" />,
-    description: 'Monitor data and detect anomalies',
-    template: `Monitor the following metrics and alert when anomalies are detected:
-
-Monitoring Targets:
-- Data Range: Check if values exceed thresholds (e.g., temperature > 30°C)
-- Anomaly Detection: Look for sudden changes or abnormal patterns
-- Alert Method: Send notification when conditions are met
-
-Please analyze the current data and compare with historical baselines to identify:
-1. Values outside normal range
-2. Sudden spikes or drops
-3. Data gaps or missing readings
-
-When an anomaly is detected, send an alert with:
-- What metric is affected
-- Current value vs expected range
-- Severity level (info/warning/critical)`
-  },
-  {
-    id: 'control',
-    label: 'Control',
-    icon: <Zap className="h-4 w-4" />,
-    description: 'Automatically control devices',
-    template: `Automatically control devices based on the following conditions:
-
-Trigger Conditions:
-- Check current sensor readings
-- Compare against threshold values
-- Verify device states before taking action
-
-Control Actions:
-- Device ID: [target device]
-- Command: [turn_on / turn_off / adjust]
-- Parameters: [any required settings]
-
-Please:
-1. First verify the current condition by checking sensor data
-2. Only execute commands when the condition is clearly met
-3. Confirm the action was successful
-4. Avoid rapid repeated switching (add a cooldown between same actions)`
-  },
-  {
-    id: 'analysis',
-    label: 'Analysis',
-    icon: <BarChart3 className="h-4 w-4" />,
-    description: 'Analyze trends and generate reports',
-    template: `Analyze the following data and generate a comprehensive report:
-
-Analysis Scope:
-- Time Range: Use available historical data
-- Metrics: All selected metrics
-- Comparison: Compare with previous periods if available
-
-Report Contents:
-1. **Data Overview**: Summary of current values and status
-2. **Trend Analysis**: Increasing, decreasing, or stable patterns
-3. **Anomalies**: Any unusual readings or deviations
-4. **Correlations**: Relationships between different metrics
-5. **Recommendations**: Actionable insights based on the data
-
-Please provide specific numbers and percentages when describing trends and changes.`
-  },
-  {
-    id: 'alert',
-    label: 'Alert',
-    icon: <Bell className="h-4 w-4" />,
-    description: 'Send notifications based on conditions',
-    template: `Monitor the selected metrics and send alerts when specific conditions occur:
-
-Alert Conditions:
-- Threshold exceeded: When metric goes above/below a value
-- Rate of change: When value changes too quickly
-- Status change: When device state changes
-
-Alert Content:
-- Which metric/device triggered the alert
-- Current value and threshold
-- Time of occurrence
-- Suggested actions if applicable
-
-Please avoid duplicate alerts - only alert when:
-1. This is a new incident (not previously reported)
-2. The condition has significantly worsened
-3. A sufficient cooldown period has passed since the last alert`
-  },
-]
 
 // ============================================================================
 // Main Component
 // ============================================================================
+
+/**
+ * The single way this dialog explains itself: a small info icon whose text
+ * appears on hover. Explanations stay off the surface, so the form reads as
+ * labels and controls rather than as prose.
+ */
+function InfoHint({ text }: { text: string }) {
+  return (
+    <TooltipProvider delayDuration={300}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Info className="h-3.5 w-3.5 shrink-0 cursor-help text-muted-foreground" />
+        </TooltipTrigger>
+        <TooltipContent side="top" className="max-w-xs">
+          <p>{text}</p>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
+
+/**
+ * One section of the editor. Every section uses the same shell, so the dialog
+ * reads as a designed form: the header carries the title, the body carries only
+ * controls. No step numbers — this is a single-page form, not a wizard.
+ */
+function EditorSection({
+  title,
+  hint,
+  children,
+}: {
+  title: React.ReactNode
+  hint?: string
+  children: React.ReactNode
+}) {
+  return (
+    <section className="overflow-hidden rounded-lg border border-border">
+      <header className="flex items-center gap-2 border-b border-border px-4 py-3">
+        <Label className="text-sm font-medium">{title}</Label>
+        {hint ? <InfoHint text={hint} /> : null}
+      </header>
+      <div className="space-y-3 p-4">{children}</div>
+    </section>
+  )
+}
 
 export function AgentEditorFullScreen({
   open,
@@ -285,7 +180,7 @@ export function AgentEditorFullScreen({
   devices,
   deviceTypes,
   extensions = [],
-  extensionDataSources = [],
+  extensionDataSources: _extensionDataSources = [],
   unifiedDataSources = [],
   onSave,
 }: AgentEditorFullScreenProps) {
@@ -304,7 +199,6 @@ export function AgentEditorFullScreen({
 
   // Basic info
   const [name, setName] = useState("")
-  const [description, setDescription] = useState("")
   const [userPrompt, setUserPrompt] = useState("")
   const [llmBackendId, setLlmBackendId] = useState<string | null>(null)
 
@@ -319,12 +213,19 @@ export function AgentEditorFullScreen({
   // Trigger sources for reactive mode
   // When field is undefined → match all fields from this source
   // When field is specified → match only that field
-  const [triggerSources, setTriggerSources] = useState<Array<{ type: string; id: string; name: string; field?: string }>>([])
+  const [triggerSources, setTriggerSources] = useState<TriggerSource[]>([])
+  // How the selected trigger sources combine (M2). `any` fires on the first
+  // match; `all` waits for every source inside `triggerWindowSecs`.
+  const [triggerMode, setTriggerMode] = useState<TriggerFilter['mode']>('any')
+  // null = the stored filter carries no window, which the backend reads as
+  // "one single event must satisfy every source". Kept null (not repaired to a
+  // default) so the editor can show the user the problem instead of quietly
+  // changing what their rule means.
+  const [triggerWindowSecs, setTriggerWindowSecs] = useState<number | null>(null)
   const [activeTriggerEntity, setActiveTriggerEntity] = useState<{ type: string; id: string } | null>(null)
   // Resource state
   const [selectedResources, setSelectedResources] = useState<SelectedResource[]>([])
   const [resourceDialogOpen, setResourceDialogOpen] = useState(false)
-  const [freeModeResourcesExpanded, setFreeModeResourcesExpanded] = useState(false)
   const [searchQuery, setSearchQuery] = useState("")
   const [recommendations, setRecommendations] = useState<ResourceRecommendation[]>([])
   const [generatingRecommendations, setGeneratingRecommendations] = useState(false)
@@ -336,13 +237,41 @@ export function AgentEditorFullScreen({
   const [llmBackends, setLlmBackends] = useState<LlmBackendInstance[]>([])
   const [activeBackendId, setActiveBackendId] = useState<string | null>(null)
 
-  // Advanced configuration state
-  const [executionMode, setExecutionMode] = useState<'focused' | 'free'>('focused')
-  const [priority, setPriority] = useState(5)
+  // How much latitude the agent gets. It is the input the derivation needs to
+  // tell "investigate" from "summarise" — no resource or field can.
+  const [canActAutonomously, setCanActAutonomously] = useState(false)
+  // The chosen starting point, or null while the picker is showing. Create-only:
+  // an existing agent already has its content.
+  const [appliedPreset, setAppliedPreset] = useState<AgentPreset['key'] | null>(null)
+  const [presetDialogOpen, setPresetDialogOpen] = useState(false)
+  const [memoryMode, setMemoryMode] = useState<AgentMemoryMode | null>(null)
+  // Notification routing: null = 未配置(走旧的关键词行为)。
+  // Seeded with the API's floor rather than null: `create_agent` applies that
+  // floor to any request that omits `notify`, so an empty card here would show
+  // "nothing configured" while the agent that gets created routes to IM on
+  // failure. What the card shows is what will be saved.
+  const [notify, setNotify] = useState<AgentNotify | null>({
+    channels: [DEFAULT_NOTIFY_CHANNEL],
+    on: DEFAULT_NOTIFY_ON,
+  })
+  const [channels, setChannels] = useState<AlertChannel[]>([])
+  const [outputSchema, setOutputSchema] = useState<OperatorField[]>([])
+  const [operatorConfig, setOperatorConfig] = useState<OperatorConfig>({
+    debounce_secs: 30,
+    timeout_secs: 60,
+    consecutive_failure_threshold: 3,
+  })
+  const [priority, setPriority] = useState(128)
   const [contextWindowSize, setContextWindowSize] = useState(10)
-  const [maxChainDepth, setMaxChainDepth] = useState(5)
+  const [maxChainDepth, setMaxChainDepth] = useState(DEFAULT_MAX_CHAIN_DEPTH)
+  // Tool gating (focused/free; structured never shows it — its contract has
+  // no tool loop). toolsEnabled=false is the text-only agent; restrictTools +
+  // the checked set becomes allowed_tools (empty = all, backend semantics).
+  const [toolsEnabled, setToolsEnabled] = useState(true)
+  const [restrictTools, setRestrictTools] = useState(false)
+  const [allowedTools, setAllowedTools] = useState<Set<string>>(new Set())
+  const [toolCatalog, setToolCatalog] = useState<AgentToolCatalogItem[]>([])
   // Advanced knobs collapsed by default — defaults suit most agents
-  const [advancedOpen, setAdvancedOpen] = useState(false)
 
   // LLM validation state
   const [llmValidating, setLlmValidating] = useState(false)
@@ -356,8 +285,34 @@ export function AgentEditorFullScreen({
   // Mode Helpers
   // ========================================================================
 
+  // ── Derived execution mode ──────────────────────────────────────────────
+  // The user answers four questions — what it should do, what it watches, what
+  // it records, how often — and the mode follows from the answers.
+  const hasDeviceCommands = useMemo(
+    () => selectedResources.some((r) => r.selectedCommands.size > 0),
+    [selectedResources],
+  )
+  const hasContract = useMemo(() => hasOutputContract(outputSchema), [outputSchema])
+  const executionMode: AgentExecutionMode = deriveExecutionMode({
+    hasDeviceCommands,
+    canActAutonomously,
+    hasOutputContract: hasContract,
+  })
   const isFocusedMode = executionMode === 'focused'
-  const isFreeMode = executionMode === 'free'
+  const isStructuredMode = executionMode === 'structured'
+  // Mirrors `MemoryMode::derived_for` on the server: a scanner carries no
+  // history, anything that reasons across turns does.
+  const effectiveMemoryMode: AgentMemoryMode = memoryMode ?? (isStructuredMode ? 'tool' : 'assistant')
+  // Resources say different things depending on the run: the only input for a
+  // single-pass agent, a supplement when an event triggers it, an optional
+  // preload when the agent fetches its own data.
+  // What the binding strip means depends on the run; the title is fixed, the
+  // role is the hint's job.
+  const resourcesHint = scheduleType === 'reactive'
+    ? tAgent('creator.resources.hintReactive')
+    : isFocusedMode
+      ? tAgent('creator.resources.hintFocused')
+      : tAgent('creator.resources.hintFree')
 
   // Helper: get metrics for a device (from deviceTypes)
   const getDeviceMetrics = useCallback((deviceId: string): Array<{ name: string; display_name: string }> => {
@@ -454,7 +409,9 @@ export function AgentEditorFullScreen({
   // Load LLM backends
   const loadBackends = useCallback(async () => {
     try {
-      const response = await api.listLlmBackends()
+      // Agents may pin the vision companion as their engine (describe-only
+      // image analysis) — the chat picker keeps the default filtered list.
+      const response = await api.listLlmBackends({ include_vlm: true })
       setLlmBackends(response.backends)
       setActiveBackendId(response.active_id)
     } catch (e) {
@@ -465,6 +422,10 @@ export function AgentEditorFullScreen({
   useEffect(() => {
     if (open) {
       loadBackends()
+      channelsApi.listMessageChannels().then((r) => setChannels(r.channels)).catch(() => {})
+      // Tool catalog for the gating section — failure keeps the section
+      // functional (the "all tools" default needs no catalog).
+      api.getAgentTools().then((r) => setToolCatalog(r.tools ?? [])).catch(() => {})
     }
   }, [open, loadBackends])
 
@@ -475,27 +436,47 @@ export function AgentEditorFullScreen({
       if (agent) {
         // Edit mode
         setName(agent.name || '')
-        setDescription(agent.description || '')
         setUserPrompt(agent.user_prompt || '')
         setLlmBackendId(agent.llm_backend_id || null)
-        // Load advanced config from agent
-        setExecutionMode(agent.execution_mode === 'free' ? 'free' : 'focused')
-        setPriority(agent.priority ?? 5)
+        // Seeded, not derived: re-saving must not silently change how an
+        // existing agent runs. A stored `free` means it was allowed latitude.
+        setCanActAutonomously(agent.execution_mode === 'free')
+        setMemoryMode(agent.memory_mode ?? null)
+        setNotify(agent.notify ?? null)
+        setNotify(agent.notify ?? null)
+        setOutputSchema(agent.output_schema ?? [])
+        setOperatorConfig(agent.operator_config ?? {
+          debounce_secs: 30,
+          timeout_secs: 60,
+          consecutive_failure_threshold: 3,
+        })
+        setPriority(agent.priority ?? 128)
         setContextWindowSize(agent.context_window_size ?? 10)
-        setMaxChainDepth(agent.max_chain_depth ?? 5)
+        setMaxChainDepth(agent.max_chain_depth ?? DEFAULT_MAX_CHAIN_DEPTH)
+        const storedTools = agent.tool_config?.allowed_tools ?? []
+        setToolsEnabled(agent.tool_config?.enabled ?? true)
+        setRestrictTools(storedTools.length > 0)
+        setAllowedTools(new Set(storedTools))
         parseSchedule(agent.schedule)
         loadAgentResources(agent)
       } else {
         // Create mode - reset
         setName("")
-        setDescription("")
         setUserPrompt("")
         setLlmBackendId(null)
         // Reset to defaults
-        setExecutionMode('focused')
+        setCanActAutonomously(false)
+        setToolsEnabled(true)
+        setRestrictTools(false)
+        setAllowedTools(new Set())
+        setMemoryMode(null)
+        setNotify({ channels: [DEFAULT_NOTIFY_CHANNEL], on: DEFAULT_NOTIFY_ON })
+        setAppliedPreset(null)
+        setOutputSchema([])
+        setOperatorConfig({ debounce_secs: 30, timeout_secs: 60, consecutive_failure_threshold: 3 })
         setPriority(5)
         setContextWindowSize(10)
-        setMaxChainDepth(5)
+        setMaxChainDepth(DEFAULT_MAX_CHAIN_DEPTH)
         setScheduleType('timer')
         setTimerSubType('interval')
         setIntervalValue(5)
@@ -517,6 +498,7 @@ export function AgentEditorFullScreen({
     if (open && agent && devices.length > 0) {
       loadAgentResources(agent)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- agent identity changes reload resources via the [agent, open] effect above
   }, [devices, deviceTypes, open])
 
   // Auto-focus name input when creating a new agent
@@ -603,23 +585,23 @@ export function AgentEditorFullScreen({
       }
     } else if (schedule.schedule_type === 'event') {
       setScheduleType('reactive')
-      // Parse trigger sources from event_filter
-      try {
-        const filter = JSON.parse(schedule.event_filter || '{}')
-        if (filter.sources && Array.isArray(filter.sources)) {
-          const sources = filter.sources.map((s: Record<string, string>) =>
+      // Trigger sources from event_filter — `any` (the legacy `sources`
+      // shape included) or `all` with its window.
+      const parsedFilter = parseTriggerFilter(schedule.event_filter)
+      setTriggerMode(parsedFilter.mode)
+      setTriggerWindowSecs(parsedFilter.withinSecs)
+      setTriggerSources(
+        parsedFilter.sources
+          .map(s =>
             restoreFromBackendSourceType({
               type: s.type || 'device',
               id: s.id || '',
               name: s.name || s.id || '',
               ...(s.field ? { field: s.field } : {}),
             })
-          ).filter((s: { id: string }) => s.id)
-          setTriggerSources(sources)
-        }
-      } catch {
-        // Legacy event_filter format - ignore
-      }
+          )
+          .filter((s: { id: string }) => s.id),
+      )
     }
   }
 
@@ -653,7 +635,7 @@ export function AgentEditorFullScreen({
         if (res.config?.data_collection && !resourceDataCollectionConfigs.has(deviceId)) {
           const dc = res.config.data_collection as { time_range_minutes?: number; include_history?: boolean; include_trend?: boolean; include_baseline?: boolean }
           resourceDataCollectionConfigs.set(deviceId, {
-            time_range_minutes: dc.time_range_minutes ?? 60,
+            time_range_minutes: dc.time_range_minutes ?? DEFAULT_LOOKBACK_MINUTES,
             include_history: dc.include_history ?? false,
             include_trend: dc.include_trend ?? false,
             include_baseline: dc.include_baseline ?? false,
@@ -680,7 +662,7 @@ export function AgentEditorFullScreen({
           if (res.config?.data_collection && !resourceDataCollectionConfigs.has(extId)) {
             const dc = res.config.data_collection as { time_range_minutes?: number; include_history?: boolean; include_trend?: boolean; include_baseline?: boolean }
             resourceDataCollectionConfigs.set(extId, {
-              time_range_minutes: dc.time_range_minutes ?? 60,
+              time_range_minutes: dc.time_range_minutes ?? DEFAULT_LOOKBACK_MINUTES,
               include_history: dc.include_history ?? false,
               include_trend: dc.include_trend ?? false,
               include_baseline: dc.include_baseline ?? false,
@@ -735,7 +717,11 @@ export function AgentEditorFullScreen({
         selectedMetrics: selectedMetrics,
         selectedCommands: selectedCmds,
         config: {
-          data_collection: resourceDataCollectionConfigs.get(deviceId),
+          // The edited value wins: the lookback field writes onto the selected
+          // resource, and the map only carries what was loaded from the server.
+          data_collection:
+            selectedResources.find(r => r.id === deviceId)?.config?.data_collection ??
+            resourceDataCollectionConfigs.get(deviceId),
         },
       })
     }
@@ -833,8 +819,8 @@ export function AgentEditorFullScreen({
       const tempKeywords = ['temperature', 'temp', '热', '温', 'climate', 'climate']
       const humidityKeywords = ['humidity', 'humid', '湿度', 'moisture']
       const lightKeywords = ['light', 'lamp', '灯', '亮度', 'brightness']
-      const motionKeywords = ['motion', 'move', 'movement', '移动', '人', 'person']
-      const alertKeywords = ['alert', 'notify', '告警', '通知', 'send', 'push']
+      const _motionKeywords = ['motion', 'move', 'movement', '移动', '人', 'person']
+      const _alertKeywords = ['alert', 'notify', '告警', '通知', 'send', 'push']
 
       devices.forEach(device => {
         const deviceType = deviceTypeMap.get(device.device_type)
@@ -1012,45 +998,36 @@ export function AgentEditorFullScreen({
     })
   }, [availableResources, searchQuery])
 
-  const agentSummary = useMemo(() => {
-    if (!name && !userPrompt) return null
+  const outputContractOk = !isStructuredMode || hasOutputContract(outputSchema)
+  // A Structured agent whose bound sources are all silent *refuses to run* —
+  // `execute_structured` errors rather than publish a guess. So an agent saved
+  // with no resources is one that can never succeed, and the editor is the only
+  // place that can say so before the user waits for a schedule to fire.
+  //
+  // Focused and Free are NOT held to this: Focused keeps a tool loop and can
+  // gather its own inputs, Free takes none by design. Blocking those would
+  // reject agents that work.
+  const resourceOk = !isStructuredMode || selectedResources.length > 0
+  const triggerFilter: TriggerFilter = {
+    mode: triggerMode,
+    sources: triggerSources,
+    withinSecs: triggerMode === 'all' ? triggerWindowSecs : null,
+  }
+  // Both shapes this catches would silently never fire, so neither is
+  // saveable — see `reasonTriggerFilterInvalid`.
+  const triggerFilterIssue =
+    scheduleType === 'reactive'
+      ? reasonTriggerFilterInvalid(triggerFilter, {
+          hasBoundResources: selectedResources.length > 0,
+        })
+      : null
 
-    const parts = []
-    if (name) parts.push(`"${name}"`)
-    if (scheduleType === 'timer') {
-      if (timerSubType === 'interval') parts.push(`runs every ${intervalValue} minutes`)
-      else if (timerSubType === 'daily') parts.push(`runs daily at ${scheduleHour}:${scheduleMinute.toString().padStart(2, '0')}`)
-      else if (timerSubType === 'weekly') parts.push(`runs weekly on ${selectedWeekdays.map(d => ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d]).join(', ')} at ${scheduleHour}:${scheduleMinute.toString().padStart(2, '0')}`)
-    }
-    if (scheduleType === 'reactive') {
-      if (triggerSources.length > 0) {
-        parts.push(`triggers on ${triggerSources.map(s => s.name).join(', ')} data updates`)
-      } else {
-        parts.push('triggers on data updates (no sources configured)')
-      }
-    }
-    if (scheduleType === 'on-demand') parts.push('runs on demand only')
-
-    const selectedDeviceCount = selectedResources.filter(r => r.type === 'device').length
-    const selectedExtCount = selectedResources.filter(r => r.type === 'extension').length
-    const metricCount = selectedResources.reduce((sum, r) => sum + r.selectedMetrics.size, 0)
-    const commandCount = selectedResources.reduce((sum, r) => sum + r.selectedCommands.size, 0)
-
-    if (selectedDeviceCount > 0 || selectedExtCount > 0) {
-      parts.push(`monitors ${selectedDeviceCount} device(s) and ${selectedExtCount} extension(s)`)
-      parts.push(`tracks ${metricCount} metric(s) and ${commandCount} command(s)`)
-    }
-
-    return parts.join(', ')
-  }, [name, scheduleType, timerSubType, intervalValue, scheduleHour, scheduleMinute, selectedWeekdays, triggerSources, selectedResources])
-
-  // Validation - name and prompt are required
-  // Metric selection is optional for event-triggered agents (device-level deduplication prevents loops)
-  const nameError = fieldErrors.name ??
-    (validateRequired(name, 'Name') || validateLength(name, 'Name', 1, 100))
-  const promptError = fieldErrors.prompt ??
-    (validateRequired(userPrompt, 'Prompt') || validateLength(userPrompt, 'Prompt', 1, 5000))
-  const isValid: boolean = name.trim().length > 0 && userPrompt.trim().length > 0
+  const isValid: boolean =
+    name.trim().length > 0 &&
+    userPrompt.trim().length > 0 &&
+    outputContractOk &&
+    resourceOk &&
+    !triggerFilterIssue
 
   // ========================================================================
   // Handlers
@@ -1085,6 +1062,118 @@ export function AgentEditorFullScreen({
     }
   }
 
+  /** Resource requests in the new unified format — shared by save and dry-run. */
+  const buildResourceRequests = useCallback((): ResourceRequest[] => {
+    const resources = selectedResources.flatMap(r => {
+      const result: ResourceRequest[] = []
+
+      // Add metrics
+      Array.from(r.selectedMetrics).forEach(metricName => {
+        const metric = r.allMetrics.find(m => m.name === metricName)
+        if (r.type === 'extension') {
+          // Extension metric format: extension:extension_id:metric_name
+          // Note: r.id already contains "extension:" prefix, so we use it directly
+          result.push({
+            resource_id: `${r.id}:${metricName}`,
+            resource_type: 'extension_metric',
+            name: metric?.display_name || metricName,
+            config: {
+              extension_id: r.id.replace('extension:', ''),
+              metric_name: metricName,
+              // Include data collection config for Focused Mode
+              ...(r.config?.data_collection && { data_collection: r.config.data_collection }),
+            },
+          })
+        } else {
+          // Device metric format: device_id:metric_name
+          result.push({
+            resource_id: `${r.id}:${metricName}`,
+            resource_type: 'metric',
+            name: metric?.display_name || metricName,
+            config: {
+              device_id: r.id,
+              metric_name: metricName,
+              // Include data collection config for Focused Mode
+              ...(r.config?.data_collection && { data_collection: r.config.data_collection }),
+            },
+          })
+        }
+      })
+
+      // Add commands/tools
+      Array.from(r.selectedCommands).forEach(commandName => {
+        const command = r.allCommands.find(c => c.name === commandName)
+        if (r.type === 'extension') {
+          // Extension tool format: extension:extension_id:command_name
+          // Note: r.id already contains "extension:" prefix, so we use it directly
+          result.push({
+            resource_id: `${r.id}:${commandName}`,
+            resource_type: 'extension_tool',
+            name: command?.display_name || commandName,
+            config: {
+              extension_id: r.id.replace('extension:', ''),
+              command_name: commandName,
+              parameters: command?.parameters || {},
+            },
+          })
+        } else {
+          // Device command format: device_id:command_name
+          result.push({
+            resource_id: `${r.id}:${commandName}`,
+            resource_type: 'command',
+            name: command?.display_name || commandName,
+            config: {
+              device_id: r.id,
+              command_name: commandName,
+              parameters: command?.parameters || {},
+            },
+          })
+        }
+      })
+
+      return result
+    })
+    return resources
+  }, [selectedResources])
+
+  const [dryRunResult, setDryRunResult] = useState<DryRunResult | null>(null)
+  const [dryRunError, setDryRunError] = useState<string | null>(null)
+  const [dryRunning, setDryRunning] = useState(false)
+
+  /** 保存前试跑：transient dry-run via /api/agents/test-preview — nothing persisted. */
+  const handleDryRun = async () => {
+    if (!userPrompt.trim() || dryRunning) return
+    setDryRunning(true)
+    setDryRunError(null)
+    setDryRunResult(null)
+    try {
+      const result = await api.testAgentPreview({
+        user_prompt: userPrompt,
+        execution_mode: executionMode,
+        resources: buildResourceRequests(),
+        output_schema: outputSchema.filter((f) => f.name.trim() !== ''),
+        operator_config: operatorConfig,
+        llm_backend_id: llmBackendId ?? undefined,
+        // Preview fidelity: a restricted agent must preview against the SAME
+        // tool set it will run with, not the full registry.
+        ...(!isStructuredMode
+          ? {
+              tool_config: {
+                enabled: toolsEnabled,
+                allowed_tools: restrictTools ? [...allowedTools] : [],
+              },
+            }
+          : {}),
+      })
+      setDryRunResult(result)
+    } catch (error) {
+      handleError(error, { operation: 'Dry-run structured agent', showToast: false })
+      setDryRunError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDryRunning(false)
+    }
+  }
+
   const handleSave = async () => {
     if (!isValid) return
 
@@ -1108,89 +1197,19 @@ export function AgentEditorFullScreen({
         }
       } else if (scheduleType === 'reactive') {
         finalScheduleType = 'event'
-        // Save trigger sources to event_filter with backend type mapping
-        const eventFilterObj: { sources: Array<{ type: string; id: string; name: string; field?: string }> } = {
-          sources: triggerSources.map(s => {
-            const mapped = mapToBackendSourceType(s.type, s.id)
-            return { type: mapped.type, id: mapped.id, name: s.name, ...(s.field ? { field: s.field } : {}) }
-          }),
-        }
-        eventFilter = JSON.stringify(eventFilterObj)
+        // Backend source-type mapping first, then the any/all envelope.
+        const mappedSources: TriggerSource[] = triggerSources.map(s => {
+          const mapped = mapToBackendSourceType(s.type, s.id)
+          return { type: mapped.type, id: mapped.id, name: s.name, ...(s.field ? { field: s.field } : {}) }
+        })
+        eventFilter = buildTriggerFilter({ ...triggerFilter, sources: mappedSources })
       } else { // on-demand
         finalScheduleType = 'manual'
         intervalSeconds = undefined  // Manual needs no interval — never auto-scheduled
       }
 
       // Build resources array in the new format that supports both devices and extensions
-      const resources = selectedResources.flatMap(r => {
-        const result: ResourceRequest[] = []
-
-        // Add metrics
-        Array.from(r.selectedMetrics).forEach(metricName => {
-          const metric = r.allMetrics.find(m => m.name === metricName)
-          if (r.type === 'extension') {
-            // Extension metric format: extension:extension_id:metric_name
-            // Note: r.id already contains "extension:" prefix, so we use it directly
-            result.push({
-              resource_id: `${r.id}:${metricName}`,
-              resource_type: 'extension_metric',
-              name: metric?.display_name || metricName,
-              config: {
-                extension_id: r.id.replace('extension:', ''),
-                metric_name: metricName,
-                // Include data collection config for Focused Mode
-                ...(r.config?.data_collection && { data_collection: r.config.data_collection }),
-              },
-            })
-          } else {
-            // Device metric format: device_id:metric_name
-            result.push({
-              resource_id: `${r.id}:${metricName}`,
-              resource_type: 'metric',
-              name: metric?.display_name || metricName,
-              config: {
-                device_id: r.id,
-                metric_name: metricName,
-                // Include data collection config for Focused Mode
-                ...(r.config?.data_collection && { data_collection: r.config.data_collection }),
-              },
-            })
-          }
-        })
-
-        // Add commands/tools
-        Array.from(r.selectedCommands).forEach(commandName => {
-          const command = r.allCommands.find(c => c.name === commandName)
-          if (r.type === 'extension') {
-            // Extension tool format: extension:extension_id:command_name
-            // Note: r.id already contains "extension:" prefix, so we use it directly
-            result.push({
-              resource_id: `${r.id}:${commandName}`,
-              resource_type: 'extension_tool',
-              name: command?.display_name || commandName,
-              config: {
-                extension_id: r.id.replace('extension:', ''),
-                command_name: commandName,
-                parameters: command?.parameters || {},
-              },
-            })
-          } else {
-            // Device command format: device_id:command_name
-            result.push({
-              resource_id: `${r.id}:${commandName}`,
-              resource_type: 'command',
-              name: command?.display_name || commandName,
-              config: {
-                device_id: r.id,
-                command_name: commandName,
-                parameters: command?.parameters || {},
-              },
-            })
-          }
-        })
-
-        return result
-      })
+      const resources = buildResourceRequests()
 
       // Also provide legacy format for backward compatibility
       const deviceIds = selectedResources
@@ -1222,7 +1241,6 @@ export function AgentEditorFullScreen({
 
       const data: CreateAgentRequest = {
         name: name.trim(),
-        description: description.trim(),
         user_prompt: userPrompt.trim(),
         llm_backend_id: llmBackendId ?? undefined,
         // Use new resources format
@@ -1238,10 +1256,32 @@ export function AgentEditorFullScreen({
           event_filter: eventFilter,
         },
         // Advanced configuration
-        priority: priority !== 5 ? priority : undefined,
+        priority: priority !== 128 ? priority : undefined,
         context_window_size: contextWindowSize !== 10 ? contextWindowSize : undefined,
-        max_chain_depth: maxChainDepth !== 5 ? maxChainDepth : undefined,
-        execution_mode: isFocusedMode ? 'focused' : 'free',
+        max_chain_depth:
+          maxChainDepth !== DEFAULT_MAX_CHAIN_DEPTH ? maxChainDepth : undefined,
+        execution_mode: executionMode,
+        memory_mode: memoryMode ?? undefined,
+        notify: notify ?? undefined,
+        // The output contract is no longer structured-only: any mode may
+        // publish fields. A reasoning agent does it in a post-run step.
+        ...(hasContract
+          ? {
+              output_schema: outputSchema.filter((f) => f.name.trim() !== ''),
+              operator_config: operatorConfig,
+            }
+          : {}),
+        // Tool gating — only the tool-carrying modes. Structured omits it
+        // entirely: its contract has no tool loop and a stored config must
+        // not silently change that.
+        ...(!isStructuredMode
+          ? {
+              tool_config: {
+                enabled: toolsEnabled,
+                allowed_tools: restrictTools ? [...allowedTools] : [],
+              },
+            }
+          : {}),
       }
 
       await onSave(data)
@@ -1298,91 +1338,150 @@ export function AgentEditorFullScreen({
   // Render
   // ========================================================================
 
-  return (
+  // One header treatment for every workspace section, numbered to match the
+  // four questions the form asks — so the dialog reads as a flow rather than a
+  // stack of unrelated blocks.
+  const applyPreset = (preset: AgentPreset) => {
+    // A matching name to go with the template — only when the field is still
+    // empty, so a name the user typed is never clobbered.
+    if (!name.trim()) setName(tAgent(`creator.preset.${preset.key}.name`))
+    setUserPrompt(tAgent(`creator.preset.${preset.key}.prompt`))
+    // Clicking the preset blurs the focused field BEFORE the fill lands, so
+    // onBlur validation can fire on the still-empty value — and the error
+    // only self-clears through onChange, which a programmatic fill never
+    // triggers. Clear both here or "Name is required" sticks beside a
+    // name the template just wrote.
+    setFieldErrors((prev) => {
+      const next = { ...prev }
+      delete next.name
+      delete next.prompt
+      return next
+    })
+    setCanActAutonomously(preset.fill.autonomy)
+    setOutputSchema(preset.fill.outputSchema ? preset.fill.outputSchema(tAgent).map((f) => ({ ...f })) : [])
+    setMemoryMode(preset.fill.memoryMode)
+    // A preset that says nothing about routing leaves `notify` null, and the
+    // API's floor applies. A preset that does say — the two whose conclusions
+    // are the point — routes nowhere on purpose: `judgment` means the task
+    // speaks through its own tools, not through the machinery.
+    setNotify(
+      preset.fill.notify
+        ? { channels: [...preset.fill.notify.channels], on: preset.fill.notify.on }
+        : null,
+    )
+    const sched = preset.fill.schedule
+    setScheduleType(sched.type)
+    if (sched.type === 'timer') {
+      setTimerSubType(sched.subType ?? 'interval')
+      if (sched.intervalMinutes) setIntervalValue(sched.intervalMinutes)
+      if (sched.hour !== undefined) {
+        setScheduleHour(sched.hour)
+        setScheduleMinute(0)
+      }
+      if (sched.weekday !== undefined) setSelectedWeekdays([sched.weekday])
+    }
+    setAppliedPreset(preset.key)
+    setPresetDialogOpen(false)
+  }
+
+  const rail: Record<string, React.ReactNode> = {}
+  const canvas: Record<string, React.ReactNode> = {}
+
+  // The card naming the applied template is also the one place that can say
+  // what the template left open. The line clears itself once the binding
+  // exists — a hint that outlives its own condition is noise.
+  const appliedPresetDef = appliedPreset ? presetByKey(appliedPreset) : undefined
+  const presetNextStep = (() => {
+    if (agent || !appliedPresetDef) return null
+    const step = nextStepFor(appliedPresetDef)
+    const met =
+      step === 'trigger'
+        ? triggerSources.length > 0 || selectedResources.length > 0
+        : selectedResources.length > 0
+    return met ? null : step
+  })()
+
+  rail['preset'] = (
     <>
-    <FullScreenDialog
-      open={open}
-      onOpenChange={onOpenChange}
-    >
-      {/* Header */}
-      <FullScreenDialogHeader
-        icon={<Sparkles className="h-5 w-5" />}
-        iconBg="bg-accent-purple-light"
-        iconColor="text-accent-purple"
-        title={agent ? tAgent('editAgent') : tAgent('createAgent')}
-        onClose={() => onOpenChange(false)}
-      />
-
-      <FullScreenDialogContent>
-        <FullScreenDialogMain className="overflow-hidden">
-          <div className="h-full overflow-y-auto">
-              <div className={cn(
-                "space-y-6",
-                isMobile ? "px-4 py-6" : "px-4 py-6"
-              )}>
-            {/* Execution Mode */}
-            <div className="space-y-2">
-              <Label className="text-sm font-medium flex items-center gap-2">
-                <Brain className="h-4 w-4 text-muted-foreground" />
-                {tAgent('creator.advanced.executionMode')}
-              </Label>
-              <div className={cn("gap-3", isMobile ? "grid grid-cols-1" : "grid grid-cols-2")}>
-                <button
-                  type="button"
-                  onClick={() => setExecutionMode('focused')}
-                  className={cn(
-                    "relative flex flex-col items-start gap-1.5 rounded-lg border p-3 text-left transition-colors",
-                    isFocusedMode
-                      ? "border-primary bg-muted"
-                      : "border-muted hover:border-border"
-                  )}
-                >
-                  <div className="flex items-center gap-2 w-full">
-                    <div className={cn(
-                      "h-8 w-8 rounded-lg flex items-center justify-center shrink-0",
-                      isFocusedMode ? "bg-primary text-primary-foreground" : "bg-muted"
-                    )}>
-                      <Target className="h-4 w-4" />
-                    </div>
-                    <div className="flex items-center gap-1.5 flex-1 min-w-0">
-                      <span className="text-sm font-medium">{tAgent('creator.advanced.focusedMode')}</span>
-                    </div>
+            {/* Create-only: a starting point for the blank prompt. It fills the
+                form and nothing gets hidden; picking another overwrites the
+                same fields. Resources are never touched — cameras and devices
+                are bound by the user in ②. */}
+            {!agent && (
+              appliedPreset ? (
+                <div className="rounded-lg border border-border bg-muted-30 px-3 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="min-w-0 truncate text-xs text-muted-foreground">
+                      {tAgent('creator.preset.appliedFrom', {
+                        name: tAgent(`creator.preset.${appliedPreset}.name`),
+                      })}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      onClick={() => setAppliedPreset(null)}
+                    >
+                      {tAgent('creator.preset.repick')}
+                    </Button>
                   </div>
-                  <p className="text-xs text-muted-foreground pl-10">
-                    {tAgent('creator.advanced.focusedModeDescription')}
-                  </p>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => { setExecutionMode('free'); setSelectedResources([]) }}
-                  className={cn(
-                    "relative flex flex-col items-start gap-1.5 rounded-lg border p-3 text-left transition-colors",
-                    isFreeMode
-                      ? "border-primary bg-muted"
-                      : "border-muted hover:border-border"
+                  {presetNextStep && (
+                    // A tinted strip rather than coloured text: this is the one
+                    // thing on the card the user has to act on, and `bg-primary-light`
+                    // bakes its alpha in at the variable level — `bg-primary/10`
+                    // would silently render nothing.
+                    <div className="mt-1.5 flex items-start gap-1.5 rounded-md bg-primary-light px-2 py-1.5 text-xs text-primary">
+                      <ArrowRight className="mt-0.5 h-3 w-3 shrink-0" />
+                      <span>{tAgent(`creator.preset.next.${presetNextStep}`)}</span>
+                    </div>
                   )}
-                >
-                  <div className="flex items-center gap-2 w-full">
-                    <div className={cn(
-                      "h-8 w-8 rounded-lg flex items-center justify-center shrink-0",
-                      isFreeMode ? "bg-primary text-primary-foreground" : "bg-muted"
-                    )}>
-                      <Zap className="h-4 w-4" />
-                    </div>
-                    <div className="flex items-center gap-1.5 flex-1 min-w-0">
-                      <span className="text-sm font-medium">{tAgent('creator.advanced.freeMode')}</span>
-                    </div>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <Label className="text-sm font-medium">{tAgent('creator.preset.title')}</Label>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      className="text-muted-foreground"
+                      onClick={() => setPresetDialogOpen(true)}
+                    >
+                      {tAgent('creator.preset.all')}
+                      <ArrowRight className="ml-1 h-3.5 w-3.5" />
+                    </Button>
                   </div>
-                  <p className="text-xs text-muted-foreground pl-10">
-                    {tAgent('creator.advanced.freeModeDescription')}
-                  </p>
-                </button>
-              </div>
-            </div>
+                  <div className="grid grid-cols-1 gap-1">
+                    {FEATURED_PRESETS.map((preset) => {
+                      const Icon = preset.icon
+                      return (
+                        <button
+                          key={preset.key}
+                          type="button"
+                          onClick={() => applyPreset(preset)}
+                          className="flex items-center gap-2 rounded-lg border border-border px-3 py-1.5 text-left transition-colors hover:border-muted-foreground hover:bg-muted"
+                        >
+                          <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          <span className="shrink-0 text-sm font-medium">
+                            {tAgent(`creator.preset.${preset.key}.name`)}
+                          </span>
+                          <span className="min-w-0 truncate text-xs text-muted-foreground">
+                            {tAgent(`creator.preset.${preset.key}.desc`)}
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              )
+            )}
+    </>
+  )
 
+  rail['name'] = (
+    <>
             {/* Name */}
-            <div className="space-y-2">
+            <div className="space-y-2 min-w-0">
               <Label className={cn("font-medium", isMobile ? "text-base" : "text-sm")}>
                 {tAgent('creator.basicInfo.name')} <span className="text-error">*</span>
               </Label>
@@ -1404,74 +1503,20 @@ export function AgentEditorFullScreen({
                 <p className="text-sm text-error mt-1">{fieldErrors.name}</p>
               )}
             </div>
+    </>
+  )
 
-            {/* Description (Optional) */}
-            <div className="space-y-2">
-              <Label className={cn("font-medium", isMobile ? "text-base" : "text-sm")}>{tAgent('creator.basicInfo.description')}</Label>
-              <Input
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                placeholder={tAgent('creator.basicInfo.descriptionPlaceholder')}
-                className={cn(isMobile ? "h-12 text-base" : "h-10")}
-              />
-            </div>
-
-            {/* Prompt */}
-            <div className="space-y-3">
-              <Label className="text-sm font-medium">
-                {tAgent('creator.basicInfo.requirement')} <span className="text-error">*</span>
-              </Label>
-
-              {/* Quick templates */}
-              <div className="flex gap-2 flex-wrap">
-                {PROMPT_TEMPLATES.filter(t => t.id !== 'empty').map((template) => (
-                  <button
-                    key={template.id}
-                    type="button"
-                    onClick={() => setUserPrompt(template.template)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border hover:bg-muted transition-colors"
-                  >
-                    {template.icon}
-                    <span>{template.label}</span>
-                  </button>
-                ))}
-              </div>
-
-              <Textarea
-                value={userPrompt}
-                onChange={(e) => {
-                  setUserPrompt(e.target.value)
-                  if (fieldErrors.prompt) setFieldErrors(prev => { const next = { ...prev }; delete next.prompt; return next })
-                }}
-                onBlur={() => {
-                  const err = validateRequired(userPrompt, 'Prompt') || validateLength(userPrompt, 'Prompt', 1, 5000)
-                  if (err) setFieldErrors(prev => ({ ...prev, prompt: err }))
-                }}
-                placeholder={tAgent('creator.basicInfo.promptPlaceholder')}
-                className={cn("min-h-[140px] resize-y text-sm leading-relaxed", fieldErrors.prompt && "border-error")}
-              />
-              {fieldErrors.prompt && (
-                <p className="text-sm text-error mt-1">{fieldErrors.prompt}</p>
-              )}
-
-              {/* AI Helper Tip */}
-              <div className="flex items-start gap-2 p-3 rounded-lg border border-border">
-                <Wand2 className="h-4 w-4 text-primary shrink-0 mt-0.5" />
-                <p className="text-xs text-muted-foreground">
-                  <span className="font-medium text-primary">Tip:</span> {tAgent('creator.basicInfo.promptTip')}
-                </p>
-              </div>
-            </div>
-
+  rail['model'] = (
+    <>
             {/* Model Selection */}
-            <div className="space-y-2">
+            <div className="space-y-2 min-w-0">
               <div className="flex items-center justify-between">
                 <Label className="text-sm font-medium">{tAgent('creator.basicInfo.llmBackend')}</Label>
                 <Button
                   type="button"
                   variant="ghost"
                   size="sm"
-                  className="h-7 text-xs"
+                  className="h-7 text-xs sm:h-7"
                   onClick={handleValidateLlm}
                   disabled={llmValidating}
                 >
@@ -1551,77 +1596,719 @@ export function AgentEditorFullScreen({
 
             {/* Advanced knobs — rarely changed; collapsed so the required
                 fields (mode / name / requirements) keep the visual focus. */}
-            <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-              <CollapsibleTrigger className="w-full flex items-center justify-between py-1 text-left">
-                <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-                  {tAgent('creator.advanced.title', 'Advanced Configuration')}
-                </span>
-                <ChevronRight className={cn(
-                  "h-4 w-4 text-muted-foreground transition-transform",
-                  advancedOpen && "rotate-90"
-                )} />
-              </CollapsibleTrigger>
-              <CollapsibleContent>
-                <div className="pt-3 space-y-6">
-            {/* Agent Priority */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Label className="text-sm font-medium">{tAgent('creator.advanced.agentPriority', 'Agent Priority')}</Label>
-                <span className="text-sm font-medium tabular-nums">{priority}</span>
+    </>
+  )
+
+  canvas['prompt'] = (
+    <>
+            {/* Prompt */}
+            <div className="space-y-3">
+
+              <div className="flex items-center gap-2">
+                <Label className="text-sm font-medium">
+                  {tAgent('creator.basicInfo.requirement')} <span className="text-error">*</span>
+                </Label>
               </div>
-              <Slider
-                min={1}
-                max={10}
-                step={1}
-                value={[priority]}
-                onValueChange={([v]) => setPriority(v)}
+              <Textarea
+                value={userPrompt}
+                onChange={(e) => {
+                  setUserPrompt(e.target.value)
+                  if (fieldErrors.prompt) setFieldErrors(prev => { const next = { ...prev }; delete next.prompt; return next })
+                }}
+                onBlur={() => {
+                  const err = validateRequired(userPrompt, 'Prompt') || validateLength(userPrompt, 'Prompt', 1, 5000)
+                  if (err) setFieldErrors(prev => ({ ...prev, prompt: err }))
+                }}
+                placeholder={tAgent('creator.basicInfo.promptPlaceholder')}
+                className={cn("min-h-[140px] resize-y text-sm leading-relaxed", fieldErrors.prompt && "border-error")}
               />
-              <p className="text-xs text-muted-foreground">
-                {tAgent('creator.advanced.priorityHint', 'Execution priority (1=lowest, 10=highest)')}
-              </p>
-            </div>
+              {fieldErrors.prompt && (
+                <p className="text-sm text-error mt-1">{fieldErrors.prompt}</p>
+              )}
 
-            {/* Max Chain Depth */}
-            <div className="space-y-2">
-              <Label className="text-sm font-medium">{tAgent('creator.advanced.chainDepth', 'Max Chain Depth')}</Label>
-              <Slider
-                min={1}
-                max={20}
-                step={1}
-                value={[maxChainDepth]}
-                onValueChange={([v]) => setMaxChainDepth(v)}
-              />
-              <p className="text-xs text-muted-foreground">
-                {tAgent('creator.advanced.chainDepthHint', 'Maximum tool-calling rounds per execution (1=single-pass, higher=more capable)')}
-              </p>
-            </div>
-
-            {/* Conversation History Depth */}
-            <div className="space-y-2">
-              <Label className="text-sm font-medium">{tAgent('creator.advanced.historyDepth', 'Conversation History Depth')}</Label>
-              <Select value={contextWindowSize.toString()} onValueChange={(v) => setContextWindowSize(parseInt(v))}>
-                <SelectTrigger className="h-9">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="5">5</SelectItem>
-                  <SelectItem value="10">10</SelectItem>
-                  <SelectItem value="20">20</SelectItem>
-                  <SelectItem value="30">30</SelectItem>
-                  <SelectItem value="50">50</SelectItem>
-                </SelectContent>
-              </Select>
-              <p className="text-xs text-muted-foreground">
-                {tAgent('creator.advanced.contextHint', 'Number of recent conversation turns to include as context')}
-              </p>
-            </div>
+              {/* 数据与指令 — the things the words above refer to, right under
+                  the words. Deep selection (which metric of which device) stays
+                  in the dialog; this strip is summary, add and remove. */}
+              <div className="space-y-2 pt-1">
+                <div className="flex items-center gap-2">
+                  <Label className="text-sm font-medium">
+                    {tAgent('creator.resources.title')}
+                  </Label>
+                  <InfoHint text={resourcesHint} />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="xs"
+                    className="ml-auto"
+                    onClick={() => setResourceDialogOpen(true)}
+                  >
+                    <Plus className="mr-1 h-3.5 w-3.5" />
+                    {tAgent('creator.resources.addResources')}
+                  </Button>
                 </div>
-              </CollapsibleContent>
-            </Collapsible>
+                {/* A zone with its own default height: the layout never jumps
+                    between "empty hint" and "first chip", and the area reads as
+                    a place you put things — dashed until it has some. */}
+                <div
+                  className={cn(
+                    'flex min-h-[3rem] flex-wrap gap-1.5 rounded-md border bg-muted-30 p-2',
+                    selectedResources.length === 0
+                      ? 'items-center justify-center border-dashed border-border'
+                      : 'content-start border-border',
+                  )}
+                >
+                {selectedResources.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    {tAgent('creator.resources.dialog.noResourcesHint')}
+                  </p>
+                ) : (
+                  selectedResources.map((r) => (
+                      <span
+                        key={r.id}
+                        className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border bg-background px-2 text-xs"
+                      >
+                        {getSourceIcon(r.type, 'h-3.5 w-3.5 shrink-0 text-muted-foreground')}
+                        <span className="max-w-[12rem] truncate font-medium">{r.name}</span>
+                        {(r.selectedMetrics.size > 0 || r.selectedCommands.size > 0) && (
+                          <span className="whitespace-nowrap text-muted-foreground">
+                            {r.selectedMetrics.size > 0 &&
+                              tAgent('creator.resources.metricCount', { count: r.selectedMetrics.size })}
+                            {r.selectedMetrics.size > 0 && r.selectedCommands.size > 0 && ' · '}
+                            {r.selectedCommands.size > 0 &&
+                              tAgent('creator.resources.commandCount', { count: r.selectedCommands.size })}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          aria-label={tAgent('creator.resources.removeOne', { name: r.name })}
+                          onClick={() =>
+                            setSelectedResources((prev) => prev.filter((x) => x.id !== r.id))
+                          }
+                          className="ml-0.5 flex h-4 w-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground"
+                        >
+                          <X className="h-2.5 w-2.5" />
+                        </button>
+                      </span>
+                    ))
+                )}
+                </div>
+                {/* Where the choice is made, not two cards down: a Structured
+                    agent's whole input is its bound sources and it refuses to
+                    run without one, so this is the only place the requirement
+                    can be acted on. */}
+                {!resourceOk && (
+                  <p className="text-sm text-error">{tAgent('creator.validation.resourceRequired')}</p>
+                )}
+              </div>
 
+              {/* The one input nothing else can express: whether the AI may
+                  take multiple rounds. It separates "investigate" from
+                  "summarise" — each option says what happens, not what is
+                  permitted. */}
+              <div className="space-y-1.5 pt-1">
+                <Label className="text-sm font-medium">
+                  {tAgent('creator.workstyle.title')}
+                </Label>
+                <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                  {([
+                    {
+                      key: 'bound' as const,
+                      active: !canActAutonomously,
+                      apply: () => setCanActAutonomously(false),
+                    },
+                    {
+                      key: 'auto' as const,
+                      active: canActAutonomously,
+                      apply: () => setCanActAutonomously(true),
+                    },
+                  ]).map(({ key, active, apply }) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={apply}
+                      className={cn(
+                        'flex flex-col items-start rounded-md border p-2.5 text-left transition-colors',
+                        active
+                          ? 'border-primary bg-muted'
+                          : 'border-border hover:border-muted-foreground',
+                      )}
+                    >
+                      <span className="text-sm font-medium">
+                        {tAgent(`creator.workstyle.${key}`)}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {tAgent(`creator.workstyle.${key}Desc`)}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Rounds only mean anything once the AI may take them. Same
+                  row shape as priority: label + hint left, exact number right —
+                  a slider over 20 steps cannot express "exactly 3". */}
+              {canActAutonomously && (
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="agent-chain-depth" className="text-sm font-medium">
+                      {tAgent('creator.advanced.chainDepth', 'Rounds per run')}
+                    </Label>
+                    <InfoHint
+                      text={tAgent(
+                        'creator.advanced.chainDepthHint',
+                        'How many rounds the AI may act for on its own. More rounds, more capable — and slower.',
+                      )}
+                    />
+                  </div>
+                  <Input
+                    id="agent-chain-depth"
+                    type="number"
+                    min={1}
+                    max={20}
+                    step={1}
+                    value={maxChainDepth}
+                    onChange={(e) => {
+                      const v = Number(e.target.value)
+                      if (e.target.value !== '' && Number.isFinite(v)) {
+                        setMaxChainDepth(Math.max(1, Math.min(20, Math.round(v))))
+                      }
+                    }}
+                    className="h-9 w-24 text-right tabular-nums"
+                  />
+                </div>
+              )}
+
+              {/* Tool gating. A narrower tool surface is both a capability
+                  fence (this agent can never touch devices) and a
+                  correctness lever — small models pick better among few.
+                  Hidden for structured: the sections below all render in one
+                  form (canvases are not exclusive), and structured's save
+                  path never sends tool_config — showing switches that do
+                  nothing would be misleading UI. */}
+              {!isStructuredMode && (
+                <>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <Label htmlFor="agent-tools-enabled" className="text-sm font-medium">
+                    {tAgent('creator.advanced.tools', 'Allow tool use')}
+                  </Label>
+                  <InfoHint
+                    text={tAgent(
+                      'creator.advanced.toolsHint',
+                      'Off = a text-only agent. On, the AI may call the platform tools its run needs.',
+                    )}
+                  />
+                </div>
+                <Switch
+                  id="agent-tools-enabled"
+                  checked={toolsEnabled}
+                  onCheckedChange={setToolsEnabled}
+                />
+              </div>
+              {canActAutonomously && !toolsEnabled && (
+                <p className="text-xs text-warning -mt-1.5">
+                  {tAgent(
+                    'creator.advanced.toolsDisabledAutonomyHint',
+                    'Autonomous work style with tools off degenerates to a single text reply — the multi-round promise cannot be kept without tools.',
+                  )}
+                </p>
+              )}
+              {toolsEnabled && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="agent-tools-restrict" className="text-sm font-medium">
+                        {tAgent('creator.advanced.toolsRestrict', 'Restrict tools')}
+                      </Label>
+                      <InfoHint
+                        text={tAgent(
+                          'creator.advanced.toolsRestrictHint',
+                          'Limit which tools this agent may call. Fewer tools is safer — and small models choose better among few.',
+                        )}
+                      />
+                    </div>
+                    <Switch
+                      id="agent-tools-restrict"
+                      checked={restrictTools}
+                      onCheckedChange={setRestrictTools}
+                    />
+                  </div>
+                  {restrictTools && (
+                    <div className="max-h-44 overflow-y-auto rounded-md border border-border p-2 space-y-1">
+                      <p className="text-xs text-muted-foreground px-1 pb-1">
+                        {tAgent('creator.advanced.toolsSelected', {
+                          defaultValue:
+                            '{{selected}} / {{total}} selected — none selected means all',
+                          selected: allowedTools.size,
+                          total: toolCatalog.length,
+                        })}
+                      </p>
+                      {toolCatalog.map((tool) => (
+                        <label
+                          key={tool.name}
+                          className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-muted-50 cursor-pointer"
+                        >
+                          <Checkbox
+                            checked={allowedTools.has(tool.name)}
+                            onCheckedChange={(checked) =>
+                              setAllowedTools((prev) => {
+                                const next = new Set(prev)
+                                if (checked) next.add(tool.name)
+                                else next.delete(tool.name)
+                                return next
+                              })
+                            }
+                          />
+                          <span className="text-xs font-mono shrink-0">{tool.name}</span>
+                          <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                            {tool.description}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+                </>
+              )}
+            </div>
+    </>
+  )
+
+  canvas['structured'] = (
+    <>
+            {/* The output contract — every mode may publish fields. A
+                structured agent produces them directly; a reasoning agent gets
+                them from a post-run step, which costs one extra call. */}
+            <div className="space-y-2">
+                {/* The user only needs to know the price on the modes that pay
+                    it: a constrained read IS the output, a reasoning agent has
+                    to be asked again at the end. */}
+                {!isStructuredMode && hasContract && (
+                  <p className="text-xs text-muted-foreground">
+                    {tAgent('creator.structured.multiRoundCost')}
+                  </p>
+                )}
+                {!outputContractOk && (
+                  <p className="text-sm text-error">{tAgent('creator.validation.outputFieldRequired')}</p>
+                )}
+
+                {outputSchema.length > 0 && (
+                  // Column identity lives in this header, not in the input
+                  // placeholders — a placeholder disappears as soon as the
+                  // field has a value, which is exactly when you need it.
+                  <div className="hidden gap-2 px-2 md:grid md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,0.7fr)_minmax(0,1.4fr)_1.75rem]">
+                    {['colName', 'colType', 'colUnit', 'colDesc'].map((k) => (
+                      <span key={k} className="text-xs text-muted-foreground">
+                        {tAgent(`creator.structured.${k}`)}
+                      </span>
+                    ))}
+                    <span />
+                  </div>
+                )}
+
+                {outputSchema.map((field, idx) => (
+                  <div key={idx} className="space-y-2 rounded-md border border-border p-2">
+                    <div className="grid grid-cols-1 items-center gap-2 md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,0.7fr)_minmax(0,1.4fr)_1.75rem]">
+                      <Input
+                        className="font-mono"
+                        placeholder={tAgent('creator.structured.fieldName')}
+                        value={field.name}
+                        onChange={(e) => {
+                          const next = [...outputSchema]
+                          next[idx] = { ...field, name: e.target.value }
+                          setOutputSchema(next)
+                        }}
+                      />
+                      <Select
+                        value={field.field_type.type}
+                        onValueChange={(v) => {
+                          const next = [...outputSchema]
+                          next[idx] = {
+                            ...field,
+                            field_type:
+                              v === 'enum'
+                                ? { type: 'enum', values: [] }
+                                : ({ type: v } as OperatorField['field_type']),
+                          }
+                          setOutputSchema(next)
+                        }}
+                      >
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="number">{tAgent('creator.structured.typeNumber')}</SelectItem>
+                          <SelectItem value="text">{tAgent('creator.structured.typeText')}</SelectItem>
+                          <SelectItem value="boolean">{tAgent('creator.structured.typeBoolean')}</SelectItem>
+                          <SelectItem value="enum">{tAgent('creator.structured.typeEnum')}</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Input
+                        placeholder={tAgent('creator.structured.fieldUnit')}
+                        value={field.unit ?? ''}
+                        onChange={(e) => {
+                          const next = [...outputSchema]
+                          next[idx] = { ...field, unit: e.target.value || undefined }
+                          setOutputSchema(next)
+                        }}
+                      />
+                      <Input
+                        placeholder={tAgent('creator.structured.fieldDescription')}
+                        value={field.description ?? ''}
+                        onChange={(e) => {
+                          const next = [...outputSchema]
+                          next[idx] = { ...field, description: e.target.value || undefined }
+                          setOutputSchema(next)
+                        }}
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        className="text-muted-foreground hover:text-error"
+                        aria-label={tAgent('creator.structured.removeField')}
+                        title={tAgent('creator.structured.removeField')}
+                        onClick={() => setOutputSchema(outputSchema.filter((_, i) => i !== idx))}
+                      >
+                        <X className="h-4 w-4" />
+                      </Button>
+                    </div>
+                    {field.field_type.type === 'enum' && (
+                      <Input
+                        placeholder={tAgent('creator.structured.enumValues')}
+                        value={field.field_type.type === 'enum' ? field.field_type.values.join(', ') : ''}
+                        onChange={(e) => {
+                          const next = [...outputSchema]
+                          next[idx] = {
+                            ...field,
+                            field_type: {
+                              type: 'enum',
+                              values: e.target.value.split(',').map((v) => v.trim()).filter(Boolean),
+                            },
+                          }
+                          setOutputSchema(next)
+                        }}
+                      />
+                    )}
+                  </div>
+                ))}
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setOutputSchema([...outputSchema, { name: '', field_type: { type: 'number' } }])
+                  }
+                  className="flex w-full items-center justify-center gap-1.5 rounded-md border border-dashed border-border py-1.5 text-xs text-muted-foreground transition-colors hover:border-muted-foreground hover:text-foreground"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  {tAgent('creator.structured.addField')}
+                </button>
+
+                <Collapsible>
+                  <CollapsibleTrigger className="flex w-full items-center justify-between py-1 text-left text-xs text-muted-foreground">
+                    <span>
+                      {isStructuredMode
+                        ? tAgent('creator.structured.guardrailSummary', {
+                            debounce: operatorConfig.debounce_secs ?? 30,
+                            timeout: operatorConfig.timeout_secs ?? 60,
+                            threshold: operatorConfig.consecutive_failure_threshold ?? 3,
+                            cap: operatorConfig.max_calls_per_day ?? '∞',
+                          })
+                        : tAgent('creator.structured.guardrailSummaryEveryRun', {
+                            timeout: operatorConfig.timeout_secs ?? 60,
+                            threshold: operatorConfig.consecutive_failure_threshold ?? 3,
+                            cap: operatorConfig.max_calls_per_day ?? '∞',
+                          })}
+                    </span>
+                    <span className="text-primary">{tAgent('creator.structured.guardrailToggle')}</span>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent>
+                <div className={cn("grid grid-cols-1 gap-2 pt-1", isStructuredMode ? "md:grid-cols-4" : "md:grid-cols-2")}>
+                  {/* Debounce is an L0 semantic (merging input bursts into
+                      one inference). The breaker and the caps apply to every
+                      run of every mode: N consecutive permanent failures
+                      demote the agent to Error, where event triggers probe
+                      it at backoff intervals until a run completes. */}
+                  {isStructuredMode && (
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">{tAgent('creator.structured.debounce')}</Label>
+                    <Input
+                      type="number"
+                      value={operatorConfig.debounce_secs ?? 30}
+                      onChange={(e) =>
+                        setOperatorConfig({ ...operatorConfig, debounce_secs: Number(e.target.value) || 30 })
+                      }
+                    />
+                  </div>
+                  )}
+                  {/* Event-trigger pacing — shown for reactive agents of every
+                      mode. Empty = platform default (60s); 0 = on-demand
+                      (idle agent fires on the next event; the executor's
+                      one-run-at-a-time guard is the only backpressure). */}
+                  {scheduleType === 'reactive' && (
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">{tAgent('creator.structured.eventCooldown')}</Label>
+                    <Input
+                      type="number"
+                      placeholder="60"
+                      value={operatorConfig.event_cooldown_secs ?? ''}
+                      onChange={(e) =>
+                        setOperatorConfig({
+                          ...operatorConfig,
+                          event_cooldown_secs: e.target.value === '' ? undefined : Math.max(0, Number(e.target.value) || 0),
+                        })
+                      }
+                    />
+                  </div>
+                  )}
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">{tAgent('creator.structured.timeout')}</Label>
+                    <Input
+                      type="number"
+                      value={operatorConfig.timeout_secs ?? 60}
+                      onChange={(e) =>
+                        setOperatorConfig({ ...operatorConfig, timeout_secs: Number(e.target.value) || 60 })
+                      }
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">{tAgent('creator.structured.threshold')}</Label>
+                    <Input
+                      type="number"
+                      value={operatorConfig.consecutive_failure_threshold ?? 3}
+                      onChange={(e) =>
+                        setOperatorConfig({
+                          ...operatorConfig,
+                          consecutive_failure_threshold: Number(e.target.value) || 3,
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">{tAgent('creator.structured.dailyCap')}</Label>
+                    <Input
+                      type="number"
+                      placeholder="—"
+                      value={operatorConfig.max_calls_per_day ?? ''}
+                      onChange={(e) =>
+                        setOperatorConfig({
+                          ...operatorConfig,
+                          max_calls_per_day: e.target.value ? Number(e.target.value) : undefined,
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+                  </CollapsibleContent>
+                </Collapsible>
+              </div>
+
+            {/* Dry-run (试跑) result — capability zone feedback */}
+            {dryRunResult && (
+              <div className="space-y-2 rounded-lg border border-success bg-card p-3">
+                <div className="flex items-center gap-2 text-sm font-medium text-success">
+                  <Check className="h-4 w-4" />
+                  {tAgent('creator.structured.dryRunResultTitle')}
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {Object.entries(dryRunResult.fields).map(([k, v]) => (
+                    <span key={k} className="rounded border border-border px-1.5 py-0.5 font-mono text-xs">
+                      {k} = {String(v)}
+                    </span>
+                  ))}
+                </div>
+                <p className="line-clamp-3 rounded bg-muted p-2 font-mono text-xs text-muted-foreground">
+                  {dryRunResult.raw_text}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {tAgent('creator.structured.dryRunMeta', {
+                    sources: dryRunResult.data_sources,
+                    attempts: dryRunResult.attempts,
+                  })}
+                </p>
+              </div>
+            )}
+            {dryRunError && (
+              <div className="rounded-lg border border-error bg-error-light p-3 text-sm text-error">
+                {dryRunError}
+              </div>
+            )}
+    </>
+  )
+
+  canvas['memory'] = (
+    <>
+            {/* What it remembers. The standards always apply (they are what the
+                judgement is made against); only past events are optional. */}
+            <div className="space-y-2">
+              {/* Sub-block of the output contract: the contract is what it
+                  records, this is how much of the past it carries alongside. */}
+              <div className="flex items-center gap-2">
+                <Label className="text-sm font-medium text-muted-foreground">
+                  {tAgent('creator.memory.title')}
+                </Label>
+                <InfoHint
+                  text={`${
+                    effectiveMemoryMode === 'tool'
+                      ? tAgent('creator.memory.statelessHint')
+                      : tAgent('creator.memory.historyHint')
+                  } ${tAgent('creator.memory.standardsKept')}`}
+                />
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {([
+                  { key: null, label: tAgent('creator.memory.auto') },
+                  { key: 'tool' as const, label: tAgent('creator.memory.stateless') },
+                  { key: 'assistant' as const, label: tAgent('creator.memory.history') },
+                ]).map(({ key, label }) => (
+                  <button
+                    key={String(key)}
+                    type="button"
+                    onClick={() => setMemoryMode(key)}
+                    className={cn(
+                      "rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors",
+                      memoryMode === key
+                        ? "border-primary bg-primary text-primary-foreground"
+                        : "border-border bg-background hover:bg-muted"
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {/* Depth only means anything once history is actually carried —
+                  and only appears when the user picked that, not when the
+                  derivation happens to land on it under "auto". */}
+              {memoryMode === 'assistant' && (
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">
+                    {tAgent('creator.advanced.historyDepth', 'Conversation History Depth')}
+                  </Label>
+                  <Select
+                    value={contextWindowSize.toString()}
+                    onValueChange={(v) => setContextWindowSize(parseInt(v))}
+                  >
+                    <SelectTrigger className="h-9">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="5">5</SelectItem>
+                      <SelectItem value="10">10</SelectItem>
+                      <SelectItem value="20">20</SelectItem>
+                      <SelectItem value="30">30</SelectItem>
+                      <SelectItem value="50">50</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    {tAgent('creator.advanced.contextHint', 'Number of recent conversation turns to include as context')}
+                  </p>
+                </div>
+              )}
+
+            </div>
+    </>
+  )
+
+
+  canvas['notify'] = (
+    <>
+            {/* Notification routing — the channels and the moment, chosen
+                explicitly instead of sniffed from the conclusion text. */}
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Label className="text-sm font-medium text-muted-foreground">
+                  {tAgent('creator.notify.title')}
+                </Label>
+                <InfoHint text={tAgent('creator.notify.hint')} />
+              </div>
+              {channels.length === 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  {tAgent('creator.notify.noChannels')}{' '}
+                  {/* A way forward, not just a note: the old text pointed at
+                      the Messages page in prose and left it there. */}
+                  <Link to="/messages" className="text-primary hover:underline">
+                    {tAgent('creator.notify.configureChannels')}
+                  </Link>
+                </p>
+              ) : (
+                <>
+                  <div className="flex flex-wrap gap-1.5">
+                    {channels.map((ch) => {
+                      const on = notify?.channels.includes(ch.name) ?? false
+                      return (
+                        <Button
+                          key={ch.name}
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            setNotify((prev) => {
+                              const base = prev ?? {
+                                channels: [],
+                                on: DEFAULT_NOTIFY_ON,
+                              }
+                              const next = on
+                                ? base.channels.filter((c) => c !== ch.name)
+                                : [...base.channels, ch.name]
+                              // An empty list is not "unset": the storage layer
+                              // reads it as a config that is present and routes
+                              // nowhere, which is what unchecking every channel
+                              // means. Returning `null` would let the API's
+                              // floor put IM back — the user's wish, undone by
+                              // a default they cannot see.
+                              return { ...base, channels: next }
+                            })
+                          }
+                          className={cn(
+                            'gap-1.5',
+                            on
+                              ? 'border-primary bg-muted text-foreground'
+                              : 'text-muted-foreground hover:border-muted-foreground',
+                            !ch.enabled && 'opacity-50',
+                          )}
+                          title={ch.channel_type + (ch.enabled ? '' : ' (disabled)')}
+                        >
+                          {on && <Check className="h-4 w-4" />}
+                          <span className="max-w-[10rem] truncate">{ch.name}</span>
+                        </Button>
+                      )
+                    })}
+                  </div>
+                  {notify && (
+                    <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-3">
+                      {(['failure', 'always', 'judgment'] as const).map((k) => (
+                        <button
+                          key={k}
+                          type="button"
+                          onClick={() => setNotify((prev) => prev && { ...prev, on: k })}
+                          className={cn(
+                            'flex flex-col items-start rounded-md border p-2 text-left transition-colors',
+                            notify.on === k
+                              ? 'border-primary bg-muted'
+                              : 'border-border hover:border-muted-foreground',
+                          )}
+                        >
+                          <span className="text-sm font-medium">
+                            {tAgent(`creator.notify.on${k[0].toUpperCase()}${k.slice(1)}`)}
+                          </span>
+                          <span className="text-xs text-muted-foreground">
+                            {tAgent(
+                              `creator.notify.on${k[0].toUpperCase()}${k.slice(1)}Desc`,
+                            )}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+    </>
+  )
+
+  canvas['schedule'] = (
+    <>
             {/* Execution Schedule */}
             <div className="space-y-3">
-              <Label className={cn("font-medium", isMobile ? "text-base" : "text-sm")}>{tAgent('creator.basicInfo.scheduleLabel')}</Label>
 
               {/* Strategy Cards - 3 modes */}
               <div className={cn(
@@ -1668,9 +2355,9 @@ export function AgentEditorFullScreen({
               </div>
 
               {/* Schedule Configuration */}
-              <div className={cn("border rounded-lg p-4")}>
+              <div className={cn("border rounded-lg p-3")}>
                 {scheduleType === 'timer' && (
-                  <div className="space-y-3">
+                  <div className="space-y-2">
                     {/* Timer sub-type tabs */}
                     <div className={cn(
                       "flex gap-1",
@@ -1686,13 +2373,13 @@ export function AgentEditorFullScreen({
                           type="button"
                           onClick={() => setTimerSubType(key)}
                           className={cn(
-                            "rounded-lg font-medium transition-colors",
+                            "rounded-lg border font-medium transition-colors",
                             isMobile
                               ? "px-4 py-2.5 text-sm flex-1"
                               : "px-3 py-1.5 text-sm",
                             timerSubType === key
-                              ? "bg-primary text-primary-foreground"
-                              : "bg-background hover:bg-muted"
+                              ? "border-primary bg-primary text-primary-foreground"
+                              : "border-border bg-background hover:bg-muted"
                           )}
                         >
                           {label}
@@ -1717,13 +2404,13 @@ export function AgentEditorFullScreen({
                               type="button"
                               onClick={() => setIntervalValue(mins)}
                               className={cn(
-                                "rounded-lg font-medium transition-colors",
+                                "rounded-lg border font-medium transition-colors",
                                 isMobile
                                   ? "px-4 py-3 text-base min-w-[60px]"
                                   : "px-3 py-1.5 text-sm",
                                 intervalValue === mins
-                                  ? "bg-primary text-primary-foreground"
-                                  : "bg-background hover:bg-muted"
+                                  ? "border-primary bg-primary text-primary-foreground"
+                                  : "border-border bg-background hover:bg-muted"
                               )}
                             >
                               {mins}m
@@ -1740,18 +2427,16 @@ export function AgentEditorFullScreen({
                         isMobile ? "flex-col items-start gap-4" : ""
                       )}>
                         <span className={cn("text-muted-foreground", isMobile ? "text-sm" : "text-sm")}>{tAgent('creator.schedule.daily.everyDay')}</span>
-                        <div className="flex items-center gap-1 bg-background rounded-lg p-1">
-                          <Select value={scheduleHour.toString()} onValueChange={(v) => setScheduleHour(parseInt(v))}>
-                            <SelectTrigger className={cn("border-0 bg-transparent", isMobile ? "w-24 h-11 text-base" : "w-20 h-9")}>
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {HOURS.map((h) => (
-                                <SelectItem key={h} value={h.toString()}>{h.toString().padStart(2, '0')}:00</SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        </div>
+                        <Select value={scheduleHour.toString()} onValueChange={(v) => setScheduleHour(parseInt(v))}>
+                          <SelectTrigger className={cn(isMobile ? "w-28 h-11 text-base" : "w-24 h-9")}>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {HOURS.map((h) => (
+                              <SelectItem key={h} value={h.toString()}>{h.toString().padStart(2, '0')}:00</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
                       </div>
                     )}
 
@@ -1776,13 +2461,13 @@ export function AgentEditorFullScreen({
                                 setSelectedWeekdays(newWeekdays)
                               }}
                               className={cn(
-                                "rounded-lg font-medium transition-colors",
+                                "rounded-lg border font-medium transition-colors",
                                 isMobile
                                   ? "w-12 h-12 text-base"
                                   : "w-10 h-10 text-sm",
                                 selectedWeekdays.includes(d)
-                                  ? "bg-primary text-primary-foreground"
-                                  : "bg-background hover:bg-muted"
+                                  ? "border-primary bg-primary text-primary-foreground"
+                                  : "border-border bg-background hover:bg-muted"
                               )}
                             >
                               {tAgent(`creator.weekdays.${d}`)}
@@ -1795,7 +2480,7 @@ export function AgentEditorFullScreen({
                         )}>
                           <span className={cn("text-muted-foreground", isMobile ? "text-sm" : "text-sm")}>{tAgent('creator.schedule.daily.at')}</span>
                           <Select value={scheduleHour.toString()} onValueChange={(v) => setScheduleHour(parseInt(v))}>
-                            <SelectTrigger className={cn(isMobile ? "w-24 h-11 text-base" : "w-20 h-9")}>
+                            <SelectTrigger className={cn(isMobile ? "w-28 h-11 text-base" : "w-24 h-9")}>
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
@@ -1981,7 +2666,12 @@ export function AgentEditorFullScreen({
                     )}>
                       {/* Left: entity list */}
                       <div className={cn(
-                        "overflow-y-auto shrink-0",
+                        // `overflow-x-hidden` as well as `overflow-y-auto`:
+                        // a row wider than the column would otherwise scroll
+                        // sideways, and the row background paints across the
+                        // whole scroll area — which is what made the hover and
+                        // selected blocks look like they overflowed the column.
+                        "overflow-y-auto overflow-x-hidden shrink-0",
                         isMobile ? "w-full border-b max-h-[120px]" : "w-[180px] border-r"
                       )}>
                         {entities.length === 0 ? (
@@ -2009,7 +2699,11 @@ export function AgentEditorFullScreen({
                                 )}
                               >
                                 {getSourceIcon(e.type, "h-4 w-4 shrink-0 text-muted-foreground")}
-                                <span className="truncate flex-1">{e.name}</span>
+                                {/* `min-w-0` is what actually lets a flex item
+                                    shrink below its text width. Without it
+                                    `truncate` never engages on a long name and
+                                    the row grows past the column. */}
+                                <span className="min-w-0 flex-1 truncate">{e.name}</span>
                                 {hasTrigger && (
                                   <Badge variant="secondary" className={cn("h-4 min-w-[18px]", textNano, "px-1 rounded-full")}>
                                     {activeAllSelected && isViewing ? tAgent('creator.schedule.reactive.allMetrics') : fieldCount}
@@ -2042,7 +2736,7 @@ export function AgentEditorFullScreen({
                                 isMobile ? "px-3 py-1.5 text-sm" : "px-2.5 py-1 text-xs",
                                 activeAllSelected
                                   ? "bg-primary text-primary-foreground"
-                                  : "bg-muted hover:bg-muted text-muted-foreground"
+                                  : "bg-muted text-muted-foreground hover:text-foreground"
                               )}
                             >
                               {tAgent('creator.schedule.reactive.allMetrics')}
@@ -2060,7 +2754,7 @@ export function AgentEditorFullScreen({
                                     isMobile ? "px-3 py-1.5 text-sm" : "px-2.5 py-1 text-xs",
                                     isSelected
                                       ? "bg-muted text-primary font-medium ring-1 ring-primary"
-                                      : "bg-muted hover:bg-muted text-muted-foreground"
+                                      : "bg-muted text-muted-foreground hover:text-foreground"
                                   )}
                                 >
                                   {m.display_name}
@@ -2072,7 +2766,95 @@ export function AgentEditorFullScreen({
                       </div>
                     </div>
 
-                    {/* Selected trigger sources summary */}
+                    {/* How the selected sources combine (M2). "any" fires on
+                        the first match — what this editor has always meant.
+                        "all" waits for every source inside a window, which is
+                        what "occupancy AND not booked" needs.
+
+                        Cards rather than a segmented strip: this is the same
+                        "pick one, and here is what it means" choice as the
+                        schedule cards above, so it speaks the same language. */}
+                    {(triggerSources.length > 1 || triggerMode === 'all') && (
+                      <div className="space-y-2.5">
+                        <div className={cn('grid gap-2', isMobile ? 'grid-cols-1' : 'grid-cols-2')}>
+                          {(['any', 'all'] as const).map(mode => {
+                            const selected = triggerMode === mode
+                            return (
+                              <button
+                                key={mode}
+                                type="button"
+                                aria-pressed={selected}
+                                onClick={() => {
+                                  setTriggerMode(mode)
+                                  // An `all` group with no window never fires,
+                                  // so offer a starting point rather than
+                                  // leaving the field empty.
+                                  if (mode === 'all' && triggerWindowSecs === null) {
+                                    setTriggerWindowSecs(600)
+                                  }
+                                }}
+                                className={cn(
+                                  'flex items-start gap-2 rounded-lg border p-2.5 text-left transition-colors',
+                                  selected
+                                    ? 'border-primary bg-muted'
+                                    : 'border-border hover:border-muted-foreground'
+                                )}
+                              >
+                                <span className="mt-0.5 shrink-0">
+                                  {mode === 'any'
+                                    ? <Sparkles className="h-4 w-4" />
+                                    : <GitBranch className="h-4 w-4" />}
+                                </span>
+                                <span className="min-w-0">
+                                  <span className={cn(
+                                    'block text-sm font-medium',
+                                    selected ? 'text-foreground' : 'text-muted-foreground'
+                                  )}>
+                                    {tAgent(`creator.schedule.reactive.mode.${mode}`)}
+                                  </span>
+                                  <span className="block text-xs text-muted-foreground">
+                                    {tAgent(`creator.schedule.reactive.modeHint.${mode}`)}
+                                  </span>
+                                </span>
+                              </button>
+                            )
+                          })}
+                        </div>
+
+                        {/* The window phrased as a sentence, with the number in
+                            it — "within [10] minutes" as a bare field read like
+                            an unfinished form. */}
+                        {triggerMode === 'all' && (
+                          <div className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
+                            <span>{tAgent('creator.schedule.reactive.windowBefore')}</span>
+                            <Input
+                              type="number"
+                              min={1}
+                              aria-label={tAgent('creator.schedule.reactive.windowLabel')}
+                              value={triggerWindowSecs === null ? '' : Math.round(triggerWindowSecs / 60)}
+                              onChange={e => {
+                                const minutes = Number(e.target.value)
+                                setTriggerWindowSecs(minutes > 0 ? minutes * 60 : null)
+                              }}
+                              className="h-8 w-16 text-center"
+                            />
+                            <span>{tAgent('creator.schedule.reactive.windowAfter')}</span>
+                          </div>
+                        )}
+
+                        {triggerFilterIssue && (
+                          <div className="flex items-start gap-2 text-sm text-warning">
+                            <Info className="h-4 w-4 mt-0.5 shrink-0" />
+                            <p>{tAgent(`creator.schedule.reactive.issue.${triggerFilterIssue}`)}</p>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* What the picker above produced. Same `border rounded-lg`
+                        surface as the picker, and one row per source, so this
+                        reads as the result of that box rather than a loose list
+                        floating under it. */}
                     {triggerSources.length > 0 && (() => {
                       const grouped = new Map<string, { type: string; id: string; name: string; fields: (string | undefined)[] }>()
                       for (const s of triggerSources) {
@@ -2081,47 +2863,78 @@ export function AgentEditorFullScreen({
                         grouped.get(key)!.fields.push(s.field)
                       }
                       return (
-                        <div className="space-y-1">
-                          {[...grouped.values()].map(g => {
-                            const hasAll = g.fields.includes(undefined)
-                            const specificFields = g.fields.filter((f): f is string => f !== undefined)
-                            const removeEntity = () => {
-                              setTriggerSources(prev => prev.filter(s => !(s.type === g.type && s.id === g.id)))
-                              // Remove corresponding resource
-                              if (g.type === 'device' || g.type === 'extension') {
-                                const resourceKey = g.type === 'extension' ? `extension:${g.id}` : g.id
-                                setSelectedResources(prev => prev.filter(r => r.id !== resourceKey))
+                        <div className="space-y-1.5">
+                          <span className="block text-xs font-medium text-muted-foreground">
+                            {tAgent('creator.schedule.reactive.selectedSources')}
+                          </span>
+                          <div className="rounded-lg border divide-y">
+                            {[...grouped.values()].map(g => {
+                              const hasAll = g.fields.includes(undefined)
+                              const specificFields = g.fields.filter((f): f is string => f !== undefined)
+                              const removeEntity = () => {
+                                setTriggerSources(prev => prev.filter(s => !(s.type === g.type && s.id === g.id)))
+                                // Remove corresponding resource
+                                if (g.type === 'device' || g.type === 'extension') {
+                                  const resourceKey = g.type === 'extension' ? `extension:${g.id}` : g.id
+                                  setSelectedResources(prev => prev.filter(r => r.id !== resourceKey))
+                                }
                               }
-                            }
-                            return (
-                              <div key={`${g.type}-${g.id}`} className="flex items-center gap-1.5 flex-wrap">
-                                {getSourceIcon(g.type, "h-4 w-4 shrink-0 text-muted-foreground")}
-                                <span className="text-xs font-medium truncate max-w-[100px]">{g.name}</span>
-                                {hasAll ? (
-                                  <Badge
-                                    variant="secondary"
-                                    className={cn(textNano, "h-5 px-1.5 gap-0.5 cursor-pointer hover:bg-muted transition-colors")}
-                                    onClick={removeEntity}
-                                  >
-                                    {tAgent('creator.schedule.reactive.allMetrics')}
-                                    <X className="h-2.5 w-2.5" />
-                                  </Badge>
-                                ) : (
-                                  specificFields.map(f => (
-                                    <Badge
-                                      key={f}
-                                      variant="outline"
-                                      className={cn(textNano, "h-5 px-1.5 gap-0.5 font-normal cursor-pointer hover:bg-muted transition-colors")}
-                                      onClick={() => removeTriggerField(g.type, g.id, f)}
-                                    >
-                                      {f}
-                                      <X className="h-2.5 w-2.5" />
-                                    </Badge>
-                                  ))
-                                )}
-                              </div>
-                            )
-                          })}
+                              // A real button, not a clickable Badge: the old chips
+                              // were status pills pretending to be controls, which
+                              // said nothing about being removable until you hovered.
+                              const chip = (key: string, label: string, onClick: () => void, aria: string) => (
+                                <button
+                                  key={key}
+                                  type="button"
+                                  onClick={onClick}
+                                  aria-label={aria}
+                                  className={cn(
+                                    textNano,
+                                    "inline-flex h-5 items-center gap-1 rounded-md border border-border bg-muted-30 px-1.5",
+                                    "text-muted-foreground transition-colors hover:border-muted-foreground hover:text-foreground"
+                                  )}
+                                >
+                                  {label}
+                                  <X className="h-2.5 w-2.5 opacity-60" />
+                                </button>
+                              )
+                              return (
+                                <div
+                                  key={`${g.type}-${g.id}`}
+                                  className="flex flex-wrap items-center gap-x-2 gap-y-2 px-2.5 py-2"
+                                >
+                                  <span className="shrink-0">
+                                    {getSourceIcon(g.type, "h-4 w-4 text-muted-foreground")}
+                                  </span>
+                                  {/* A floor, not just `flex-1`: many chips make
+                                      a wide block beside the name, and a bare
+                                      `flex-1` on a zero basis lets that block
+                                      squeeze the name to nothing — which is how
+                                      it disappeared once the chips ran past two
+                                      lines. The row wraps instead, so the name
+                                      keeps its line and the chips fall below. */}
+                                  <span className="min-w-0 flex-1 truncate text-xs font-medium" title={g.name}>{g.name}</span>
+                                  <span className="flex flex-wrap items-center gap-1">
+                                    {hasAll
+                                      ? chip(
+                                          'all',
+                                          tAgent('creator.schedule.reactive.allMetrics'),
+                                          removeEntity,
+                                          tAgent('creator.schedule.reactive.removeAllMetrics', { name: g.name }),
+                                        )
+                                      : specificFields.map(f =>
+                                          chip(
+                                            f,
+                                            f,
+                                            () => removeTriggerField(g.type, g.id, f),
+                                            tAgent('creator.schedule.reactive.removeField', { field: f, name: g.name }),
+                                          ),
+                                        )}
+                                  </span>
+                                </div>
+                              )
+                            })}
+                          </div>
                         </div>
                       )
                     })()}
@@ -2148,152 +2961,46 @@ export function AgentEditorFullScreen({
                   </div>
                 )}
               </div>
-            </div>
 
-            {/* Resources Section */}
-            {(() => {
-              // Determine Resources section style based on schedule type + execution mode
-              // Priority: scheduleType first (Reactive always supplemental), then executionMode
-              const isReactive = scheduleType === 'reactive'
-              const isProminent = !isReactive && isFocusedMode
-              // isCollapsed = Free mode OR Reactive mode
-
-              const sectionTitle = isReactive
-                ? tAgent('creator.resources.supplementalTitle')
-                : isProminent
-                  ? tAgent('creator.resources.title')
-                  : tAgent('creator.resources.preloadTitle')
-
-              const sectionHint = isReactive
-                ? tAgent('creator.resources.hintReactive')
-                : isProminent
-                  ? tAgent('creator.resources.hintFocused')
-                  : tAgent('creator.resources.hintFree')
-
-              if (isProminent) {
-                return (
-                  <div className="space-y-3 rounded-lg p-3 -mx-3 border border-border">
-                    <div className={cn(
-                      "flex items-center justify-between",
-                      isMobile ? "flex-col items-start gap-3" : ""
-                    )}>
-                      <div className="flex items-center gap-2">
-                        <Label className={cn("font-medium", isMobile ? "text-base" : "text-sm")}>{sectionTitle}</Label>
-                        {selectedResources.length > 0 && (
-                          <Badge variant="secondary" className="text-xs h-5">
-                            {selectedResources.length}
-                          </Badge>
-                        )}
-                      </div>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size={isMobile ? "default" : "sm"}
-                        onClick={() => setResourceDialogOpen(true)}
-                        className={isMobile ? "w-full justify-center h-11" : ""}
-                      >
-                        <Plus className={cn(isMobile ? "h-5 w-5" : "h-4 w-4", "mr-2")} />
-                        {tAgent('creator.resources.addResources')}
-                      </Button>
-                    </div>
-                    <p className="text-xs text-muted-foreground">{sectionHint}</p>
-                    {selectedResources.length === 0 ? (
-                      <div className="flex flex-col items-center justify-center py-6 border rounded-lg">
-                        <Target className="h-6 w-6 text-muted-foreground mb-2" />
-                        <p className="text-xs text-muted-foreground">
-                          {tAgent('creator.resources.dialog.noResourcesHint')}
-                        </p>
-                      </div>
-                    ) : (
-                      <div className="space-y-2">
-                        {selectedResources.map((resource) => (
-                          <SelectedResourceItem
-                            key={resource.id}
-                            resource={resource}
-                            setSelectedResources={setSelectedResources}
-                            onRemove={() => setSelectedResources(prev => prev.filter(r => r.id !== resource.id))}
-                            onToggleMetric={(resourceId, metricName) => {
-                              setSelectedResources((prev) => prev.map(r => r.id === resourceId ? { ...r, selectedMetrics: new Set(r.selectedMetrics.has(metricName) ? Array.from(r.selectedMetrics).filter(n => n !== metricName) : [...r.selectedMetrics, metricName]) } : r))
-                            }}
-                            onToggleCommand={(resourceId, commandName) => {
-                              setSelectedResources((prev) => prev.map(r => r.id === resourceId ? { ...r, selectedCommands: new Set(r.selectedCommands.has(commandName) ? Array.from(r.selectedCommands).filter(n => n !== commandName) : [...r.selectedCommands, commandName]) } : r))
-                            }}
-                            isMobile={isMobile}
-                                                      />
-                        ))}
-                      </div>
+              {/* Scheduling order — same axis as this section: when runs happen.
+                  A number, not a slider: priority is a value you may want
+                  exactly (128 is the default every untouched agent carries,
+                  so "+1 to go first" is a real intent a drag cannot express). */}
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <Label htmlFor="agent-priority" className="text-sm font-medium">
+                    {tAgent('creator.advanced.agentPriority', 'Agent Priority')}
+                  </Label>
+                  <InfoHint
+                    text={tAgent(
+                      'creator.advanced.priorityHint',
+                      'Higher runs first when agents compete for a slot (128 = default)',
                     )}
-                  </div>
-                )
-              }
-
-              // Collapsed style (Reactive / Free / On-demand)
-              return (
-                <div className="rounded-lg -mx-3 border overflow-hidden">
-                  <button
-                    type="button"
-                    onClick={() => setFreeModeResourcesExpanded(!freeModeResourcesExpanded)}
-                    className="w-full flex items-center justify-between p-3 text-left hover:bg-muted-30 transition-colors"
-                  >
-                    <div className="flex items-center gap-2">
-                      <ChevronRight className={cn("h-4 w-4 transition-transform", freeModeResourcesExpanded && "rotate-90")} />
-                      <Label className="text-sm font-medium">{sectionTitle}</Label>
-                      {selectedResources.length > 0 && (
-                        <Badge variant="secondary" className="text-xs h-5">
-                          {selectedResources.length}
-                        </Badge>
-                      )}
-                      <Badge variant="outline" className="text-xs h-5">
-                        {tAgent('creator.resources.optional')}
-                      </Badge>
-                    </div>
-                    <Plus
-                      className="h-4 w-4 text-muted-foreground cursor-pointer hover:text-foreground"
-                      onClick={(e) => { e.stopPropagation(); setResourceDialogOpen(true) }}
-                    />
-                  </button>
-                  {freeModeResourcesExpanded && (
-                    <div className="px-3 pb-3 pt-0 space-y-2 border-t">
-                      <p className="text-xs text-muted-foreground pt-2">{sectionHint}</p>
-                      {selectedResources.length === 0 ? (
-                        <div className="flex flex-col items-center justify-center py-4 border rounded-lg">
-                          <Target className="h-6 w-6 text-muted-foreground mb-1" />
-                          <p className="text-xs text-muted-foreground">
-                            {tAgent('creator.resources.dialog.noResourcesHint')}
-                          </p>
-                        </div>
-                      ) : (
-                        <div className="space-y-2">
-                          {selectedResources.map((resource) => (
-                            <SelectedResourceItem
-                              key={resource.id}
-                              resource={resource}
-                              setSelectedResources={setSelectedResources}
-                              onRemove={() => setSelectedResources(prev => prev.filter(r => r.id !== resource.id))}
-                              onToggleMetric={(resourceId, metricName) => {
-                                setSelectedResources((prev) => prev.map(r => r.id === resourceId ? { ...r, selectedMetrics: new Set(r.selectedMetrics.has(metricName) ? Array.from(r.selectedMetrics).filter(n => n !== metricName) : [...r.selectedMetrics, metricName]) } : r))
-                              }}
-                              onToggleCommand={(resourceId, commandName) => {
-                                setSelectedResources((prev) => prev.map(r => r.id === resourceId ? { ...r, selectedCommands: new Set(r.selectedCommands.has(commandName) ? Array.from(r.selectedCommands).filter(n => n !== commandName) : [...r.selectedCommands, commandName]) } : r))
-                              }}
-                              isMobile={isMobile}
-                            />
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
+                  />
                 </div>
-              )
-            })()}
-          </div>
-        </div>
-        </FullScreenDialogMain>
-      </FullScreenDialogContent>
+                <Input
+                  id="agent-priority"
+                  type="number"
+                  min={0}
+                  max={255}
+                  step={1}
+                  value={priority}
+                  onChange={(e) => {
+                    const v = Number(e.target.value)
+                    if (e.target.value !== '' && Number.isFinite(v)) {
+                      setPriority(Math.max(0, Math.min(255, Math.round(v))))
+                    }
+                  }}
+                  className="h-9 w-24 text-right tabular-nums"
+                />
+              </div>
+            </div>
+    </>
+  )
 
-      {/* Footer with action buttons and summary */}
-      <FullScreenDialogFooter className="flex-col items-stretch">
-        <div className={cn(
+  const footerNode = (
+    <div className="flex w-full flex-col gap-2">
+      <div className={cn(
           "flex gap-2",
           isMobile ? "justify-end" : "justify-end"
         )}>
@@ -2306,6 +3013,18 @@ export function AgentEditorFullScreen({
           >
             {tCommon('cancel')}
           </Button>
+          {/* 试跑 open to every mode: structured previews the constrained
+              extraction; reasoning modes preview through the same endpoint. */}
+          <Button
+            variant="outline"
+            size={isMobile ? "default" : "sm"}
+            onClick={handleDryRun}
+              disabled={!userPrompt.trim() || !outputContractOk || dryRunning || saving}
+              className={isMobile ? "min-w-[100px] h-12" : ""}
+            >
+              {dryRunning ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
+              {dryRunning ? tAgent('creator.structured.dryRunRunning') : tAgent('creator.structured.dryRun')}
+            </Button>
           <Button
             size={isMobile ? "default" : "sm"}
             onClick={handleSave}
@@ -2316,18 +3035,49 @@ export function AgentEditorFullScreen({
             {saving ? 'Saving...' : agent ? tCommon('save') : tCommon('create')}
           </Button>
         </div>
-        {agentSummary && (
-          <div className={cn(
-            "flex items-center gap-2 text-muted-foreground border-t pt-2",
-            isMobile ? "text-xs" : "text-xs"
-          )}>
-            <Info className={cn(isMobile ? "h-4 w-4" : "h-4 w-4", "shrink-0")} />
-            <span className="line-clamp-1">{agentSummary}</span>
-          </div>
-        )}
-      </FullScreenDialogFooter>
+    </div>
+  )
 
-    </FullScreenDialog>
+
+  return (
+    <>
+    <BuilderShell
+      open={open}
+      onOpenChange={onOpenChange}
+      accent="indigo"
+      title={agent ? tAgent('editAgent') : tAgent('createAgent')}
+      icon={<Sparkles className="h-5 w-5" />}
+      config={<div className="space-y-5">{rail.preset}{rail.name}{rail.model}</div>}
+      workspace={
+        <div className="space-y-4">
+          <EditorSection
+            title={
+              <>
+                {tAgent('creator.section.what')} <span className="text-error">*</span>
+              </>
+            }
+            hint={tAgent('creator.basicInfo.promptTip')}
+          >
+            {canvas.prompt}
+          </EditorSection>
+          <EditorSection
+            title={tAgent('creator.section.record')}
+            hint={tAgent('creator.structured.hint')}
+          >
+            {canvas.structured}
+            {canvas.memory}
+            {canvas.notify}
+          </EditorSection>
+          <EditorSection title={tAgent('creator.section.when')}>
+            {canvas.schedule}
+          </EditorSection>
+        </div>
+      }
+      footer={footerNode}
+      mobileConfigLabel={tAgent('creator.steps.basic')}
+    />
+
+
 
       {/* Resource Selection Dialog — sibling of FullScreenDialog to avoid Radix focus conflict (double-click issue) */}
       <ResourceSelectionDialog
@@ -2344,6 +3094,13 @@ export function AgentEditorFullScreen({
         toggleRecommendation={toggleRecommendation}
         scheduleType={scheduleType}
       />
+
+      {/* Sibling of the editor dialog for the same reason as the one above. */}
+      <PresetPickerDialog
+        open={presetDialogOpen}
+        onOpenChange={setPresetDialogOpen}
+        onSelect={applyPreset}
+      />
     </>
   )
 }
@@ -2352,704 +3109,4 @@ export function AgentEditorFullScreen({
 // Resource Selection Dialog
 // ============================================================================
 
-interface ResourceSelectionDialogProps {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  availableResources: AvailableResource[]
-  selectedResources: SelectedResource[]
-  setSelectedResources: React.Dispatch<React.SetStateAction<SelectedResource[]>>
-  recommendations: ResourceRecommendation[]
-  generatingRecommendations: boolean
-  searchQuery: string
-  setSearchQuery: (v: string) => void
-  toggleResource: (r: AvailableResource) => void
-  toggleRecommendation: (r: ResourceRecommendation) => void
-  scheduleType: ScheduleType
-}
-
-function ResourceSelectionDialog({
-  open,
-  onOpenChange,
-  availableResources,
-  selectedResources,
-  setSelectedResources,
-  recommendations,
-  generatingRecommendations,
-  searchQuery,
-  setSearchQuery,
-  toggleResource,
-  toggleRecommendation,
-  scheduleType,
-}: ResourceSelectionDialogProps) {
-  const { t: tAgent } = useTranslation('agents')
-  const isMobile = useIsMobile()
-  const insets = useSafeAreaInsets()
-
-  // Lock body scroll when dialog is open (mobile only)
-  useBodyScrollLock(open, { mobileOnly: true })
-
-  const isSelected = (id: string) => selectedResources.some(r => r.id === id)
-
-  // Mobile full-screen portal
-  if (isMobile) {
-    return createPortal(
-      <div
-        className={cn(
-          "fixed inset-0 z-[100] bg-background flex flex-col",
-          !open && "hidden"
-        )}
-        style={{
-          paddingTop: `${insets.top}px`,
-          paddingBottom: `${insets.bottom}px`,
-        }}
-      >
-        {/* Mobile Header */}
-        <div className="flex items-center justify-between px-4 py-4 border-b shrink-0">
-          <h2 className="text-base font-semibold">{tAgent('creator.resources.dialog.title')}</h2>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-10 w-10"
-            onClick={() => onOpenChange(false)}
-          >
-            <X className="h-5 w-5" />
-          </Button>
-        </div>
-
-        {/* Mobile Content */}
-        <div className="flex-1 overflow-y-auto">
-          {/* Recommendations */}
-          {recommendations.length > 0 && (
-            <div className="px-4 py-3 border-b shrink-0">
-              <div className="flex items-center gap-2 mb-2">
-                <Sparkles className="h-4 w-4 text-primary" />
-                <span className="text-sm font-medium">{tAgent('creator.resources.dialog.recommended')}</span>
-                {generatingRecommendations && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
-              </div>
-              <div className="flex gap-2 overflow-x-auto pb-1">
-                {recommendations.map((rec) => (
-                  <RecommendationCard
-                    key={rec.id}
-                    recommendation={rec}
-                    selected={isSelected(rec.id)}
-                    onClick={() => toggleRecommendation(rec)}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Available Resources Section */}
-          <div className="px-4 py-3 border-b">
-            <div className="flex items-center justify-between mb-3">
-              <span className="text-sm font-medium">{tAgent('creator.resources.dialog.available')}</span>
-              <Badge variant="secondary">{availableResources.length}</Badge>
-            </div>
-            <div className="relative mb-3">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-              <Input
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder={tAgent('creator.resources.dialog.searchPlaceholder')}
-                className="h-11 text-base pl-10"
-              />
-            </div>
-            <div className="space-y-2">
-              {availableResources.map((resource) => {
-                const selected = isSelected(resource.id)
-                return (
-                  <ResourceListItem
-                    key={resource.id}
-                    resource={resource}
-                    selected={selected}
-                    onClick={() => toggleResource(resource)}
-                    isMobile={true}
-                  />
-                )
-              })}
-              {availableResources.length === 0 && (
-                <div className="text-center py-8 text-muted-foreground text-sm">
-                  {tAgent('creator.resources.noResourcesFound')}
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Selected Resources Section */}
-          <div className="px-4 py-3">
-            <div className="flex items-center justify-between mb-3">
-              <span className="text-sm font-medium">{tAgent('creator.resources.dialog.selected')}</span>
-              <Badge variant={selectedResources.length === 0 ? "secondary" : "default"}>
-                {selectedResources.length}
-              </Badge>
-            </div>
-            {selectedResources.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-full text-center py-8">
-                <Target className="h-8 w-8 text-muted-foreground mb-2" />
-                <p className="text-sm text-muted-foreground">
-                  {tAgent('creator.resources.dialog.noResourcesHint')}
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {selectedResources.map((resource) => (
-                  <SelectedResourceItem
-                    key={resource.id}
-                    resource={resource}
-                    setSelectedResources={setSelectedResources}
-                    onRemove={() => {
-                      setSelectedResources(prev => prev.filter(r => r.id !== resource.id))
-                    }}
-                    onToggleMetric={(resourceId, metricName) => {
-                      setSelectedResources((prev) =>
-                        prev.map(r =>
-                          r.id === resourceId
-                            ? {
-                                ...r,
-                                selectedMetrics: new Set(
-                                  r.selectedMetrics.has(metricName)
-                                    ? Array.from(r.selectedMetrics).filter(n => n !== metricName)
-                                    : [...r.selectedMetrics, metricName]
-                                ),
-                              }
-                            : r
-                        )
-                      )
-                    }}
-                    onToggleCommand={(resourceId, commandName) => {
-                      setSelectedResources((prev) =>
-                        prev.map(r =>
-                          r.id === resourceId
-                            ? {
-                                ...r,
-                                selectedCommands: new Set(
-                                  r.selectedCommands.has(commandName)
-                                    ? Array.from(r.selectedCommands).filter(n => n !== commandName)
-                                    : [...r.selectedCommands, commandName]
-                                ),
-                              }
-                            : r
-                        )
-                      )
-                    }}
-                    isMobile={true}
-                                      />
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Mobile Footer */}
-        <div className="px-4 py-4 border-t flex justify-between items-center shrink-0">
-          <p className="text-sm text-muted-foreground">
-            {tAgent('creator.resources.dialog.selectedCount', { count: selectedResources.length })}
-          </p>
-          <Button className="min-w-[100px] h-12" onClick={() => onOpenChange(false)}>
-            {tAgent('creator.resources.dialog.done')}
-          </Button>
-        </div>
-      </div>, getPortalRoot()
-    )
-  }
-
-  // Desktop Dialog
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="z-[110] sm:max-w-3xl sm:max-h-[80vh] flex flex-col p-0 sm:p-0 gap-0 m-0">
-        <DialogHeader className="px-5 py-3 border-b">
-          <DialogTitle>{tAgent('creator.resources.dialog.title')}</DialogTitle>
-        </DialogHeader>
-
-        <div className="flex-1 overflow-hidden flex flex-col min-h-0">
-          {/* Recommendations */}
-          {recommendations.length > 0 && (
-            <div className="px-5 py-3 border-b shrink-0">
-              <div className="flex items-center gap-2 mb-2">
-                <Sparkles className="h-4 w-4 text-primary" />
-                <span className="text-sm font-medium">{tAgent('creator.resources.dialog.recommended')}</span>
-                {generatingRecommendations && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
-              </div>
-              <div className="flex gap-2 overflow-x-auto pb-1">
-                {recommendations.map((rec) => (
-                  <RecommendationCard
-                    key={rec.id}
-                    recommendation={rec}
-                    selected={isSelected(rec.id)}
-                    onClick={() => toggleRecommendation(rec)}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Dual-pane layout */}
-          <div className="flex-1 flex gap-4 min-h-0 p-4 overflow-hidden">
-            {/* Available Resources */}
-            <div className="flex-1 flex flex-col rounded-lg overflow-hidden">
-              <div className="p-3 border-b bg-bg-50">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-sm font-medium">{tAgent('creator.resources.dialog.available')}</span>
-                  <Badge variant="secondary">{availableResources.length}</Badge>
-                </div>
-                <div className="relative">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                  <Input
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder={tAgent('creator.resources.dialog.searchPlaceholder')}
-                    className="h-8 text-sm pl-9"
-                  />
-                </div>
-              </div>
-              <ScrollArea className="flex-1">
-                <div className="p-2 space-y-1">
-                  {availableResources.map((resource) => {
-                    const selected = isSelected(resource.id)
-                    return (
-                      <ResourceListItem
-                        key={resource.id}
-                        resource={resource}
-                        selected={selected}
-                        onClick={() => toggleResource(resource)}
-                      />
-                    )
-                  })}
-                  {availableResources.length === 0 && (
-                    <div className="text-center py-8 text-muted-foreground text-sm">
-                      {tAgent('creator.resources.noResourcesFound')}
-                    </div>
-                  )}
-                </div>
-              </ScrollArea>
-            </div>
-
-            {/* Selected Resources */}
-            <div className="flex-1 flex flex-col rounded-lg overflow-hidden border">
-              <div className="p-3 border-b">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium">{tAgent('creator.resources.dialog.selected')}</span>
-                  <Badge variant={selectedResources.length === 0 ? "secondary" : "default"}>
-                    {selectedResources.length}
-                  </Badge>
-                </div>
-              </div>
-              <ScrollArea className="flex-1">
-                <div className="p-2 space-y-1">
-                  {selectedResources.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center h-full text-center py-8">
-                      <Target className="h-8 w-8 text-muted-foreground mb-2" />
-                      <p className="text-sm text-muted-foreground">
-                        {tAgent('creator.resources.dialog.noResourcesHint')}
-                      </p>
-                    </div>
-                  ) : (
-                    selectedResources.map((resource) => (
-                      <SelectedResourceItem
-                        key={resource.id}
-                        resource={resource}
-                        setSelectedResources={setSelectedResources}
-                        onRemove={() => {
-                          setSelectedResources(prev => prev.filter(r => r.id !== resource.id))
-                        }}
-                        onToggleMetric={(resourceId, metricName) => {
-                          setSelectedResources((prev) =>
-                            prev.map(r =>
-                              r.id === resourceId
-                                ? {
-                                    ...r,
-                                    selectedMetrics: new Set(
-                                      r.selectedMetrics.has(metricName)
-                                        ? Array.from(r.selectedMetrics).filter(n => n !== metricName)
-                                        : [...r.selectedMetrics, metricName]
-                                    ),
-                                  }
-                                : r
-                            )
-                          )
-                        }}
-                        onToggleCommand={(resourceId, commandName) => {
-                          setSelectedResources((prev) =>
-                            prev.map(r =>
-                              r.id === resourceId
-                                ? {
-                                    ...r,
-                                    selectedCommands: new Set(
-                                      r.selectedCommands.has(commandName)
-                                        ? Array.from(r.selectedCommands).filter(n => n !== commandName)
-                                        : [...r.selectedCommands, commandName]
-                                    ),
-                                  }
-                                : r
-                            )
-                          )
-                        }}
-                                              />
-                    ))
-                  )}
-                </div>
-              </ScrollArea>
-            </div>
-          </div>
-        </div>
-
-        <div className="px-5 py-3 border-t flex justify-between items-center shrink-0">
-          <p className="text-sm text-muted-foreground">
-            {tAgent('creator.resources.dialog.selectedCount', { count: selectedResources.length })}
-          </p>
-          <Button onClick={() => onOpenChange(false)}>
-            {tAgent('creator.resources.dialog.done')}
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-// ============================================================================
-// Sub-Components
-// ============================================================================
-
-interface ScheduleCardProps {
-  icon: React.ReactNode
-  label: string
-  description: string
-  active: boolean
-  onClick: () => void
-  isMobile?: boolean
-}
-
-function ScheduleCard({ icon, label, description, active, onClick, isMobile = false }: ScheduleCardProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        "flex flex-col items-center rounded-lg border transition-colors",
-        isMobile ? "gap-3 p-4" : "gap-2 p-3",
-        active
-          ? "border-primary bg-muted"
-          : "border-transparent hover:border-border"
-      )}
-    >
-      <div className={cn("rounded-lg", active ? "bg-muted" : "", isMobile ? "p-2" : "p-1.5")}>
-        {icon}
-      </div>
-      <div className="text-center">
-        <div className={cn("font-medium", active ? "text-foreground" : "text-muted-foreground", isMobile ? "text-sm" : "text-xs")}>{label}</div>
-        <div className={cn("text-muted-foreground", isMobile ? "text-xs" : textNano)}>{description}</div>
-      </div>
-    </button>
-  )
-}
-
-interface RecommendationCardProps {
-  recommendation: ResourceRecommendation
-  selected: boolean
-  onClick: () => void
-}
-
-function RecommendationCard({ recommendation, selected, onClick }: RecommendationCardProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        "flex items-center gap-2 px-3 py-2 rounded-lg border text-left whitespace-nowrap transition-colors min-w-0",
-        selected ? "border-primary bg-muted" : "border-border hover:bg-muted-30"
-      )}
-    >
-      <div className={cn(
-        "p-1 rounded",
-        selected ? "bg-primary text-primary-foreground" : "bg-muted"
-      )}>
-        {recommendation.type === 'extension' ? <Puzzle className="h-4 w-4" /> : <Target className="h-4 w-4" />}
-      </div>
-      <div className="min-w-0">
-        <div className="text-sm font-medium truncate">{recommendation.name}</div>
-        <div className="text-xs text-muted-foreground truncate">{recommendation.reason}</div>
-      </div>
-      {selected && <Check className="h-4 w-4 text-primary ml-1 shrink-0" />}
-    </button>
-  )
-}
-
-interface AvailableResource {
-  id: string
-  name: string
-  type: 'device' | 'extension'
-  deviceType?: string
-  metrics: MetricInfo[]
-  commands: CommandInfo[]
-}
-
-interface ResourceListItemProps {
-  resource: AvailableResource
-  selected: boolean
-  onClick: () => void
-  isMobile?: boolean
-}
-
-function ResourceListItem({ resource, selected, onClick, isMobile = false }: ResourceListItemProps) {
-  const metricCount = resource.metrics.length
-  const commandCount = resource.commands.length
-
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        "w-full rounded-lg text-left transition-colors flex items-center justify-between group",
-        isMobile ? "px-4 py-3" : "px-3 py-2.5",
-        selected ? "bg-muted border border-border" : "hover:bg-muted border border-transparent"
-      )}
-    >
-      <div className="flex items-center gap-2 min-w-0">
-        <div className={cn(
-          "rounded",
-          isMobile ? "p-2" : "p-1.5",
-          selected ? "bg-primary text-primary-foreground" : "bg-muted"
-        )}>
-          {resource.type === 'extension' ? <Puzzle className={cn(isMobile ? "h-4 w-4" : "h-4 w-4")} /> : <Target className={cn(isMobile ? "h-4 w-4" : "h-4 w-4")} />}
-        </div>
-        <div className="min-w-0">
-          <div className={cn("font-medium truncate", isMobile ? "text-base" : "text-sm")}>{resource.name}</div>
-          <div className={cn("text-muted-foreground", isMobile ? "text-xs" : "text-xs")}>
-            {metricCount > 0 && `${metricCount} metric${metricCount > 1 ? 's' : ''}`}
-            {metricCount > 0 && commandCount > 0 && ' • '}
-            {commandCount > 0 && `${commandCount} command${commandCount > 1 ? 's' : ''}`}
-          </div>
-        </div>
-      </div>
-      {selected && <Check className={cn("text-primary shrink-0", isMobile ? "h-5 w-5" : "h-4 w-4")} />}
-    </button>
-  )
-}
-
-interface SelectedResourceItemProps {
-  resource: SelectedResource
-  setSelectedResources: React.Dispatch<React.SetStateAction<SelectedResource[]>>
-  onRemove: () => void
-  onToggleMetric: (resourceId: string, metricName: string) => void
-  onToggleCommand: (resourceId: string, commandName: string) => void
-  isMobile?: boolean
-}
-
-function SelectedResourceItem({ resource, setSelectedResources, onRemove, onToggleMetric, onToggleCommand, isMobile = false }: SelectedResourceItemProps) {
-  const [expanded, setExpanded] = useState(false)
-  const [showAllMetrics, setShowAllMetrics] = useState(false)
-  const [showAllCommands, setShowAllCommands] = useState(false)
-  const { t: tAgent } = useTranslation('agents')
-  const selectedMetricCount = resource.selectedMetrics.size
-  const selectedCommandCount = resource.selectedCommands.size
-  const allMetricCount = resource.allMetrics.length
-  const allCommandCount = resource.allCommands.length
-
-  const hasMetrics = resource.allMetrics.length > 0
-  const hasCommands = resource.allCommands.length > 0
-
-  return (
-    <div className={cn("rounded-lg border group", isMobile ? "px-4 py-3" : "px-3 py-2")}>
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <button
-          type="button"
-          onClick={() => setExpanded(!expanded)}
-          className="flex items-center gap-2 min-w-0 flex-1"
-        >
-          <ChevronRight
-            className={cn(
-              "text-muted-foreground transition-transform",
-              isMobile ? "h-5 w-5" : "h-4 w-4",
-              expanded && "rotate-90"
-            )}
-          />
-          <div className={cn(
-            "rounded",
-            isMobile ? "p-2" : "p-1",
-            resource.type === 'extension' ? "bg-accent-purple-light text-accent-purple" : "bg-info-light text-info"
-          )}>
-            {resource.type === 'extension' ? <Puzzle className={cn(isMobile ? "h-4 w-4" : "h-4 w-4")} /> : <Target className={cn(isMobile ? "h-4 w-4" : "h-4 w-4")} />}
-          </div>
-          <span className={cn("font-medium truncate", isMobile ? "text-base" : "text-sm")}>{resource.name}</span>
-          {(hasMetrics || hasCommands) && (
-            <Badge variant="secondary" className={cn(isMobile ? "text-xs" : "text-xs")}>
-              {selectedMetricCount}/{allMetricCount} • {selectedCommandCount}/{allCommandCount}
-            </Badge>
-          )}
-        </button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className={cn("transition-opacity", isMobile ? "h-9 w-9" : "h-6 w-6", isMobile ? "opacity-100" : "opacity-0 group-hover:opacity-100")}
-          onClick={onRemove}
-        >
-          <X className={cn(isMobile ? "h-4 w-4" : "h-4 w-4")} />
-        </Button>
-      </div>
-
-      {/* Collapsed state summary */}
-      {!expanded && (selectedMetricCount > 0 || selectedCommandCount > 0) && (
-        <div className={cn("mt-1", isMobile ? "pl-7" : "pl-6")}>
-          <p className="text-xs text-muted-foreground truncate">
-            {resource.allMetrics
-              .filter(m => resource.selectedMetrics.has(m.name))
-              .map(m => m.display_name)
-              .slice(0, 3)
-              .join(', ')}
-            {selectedMetricCount > 3 && ` +${selectedMetricCount - 3} more`}
-            {selectedMetricCount > 0 && selectedCommandCount > 0 && ' \u00B7 '}
-            {selectedCommandCount > 0 && `${selectedCommandCount} cmd${selectedCommandCount > 1 ? 's' : ''}`}
-          </p>
-        </div>
-      )}
-
-      {/* Expandable Metrics/Commands — partition folding: show only selected by default */}
-      {expanded && (hasMetrics || hasCommands) && (
-        <div className={cn("space-y-2", isMobile ? "mt-3 pl-7" : "mt-2 pl-6")}>
-          {/* Metrics */}
-          {hasMetrics && (
-            <div className="space-y-1">
-              <div className={cn("text-muted-foreground flex items-center justify-between", isMobile ? "text-sm" : "text-xs")}>
-                <span>Metrics ({selectedMetricCount}/{allMetricCount})</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const selectAll = selectedMetricCount < allMetricCount
-                    setSelectedResources((prev: SelectedResource[]) =>
-                      prev.map(r =>
-                        r.id === resource.id
-                          ? {
-                              ...r,
-                              selectedMetrics: selectAll
-                                ? new Set(resource.allMetrics.map(m => m.name))
-                                : new Set(),
-                            }
-                          : r
-                      )
-                    )
-                  }}
-                  className="text-primary hover:underline"
-                >
-                  {selectedMetricCount === allMetricCount ? 'Deselect All' : 'Select All'}
-                </button>
-              </div>
-              <div className={cn("gap-1", isMobile ? "grid grid-cols-1" : "grid grid-cols-2")}>
-                {(showAllMetrics || selectedMetricCount === 0 ? resource.allMetrics : resource.allMetrics.filter(m => resource.selectedMetrics.has(m.name)))
-                  .map((metric) => (
-                  <div key={metric.name} className="contents">
-                    <div
-                      className={cn(
-                        "flex items-center justify-between rounded transition-colors",
-                        isMobile
-                          ? "px-2 py-1 text-sm"
-                          : "px-1.5 py-0.5 text-xs",
-                        resource.selectedMetrics.has(metric.name)
-                          ? "bg-muted text-primary"
-                          : "hover:bg-muted-30"
-                      )}
-                    >
-                      <div
-                        className="flex items-center gap-2 cursor-pointer min-w-0"
-                        onClick={() => onToggleMetric(resource.id, metric.name)}
-                      >
-                        <Checkbox
-                          checked={resource.selectedMetrics.has(metric.name)}
-                          className={cn(isMobile ? "h-4 w-4" : "h-4 w-4")}
-                        />
-                        <span className="truncate">{metric.display_name}</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {!showAllMetrics && selectedMetricCount < allMetricCount && (
-                <button type="button" onClick={() => setShowAllMetrics(true)} className={inlineLinkBtn}>
-                  Show All ({allMetricCount})
-                </button>
-              )}
-              {showAllMetrics && selectedMetricCount < allMetricCount && (
-                <button type="button" onClick={() => setShowAllMetrics(false)} className={inlineLinkBtn}>
-                  Show Selected Only
-                </button>
-              )}
-            </div>
-          )}
-
-          {/* Commands */}
-          {hasCommands && (
-            <div className="space-y-1">
-              <div className={cn("text-muted-foreground flex items-center justify-between", isMobile ? "text-sm" : "text-xs")}>
-                <span>Commands ({selectedCommandCount}/{allCommandCount})</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const selectAll = selectedCommandCount < allCommandCount
-                    setSelectedResources((prev: SelectedResource[]) =>
-                      prev.map(r =>
-                        r.id === resource.id
-                          ? {
-                              ...r,
-                              selectedCommands: selectAll
-                                ? new Set(resource.allCommands.map(c => c.name))
-                                : new Set(),
-                            }
-                          : r
-                      )
-                    )
-                  }}
-                  className="text-primary hover:underline"
-                >
-                  {selectedCommandCount === allCommandCount ? 'Deselect All' : 'Select All'}
-                </button>
-              </div>
-              <div className={cn("gap-1", isMobile ? "grid grid-cols-1" : "grid grid-cols-2")}>
-                {(showAllCommands || selectedCommandCount === 0 ? resource.allCommands : resource.allCommands.filter(c => resource.selectedCommands.has(c.name)))
-                  .map((command) => (
-                  <div
-                    key={command.name}
-                    className={cn(
-                      "flex items-center gap-2 rounded cursor-pointer transition-colors",
-                      isMobile
-                        ? "px-2 py-1 text-sm"
-                        : "px-1.5 py-0.5 text-xs",
-                      resource.selectedCommands.has(command.name)
-                        ? "bg-muted text-primary"
-                        : "hover:bg-muted-30"
-                    )}
-                    onClick={() => onToggleCommand(resource.id, command.name)}
-                  >
-                    <Checkbox
-                      checked={resource.selectedCommands.has(command.name)}
-                      className={cn(isMobile ? "h-4 w-4" : "h-4 w-4")}
-                    />
-                    <span className="truncate">{command.display_name}</span>
-                  </div>
-                ))}
-              </div>
-              {!showAllCommands && selectedCommandCount < allCommandCount && (
-                <button type="button" onClick={() => setShowAllCommands(true)} className={inlineLinkBtn}>
-                  Show All ({allCommandCount})
-                </button>
-              )}
-              {showAllCommands && selectedCommandCount < allCommandCount && (
-                <button type="button" onClick={() => setShowAllCommands(false)} className={inlineLinkBtn}>
-                  Show Selected Only
-                </button>
-              )}
-            </div>
-          )}
-
-          {!hasMetrics && !hasCommands && (
-            <p className={cn("text-muted-foreground italic", isMobile ? "text-xs" : "text-xs")}>No metrics or commands available</p>
-          )}
-
-        </div>
-      )}
-    </div>
-  )
-}
-
-// Export as default
 export default AgentEditorFullScreen

@@ -316,7 +316,11 @@ impl ServerState {
     /// Get embedded broker.
     #[cfg(feature = "embedded-broker")]
     pub fn embedded_broker(&self) -> Option<Arc<EmbeddedBroker>> {
-        self.devices.embedded_broker.read().unwrap().clone()
+        self.devices
+            .embedded_broker
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Restart the embedded MQTT broker and internal adapter with updated config.
@@ -338,7 +342,12 @@ impl ServerState {
 
         // 1. Stop existing broker — rmqtt abort is instant, port released immediately
         let old_broker_config = {
-            let old_broker = self.devices.embedded_broker.read().unwrap().clone();
+            let old_broker = self
+                .devices
+                .embedded_broker
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             if let Some(ref broker) = old_broker {
                 if broker.is_running() {
                     tracing::info!("Stopping embedded broker for config change...");
@@ -349,7 +358,11 @@ impl ServerState {
                 }
             }
             let config = old_broker.as_ref().map(|b| b.config());
-            *self.devices.embedded_broker.write().unwrap() = None;
+            *self
+                .devices
+                .embedded_broker
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             config
         };
 
@@ -369,7 +382,10 @@ impl ServerState {
         if let Ok(store) = crate::config::open_settings_store() {
             match CredentialCache::load_from_store(&store) {
                 Ok(cache) => {
-                    *self.credential_cache.write().unwrap() = cache;
+                    *self
+                        .credential_cache
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = cache;
                 }
                 Err(e) => {
                     tracing::error!("Failed to refresh credential cache during restart: {}", e)
@@ -380,7 +396,7 @@ impl ServerState {
         let cache = self.credential_cache.clone();
         let credential_validator: CredentialValidator =
             std::sync::Arc::new(move |username: &str, password: &str| {
-                let cache = cache.read().unwrap();
+                let cache = cache.read().unwrap_or_else(|e| e.into_inner());
 
                 if username == "__heramind_internal__" {
                     if let Some(ref system_pass) = cache.system_password {
@@ -419,7 +435,7 @@ impl ServerState {
                 let rollback_cache = self.credential_cache.clone();
                 let rollback_validator: CredentialValidator =
                     std::sync::Arc::new(move |username: &str, password: &str| {
-                        let cache = rollback_cache.read().unwrap();
+                        let cache = rollback_cache.read().unwrap_or_else(|e| e.into_inner());
                         if username == "__heramind_internal__" {
                             return cache.system_password.as_deref() == Some(password);
                         }
@@ -436,8 +452,11 @@ impl ServerState {
                     rollback_broker.set_event_bus(bus.clone());
                 }
                 if let Ok(()) = rollback_broker.start().await {
-                    *self.devices.embedded_broker.write().unwrap() =
-                        Some(Arc::new(rollback_broker));
+                    *self
+                        .devices
+                        .embedded_broker
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(rollback_broker));
                     tracing::info!("Rollback successful: broker restarted with previous config");
 
                     // Also rebuild the internal-mqtt adapter with old config
@@ -512,7 +531,11 @@ impl ServerState {
             broker_config.tls_enabled
         );
 
-        *self.devices.embedded_broker.write().unwrap() = Some(Arc::new(broker));
+        *self
+            .devices
+            .embedded_broker
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(broker));
 
         // 4. Create new internal-mqtt adapter with updated config
         let (adapter_username, adapter_password) = {
@@ -797,7 +820,7 @@ impl ServerState {
         // load the persistent database in the background so that a large
         // telemetry.redb does not block server startup.
         let time_series_storage =
-            Arc::new(TimeSeriesStorage::memory().expect("in-memory telemetry storage"));
+            Arc::new(TimeSeriesStorage::memory_deferred().expect("deferred telemetry placeholder"));
         let telemetry_for_bg = time_series_storage.clone();
         let telemetry_path = heramind_core::paths::store_path("telemetry.redb");
         tokio::spawn(async move {
@@ -827,6 +850,8 @@ impl ServerState {
             .expect("telemetry open task panicked");
 
             if let Some(persistent) = t {
+                // NOTE: the drain inside matters as much as the swap — see
+                // swap_store_with_drain.
                 let inner = persistent.inner_store();
 
                 // Migrate legacy bare device_id keys to unified "device:" prefix format.
@@ -843,8 +868,29 @@ impl ServerState {
                     }
                 }
 
-                telemetry_for_bg.swap_store(inner);
-                tracing::info!("Persistent telemetry storage swapped in");
+                match telemetry_for_bg.swap_store_with_drain(inner).await {
+                    Ok(migrated) if migrated > 0 => {
+                        tracing::info!(
+                            migrated_points = migrated,
+                            "Persistent telemetry storage swapped in (drained placeholder)"
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::info!("Persistent telemetry storage swapped in");
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            category = "storage",
+                            error = %e,
+                            "Drain into persistent telemetry failed — swapping anyway; data written before the swap is lost"
+                        );
+                        telemetry_for_bg.finalize_memory();
+                    }
+                }
+            } else {
+                // Open failed and memory is final — release waiters, or the
+                // agent manager blocks forever on the deferred load.
+                telemetry_for_bg.finalize_memory();
             }
         });
 
@@ -1132,8 +1178,10 @@ impl ServerState {
         let agent_store = agent_store_h.await.expect("agent_store task panicked");
 
         // Initialize system memory store (Markdown-based persistent memory)
-        let system_memory_store = Arc::new(heramind_storage::MarkdownMemoryStore::new(
-            heramind_core::paths::data_dir().join("memory"),
+        let memory_config = heramind_storage::MemoryConfig::load();
+        let system_memory_store = Arc::new(heramind_storage::MarkdownMemoryStore::with_config(
+            &memory_config.storage_path,
+            memory_config.clone(),
         ));
         if let Err(e) = system_memory_store.init() {
             tracing::warn!(category = "storage", error = %e, "Failed to initialize system memory store");
@@ -1308,6 +1356,46 @@ impl ServerState {
     /// - In-memory device registry
     /// - In-memory time-series storage
     /// - In-memory session manager
+    ///
+    /// A private, freshly-pruned directory for a test state's markdown memory.
+    ///
+    /// Unique per call — the states are meant to be isolated, and a fixed path
+    /// meant every one of them shared a single directory — and pruned of older
+    /// siblings, so a run does not leave one behind for ever.
+    #[cfg(any(test, feature = "testing"))]
+    fn fresh_test_memory_dir() -> std::path::PathBuf {
+        const PREFIX: &str = "heramind-test-memory-";
+        // Pruning by age rather than relying on a cleanup that runs at drop:
+        // a killed test process never reaches it.
+        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+            let now = std::time::SystemTime::now();
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !name.starts_with(PREFIX) {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                let Ok(modified) = meta.modified() else {
+                    continue;
+                };
+                if now
+                    .duration_since(modified)
+                    .map(|age| age > std::time::Duration::from_secs(3600))
+                    .unwrap_or(false)
+                {
+                    let path = entry.path();
+                    let _ = if meta.is_dir() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                }
+            }
+        }
+        std::env::temp_dir().join(format!("{PREFIX}{}", uuid::Uuid::new_v4()))
+    }
+
     /// - Fresh event bus and message manager
     /// - No API key generation
     #[cfg(any(test, feature = "testing"))]
@@ -1410,8 +1498,9 @@ impl ServerState {
         // ========== Build AGENT STATE ==========
         let session_manager = SessionManager::memory();
         let agent_store = heramind_storage::AgentStore::memory().unwrap();
-        let system_memory_store = Arc::new(heramind_storage::MarkdownMemoryStore::new(
-            std::env::temp_dir().join("heramind-test-memory"),
+        let system_memory_store = Arc::new(heramind_storage::MarkdownMemoryStore::with_config(
+            Self::fresh_test_memory_dir(),
+            heramind_storage::MemoryConfig::default(),
         ));
 
         let agents = AgentState::new(
@@ -1703,7 +1792,10 @@ impl ServerState {
         if let Ok(store) = open_settings_store() {
             match CredentialCache::load_from_store(&store) {
                 Ok(cache) => {
-                    *self.credential_cache.write().unwrap() = cache;
+                    *self
+                        .credential_cache
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = cache;
                 }
                 Err(e) => tracing::error!("Failed to load credential cache: {}", e),
             }
@@ -1714,7 +1806,7 @@ impl ServerState {
         let cache = self.credential_cache.clone();
         let credential_validator: CredentialValidator =
             Arc::new(move |username: &str, password: &str| {
-                let cache = cache.read().unwrap();
+                let cache = cache.read().unwrap_or_else(|e| e.into_inner());
 
                 // System credential check (plaintext comparison)
                 if username == "__heramind_internal__" {
@@ -1763,7 +1855,11 @@ impl ServerState {
             }
         }
 
-        *self.devices.embedded_broker.write().unwrap() = Some(Arc::new(broker));
+        *self
+            .devices
+            .embedded_broker
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(broker));
     }
 
     /// Initialize MQTT adapter for device communication.
@@ -1788,7 +1884,10 @@ impl ServerState {
         let (adapter_username, adapter_password) = {
             #[cfg(feature = "embedded-broker")]
             {
-                let cache = self.credential_cache.read().unwrap();
+                let cache = self
+                    .credential_cache
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(ref pass) = cache.system_password {
                     tracing::debug!("Internal MQTT adapter: using system credential from cache");
                     (
@@ -2031,27 +2130,37 @@ impl ServerState {
             // Shell tool — CLI-first: domain operations via `heramind` commands
             .with_shell_tool(Some(heramind_agent::toolkit::ShellConfig {
                 enabled: true,
-                timeout_secs: 30,
+                timeout_secs: heramind_agent::toolkit::timeouts::shell_default().as_secs(),
                 max_output_chars: 10000,
             }))
-            // Scan extensions and register their tools (dynamic, keep)
+            // Direct extension tools: gated by HERAMIND_EXTENSION_DIRECT_TOOLS
+            // (CLI-only candidate skips registration; invoke stays on CLI).
             .with_extensions_scanned()
             .await
             .build();
 
         // Register standalone tools that don't map to CLI commands
-        // Skill tool — manages skill CRUD (not CLI-replaceable)
-        let skill_registry = self.agents.session_manager.skill_registry();
-        {
-            let tool = heramind_agent::toolkit::skill_tool::SkillTool::with_data_dir(
-                skill_registry.clone(),
-                self.data_dir.clone(),
-            );
-            registry.register(Arc::new(tool));
+        // Skill tool — manages skill CRUD (not CLI-replaceable). Skipped in
+        // the eval-only no-skill comparison mode (see skills::disabled_by_env).
+        if !heramind_agent::skills::disabled_by_env() {
+            let skill_registry = self.agents.session_manager.skill_registry();
+            {
+                let tool = heramind_agent::toolkit::skill_tool::SkillTool::with_data_dir(
+                    skill_registry.clone(),
+                    self.data_dir.clone(),
+                );
+                registry.register(Arc::new(tool));
+            }
         }
 
+        // Web search tool — keyless structured search (Bing RSS channel)
+        registry.register(Arc::new(heramind_agent::toolkit::WebSearchTool::new()));
         // Web fetch tool — retrieves URL content
         registry.register(Arc::new(heramind_agent::toolkit::WebFetchTool::new()));
+        // File read tool — line-numbered reads + freshness snapshots
+        registry.register(Arc::new(heramind_agent::toolkit::FileReadTool::new(
+            self.data_dir.clone(),
+        )));
         // File write tool — creates/overwrites files in data/
         registry.register(Arc::new(heramind_agent::toolkit::FileWriteTool::new(
             self.data_dir.clone(),
@@ -2061,22 +2170,17 @@ impl ServerState {
             self.data_dir.clone(),
         )));
 
-        // Vision tool — auto-detect VLM backend and register if available
+        // Keep the builtin tool registered; candidates are resolved per call so
+        // adding/removing a VLM after startup needs no registry rebuild.
         if let Ok(llm_manager) = heramind_agent::llm_backends::get_instance_manager() {
-            let has_vlm = llm_manager
-                .list_instances()
-                .iter()
-                .any(|inst| inst.capabilities.supports_multimodal);
-            if has_vlm {
-                registry.register(Arc::new(heramind_agent::toolkit::VisionTool::new(
-                    heramind_agent::toolkit::VisionConfig::default(),
-                    llm_manager,
-                )));
-                tracing::info!(
-                    category = "ai",
-                    "Vision tool registered (VLM backend detected)"
-                );
-            }
+            registry.register(Arc::new(heramind_agent::toolkit::VisionTool::new(
+                heramind_agent::toolkit::VisionConfig::default(),
+                llm_manager,
+            )));
+            tracing::info!(
+                category = "ai",
+                "Vision tool registered (dynamic VLM resolution)"
+            );
         } else {
             tracing::debug!(
                 category = "ai",
@@ -2110,7 +2214,9 @@ impl ServerState {
 
         tracing::info!(
             category = "ai",
-            "Tool registry initialized with {} tools (CLI-first + extensions + meta)",
+            direct_extension_tools =
+                heramind_agent::toolkit::extension_tools::extension_direct_tools_for_llm(),
+            "Tool registry initialized with {} tools (CLI-first + optional extension tools + meta)",
             tool_registry.len()
         );
     }
@@ -2130,25 +2236,33 @@ impl ServerState {
             .with_extension_registry(self.extensions.registry.clone())
             .with_shell_tool(Some(heramind_agent::toolkit::ShellConfig {
                 enabled: true,
-                timeout_secs: 30,
+                timeout_secs: heramind_agent::toolkit::timeouts::shell_default().as_secs(),
                 max_output_chars: 10000,
             }))
             .with_extensions_scanned()
             .await
             .build();
 
-        // Re-register standalone tools
-        let skill_registry = self.agents.session_manager.skill_registry();
-        {
-            let tool = heramind_agent::toolkit::skill_tool::SkillTool::with_data_dir(
-                skill_registry.clone(),
-                self.data_dir.clone(),
-            );
-            registry.register(Arc::new(tool));
+        // Re-register standalone tools (guarded by the eval no-skill mode)
+        if !heramind_agent::skills::disabled_by_env() {
+            let skill_registry = self.agents.session_manager.skill_registry();
+            {
+                let tool = heramind_agent::toolkit::skill_tool::SkillTool::with_data_dir(
+                    skill_registry.clone(),
+                    self.data_dir.clone(),
+                );
+                registry.register(Arc::new(tool));
+            }
         }
 
+        // Re-register stateful chat tools (query_conclusion / run_now /
+        // device_command) — previously dropped on extension refresh.
         // Re-register web/file tools
+        registry.register(Arc::new(heramind_agent::toolkit::WebSearchTool::new()));
         registry.register(Arc::new(heramind_agent::toolkit::WebFetchTool::new()));
+        registry.register(Arc::new(heramind_agent::toolkit::FileReadTool::new(
+            self.data_dir.clone(),
+        )));
         registry.register(Arc::new(heramind_agent::toolkit::FileWriteTool::new(
             self.data_dir.clone(),
         )));
@@ -2156,22 +2270,17 @@ impl ServerState {
             self.data_dir.clone(),
         )));
 
-        // Vision tool — auto-detect VLM backend and register if available
+        // Keep the builtin tool registered; candidates are resolved per call so
+        // adding/removing a VLM after startup needs no registry rebuild.
         if let Ok(llm_manager) = heramind_agent::llm_backends::get_instance_manager() {
-            let has_vlm = llm_manager
-                .list_instances()
-                .iter()
-                .any(|inst| inst.capabilities.supports_multimodal);
-            if has_vlm {
-                registry.register(Arc::new(heramind_agent::toolkit::VisionTool::new(
-                    heramind_agent::toolkit::VisionConfig::default(),
-                    llm_manager,
-                )));
-                tracing::info!(
-                    category = "ai",
-                    "Vision tool registered (VLM backend detected)"
-                );
-            }
+            registry.register(Arc::new(heramind_agent::toolkit::VisionTool::new(
+                heramind_agent::toolkit::VisionConfig::default(),
+                llm_manager,
+            )));
+            tracing::info!(
+                category = "ai",
+                "Vision tool registered (dynamic VLM resolution)"
+            );
         } else {
             tracing::debug!(
                 category = "ai",
@@ -2208,6 +2317,8 @@ impl ServerState {
 
         tracing::info!(
             category = "ai",
+            direct_extension_tools =
+                heramind_agent::toolkit::extension_tools::extension_direct_tools_for_llm(),
             "Tool registry refreshed with {} tools (extensions now loaded)",
             tool_count
         );
@@ -2746,7 +2857,6 @@ impl ServerState {
             tracing::info!("Auto-onboarding event listener started");
 
             while let Some((event, _metadata)) = rx.recv().await {
-                // Check if this is a device discovered event
                 if let heramind_core::HeraMindEvent::DeviceDiscovered {
                     device_id,
                     source,
@@ -2757,63 +2867,17 @@ impl ServerState {
                     timestamp: _,
                 } = event
                 {
-                    // Extract the actual payload data from sample
-                    let payload_data = sample.get("data").unwrap_or(&sample);
-
-                    // Check if device is already registered - skip auto-onboarding if it is
-                    if device_service_clone.get_device(&device_id).is_some() {
-                        tracing::debug!(
-                            "Device {} already registered, skipping auto-onboarding",
-                            device_id
-                        );
-                        continue;
-                    }
-
-                    tracing::info!(
-                        "Processing discovered device from {}: device_id={}, is_binary={}",
-                        source,
+                    Self::process_device_discovered_for_onboarding(
+                        manager.as_ref(),
+                        device_service_clone.as_ref(),
                         device_id,
-                        is_binary
-                    );
-
-                    // Extract original_topic if available (for MQTT devices)
-                    let original_topic = metadata
-                        .get("original_topic")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    // Process the payload data through auto-onboarding
-                    match manager
-                        .process_unknown_device_with_topic(
-                            &device_id,
-                            &source,
-                            payload_data,
-                            is_binary,
-                            original_topic,
-                            adapter_id,
-                        )
-                        .await
-                    {
-                        Ok(true) => {
-                            tracing::info!(
-                                "Successfully processed discovered device: {}",
-                                device_id
-                            );
-                        }
-                        Ok(false) => {
-                            tracing::debug!(
-                                "Discovered device not accepted (disabled or at capacity): {}",
-                                device_id
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to process discovered device {}: {}",
-                                device_id,
-                                e
-                            );
-                        }
-                    }
+                        source,
+                        adapter_id,
+                        &metadata,
+                        &sample,
+                        is_binary,
+                    )
+                    .await;
                 }
             }
         });
@@ -2821,6 +2885,149 @@ impl ServerState {
         tracing::info!(
             "Auto-onboarding event listener initialized - MQTT unknown devices will trigger auto-onboarding"
         );
+    }
+
+    /// Handle one `DeviceDiscovered` for auto-onboarding (listener + tests).
+    ///
+    /// Ordinary registered ids are skipped. Association-exception events
+    /// (Conflict / Unverifiable against a registered identity) stay visible as
+    /// pending drafts under a non-colliding candidate id — never silent drop,
+    /// never auto-overwrite the blocked device.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_device_discovered_for_onboarding(
+        manager: &crate::automation::AutoOnboardManager,
+        device_service: &heramind_devices::DeviceService,
+        device_id: String,
+        source: String,
+        adapter_id: Option<String>,
+        metadata: &serde_json::Value,
+        sample: &serde_json::Value,
+        is_binary: bool,
+    ) -> bool {
+        use heramind_devices::adapters::mqtt::{
+            pending_association_candidate_id, MQTT_ASSOCIATION_EXCEPTION_KEY,
+            MQTT_ASSOCIATION_KIND_KEY, MQTT_BLOCKED_DEVICE_IDS_KEY, MQTT_CLAIMED_IDENTITY_KEY,
+            MQTT_PENDING_CANDIDATE_ID_KEY,
+        };
+
+        let payload_data = sample.get("data").unwrap_or(sample);
+        let is_exception = metadata
+            .get(MQTT_ASSOCIATION_EXCEPTION_KEY)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let original_topic = metadata
+            .get("original_topic")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let mqtt_identity_source = metadata
+            .get("mqtt_identity_source")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let mqtt_identity_field = metadata
+            .get("mqtt_identity_field")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let mut effective_id = device_id.clone();
+        let mut exception_draft = None;
+
+        if is_exception {
+            let claimed = metadata
+                .get(MQTT_CLAIMED_IDENTITY_KEY)
+                .and_then(|v| v.as_str())
+                .unwrap_or(device_id.as_str())
+                .to_string();
+            let pending = metadata
+                .get(MQTT_PENDING_CANDIDATE_ID_KEY)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    let topic = original_topic.as_deref().unwrap_or("");
+                    pending_association_candidate_id(topic, &claimed)
+                });
+            // Defense: even if the emitter still sent a registered id, remap.
+            if device_service.get_device(&effective_id).is_some() {
+                tracing::info!(
+                    claimed = %claimed,
+                    pending = %pending,
+                    "Association exception against registered identity — pending candidate (no overwrite)"
+                );
+                effective_id = pending;
+            } else if effective_id != pending {
+                // Prefer the stable pending key from metadata when present.
+                if metadata.get(MQTT_PENDING_CANDIDATE_ID_KEY).is_some() {
+                    effective_id = pending;
+                }
+            }
+
+            let blocked: Vec<String> = metadata
+                .get(MQTT_BLOCKED_DEVICE_IDS_KEY)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![claimed.clone()]);
+            exception_draft = Some(crate::automation::AssociationExceptionDraft {
+                kind: metadata
+                    .get(MQTT_ASSOCIATION_KIND_KEY)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                blocked_device_ids: blocked,
+                claimed_identity: Some(claimed),
+            });
+        } else if device_service.get_device(&device_id).is_some() {
+            tracing::debug!(
+                "Device {} already registered, skipping auto-onboarding",
+                device_id
+            );
+            return false;
+        }
+
+        tracing::info!(
+            "Processing discovered device from {}: device_id={}, is_binary={}, association_exception={}",
+            source,
+            effective_id,
+            is_binary,
+            is_exception
+        );
+
+        match manager
+            .process_unknown_device_with_topic_ex(
+                &effective_id,
+                &source,
+                payload_data,
+                is_binary,
+                original_topic,
+                adapter_id,
+                mqtt_identity_source,
+                mqtt_identity_field,
+                exception_draft,
+            )
+            .await
+        {
+            Ok(true) => {
+                tracing::info!("Successfully processed discovered device: {}", effective_id);
+                true
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    "Discovered device not accepted (disabled or at capacity): {}",
+                    effective_id
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to process discovered device {}: {}",
+                    effective_id,
+                    e
+                );
+                false
+            }
+        }
     }
 
     /// Save LLM configuration to database.
@@ -2892,155 +3099,31 @@ impl ServerState {
         // Reuse the TimeSeriesStore that's already opened by DeviceService
         // We can't reopen telemetry.redb because redb doesn't support opening the same
         // file multiple times in the same process
+        //
+        // WAIT for the deferred persistent load first: inner_store() pins the
+        // Arc for the executor's lifetime, and capturing the startup
+        // placeholder meant every AI-agent write landed in a throwaway
+        // memory store — values looked fine until the restart wiped them.
+        self.devices.telemetry.wait_for_storage_load().await;
         let time_series_store = Some(self.devices.telemetry.inner_store());
 
-        // Get LLM runtime from SessionManager if available
-        let llm_runtime = if let Ok(Some(backend)) =
-            self.agents.session_manager.get_llm_backend().await
-        {
-            use heramind_agent::llm_backends::{
-                CloudConfig, CloudRuntime, OllamaConfig, OllamaRuntime,
-            };
-            use heramind_agent::LlmBackend;
-            use heramind_core::llm::backend::LlmRuntime;
-
-            match backend {
-                LlmBackend::Ollama {
-                    endpoint,
-                    model,
-                    capabilities: _,
-                } => {
-                    let timeout = std::env::var("OLLAMA_TIMEOUT_SECS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(120);
-                    match OllamaRuntime::new(
-                        OllamaConfig::new(&model)
-                            .with_endpoint(&endpoint)
-                            .with_timeout_secs(timeout),
-                    ) {
-                        Ok(runtime) => Some(Arc::new(runtime) as Arc<dyn LlmRuntime + Send + Sync>),
-                        Err(e) => {
-                            tracing::warn!(category = "ai", error = %e, "Failed to create Ollama runtime for agents");
-                            None
-                        }
-                    }
+        // Unified LLM runtime for agents: resolve the ACTIVE backend through
+        // the platform instance manager — the single factory/cache/
+        // capability-detection path shared with the chat side (M0-2). The
+        // per-backend construction match that used to live here had drifted
+        // from the manager and was removed.
+        let llm_runtime = match heramind_agent::get_instance_manager() {
+            Ok(manager) => match manager.get_active_runtime().await {
+                Ok(runtime) => Some(runtime),
+                Err(e) => {
+                    tracing::info!(category = "ai", error = %e, "No active LLM backend for agents");
+                    None
                 }
-                LlmBackend::LlamaCpp {
-                    endpoint,
-                    model,
-                    capabilities: _,
-                } => {
-                    use heramind_agent::llm_backends::backends::llamacpp::{
-                        LlamaCppConfig, LlamaCppRuntime,
-                    };
-                    let timeout = std::env::var("LLAMACPP_TIMEOUT_SECS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(180);
-                    match LlamaCppRuntime::new(
-                        LlamaCppConfig::new(&model)
-                            .with_endpoint(&endpoint)
-                            .with_timeout_secs(timeout),
-                    ) {
-                        Ok(runtime) => Some(Arc::new(runtime) as Arc<dyn LlmRuntime + Send + Sync>),
-                        Err(e) => {
-                            tracing::warn!(category = "ai", error = %e, "Failed to create llama.cpp runtime for agents");
-                            None
-                        }
-                    }
-                }
-                LlmBackend::OpenAi {
-                    api_key,
-                    endpoint,
-                    model,
-                    capabilities: _,
-                } => {
-                    // Use CloudRuntime for OpenAI-compatible APIs
-                    let timeout = std::env::var("OPENAI_TIMEOUT_SECS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(60);
-                    match CloudRuntime::new(
-                        CloudConfig::custom(&api_key, &endpoint)
-                            .with_model(&model)
-                            .with_timeout_secs(timeout),
-                    ) {
-                        Ok(runtime) => Some(Arc::new(runtime) as Arc<dyn LlmRuntime + Send + Sync>),
-                        Err(e) => {
-                            tracing::warn!(category = "ai", error = %e, "Failed to create OpenAI runtime for agents");
-                            None
-                        }
-                    }
-                }
-                // Other cloud backends (Anthropic, Google, XAi, Qwen, DeepSeek, GLM, MiniMax)
-                _backend => {
-                    let (api_key, endpoint, model) = match &_backend {
-                        LlmBackend::Anthropic {
-                            api_key,
-                            endpoint,
-                            model,
-                            capabilities: _,
-                        }
-                        | LlmBackend::Google {
-                            api_key,
-                            endpoint,
-                            model,
-                            capabilities: _,
-                        }
-                        | LlmBackend::XAi {
-                            api_key,
-                            endpoint,
-                            model,
-                            capabilities: _,
-                        }
-                        | LlmBackend::Qwen {
-                            api_key,
-                            endpoint,
-                            model,
-                            capabilities: _,
-                        }
-                        | LlmBackend::DeepSeek {
-                            api_key,
-                            endpoint,
-                            model,
-                            capabilities: _,
-                        }
-                        | LlmBackend::GLM {
-                            api_key,
-                            endpoint,
-                            model,
-                            capabilities: _,
-                        }
-                        | LlmBackend::MiniMax {
-                            api_key,
-                            endpoint,
-                            model,
-                            capabilities: _,
-                        } => (api_key.clone(), endpoint.clone(), model.clone()),
-                        // This is unreachable since we've excluded Ollama and OpenAi above
-                        _ => unreachable!("Unexpected LLM backend type"),
-                    };
-                    let timeout = std::env::var("OPENAI_TIMEOUT_SECS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(60);
-                    match CloudRuntime::new(
-                        CloudConfig::custom(&api_key, &endpoint)
-                            .with_model(&model)
-                            .with_timeout_secs(timeout),
-                    ) {
-                        Ok(runtime) => Some(Arc::new(runtime) as Arc<dyn LlmRuntime + Send + Sync>),
-                        Err(e) => {
-                            tracing::warn!(category = "ai", error = %e, "Failed to create cloud runtime for agents");
-                            None
-                        }
-                    }
-                }
+            },
+            Err(e) => {
+                tracing::warn!(category = "ai", error = %e, "Instance manager unavailable");
+                None
             }
-        } else {
-            tracing::info!(category = "ai", "No LLM backend configured for agents");
-            None
         };
 
         let has_llm = llm_runtime.is_some();
@@ -3264,6 +3347,25 @@ impl ServerState {
             );
         }
 
+        // Publish IM as a notification channel. Agents route by channel *name*
+        // (`notify.channels`), so being a channel is what makes "IM" appear in
+        // the editor's notify picker — and it is the only way a run's outcome
+        // can reach a bound chat, since the executor has no session concept and
+        // cannot address one directly. Registered here, after the persisted
+        // bridges reload, so the registry the channel reads from is populated.
+        {
+            let im_channel: Arc<dyn heramind_messages::channels::MessageChannel> = Arc::new(
+                heramind_messages::im_bridge::channel::ImChannel::new(router.clone()),
+            );
+            let channel_registry = self.message_manager().channels().await;
+            channel_registry.read().await.register(im_channel).await;
+            tracing::info!(
+                category = "im",
+                channel = heramind_messages::im_bridge::channel::IM_CHANNEL_NAME,
+                "IM registered as a notification channel"
+            );
+        }
+
         *self.im_router.write().await = Some(router);
         tracing::info!(category = "im", "IM router started");
 
@@ -3385,8 +3487,25 @@ impl ServerState {
                         device_id,
                         metric,
                         value,
+                        is_virtual,
                         ..
                     } => {
+                        // Virtual metrics (ai:<agent>:<field>, transform aliases)
+                        // must NOT re-trigger event agents: an agent listening
+                        // on a wildcard or on another agent's output would be
+                        // re-fired by its own publish, forming an unbounded
+                        // self/mutual-trigger loop that burns an LLM call
+                        // every cooldown expiry. Real-device feedback loops
+                        // (a command changing a physical reading) still work —
+                        // those arrive with is_virtual unset/false.
+                        if is_virtual.unwrap_or(false) {
+                            tracing::debug!(
+                                device_id = %device_id,
+                                metric = %metric,
+                                "skipping event-agent trigger for virtual metric (feedback-loop guard)"
+                            );
+                            continue;
+                        }
                         if let Err(e) = executor
                             .check_and_trigger_data_event("device", device_id, metric, &value)
                             .await
@@ -3421,11 +3540,12 @@ impl ServerState {
 
 /// Rebuild the ToolRegistry disabled set from the persisted ExtensionRecord
 /// state and push it live. Built-in tools are never disabled; only extension
-/// tools whose parent extension is `enabled=false` (master off) or whose
+/// tools whose parent extension is `ai_enabled=false` (AI master off) or whose
 /// command name appears in `disabled_commands` (per-command off) are hidden.
+/// Run/load `enabled` is not consulted here.
 ///
 /// Called at startup (after extensions load + tool registry finalized) and
-/// after every toggle API call. Cheap: O(n_extensions × n_commands).
+/// after every AI / per-command toggle API call. Cheap: O(n_extensions × n_commands).
 async fn apply_persisted_tool_disabled_state(
     runtime: &heramind_core::extension::ExtensionRuntime,
     tool_registry: &std::sync::Arc<heramind_agent::toolkit::ToolRegistry>,
@@ -3450,8 +3570,14 @@ async fn apply_persisted_tool_disabled_state(
         if r.uninstalled {
             continue;
         }
-        if !r.enabled {
-            // Master off: enumerate live commands to materialize tool names.
+        // Same AI visibility the capability catalog uses (NM-247).
+        heramind_core::extension::set_instance_ai_visibility(
+            &r.id,
+            r.ai_enabled,
+            r.disabled_commands.clone(),
+        );
+        if !r.ai_enabled {
+            // AI master off: enumerate live commands to materialize tool names.
             if let Some(info) = runtime.get(&r.id).await {
                 for cmd in &info.commands {
                     disabled.insert(format!("{}:{}", r.id, cmd.name));
@@ -3461,6 +3587,15 @@ async fn apply_persisted_tool_disabled_state(
         }
         for cmd_name in &r.disabled_commands {
             disabled.insert(format!("{}:{}", r.id, cmd_name));
+        }
+        // Author-declared hidden commands (ai_exposed=false in the live
+        // descriptor) are always hidden — admin toggles cannot override.
+        if let Some(info) = runtime.get(&r.id).await {
+            for cmd in &info.commands {
+                if !cmd.ai_exposed {
+                    disabled.insert(format!("{}:{}", r.id, cmd.name));
+                }
+            }
         }
     }
 
@@ -3513,13 +3648,24 @@ impl heramind_messages::im_bridge::AgentRunner for SessionManagerAgentRunner {
         Ok(self.sm.create_session_with_options(opts).await?)
     }
 
+    async fn persist(&self, session_id: &str) -> anyhow::Result<()> {
+        // Called by the IM router when it abandons a run on the hard
+        // timeout — the dropped run future's per-round persist never
+        // executes, so the in-memory turn (user message included) is
+        // snapshotted here instead.
+        self.sm.persist_history(session_id).await?;
+        Ok(())
+    }
+
     async fn run(&self, session_id: &str, text: &str) -> anyhow::Result<String> {
         use futures::StreamExt as _;
         // backend_id=None → use the session's currently-active backend.
         // selected_skills=&[] → no pinned skills for this turn.
         let stream = self
             .sm
-            .process_message_events_with_backend_and_skills(session_id, text, None, None)
+            .process_message_events_with_backend_and_skills(
+                session_id, text, None, None, None, None,
+            )
             .await?;
         let mut s = stream;
         let mut out = String::new();
@@ -3545,7 +3691,72 @@ impl heramind_messages::im_bridge::AgentRunner for SessionManagerAgentRunner {
                 out = format!("（处理失败：{msg}）");
             }
         }
+
+        // Persist the turn. The session manager keeps a running conversation in
+        // memory and writes it only when someone asks — the HTTP chat path does
+        // that after its stream, the WS path on disconnect, and this path did
+        // neither. So a conversation you had over Telegram lived until the next
+        // restart and then showed as an empty one: the session row is written at
+        // creation and survives, while its messages never reached sessions.redb.
+        //
+        // Persisted even when the reply failed: the user's own message is part
+        // of the conversation either way, and losing it is what makes a restart
+        // look like the chat was wiped.
+        if let Err(e) = self.sm.persist_history(session_id).await {
+            tracing::warn!(
+                category = "im",
+                session_id = %session_id,
+                error = %e,
+                "Failed to persist the IM conversation"
+            );
+        }
+
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod im_persistence_tests {
+    use super::*;
+    // create_session and run live on the trait, not on the struct.
+    use heramind_messages::im_bridge::AgentRunner as _;
+
+    /// An IM conversation has to survive a restart.
+    ///
+    /// The session manager holds a running conversation in memory and writes it
+    /// only when asked. The HTTP chat path asks after its stream, the WS path on
+    /// disconnect — this adapter asked never, so a chat held over Telegram lived
+    /// until the next restart and then showed as an empty conversation: the
+    /// session row is written at creation and survives, while the messages never
+    /// reached `sessions.redb`.
+    #[tokio::test]
+    async fn an_im_turn_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.redb");
+
+        let session_id = {
+            let sm =
+                Arc::new(heramind_agent::SessionManager::with_path(&path).expect("session store"));
+            let runner = SessionManagerAgentRunner::new(sm);
+            let sid = runner.create_session().await.expect("create session");
+            // No LLM backend is configured here, so the reply comes back as an
+            // error message. That is deliberate: the user's own message has to
+            // reach the disk however the answer went, and a run that only
+            // persisted on success would still lose the conversation whenever
+            // the model was unreachable.
+            let _ = runner.run(&sid, "冷库现在怎么样").await;
+            sid
+        };
+
+        // "Restart": a fresh manager over the same file, with nothing in memory.
+        let reopened =
+            heramind_agent::SessionManager::with_path(&path).expect("reopen session store");
+        let history = reopened.get_history(&session_id).await.expect("history");
+        assert!(
+            history.iter().any(|m| m.content.contains("冷库现在怎么样")),
+            "the user's message must outlive a restart; got {} message(s): {history:?}",
+            history.len()
+        );
     }
 }
 
@@ -3577,6 +3788,7 @@ mod boot_resilience_tests {
             author: None,
             auto_start: false,
             enabled: true,
+            ai_enabled: true,
             uninstalled: false,
             disabled_commands: vec![],
             config: None,
@@ -3629,6 +3841,7 @@ mod boot_resilience_tests {
             author: None,
             auto_start: false,
             enabled: true,
+            ai_enabled: true,
             uninstalled: false,
             disabled_commands: vec![],
             config: None,

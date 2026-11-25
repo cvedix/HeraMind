@@ -29,6 +29,56 @@ const HISTORY_TABLE: TableDefinition<(&str, u64), Vec<u8>> = TableDefinition::ne
 const PENDING_STREAM_TABLE: TableDefinition<&str, Vec<u8>> =
     TableDefinition::new("pending_streams");
 
+// Minimal Operation + write ledger per session (JSON). Auth grants / stream
+// leases are never stored here — agent sanitizes Running→Unknown on restore.
+const OP_LEDGER_TABLE: TableDefinition<&str, Vec<u8>> = TableDefinition::new("op_ledgers");
+
+// Per-operation status index keyed by operation_id (JSON) for O(1) lookup via
+// `GET /api/v1/operations/:id` and `heramind operation get <op_id>`.
+const OPERATIONS_INDEX_TABLE: TableDefinition<&str, Vec<u8>> =
+    TableDefinition::new("operations_index");
+
+/// Persisted operation status entry queryable by `operation_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedOperationRecord {
+    pub operation_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// One of: `in_progress`, `succeeded`, `failed`, `unknown`, `rejected`, `cancelled`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub origin_turn_id: u64,
+    #[serde(default)]
+    pub created_at_ms: u64,
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
+impl PersistedOperationRecord {
+    /// True when the operation has reached a confirmed terminal outcome
+    /// (`succeeded`, `failed`, `rejected`, or `cancelled`).
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "succeeded" | "failed" | "rejected" | "cancelled"
+        )
+    }
+}
+
 /// Default value for memory_enabled: true.
 const fn default_memory_enabled() -> bool {
     true
@@ -40,7 +90,7 @@ pub struct SessionMetadata {
     /// User-defined title for the session
     #[serde(default)]
     pub title: Option<String>,
-    /// Whether memory injection is enabled for this session (defaults to true)
+    /// Whether on-demand memory access is enabled for this session (defaults to true)
     #[serde(default = "default_memory_enabled")]
     pub memory_enabled: bool,
     /// Conversation summary for context compression (injected when context exceeds threshold)
@@ -52,6 +102,12 @@ pub struct SessionMetadata {
     /// Preview text derived from the first user message (truncated)
     #[serde(default)]
     pub preview: Option<String>,
+    /// Owning principal ("user:<name>" or "apikey"), stamped at the
+    /// session's first WS attachment. A connection authenticated as a
+    /// different principal may not attach — the pre-owner WS path let any
+    /// valid token take over any sessionId and replay its full history.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl Default for SessionMetadata {
@@ -62,6 +118,8 @@ impl Default for SessionMetadata {
             conversation_summary: None,
             summary_up_to_index: None,
             preview: None,
+
+            owner: None,
         }
     }
 }
@@ -90,6 +148,39 @@ pub struct SessionMessage {
     /// Per-round thinking content for grouped rendering (round number → thinking text).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub round_thinking: Option<serde_json::Value>,
+    /// Runtime guard notes for the user (incomplete action, guard budget
+    /// spent, …) — rendered as callouts by the frontend, never part of
+    /// `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_notes: Option<Vec<String>>,
+    /// Persisted End.goalStatus snapshot (opaque JSON). History returns
+    /// this as-is — never recomputed from live TaskState. Wire key
+    /// `goalStatus` (camelCase, matches the live End event).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "goalStatus"
+    )]
+    pub goal_status: Option<serde_json::Value>,
+    /// Persisted End.endReason (`normal` / `interrupted` / …).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "endReason")]
+    pub end_reason: Option<String>,
+    /// Ordered content nodes (v1 inline-@ protocol). Opaque JSON matching
+    /// the API `ChatContentNode` shape; camelCase on the wire for the
+    /// history client (`contentNodes`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "contentNodes"
+    )]
+    pub content_nodes: Option<Vec<serde_json::Value>>,
+    /// Protocol version for `content_nodes` (currently `1`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "contentVersion"
+    )]
+    pub content_version: Option<u32>,
     /// Message timestamp.
     pub timestamp: i64,
 }
@@ -97,11 +188,15 @@ pub struct SessionMessage {
 /// An image attached to a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMessageImage {
-    /// Base64 data URL (e.g., "data:image/png;base64,...").
+    /// Base64 data URL (e.g., "data:image/png;base64,...") or durable
+    /// `/api/images/<file>` reference after persistence.
     pub data: String,
     /// MIME type (e.g., "image/png").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Optional companion / VLM caption for this image (session album).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
 }
 
 impl SessionMessage {
@@ -117,6 +212,11 @@ impl SessionMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -133,6 +233,11 @@ impl SessionMessage {
             images: Some(images),
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -149,6 +254,11 @@ impl SessionMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -165,6 +275,11 @@ impl SessionMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -181,6 +296,11 @@ impl SessionMessage {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         }
     }
@@ -226,8 +346,22 @@ pub struct PendingStreamState {
     pub updated_at: i64,
     /// Tool calls detected so far (if any)
     pub tool_calls: Option<Vec<serde_json::Value>>,
-    /// Whether the stream was intentionally interrupted
-    pub interrupted: bool,
+    /// Per-round narration content (the client moves each round's text out
+    /// of `content` on IntermediateEnd; the pending snapshot mirrors that
+    /// so a restored bubble shows rounds correctly and the final content is
+    /// only the LAST round's). Stringified round numbers as keys.
+    #[serde(default)]
+    pub round_contents: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The round the turn is CURRENTLY in (1-based). Restoring a page mid-
+    /// turn without this left the client's round counter at 1 — the next
+    /// intermediate_end wrote round 3's narration into the round-1 slot,
+    /// overwriting the recovered round 1.
+    #[serde(default = "default_round")]
+    pub current_round: u32,
+}
+
+fn default_round() -> u32 {
+    1
 }
 
 /// Current stage of stream processing.
@@ -251,6 +385,30 @@ pub enum StreamStage {
     Complete,
 }
 
+/// Pending tool results are the one UNBOUNDED field: a shell cat of a
+/// large file lands verbatim in the snapshot, rewritten to redb on every
+/// ToolCallEnd and shipped whole on every 3s poll. Cap at 8 KiB with a
+/// marker — the restored display shows the head, the completed turn
+/// persists the full result regardless.
+fn truncate_pending_tool_result(result: &serde_json::Value) -> serde_json::Value {
+    const MAX_TOOL_RESULT_BYTES: usize = 8 * 1024;
+    let s = match result.as_str() {
+        Some(s) => s,
+        None => return result.clone(),
+    };
+    if s.len() <= MAX_TOOL_RESULT_BYTES {
+        return result.clone();
+    }
+    let mut cut = MAX_TOOL_RESULT_BYTES;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    serde_json::Value::String(format!(
+        "{}\n…[pending snapshot truncated at 8 KiB — full result persists in the completed turn]",
+        &s[..cut]
+    ))
+}
+
 impl PendingStreamState {
     /// Create a new pending stream state.
     pub fn new(session_id: String, user_message: String) -> Self {
@@ -264,21 +422,106 @@ impl PendingStreamState {
             started_at: now,
             updated_at: now,
             tool_calls: None,
-            interrupted: false,
+            round_contents: None,
+            current_round: 1,
         }
     }
 
     /// Update the content and timestamp.
-    pub fn update_content(&mut self, content: impl Into<String>) {
-        self.content = content.into();
+    ///
+    /// APPENDS the delta — the stream delivers Content events as chunks
+    /// (the WS client concatenates them the same way). The old replace
+    /// semantics stored only the LAST chunk, so resuming after a page
+    /// refresh restored an answer missing everything but its final few
+    /// characters (live-test regression 2026-10-08).
+    pub fn update_content(&mut self, delta: impl Into<String>) {
+        self.content.push_str(&delta.into());
+        Self::truncate_pending_field(&mut self.content);
         self.updated_at = chrono::Utc::now().timestamp();
     }
 
-    /// Update the thinking content and timestamp.
-    pub fn update_thinking(&mut self, thinking: impl Into<String>) {
-        self.thinking = thinking.into();
+    /// Update the thinking content and timestamp (same append semantics —
+    /// see [`update_content`]).
+    pub fn update_thinking(&mut self, delta: impl Into<String>) {
+        self.thinking.push_str(&delta.into());
+        Self::truncate_pending_field(&mut self.thinking);
         self.stage = StreamStage::Thinking;
         self.updated_at = chrono::Utc::now().timestamp();
+    }
+
+    /// Register a tool-call START (result filled later by
+    /// [`complete_tool_call`]). Bounded: display-only artifact.
+    pub fn push_tool_call(&mut self, call: serde_json::Value) {
+        const MAX_PENDING_TOOL_CALLS: usize = 200;
+        let v = self.tool_calls.get_or_insert_with(Vec::new);
+        if v.len() >= MAX_PENDING_TOOL_CALLS {
+            v.remove(0);
+        }
+        v.push(call);
+    }
+
+    /// Fill the result of the FIRST still-resultless call matching
+    /// (name, round) — the SAME forward direction the client's
+    /// ToolCallStart/End pairing uses (`findIndex` scans oldest-first).
+    /// The two projections must agree: the poll adopts this snapshot into
+    /// the client's state, so opposite pairing directions drift the two
+    /// views apart when one round holds several same-name calls.
+    pub fn complete_tool_call(
+        &mut self,
+        name: &str,
+        round: Option<u32>,
+        result: &serde_json::Value,
+    ) {
+        if let Some(v) = self.tool_calls.as_mut() {
+            for c in v.iter_mut() {
+                let name_ok = c.get("name").and_then(|n| n.as_str()) == Some(name);
+                let resultless = c.get("result").map(|r| r.is_null()).unwrap_or(true);
+                let round_ok = match round {
+                    Some(r) => c.get("round").and_then(|x| x.as_u64()) == Some(r as u64),
+                    None => true,
+                };
+                if name_ok && resultless && round_ok {
+                    c["result"] = truncate_pending_tool_result(result);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Move the current round's accumulated content into `round_contents`
+    /// and reset `content` — the client does the same on IntermediateEnd:
+    /// the restored bubble's final content must be the LAST round's text,
+    /// with earlier rounds' narration in the round sections.
+    pub fn rotate_round(&mut self, round: u32) {
+        // Track even on empty content: an intermediate round with no text
+        // still advances the round the client must resume into.
+        self.current_round = self.current_round.max(round + 1);
+        if self.content.is_empty() {
+            return;
+        }
+        let map = self.round_contents.get_or_insert_with(serde_json::Map::new);
+        let key = round.to_string();
+        let prev = map.get(&key).and_then(|v| v.as_str()).unwrap_or("");
+        let merged = format!("{prev}{}", self.content);
+        map.insert(key, serde_json::Value::String(merged));
+        self.content.clear();
+    }
+
+    /// Pending state is a display/recovery artifact — the completed turn is
+    /// persisted in full by `persist_history`. Beyond the cap the OLDEST
+    /// text is dropped (char-boundary-safe) so a pathological stream cannot
+    /// grow redb writes unboundedly.
+    fn truncate_pending_field(field: &mut String) {
+        const MAX_PENDING_FIELD_BYTES: usize = 1024 * 1024;
+        if field.len() <= MAX_PENDING_FIELD_BYTES {
+            return;
+        }
+        let cut = field.len() - MAX_PENDING_FIELD_BYTES;
+        let mut boundary = cut;
+        while boundary < field.len() && !field.is_char_boundary(boundary) {
+            boundary += 1;
+        }
+        field.replace_range(0..boundary, "…");
     }
 
     /// Update the processing stage.
@@ -358,19 +601,23 @@ impl SessionStore {
     /// code should keep using [`open`](Self::open).
     pub fn open_isolated<P: AsRef<Path>>(path: P) -> Result<Arc<Self>, Error> {
         let path_str = path.as_ref().to_string_lossy().to_string();
-        // ":memory:" → unique temp file. redb 2.1 has no in-memory backend,
-        // and the global singleton would make parallel tests share one store.
-        // A unique path guarantees each call gets an independent store
-        // (matches TimeSeriesStorage::memory's pattern).
-        let db_path: std::path::PathBuf = if path_str == ":memory:" {
-            std::env::temp_dir().join(format!("session_isolated_{}.redb", uuid::Uuid::new_v4()))
+        // ":memory:" gets a genuine in-memory database, so each call is
+        // independent (the singleton would otherwise make parallel tests share
+        // one store). It used to fall back to a unique temp file because "redb
+        // 2.1 has no in-memory backend" — true when that note was written, and
+        // not any more; the file was never removed, so a test run left
+        // thousands behind.
+        let db = if path_str == ":memory:" {
+            Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .map_err(|e| Error::Storage(e.to_string()))?
         } else {
-            path.as_ref().to_path_buf()
-        };
-        let db = if db_path.exists() {
-            Database::open(&db_path)?
-        } else {
-            Database::create(&db_path)?
+            let db_path = path.as_ref();
+            if db_path.exists() {
+                Database::open(db_path)?
+            } else {
+                Database::create(db_path)?
+            }
         };
         Ok(Arc::new(SessionStore {
             db: Arc::new(db),
@@ -462,6 +709,14 @@ impl SessionStore {
                 messages.len(),
                 session_id
             );
+
+            // Touch the session's recency stamp in the SAME transaction:
+            // list_sessions (and the summary worker's "recent sessions")
+            // sorts by this stamp, and it used to be creation-only — a
+            // long-lived active session never came up for summarization
+            // while newest-created ones were re-picked every cycle.
+            let mut sessions_table = write_txn.open_table(SESSIONS_TABLE)?;
+            sessions_table.insert(session_id, chrono::Utc::now().timestamp())?;
         }
         write_txn.commit()?;
         Ok(())
@@ -541,6 +796,38 @@ impl SessionStore {
         Ok(messages)
     }
 
+    /// First `limit` persisted messages of a session, in order.
+    ///
+    /// For a caller that only needs the opening of a history — the session
+    /// listing reads the first user message for its preview — this avoids
+    /// reading and deserializing every message. Messages that fail to
+    /// deserialize are skipped, as in [`Self::load_history`].
+    pub fn load_history_prefix(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>, Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(HISTORY_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(Error::Storage(format!("Failed to open table: {}", e))),
+        };
+
+        let start_key = (session_id, 0u64);
+        let end_key = (session_id, u64::MAX);
+
+        let mut messages = Vec::new();
+        for result in table.range(start_key..=end_key)?.take(limit) {
+            let (_key, value) = result?;
+            if let Ok(message) = serde_json::from_slice(value.value().as_slice()) {
+                messages.push(message);
+            }
+        }
+
+        Ok(messages)
+    }
+
     /// Append a single message to session history (incremental save).
     /// This is more efficient than save_history for adding new messages.
     pub fn append_message(&self, session_id: &str, message: &SessionMessage) -> Result<u64, Error> {
@@ -565,6 +852,11 @@ impl SessionStore {
             let key = (session_id, max_index);
             let value = serde_json::to_vec(message)?;
             table.insert(key, value)?;
+
+            // Refresh the recency stamp (see save_history) in the same
+            // transaction so incremental appends keep the session "recent".
+            let mut sessions_table = write_txn.open_table(SESSIONS_TABLE)?;
+            sessions_table.insert(session_id, chrono::Utc::now().timestamp())?;
 
             max_index
         };
@@ -608,6 +900,11 @@ impl SessionStore {
                 next_index += 1;
             }
 
+            // Refresh the recency stamp (see save_history) in the same
+            // transaction so incremental appends keep the session "recent".
+            let mut sessions_table = write_txn.open_table(SESSIONS_TABLE)?;
+            sessions_table.insert(session_id, chrono::Utc::now().timestamp())?;
+
             messages.len()
         };
         write_txn.commit()?;
@@ -641,6 +938,24 @@ impl SessionStore {
         {
             let mut meta_table = write_txn.open_table(SESSIONS_META_TABLE)?;
             let _ = meta_table.remove(session_id); // Ignore error if not exists
+        }
+
+        // Delete op ledger (table may not exist on older DBs). Errors
+        // propagate — mirroring delete_op_ledger's fail-closed contract — so
+        // a partially-deleted session can never silently leave ledger rows
+        // under a dead session id.
+        match write_txn.open_table(OP_LEDGER_TABLE) {
+            Ok(mut ledger_table) => {
+                ledger_table.remove(session_id)?;
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                // Nothing to delete on older DBs.
+            }
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "Failed to open op_ledgers table for delete: {e}"
+                )));
+            }
         }
 
         // Delete from history table - we need to collect the actual key tuples
@@ -683,13 +998,21 @@ impl SessionStore {
             Err(_) => return Ok(Vec::new()),
         };
 
-        let mut sessions = Vec::new();
+        // The table value is the session's recency stamp: set at creation
+        // and refreshed by every history write (save_history and the
+        // append_* paths touch it in the same transaction). redb iterates
+        // in KEY order — with UUID session IDs that is a random-but-fixed
+        // order, so a `take(n)` caller summarizing "recent sessions" would
+        // keep picking the same arbitrary subset forever. Sort by the
+        // stamp, newest first — ACTIVITY order, not creation order.
+        let mut sessions: Vec<(String, i64)> = Vec::new();
         for result in table.iter()? {
-            let key = result?.0;
-            sessions.push(key.value().to_string());
+            let (key, value) = result?;
+            sessions.push((key.value().to_string(), value.value()));
         }
+        sessions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
 
-        Ok(sessions)
+        Ok(sessions.into_iter().map(|(id, _)| id).collect())
     }
 
     /// Check if a session exists.
@@ -710,6 +1033,42 @@ impl SessionStore {
             Err(_) => return Ok(None),
         };
         Ok(table.get(session_id)?.map(|v| v.value()))
+    }
+
+    /// Delete sessions whose last-update timestamp is older than
+    /// `max_age_secs`. Returns the number of sessions removed.
+    ///
+    /// Chat sessions had no retention — sessions.redb grew forever on
+    /// long-lived edge boxes (telemetry already had retention). Sessions
+    /// without a timestamp are kept (never delete what we cannot date).
+    pub fn cleanup_old_sessions(&self, max_age_secs: i64) -> Result<usize, Error> {
+        let cutoff = chrono::Utc::now().timestamp() - max_age_secs;
+        let mut to_delete = Vec::new();
+        for session_id in self.list_sessions()? {
+            match self.get_session_timestamp(&session_id)? {
+                Some(ts) if ts < cutoff => to_delete.push(session_id),
+                _ => {}
+            }
+        }
+        let count = to_delete.len();
+        for session_id in &to_delete {
+            if let Err(e) = self.delete_session(session_id) {
+                tracing::warn!(
+                    category = "storage",
+                    session_id = %session_id,
+                    error = %e,
+                    "Session retention: failed to delete expired session"
+                );
+            }
+        }
+        if count > 0 {
+            tracing::info!(
+                category = "storage",
+                count,
+                "Session retention: removed expired chat sessions"
+            );
+        }
+        Ok(count)
     }
 
     /// Save session metadata (title, etc.).
@@ -763,6 +1122,253 @@ impl SessionStore {
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    // ========== Op ledger (anti-replay across process restart) ==========
+
+    /// Peek `version` from persisted op-ledger JSON (default 0 when absent).
+    fn peek_op_ledger_version(ledger_json: &[u8]) -> Result<u64, Error> {
+        #[derive(Deserialize)]
+        struct VersionPeek {
+            #[serde(default)]
+            version: u64,
+        }
+        let peek: VersionPeek = serde_json::from_slice(ledger_json).map_err(|e| {
+            Error::Storage(format!(
+                "op ledger JSON unreadable (refusing overwrite until clear/recover): {e}"
+            ))
+        })?;
+        Ok(peek.version)
+    }
+
+    /// Persist a session's minimal Operation + write ledger (opaque JSON).
+    ///
+    /// Single durable write path for production: callers must supply
+    /// strictly increasing `version`. Stale snapshots (`version` ≤ on-disk)
+    /// are rejected so interleaved `persist_history` cannot clobber a newer
+    /// write-intent commit. Unreadable on-disk bytes are also refused —
+    /// only [`Self::delete_op_ledger`] (explicit clear/recover) clears them.
+    pub fn save_op_ledger(&self, session_id: &str, ledger_json: &[u8]) -> Result<(), Error> {
+        let incoming_version = Self::peek_op_ledger_version(ledger_json)?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn
+                .open_table(OP_LEDGER_TABLE)
+                .map_err(|e| Error::Storage(format!("Failed to open op_ledgers table: {}", e)))?;
+            if let Some(existing) = table.get(session_id)? {
+                let existing_bytes = existing.value();
+                let existing_version = match Self::peek_op_ledger_version(&existing_bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(Error::Storage(format!(
+                            "refusing to overwrite unreadable op ledger until clear/recover: {e}"
+                        )));
+                    }
+                };
+                if incoming_version <= existing_version {
+                    return Err(Error::Storage(format!(
+                        "stale op ledger write rejected (incoming version {incoming_version} <= on-disk {existing_version})"
+                    )));
+                }
+            }
+            table.insert(session_id, ledger_json.to_vec())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Test seam: write raw op-ledger bytes bypassing version/parse gates
+    /// (seed corrupt fixtures). Never compiled into release builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn debug_write_op_ledger_raw(
+        &self,
+        session_id: &str,
+        ledger_json: &[u8],
+    ) -> Result<(), Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn
+                .open_table(OP_LEDGER_TABLE)
+                .map_err(|e| Error::Storage(format!("Failed to open op_ledgers table: {}", e)))?;
+            table.insert(session_id, ledger_json.to_vec())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Load a session's persisted op ledger JSON, if any.
+    ///
+    /// Fail-closed: only a truly missing table or missing key yields
+    /// `Ok(None)`. `begin_read` / non-missing table errors (type mismatch,
+    /// storage, already-open, …) return `Err` so callers mark the ledger
+    /// untrusted instead of treating failure as an empty trusted ledger.
+    pub fn load_op_ledger(&self, session_id: &str) -> Result<Option<Vec<u8>>, Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(OP_LEDGER_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "Failed to open op_ledgers table: {}",
+                    e
+                )));
+            }
+        };
+        match table.get(session_id)? {
+            Some(value) => Ok(Some(value.value())),
+            None => Ok(None),
+        }
+    }
+
+    /// Test seam: replace `op_ledgers` with a wrong value type so
+    /// [`load_op_ledger`] returns `Err` (TableTypeMismatch), not `Ok(None)`.
+    ///
+    /// Gated behind `test-utils` so it never compiles into a release binary.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn debug_corrupt_op_ledger_table_type(&self) -> Result<(), Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let _ = write_txn.delete_table(OP_LEDGER_TABLE)?;
+            const WRONG: TableDefinition<&str, i64> = TableDefinition::new("op_ledgers");
+            let mut table = write_txn.open_table(WRONG)?;
+            table.insert("__type_mismatch__", 0i64)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Delete a session's persisted op ledger (no-op when missing).
+    ///
+    /// Missing table → Ok (nothing to delete). Non-missing open errors
+    /// (type mismatch, …) → Err so `clear_history` can fail closed to the
+    /// caller instead of reporting success while the ledger remains.
+    pub fn delete_op_ledger(&self, session_id: &str) -> Result<(), Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = match write_txn.open_table(OP_LEDGER_TABLE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(e) => {
+                    return Err(Error::Storage(format!(
+                        "Failed to open op_ledgers table for delete: {e}"
+                    )));
+                }
+            };
+            table.remove(session_id)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// List all persisted `(session_id, ledger_json)` entries from `op_ledgers`.
+    pub fn list_op_ledgers(&self) -> Result<Vec<(String, Vec<u8>)>, Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(OP_LEDGER_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "Failed to open op_ledgers table: {e}"
+                )));
+            }
+        };
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            out.push((k.value().to_string(), v.value()));
+        }
+        Ok(out)
+    }
+
+    /// Insert or update a persisted operation record by `operation_id`.
+    pub fn upsert_operation_record(&self, record: &PersistedOperationRecord) -> Result<(), Error> {
+        if record.operation_id.trim().is_empty() {
+            return Err(Error::InvalidInput("operation_id must not be empty".into()));
+        }
+        let bytes = serde_json::to_vec(record)
+            .map_err(|e| Error::Storage(format!("Failed to serialize operation record: {e}")))?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(OPERATIONS_INDEX_TABLE).map_err(|e| {
+                Error::Storage(format!("Failed to open operations_index table: {e}"))
+            })?;
+            table.insert(record.operation_id.as_str(), bytes)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Look up one persisted operation record by `operation_id`.
+    pub fn get_operation_record(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<PersistedOperationRecord>, Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(OPERATIONS_INDEX_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "Failed to open operations_index table: {e}"
+                )));
+            }
+        };
+        let Some(raw) = table.get(operation_id)? else {
+            return Ok(None);
+        };
+        let record = serde_json::from_slice::<PersistedOperationRecord>(&raw.value())
+            .map_err(|e| Error::Storage(format!("Failed to decode operation record: {e}")))?;
+        Ok(Some(record))
+    }
+
+    /// List persisted operation records ordered newest-first (`updated_at_ms` desc).
+    pub fn list_operation_records(
+        &self,
+        session_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PersistedOperationRecord>, Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(OPERATIONS_INDEX_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "Failed to open operations_index table: {e}"
+                )));
+            }
+        };
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (_k, v) = entry?;
+            let Ok(rec) = serde_json::from_slice::<PersistedOperationRecord>(&v.value()) else {
+                continue;
+            };
+            if let Some(sid) = session_id {
+                if rec.session_id != sid {
+                    continue;
+                }
+            }
+            if let Some(st) = status {
+                if !rec.status.eq_ignore_ascii_case(st) {
+                    continue;
+                }
+            }
+            out.push(rec);
+        }
+        out.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.operation_id.cmp(&b.operation_id))
+        });
+        if limit > 0 && out.len() > limit {
+            out.truncate(limit);
+        }
+        Ok(out)
     }
 
     // ========== P0.3: Pending Stream State Management ==========
@@ -946,6 +1552,7 @@ mod tests {
 
     /// Helper to create a temporary SessionStore for tests
     fn create_temp_store() -> Arc<SessionStore> {
+        crate::prune_stale_temp_entries("session_test_", std::time::Duration::from_secs(3600));
         let temp_dir = std::env::temp_dir().join(format!("session_test_{}", uuid::Uuid::new_v4()));
         // Remove existing directory if it exists
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -977,6 +1584,11 @@ mod tests {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         };
         let msg2 = SessionMessage {
@@ -989,6 +1601,11 @@ mod tests {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: chrono::Utc::now().timestamp(),
         };
         let messages = vec![msg1, msg2];
@@ -1010,6 +1627,48 @@ mod tests {
         // Delete session
         store.delete_session("test-session").unwrap();
         assert!(!store.session_exists("test-session").unwrap());
+    }
+
+    /// The session listing reads a history's opening messages only: it must
+    /// get the first `limit` in stored order and nothing else.
+    #[test]
+    fn load_history_prefix_reads_only_the_opening() {
+        let store = create_temp_store();
+        store.save_session_id("test-session").unwrap();
+        let messages: Vec<SessionMessage> = (0..10)
+            .map(|i| {
+                if i % 2 == 0 {
+                    SessionMessage::user(format!("u{i}"))
+                } else {
+                    SessionMessage::assistant(format!("a{i}"))
+                }
+            })
+            .collect();
+        store.save_history("test-session", &messages).unwrap();
+
+        let head = store.load_history_prefix("test-session", 3).unwrap();
+        assert_eq!(
+            head.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["u0", "a1", "u2"]
+        );
+
+        // A limit past the end yields everything, in order.
+        let all = store.load_history_prefix("test-session", 50).unwrap();
+        assert_eq!(all.len(), 10);
+        assert_eq!(all[9].content, "a9");
+
+        // Unknown session: nothing, not an error.
+        assert!(store
+            .load_history_prefix("no-such-session", 3)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A store that never held a history has no history table yet.
+    #[test]
+    fn load_history_prefix_on_a_store_without_history_table() {
+        let store = SessionStore::open_isolated(":memory:").unwrap();
+        assert!(store.load_history_prefix("any", 3).unwrap().is_empty());
     }
 
     #[test]
@@ -1079,6 +1738,11 @@ mod tests {
             images: None,
             round_contents: None,
             round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
             timestamp: 12345,
         };
 
@@ -1087,6 +1751,86 @@ mod tests {
         assert_eq!(deserialized.role, "user");
         assert_eq!(deserialized.content, "Hello");
         assert_eq!(deserialized.timestamp, 12345);
+    }
+
+    #[test]
+    fn session_message_goal_status_round_trip_camel_case() {
+        let msg = SessionMessage {
+            role: "assistant".to_string(),
+            content: "trying".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_call_name: None,
+            thinking: None,
+            images: None,
+            round_contents: None,
+            round_thinking: None,
+            system_notes: None,
+            goal_status: Some(serde_json::json!({
+                "status": "incomplete",
+                "reason": "missing delivery",
+                "level": "none",
+                "operation_id": "op-1",
+                "task_complete_ok": false,
+                "physical_ok": false
+            })),
+            end_reason: Some("normal".to_string()),
+            content_nodes: None,
+            content_version: None,
+            timestamp: 42,
+        };
+        let v: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
+        assert!(v.get("goalStatus").is_some(), "wire key must be camelCase");
+        assert_eq!(v["goalStatus"]["status"], "incomplete");
+        assert_eq!(v["endReason"], "normal");
+        assert!(v.get("goal_status").is_none());
+
+        let back: SessionMessage = serde_json::from_value(v).unwrap();
+        assert_eq!(back.goal_status.as_ref().unwrap()["status"], "incomplete");
+        assert_eq!(back.end_reason.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn session_message_content_nodes_round_trip_camel_case() {
+        let msg = SessionMessage {
+            role: "user".to_string(),
+            content: "检查".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_call_name: None,
+            thinking: None,
+            images: None,
+            round_contents: None,
+            round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: Some(vec![
+                serde_json::json!({"kind":"text","text":"检查"}),
+                serde_json::json!({
+                    "kind":"reference",
+                    "type":"device",
+                    "id":"sensor-001",
+                    "labelSnapshot":"温湿度"
+                }),
+            ]),
+            content_version: Some(1),
+            timestamp: 99,
+        };
+        let v: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
+        assert!(
+            v.get("contentNodes").is_some(),
+            "wire key must be camelCase"
+        );
+        assert!(v.get("contentVersion").is_some());
+        assert!(v.get("content_nodes").is_none());
+
+        let back: SessionMessage = serde_json::from_value(v).unwrap();
+        assert_eq!(back.content_version, Some(1));
+        assert_eq!(back.content_nodes.as_ref().unwrap().len(), 2);
+        assert_eq!(back.content_nodes.as_ref().unwrap()[1]["id"], "sensor-001");
     }
 
     #[test]
@@ -1411,6 +2155,110 @@ mod tests {
     }
 
     #[test]
+    fn test_op_ledger_round_trip_and_delete() {
+        let store = create_temp_store();
+        store.save_session_id("ledger-session").unwrap();
+        let payload = br#"{"version":1,"operations":[],"write_ledger":[],"current_operation_id":"op-1","turn_count":3}"#;
+        store.save_op_ledger("ledger-session", payload).unwrap();
+        let loaded = store.load_op_ledger("ledger-session").unwrap().unwrap();
+        assert_eq!(loaded, payload);
+        store.delete_op_ledger("ledger-session").unwrap();
+        assert!(store.load_op_ledger("ledger-session").unwrap().is_none());
+        // delete_session also drops the ledger
+        store.save_op_ledger("ledger-session", payload).unwrap();
+        store.delete_session("ledger-session").unwrap();
+        assert!(store.load_op_ledger("ledger-session").unwrap().is_none());
+    }
+
+    #[test]
+    fn save_op_ledger_rejects_stale_version_keeps_newer() {
+        let store = create_temp_store();
+        store.save_session_id("race-session").unwrap();
+        // Minimal JSON — version gate only peeks `version`, not full schema.
+        let newer = br#"{"version":2,"operations":[],"write_ledger":[],"current_operation_id":"op-intent","turn_count":1}"#;
+        store.save_op_ledger("race-session", newer).unwrap();
+
+        let stale = br#"{"version":1,"operations":[],"write_ledger":[],"current_operation_id":"","turn_count":0}"#;
+        let err = store
+            .save_op_ledger("race-session", stale)
+            .expect_err("stale version must be rejected");
+        assert!(
+            err.to_string().contains("stale op ledger write rejected"),
+            "got: {err}"
+        );
+
+        let loaded = store.load_op_ledger("race-session").unwrap().unwrap();
+        assert_eq!(
+            loaded, newer,
+            "newer write intent must survive stale snapshot"
+        );
+    }
+
+    #[test]
+    fn save_op_ledger_refuses_overwrite_of_unreadable_bytes() {
+        let store = create_temp_store();
+        store.save_session_id("corrupt-session").unwrap();
+        store
+            .debug_write_op_ledger_raw("corrupt-session", b"not-json{{{")
+            .unwrap();
+        let newer = br#"{"version":1,"operations":[]}"#;
+        let err = store
+            .save_op_ledger("corrupt-session", newer)
+            .expect_err("unreadable on-disk ledger must block overwrite");
+        assert!(err.to_string().contains("unreadable"), "got: {err}");
+        let loaded = store.load_op_ledger("corrupt-session").unwrap().unwrap();
+        assert_eq!(loaded, b"not-json{{{");
+        // Explicit clear/recover unlocks writes.
+        store.delete_op_ledger("corrupt-session").unwrap();
+        store.save_op_ledger("corrupt-session", newer).unwrap();
+    }
+
+    #[test]
+    fn load_op_ledger_missing_table_or_key_is_none() {
+        // Fresh store never created op_ledgers → TableDoesNotExist → Ok(None).
+        let store = SessionStore::open_isolated(":memory:").unwrap();
+        assert!(store.load_op_ledger("no-such-session").unwrap().is_none());
+
+        // Table exists after a save, but a different key is still Ok(None).
+        store
+            .save_op_ledger("other-session", br#"{"version":1,"operations":[]}"#)
+            .unwrap();
+        assert!(store.load_op_ledger("no-such-session").unwrap().is_none());
+    }
+
+    #[test]
+    fn load_op_ledger_table_type_mismatch_is_err_not_none() {
+        // Same table name, wrong value type: must Err (fail closed), not Ok(None).
+        // Pre-fix string match on "Table" swallowed TableTypeMismatch as missing.
+        let temp_dir =
+            std::env::temp_dir().join(format!("session_ledger_mismatch_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("sessions.redb");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                const WRONG: TableDefinition<&str, i64> = TableDefinition::new("op_ledgers");
+                let mut table = write.open_table(WRONG).unwrap();
+                table.insert("sid", 1i64).unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let store = SessionStore::open_isolated(&db_path).unwrap();
+        let err = store
+            .load_op_ledger("sid")
+            .expect_err("type mismatch must not look like a missing ledger");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("op_ledgers") || msg.contains("Failed to open"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn test_save_history_overwrites() {
         let store = create_temp_store();
 
@@ -1452,6 +2300,7 @@ mod tests {
             conversation_summary: Some("This is a summary".to_string()),
             summary_up_to_index: Some(5),
             preview: None,
+            owner: None,
         };
         store
             .save_session_metadata("test-session", &metadata)
@@ -1496,6 +2345,69 @@ mod tests {
         // Verify deleted
         let loaded = store.get_pending_stream("test-session").unwrap();
         assert!(loaded.is_none());
+    }
+
+    /// Regression (2026-10-08 live test): Content/Thinking events are
+    /// DELTAS. The old replace semantics kept only the last chunk, so a
+    /// page refresh mid-answer restored an answer missing everything but
+    /// its final few characters, plus a stray fragmentary thinking block.
+    #[test]
+    fn test_pending_stream_accumulates_deltas() {
+        let mut state = PendingStreamState::new("s".to_string(), "q".to_string());
+        state.update_content("你好");
+        state.update_content("，");
+        state.update_content("世界");
+        assert_eq!(state.content, "你好，世界");
+
+        state.update_thinking("先想");
+        state.update_thinking("第一步");
+        assert_eq!(state.thinking, "先想第一步");
+    }
+
+    /// The cap drops the OLDEST text and never splits a CJK char.
+    #[test]
+    fn test_pending_stream_cap_keeps_newest_tail() {
+        let mut state = PendingStreamState::new("s".to_string(), "q".to_string());
+        let big = "汉".repeat(600_000); // 1.8 MB > the 1 MiB cap
+        state.update_content(&big);
+        state.update_content("结尾");
+        assert!(state.content.len() <= 1024 * 1024 + 10);
+        assert!(state.content.ends_with("结尾"));
+        assert!(state.content.starts_with('…'));
+    }
+
+    /// The restored bubble needs the tool process: Start registers a
+    /// resultless call, End fills the most recent match (name+round).
+    #[test]
+    fn test_pending_stream_tool_call_pairing() {
+        let mut state = PendingStreamState::new("s".to_string(), "q".to_string());
+        state.push_tool_call(serde_json::json!({
+            "name": "shell", "id": "", "arguments": {"command": "ls"},
+            "result": null, "round": 1,
+        }));
+        state.push_tool_call(serde_json::json!({
+            "name": "shell", "id": "", "arguments": {"command": "pwd"},
+            "result": null, "round": 2,
+        }));
+        // End for round 2's call must not clobber round 1's resultless one.
+        state.complete_tool_call("shell", Some(2), &serde_json::json!({"exit_code": 0}));
+        let calls = state.tool_calls.unwrap();
+        assert!(calls[0]["result"].is_null());
+        assert_eq!(calls[1]["result"]["exit_code"], 0);
+    }
+
+    /// Multi-round semantics: IntermediateEnd moves the round's text into
+    /// round_contents and resets content — the restored bubble's final
+    /// content must be the LAST round's, not a concatenation of all.
+    #[test]
+    fn test_pending_stream_round_rotation() {
+        let mut state = PendingStreamState::new("s".to_string(), "q".to_string());
+        state.update_content("第一轮旁白");
+        state.rotate_round(1);
+        state.update_content("最终回答");
+        assert_eq!(state.content, "最终回答");
+        let rounds = state.round_contents.unwrap();
+        assert_eq!(rounds.get("1").unwrap().as_str().unwrap(), "第一轮旁白");
     }
 
     #[test]
@@ -1572,10 +2484,12 @@ mod tests {
             SessionMessageImage {
                 data: "data:image/png;base64,iVBORw0KG...".to_string(),
                 mime_type: Some("image/png".to_string()),
+                caption: None,
             },
             SessionMessageImage {
                 data: "data:image/jpeg;base64,/9j/4AAQ...".to_string(),
                 mime_type: Some("image/jpeg".to_string()),
+                caption: None,
             },
         ];
 
@@ -1844,7 +2758,6 @@ mod tests {
         assert!(state.thinking.is_empty());
         assert!(matches!(state.stage, StreamStage::Waiting));
         assert!(state.tool_calls.is_none());
-        assert!(!state.interrupted);
 
         // Elapsed time should be small
         let elapsed = state.elapsed_secs();
@@ -1886,5 +2799,206 @@ mod tests {
         // Cleanup on empty database should return 0
         let cleaned = store.cleanup_stale_pending_streams().unwrap();
         assert_eq!(cleaned, 0);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("nm-session-retention-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn seed(store: &SessionStore, id: &str, age_secs: i64) {
+        store.save_session_id(id).unwrap();
+        store
+            .save_history(id, &[SessionMessage::user("hello")])
+            .unwrap();
+        // Overwrite the stamp with an artificial LAST-ACTIVITY age. History
+        // writes refresh the stamp (activity semantics — see save_history),
+        // so the overwrite must come AFTER the write to simulate a session
+        // whose last message landed N seconds ago.
+        let old_ts = chrono::Utc::now().timestamp() - age_secs;
+        let write_txn = store.db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(SESSIONS_TABLE).unwrap();
+            table.insert(id, old_ts).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    #[test]
+    fn cleanup_removes_only_expired_sessions() {
+        let dir = scratch("expired");
+        let store = SessionStore::open_isolated(dir.join("sessions.redb")).unwrap();
+
+        seed(&store, "ancient", 100 * 24 * 3600); // 100 days old
+        seed(&store, "fresh", 60); // one minute old
+
+        let removed = store.cleanup_old_sessions(30 * 24 * 3600).unwrap(); // 30-day window
+        assert_eq!(removed, 1);
+        assert!(!store.session_exists("ancient").unwrap());
+        assert!(store.session_exists("fresh").unwrap());
+        // history went with the session
+        assert!(store.load_history("ancient").unwrap().is_empty());
+        assert_eq!(store.load_history("fresh").unwrap().len(), 1);
+
+        // Idempotent second pass
+        assert_eq!(store.cleanup_old_sessions(30 * 24 * 3600).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A history write REFRESHES the session's recency stamp: list_sessions
+    /// sorts by it and the chat-summary worker picks "recent sessions" from
+    /// it, so the stamp must mean last ACTIVITY, not creation (the
+    /// creation-only stamp starved long-lived active sessions of
+    /// summarization forever).
+    #[test]
+    fn history_write_refreshes_recency_stamp() {
+        let dir = scratch("touch");
+        let store = SessionStore::open_isolated(dir.join("sessions.redb")).unwrap();
+
+        store.save_session_id("s").unwrap();
+        // Age the stamp artificially: a session whose last activity was
+        // 90 days ago.
+        let old_ts = chrono::Utc::now().timestamp() - 90 * 24 * 3600;
+        let write_txn = store.db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(SESSIONS_TABLE).unwrap();
+            table.insert("s", old_ts).unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        // One incremental append — any history write counts — must bring the
+        // session back inside the retention window.
+        store
+            .append_message("s", &SessionMessage::user("still alive"))
+            .unwrap();
+
+        assert_eq!(
+            store.cleanup_old_sessions(30 * 24 * 3600).unwrap(),
+            0,
+            "an active session must not be reaped as old"
+        );
+        assert!(store.session_exists("s").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_keeps_sessions_without_timestamp() {
+        let dir = scratch("undated");
+        let store = SessionStore::open_isolated(dir.join("sessions.redb")).unwrap();
+        store.save_session_id("undated").unwrap();
+        // remove its timestamp entirely
+        let write_txn = store.db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(SESSIONS_TABLE).unwrap();
+            table.remove("undated").unwrap();
+        }
+        write_txn.commit().unwrap();
+        // list_sessions comes from the sessions table — undated is now
+        // invisible to listing, so cleanup cannot touch it (safe by design).
+        assert_eq!(store.cleanup_old_sessions(1).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `list_sessions` orders by the session stamp, newest first. The old
+    /// implementation returned redb's key order — with UUID session IDs that
+    /// is a random-but-fixed permutation, so the chat-summary background job's
+    /// "take 5 recent sessions" kept summarizing the same arbitrary subset
+    /// forever (UUIDs that happen to sort first), never picking up new ones.
+    #[test]
+    fn list_sessions_orders_by_recency_not_key_order() {
+        let dir = scratch("recency");
+        let store = SessionStore::open_isolated(dir.join("sessions.redb")).unwrap();
+
+        seed(&store, "aaa-created-first", 500);
+        seed(&store, "zzz-created-last", 50);
+        seed(&store, "mmm-created-middle", 250);
+
+        let listed = store.list_sessions().unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                "zzz-created-last".to_string(),
+                "mmm-created-middle".to_string(),
+                "aaa-created-first".to_string()
+            ],
+            "newest stamp must come first regardless of key order"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_operation_records_roundtrip_filter_and_order() {
+        let dir = scratch("op-index");
+        let db_path = dir.join("sessions.redb");
+        {
+            let store = SessionStore::open_isolated(&db_path).unwrap();
+            store
+                .upsert_operation_record(&PersistedOperationRecord {
+                    operation_id: "op-1".into(),
+                    session_id: "sess-a".into(),
+                    domain: Some("device".into()),
+                    action: Some("control".into()),
+                    tool_name: "shell".into(),
+                    target: Some("device_a".into()),
+                    status: "succeeded".into(),
+                    result_summary: Some("adapter_accepted".into()),
+                    error_summary: None,
+                    evidence: vec!["delivery=adapter_accepted".into()],
+                    origin_turn_id: 1,
+                    created_at_ms: 1000,
+                    updated_at_ms: 1100,
+                })
+                .unwrap();
+            store
+                .upsert_operation_record(&PersistedOperationRecord {
+                    operation_id: "op-2".into(),
+                    session_id: "sess-b".into(),
+                    domain: Some("rule".into()),
+                    action: Some("create".into()),
+                    tool_name: "shell".into(),
+                    target: Some("rule_1".into()),
+                    status: "failed".into(),
+                    result_summary: None,
+                    error_summary: Some("offline".into()),
+                    evidence: vec![],
+                    origin_turn_id: 2,
+                    created_at_ms: 2000,
+                    updated_at_ms: 2500,
+                })
+                .unwrap();
+        }
+        // Reopen to prove redb persistence.
+        let reopened = SessionStore::open_isolated(&db_path).unwrap();
+        let got = reopened.get_operation_record("op-1").unwrap().unwrap();
+        assert_eq!(got.status, "succeeded");
+        assert!(got.is_terminal());
+        assert_eq!(got.target.as_deref(), Some("device_a"));
+
+        let all = reopened.list_operation_records(None, None, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].operation_id, "op-2");
+        assert_eq!(all[1].operation_id, "op-1");
+
+        let only_failed = reopened
+            .list_operation_records(None, Some("failed"), 10)
+            .unwrap();
+        assert_eq!(only_failed.len(), 1);
+        assert_eq!(only_failed[0].operation_id, "op-2");
+
+        let only_sess_a = reopened
+            .list_operation_records(Some("sess-a"), None, 10)
+            .unwrap();
+        assert_eq!(only_sess_a.len(), 1);
+        assert_eq!(only_sess_a[0].operation_id, "op-1");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

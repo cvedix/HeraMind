@@ -1,3 +1,16 @@
+
+/** Devices as returned by the automation resource APIs — the slim rule/
+ *  transform-builder shape (id/name/type/metrics/commands), not the full
+ *  canonical Device record. */
+type ResourceDevice = {
+  id: string
+  name: string
+  device_type: string
+  metrics?: Array<{ name: string; data_type: string; unit?: string | null }>
+  commands?: Array<{ name: string; description: string }>
+  online?: boolean
+}
+
 /**
  * HeraMind Automation Page
  *
@@ -8,24 +21,24 @@
 
 import { useState, useCallback, useEffect, useRef, useMemo } from "react"
 import { useDataVersion } from "@/hooks/useDataVersion"
+import type { AlertChannel, Device, DeviceType } from '@/types'
 import { useTranslation } from "react-i18next"
 import { useNavigate, useLocation } from "react-router-dom"
 import { PageLayout } from "@/components/layout/PageLayout"
-import { PageTabsBar, PageTabsContent, PageTabsBottomNav, Pagination } from "@/components/shared"
-import { Sparkles, GitBranch, Download, Upload, MoreVertical } from "lucide-react"
+import { PageTabsBar, PageTabsContent, Pagination, SearchInput } from "@/components/shared"
+import { Sparkles, GitBranch, Download, Upload } from "lucide-react"
 import { api } from "@/lib/api"
 import { useToast } from "@/hooks/use-toast"
 import { confirm } from "@/hooks/use-confirm"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
 import { showErrorToast } from "@/lib/error-messages"
 import { useIsMobile } from "@/hooks/useMobile"
-import { Button } from "@/components/ui/button"
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-  DropdownMenuSeparator,
+
+
+
+
+
 } from "@/components/ui/dropdown-menu"
 import type { TransformAutomation, Rule, Extension, ExtensionDataSourceInfo, TransformDataSourceInfo } from "@/types"
 
@@ -102,9 +115,9 @@ export function AutomationPage() {
   const [transformsPage, setTransformsPage] = useState(1)
 
   // Resources for dialogs (lazy-loaded)
-  const [devices, setDevices] = useState<any[]>([])
-  const [deviceTypes, setDeviceTypes] = useState<any[]>([])
-  const [ruleDevices, setRuleDevices] = useState<any[]>([])  // Devices with metrics for rules
+  const [devices, setDevices] = useState<ResourceDevice[]>([])
+  const [deviceTypes, setDeviceTypes] = useState<DeviceType[]>([])
+  const [ruleDevices, setRuleDevices] = useState<ResourceDevice[]>([])  // Devices with metrics for rules
   const [extensions, setExtensions] = useState<Extension[]>([])
   const [extensionDataSources, setExtensionDataSources] = useState<ExtensionDataSourceInfo[]>([])
   const [transformDataSources, setTransformDataSources] = useState<TransformDataSourceInfo[]>([])
@@ -145,15 +158,15 @@ export function AutomationPage() {
     setResourcesLoading(true)
     try {
       const [devicesData, typesResult, resourcesResult, extResult, channelsResult, agentsResult] = await Promise.all([
-        api.getDevices().catch((): any => ({ devices: [] })),
-        api.getDeviceTypes().catch((): any => ({ device_types: [] })),
-        api.getRuleResources().catch((): any => ({ devices: [] })),
+        api.getDevices().catch(() => ({ devices: [] as ResourceDevice[] })),
+        api.getDeviceTypes().catch(() => ({ device_types: [] as DeviceType[] })),
+        api.getRuleResources().catch(() => ({ devices: [] as ResourceDevice[] })),
         Promise.all([
           api.listExtensions().catch((): Extension[] => []),
           api.listAllDataSources().catch((): (ExtensionDataSourceInfo | TransformDataSourceInfo)[] => []),
         ]),
-        api.listMessageChannels().catch((): any => ({ channels: [] })),
-        api.listAgentSummaries().catch((): any => ({ agents: [] })),
+        api.listMessageChannels().catch(() => ({ channels: [] as AlertChannel[] })),
+        api.listAgentSummaries().catch(() => ({ agents: [] as Array<{ id: string; name: string }> })),
       ])
 
       setDevices(devicesData.devices || [])
@@ -165,8 +178,8 @@ export function AutomationPage() {
       setExtensionDataSources(dsData.filter((source): source is ExtensionDataSourceInfo => 'extension_id' in source))
       setTransformDataSources(dsData.filter((source): source is TransformDataSourceInfo => 'transform_id' in source))
 
-      setAgents((agentsResult.agents || []).map((a: any) => ({ id: a.id, name: a.name })))
-      setMessageChannels((channelsResult.channels || []).map((ch: any) => ({
+      setAgents(((agentsResult.agents) || []).map((a) => ({ id: a.id, name: a.name })))
+      setMessageChannels(((channelsResult.channels) || []).map((ch) => ({
         name: ch.name,
         type: ch.channel_type,
         enabled: ch.enabled
@@ -198,30 +211,54 @@ export function AutomationPage() {
     setTransformsPage(1)
   }, [transforms.length])
 
+  // List search — client-side over the full arrays (both lists are
+  // client-paginated, so the filter must sit BEFORE the pagination slice).
+  // Rules match name/description; transforms match name/description.
+  const [ruleSearch, setRuleSearch] = useState('')
+  const [transformSearch, setTransformSearch] = useState('')
+  const filteredRules = useMemo(() => {
+    const q = ruleSearch.trim().toLowerCase()
+    if (!q) return rules
+    return rules.filter((r) =>
+      [r.name, r.description].some((field) => field?.toLowerCase().includes(q))
+    )
+  }, [rules, ruleSearch])
+  const filteredTransforms = useMemo(() => {
+    const q = transformSearch.trim().toLowerCase()
+    if (!q) return transforms
+    return transforms.filter((tr) =>
+      [tr.name, tr.description].some((field) => field?.toLowerCase().includes(q))
+    )
+  }, [transforms, transformSearch])
+
+  // Entering/leaving a query must land the user on page 1 of the result set.
+  useEffect(() => { setRulesPage(1) }, [ruleSearch])
+  useEffect(() => { setTransformsPage(1) }, [transformSearch])
+
   // Compute paginated data
   // On mobile: show cumulative data (all pages up to current)
   // On desktop: show only current page
   const paginatedRules = useMemo(() => {
     if (isMobile) {
-      return rules.slice(0, rulesPage * RULES_ITEMS_PER_PAGE)
+      return filteredRules.slice(0, rulesPage * RULES_ITEMS_PER_PAGE)
     } else {
-      return rules.slice(
+      return filteredRules.slice(
         (rulesPage - 1) * RULES_ITEMS_PER_PAGE,
         rulesPage * RULES_ITEMS_PER_PAGE
       )
     }
-  }, [rules, rulesPage, RULES_ITEMS_PER_PAGE, isMobile])
+  }, [filteredRules, rulesPage, RULES_ITEMS_PER_PAGE, isMobile])
 
   const paginatedTransforms = useMemo(() => {
     if (isMobile) {
-      return transforms.slice(0, transformsPage * TRANSFORMS_ITEMS_PER_PAGE)
+      return filteredTransforms.slice(0, transformsPage * TRANSFORMS_ITEMS_PER_PAGE)
     } else {
-      return transforms.slice(
+      return filteredTransforms.slice(
         (transformsPage - 1) * TRANSFORMS_ITEMS_PER_PAGE,
         transformsPage * TRANSFORMS_ITEMS_PER_PAGE
       )
     }
-  }, [transforms, transformsPage, TRANSFORMS_ITEMS_PER_PAGE, isMobile])
+  }, [filteredTransforms, transformsPage, TRANSFORMS_ITEMS_PER_PAGE, isMobile])
 
   // Handlers
   const handleCreate = async () => {
@@ -295,11 +332,14 @@ export function AutomationPage() {
 
   const handleExecuteRule = async (rule: Rule) => {
     try {
-      const result = await api.testRule(rule.id, true) // execute=true to actually run actions
-      if ((result as any).executed) {
+      const result = await api.testRule(rule.id, true) as unknown as {
+        executed?: boolean
+        execution_result?: { actions_executed?: unknown[] }
+      }
+      if (result.executed) {
         toast({
           title: tCommon('success'),
-          description: tAuto('executeSuccess') + ' - ' + ((result as any).execution_result?.actions_executed?.length || 0) + ' actions executed',
+          description: tAuto('executeSuccess') + ' - ' + (result.execution_result?.actions_executed?.length || 0) + ' actions executed',
         })
       } else {
         toast({
@@ -392,12 +432,12 @@ export function AutomationPage() {
   }
 
   // Save handlers
-  const handleSaveRule = async (rule: any) => {
+  const handleSaveRule = async (rule: Partial<Rule>) => {
     try {
       if (rule.id) {
-        await api.updateRule(rule.id, rule)
+        await api.updateRule(rule.id, rule as Omit<Rule, 'id' | 'updated_at' | 'created_at'>)
       } else {
-        await api.createRule(rule)
+        await api.createRule(rule as Omit<Rule, 'id' | 'updated_at' | 'created_at'>)
       }
       setShowRuleDialog(false)
       setEditingRule(undefined)
@@ -483,11 +523,11 @@ export function AutomationPage() {
 
   const handleExportTransforms = async () => {
     try {
-      const data = await api.exportAutomations()
+      const data = await api.exportAutomations() as { automations?: Array<{ type?: string }>; exported_at?: string }
       // Filter only transform-type automations
       const transformData = {
-        automations: (data.automations || []).filter((a: any) => a.type === 'transform'),
-        count: ((data.automations || []).filter((a: any) => a.type === 'transform')).length,
+        automations: (data.automations || []).filter((a) => a.type === 'transform'),
+        count: ((data.automations || []).filter((a) => a.type === 'transform')).length,
         exported_at: data.exported_at,
       }
       const blob = new Blob([JSON.stringify(transformData, null, 2)], { type: 'application/json' })
@@ -615,9 +655,7 @@ export function AutomationPage() {
     <>
       <PageLayout
         title={tAuto('title')}
-        subtitle={tAuto('pageDescription')}
         hideFooterOnMobile
-        hasBottomNav
         headerContent={
           <PageTabsBar
             tabs={tabs}
@@ -625,19 +663,38 @@ export function AutomationPage() {
             onTabChange={(v) => handleTabChange(v as AutomationTab)}
             actions={actions}
             secondaryActions={secondaryActions}
+            actionsExtra={
+              activeTab === 'rules' ? (
+                <SearchInput
+                  value={ruleSearch}
+                  onChange={setRuleSearch}
+                  placeholder={tAuto('searchRules', { defaultValue: 'Search rules...' })}
+                  aria-label={tAuto('searchRules', { defaultValue: 'Search rules...' })}
+                  className="w-full sm:w-[min(16rem,calc(100vw-3rem))]"
+                />
+              ) : activeTab === 'transforms' ? (
+                <SearchInput
+                  value={transformSearch}
+                  onChange={setTransformSearch}
+                  placeholder={tAuto('searchTransforms', { defaultValue: 'Search transforms...' })}
+                  aria-label={tAuto('searchTransforms', { defaultValue: 'Search transforms...' })}
+                  className="w-full sm:w-[min(16rem,calc(100vw-3rem))]"
+                />
+              ) : undefined
+            }
           />
         }
         footer={
-          activeTab === 'rules' && rules.length > RULES_ITEMS_PER_PAGE ? (
+          activeTab === 'rules' && filteredRules.length > RULES_ITEMS_PER_PAGE ? (
             <Pagination
-              total={rules.length}
+              total={filteredRules.length}
               pageSize={RULES_ITEMS_PER_PAGE}
               currentPage={rulesPage}
               onPageChange={setRulesPage}
             />
-          ) : activeTab === 'transforms' && transforms.length > TRANSFORMS_ITEMS_PER_PAGE ? (
+          ) : activeTab === 'transforms' && filteredTransforms.length > TRANSFORMS_ITEMS_PER_PAGE ? (
             <Pagination
-              total={transforms.length}
+              total={filteredTransforms.length}
               pageSize={TRANSFORMS_ITEMS_PER_PAGE}
               currentPage={transformsPage}
               onPageChange={setTransformsPage}
@@ -682,13 +739,6 @@ export function AutomationPage() {
           />
         </PageTabsContent>
       </PageLayout>
-
-      {/* Mobile Bottom Navigation */}
-      <PageTabsBottomNav
-        tabs={tabs}
-        activeTab={activeTab}
-        onTabChange={(v) => handleTabChange(v as AutomationTab)}
-      />
 
       {/* Rule Builder Dialog */}
       <SimpleRuleBuilderSplit

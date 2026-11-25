@@ -2,7 +2,6 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::llm_backends::{OllamaConfig, OllamaRuntime};
 use futures::future::join_all;
 use futures::FutureExt;
 use heramind_core::llm::backend::LlmRuntime;
@@ -12,8 +11,6 @@ use heramind_core::{
 };
 use heramind_devices::DeviceService;
 
-#[cfg(feature = "cloud")]
-use crate::llm_backends::{CloudConfig, CloudRuntime};
 use heramind_messages::MessageManager;
 use heramind_storage::{
     AgentExecutionRecord, AgentResource, AgentStore, AgentToolConfig, AiAgent, DataCollected,
@@ -58,6 +55,9 @@ pub(crate) enum StopReason {
     NaturalCompletion,
     /// Hit the round budget (`max_rounds`); Phase 2 synthesized a summary.
     MaxRounds,
+    /// Hit the per-run token budget (`AiAgent::max_tokens_per_run`);
+    /// Phase 2 synthesizes a summary, same as MaxRounds.
+    TokenBudget,
     /// Every tool call this round was a cross-round duplicate (results in hand).
     AllDuplicate,
     /// LLM generation failed (after transient retries).
@@ -72,6 +72,7 @@ impl StopReason {
         match self {
             StopReason::NaturalCompletion => "natural-completion",
             StopReason::MaxRounds => "max-rounds",
+            StopReason::TokenBudget => "token-budget",
             StopReason::AllDuplicate => "all-duplicate",
             StopReason::LlmError => "llm-error",
             StopReason::Cancelled => "cancelled",
@@ -90,6 +91,10 @@ pub(crate) struct ToolLoopOutput {
     /// Used by `execute_with_tools` to surface the real error cause instead
     /// of a generic "tool-calling failed" message.
     pub(crate) last_llm_error: Option<heramind_core::llm::backend::LlmError>,
+    /// Backend-reported LLM tokens (prompt + completion) summed across the
+    /// run's calls. 0 when the backend reported no usage — an unreported
+    /// run, not a free one. Threaded into `DecisionProcess::tokens_used`.
+    pub(crate) tokens_used: u64,
 }
 
 /// Outcome of intra-round + cross-round deduplication.
@@ -162,12 +167,15 @@ mod context;
 mod data_collector;
 mod event_trigger;
 mod intent;
+mod judgment_notify;
 mod llm_runtime;
 mod memory;
 mod response_parser;
+mod structured;
 mod tool_loop;
 mod tool_prompt;
 pub(crate) mod tool_result; // pub(crate): hallucinated_tool_hint reused by chat streaming path
+mod vision_path;
 
 // Re-export public types
 pub(crate) use analyzer::AnalysisResult;
@@ -181,6 +189,7 @@ pub(crate) use response_parser::{
     extract_command_from_description, extract_device_from_description, extract_json_from_codeblock,
     summarize_tool_output,
 };
+pub use structured::EXECUTION_ID_KEY;
 
 /// Resolve the role prompt for an agent.
 /// Returns the agent's custom `system_prompt` if set, otherwise the default IoT role string.
@@ -252,7 +261,7 @@ pub struct AgentExecutorConfig {
     /// Message manager for sending notifications (replaces AlertManager)
     pub message_manager: Option<Arc<MessageManager>>,
     /// LLM runtime for intent analysis (default)
-    pub llm_runtime: Option<Arc<dyn heramind_core::llm::backend::LlmRuntime + Send + Sync>>,
+    pub llm_runtime: Option<Arc<dyn heramind_core::llm::backend::LlmRuntime>>,
     /// LLM backend store for per-agent backend lookup
     pub llm_backend_store: Option<Arc<LlmBackendStore>>,
     /// Phase 3.3: Extension registry for dynamic tool loading
@@ -314,7 +323,7 @@ pub struct AgentExecutor {
     /// Configuration
     pub(crate) _config: AgentExecutorConfig,
     /// LLM runtime (default)
-    pub(crate) llm_runtime: Option<Arc<dyn heramind_core::llm::backend::LlmRuntime + Send + Sync>>,
+    pub(crate) llm_runtime: Option<Arc<dyn heramind_core::llm::backend::LlmRuntime>>,
     /// LLM backend store for per-agent backend lookup
     pub(crate) llm_backend_store: Option<Arc<LlmBackendStore>>,
     /// Event-triggered agents cache
@@ -322,11 +331,21 @@ pub struct AgentExecutor {
     /// Track recent executions to prevent duplicates (agent_id, device_id -> timestamp)
     /// Deduplicates by device only, not by individual metrics
     pub(crate) recent_executions: Arc<RwLock<HashMap<String, i64>>>,
-    /// LLM runtime cache: backend_id -> runtime
-    /// Key format: "{backend_type}:{endpoint}:{model}" for cache invalidation
-    pub(crate) llm_runtime_cache: Arc<
-        RwLock<HashMap<String, Arc<dyn heramind_core::llm::backend::LlmRuntime + Send + Sync>>>,
-    >,
+    /// Structured (L0) event debounce: agent_id -> timestamp of that agent's last
+    /// event-driven run. Unlike `recent_executions` (keyed per agent+source),
+    /// this is per AGENT: one physical event can match several of its sources,
+    /// and the guardrail merges them into a single inference.
+    pub(crate) last_event_inference: parking_lot::RwLock<HashMap<String, i64>>,
+    /// `all`-window aggregation state (M2-1): agent_id -> the open window.
+    /// At most one entry per agent, so this is bounded by the agent count.
+    /// Entries are dropped when the window expires or the agent fires — an
+    /// expired window is caught lazily inside `EventFilter::observe`, so no
+    /// separate sweep is needed.
+    pub(crate) event_windows:
+        parking_lot::RwLock<HashMap<String, heramind_storage::agents::WindowState>>,
+    /// Structured (L0) daily inference budget: agent_id -> (YYYY-MM-DD, calls).
+    /// In-memory v1 — resets on restart, which only ever grants extra calls
+    /// for one day; the scheduler gate reads it, execute_structured increments.
     /// Phase 3.3: Extension registry for dynamic tool loading
     pub(crate) extension_registry:
         Option<Arc<heramind_core::extension::registry::ExtensionRegistry>>,
@@ -346,10 +365,6 @@ pub struct AgentExecutor {
     pub(crate) event_task_handles: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
-/// Parse the LLM's final text response to extract situation_analysis, conclusion, and confidence.
-///
-/// Expects a JSON block like: ```json\n{"situation_analysis":"...","conclusion":"...","confidence":0.8}\n```
-/// Falls back to sensible defaults if parsing fails.
 impl AgentExecutor {
     /// Publish an event to the event bus (no-op if no bus is configured).
     async fn publish_event(&self, event: HeraMindEvent) {
@@ -375,7 +390,8 @@ impl AgentExecutor {
             llm_backend_store,
             event_agents: Arc::new(RwLock::new(HashMap::new())),
             recent_executions: Arc::new(RwLock::new(HashMap::new())),
-            llm_runtime_cache: Arc::new(RwLock::new(HashMap::new())),
+            last_event_inference: parking_lot::RwLock::new(HashMap::new()),
+            event_windows: parking_lot::RwLock::new(HashMap::new()),
             extension_registry,
             tool_registry: parking_lot::RwLock::new(config.tool_registry.clone()),
             memory_store: config.memory_store.clone(),
@@ -402,22 +418,54 @@ impl AgentExecutor {
     }
 
     /// Set the LLM runtime for intent parsing.
-    pub async fn set_llm_runtime(
-        &mut self,
-        llm: Arc<dyn heramind_core::llm::backend::LlmRuntime + Send + Sync>,
-    ) {
+    pub async fn set_llm_runtime(&mut self, llm: Arc<dyn LlmRuntime>) {
         self.llm_runtime = Some(llm);
+    }
+
+    /// Attach time-series storage after construction. The collector reads
+    /// bound metrics from it, so a harness that leaves it `None` can never
+    /// collect anything.
+    pub fn set_time_series_storage(&mut self, storage: Arc<heramind_storage::TimeSeriesStore>) {
+        self.time_series_storage = Some(storage);
+    }
+
+    /// Reserve one of today's runs for this agent.
+    ///
+    /// `max_calls_per_day` caps **runs**, not L0 inferences: a reasoning agent
+    /// costs more per run, not less, so the guardrail has to apply to every
+    /// mode. Counted at the point of execution rather than the scheduler, so
+    /// manual invokes and event triggers count too.
+    fn reserve_daily_call(&self, agent: &AiAgent) -> AgentResult<()> {
+        let Some(cap) = agent
+            .operator_config
+            .as_ref()
+            .and_then(|c| c.max_calls_per_day)
+        else {
+            return Ok(());
+        };
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let mut counts = global_daily_call_counts().write();
+        let entry = counts
+            .entry(agent.id.clone())
+            .or_insert_with(|| (today.clone(), 0));
+        if entry.0 != today {
+            *entry = (today.clone(), 0);
+        }
+        if entry.1 >= cap {
+            return Err(crate::error::HeraMindError::Config(format!(
+                "daily run cap reached ({}/{}), agent paused until tomorrow",
+                entry.1, cap
+            )));
+        }
+        entry.1 += 1;
+        Ok(())
     }
 
     /// Check whether tool mode should be used for this agent execution.
     ///
     /// All agents use tool-calling when the LLM and tool registry support it.
     /// Falls back to structured JSON analysis only when tool-calling is unavailable.
-    fn should_use_tools(
-        &self,
-        agent: &AiAgent,
-        llm_runtime: &Arc<dyn LlmRuntime + Send + Sync>,
-    ) -> bool {
+    fn should_use_tools(&self, agent: &AiAgent, llm_runtime: &Arc<dyn LlmRuntime>) -> bool {
         let llm_supports_tools = llm_runtime.capabilities().function_calling;
         let registry_available = self.tool_registry.read().is_some();
 
@@ -507,7 +555,7 @@ impl AgentExecutor {
         &self,
         agent: &AiAgent,
         data_collected: &[DataCollected],
-        llm_runtime: Arc<dyn LlmRuntime + Send + Sync>,
+        llm_runtime: Arc<dyn LlmRuntime>,
         execution_id: &str,
         invocation_input: Option<&super::AgentInput>,
     ) -> AgentResult<(DecisionProcess, heramind_storage::ExecutionResult)> {
@@ -526,24 +574,49 @@ impl AgentExecutor {
         let tool_config = match agent.execution_mode {
             heramind_storage::agents::ExecutionMode::Free => ToolLoopConfig::free(),
             heramind_storage::agents::ExecutionMode::Focused => ToolLoopConfig::focused_plus(agent),
+            // Structured (L0) never reaches the tool loop — execute_internal
+            // routes it to the single-shot path before this. Defense-in-depth:
+            // treat it as the tightest possible loop config.
+            heramind_storage::agents::ExecutionMode::Structured => {
+                ToolLoopConfig::focused_plus(agent)
+            }
         };
 
         let (mut filtered_tools, mut tool_name_map) =
             Self::filter_tools(&registry, &agent.tool_config);
 
-        // When the LLM already supports vision AND images are embedded in the
-        // multimodal user message, remove the `vision` tool to prevent redundant
-        // calls.  The LLM sees the images directly — calling a separate VLM
-        // wastes a round, passes truncated data (the LLM can only reference a
-        // tiny preview in tool arguments), and may hit rate limits.
-        let has_images_in_data = data_collected.iter().any(|d| {
-            d.values
-                .get("_is_image")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        });
+        // Honest vision path (T4 Dongpingshan false-success):
+        // - Multimodal primary + embeddable images → strip `vision`, rewrite
+        //   standing guidance so the model does not hunt for a missing tool.
+        // - Images present but neither multimodal nor vision tool → refuse
+        //   Completed / high-confidence false success.
+        let has_embeddable_images = vision_path::has_embeddable_image(data_collected);
         let llm_supports_vision = llm_runtime.capabilities().supports_images;
-        if has_images_in_data && llm_supports_vision {
+        let vision_tool_available = filtered_tools.iter().any(|t| t.name == "vision")
+            || tool_name_map.values().any(|n| n == "vision");
+        let vision_exec_path = vision_path::resolve_vision_execution_path(
+            has_embeddable_images,
+            llm_supports_vision,
+            vision_tool_available,
+        );
+
+        if matches!(
+            vision_exec_path,
+            vision_path::VisionExecutionPath::Unavailable
+        ) {
+            tracing::error!(
+                agent_id = %agent.id,
+                has_embeddable_images,
+                llm_supports_vision,
+                vision_tool_available,
+                "Vision required but unavailable — refusing false-success Completed"
+            );
+            return Err(HeraMindError::Llm(
+                vision_path::vision_unavailable_error().to_string(),
+            ));
+        }
+
+        if vision_path::should_exclude_vision_tool(vision_exec_path) {
             let before = filtered_tools.len();
             let vision_names = ["vision"];
             filtered_tools.retain(|t| !vision_names.contains(&t.name.as_str()));
@@ -558,6 +631,27 @@ impl AgentExecutor {
             }
         }
 
+        // A judgment-notify agent decides from the input attached to this run.
+        // Outbound web tools only give a small model somewhere to hunt for
+        // what it thinks is missing: T4's camera agents sent device IDs and
+        // the site name to a search engine 233 times looking for an "image
+        // data path". Off unless the agent's allowlist names them.
+        if judgment_notify::agent_uses_judgment_notify(agent) {
+            let before = filtered_tools.len();
+            filtered_tools
+                .retain(|t| !judgment_notify::judgment_tool_off_by_default(agent, &t.name));
+            tool_name_map
+                .retain(|_, orig| !judgment_notify::judgment_tool_off_by_default(agent, orig));
+            let removed = before - filtered_tools.len();
+            if removed > 0 {
+                tracing::info!(
+                    agent_id = %agent.id,
+                    removed,
+                    "Excluded web tool(s) — judgment-notify agent (name them in the tool allowlist to enable)"
+                );
+            }
+        }
+
         if !tool_name_map.is_empty() {
             tracing::debug!(
                 agent_id = %agent.id,
@@ -566,6 +660,11 @@ impl AgentExecutor {
             );
         }
 
+        // Knowledge is inlined right below: the task-understanding file must
+        // carry the agent's current mission when it goes in. A file that
+        // cannot be repaired on disk is inlined in its repaired form.
+        let task_understanding = self.sync_task_understanding_mission(agent).await;
+
         // Pre-fetch knowledge file content for inline injection.
         // This avoids wasting a tool-call round to read files the agent already
         // knows about — especially valuable in Focused+ mode with only 3 rounds.
@@ -573,6 +672,9 @@ impl AgentExecutor {
             &agent.id,
             &agent.memory.knowledge_files,
             llm_runtime.max_context_length(),
+            task_understanding
+                .as_ref()
+                .map(|(name, content)| (*name, content.as_str())),
         );
 
         let system_prompt = tool_prompt::build_tool_system_prompt(
@@ -581,6 +683,7 @@ impl AgentExecutor {
             invocation_input,
             &tool_config,
             knowledge_content.as_ref(),
+            vision_exec_path,
         );
         let mut messages = tool_prompt::build_tool_messages(&system_prompt, data_collected);
 
@@ -672,6 +775,39 @@ impl AgentExecutor {
 
         let (decision_process, execution_result) =
             tool_result::build_tool_result(agent, data_collected, loop_output);
+
+        // Safety net: images were on this run but the conclusion admits vision
+        // analysis never happened ("Vision tool not available", etc.). That is
+        // product false-success — do not leave Completed + high confidence.
+        // When tools already ran (e.g. message send), keep actions_executed in
+        // the result and mark success_rate=0 so stats/journal stay aligned
+        // without erasing the side-effect audit.
+        if has_embeddable_images
+            && vision_path::conclusion_admits_vision_failure_for_path(
+                &decision_process.conclusion,
+                vision_exec_path,
+            )
+        {
+            tracing::warn!(
+                agent_id = %agent.id,
+                vision_path = ?vision_exec_path,
+                actions = execution_result.actions_executed.len(),
+                "Conclusion admits vision failure — refusing Completed/false-success"
+            );
+            if !execution_result.actions_executed.is_empty() {
+                let mut er = execution_result;
+                er.success_rate = 0.0;
+                er.summary = format!(
+                    "Vision analysis failed: {}",
+                    truncate_to(&decision_process.conclusion, 200)
+                );
+                return Ok((decision_process, er));
+            }
+            return Err(HeraMindError::Llm(format!(
+                "Vision analysis failed: {}",
+                truncate_to(&decision_process.conclusion, 200)
+            )));
+        }
 
         Ok((decision_process, execution_result))
     }
@@ -809,6 +945,23 @@ impl AgentExecutor {
         let execution_id = uuid::Uuid::new_v4().to_string();
         let start_time = std::time::Instant::now();
         let timestamp = chrono::Utc::now().timestamp();
+
+        // Re-entrancy guard: ONE execution of a given agent at a time, across
+        // every trigger path (scheduler / event / manual). Concurrent runs of
+        // the same agent race their journal read-modify-write and stats
+        // updates — the loser's write silently erases the winner's. Manual
+        // invoke used to be the unguarded path.
+        {
+            let mut in_flight = in_flight_agents().lock().unwrap();
+            if in_flight.contains(&agent_id) {
+                return Err(HeraMindError::Validation(format!(
+                    "agent '{}' is already executing — wait for it to finish or cancel it first",
+                    agent_name
+                )));
+            }
+            in_flight.insert(agent_id.clone());
+        }
+        let _in_flight_guard = InFlightGuard(agent_id.clone());
 
         // Update agent status to executing
         self.store
@@ -967,29 +1120,50 @@ impl AgentExecutor {
         // Build execution record
         let record = match execution_result {
             Ok((decision_process, result)) => {
-                // Update stats
-                if let Err(e) = self
-                    .store
-                    .update_agent_stats(&agent_id, true, duration_ms)
-                    .await
-                {
-                    tracing::error!(
-                        agent_id = %agent_id,
-                        error = %e,
-                        "Failed to update agent stats after successful execution"
-                    );
+                // Tool-loop business success: empty tools OR any successful
+                // tool call → Completed. All tools failed (rate==0) or an
+                // explicit vision reject (rate forced to 0) → Failed.
+                // Empty-event skips are Completed for retry/breaker purposes
+                // but do not bump successful_executions (or failed).
+                let is_skip = is_empty_event_skip(&result);
+                let business_ok = execution_business_ok(&result);
+                if !is_skip {
+                    if let Err(e) = self
+                        .store
+                        .update_agent_stats(&agent_id, business_ok, duration_ms)
+                        .await
+                    {
+                        tracing::error!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "Failed to update agent stats after execution"
+                        );
+                    }
                 }
+
+                let (status, error) = if is_skip || business_ok {
+                    (ExecutionStatus::Completed, None)
+                } else {
+                    (
+                        ExecutionStatus::Failed,
+                        Some(format!(
+                            "Execution completed with business failure (success_rate={:.2}): {}",
+                            result.success_rate,
+                            truncate_to(&result.summary, 200)
+                        )),
+                    )
+                };
 
                 AgentExecutionRecord {
                     id: execution_id.clone(),
                     agent_id: agent_id.clone(),
                     timestamp,
                     trigger_type: trigger_type.clone(),
-                    status: ExecutionStatus::Completed,
+                    status,
                     decision_process,
                     result: Some(result),
                     duration_ms,
-                    error: None,
+                    error,
                 }
             }
             Err(e) => {
@@ -1045,8 +1219,11 @@ impl AgentExecutor {
                         reasoning_steps: vec![],
                         decisions: vec![],
                         conclusion: format!("Failed: {}", e),
-                        confidence: 0.0,
+                        // A run that failed has nothing to be confident about;
+                        // 0.0 would read as "0% sure", which is a different claim.
+                        confidence: None,
                         stop_reason: String::new(),
+                        tokens_used: 0,
                     },
                     result: None,
                     duration_ms,
@@ -1067,19 +1244,70 @@ impl AgentExecutor {
             "Execution and conversation turn saved successfully"
         );
 
+        // Explicit notification routing (2026-09-23): the user picked the
+        // channels and the trigger; route accordingly. Replaces the old
+        // intent-keyword sniffing — which still runs for agents WITHOUT a
+        // notify config, so legacy behavior is unchanged.
+        //
+        // Probe runs are SILENT: a run that starts with the agent already in
+        // Error is the breaker's recovery probe, not a verdict. The failure
+        // that demoted the agent already notified; a broken agent probing at
+        // backoff intervals would otherwise ping every few minutes all day.
+        let is_probe = agent.status == heramind_storage::AgentStatus::Error;
+        if !is_probe {
+            self.dispatch_agent_notifications(&agent_id, &agent_name, &record, false)
+                .await;
+        }
+
         // Reset agent status based on result.
         //
         // For *transient* failures (network, timeout, rate-limit, the global
         // 300s timeout), keep the agent Active so the scheduler will retry it
-        // on the next trigger. Only *permanent* failures (malformed output,
-        // auth errors, model not found) demote the agent to Error, requiring
-        // manual intervention to re-enable.
+        // on the next trigger. *Permanent* failures (malformed output, auth
+        // errors, model not found) count toward the breaker: the agent
+        // demotes to Error only after `consecutive_failure_threshold`
+        // consecutive permanent failures (default 3 — one glitch from a
+        // small model no longer kills an event agent, which has no other
+        // path back to Active). Transient failures neither count nor reset.
         //
         // Disarm the RAII guard — normal completion handles status reset
         status_guard.armed.set(false);
 
-        let new_status = if record.status == ExecutionStatus::Completed {
+        let breaker_threshold = agent
+            .operator_config
+            .as_ref()
+            .map(|c| c.consecutive_failure_threshold as u32)
+            .unwrap_or(3);
+
+        let is_event_skip = record.result.as_ref().is_some_and(is_empty_event_skip);
+
+        let new_status = if is_event_skip {
+            // Empty-event skip is not a success and not a breaker strike —
+            // leave consecutive_failures untouched and stay Active.
             heramind_storage::AgentStatus::Active
+        } else if record.status == ExecutionStatus::Completed {
+            // Unconditional reset: the passed-in agent object can be stale
+            // (event cache, manual re-invoke), so comparing its count would
+            // skip resets. One cheap write per successful run.
+            let _ = self
+                .store
+                .update_agent_consecutive_failures(&agent_id, 0)
+                .await;
+            heramind_storage::AgentStatus::Active
+        } else if is_probe {
+            // A probe run does not re-litigate the demotion: only a COMPLETED
+            // run recovers the agent. Letting a failed probe fall through to
+            // the threshold logic (or the transient branch) flipped demoted
+            // agents back to Active without evidence — a flaky-network agent
+            // would ping-pong Active/Error, re-notifying on every demotion.
+            // "Still can't tell" keeps Error; the next backoff probe decides.
+            tracing::info!(
+                agent_id = %agent_id,
+                execution_id = %execution_id,
+                error = ?record.error,
+                "Recovery probe did not complete — agent stays Error"
+            );
+            heramind_storage::AgentStatus::Error
         } else if is_transient_failure(record.error.as_deref()) {
             tracing::info!(
                 agent_id = %agent_id,
@@ -1089,7 +1317,50 @@ impl AgentExecutor {
             );
             heramind_storage::AgentStatus::Active
         } else {
-            heramind_storage::AgentStatus::Error
+            // Read the count fresh from the store — the caller's agent
+            // object may predate the previous run's increment.
+            let current = self
+                .store
+                .get_agent(&agent_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|a| a.consecutive_failures)
+                .unwrap_or(0);
+            let new_consecutive = current.saturating_add(1);
+            let _ = self
+                .store
+                .update_agent_consecutive_failures(&agent_id, new_consecutive)
+                .await;
+            if new_consecutive >= breaker_threshold {
+                // Seed the probe clock only on the Active→Error TRANSITION:
+                // a failed probe run lands here too, and re-seeding would
+                // restart the backoff ladder every probe (it would never
+                // grow). The probe's outcome path owns the ladder once the
+                // agent is already Error.
+                if !is_probe {
+                    seed_error_probe(&agent_id);
+                }
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    execution_id = %execution_id,
+                    consecutive_failures = new_consecutive,
+                    threshold = breaker_threshold,
+                    error = ?record.error,
+                    "Circuit breaker OPEN — agent demoted to Error (event triggers will probe at backoff intervals)"
+                );
+                heramind_storage::AgentStatus::Error
+            } else {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    execution_id = %execution_id,
+                    consecutive_failures = new_consecutive,
+                    threshold = breaker_threshold,
+                    error = ?record.error,
+                    "Permanent-classified failure — breaker not tripped yet, agent stays Active"
+                );
+                heramind_storage::AgentStatus::Active
+            }
         };
 
         // Retry status reset once on failure to prevent agent getting stuck in Executing state
@@ -1218,6 +1489,12 @@ impl AgentExecutor {
         let execution_id = context.execution_id.clone();
         let mut step_num = 1u32;
 
+        // Before any work: every mode costs a run, and the cap is about how
+        // often this agent may run — not about which branch it takes. Placed
+        // here rather than in the scheduler so manual invokes and event
+        // triggers count too.
+        self.reserve_daily_call(&agent)?;
+
         // Progress: Collecting data
         self.send_progress(
             &agent_id,
@@ -1259,8 +1536,9 @@ impl AgentExecutor {
                 reasoning_steps: vec![],
                 decisions: vec![],
                 conclusion: "Execution skipped: event data was recognized as an image metric but image extraction failed. Check device data format and field names.".to_string(),
-                confidence: 0.0,
+                confidence: None,
                 stop_reason: String::new(),
+                tokens_used: 0,
             };
             let exec_result = heramind_storage::ExecutionResult {
                 actions_executed: vec![],
@@ -1308,6 +1586,17 @@ impl AgentExecutor {
             step_num += 1;
             // Small delay for visual effect
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Structured (L0) branch: one constrained inference, schema-validated
+        // fields out — no intent parse, no situation analysis, no tool loop.
+        if matches!(
+            agent.execution_mode,
+            heramind_storage::agents::ExecutionMode::Structured
+        ) {
+            return self
+                .execute_structured(&execution_id, &agent, data_collected)
+                .await;
         }
 
         // Progress: Analyzing
@@ -1368,7 +1657,7 @@ impl AgentExecutor {
             // Tool-calling mode already produced a full DecisionProcess and
             // ExecutionResult.  We only need to update memory and return.
             AnalysisResult::Free {
-                decision_process,
+                mut decision_process,
                 execution_result,
             } => {
                 self.send_thinking(
@@ -1376,76 +1665,53 @@ impl AgentExecutor {
                     &execution_id,
                     step_num,
                     &format!(
-                        "Tool-calling analysis completed: {} tool call(s), confidence {:.0}%",
+                        "Tool-calling analysis completed: {} tool call(s){}",
                         decision_process.decisions.len(),
-                        decision_process.confidence * 100.0
+                        match decision_process.confidence {
+                            Some(c) => format!(", confidence {:.0}%", c * 100.0),
+                            None => String::new(),
+                        }
                     ),
                 )
                 .await;
 
-                // Update memory with Free mode results
-                // Reflect partial failures: mark as failed when success_rate < 1.0
-                let overall_success = execution_result.success_rate >= 1.0;
-                let mut updated_memory = self
-                    .update_memory(
-                        &agent,
-                        &decision_process.decisions,
-                        &decision_process.conclusion,
-                        &execution_id,
-                        overall_success,
-                        &decision_process.stop_reason,
-                    )
-                    .await?;
-
-                // Sync knowledge_files from per-execution MemoryTool handle
-                if let Some(ref handle) = per_exec_knowledge_files {
-                    updated_memory.knowledge_files = handle.read().await.clone();
-                }
-
-                // Auto-init knowledge file on first SUCCESSFUL execution
-                self.auto_init_knowledge_file(
+                // Update memory with Free mode results.
+                // Self-heal runs (0 < success_rate < 1) count as business success;
+                // only all-tools-failed / vision-reject (rate == 0 with actions) fail.
+                let overall_success = execution_business_ok(&execution_result);
+                self.finalize_execution_memory(
                     &agent,
-                    &mut updated_memory,
+                    &decision_process.decisions,
                     &decision_process.conclusion,
+                    &execution_id,
                     overall_success,
-                );
-
-                // Cap knowledge_files FIFO. The MemoryTool can append
-                // arbitrary new files; without a cap a runaway agent
-                // (or a long-lived one accumulating one file per execution)
-                // bloats both storage and the system prompt —
-                // `prefetch_knowledge_files` injects ALL file contents
-                // into context. Same trim pattern as `journal.records`
-                // (memory.rs:49-51) and `user_messages` (storage
-                // MAX_USER_MESSAGES=50).
-                while updated_memory.knowledge_files.len() > memory::MAX_KNOWLEDGE_FILES {
-                    let dropped = updated_memory.knowledge_files.remove(0);
-                    tracing::info!(
-                        agent_id = %agent.id,
-                        dropped_file = %dropped.name,
-                        remaining = updated_memory.knowledge_files.len(),
-                        "Trimmed knowledge file exceeding MAX_KNOWLEDGE_FILES (FIFO)"
-                    );
-                }
-
-                self.store
-                    .update_agent_memory(&agent.id, updated_memory.clone())
-                    .await
-                    .map_err(|e| {
-                        HeraMindError::Storage(format!("Failed to update memory: {}", e))
-                    })?;
-
-                // Extract learned patterns into system memory
-                // DISABLED: per-execution memory extraction was turned off (token
-                // cost, wrong model). The memory scheduler (memory/scheduler.rs)
-                // does NOT compensate — it only does temp-file cleanup. So agents
-                // currently learn only via explicit memory-tool calls. Proper
-                // extraction is tracked as follow-up work (Mem0 single-pass).
+                    &decision_process.stop_reason,
+                    &per_exec_knowledge_files,
+                )
+                .await?;
 
                 tracing::debug!(
                     agent_id = %agent_id,
                     "[TOOL-CALLING] Returning direct results — skipped Focused JSON post-processing"
                 );
+
+                // M2-2: publish output-contract fields only on business success
+                // so a rejected / all-failed conclusion never lands in ai:*.
+                if overall_success {
+                    let published = self
+                        .apply_output_contract(&agent, &execution_id, &decision_process.conclusion)
+                        .await;
+                    if let Some(field_count) = published {
+                        decision_process.decisions.push(Decision {
+                            decision_type: "output_contract".to_string(),
+                            description: format!("Published {} schema field(s)", field_count),
+                            action: format!("ai:{}:* → {}", agent.id, field_count),
+                            rationale: "Output contract applied to the run's conclusion"
+                                .to_string(),
+                            expected_outcome: "Fields available as ai:* data sources".to_string(),
+                        });
+                    }
+                }
 
                 Ok((*decision_process, *execution_result))
             }
@@ -1456,7 +1722,7 @@ impl AgentExecutor {
             AnalysisResult::Focused {
                 situation_analysis,
                 reasoning_steps,
-                decisions,
+                mut decisions,
                 conclusion,
             } => {
                 // Send thinking event for analysis completion
@@ -1557,55 +1823,51 @@ impl AgentExecutor {
                 // Reflect partial failures in action execution
                 let focused_success =
                     actions_executed.is_empty() || actions_executed.iter().all(|a| a.success);
-                let mut updated_memory = self
-                    .update_memory(
-                        &agent,
-                        &decisions,
-                        &conclusion,
-                        &execution_id,
-                        focused_success,
-                        "",
-                    )
-                    .await?;
-
-                // Sync knowledge_files from per-execution MemoryTool handle
-                if let Some(ref handle) = per_exec_knowledge_files {
-                    updated_memory.knowledge_files = handle.read().await.clone();
-                }
-
-                // Auto-init knowledge file on first SUCCESSFUL execution
-                self.auto_init_knowledge_file(
+                self.finalize_execution_memory(
                     &agent,
-                    &mut updated_memory,
+                    &decisions,
                     &conclusion,
+                    &execution_id,
                     focused_success,
-                );
+                    "",
+                    &per_exec_knowledge_files,
+                )
+                .await?;
 
-                // Save updated memory
-                self.store
-                    .update_agent_memory(&agent.id, updated_memory.clone())
-                    .await
-                    .map_err(|e| {
-                        HeraMindError::Storage(format!("Failed to update memory: {}", e))
-                    })?;
-
-                // Bridge: extract learned patterns into system memory
-                // DISABLED: per-execution memory extraction was turned off (token
-                // cost, wrong model). The memory scheduler (memory/scheduler.rs)
-                // does NOT compensate — it only does temp-file cleanup. So agents
-                // currently learn only via explicit memory-tool calls. Proper
-                // extraction is tracked as follow-up work (Mem0 single-pass).
-
-                // Calculate confidence from reasoning
-                let confidence = if reasoning_steps.is_empty() {
-                    0.5
+                // Average of the confidences the steps actually reported. No
+                // steps claiming one means no claim here either — the old 0.5
+                // fallback was an invented number wearing the same face as a
+                // measured one.
+                let reported: Vec<f32> = reasoning_steps
+                    .iter()
+                    .filter_map(|s| s.confidence)
+                    .collect();
+                let confidence = if reported.is_empty() {
+                    None
                 } else {
-                    reasoning_steps.iter().map(|s| s.confidence).sum::<f32>()
-                        / reasoning_steps.len() as f32
+                    Some(reported.iter().sum::<f32>() / reported.len() as f32)
                 };
 
                 // No truncation — preserve full LLM output for quality
                 let summary_for_result = conclusion.clone();
+
+                // M2-2: publish only when focused actions succeeded — a failed
+                // conclusion must not land in ai:* telemetry.
+                if focused_success {
+                    let published = self
+                        .apply_output_contract(&agent, &execution_id, &conclusion)
+                        .await;
+                    if let Some(field_count) = published {
+                        decisions.push(Decision {
+                            decision_type: "output_contract".to_string(),
+                            description: format!("Published {} schema field(s)", field_count),
+                            action: format!("ai:{}:* → {}", agent.id, field_count),
+                            rationale: "Output contract applied to the run's conclusion"
+                                .to_string(),
+                            expected_outcome: "Fields available as ai:* data sources".to_string(),
+                        });
+                    }
+                }
 
                 let decision_process = DecisionProcess {
                     situation_analysis,
@@ -1615,6 +1877,7 @@ impl AgentExecutor {
                     conclusion,
                     confidence,
                     stop_reason: String::new(),
+                    tokens_used: 0,
                 };
 
                 let success_rate = if actions_executed.is_empty() {
@@ -1636,6 +1899,92 @@ impl AgentExecutor {
                 Ok((decision_process, execution_result))
             }
         }
+    }
+}
+
+/// Agents with an execution currently in flight, PROCESS-WIDE. The event
+/// path constructs a fresh `AgentExecutor` per trigger, so a per-instance
+/// set would not see the scheduler's or the manual path's runs — the guard
+/// must be global to close the same-agent race.
+static IN_FLIGHT_AGENTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn in_flight_agents() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    IN_FLIGHT_AGENTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// RAII in-flight marker. Drop removes the agent from the global set on
+/// every exit path — early error, timeout, panic, or caller cancellation.
+struct InFlightGuard(String);
+
+/// Per-agent daily run counters, PROCESS-WIDE. The event path builds a new
+/// `AgentExecutor` per trigger; with a per-instance map the day's count
+/// restarted on every event execution, so `max_calls_per_day` never held on
+/// the most frequent trigger path. Entries are `(day, count)` and roll over
+/// on the first reserve of a new UTC day.
+static DAILY_CALL_COUNTS: std::sync::OnceLock<parking_lot::RwLock<HashMap<String, (String, u32)>>> =
+    std::sync::OnceLock::new();
+
+/// Access the process-wide daily run counters (shared by every executor
+/// instance and the scheduler's skip check).
+pub(crate) fn global_daily_call_counts(
+) -> &'static parking_lot::RwLock<HashMap<String, (String, u32)>> {
+    DAILY_CALL_COUNTS.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+}
+
+// ========================================================================
+// Error-state recovery probes (event-trigger path)
+// ========================================================================
+
+/// Recovery-probe backoff state for one demoted agent: when the last probe
+/// ran and how many probes have failed since demotion. Process-wide for the
+/// same reason the daily counters are — the event path builds a fresh
+/// executor per trigger.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ErrorProbeEntry {
+    pub last_attempt: i64,
+    pub consecutive_failures: u32,
+}
+
+/// Base probe spacing after demotion (matches the scheduler's Error
+/// cooldown) and its ceiling.
+pub(crate) const ERROR_PROBE_BASE_SECS: i64 = 300;
+pub(crate) const ERROR_PROBE_MAX_SECS: i64 = 3600;
+
+/// Backoff before the next probe: 5min, 10, 20, 40, capped at 1h. A broken
+/// agent costs at most ~24 probe attempts/day once the backoff saturates.
+pub(crate) fn error_probe_backoff_secs(failures: u32) -> i64 {
+    let shift = failures.min(4); // 300·2⁴ = 4800 > 3600, so 4 saturates
+    (ERROR_PROBE_BASE_SECS << shift).min(ERROR_PROBE_MAX_SECS)
+}
+
+static ERROR_PROBE_STATE: std::sync::OnceLock<
+    parking_lot::RwLock<HashMap<String, ErrorProbeEntry>>,
+> = std::sync::OnceLock::new();
+
+/// Access the process-wide probe state (listener gate + spawn outcome path).
+pub(crate) fn global_error_probe_state(
+) -> &'static parking_lot::RwLock<HashMap<String, ErrorProbeEntry>> {
+    ERROR_PROBE_STATE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+}
+
+/// Start (or restart) the recovery clock for a demoted agent: the first
+/// probe comes no sooner than the base backoff after demotion, so an agent
+/// that just tripped the breaker isn't re-probed by the very next event.
+pub(crate) fn seed_error_probe(agent_id: &str) {
+    let now = chrono::Utc::now().timestamp();
+    global_error_probe_state().write().insert(
+        agent_id.to_string(),
+        ErrorProbeEntry {
+            last_attempt: now,
+            consecutive_failures: 0,
+        },
+    );
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        in_flight_agents().lock().unwrap().remove(&self.0);
     }
 }
 
@@ -1695,6 +2044,26 @@ pub(super) fn classify_tool_call_text(text: &str) -> ToolCallTextClassification 
     }
 }
 
+/// Empty-event skip marker (`Skipped: event data extraction failed`).
+/// Not a business success and not a breaker / event-retry failure.
+pub(crate) fn is_empty_event_skip(result: &StorageExecutionResult) -> bool {
+    let lower = result.summary.to_lowercase();
+    result.summary.starts_with("Skipped:") || lower.contains("event data extraction failed")
+}
+
+/// Tool-loop / run business success for stats + Completed vs Failed.
+///
+/// - Empty-event skip → false (caller must not bump successful_executions)
+/// - No tools called → true
+/// - Any successful tool (`success_rate > 0`) → true (self-heal OK)
+/// - All tools failed or vision reject (`success_rate == 0` with actions) → false
+pub(crate) fn execution_business_ok(result: &StorageExecutionResult) -> bool {
+    if is_empty_event_skip(result) {
+        return false;
+    }
+    result.actions_executed.is_empty() || result.success_rate > 0.0
+}
+
 /// Heuristic: detect transient (retryable) failures from the error message.
 ///
 /// These are failures where the agent itself is fine — the LLM provider had
@@ -1703,14 +2072,29 @@ pub(super) fn classify_tool_call_text(text: &str) -> ToolCallTextClassification 
 ///
 /// Permanent failures (malformed output, auth/model errors, panics) return
 /// false so the agent is demoted to Error and needs manual re-enable.
+/// Transient-failure classification shared with the manual-invoke path's
+/// status handling in `ai_agent::mod`.
+pub(crate) fn is_transient_failure_shared(error: Option<&str>) -> bool {
+    is_transient_failure(error)
+}
+
 fn is_transient_failure(error: Option<&str>) -> bool {
     let msg = match error {
         Some(m) => m,
         None => return false, // unknown error → treat as permanent (safe)
     };
     let lower = msg.to_lowercase();
-    // Network errors (reqwest::Error display)
-    lower.contains("network")
+    // Busy, not broken: the re-entrancy guard's rejection means another run
+    // holds the agent — demoting to Error would badge a healthy agent red.
+    lower.contains("already executing")
+        // Daily run cap: a budget refusal, not a fault. Demoting to Error
+        // killed event agents permanently — the trigger cache only loads
+        // Active agents, the Error probe never comes due for event agents
+        // (next_execution=MAX), and startup no longer reactivates them.
+        // "paused until tomorrow" must mean exactly that.
+        || lower.contains("daily run cap")
+        // Network errors (reqwest::Error display)
+        || lower.contains("network")
         || lower.contains("error sending request")
         || lower.contains("dns")
         || lower.contains("connection reset")
@@ -1733,6 +2117,86 @@ mod behavior_tests;
 #[cfg(test)]
 mod tests {
     use super::{classify_tool_call_text, is_transient_failure};
+
+    /// Tool-gating semantics the editor now exposes (per-agent
+    /// AgentToolConfig): enabled=false is the text-only agent (empty set
+    /// even for a populated registry); a non-empty allowed_tools is a
+    /// strict name whitelist; None/empty keeps everything.
+    struct GatedShellTool;
+    #[async_trait::async_trait]
+    impl crate::toolkit::tool::Tool for GatedShellTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+        fn description(&self) -> &str {
+            "mock shell"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<crate::toolkit::tool::ToolOutput, crate::toolkit::error::ToolError> {
+            Ok(crate::toolkit::tool::ToolOutput::success("ok"))
+        }
+    }
+    struct GatedListRulesTool;
+    #[async_trait::async_trait]
+    impl crate::toolkit::tool::Tool for GatedListRulesTool {
+        fn name(&self) -> &str {
+            "list_rules"
+        }
+        fn description(&self) -> &str {
+            "mock rules list"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<crate::toolkit::tool::ToolOutput, crate::toolkit::error::ToolError> {
+            Ok(crate::toolkit::tool::ToolOutput::success("ok"))
+        }
+    }
+
+    #[test]
+    fn filter_tools_honors_enabled_and_whitelist() {
+        use crate::toolkit::ToolRegistryBuilder;
+        let mut registry = ToolRegistryBuilder::new().build();
+        registry.register(std::sync::Arc::new(GatedShellTool));
+        registry.register(std::sync::Arc::new(GatedListRulesTool));
+
+        // Baseline: no config → everything passes.
+        let (defs, _) = super::AgentExecutor::filter_tools(&registry, &None);
+        assert_eq!(defs.len(), 2, "no config = all tools");
+
+        // Whitelist: only the named tool survives.
+        let cfg = Some(heramind_storage::AgentToolConfig {
+            enabled: true,
+            allowed_tools: vec!["shell".to_string()],
+        });
+        let (defs, _) = super::AgentExecutor::filter_tools(&registry, &cfg);
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["shell"], "strict whitelist");
+
+        // enabled=false is the text-only agent — empty set regardless.
+        let cfg = Some(heramind_storage::AgentToolConfig {
+            enabled: false,
+            allowed_tools: vec!["shell".to_string()],
+        });
+        let (defs, _) = super::AgentExecutor::filter_tools(&registry, &cfg);
+        assert!(defs.is_empty(), "enabled=false must yield no tools");
+
+        // enabled=true with EMPTY allowed_tools = all (not none).
+        let cfg = Some(heramind_storage::AgentToolConfig {
+            enabled: true,
+            allowed_tools: vec![],
+        });
+        let (defs, _) = super::AgentExecutor::filter_tools(&registry, &cfg);
+        assert_eq!(defs.len(), 2, "empty whitelist = all tools");
+    }
 
     #[test]
     fn transient_network_error_is_detected() {

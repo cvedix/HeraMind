@@ -103,7 +103,12 @@ impl PushManager {
         let target_type: PushTargetType = match config.target_type.as_str() {
             "webhook" => PushTargetType::Webhook,
             "mqtt" => PushTargetType::Mqtt,
-            other => return Err(anyhow!("Unknown target type: {}", other)),
+            other => {
+                return Err(anyhow!(
+                    "Unknown target type: {} (valid: webhook | mqtt)",
+                    other
+                ))
+            }
         };
 
         let dest = create_destination(&target_type, &config.config)?;
@@ -152,7 +157,12 @@ impl PushManager {
             target.target_type = match target_type_str.as_str() {
                 "webhook" => PushTargetType::Webhook,
                 "mqtt" => PushTargetType::Mqtt,
-                other => return Err(anyhow!("Unknown target type: {}", other)),
+                other => {
+                    return Err(anyhow!(
+                        "Unknown target type: {} (valid: webhook | mqtt)",
+                        other
+                    ))
+                }
             };
         }
         if let Some(config_val) = config.config {
@@ -297,14 +307,24 @@ impl PushManager {
         self.store.list_delivery_logs(target_id, limit, offset)
     }
 
-    /// Get aggregated push statistics.
+    /// Get aggregated push statistics. Delivery numbers come from the
+    /// process-wide counters the scheduler maintains — they used to be
+    /// ..Default::default(), permanently zero, making the stats endpoint
+    /// decorative.
     pub fn get_stats(&self) -> Result<PushStats> {
+        use std::sync::atomic::Ordering::Relaxed;
         let targets = self.store.list_targets()?;
         let active = targets.iter().filter(|t| t.enabled).count();
+        let c = crate::scheduler::delivery_counters();
         Ok(PushStats {
             total_targets: targets.len(),
             active_targets: active,
-            ..Default::default()
+            // Derived: attempts-in-progress states no longer pollute the
+            // total (see record_delivery_outcome).
+            total_deliveries: c.success.load(Relaxed) + c.failed.load(Relaxed),
+            successful_deliveries: c.success.load(Relaxed),
+            failed_deliveries: c.failed.load(Relaxed),
+            dropped_backpressure: c.dropped_backpressure.load(Relaxed),
         })
     }
 

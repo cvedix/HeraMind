@@ -1,13 +1,25 @@
 //! Handler tests module.
 
+pub mod agent_execution_readback;
+pub mod agents;
 pub mod auth_users;
+pub mod automations;
 pub mod basic;
+pub mod chat_refs;
+pub mod mentions;
 // llm_backends.rs deprecated - API changed significantly
+pub mod device_command_validation;
 pub mod devices;
 pub mod extensions;
 // events.rs and events_sse.rs removed due to axum 0.7 API incompatibility
 // memory.rs and tools.rs removed - functionality moved to heramind-agent
 // plugins.rs deprecated - migrated to Extension system
+pub mod e2e_scenarios;
+pub mod message_channels;
+pub mod messages_chain;
+pub mod mqtt_assoc_exception;
+pub mod onboarding;
 pub mod rules;
 pub mod sessions;
+pub mod stats;
 // settings.rs deprecated - API changed significantly

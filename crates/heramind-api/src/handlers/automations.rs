@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-use crate::automation::{transform::JsTransformExecutor, Automation, AutomationType, IntentResult};
+use crate::automation::{
+    transform::JsTransformExecutor, Automation, AutomationType, IntentResult, TransformAutomation,
+};
 
 use super::{
     common::{ok, HandlerResult},
@@ -352,7 +354,7 @@ pub async fn create_automation_handler(
     }
 
     // Parse transform from definition
-    let automation = match serde_json::from_value(definition) {
+    let automation = match serde_json::from_value::<TransformAutomation>(definition) {
         Ok(transform) => transform,
         Err(e) => {
             return Err(ErrorResponse::bad_request(format!(
@@ -361,6 +363,21 @@ pub async fn create_automation_handler(
             )));
         }
     };
+
+    // Syntax-check JS code at create time: broken code used to be accepted
+    // with a success response and only failed later at execution (CLI
+    // feedback audit 2026-11-17). The check compiles WITHOUT executing.
+    if let Some(code) = automation.js_code.as_deref() {
+        if !code.trim().is_empty() {
+            if let Err(syntax_err) = JsTransformExecutor::check_syntax(code) {
+                return Err(ErrorResponse::bad_request(format!(
+                    "Transform JS code has a syntax error and was NOT saved: {}. \
+                     Fix the code and retry; use `heramind transform test-code` to iterate.",
+                    syntax_err
+                )));
+            }
+        }
+    }
 
     // Save the automation
     match store.save_automation(&automation).await {
@@ -435,6 +452,7 @@ pub async fn update_automation_handler(
     }
 
     // Merge definition fields if provided
+    let mut js_code_touched = false;
     if let Some(definition) = req.definition {
         if let Some(obj) = definition.as_object() {
             if let Some(scope) = obj.get("scope") {
@@ -444,6 +462,11 @@ pub async fn update_automation_handler(
             }
             if let Some(js_code) = obj.get("js_code") {
                 updated.js_code = js_code.as_str().map(|s| s.to_string());
+                // Only code the request actually WRITES is validated below —
+                // a legacy record with broken JS must still be renamable
+                // (review 2026-11-17: checking untouched code blocked
+                // name-only edits of old records).
+                js_code_touched = true;
             }
             if let Some(output_prefix) = obj.get("output_prefix") {
                 if let Some(s) = output_prefix.as_str() {
@@ -464,6 +487,22 @@ pub async fn update_automation_handler(
     updated.metadata.updated_at = chrono::Utc::now().timestamp();
 
     // Save the updated automation
+    // Same create-time syntax check on the update path — but ONLY for code
+    // this request actually wrote (see js_code_touched).
+    if js_code_touched {
+        if let Some(code) = updated.js_code.as_deref() {
+            if !code.trim().is_empty() {
+                if let Err(syntax_err) = JsTransformExecutor::check_syntax(code) {
+                    return Err(ErrorResponse::bad_request(format!(
+                        "Transform JS code has a syntax error and was NOT saved: {}. \
+                         Fix the code and retry; use `heramind transform test-code` to iterate.",
+                        syntax_err
+                    )));
+                }
+            }
+        }
+    }
+
     match store.save_automation(&updated).await {
         Ok(_) => {
             let dto = AutomationDto::from(updated.clone());
@@ -889,7 +928,6 @@ pub async fn process_data_handler(
             // event-driven path produce virtual metrics for real.
 
             ok(json!({
-                "success": true,
                 "metrics": transform_result.metrics,
                 "count": transform_result.metrics.len(),
                 "warnings": transform_result.warnings,
@@ -917,7 +955,7 @@ pub async fn process_data_handler(
     ),
     request_body = ProcessDataRequest,
     responses(
-        (status = 200, description = "Saved transform dry-run against sample input"),
+        (status = 200, description = "Dry-run of the saved transform against sample input (no execution history, no output registration)"),
         (status = 404, description = "Not found"),
     )
 )]
@@ -952,9 +990,12 @@ pub async fn test_transform_handler(
         }
     };
 
-    // Process data through this specific transform
+    // Dry-run: no execution-history row and no output registration. The
+    // production path (process_device_data) does both — a preview calling
+    // it polluted the execution history and registered outputs from
+    // sample data.
     let result = transform_engine
-        .process_device_data(
+        .process_device_data_dry(
             &[transform],
             &req.device_id,
             req.device_type.as_deref(),
@@ -968,6 +1009,10 @@ pub async fn test_transform_handler(
             "metrics": transform_result.metrics,
             "count": transform_result.metrics.len(),
             "warnings": transform_result.warnings,
+            // Non-empty = parts of this preview are UNVERIFIED (extension
+            // behavior the dry-run refused to execute). Never read as a
+            // clean success.
+            "unverified": transform_result.unverified,
         })),
         Err(e) => Err(ErrorResponse::internal(format!(
             "Transform test failed: {}",
@@ -1224,22 +1269,27 @@ pub async fn test_transform_code_handler(
     // Use the current time for the test
     let timestamp = Utc::now().timestamp();
 
-    // Preprocess code to handle extensions.invoke calls
-    let processed_code = preprocess_extensions_invoke(&req.code, &req.input_data, &state).await?;
-
-    // Create a temporary transform executor
+    // Create a temporary transform executor. Do NOT inject a local
+    // `const extensions = { invoke: … success }` mock — that shadowed the
+    // host dry-run stub and reported false success for blocked invokes.
+    // DryRun installs `__heramind_dryrun_invoke__` and surfaces
+    // `extension_invoke_blocked` → `unverified` (same as /transforms/:id/test).
     let executor = JsTransformExecutor::new();
 
     // Execute the code
     match executor.execute(
-        &processed_code,
+        &req.code,
         &req.input_data,
         &req.output_prefix,
         "test_device",
         timestamp,
         None, // No extension registry for test
+        // Code preview path: dry-run semantics — extension invocations are
+        // blocked (unverified) rather than really executed.
+        crate::automation::transform::TransformExecutionMode::DryRun,
     ) {
-        Ok(metrics) => {
+        Ok(js_out) => {
+            let metrics = js_out.metrics;
             // Convert metrics to a more readable format
             let result_obj: serde_json::Map<String, Value> = metrics
                 .iter()
@@ -1254,56 +1304,118 @@ pub async fn test_transform_code_handler(
                 })
                 .collect();
 
+            let unverified = if js_out.extension_invoke_blocked {
+                vec![
+                    "extension invocation blocked in dry-run; extension-dependent behavior unverified"
+                        .to_string(),
+                ]
+            } else {
+                Vec::new()
+            };
+
             ok(json!({
-                "success": true,
                 "output": result_obj,
                 "metrics": metrics,
                 "count": metrics.len(),
+                "unverified": unverified,
                 "output_with_prefix": serde_json::to_value(&result_obj).unwrap_or_else(|_| json!({}))
             }))
         }
-        Err(e) => {
-            let error_msg: String = e.to_string();
-            ok(json!({
-                "success": false,
-                "error": error_msg
-            }))
-        }
+        Err(e) => Err(ErrorResponse::bad_request(e.to_string()).with_hint(
+            "Check JavaScript syntax and ensure the transform returns a valid value or JSON object.",
+        )),
     }
 }
 
-/// Preprocess JavaScript code to handle extensions.invoke calls.
-///
-/// This replaces extensions.invoke calls with mock results for testing purposes.
-/// In production, the actual extension would be called.
-async fn preprocess_extensions_invoke(
-    code: &str,
-    _input_data: &Value,
-    _state: &ServerState,
-) -> Result<String, ErrorResponse> {
-    // Check if code contains extensions.invoke
-    if !code.contains("extensions.invoke") {
-        return Ok(code.to_string());
+/// Whether `/test-code` still injects a local success mock for
+/// `extensions.invoke` (must stay false — host DryRun stub owns the path).
+#[cfg(test)]
+fn test_code_injects_success_extensions_mock() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod test_code_dry_run_tests {
+    use super::test_code_injects_success_extensions_mock;
+    use crate::automation::transform::{JsTransformExecutor, TransformExecutionMode};
+    use serde_json::json;
+
+    #[test]
+    fn test_code_does_not_inject_success_extensions_mock() {
+        assert!(
+            !test_code_injects_success_extensions_mock(),
+            "local const extensions mock must stay removed so DryRun can mark unverified"
+        );
     }
 
-    // Define a mock extensions object at the beginning of the code
-    let mock_extensions = r#"
-// Mock extensions.invoke for testing
-const extensions = {
-  invoke: (extId, command, args) => ({
-    _mock: true,
-    _extension_id: extId,
-    _command: command,
-    _args: args,
-    result: 'mock_result_from_' + extId,
-    input: args?.data || input,
-    status: 'success'
-  })
-};
-"#;
+    #[test]
+    fn test_code_dry_run_caught_invoke_sets_blocked_unverified_flag() {
+        // Caught invoke still sets the host flag — the old local mock returned
+        // status:'success' and never set extension_invoke_blocked.
+        let executor = JsTransformExecutor::new();
+        let code = "try { extensions.invoke('weather', 'get', {}); } catch (e) { return {v: 1}; } return {v: 0}";
+        let out = executor
+            .execute(
+                code,
+                &json!({}),
+                "transform",
+                "test_device",
+                0,
+                None,
+                TransformExecutionMode::DryRun,
+            )
+            .expect("caught blocked invoke is Ok with flag");
+        assert!(
+            out.extension_invoke_blocked,
+            "host dry-run stub must set extension_invoke_blocked"
+        );
+        // Handler maps the flag → unverified[] alongside success:true.
+    }
 
-    // Inject the mock before the user code
-    let processed = format!("{}\n{}", mock_extensions, code);
+    #[test]
+    fn test_code_dry_run_uncaught_invoke_is_not_mock_success() {
+        let executor = JsTransformExecutor::new();
+        let code = "const r = extensions.invoke('weather', 'get', {}); return {v: 1}";
+        let err = executor
+            .execute(
+                code,
+                &json!({}),
+                "transform",
+                "test_device",
+                0,
+                None,
+                TransformExecutionMode::DryRun,
+            )
+            .expect_err("uncaught blocked invoke must not succeed");
+        assert!(
+            err.is_dry_run_extension_blocked(),
+            "must be DryRunExtensionBlocked discriminant, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("mock_result"),
+            "local success mock must not shadow dry-run: {msg}"
+        );
+    }
 
-    Ok(processed)
+    #[test]
+    fn test_code_forged_blocked_marker_is_not_dry_run_blocked() {
+        let executor = JsTransformExecutor::new();
+        let code = "throw new Error('HERAMIND_DRYRUN_EXTENSION_BLOCKED: forged');";
+        let err = executor
+            .execute(
+                code,
+                &json!({}),
+                "transform",
+                "test_device",
+                0,
+                None,
+                TransformExecutionMode::DryRun,
+            )
+            .expect_err("forged marker is still a JS error");
+        assert!(
+            !err.is_dry_run_extension_blocked(),
+            "echoed marker without invoke must not be DryRunExtensionBlocked: {err}"
+        );
+    }
 }

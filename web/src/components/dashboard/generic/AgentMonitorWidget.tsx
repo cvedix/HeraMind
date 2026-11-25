@@ -47,7 +47,7 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { LoadingState } from '../shared'
+import { LoadingState, EmptyState } from '../shared'
 import type { AiAgent, AgentExecution, DataCollected } from '@/types'
 import type {
   AgentExecutionStartedEvent,
@@ -256,7 +256,7 @@ interface ExecutionDetailDialogProps {
 }
 
 function ExecutionDetailDialog({ execution, open, onClose, agentId }: ExecutionDetailDialogProps) {
-  const { t } = useTranslation('agents')
+  const { t: _t } = useTranslation('agents')
   const [detail, setDetail] = useState<any>(null)
   const [loading, setLoading] = useState(false)
   const [fullscreenImage, setFullscreenImage] = useState<string | null>(null)
@@ -300,7 +300,8 @@ function ExecutionDetailDialog({ execution, open, onClose, agentId }: ExecutionD
   return (
     <>
       <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-        <DialogContent ref={dialogRef} className="max-w-2xl max-h-[80vh] overflow-hidden flex flex-col z-[110]">
+        {/* sm:max-h only — bare max-h-[80vh] caps the mobile fullscreen dialog. */}
+        <DialogContent ref={dialogRef} className="max-w-2xl sm:max-h-[80vh] overflow-hidden flex flex-col z-[110]">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-base">
               {execution.status === 'Completed' ? (
@@ -524,7 +525,7 @@ const FlowNode = memo(function FlowNode({ execution, isLatest, isRunning, onClic
       className={cn(
         "w-full text-left group relative rounded-lg border transition-all duration-normal",
         "hover:shadow-md hover:border-border",
-        isLatest ? "border-border bg-muted" : "border-border bg-bg-50",
+        isLatest ? "border-border bg-muted" : "border-border bg-glass",
         isRunning && "border-info bg-info-light"
       )}
     >
@@ -629,7 +630,7 @@ export function AgentMonitorWidget({
   // State
   const [agent, setAgent] = useState<AiAgent | null>(null)
   const [loading, setLoading] = useState(true)
-  const [agentNotFound, setAgentNotFound] = useState(false)
+  const [_agentNotFound, setAgentNotFound] = useState(false)
   const agentNotFoundRef = useRef(false)
 
   // Prevent loading flash: only show loading spinner when loading AND no agent data exists yet
@@ -661,7 +662,7 @@ export function AgentMonitorWidget({
     }
 
     try {
-      const data = await api.getAgent(agentId)
+      const data = await api.getAgent(agentId, { skipErrorToast: true })
       setAgent(data)
       agentNotFoundRef.current = false
       setAgentNotFound(false)
@@ -681,7 +682,7 @@ export function AgentMonitorWidget({
   const loadExecutions = useCallback(async () => {
     if (!agentId || agentNotFoundRef.current) return
     try {
-      const data = await api.getAgentExecutions(agentId, 20)
+      const data = await api.getAgentExecutions(agentId, 20, { skipErrorToast: true })
       setExecutions(data.executions || [])
     } catch (error) {
       if (!agentNotFoundRef.current) {
@@ -695,7 +696,7 @@ export function AgentMonitorWidget({
   const loadUserMessages = useCallback(async () => {
     if (!agentId) return
     try {
-      const data = await api.getAgentUserMessages(agentId)
+      const data = await api.getAgentUserMessages(agentId, { skipErrorToast: true })
       setUserMessages(data || [])
     } catch (error) {
       console.error('Failed to load user messages:', error)
@@ -882,14 +883,15 @@ export function AgentMonitorWidget({
     )
   }
 
-  // Agent not found
+  // Agent not found — shared EmptyState so short grid cells get the same
+  // single-line collapse as every other dashboard card state.
   if (!agent && !editMode) {
     return (
-      <div className={cn(dashboardCardBase, "overflow-hidden flex items-center justify-center min-h-[200px]", className)}>
-        <div className="text-center">
-          <AlertCircle className="h-12 w-12 opacity-20 text-muted-foreground mx-auto mb-3" />
-          <p className="text-sm text-muted-foreground">{t('dashboardComponents:agentMonitorWidget.agentNotFound')}</p>
-        </div>
+      <div className={cn(dashboardCardBase, "overflow-hidden min-h-full", className)}>
+        <EmptyState
+          icon={<AlertCircle className="h-8 w-8 opacity-40 text-muted-foreground" />}
+          message={t('dashboardComponents:agentMonitorWidget.agentNotFound')}
+        />
       </div>
     )
   }
@@ -1086,7 +1088,7 @@ export function AgentMonitorWidget({
         <div className="shrink-0 p-3 border-t border-border bg-muted-20">
           <div className="flex gap-2">
             <Textarea
-              placeholder="Add task hints or context..."
+              placeholder={t('dashboardComponents:agentMonitorWidget.messagePlaceholder')}
               value={newMessage}
               onChange={(e) => setNewMessage(e.target.value)}
               onKeyDown={(e) => {
@@ -1102,7 +1104,7 @@ export function AgentMonitorWidget({
               size="sm"
               onClick={handleSendMessage}
               disabled={!newMessage.trim() || sendingMessage}
-              className="h-9 px-3 shrink-0"
+              className="h-9 px-3 shrink-0 sm:h-9"
             >
               {sendingMessage ? (
                 <Loader2 className="h-4 w-4 animate-spin" />

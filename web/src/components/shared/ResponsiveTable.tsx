@@ -8,19 +8,19 @@
 import { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Card } from '@/components/ui/card'
-import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
+import { IconButton } from '@/components/ui/button'
+import { tableHeadClass, tableCellClass, tableRowClass } from '@/components/ui/table-styles'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
-import { MoreVertical, Loader2, Inbox } from 'lucide-react'
+import { MoreVertical } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
 import { EmptyStateCompact } from '@/components/shared/EmptyState'
 import { cn } from '@/lib/utils'
-import { interactiveCardHover } from '@/design-system/tokens/size'
 import { textMini } from "@/design-system/tokens/typography"
 
 export interface TableColumn {
   key: string
   label: string | ReactNode
+  /** CSS width (e.g. 28%, 180px) or legacy Tailwind sizing classes. */
   width?: string
   align?: 'left' | 'center' | 'right'
   className?: string
@@ -65,11 +65,12 @@ export interface ResponsiveTableProps<T = Record<string, unknown>> {
    *  the table has no row actions but the right side of the header would
    *  otherwise be empty. */
   renderMobileHeaderExtra?: (rowData: T) => ReactNode
-  /** Flatten the mobile card header — drop the `bg-muted` band and the
-   *  border under it so the header and body read as one continuous
-   *  surface. Use when the body already provides enough visual structure
-   *  (e.g., via renderMobileBody) and the gray header band feels heavy. */
-  mobileFlatHeader?: boolean
+}
+
+// Keep existing Tailwind widths while accepting the CSS values used by page columns.
+function columnWidth(width?: string) {
+  const isCssWidth = width && /^(?:\d|\.|calc\(|clamp\(|min\(|max\(|var\(|auto$|fit-content$|max-content$|min-content$)/.test(width)
+  return isCssWidth ? { style: { width } } : { className: width }
 }
 
 /**
@@ -96,20 +97,18 @@ export function ResponsiveTable<T extends object>({
   emptyState,
   getRowClassName,
   stickyHeader = true,
-  maxHeight = 'calc(100vh - 280px)',
-  flexHeight = false,
+  maxHeight: _maxHeight = 'calc(100vh - 280px)',
+  flexHeight: _flexHeight = false,
   renderMobileBody,
   renderMobileHeaderExtra,
-  mobileFlatHeader = false,
 }: ResponsiveTableProps<T>) {
   const { t } = useTranslation('common')
   // Show empty state only on mobile when no data
-  const showEmptyState = data.length === 0 && !loading
+  const _showEmptyState = data.length === 0 && !loading
 
   // Default empty state — uses shared EmptyStateCompact for consistency
   const defaultEmpty = (
     <EmptyStateCompact
-      icon={<Inbox className="h-5 w-5" />}
       title={t('noData', { defaultValue: 'No data available' })}
     />
   )
@@ -122,24 +121,26 @@ export function ResponsiveTable<T extends object>({
             outgrows it (min-w-full keeps the table filling the container) */}
         <div className="hidden md:block w-full overflow-x-auto rounded-lg border bg-card">
           <table className={cn("min-w-full caption-bottom text-sm", className)}>
-            <thead className="[&_tr]:border-b">
+            <thead className="bg-muted-30 [&_tr]:border-b">
               <tr className="rounded-t-lg">
                 {columns.map((column) => (
                   <th
                     key={column.key}
+                    scope="col"
+                    style={columnWidth(column.width).style}
                     className={cn(
-                      "h-12 px-4 align-middle text-mini font-semibold uppercase tracking-wide text-muted-foreground",
+                      tableHeadClass,
                       column.align === 'center' && 'text-center',
                       column.align === 'right' && 'text-right',
                       !column.align && 'text-left',
-                      column.width
+                      columnWidth(column.width).className
                     )}
                   >
                     {renderColumnLabel(column.label)}
                   </th>
                 ))}
                 {actions && actions.length > 0 && (
-                  <th className="w-[60px]"></th>
+                  <th className="w-16 bg-muted-30"></th>
                 )}
               </tr>
             </thead>
@@ -147,12 +148,12 @@ export function ResponsiveTable<T extends object>({
               {Array.from({ length: skeletonRows }).map((_, i) => (
                 <tr key={i} className="border-b">
                   {columns.map((column) => (
-                    <td key={column.key} className="px-4 py-3">
-                      <Skeleton className="h-4 w-full" />
+                    <td key={column.key} className={tableCellClass}>
+                      <div className="flex min-h-8 items-center"><Skeleton className="h-4 w-full" /></div>
                     </td>
                   ))}
                   {actions && actions.length > 0 && (
-                    <td className="px-4 py-3">
+                    <td className={tableCellClass}>
                       <Skeleton className="h-4 w-6" />
                     </td>
                   )}
@@ -162,13 +163,13 @@ export function ResponsiveTable<T extends object>({
           </table>
         </div>
         {/* Mobile skeleton */}
-        <div className="md:hidden space-y-3">
+        <div className="space-y-2 md:hidden">
           {Array.from({ length: 4 }).map((_, i) => (
-            <div key={i} className="rounded-lg border bg-card overflow-hidden">
-              <div className="bg-muted px-4 py-3 border-b">
+            <div key={i} className="rounded-2xl border border-border bg-card px-4 py-3.5">
+              <div>
                 <Skeleton className="h-4 w-1/3" />
               </div>
-              <div className="p-4 space-y-3">
+              <div className="mt-3 space-y-2">
                 {columns.slice(1).map((column) => (
                   <div key={column.key} className="flex items-center justify-between gap-3">
                     <Skeleton className="h-3 w-24 shrink-0" />
@@ -191,26 +192,28 @@ export function ResponsiveTable<T extends object>({
       <div className="hidden md:block w-full overflow-x-auto rounded-lg border bg-card">
         <table className={cn("min-w-full caption-bottom text-sm", className)}>
           <thead className={cn(
-            "[&_tr]:border-b",
-            stickyHeader && "sticky top-0 z-10 bg-card"
+            "bg-card [&_tr]:border-b",
+            stickyHeader && "sticky top-0 z-10"
           )}>
             <tr className="rounded-t-xl">
               {columns.map((column) => (
                 <th
                   key={column.key}
+                  scope="col"
+                  style={columnWidth(column.width).style}
                   className={cn(
-                    "h-12 px-4 align-middle text-mini font-semibold uppercase tracking-wide text-muted-foreground",
+                    tableHeadClass,
                     column.align === 'center' && 'text-center',
                     column.align === 'right' && 'text-right',
                     !column.align && 'text-left',
-                    column.width
+                    columnWidth(column.width).className
                   )}
                 >
                   {renderColumnLabel(column.label)}
                 </th>
               ))}
               {actions && actions.length > 0 && (
-                <th className="w-[60px]"></th>
+                <th className="w-16 bg-muted-30"></th>
               )}
             </tr>
           </thead>
@@ -224,7 +227,7 @@ export function ResponsiveTable<T extends object>({
                 </td>
               </tr>
             ) : (
-              data.map((rowData, index) => {
+              data.map((rowData) => {
                 const rowClass = getRowClassName?.(rowData)
                 const visibleActions = actions?.filter(a => a.show?.(rowData) !== false)
 
@@ -232,18 +235,17 @@ export function ResponsiveTable<T extends object>({
                   <tr
                     key={rowKey(rowData)}
                     className={cn(
-                      "border-b transition-colors duration-fast hover:bg-muted-30 animate-fade-in-up",
+                      tableRowClass,
                       onRowClick && 'cursor-pointer',
                       rowClass
                     )}
-                    style={{ animationDelay: `calc(${index} * var(--stagger-step))`, animationFillMode: 'both' }}
                     onClick={() => onRowClick?.(rowData)}
                   >
                     {columns.map((column) => (
                       <td
                         key={column.key}
                         className={cn(
-                          "px-4 py-3 align-middle",
+                          tableCellClass,
                           column.align === 'center' && 'text-center',
                           column.align === 'right' && 'text-right',
                           !column.align && 'text-left',
@@ -251,7 +253,7 @@ export function ResponsiveTable<T extends object>({
                         )}
                       >
                         <div className={cn(
-                          "flex items-center min-h-[36px]",
+                          "flex items-center min-h-[32px]",
                           column.align === 'center' && 'justify-center',
                           column.align === 'right' && 'justify-end',
                           (!column.align || column.align === 'left') && 'justify-start',
@@ -260,19 +262,17 @@ export function ResponsiveTable<T extends object>({
                         </div>
                       </td>
                     ))}
-                    {visibleActions && visibleActions.length > 0 && (
-                      <td className="px-4 py-3 align-middle">
-                        <DropdownMenu>
+                    {actions && actions.length > 0 && (
+                      <td className={cn(tableCellClass, "text-right")} onClick={(e) => e.stopPropagation()}>
+                        {!!visibleActions?.length && <DropdownMenu>
                           <DropdownMenuTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 p-0"
-                              aria-label="Actions"
+                            <IconButton
+                              size="sm"
+                              aria-label={t('actions', { defaultValue: 'Actions' })}
                               onClick={(e) => e.stopPropagation()}
                             >
                               <MoreVertical className="h-4 w-4" />
-                            </Button>
+                            </IconButton>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end" className="w-[160px]">
                             {visibleActions.map((action, idx) => (
@@ -293,7 +293,7 @@ export function ResponsiveTable<T extends object>({
                               </DropdownMenuItem>
                             ))}
                           </DropdownMenuContent>
-                        </DropdownMenu>
+                        </DropdownMenu>}
                       </td>
                     )}
                   </tr>
@@ -304,55 +304,74 @@ export function ResponsiveTable<T extends object>({
         </table>
       </div>
 
-      {/* Mobile Card List */}
-      <div className="md:hidden space-y-2">
+      {/* Mobile card list — every record owns a clear surface, with one
+          consistent radius, border and vertical rhythm across pages. */}
+      <div className="space-y-2 md:hidden">
         {data.length === 0 ? (
-          <Card className="overflow-hidden border-border">
-            <div className="p-8">
+          <div className="py-8">
               {emptyState || defaultEmpty}
-            </div>
-          </Card>
+          </div>
         ) : (
-          data.map((rowData, index) => {
+          data.map((rowData) => {
             const rowClass = getRowClassName?.(rowData)
             const visibleActions = actions?.filter(a => a.show?.(rowData) !== false)
 
             return (
-              <Card
+              <div
                 key={rowKey(rowData)}
+                role={onRowClick ? "button" : undefined}
+                tabIndex={onRowClick ? 0 : undefined}
                 className={cn(
-                  'overflow-hidden border-border shadow-sm animate-fade-in-up',
-                  interactiveCardHover,
-                  onRowClick && 'cursor-pointer active:scale-[0.99]',
+                  'animate-fade-in-up rounded-2xl border border-border bg-card px-4 py-3.5 transition-colors',
+                  onRowClick && 'cursor-pointer active:bg-muted',
                   rowClass
                 )}
-                style={{ animationDelay: `calc(${index} * var(--stagger-step))`, animationFillMode: 'both' }}
                 onClick={() => onRowClick?.(rowData)}
+                onKeyDown={(e) => {
+                  if (!onRowClick || (e.key !== 'Enter' && e.key !== ' ')) return
+                  e.preventDefault()
+                  onRowClick(rowData)
+                }}
               >
-                {/* Card Header - First column as title */}
-                <div className={cn(
-                  "px-3 py-2.5",
-                  mobileFlatHeader
-                    ? "pb-1"
-                    : "bg-muted border-b border-border rounded-t-lg",
-                )}>
+                {/* Card Header - First column as title. Flat single-surface
+                    card: no banded header strip — the grey band read as
+                    admin-table chrome and isn't part of the app's card
+                    language (AgentCard & co. are single-surface). */}
+                <div>
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
                       <div className="min-w-0 flex-1 truncate">
                         {renderCell(columns[0].key, rowData)}
                       </div>
                     </div>
-                    {visibleActions && visibleActions.length > 0 ? (
+                    {visibleActions?.length === 1 ? (
+                      <IconButton
+                        size="sm"
+                        className={cn(
+                          "shrink-0 hover:bg-muted",
+                          visibleActions[0].variant === 'destructive' && "text-error"
+                        )}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          visibleActions[0].onClick(rowData)
+                        }}
+                        disabled={visibleActions[0].disabled}
+                        aria-label={visibleActions[0].label}
+                        title={visibleActions[0].label}
+                      >
+                        {visibleActions[0].icon}
+                      </IconButton>
+                    ) : visibleActions && visibleActions.length > 1 ? (
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 shrink-0 hover:bg-muted"
-                            aria-label="Actions"
+                          <IconButton
+                            size="sm"
+                            className="shrink-0 hover:bg-muted"
+                            onClick={(e) => e.stopPropagation()}
+                            aria-label={t('actions', { defaultValue: 'Actions' })}
                           >
                             <MoreVertical className="h-4 w-4" />
-                          </Button>
+                          </IconButton>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end" className="w-[160px]">
                           {visibleActions.map((action, idx) => (
@@ -389,7 +408,7 @@ export function ResponsiveTable<T extends object>({
                     callers can pass renderMobileBody to swap in a tailored
                     layout without losing the shared Card chrome, header,
                     and actions menu. */}
-                <div className="p-3">
+                <div className="pt-1.5">
                   {renderMobileBody ? (
                     renderMobileBody(rowData)
                   ) : (
@@ -417,7 +436,7 @@ export function ResponsiveTable<T extends object>({
                     </div>
                   )}
                 </div>
-              </Card>
+              </div>
             )
           })
         )}

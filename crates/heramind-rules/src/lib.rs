@@ -30,10 +30,12 @@
 //! }
 //! ```
 
+pub mod chain;
 pub mod device_integration;
 pub mod device_status_emitter;
 pub mod engine;
 pub mod error;
+pub mod explain;
 pub mod extension_integration;
 pub mod models;
 pub mod preview;
@@ -47,6 +49,7 @@ pub use device_status_emitter::{
 };
 pub use engine::{AgentTriggerCallback, InMemoryValueProvider, RuleEngine};
 pub use error::RuleError;
+pub use explain::{ConditionExplanation, EvalOutcome, RuleExplanation};
 pub use models::{
     ComparisonOperator, CompiledRule, ExecuteTarget, LogicalOperator, NotifySeverity, RuleAction,
     RuleCondition, RuleExecutionResult, RuleId, RuleState, RuleTrigger, RuleValue, ValueProvider,

@@ -29,6 +29,8 @@ pub mod payload_template;
 pub mod telemetry;
 
 // Simplified device management
+pub mod association_bind;
+pub mod command_validation;
 pub mod registry;
 pub mod service;
 
@@ -49,6 +51,7 @@ pub mod embedded_broker;
 
 // Re-exports (only types used externally via crate-root shortcut path)
 pub use adapter::{AdapterResult, ConnectionStatus, DeviceAdapter, DeviceEvent};
+pub use association_bind::{AssociationBindInput, AssociationBindOutcome};
 pub use mdl::{DeviceError, MetricDataType, MetricValue};
 pub use mdl_format::{CommandDefinition, MetricDefinition as MdlMetricDefinition};
 pub use registry::{

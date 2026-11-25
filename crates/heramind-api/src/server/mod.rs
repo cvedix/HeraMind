@@ -30,7 +30,6 @@ pub use state::DeviceStatusUpdate;
 pub use types::{ServerState, MAX_REQUEST_BODY_SIZE};
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +43,6 @@ use tower_http::timeout::{RequestBodyTimeoutLayer, TimeoutLayer};
 /// reachable on the LAN (0.0.0.0) or only locally (127.0.0.1/localhost).
 static HTTP_BIND_LOOPBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static HTTP_BIND_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
 /// Whether the HTTP server is bound to loopback only.
 pub fn http_bind_is_loopback() -> bool {
@@ -52,8 +50,11 @@ pub fn http_bind_is_loopback() -> bool {
 }
 
 /// The bound HTTP port (0 if not yet bound).
+///
+/// Delegates to [`heramind_core::advertise::http_listen_port`] so device
+/// advertise URLs and the dashboards proxy share one recorded bind port.
 pub fn http_bind_port() -> u16 {
-    HTTP_BIND_PORT.load(std::sync::atomic::Ordering::Relaxed)
+    heramind_core::advertise::http_listen_port()
 }
 
 pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
@@ -62,11 +63,8 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
     // would otherwise panic on first TLS use (e.g. the TLS proxy below).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    HTTP_BIND_LOOPBACK.store(
-        bind.ip().is_loopback(),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    HTTP_BIND_PORT.store(bind.port(), std::sync::atomic::Ordering::Relaxed);
+    // Listen port / loopback flags are recorded **after** the socket binds
+    // (see below) so port 0 gets the OS-assigned port via local_addr().
     use crate::startup::{ServiceStatus, StartupLogger};
 
     // Note: V2 extension system doesn't require panic hook installation
@@ -113,6 +111,65 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
     // Start enabled data push targets (must be after event bus is ready)
     state.init_data_push_targets().await;
     startup.service("Data push targets", ServiceStatus::Started);
+
+    // Bootstrap the agent's platform-command auth: provision an internal
+    // wildcard API key if none exists, so the chat agent's HTTP-path CLI
+    // commands work out of the box on fresh installs (see
+    // AuthState::ensure_internal_api_key).
+    state.auth.api_key_state.ensure_internal_api_key().await;
+
+    // Session retention: prune chat sessions older than the configured
+    // window (settings → retention → session_retention_hours; default OFF).
+    // Hourly cadence, config re-read each cycle so runtime changes apply.
+    {
+        let state_for_retention = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let hours = heramind_storage::SettingsStore::open_default()
+                    .ok()
+                    .and_then(|s| s.get_retention_config().session_retention_hours);
+                let Some(hours) = hours else { continue };
+                let session_store = state_for_retention.agents.session_manager.session_store();
+                match session_store.cleanup_old_sessions(hours as i64 * 3600) {
+                    Ok(n) if n > 0 => tracing::info!(
+                        category = "storage",
+                        n,
+                        hours,
+                        "Session retention pass complete"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        category = "storage",
+                        error = %e,
+                        "Session retention pass failed"
+                    ),
+                }
+            }
+        });
+    }
+
+    // Split-brain guard: with HERAMIND_DATA_DIR set, stores whose file only
+    // exists at the legacy cwd-relative data/ get silently redirected there
+    // (upgrade compat — see heramind_core::paths). Half-env/half-legacy is a
+    // data-loss illusion waiting to happen, so surface it as ONE prominent
+    // error-level banner instead of scattered per-file warns. Strict mode
+    // (HERAMIND_STRICT_DATA_DIR) never redirects at all.
+    // NOTE: placed after ALL init_* phases — stores resolve lazily through
+    // init (device/telemetry/llm/rules/automations/data-push among them), so
+    // checking earlier under-reports.
+    let redirected = heramind_core::paths::legacy_redirected_stores();
+    if !redirected.is_empty() {
+        tracing::error!(
+            files = ?redirected,
+            data_dir = %heramind_core::paths::data_dir().display(),
+            "DATA-DIR SPLIT: HERAMIND_DATA_DIR is set, but the stores above were \
+             found ONLY at the legacy cwd-relative ./data/ and are being used \
+             from there. Set HERAMIND_STRICT_DATA_DIR to disable the fallback, \
+             or move the files into the data dir to consolidate."
+        );
+    }
 
     // Configuration phase
     startup.phase_config();
@@ -177,13 +234,22 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
     // with the tokio runtime is unsupported" — seen on macOS 15+).
     socket.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(socket.into())?;
+    // Prefer local_addr() over the pre-bind `bind` arg: when port is 0 the OS
+    // assigns an ephemeral port that bind.port() still reports as 0.
+    let bound_addr = listener.local_addr()?;
+    HTTP_BIND_LOOPBACK.store(
+        bound_addr.ip().is_loopback(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    heramind_core::advertise::set_http_listen_port(bound_addr.port());
 
     // Ready phase — HTTP listener is bound
     startup.phase_ready();
-    startup.ready_info(&bind.to_string());
+    startup.ready_info(&bound_addr.to_string());
 
     tracing::info!(
         elapsed_ms = t_start.elapsed().as_millis() as u64,
+        listen = %bound_addr,
         "HTTP listener ready (time to serve)"
     );
 
@@ -201,7 +267,7 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(9376);
-        let target = format!("127.0.0.1:{}", bind.port());
+        let target = format!("127.0.0.1:{}", bound_addr.port());
         tokio::spawn(async move {
             match run_tls_proxy(&cert, &key, tls_port, &target).await {
                 Ok(()) => unreachable!("tls proxy loop never returns Ok"),
@@ -216,13 +282,17 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
     // Initialize extension metrics collector (decoupled from device system)
     let runtime = state.extensions.runtime.clone();
     let metrics_storage = state.extensions.metrics_storage.clone();
+    // Saved extension configs so the collector's self-heal reload restores
+    // configuration instead of resetting the extension to defaults.
+    let extension_config_store = state.extensions.store.clone();
     let event_bus_for_metrics = state.core.event_bus.clone();
     tokio::spawn(async move {
         use crate::server::extension_metrics::ExtensionMetricsCollector;
         use std::time::Duration;
 
         let mut collector = ExtensionMetricsCollector::new(runtime, metrics_storage)
-            .with_interval(Duration::from_secs(60));
+            .with_interval(Duration::from_secs(60))
+            .with_config_store(extension_config_store);
 
         if let Some(bus) = event_bus_for_metrics {
             collector = collector.with_event_bus(bus);
@@ -233,6 +303,8 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
 
     // Start telemetry retention cleanup background task
     {
+        let session_store = state.agents.session_manager.session_store();
+        let agent_store = state.agents.agent_store.clone();
         tokio::spawn(async move {
             use heramind_storage::{SettingsStore, TimeSeriesStore};
 
@@ -293,15 +365,26 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
                         }
                     }
 
-                    // Clean up expired image files
+                    // Clean up expired image files. Files still referenced by a
+                    // conversation or agent journal survive — deleting them on the
+                    // image schedule turned history markdown into 404s.
                     if let Some(image_retention_hours) = config.image_retention {
-                        let data_dir = std::env::var("HERAMIND_DATA_DIR")
-                            .unwrap_or_else(|_| "data".to_string());
-                        let images_dir = PathBuf::from(&data_dir).join("images");
+                        // Canonical data dir (paths::data_dir treats an
+                        // EMPTY env var as unset; a raw env read here treated
+                        // it as "" and joined "./images").
+                        let images_dir = heramind_core::paths::data_dir().join("images");
 
-                        match crate::server::image_cleanup::cleanup_expired_images(
+                        let protected =
+                            crate::server::image_cleanup::collect_referenced_image_files(
+                                &session_store,
+                                &agent_store,
+                            )
+                            .await;
+
+                        match crate::server::image_cleanup::cleanup_expired_images_with_protection(
                             &images_dir,
                             image_retention_hours,
+                            &protected,
                         )
                         .await
                         {
@@ -617,13 +700,22 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
             {
                 let bg_state_for_builtin = bg_state.clone();
                 tokio::spawn(async move {
-                    let cfg = crate::builtin_llm::config::BuiltinConfig::from_env();
+                    // API-owned engine knobs persist here and win over the
+                    // systemd env on service restart (2026-10-30: ctx 32768
+                    // reverted to 8192 and every turn failed).
+                    crate::builtin_llm::config::set_engine_overrides_path(
+                        bg_state_for_builtin.data_dir.join("builtin_engine.json"),
+                    );
+                    let mut cfg = crate::builtin_llm::config::BuiltinConfig::from_env();
                     let data_dir = bg_state_for_builtin.data_dir.clone();
                     // 镜像 auto_register 守卫:get_instance_manager 启动初期可能暂不可用,
                     // 重试到可用(与上面 llama.cpp 块相同的 12×5s 节奏)。
                     let mut retry_interval = tokio::time::interval(Duration::from_secs(5));
                     for _ in 0..12 {
                         retry_interval.tick().await;
+                        let _engine_change =
+                            crate::builtin_llm::config::ENGINE_CHANGE_LOCK.lock().await;
+                        cfg = crate::builtin_llm::config::BuiltinConfig::from_env();
                         if let Ok(manager) = heramind_agent::get_instance_manager() {
                             match crate::builtin_llm::state::bootstrap(&data_dir, &cfg, &manager)
                                 .await
@@ -643,6 +735,149 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
                             }
                             break;
                         }
+                    }
+
+                    // [llama watchdog] OOM self-heal (2026-10-15 incident on
+                    // NG4520: llama-server maps ~47 GB of CUDA address space,
+                    // tops the oom_score ranking, and was killed 5× in 17 h;
+                    // each death left chat dead with connection-refused until
+                    // a MANUAL service restart). bootstrap() is already
+                    // idempotent with exactly the right semantics (healthy →
+                    // no-op; instance present but server dead → respawn), so
+                    // the watchdog just drives it on a slow cadence. The
+                    // health-first check keeps the common case one HTTP GET;
+                    // consecutive failures back off to cap log noise, and a
+                    // missing model never triggers respawn attempts.
+                    let mut poll = Duration::from_secs(30);
+                    let mut backoff = Duration::from_secs(30);
+                    // Consecutive alive-but-unhealthy cycles. A LIVE process
+                    // with a dead port is "loading / box under load", not an
+                    // OOM death — respawning it on a probe timeout would
+                    // double-spawn two ~47 GB mappings and OOM the box
+                    // (2026-10-15 near-miss). Only a genuinely wedged server
+                    // (5 min unresponsive) gets the kill-then-respawn
+                    // escalation.
+                    let mut wedged_cycles: u32 = 0;
+                    // Consecutive failed starts while an operator pin is in
+                    // effect. A pin that cannot start is a proven-impossible
+                    // configuration, not a transient; retrying it forever was
+                    // the 2026-10-30 crash loop. After 2 failures this process
+                    // drops the pin so the auto-sizer can degrade (partial
+                    // offload / CPU) — the systemd file is NOT modified, so a
+                    // service restart still honors the operator's pin.
+                    let mut pinned_failures: u32 = 0;
+                    let mut recovery = crate::builtin_llm::config::WatchdogRecovery::new(&cfg);
+                    loop {
+                        tokio::time::sleep(poll).await;
+                        let _engine_change =
+                            crate::builtin_llm::config::ENGINE_CHANGE_LOCK.lock().await;
+                        let (latest, pins_changed) =
+                            recovery.refresh(crate::builtin_llm::config::BuiltinConfig::from_env());
+                        cfg = latest;
+                        if pins_changed {
+                            pinned_failures = 0;
+                        }
+                        if !cfg.enabled || cfg.stopped {
+                            // `stopped` = deliberate API stop; the watchdog
+                            // must not respawn what the user turned off.
+                            continue;
+                        }
+                        if crate::builtin_llm::server::health_check(cfg.port).await {
+                            backoff = Duration::from_secs(30);
+                            wedged_cycles = 0;
+                            continue;
+                        }
+                        // Port dead. Only an incident when a model is
+                        // actually installed — otherwise "stopped" is the
+                        // normal not-configured state.
+                        let mdir = crate::builtin_llm::handlers::models_dir(&data_dir);
+                        if crate::builtin_llm::handlers::installed_model(&mdir).is_none() {
+                            continue;
+                        }
+                        if crate::builtin_llm::server::any_llama_server_alive() {
+                            wedged_cycles += 1;
+                            if wedged_cycles < 10 {
+                                // Alive but not answering yet — wait it out.
+                                tracing::debug!(
+                                    port = cfg.port,
+                                    wedged_cycles,
+                                    "builtin llm watchdog: llama-server alive but not answering — waiting"
+                                );
+                                continue;
+                            }
+                            tracing::warn!(
+                                port = cfg.port,
+                                "builtin llm watchdog: llama-server alive but unresponsive for ~5min — killing and respawning"
+                            );
+                            crate::builtin_llm::server::stop_all_llama_servers();
+                            wedged_cycles = 0;
+                        } else {
+                            wedged_cycles = 0;
+                            // Process gone (the OOM case): clear its stale
+                            // registry entry before the replacement lands.
+                            crate::builtin_llm::server::stop_all_llama_servers();
+                        }
+                        let Ok(manager) = heramind_agent::get_instance_manager() else {
+                            continue;
+                        };
+                        tracing::warn!(
+                            port = cfg.port,
+                            next_backoff_secs = backoff.as_secs(),
+                            "builtin llm watchdog: llama-server not answering — attempting respawn"
+                        );
+                        match crate::builtin_llm::state::bootstrap(&data_dir, &cfg, &manager).await
+                        {
+                            crate::builtin_llm::state::BootstrapOutcome::ServerReady {
+                                endpoint,
+                            } => {
+                                tracing::info!(
+                                    endpoint = %endpoint,
+                                    "builtin llm watchdog: llama-server revived"
+                                );
+                                pinned_failures = 0;
+                                backoff = Duration::from_secs(30);
+                            }
+                            crate::builtin_llm::state::BootstrapOutcome::ServerAlreadyRunning => {
+                                // Someone else (restart API / race) fixed it.
+                                pinned_failures = 0;
+                                backoff = Duration::from_secs(30);
+                            }
+                            crate::builtin_llm::state::BootstrapOutcome::Failed(e) => {
+                                if cfg.ngl.is_some() || cfg.vlm_ngl.is_some() {
+                                    pinned_failures = pinned_failures.saturating_add(1);
+                                    if pinned_failures >= 2 {
+                                        tracing::error!(
+                                            pinned_ngl = ?cfg.ngl,
+                                            pinned_vlm_ngl = ?cfg.vlm_ngl,
+                                            failures = pinned_failures,
+                                            error = %e,
+                                            "builtin llm watchdog: pinned NGL failed repeated starts — \
+                                             clearing the pin for respawns in THIS process so the \
+                                             auto-sizer can degrade; the systemd config is unchanged \
+                                             (remove HERAMIND_BUILTIN_MODEL_NGL/_VLM_NGL to fix it \
+                                             permanently)"
+                                        );
+                                        recovery.degrade();
+                                        cfg.ngl = None;
+                                        cfg.vlm_ngl = None;
+                                        pinned_failures = 0;
+                                    }
+                                }
+                                tracing::warn!(
+                                    error = %e,
+                                    next_backoff_secs = backoff.as_secs(),
+                                    "builtin llm watchdog: respawn failed — backing off"
+                                );
+                                backoff = std::cmp::min(backoff * 2, Duration::from_secs(300));
+                            }
+                            // ModelMissing mid-loop: model was uninstalled —
+                            // stop attempting, the outer enabled/model checks
+                            // handle re-arming.
+                            _ => {
+                                backoff = Duration::from_secs(30);
+                            }
+                        }
+                        poll = backoff;
                     }
                 });
             }
@@ -670,24 +905,30 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
                     // Wait for system to stabilize
                     tokio::time::sleep(Duration::from_secs(30)).await;
 
-                    let config = MemoryConfig::load();
-                    let context_interval = config.system_context_interval_secs.max(60);
-                    let summary_interval = config.summary_interval_secs.max(600);
-
-                    let mut context_timer =
-                        tokio::time::interval(Duration::from_secs(context_interval));
-                    let mut summary_timer =
-                        tokio::time::interval(Duration::from_secs(summary_interval));
+                    // Both deadlines start "now", so the first gather and the
+                    // first summary run right after stabilization.
+                    let mut next_context_at = tokio::time::Instant::now();
+                    let mut next_summary_at = tokio::time::Instant::now();
 
                     tracing::info!(
-                        context_interval_secs = context_interval,
-                        summary_interval_secs = summary_interval,
-                        "System context background task started"
+                        "System context background task started (intervals hot-reload from memory config)"
                     );
 
                     loop {
+                        // Reload the config EVERY iteration so runtime changes
+                        // to the intervals take effect on the next tick. The
+                        // previous interval()-based timers captured both
+                        // intervals once at startup — while a comment inside
+                        // the tick claimed reloads worked.
+                        let config = MemoryConfig::load();
+                        let context_interval =
+                            Duration::from_secs(config.system_context_interval_secs.max(60));
+                        let summary_interval =
+                            Duration::from_secs(config.summary_interval_secs.max(600));
+
                         tokio::select! {
-                            _ = context_timer.tick() => {
+                            _ = tokio::time::sleep_until(next_context_at) => {
+                                next_context_at = tokio::time::Instant::now() + context_interval;
                                 let context = crate::server::system_context::gather_system_context(&ctx_state).await;
 
                                 if let Err(e) = ctx_state.agents.system_memory_store
@@ -697,12 +938,12 @@ pub async fn run(bind: SocketAddr) -> anyhow::Result<()> {
                                     tracing::warn!(error = %e, "Failed to update system context");
                                 }
                             }
-                            _ = summary_timer.tick() => {
-                                // Reload config each tick to pick up runtime changes
-                                let current_config = MemoryConfig::load();
+                            _ = tokio::time::sleep_until(next_summary_at) => {
+                                next_summary_at = tokio::time::Instant::now() + summary_interval;
+
                                 let llm_result = async {
                                     let manager = heramind_agent::get_instance_manager().ok()?;
-                                    match &current_config.summary_backend_id {
+                                    match &config.summary_backend_id {
                                         Some(id) => manager.get_runtime(id).await.ok(),
                                         None => manager.get_active_runtime().await.ok(),
                                     }

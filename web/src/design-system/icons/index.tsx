@@ -32,6 +32,7 @@ import {
 
   // Charts
   BarChart3,
+  Camera,
   PieChart as PieChartIcon,
   LineChart as LineChartIcon,
   Donut,
@@ -52,8 +53,8 @@ import {
   Unlock,
   DoorOpen,
   DoorClosed,
-  Eye,
-  EyeOff,
+
+
   Volume2,
   Sun,
   Moon,
@@ -237,6 +238,7 @@ export {
   ToggleLeft,
   ToggleRight,
   BarChart3,
+  Camera,
   PieChartIcon,
   LineChartIcon,
   Donut,

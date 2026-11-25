@@ -148,6 +148,8 @@
   "defaultRetentionDesc": "数值指标（温度、湿度等）的保留时间",
   "imageRetention": "图片保留时间",
   "imageRetentionDesc": "摄像头图片和二进制数据的保留时间",
+  "sessionRetention": "会话保留时间",
+  "sessionRetentionDesc": "聊天会话的保留时间;超期的会话(含历史)将被定期清理,留空表示永久保留",
   "retentionNever": "永不清理",
   "retention12h": "12 小时",
   "retention1d": "1 天",
@@ -332,7 +334,13 @@
     "copyLink": "复制链接",
     "linkCopied": "链接已复制",
     "copyFailed": "复制失败",
-    "deepLinkUnavailable": "机器人尚未识别，暂时无法生成深度链接。",
+    "copyCommand": "复制命令",
+    "commandCopied": "命令已复制",
+    "copyToken": "复制密钥",
+    "tokenCopied": "密钥已复制",
+    "manualBindHint": "机器人尚未识别，暂时无法生成深度链接。可直接向机器人发送以下命令绑定当前会话：",
+    "howToGet": "这些信息怎么获取？→ 配置指南",
+    "howToPair": "如何用邀请绑定会话？→ 配对说明",
     "noInvites": "暂无邀请",
     "noInvitesDesc": "生成一个邀请以绑定会话。",
     "token": "Token",
@@ -378,6 +386,9 @@
   "chatHistoryDepthDesc": "聊天发送给模型的最近对话轮数（定时智能体不受影响，用各自设置）",
   "chatTurnTimeout": "单轮对话时间预算",
   "chatTurnTimeoutDesc": "一轮对话中多步工具调用的总时限，超时后强制总结收尾（默认 30 分钟；长任务可调大）",
+  "summaryInstance": "压缩模型",
+  "summaryInstanceDesc": "上下文接近上限时用于总结会话历史的模型实例。选\"会话模型\"则沿用各会话当前模型；指向更小更快的实例可避免压缩与主模型争抢资源。",
+  "summaryInstanceSessionDefault": "会话模型（默认）",
   "lan": {
     "title": "允许局域网设备连接",
     "description": "开启后，同一网络内的设备可通过本机 IP 接入（含 MQTT 设备接入与 Web 访问）。默认开启；若在不可信网络下使用，可关闭并仅监听本机。",
@@ -385,5 +396,13 @@
     "restartNow": "立即重启",
     "compatNotice": "已保持旧版本默认的局域网访问（你的设备此前可直连本机）。若不需要，可在此关闭。",
     "dismiss": "知道了"
-  }
+  },
+  "processUsage": "HeraMind资源占用分析",
+  "dataDirUsage": "数据目录占用",
+  "residentMemory": "常驻内存",
+  "ofTotalMemory": "占整机",
+  "processCpu": "进程 CPU",
+  "ofOneCore": "单核占比",
+  "threads": "线程",
+  "processUptime": "进程运行时长"
 }

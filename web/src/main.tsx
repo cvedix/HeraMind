@@ -7,11 +7,17 @@ import "./index.css"
 import "./i18n/config"
 import App from "./App"
 import { ThemeProvider } from "@/components/ui/theme"
+import { ThemeColorSync } from "@/hooks/useThemeColor"
 import { initVisualViewport } from "@/hooks/useVisualViewport"
+import { installGlobalTauriWindowDrag } from "@/lib/windowDrag"
 
 // Expose React and JSX runtime as globals for community component bundles (IIFE)
 ;(window as any).React = React
 ;(window as any).jsxRuntime = jsxRuntime
+
+// Tauri desktop: keep the top edge of the window draggable even when a
+// fullscreen dialog/overlay is on top of the per-element drag strips.
+installGlobalTauriWindowDrag()
 
 // Expose HeraMind API for community/extension components
 ;(window as any).heramind = {
@@ -148,7 +154,7 @@ import { initVisualViewport } from "@/hooks/useVisualViewport"
    * List transform automations, optionally filtered.
    * GET /api/automations?type=transform
    */
-  listTransforms: async (filter?: { scope?: string; extension_id?: string }) => {
+  listTransforms: async (_filter?: { scope?: string; extension_id?: string }) => {
     const { api } = await import('@/lib/api')
     const result = await api.listAutomations({ type: 'transform' })
     return result.automations.map((a: any) => ({
@@ -285,6 +291,7 @@ createRoot(document.getElementById("root")!).render(
         only behaviours — the old `future` prop no longer exists. */}
     <BrowserRouter>
       <ThemeProvider>
+        <ThemeColorSync />
         <App />
       </ThemeProvider>
     </BrowserRouter>

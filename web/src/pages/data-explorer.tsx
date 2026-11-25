@@ -3,9 +3,8 @@ import { useTranslation } from 'react-i18next'
 import { PageLayout } from '@/components/layout/PageLayout'
 import { useStore } from '@/store'
 import { Card } from '@/components/ui/card'
-import { ResponsiveTable, type TableColumn, Pagination, EmptyState } from '@/components/shared'
-import { PageTabsBar, PageTabsContent, PageTabsBottomNav } from '@/components/shared/PageTabs'
-import { Input } from '@/components/ui/input'
+import { ResponsiveTable, type TableColumn, Pagination, EmptyState, EmptyStateCard, SearchInput } from '@/components/shared'
+import { PageTabsBar, PageTabsContent } from '@/components/shared/PageTabs'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { debounce } from '@/lib/utils/async'
@@ -31,14 +30,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Search, Database, Cpu, Puzzle, Workflow, Brain, History, Loader2, Eye, Download, Clock, Copy, Check, Send, Plus, AlertTriangle, RefreshCw } from 'lucide-react'
+import { Database, Cpu, Puzzle, Workflow, Brain, History, Loader2, Eye, Download, Clock, Copy, Check, Send, Plus, AlertTriangle, RefreshCw } from 'lucide-react'
 import { api } from '@/lib/api'
 import { isBase64Image, getImageDataUrl } from '@/pages/devices/utils'
 import { cn } from '@/lib/utils'
 import type { UnifiedDataSourceInfo } from '@/types'
 import { useIsMobile } from '@/hooks/useMobile'
 import { useEvents } from '@/hooks/useEvents'
-import { useAbortController } from '@/hooks/useAbortController'
 import { textNano, textMini } from "@/design-system/tokens/typography"
 import { ExportDataDialog } from '@/components/data/ExportDataDialog'
 import { formatTimestamp } from '@/lib/utils/format'
@@ -78,7 +76,7 @@ function formatTime(timestamp?: number): string {
   return `${d.getMonth() + 1}/${d.getDate()} ${time}`
 }
 
-function formatDateTime(timestamp: number): string {
+function _formatDateTime(timestamp: number): string {
   const ms = timestamp < 1e12 ? timestamp * 1000 : timestamp
   const d = new Date(ms)
   const pad = (n: number) => String(n).padStart(2, '0')
@@ -100,17 +98,18 @@ export function DataExplorerPage() {
   const [loading, setLoading] = useState(true)
 
   // Mobile: track loaded page count for cumulative append
-  const [mobileLoadedPages, setMobileLoadedPages] = useState(1)
+  const [_mobileLoadedPages, setMobileLoadedPages] = useState(1)
 
   // Filters
   const [search, setSearch] = useState('')
+  const [pushSearch, setPushSearch] = useState('')
   const [selectedSourceName, setSelectedSourceName] = useState<string>('__all__')
   const [page, setPage] = useState(1)
   const pageSize = 10
 
   // Debounced search value
   const [debouncedSearch, setDebouncedSearch] = useState('')
-  const searchTimerRef = useRef<ReturnType<typeof setTimeout>>()
+  const _searchTimerRef = useRef<ReturnType<typeof setTimeout>>()
   const updateSearch = useMemo(() => debounce(setDebouncedSearch, 300), [])
 
   // Detail dialog
@@ -333,11 +332,15 @@ export function DataExplorerPage() {
     switch (columnKey) {
       case 'source_display_name':
         return (
-          <span className="text-sm font-medium text-foreground">{source.source_display_name}</span>
+          <span className="block min-w-0 truncate text-sm font-medium text-foreground" title={source.source_display_name}>
+            {source.source_display_name}
+          </span>
         )
       case 'field_display_name':
         return (
-          <span className="text-sm font-medium">{source.field_display_name}</span>
+          <span className="block min-w-0 truncate text-sm font-medium" title={source.field_display_name}>
+            {source.field_display_name}
+          </span>
         )
       case 'unit':
         return (
@@ -355,7 +358,7 @@ export function DataExplorerPage() {
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-2"
+              className="h-7 px-2 sm:h-7"
               onClick={(e) => { e.stopPropagation(); setSelectedSource(source) }}
             >
               <Eye className="h-4 w-4" />
@@ -363,7 +366,7 @@ export function DataExplorerPage() {
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-2"
+              className="h-7 px-2 sm:h-7"
               onClick={(e) => { e.stopPropagation(); setExportSource(source) }}
             >
               <Download className="h-4 w-4" />
@@ -380,31 +383,56 @@ export function DataExplorerPage() {
 
   const dataTable = (
     isMobile ? (
-      <div className="space-y-2">
+      <div className="min-w-0 space-y-2">
+        {pageData.length === 0 && loading && (
+          [0, 1, 2].map((i) => (
+            <Card key={i} className="overflow-hidden rounded-2xl border-border bg-card shadow-none">
+              <div className="px-3 py-2.5 animate-pulse space-y-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="h-5 w-14 rounded-full bg-muted" />
+                  <div className="h-4 w-40 rounded bg-muted" />
+                </div>
+                <div className="h-3 w-52 rounded bg-muted" />
+              </div>
+            </Card>
+          ))
+        )}
         {pageData.length === 0 && !loading ? (
-          <EmptyState
-            icon={<Database className="h-12 w-12" />}
-            title={search ? t('data:noResults', 'No data sources match your search') : t('data:noSources', 'No data sources available')}
-            description={search ? undefined : t('data:noSourcesDesc', 'Data sources will appear here once devices are connected or extensions are registered')}
-          />
+          <EmptyStateCard>
+            <EmptyState
+              title={search ? t('data:noResults', 'No data sources match your search') : t('data:noSources', 'No data sources available')}
+              description={search ? undefined : t('data:noSourcesDesc', 'Data sources will appear here once devices are connected or extensions are registered')}
+            />
+          </EmptyStateCard>
         ) : pageData.map((source) => (
           <Card
             key={source.id}
-            className="overflow-hidden border-border shadow-sm cursor-pointer active:scale-[0.99] transition-all"
+            className={cn(
+              "cursor-pointer overflow-hidden rounded-2xl border border-border bg-card shadow-none transition-colors active:bg-muted",
+            )}
             onClick={() => setSelectedSource(source)}
           >
-            <div className="px-3 py-2.5">
-              {/* Row 1: source + field + eye button */}
-              <div className="flex items-center gap-2.5">
-                <SourceTypeBadge type={source.source_type} />
-                <div className="flex-1 min-w-0">
-                  <div className="font-medium text-sm truncate">{source.field_display_name}</div>
+            <div className="min-w-0 px-3 py-2.5">
+              {/* Row 1: type + field/source + actions */}
+              <div className="flex min-w-0 items-center gap-2.5">
+                <div className="shrink-0">
+                  <SourceTypeBadge type={source.source_type} />
                 </div>
-                <div className="flex items-center gap-1">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium" title={source.field_display_name}>
+                    {source.field_display_name}
+                  </div>
+                  {source.source_display_name && (
+                    <div className="truncate text-xs text-muted-foreground" title={source.source_display_name}>
+                      {source.source_display_name}
+                    </div>
+                  )}
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-7 px-2"
+                    className="h-7 px-2 sm:h-7"
                     onClick={(e) => { e.stopPropagation(); setSelectedSource(source) }}
                   >
                     <Eye className="h-4 w-4" />
@@ -412,18 +440,27 @@ export function DataExplorerPage() {
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-7 px-2"
+                    className="h-7 px-2 sm:h-7"
                     onClick={(e) => { e.stopPropagation(); setExportSource(source) }}
                   >
                     <Download className="h-4 w-4" />
                   </Button>
                 </div>
               </div>
-              {/* Row 2: ID + data type + time */}
-              <div className="flex items-center gap-1.5 mt-1.5">
-                <code className={cn(textMini, "text-muted-foreground font-mono truncate flex-1")}>{source.id}</code>
-                <Badge variant="secondary" className={cn(textNano, "h-5 px-1.5")}>{source.data_type}</Badge>
-                <span className={cn(textMini, "text-muted-foreground")}>{formatTime(source.last_update)}</span>
+              {/* Row 2: ID + data type + time (empty values stay hidden) */}
+              <div className="mt-1.5 flex min-w-0 items-center gap-1.5">
+                <code
+                  className={cn(textMini, "min-w-0 flex-1 truncate font-mono text-muted-foreground")}
+                  title={source.id}
+                >
+                  {source.id}
+                </code>
+                {source.data_type && (
+                  <span className={cn(textMini, "shrink-0 text-muted-foreground")}>{source.data_type}</span>
+                )}
+                {formatTime(source.last_update) !== '-' && (
+                  <span className={cn(textMini, "shrink-0 text-muted-foreground")}>{formatTime(source.last_update)}</span>
+                )}
               </div>
             </div>
           </Card>
@@ -441,7 +478,6 @@ export function DataExplorerPage() {
       className={isSearchPending ? 'opacity-60 transition-opacity duration-normal' : undefined}
       emptyState={
         <EmptyState
-          icon={<Database className="h-12 w-12" />}
           title={search ? t('data:noResults', 'No data sources match your search') : t('data:noSources', 'No data sources available')}
           description={search ? undefined : t('data:noSourcesDesc', 'Data sources will appear here once devices are connected or extensions are registered')}
         />
@@ -452,7 +488,7 @@ export function DataExplorerPage() {
 
   const sourceFilter = sourceOptions.length > 1 ? (
     <Select value={selectedSourceName} onValueChange={setSelectedSourceName}>
-      <SelectTrigger className="w-[160px] md:w-[200px] h-9 text-sm">
+      <SelectTrigger className="h-10 w-32 shrink-0 text-sm md:h-9 md:w-[200px]">
         <SelectValue placeholder={t('data:filterSource', 'Filter source...')} />
       </SelectTrigger>
       <SelectContent>
@@ -474,9 +510,7 @@ export function DataExplorerPage() {
     <>
       <PageLayout
         title={t('data:title', 'Data Explorer')}
-        subtitle={t('data:subtitle', 'Browse all data sources across devices, extensions, and transforms')}
         hideFooterOnMobile
-        hasBottomNav
         headerContent={
           <PageTabsBar
             tabs={tabs}
@@ -494,25 +528,28 @@ export function DataExplorerPage() {
             }
             actionsExtra={
               activeTab === 'data' ? (
-                <div className="flex items-center gap-2">
+                <div className="flex w-full min-w-0 items-center gap-2">
                   {sourceFilter}
-                  <div className="relative">
-                    <span className="absolute left-2.5 top-0 bottom-0 flex items-center">
-                      {isSearchPending ? (
-                        <Loader2 className="h-4 w-4 text-muted-foreground animate-spin" />
-                      ) : (
-                        <Search className="h-4 w-4 text-muted-foreground" />
-                      )}
-                    </span>
-                    <Input
-                      placeholder={t('data:search', 'Search data sources...')}
-                      value={search}
-                      onChange={e => setSearch(e.target.value)}
-                      className="pl-9 w-[180px] md:w-[240px] h-9"
-                      autoFocus
-                    />
-                  </div>
+                  <SearchInput
+                    placeholder={t('data:search', 'Search data sources...')}
+                    value={search}
+                    onChange={setSearch}
+                    pending={isSearchPending}
+                    aria-label={t('data:search', 'Search data sources...')}
+                    className="min-w-0 flex-1 md:w-[240px] md:flex-none"
+                    // No autofocus on mobile: the input lifts into the sticky
+                    // page header, so it would pop the keyboard over the list.
+                    autoFocus={!isMobile}
+                  />
                 </div>
+              ) : activeTab === 'push' ? (
+                <SearchInput
+                  value={pushSearch}
+                  onChange={setPushSearch}
+                  placeholder={t('common:dataPush.searchTargets', 'Search push targets...')}
+                  aria-label={t('common:dataPush.searchTargets', 'Search push targets...')}
+                  className="min-w-0 flex-1 md:w-[240px] md:flex-none"
+                />
               ) : undefined
             }
           />
@@ -533,15 +570,9 @@ export function DataExplorerPage() {
           {dataTable}
         </PageTabsContent>
         <PageTabsContent value="push" activeTab={activeTab}>
-          <PushTargetsTab />
+          <PushTargetsTab searchQuery={pushSearch} />
         </PageTabsContent>
       </PageLayout>
-
-      <PageTabsBottomNav
-        tabs={tabs}
-        activeTab={activeTab}
-        onTabChange={(v) => setActiveTab(v as TabValue)}
-      />
 
       <FullScreenDialog
         open={!!selectedSource}

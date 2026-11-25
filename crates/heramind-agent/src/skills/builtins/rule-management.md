@@ -1,13 +1,16 @@
 ---
 id: rule-management
+summary: Create, modify, and diagnose condition-triggered automation rules.
+not_for: [notification-channel setup (message-management), data conversion (transform-management)]
 name: Rule Management Guide
+aliases: [rule, rules]
 description: Use when the user wants to create or manage rules — conditions (comparison/range/logical), triggers, actions (notify/execute/trigger-agent), thresholds, enabling/disabling. Covers rule create/update/enable/disable even without saying 'rule' (e.g. '温度超过30就告警', '低于20发通知'). Includes 规则/告警/条件/阈值/自动化.
 category: rule
 origin: builtin
 priority: 85
 token_budget: 5000
 triggers:
-  keywords: [rule, 规则, 创建规则, create rule, alert, 告警, 报警, trigger, 触发, automation, 自动化, condition, 条件, action, 动作, threshold, 阈值, notification, 通知, 规则管理, rule create, rule update, rule enable, rule disable, 阈值判断, 超过, 低于, 大于, 小于, temperature, 温度, humidity, 湿度, battery, 电池]
+  keywords: [rule, 规则, 创建规则, create rule, alert, 告警, 报警, trigger, 触发, automation, 自动化, condition, 条件, threshold, 阈值, 规则管理, rule create, rule update, rule enable, rule disable, 阈值判断, 超过, 低于, 大于, 小于, exceeds, below, above, 通知我, notify me]
   tool_target:
     - tool: rule
       actions: [list, get, create, update, delete, enable, disable, test, history]
@@ -15,11 +18,42 @@ anti_triggers:
   keywords: [dashboard, 仪表盘, agent, 代理, extension develop, 扩展开发, device connect, 设备连接]
 ---
 
+# rule-management
+
+Ask vs inspect vs mutate: how-to / "how would I…" questions → answer with zero writes; inspect with `get`/`list`/`explain`/`history`/`test`; mutate only on an explicit create/update/enable/disable/delete request.
+Split intents: rename / notify text / frequency (`cooldown`/`for_duration`) are targeted updates; "why didn't it fire" is diagnosis (enabled → data → condition → cooldown/duration → channels) — do not rewrite the rule while diagnosing unless asked.
+Use actual source IDs and metric names from current references or device/extension/transform inspection. Preserve the user's threshold and units; a current reading is not permission to choose a different threshold.
+For a simple numeric threshold, use rule create flags; for logical/range/multi-action rules use --body JSON. Load the condition/action reference section before constructing an unfamiliar shape.
+Source IDs use device:<id>:<field>, extension:<id>:<field>, or transform:<transform-id>:<field>. Transform ID is not output_prefix.
+Actions: notify creates a message routed through configured channels; execute uses a discovered command and parameters; trigger_agent invokes an agent. Inspect channels only when delivery is requested or being diagnosed.
+cooldown and for_duration are milliseconds. A manual rule test does not establish continuous-duration satisfaction or real delivery. Omitted trigger defaults to data_change; explicit trigger is an object with trigger_type.
+Create/update, read back, then verify the requested behavior through explain/test/history as available. Do not inject live test telemetry or actuate a device solely to prove a rule without authorization.
+When diagnosing, check enabled state, actual source values, missing/type-mismatched data, cooldown/duration, and action results. Missing values are unknown, not zero.
+
+## Commands
+| Command | Purpose |
+|---|---|
+| `heramind rule list` | List all rules |
+| `heramind rule get <id>` | Rule details |
+| `heramind rule create` | Create a new rule |
+| `heramind rule update <id>` | Update a rule (rename/notify/cooldown, or re-target with `--trigger-device <dev> --metric <m> --operator <op> --threshold <v>`) |
+| `heramind rule delete <id>` | Delete a rule |
+| `heramind rule enable <id>` | Enable a rule |
+| `heramind rule disable <id>` | Disable a rule |
+| `heramind rule test <id>` | Test a rule |
+| `heramind rule history <id>` | Rule execution history |
+
+## Detailed reference
+Use skill(action="load", id="rule-management", section="<exact returned title>") only for the needed detail. Section titles are returned with this overview.
+
+<!-- SKILL_REFERENCE -->
+
+
 # Rule Management
 
-## Command Cheat-Sheet (run these via `shell`)
+## Command Cheat-Sheet (via `shell` when mutating or inspecting live state)
 
-Always RUN the command yourself and report the real output.
+Ask → answer from this guide with examples (**zero shell writes**). Inspect → read (`list`/`get`/`explain`/`history`/`test`). Mutate → write only on an explicit create/update/enable/disable/delete request; then report the real output.
 
 | Command | Purpose |
 |---|---|
@@ -39,10 +73,21 @@ Create, update, diagnose, or delete event-driven rules over device / extension /
 
 | User intent | Section to follow |
 |---|---|
+| "how do I set frequency / cooldown / rename / change notify?" (ask only) | Answer from this guide with examples — **zero writes** until they ask to apply |
 | "create / set up / add a rule" | Phase 1 → 2 → 3 → 4 below |
-| "why didn't rule X fire / 排查 / 没触发" | Jump to **Diagnosis Flow** |
+| "why didn't rule X fire / 排查 / 没触发" | Jump to **Diagnosis Flow** (inspect only; mutate only if asked) |
+| "change freq / rename / notify text on rule X" | Inspect with `rule get`, then targeted `rule update` (see `rule update --help`) |
 | "delete / disable / enable rule X" | **Quick Command Reference** |
-| "update an existing rule" | Run diagnosis first, then **Phase 2** with new JSON |
+| "rewrite / re-target an existing rule" | `rule get` current definition → confirm target/fields → apply with `rule update` options from `--help` (full **Diagnosis Flow** only for "why didn't fire") |
+
+## Deployments involving rules, channels, and device control
+
+When a request spans several resource types (for example, BMS ventilation rules, an alert channel, and immediate HVAC control), load the `message-management` and `device-onboarding` guides as well. Their CLI contracts differ from `rule create`:
+
+- Discover the channel type and schema with `heramind message channel-types` and `heramind message channel-type-schema <type>` before `channel-create`. Use the documented `--type` and `--param key=value` or `--config` form; `--url` alone is not a channel-create option.
+- Inspect the target device's supported metrics and commands with `heramind device get <id>` before rule creation or control. A light actuator may not expose an `occupancy` metric; source the condition from a device that actually reports occupancy.
+- Send an immediate command as `heramind device control <id> <command> --param key=value` or `--params '{"key":"value"}'`; a bare value after the command is not an accepted parameter.
+- Read each shell result's `exit_code`, stderr, and returned state. A completed tool call can contain a failed command. After errors, consult `--help` or the relevant guide and retry with a valid schema. Before saying a deployment is complete, verify the requested rule count, channel existence, and immediate device command result. Name any uncompleted item plainly.
 
 ## HARD GATE
 
@@ -50,24 +95,24 @@ Create, update, diagnose, or delete event-driven rules over device / extension /
 NO RULE JSON CONSTRUCTION WITHOUT PRIOR DEVICE/METRIC DISCOVERY
 ```
 
-**You MUST complete Phase 1 before Phase 2.** Violating this is the single most common failure mode: rules silently never fire because the device_id or metric name was guessed.
+Establish the source identity and schema before building the condition. Reuse current verified references; discover only missing or stale facts.
 
 ## Phase 1: Discovery — Completion Checklist
 
-Every item must be ticked. Re-run if any is unchecked.
+Check the required facts; do not repeat reads already established in this conversation.
 
 - [ ] Ran `heramind device list` (or `heramind extension get <id>` for extension metrics)
 - [ ] Identified the EXACT `device_id` (case-sensitive, hyphens matter) for each target
 - [ ] Confirmed the EXACT metric name appears in `metric_fields` (NOT a guessed translation)
 - [ ] If `metric_fields` is empty OR device offline OR >50 devices: ran `heramind device get <id>` per target
-- [ ] Noted current value range (to pick a sensible threshold, not a magic number)
+- [ ] Preserved the requested threshold and units; ask if a required threshold was not specified
 
 **Output of Phase 1** (write it down before Phase 2):
 ```
 device_id: <string>
 metric_name: <string from metric_fields>
 current_value: <number from device get>
-operator + threshold: <chosen based on current_value>
+operator + threshold: <requested by user>
 ```
 
 ## Phase 2: Construct Rule JSON
@@ -137,8 +182,8 @@ Before running `heramind rule create`, tick every box:
 - [ ] `device_id` in JSON matches Phase 1 output character-for-character
 - [ ] metric name in JSON matches Phase 1 output character-for-character
 - [ ] operator matches metric data type (numeric vs string)
-- [ ] threshold is realistic vs `current_value` from Phase 1 (not magic number)
-- [ ] If action is `notify`: at least one message channel exists — run `heramind message channel-list`. If empty, load **message-management** skill first.
+- [ ] threshold and units match the user request
+- [ ] If external notification delivery is requested: inspect the intended channel and its routing filters. Creating a platform message does not require configuring a new external channel.
 - [ ] If action is `execute`: target device exists in `heramind device list` and has the command listed under `command_fields`
 - [ ] `cooldown` is set explicitly when `notify` is the action
 
@@ -153,10 +198,10 @@ heramind rule create --name "High Temp" \
   --notify "Too hot: {value}"
 
 # FULL FORM for anything else (range/logical/multi-action/schedule):
-heramind rule create --body '<your_json>'
+Chat/shell preferred: `{ "command": "heramind rule create", "params": {…rule object…} }` (maps to `--body`). Human CLI: `heramind rule create --body '<your_json>'`
 # Note the returned rule ID.
 
-# For threshold rules: inject a test value to confirm it fires end-to-end.
+# With authorized test input: evaluate the condition; this alone does not prove duration or physical delivery.
 heramind rule test <ID> --input '{"<metric>": <value_above_threshold>}'
 
 # For ongoing monitoring of when/how it fires.
@@ -186,7 +231,7 @@ Run these in order. Stop at the first failure.
 | `notify` action but haven't run `channel-list` | Alerts vanish silently | Verify ≥1 channel, or load message-management |
 | `cooldown: 0` or unset on `notify` rule | Alert storms | Set ≥300000 (5 min) |
 | String operator (`contains`) on numeric metric | Always errors or never matches | Use numeric operator |
-| Skipping `rule test` after creation | "Works on paper" but real flow broken | Always run with synthetic input |
+| Skipping `rule test` after creation | "Works on paper" but real flow broken | Use authorized test input; distinguish simulation from live delivery |
 
 ## Quick Command Reference
 
@@ -197,6 +242,7 @@ heramind rule create --name <N> --trigger-device <D> --metric <M> --operator <OP
                                           # fast path: single-metric threshold rule (flags)
 heramind rule create --body '<JSON>'       # full form: range/logical/multi-action (enabled by default)
 heramind rule update <ID> --body '<JSON>'  # modify fields (ID also accepted as --id <ID>)
+heramind rule update <ID> --trigger-device sensor-001 --metric values.battery --operator less_than --threshold 15  # re-target / re-threshold (actions preserved)
 heramind rule enable <ID>                  # re-enable a paused rule
 heramind rule disable <ID>                 # pause without deleting
 heramind rule delete <ID>                  # permanent removal

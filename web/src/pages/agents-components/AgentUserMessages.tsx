@@ -9,16 +9,15 @@
 import { useState, useEffect, useRef } from "react"
 import { useTranslation } from "react-i18next"
 import { useErrorHandler } from "@/hooks/useErrorHandler"
+import { useIsMobile } from "@/hooks/useMobile"
 import { Button } from "@/components/ui/button"
-import { Card } from "@/components/ui/card"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import { Textarea } from "@/components/ui/textarea"
-import { Badge } from "@/components/ui/badge"
 import {
+  Loader2,
   MessageSquare,
   Send,
   Trash2,
-  X,
+
   Clock,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -29,17 +28,24 @@ import type { UserMessage } from "@/types"
 interface AgentUserMessagesProps {
   agentId: string
   onMessageAdded?: () => void
+  /** Bump to refetch (the sibling composer increments it after sending). */
+  refreshToken?: number
 }
 
-export function AgentUserMessages({ agentId, onMessageAdded }: AgentUserMessagesProps) {
+interface AgentUserMessagesComposerProps {
+  agentId: string
+  /** Fired after a successful send so the list can refetch/scroll. */
+  onSent?: (message: UserMessage) => void
+}
+
+/** The message list. The composer that belongs to it renders separately
+ *  (pinned to the detail page's bottom bar) — the list here only reads. */
+export function AgentUserMessages({ agentId, onMessageAdded, refreshToken = 0 }: AgentUserMessagesProps) {
   const { t } = useTranslation(['common', 'agents'])
   const { handleError } = useErrorHandler()
   const [messages, setMessages] = useState<UserMessage[]>([])
   const [loading, setLoading] = useState(false)
-  const [sending, setSending] = useState(false)
-  const [newMessage, setNewMessage] = useState("")
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
-  const scrollAreaRef = useRef<HTMLDivElement>(null)
+  const bottomRef = useRef<HTMLDivElement>(null)
 
   // Load messages
   const loadMessages = async () => {
@@ -56,38 +62,16 @@ export function AgentUserMessages({ agentId, onMessageAdded }: AgentUserMessages
 
   useEffect(() => {
     loadMessages()
-  }, [agentId])
+    // refreshToken: the composer lives outside this component; a send bumps
+    // the token so the list picks the new note up.
+  }, [agentId, refreshToken])
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
-    if (scrollAreaRef.current && messages.length > 0) {
-      const scrollContainer = scrollAreaRef.current.querySelector('[data-radix-scroll-area-viewport]')
-      if (scrollContainer) {
-        scrollContainer.scrollTop = scrollContainer.scrollHeight
-      }
+    if (messages.length > 0) {
+      bottomRef.current?.scrollIntoView({ block: 'nearest' })
     }
   }, [messages])
-
-  const handleSendMessage = async () => {
-    if (!newMessage.trim() || sending) return
-
-    const content = newMessage.trim()
-    setNewMessage("")
-    setSending(true)
-
-    try {
-      const message = await api.addAgentUserMessage(agentId, content)
-      setMessages(prev => [...prev, message])
-      onMessageAdded?.()
-    } catch (error) {
-      handleError(error, { operation: 'Send message to agent', showToast: false })
-      // Restore message on error
-      setNewMessage(content)
-    } finally {
-      setSending(false)
-      textareaRef.current?.focus()
-    }
-  }
 
   const handleDeleteMessage = async (messageId: string) => {
     try {
@@ -98,69 +82,99 @@ export function AgentUserMessages({ agentId, onMessageAdded }: AgentUserMessages
     }
   }
 
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-3">
+      {/* The list scrolls itself (min-h-0 + overflow) — many notes never
+          overflow the outer page container. */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+            {loading ? (
+              <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t('common:loading')}
+              </div>
+            ) : messages.length === 0 ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed border-border text-center">
+                <MessageSquare className="h-8 w-8 text-muted-foreground opacity-40" />
+                <p className="text-sm text-muted-foreground">{t('agents:userMessages.empty')}</p>
+                <p className="text-xs text-muted-foreground opacity-70">{t('agents:userMessages.emptyHint')}</p>
+              </div>
+            ) : (
+              <>
+                {messages.map((message) => (
+                  <MessageBubble
+                    key={message.id}
+                    message={message}
+                    onDelete={() => handleDeleteMessage(message.id)}
+                  />
+                ))}
+                <div ref={bottomRef} />
+              </>
+            )}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The composer for agent notes. Rendered by the detail page's bottom bar
+ * (pinned, chat-style) rather than inside the list, so it stays put while
+ * the section scrolls.
+ */
+export function AgentUserMessagesComposer({ agentId, onSent }: AgentUserMessagesComposerProps) {
+  const { t } = useTranslation(['common', 'agents'])
+  const { handleError } = useErrorHandler()
+  const [newMessage, setNewMessage] = useState("")
+  const [sending, setSending] = useState(false)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  const handleSend = async () => {
+    if (!newMessage.trim() || sending) return
+
+    const content = newMessage.trim()
+    setNewMessage("")
+    setSending(true)
+
+    try {
+      const message = await api.addAgentUserMessage(agentId, content)
+      onSent?.(message)
+    } catch (error) {
+      handleError(error, { operation: 'Send message to agent', showToast: false })
+      setNewMessage(content) // restore on error
+    } finally {
+      setSending(false)
+      textareaRef.current?.focus()
+    }
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+    // Enter sends; Shift+Enter inserts a newline.
+    if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      handleSendMessage()
+      void handleSend()
     }
   }
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Messages List */}
-      <div className="flex-1 min-h-0">
-        <ScrollArea className="h-full" ref={scrollAreaRef}>
-          <div className="p-4 space-y-3">
-            {loading ? (
-              <div className="text-center py-8 text-muted-foreground text-sm">
-                {t('common:loading')}...
-              </div>
-            ) : messages.length === 0 ? (
-              <div className="text-center py-8 text-muted-foreground">
-                <MessageSquare className="h-10 w-10 mx-auto mb-2 opacity-20" />
-                <p className="text-sm">{t('agents:userMessages.empty')}</p>
-                <p className="text-xs mt-1">{t('agents:userMessages.emptyHint')}</p>
-              </div>
-            ) : (
-              messages.map((message) => (
-                <MessageBubble
-                  key={message.id}
-                  message={message}
-                  onDelete={() => handleDeleteMessage(message.id)}
-                />
-              ))
-            )}
-          </div>
-        </ScrollArea>
-      </div>
-
-      {/* Input Area */}
-      <div className="border-t p-3 bg-muted-20">
-        <div className="flex gap-2">
-          <Textarea
-            ref={textareaRef}
-            value={newMessage}
-            onChange={(e) => setNewMessage(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder={t('agents:userMessages.placeholder')}
-            className="resize-none min-h-[60px] max-h-[120px]"
-            disabled={sending}
-          />
-          <div className="flex flex-col gap-2">
-            <Button
-              size="icon"
-              onClick={handleSendMessage}
-              disabled={!newMessage.trim() || sending}
-              className="h-full shrink-0"
-            >
-              <Send className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-        <p className="text-xs text-muted-foreground mt-2">
-          {t('agents:userMessages.hint')} ⌘⏎ / Ctrl+Enter
-        </p>
-      </div>
+    <div className="flex items-center gap-1.5 rounded-lg border border-input bg-card py-1.5 pl-3 pr-1.5">
+      <Textarea
+        ref={textareaRef}
+        value={newMessage}
+        onChange={(e) => setNewMessage(e.target.value)}
+        onKeyDown={handleKeyDown}
+        placeholder={t('agents:userMessages.placeholder')}
+        rows={1}
+        className="min-h-0 max-h-[120px] flex-1 resize-none border-0 bg-transparent p-0 text-sm shadow-none focus-visible:ring-0"
+        disabled={sending}
+      />
+      <Button
+        size="icon"
+        onClick={() => void handleSend()}
+        disabled={!newMessage.trim() || sending}
+        className="h-7 w-7 shrink-0 rounded-md sm:h-7 sm:w-7"
+        aria-label={t('common:send')}
+      >
+        {sending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+      </Button>
     </div>
   )
 }
@@ -176,39 +190,31 @@ interface MessageBubbleProps {
 
 function MessageBubble({ message, onDelete }: MessageBubbleProps) {
   const { t } = useTranslation(['common', 'agents'])
+  const isMobile = useIsMobile()
 
   return (
-    <Card className="p-3 relative group">
+    <div className="group relative rounded-lg bg-muted px-3 py-2">
       <button
         onClick={onDelete}
         aria-label={t('common:delete')}
         className={cn(
-          "absolute top-2 right-2 opacity-0 group-hover:opacity-100",
-          "transition-opacity p-1 rounded hover:bg-muted",
-          "text-muted-foreground hover:text-error"
+          // Hover-reveal is desktop-only; touch has no hover.
+          "absolute inset-y-0 right-1.5 my-auto flex h-7 w-7 items-center justify-center rounded-md transition-opacity",
+          isMobile ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+          "text-muted-foreground hover:bg-card hover:text-error"
         )}
         title={t('common:delete')}
       >
-        <Trash2 className="h-4 w-4" />
+        <Trash2 className="h-3.5 w-3.5" />
       </button>
 
-      <div className="pr-6">
-        <div className="flex items-center gap-2 mb-1.5">
-          <MessageSquare className="h-4 w-4 text-muted-foreground" />
-          <span className="text-xs text-muted-foreground flex items-center gap-1">
-            <Clock className="h-4 w-4" />
-            {formatTimestamp(message.timestamp, false)}
-          </span>
-          {message.message_type && (
-            <Badge variant="secondary" className="text-xs h-5">
-              {message.message_type}
-            </Badge>
-          )}
-        </div>
-        <p className="text-sm whitespace-pre-wrap break-words">
-          {message.content}
-        </p>
-      </div>
-    </Card>
+      <p className="pr-6 text-sm leading-relaxed whitespace-pre-wrap break-words">
+        {message.content}
+      </p>
+      <p className="mt-1 text-mini tabular-nums text-muted-foreground">
+        {formatTimestamp(message.timestamp, false)}
+        {message.message_type ? ` · ${message.message_type}` : ''}
+      </p>
+    </div>
   )
 }

@@ -43,7 +43,16 @@ pub struct SkillTriggers {
     pub tool_target: Vec<ToolTarget>,
 }
 
-/// Tool-action pair for trigger matching.
+/// One `tool_target` trigger — **TEXT triggers, not tool bindings**.
+///
+/// `tool` and `actions` are matched as SUBSTRINGS of the user's message
+/// (see `matcher::score_skill`: `tool` hit = +0.2, tool+action = +0.5) and
+/// are also concatenated into the skill tool's search corpus. The names
+/// echo CLI domains (`rule`, `widget`, `dashboard`…) for authoring clarity,
+/// but they are NEVER looked up against the tool registry — `tool: widget`
+/// fires when the user's message mentions "widget", whether or not any
+/// tool by that name exists. (Read once as "stale bindings to a
+/// nonexistent widget tool" — they are neither bindings nor stale.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolTarget {
     pub tool: String,
@@ -69,6 +78,25 @@ pub struct SkillMetadata {
     /// Optional for backward compat (empty = fall back to keywords-only).
     #[serde(default)]
     pub description: String,
+    /// One-line purpose: WHAT task this guide completes. The model-facing
+    /// catalog line and the PRIMARY retrieval signal. Optional for backward
+    /// compat (empty = fall back to description).
+    #[serde(default)]
+    pub summary: String,
+    /// Adjacent tasks this guide explicitly does NOT cover (boundary
+    /// understanding for the model). NEVER concatenated into positive
+    /// retrieval text — boundary wording in the scoring corpus distorts
+    /// ranking (2026-11-17: a "Not for … telemetry" sentence handed
+    /// convert-queries to data-push).
+    #[serde(default)]
+    pub not_for: Vec<String>,
+    /// Declared short names the `skill` tool may resolve for `load`
+    /// (case-insensitive, whole-word exact — never substring matching).
+    /// A declared alias resolves only while it maps to exactly ONE skill in
+    /// the registry; collisions degrade to `needs_selection`.
+    /// Optional for backward compat with existing user skills.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     #[serde(default = "default_category")]
     pub category: SkillCategory,
     #[serde(default = "default_origin")]
@@ -106,22 +134,77 @@ pub struct Skill {
 }
 
 impl Skill {
+    /// Progressive disclosure: builtins keep their detailed reference after this marker.
+    /// Existing user skills without a marker retain their original load behavior.
+    pub fn overview(&self) -> &str {
+        self.body
+            .split_once("<!-- SKILL_REFERENCE -->")
+            .map_or(self.body.as_str(), |(overview, _)| overview)
+            .trim()
+    }
+
+    pub fn reference_sections(&self) -> Vec<(String, String)> {
+        let Some((_, reference)) = self.body.split_once("<!-- SKILL_REFERENCE -->") else {
+            return Vec::new();
+        };
+        let mut sections: Vec<(String, String)> = Vec::new();
+        let mut fenced = false;
+        for line in reference.lines() {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+            }
+            if !fenced && line.starts_with("## ") {
+                sections.push((line[3..].trim().to_string(), String::new()));
+            }
+            if let Some((_, body)) = sections.last_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        sections
+    }
+
+    pub fn load_guide(&self, section: Option<&str>) -> Result<serde_json::Value, String> {
+        let sections = self.reference_sections();
+        let names: Vec<_> = sections.iter().map(|(name, _)| name.clone()).collect();
+        let (guide, selected) = match section.filter(|s| !s.trim().is_empty()) {
+            None => (self.overview().to_string(), None),
+            Some(requested) => {
+                let matches: Vec<_> = sections
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case(requested.trim()))
+                    .collect();
+                if matches.len() != 1 {
+                    return Err(format!(
+                        "Unknown or ambiguous section '{requested}'. Available sections: {}",
+                        names.join("; ")
+                    ));
+                }
+                (matches[0].1.clone(), Some(matches[0].0.clone()))
+            }
+        };
+        Ok(serde_json::json!({
+            "id": self.metadata.id, "name": self.metadata.name,
+            "guide": guide, "section": selected, "sections": names
+        }))
+    }
+
     /// Truncate body to fit within token budget.
     pub fn body_within_budget(&self) -> String {
+        let body = self.overview();
         let budget_chars = self.metadata.token_budget * 4;
-        if self.body.len() <= budget_chars {
-            self.body.clone()
+        if body.len() <= budget_chars {
+            body.to_string()
         } else {
             // Find correct UTF-8 byte boundary for budget_chars characters
-            let byte_cutoff = self
-                .body
+            let byte_cutoff = body
                 .char_indices()
                 .nth(budget_chars)
                 .map(|(i, _)| i)
-                .unwrap_or(self.body.len());
-            let truncated = &self.body[..byte_cutoff];
+                .unwrap_or(body.len());
+            let truncated = &body[..byte_cutoff];
             if let Some(pos) = truncated.rfind("\n\n") {
-                self.body[..pos].to_string()
+                body[..pos].to_string()
             } else {
                 truncated.to_string()
             }
@@ -158,5 +241,38 @@ impl TokenBudgetConfig {
             8000
         };
         Self { max_tokens }
+    }
+}
+
+#[cfg(test)]
+mod progressive_tests {
+    use super::*;
+    fn fixture(body: &str) -> Skill {
+        Skill {
+            metadata: serde_json::from_value(
+                serde_json::json!({"id":"custom","name":"Custom","description":""}),
+            )
+            .unwrap(),
+            body: body.to_string(),
+        }
+    }
+    #[test]
+    fn existing_custom_skill_keeps_full_load() {
+        let skill = fixture("Custom instructions\n## Existing chapter\nkeep me");
+        assert_eq!(skill.load_guide(None).unwrap()["guide"], skill.body);
+        assert!(skill.reference_sections().is_empty());
+    }
+    #[test]
+    fn references_do_not_leak_into_pinned_overview_and_fences_are_preserved() {
+        let skill = fixture("Overview\n<!-- SKILL_REFERENCE -->\n## Syntax\n```sh\n## not a section\n```\nexample\n## Errors\nrecover");
+        assert_eq!(skill.body_within_budget(), "Overview");
+        assert_eq!(skill.reference_sections().len(), 2);
+        let loaded = skill.load_guide(Some(" syntax ")).unwrap();
+        assert_eq!(loaded["section"], "Syntax");
+        assert!(loaded["guide"]
+            .as_str()
+            .unwrap()
+            .contains("## not a section"));
+        assert!(skill.load_guide(Some("missing")).is_err());
     }
 }

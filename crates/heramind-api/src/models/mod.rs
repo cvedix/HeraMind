@@ -27,6 +27,64 @@ pub struct ChatImage {
     pub mime_type: Option<String>,
 }
 
+/// A structured object reference attached to a chat message (@-mention).
+#[derive(utoipa::ToSchema, Debug, Clone, Deserialize, serde::Serialize)]
+pub struct ChatReference {
+    /// One of: device | rule | transform | agent.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Authoritative object id.
+    pub id: String,
+    /// Display-only label at selection time; may be stale after renames.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Ordered content node for the v1 inline-@ protocol (plan 1.3 iter C).
+///
+/// `kind` is `"text"` or `"reference"`. Text nodes carry `text`; reference
+/// nodes carry `type`/`id`/`labelSnapshot`. Unknown kinds are rejected.
+#[derive(utoipa::ToSchema, Debug, Clone, Deserialize, serde::Serialize)]
+pub struct ChatContentNode {
+    /// `"text"` | `"reference"`.
+    pub kind: String,
+    /// Plain text for `kind=text`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Entity type for `kind=reference` (device|rule|transform|agent).
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// Authoritative object id for `kind=reference`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Display-only name snapshot at selection time (never trusted for auth).
+    #[serde(
+        rename = "labelSnapshot",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub label_snapshot: Option<String>,
+}
+
+/// Explicit Unknown re-run authorization submit (request-id keyed).
+///
+/// Host/UI echoes the structured confirm event fields (`requestId`,
+/// `priorOperationId`, `writeFingerprint`) — fingerprints may contain spaces
+/// and must travel as JSON, never via whitespace-split text parse. Server
+/// atomically validates + consumes the pending confirm before granting.
+#[derive(utoipa::ToSchema, Debug, Clone, Deserialize, Serialize)]
+pub struct AuthorizeNewOperationRequest {
+    /// Server-issued confirm request id (required for host submit).
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    /// Prior Unknown Operation ID to re-run.
+    #[serde(rename = "priorOperationId")]
+    pub prior_operation_id: String,
+    /// Business write fingerprint that must match that Operation.
+    #[serde(rename = "writeFingerprint")]
+    pub write_fingerprint: String,
+}
+
 /// Chat request from the web client.
 #[derive(utoipa::ToSchema, Debug, Clone, Deserialize)]
 pub struct ChatRequest {
@@ -51,6 +109,20 @@ pub struct ChatRequest {
     /// Optional page context for first message (short neutral description of current page).
     #[serde(rename = "pageContext", default)]
     pub page_context: Option<String>,
+    /// Structured object references attached by the composer (@-mentions).
+    /// Legacy attachment-chip path: resolved into a bounded preamble.
+    /// Prefer `contentNodes` for in-sentence position.
+    #[serde(rename = "references", default)]
+    pub references: Option<Vec<ChatReference>>,
+    /// Protocol version for `contentNodes` (currently only `1`). Omitted with
+    /// no nodes = legacy plain/`references` path.
+    #[serde(rename = "contentVersion", default)]
+    pub content_version: Option<u32>,
+    /// Ordered text/reference nodes (inline @). When present and non-empty,
+    /// the server renders references **in place** into the model message
+    /// (ids + server-resolved names). Caps are hard errors (no silent drop).
+    #[serde(rename = "contentNodes", default)]
+    pub content_nodes: Option<Vec<ChatContentNode>>,
     /// Optional per-session config overrides. Honored **only** when this
     /// request triggers creation of a new session (no `sessionId`, or
     /// `sessionId` not found). For an existing session this field is
@@ -59,6 +131,19 @@ pub struct ChatRequest {
     /// prompt without polluting every user message via `pageContext`.
     #[serde(rename = "sessionConfig", default)]
     pub session_config: Option<SessionConfigPatch>,
+    /// Host/UI Unknown re-run authorization target. When set, binds the
+    /// one-shot grant to this Operation (required when multiple Unknowns
+    /// exist). Bare phrase shortcuts still work for a unique Unknown.
+    #[serde(rename = "authorizeNewOperation", default)]
+    pub authorize_new_operation: Option<AuthorizeNewOperationRequest>,
+    /// Client-supplied correlation id for a receive-ack (`MessageReceived`).
+    /// Older clients omit it — the server then emits no ack frame. Used by
+    /// the composer draft lifecycle: local `ws.send` / queue success is NOT
+    /// a server accept. Accepted is emitted only AFTER busy/clearing checks
+    /// and the user message is successfully saved; earlier failures
+    /// (protocol / busy / clearing / save) reject with the same id.
+    #[serde(rename = "clientRequestId", default)]
+    pub client_request_id: Option<String>,
 }
 
 /// Patch-style session config: every field is optional, and `None` means

@@ -19,10 +19,29 @@ const AGENT_EXECUTIONS_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("agent_executions");
 const AGENT_MEMORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("agent_memory");
 
+/// Per-instance test hook state for deterministic RMW interleaving tests.
+/// Cloned stores share the hook (same Arc); separate stores are isolated.
+/// Only present in test builds; production builds compile it away.
+#[cfg(test)]
+pub type SharedTestHook = std::sync::Arc<std::sync::Mutex<TestHookState>>;
+
+#[cfg(test)]
+#[derive(PartialEq, Clone, Copy, Default)]
+pub enum TestHookState {
+    #[default]
+    Disarmed,
+    Armed,
+    Paused,
+}
+
 /// AI Agent store for persisting autonomous agents.
 pub struct AgentStore {
     /// redb database
     db: Arc<Database>,
+    /// Per-instance deterministic-interleaving test hook (test builds only).
+    /// Arc-cloned stores share the hook; separate stores are isolated.
+    #[cfg(test)]
+    pub(crate) test_hook: SharedTestHook,
 }
 
 /// An AI Agent definition.
@@ -105,6 +124,37 @@ pub struct AiAgent {
     /// Current consecutive failure count (reset to 0 on success)
     #[serde(default)]
     pub consecutive_failures: u32,
+    /// Structured-mode (L0) output contract: fields published as
+    /// `ai:{agent_id}:{field}`. None for Focused/Free agents.
+    /// Tail-appended with serde defaults — existing bincode rows decode
+    /// unchanged (same pattern as `enable_tool_chaining`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Vec<OperatorField>>,
+    /// Structured-mode (L0) runtime tuning (debounce / budget / circuit
+    /// breaker). None for Focused/Free agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_config: Option<OperatorConfig>,
+    /// Memory axis (2026-09-22): Tool = stateless per run, Assistant =
+    /// carry the recent-execution narrative. None = mode-derived default
+    /// (Structured→Tool, Free/Focused→Assistant). Tail-appended, serde
+    /// defaulted — existing rows decode unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mode: Option<MemoryMode>,
+    /// Explicit notification routing; None keeps legacy behavior
+    /// (intent-keyword alerts) untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<AgentNotify>,
+    /// Per-run LLM token budget (prompt + completion, summed across every
+    /// LLM call of one execution). `None` = uncapped (historical default).
+    /// When the budget is hit the tool loop stops with stop reason
+    /// `token-budget` and Phase 2 synthesizes a conclusion from the results
+    /// collected so far. Counts backend-reported usage only — backends that
+    /// report no usage never trip it. The other guardrails count the wrong
+    /// units for cost: rounds, seconds and calls-per-day all stay green
+    /// while a cloud-backed event agent burns tokens every cooldown window.
+    /// Tail-appended with serde defaults — existing rows decode unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_per_run: Option<u64>,
 }
 
 /// Tool configuration for AI Agent function calling mode.
@@ -130,9 +180,14 @@ fn default_context_window() -> usize {
     10
 }
 
-/// Default value for max chain depth.
+/// How many tool rounds a Focused agent may take in one run, when the caller
+/// does not say. Public so the API layer defaults to the same number instead of
+/// carrying its own copy — it used to be 3 there and 5 here, both calling
+/// themselves "the default".
+pub const DEFAULT_MAX_CHAIN_DEPTH: usize = 10;
+
 fn default_max_chain_depth() -> usize {
-    5 // Allow up to 5 chain steps by default (enough for multi-step Focused analysis)
+    DEFAULT_MAX_CHAIN_DEPTH
 }
 
 /// Default value for agent priority.
@@ -211,6 +266,197 @@ pub struct AgentSchedule {
     pub timezone: Option<String>,
 }
 
+/// One source inside a structured `EventFilter` (M2-1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventSource {
+    /// Source kind as the trigger path names it: "device" | "extension" | ...
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// Concrete source id, or "all" to match every source of this type.
+    #[serde(default)]
+    pub id: String,
+    /// Metric/output field; None matches any field on the source.
+    #[serde(default)]
+    pub field: Option<String>,
+}
+
+/// Structured event filter (M2-1) — the polymorphic view over the stored
+/// `event_filter` string. `any` fires on the first matching source (what the
+/// legacy shape has always meant); `all` fires only once every listed source
+/// has been seen inside `within_secs`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct EventFilter {
+    /// Fires when ANY of these sources reports. Aliased from the legacy
+    /// `sources` key so saved agents keep matching exactly as before.
+    #[serde(default, alias = "sources")]
+    pub any: Vec<EventSource>,
+    /// Fires only when ALL of these sources have reported.
+    #[serde(default)]
+    pub all: Vec<EventSource>,
+    /// Aggregation window for `all`, in seconds. `None` = the default
+    /// window (`DEFAULT_ALL_WINDOW_SECS`, currently 300s) — NOT "no
+    /// window": a literal no-window `all` could only fire when every
+    /// source arrived in the SAME event, which the event-by-event
+    /// evaluation can never observe.
+    #[serde(default)]
+    pub within_secs: Option<u64>,
+}
+
+/// Aggregation state for one agent's `all` window (M2-1). Held in memory by
+/// the trigger path, one entry per agent — never persisted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowState {
+    /// When the window opened — the first source hit that started the clock.
+    pub opened_at: i64,
+    /// Indexes into `EventFilter::all` already seen inside the window.
+    pub seen: Vec<usize>,
+}
+
+/// What one event does to an `all` window.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowOutcome {
+    /// Not a trigger yet; carry this state forward.
+    Pending(Option<WindowState>),
+    /// Every source matched inside the window — fire, and clear the window.
+    Fire,
+}
+
+/// Default window for an `all` filter that omits `within_secs` — see
+/// [`EventFilter::observe`]. Five minutes: long enough for multi-sensor
+/// bursts to align, short enough not to bridge unrelated events.
+const DEFAULT_ALL_WINDOW_SECS: u32 = 300;
+
+impl EventFilter {
+    /// Fold one event into the `all` window and decide whether it completes.
+    pub fn observe(
+        &self,
+        state: Option<&WindowState>,
+        source_type: &str,
+        source_id: &str,
+        field: &str,
+        now: i64,
+    ) -> WindowOutcome {
+        // An `all` filter without an explicit window used to be a SILENT DEAD
+        // TRIGGER: the None window carried no partial hits between events, so
+        // the AND could only complete if a single event matched every spec —
+        // in practice never. Default it to a short window so AND filters
+        // compose without an explicit within_secs; `any`-only filters keep
+        // the "same instant, same event" reading of None.
+        let effective_window = if self.all.is_empty() {
+            self.within_secs
+        } else {
+            Some(self.within_secs.unwrap_or(DEFAULT_ALL_WINDOW_SECS as u64))
+        };
+
+        let live = match effective_window {
+            None => None,
+            Some(window) => match state {
+                // An expired window is dead. Reviving it would let a late
+                // hit complete an AND whose sources never actually overlapped.
+                Some(s) if now - s.opened_at > window as i64 => None,
+                carried => carried,
+            },
+        };
+
+        let mut seen = live.map(|s| s.seen.clone()).unwrap_or_default();
+        let opened_at = live.map(|s| s.opened_at).unwrap_or(now);
+
+        for (index, spec) in self.all.iter().enumerate() {
+            if spec.matches_event(source_type, source_id, field) && !seen.contains(&index) {
+                seen.push(index);
+            }
+        }
+
+        if !self.all.is_empty() && seen.len() == self.all.len() {
+            return WindowOutcome::Fire;
+        }
+
+        // Nothing to carry forward: either there is no window at all, or this
+        // event matched none of the sources (a window only exists once
+        // something has hit it — an empty one would be pruned state that
+        // looks like an open window).
+        if effective_window.is_none() || seen.is_empty() {
+            return WindowOutcome::Pending(None);
+        }
+
+        WindowOutcome::Pending(Some(WindowState { opened_at, seen }))
+    }
+}
+
+impl EventSource {
+    /// Does this configured source match one concrete event?
+    ///
+    /// Semantics are the pre-M2 trigger path's, case for case — including the
+    /// wildcard's early return, which the tests pin deliberately.
+    pub fn matches_event(&self, source_type: &str, source_id: &str, field: &str) -> bool {
+        if self.source_type != source_type {
+            return false;
+        }
+        // "all" is the wildcard the editor offers for "any source of this
+        // type". It answers before the field is consulted: the old path
+        // returned here too, so a wildcard that also names a field still
+        // matches every field.
+        if self.id == "all" {
+            return true;
+        }
+        // An empty id is ambiguous, not a wildcard.
+        if self.id.is_empty() || self.id != source_id {
+            return false;
+        }
+        // A configured field must match exactly; no field matches any.
+        match self.field.as_deref() {
+            Some(f) if !f.is_empty() => f == field,
+            _ => true,
+        }
+    }
+}
+
+impl AgentSchedule {
+    /// Parse the stored `event_filter` string into a structured filter.
+    ///
+    /// The column keeps its `Option<String>` type on purpose: it is the
+    /// on-disk contract with every agent already in `agents.redb`.
+    /// `None` means "no filter / unparseable" and callers then fall back to
+    /// the resource bindings, exactly as before.
+    pub fn parsed_event_filter(&self) -> Option<EventFilter> {
+        let value: serde_json::Value = serde_json::from_str(self.event_filter.as_deref()?).ok()?;
+
+        // A non-empty sources shape (the legacy `sources` key, or the new
+        // `any`/`all` ones) wins outright — the trigger path has always
+        // consulted `event_type` only when no sources are configured.
+        let has_sources = ["any", "all", "sources"].iter().any(|key| {
+            value
+                .get(*key)
+                .and_then(|v| v.as_array())
+                .is_some_and(|sources| !sources.is_empty())
+        });
+        if has_sources {
+            return serde_json::from_value(value).ok();
+        }
+
+        // The pre-`sources` shape names its source in `event_type`/`device_id`
+        // instead of a sources array. Translate it rather than let it fall
+        // through: a filter that parses into "no sources" is an agent that
+        // silently never fires.
+        let (source_type, id) = match value.get("event_type").and_then(|v| v.as_str()) {
+            Some("device.metric") => ("device", value.get("device_id")),
+            Some("extension.output") => ("extension", value.get("extension_id")),
+            _ => return None,
+        };
+        let id = id.and_then(|v| v.as_str())?;
+
+        Some(EventFilter {
+            any: vec![EventSource {
+                source_type: source_type.to_string(),
+                id: id.to_string(),
+                field: None,
+            }],
+            all: Vec::new(),
+            within_secs: None,
+        })
+    }
+}
+
 /// Schedule type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -259,6 +505,175 @@ pub enum ExecutionMode {
     /// Free mode — LLM freely explores with full tool access, multi-round reasoning
     #[serde(rename = "free", alias = "react")]
     Free,
+    /// Structured mode (L0 operator, 2026-09) — single constrained inference:
+    /// no intent/situation preamble, no tool loop; input data sources in,
+    /// schema-validated fields out, published as `ai:{agent_id}:{field}`.
+    /// Appended LAST: bincode encodes variants by index, so Focused=0 / Free=1
+    /// rows in agents.redb keep decoding unchanged.
+    #[serde(rename = "structured")]
+    Structured,
+}
+
+/// One output field of a Structured-mode agent's schema.
+#[derive(utoipa::ToSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperatorField {
+    /// Field name (becomes the metric name in `ai:{agent_id}:{name}`)
+    pub name: String,
+    /// Value type; `Enum` restricts the model to the listed values
+    pub field_type: OperatorFieldType,
+    /// Unit shown by dashboards (e.g. "℃", "件")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Field semantics, injected into the prompt so the model knows what to emit
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Allowed value types for [`OperatorField`].
+#[derive(utoipa::ToSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", tag = "type", content = "values")]
+pub enum OperatorFieldType {
+    Number,
+    Text,
+    Boolean,
+    Enum(Vec<String>),
+}
+
+/// Runtime tuning for a Structured-mode agent (L0). All costs are bounded:
+/// debounce caps frequency, budget caps daily volume, the failure threshold
+/// trips the circuit breaker (agent degrades: keeps last values, marked stale).
+#[derive(utoipa::ToSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperatorConfig {
+    /// Inputs are merged: at most one inference per `debounce_secs` (default 30)
+    #[serde(default = "default_operator_debounce")]
+    pub debounce_secs: u32,
+    /// Daily inference cap; None = uncapped (local models) — exceeded pauses
+    /// the agent until the next day
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_calls_per_day: Option<u32>,
+    /// Per-inference timeout (default 60s — L0 is a single call, not the
+    /// 300s agent loop)
+    #[serde(default = "default_operator_timeout")]
+    pub timeout_secs: u32,
+    /// Consecutive failures before the circuit breaker opens (default 3)
+    #[serde(default = "default_operator_failure_threshold")]
+    pub consecutive_failure_threshold: u8,
+    /// Event-trigger cooldown: minimum seconds between two admitted
+    /// event-triggered runs of this agent, measured from the previous
+    /// admission. `None` = the platform default (60s); `Some(0)` = on-demand
+    /// (an idle agent admits the next event immediately — the executor's
+    /// one-run-at-a-time guard is the only backpressure). Applies to every
+    /// execution mode; the re-entrancy guard still forbids overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_cooldown_secs: Option<u32>,
+}
+
+impl OperatorConfig {
+    /// The cooldown to enforce on the event-trigger path for this config.
+    pub fn effective_event_cooldown_secs(&self) -> i64 {
+        self.event_cooldown_secs
+            .unwrap_or(DEFAULT_EVENT_COOLDOWN_SECS) as i64
+    }
+}
+
+/// Event-trigger cooldown when `OperatorConfig::event_cooldown_secs` is
+/// unset. Historical value: 60s kept agents to one run per minute even when
+/// a run finished in seconds, so fast agents idled while data flowed past.
+pub const DEFAULT_EVENT_COOLDOWN_SECS: u32 = 60;
+
+/// Explicit notification routing (2026-09-23). Replaces the old
+/// keyword-sniffing on decision text: the user picks the channels and when
+/// to notify; the executor routes accordingly. Channels are names from the
+/// messages domain (`listMessageChannels`).
+#[derive(utoipa::ToSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyOn {
+    /// Notify only when a run FAILS (the ops heartbeat — silence is health).
+    #[default]
+    Failure,
+    /// Notify after every run (watch-style: each verdict is worth reading).
+    Always,
+    /// The operator decides per-run at the source: no routed notification is
+    /// built, AND the legacy keyword path is suppressed too. That second half
+    /// matters — otherwise "let the agent decide" still produced a keyword-
+    /// sniffed alert, which is the very thing an agent that speaks for itself
+    /// is replacing.
+    ///
+    /// The agent's own judgement reaches the operator through the tools it
+    /// already has (`heramind message send`), so a run that finds something
+    /// worth saying says it, and a run that does not stays quiet.
+    ///
+    /// Appended LAST: agents.redb holds JSON, so a row written before this
+    /// variant existed simply never decodes to it.
+    Judgment,
+}
+
+/// Per-agent notification routing.
+#[derive(utoipa::ToSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentNotify {
+    /// Channel names to deliver to. Empty = config present but nowhere to
+    /// send (valid; effectively muted).
+    #[serde(default)]
+    pub channels: Vec<String>,
+    #[serde(default)]
+    pub on: NotifyOn,
+}
+
+/// How much history an agent carries into each run (2026-09-22 review —
+/// the memory axis made explicit, docs/designs/002 §3.5).
+///
+/// Scope of "stateless" (Tool): the JOURNAL NARRATIVE and knowledge-file
+/// AUTO-INIT are skipped — nothing that describes *past runs* enters the
+/// prompt. What still applies to a Tool agent: the user's standing
+/// instructions (`user_messages`) and knowledge files it has explicitly
+/// created via the memory tool (both are standards, not history — see
+/// `build_history_context`). If the product ever wants Tool to mean
+/// "fully blank slate", that is a change to `build_history_context`, not
+/// to this enum.
+#[derive(utoipa::ToSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryMode {
+    /// Stateless tool:每次只看当前输入 + instructed standard. No journal
+    /// narrative, no knowledge-file preload into the *prompt* — the agent
+    /// behaves like a scanner. Journal still RECORDS (for humans + the
+    /// detail page); corrections still apply (they encode the user's
+    /// standards, not past events). Cheapest, most predictable.
+    #[default]
+    Tool,
+    /// Assistant with history: 每次运行带上最近执行的结果叙事（journal
+    /// timeline），能说"比上次更差"这类判断。排查/汇总/自由发挥必须有它。
+    Assistant,
+}
+
+impl MemoryMode {
+    /// What an agent runs in when it carries no explicit override: a scanner
+    /// (structured) has nothing to learn from past runs, so carrying their
+    /// narrative is pure cost; everything that reasons across turns does.
+    pub fn derived_for(execution_mode: ExecutionMode) -> Self {
+        match execution_mode {
+            ExecutionMode::Structured => MemoryMode::Tool,
+            ExecutionMode::Focused | ExecutionMode::Free => MemoryMode::Assistant,
+        }
+    }
+}
+
+impl AiAgent {
+    /// Resolve the memory axis for this agent — an explicit choice wins,
+    /// otherwise it follows the execution mode.
+    pub fn effective_memory_mode(&self) -> MemoryMode {
+        self.memory_mode
+            .unwrap_or_else(|| MemoryMode::derived_for(self.execution_mode))
+    }
+}
+
+fn default_operator_debounce() -> u32 {
+    30
+}
+fn default_operator_timeout() -> u32 {
+    60
+}
+fn default_operator_failure_threshold() -> u8 {
+    3
 }
 
 /// Agent execution statistics.
@@ -432,12 +847,22 @@ pub struct DecisionProcess {
     pub decisions: Vec<Decision>,
     /// Final conclusion
     pub conclusion: String,
-    /// Confidence level (0-1)
-    pub confidence: f32,
+    /// Confidence level (0-1), as the model reported it. `None` when it did
+    /// not report one — a missing claim rather than an invented default, since
+    /// 002 §4.2 gates behaviour on this number. `default` keeps the records
+    /// written before the field existed readable.
+    #[serde(default)]
+    pub confidence: Option<f32>,
     /// Why the tool loop ended (StopReason label); threaded to the journal so
     /// the agent can learn from prior stop reasons. Empty when no loop ran.
     #[serde(default)]
     pub stop_reason: String,
+    /// LLM tokens consumed by this run (prompt + completion, summed across
+    /// calls) when the backend reported usage. `0` means unreported, not
+    /// "free" — read alongside the agent's `max_tokens_per_run` for budget
+    /// auditing.
+    #[serde(default)]
+    pub tokens_used: u64,
 }
 
 /// Data collected for decision making.
@@ -466,8 +891,10 @@ pub struct ReasoningStep {
     pub input: Option<String>,
     /// Output of this step
     pub output: String,
-    /// Confidence in this step (0-1)
-    pub confidence: f32,
+    /// Confidence in this step (0-1). `None` where nothing actually produced
+    /// one — the same rule as [`DecisionProcess::confidence`].
+    #[serde(default)]
+    pub confidence: Option<f32>,
 }
 
 /// A decision made during execution.
@@ -595,7 +1022,23 @@ pub struct ExecutionFilter {
 impl AgentStore {
     /// Open or create an agent store at the given path.
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Arc<Self>, Error> {
-        let db = Database::create(path)?;
+        Self::from_db(Database::create(path)?)
+    }
+
+    /// An in-memory agent store.
+    ///
+    /// Genuinely in memory. It used to create a real redb file in the temp
+    /// directory and never remove it, so every call — and the test suite makes
+    /// thousands — left ~1.5 MB behind for good.
+    pub fn memory() -> Result<Arc<Self>, Error> {
+        Self::from_db(
+            Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .map_err(|e| Error::Storage(e.to_string()))?,
+        )
+    }
+
+    fn from_db(db: Database) -> Result<Arc<Self>, Error> {
         // Rollback guard: refuse databases stamped by a newer build (see schema.rs).
         crate::schema::check_or_stamp(&db)
             .map_err(|e| Error::Storage(format!("schema version: {e}")))?;
@@ -607,19 +1050,38 @@ impl AgentStore {
         write_txn.open_table(AGENT_MEMORY_TABLE)?;
         write_txn.commit()?;
 
-        Ok(Arc::new(Self { db: Arc::new(db) }))
+        Ok(Arc::new(Self {
+            db: Arc::new(db),
+            #[cfg(test)]
+            test_hook: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::agents::TestHookState::Disarmed,
+            )),
+        }))
     }
 
-    /// Create an in-memory agent store for testing.
-    pub fn memory() -> Result<Arc<Self>, Error> {
-        let temp_path =
-            std::env::temp_dir().join(format!("agents_test_{}.redb", uuid::Uuid::new_v4()));
-        Self::open(temp_path)
+    /// Test-only: park this call while it holds the write transaction,
+    /// enabling deterministic interleaving tests. No-op in production.
+    #[cfg(test)]
+    fn test_hook_point(&self) {
+        let mut guard = self.test_hook.lock().unwrap();
+        if *guard == crate::agents::TestHookState::Armed {
+            *guard = crate::agents::TestHookState::Paused;
+            // Wake any waiter that's looking for Paused.
+            // We use a spin-wait here (test-only, bounded by release()).
+            while *guard == crate::agents::TestHookState::Paused {
+                drop(guard);
+                std::thread::yield_now();
+                guard = self.test_hook.lock().unwrap();
+            }
+        }
+        *guard = crate::agents::TestHookState::Disarmed;
     }
 
     /// Save an agent to the store.
     pub async fn save_agent(&self, agent: &AiAgent) -> Result<(), Error> {
         let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
         {
             let mut table = write_txn.open_table(AGENTS_TABLE)?;
 
@@ -712,31 +1174,27 @@ impl AgentStore {
         status: AgentStatus,
         error_message: Option<String>,
     ) -> Result<(), Error> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(AGENTS_TABLE)?;
-
-        let agent = match table.get(id)? {
-            Some(bytes) => {
-                let mut ag: AiAgent = serde_json::from_slice(bytes.value())
+        // Atomic read-modify-write in ONE write transaction: a concurrent
+        // delete either commits first (row gone -> no re-create, same as the
+        // old no-op) or afterwards (removes the updated row). The previous
+        // two-transaction shape re-inserted a stale snapshot and resurrected
+        // deleted agents (2026-11-04 delete-vs-update race).
+        let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
+        {
+            let mut table = write_txn.open_table(AGENTS_TABLE)?;
+            let existing = table.get(id)?.map(|guard| guard.value().to_vec());
+            if let Some(bytes) = existing {
+                let mut ag: AiAgent = serde_json::from_slice(bytes.as_slice())
                     .map_err(|e| Error::Serialization(e.to_string()))?;
                 ag.status = status;
                 ag.error_message = error_message;
                 ag.updated_at = chrono::Utc::now().timestamp();
-                ag
+                let value =
+                    serde_json::to_vec(&ag).map_err(|e| Error::Serialization(e.to_string()))?;
+                table.insert(id, value.as_slice())?;
             }
-            None => return Ok(()), // Agent doesn't exist
-        };
-        drop(table);
-        drop(read_txn);
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(AGENTS_TABLE)?;
-
-            let value =
-                serde_json::to_vec(&agent).map_err(|e| Error::Serialization(e.to_string()))?;
-
-            table.insert(id, value.as_slice())?;
         }
         write_txn.commit()?;
         Ok(())
@@ -748,30 +1206,22 @@ impl AgentStore {
         id: &str,
         consecutive_failures: u32,
     ) -> Result<(), Error> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(AGENTS_TABLE)?;
-
-        let agent = match table.get(id)? {
-            Some(bytes) => {
-                let mut ag: AiAgent = serde_json::from_slice(bytes.value())
+        // Atomic RMW, one write transaction (see update_agent_status).
+        let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
+        {
+            let mut table = write_txn.open_table(AGENTS_TABLE)?;
+            let existing = table.get(id)?.map(|guard| guard.value().to_vec());
+            if let Some(bytes) = existing {
+                let mut ag: AiAgent = serde_json::from_slice(bytes.as_slice())
                     .map_err(|e| Error::Serialization(e.to_string()))?;
                 ag.consecutive_failures = consecutive_failures;
                 ag.updated_at = chrono::Utc::now().timestamp();
-                ag
+                let value =
+                    serde_json::to_vec(&ag).map_err(|e| Error::Serialization(e.to_string()))?;
+                table.insert(id, value.as_slice())?;
             }
-            None => return Ok(()), // Agent doesn't exist
-        };
-        drop(table);
-        drop(read_txn);
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(AGENTS_TABLE)?;
-
-            let value =
-                serde_json::to_vec(&agent).map_err(|e| Error::Serialization(e.to_string()))?;
-
-            table.insert(id, value.as_slice())?;
         }
         write_txn.commit()?;
         Ok(())
@@ -783,30 +1233,22 @@ impl AgentStore {
         id: &str,
         parsed_intent: Option<ParsedIntent>,
     ) -> Result<(), Error> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(AGENTS_TABLE)?;
-
-        let agent = match table.get(id)? {
-            Some(bytes) => {
-                let mut ag: AiAgent = serde_json::from_slice(bytes.value())
+        // Atomic RMW, one write transaction (see update_agent_status).
+        let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
+        {
+            let mut table = write_txn.open_table(AGENTS_TABLE)?;
+            let existing = table.get(id)?.map(|guard| guard.value().to_vec());
+            if let Some(bytes) = existing {
+                let mut ag: AiAgent = serde_json::from_slice(bytes.as_slice())
                     .map_err(|e| Error::Serialization(e.to_string()))?;
                 ag.parsed_intent = parsed_intent;
                 ag.updated_at = chrono::Utc::now().timestamp();
-                ag
+                let value =
+                    serde_json::to_vec(&ag).map_err(|e| Error::Serialization(e.to_string()))?;
+                table.insert(id, value.as_slice())?;
             }
-            None => return Ok(()), // Agent doesn't exist
-        };
-        drop(table);
-        drop(read_txn);
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(AGENTS_TABLE)?;
-
-            let value =
-                serde_json::to_vec(&agent).map_err(|e| Error::Serialization(e.to_string()))?;
-
-            table.insert(id, value.as_slice())?;
         }
         write_txn.commit()?;
         Ok(())
@@ -815,40 +1257,30 @@ impl AgentStore {
     /// Update agent memory after execution.
     /// First reads the agent, then updates both tables in a single write transaction.
     pub async fn update_agent_memory(&self, id: &str, memory: AgentMemory) -> Result<(), Error> {
-        // First, read the current agent data (before starting write transaction)
-        let agent = {
-            let read_txn = self.db.begin_read()?;
-            let table = read_txn.open_table(AGENTS_TABLE)?;
-            match table.get(id)? {
-                Some(bytes) => Some(
-                    serde_json::from_slice::<AiAgent>(bytes.value())
-                        .map_err(|e| Error::Serialization(e.to_string()))?,
-                ),
-                None => None,
-            }
-        };
-
-        // Now start write transaction and update both tables
+        // Atomic RMW over BOTH tables in one write transaction. If the agent
+        // row is gone (concurrent delete), neither the agent row nor an
+        // orphan memory row may be written — the old shape wrote the memory
+        // table unconditionally and re-inserted a stale agent snapshot.
+        let memory_value =
+            serde_json::to_vec(&memory).map_err(|e| Error::Serialization(e.to_string()))?;
         let write_txn = self.db.begin_write()?;
-
-        // Update memory in dedicated table
+        #[cfg(test)]
+        self.test_hook_point();
         {
-            let memory_value =
-                serde_json::to_vec(&memory).map_err(|e| Error::Serialization(e.to_string()))?;
-            let mut memory_table = write_txn.open_table(AGENT_MEMORY_TABLE)?;
-            memory_table.insert(id, memory_value.as_slice())?;
-        }
-
-        // Also update the agent record
-        if let Some(mut ag) = agent {
-            ag.memory = memory;
-            ag.updated_at = chrono::Utc::now().timestamp();
-
-            let value = serde_json::to_vec(&ag).map_err(|e| Error::Serialization(e.to_string()))?;
             let mut agent_table = write_txn.open_table(AGENTS_TABLE)?;
-            agent_table.insert(id, value.as_slice())?;
+            let mut memory_table = write_txn.open_table(AGENT_MEMORY_TABLE)?;
+            let existing_agent = agent_table.get(id)?.map(|guard| guard.value().to_vec());
+            if let Some(bytes) = existing_agent {
+                memory_table.insert(id, memory_value.as_slice())?;
+                let mut ag: AiAgent = serde_json::from_slice(bytes.as_slice())
+                    .map_err(|e| Error::Serialization(e.to_string()))?;
+                ag.memory = memory;
+                ag.updated_at = chrono::Utc::now().timestamp();
+                let value =
+                    serde_json::to_vec(&ag).map_err(|e| Error::Serialization(e.to_string()))?;
+                agent_table.insert(id, value.as_slice())?;
+            }
         }
-
         write_txn.commit()?;
         Ok(())
     }
@@ -862,29 +1294,24 @@ impl AgentStore {
         success: bool,
         duration_ms: u64,
     ) -> Result<(), Error> {
-        let read_txn = self.db.begin_read()?;
-
-        // Read agent and latest memory in the same transaction
-        let table = read_txn.open_table(AGENTS_TABLE)?;
-        let memory_table = read_txn.open_table(AGENT_MEMORY_TABLE)?;
-
-        let agent = match table.get(id)? {
-            Some(bytes) => {
-                let mut ag: AiAgent = serde_json::from_slice(bytes.value())
+        // Atomic RMW, one write transaction (see update_agent_status): reads
+        // the agent row AND the latest memory inside the same transaction, so
+        // neither a concurrent delete can be overwritten nor updates lost.
+        let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
+        {
+            let mut table = write_txn.open_table(AGENTS_TABLE)?;
+            let memory_table = write_txn.open_table(AGENT_MEMORY_TABLE)?;
+            let existing = table.get(id)?.map(|guard| guard.value().to_vec());
+            if let Some(bytes) = existing {
+                let mut ag: AiAgent = serde_json::from_slice(bytes.as_slice())
                     .map_err(|e| Error::Serialization(e.to_string()))?;
 
-                // Try to get latest memory from memory table
-                let latest_mem = match memory_table.get(id)? {
-                    Some(mem_bytes) => Some(
-                        serde_json::from_slice::<AgentMemory>(mem_bytes.value())
-                            .map_err(|e| Error::Serialization(e.to_string()))?,
-                    ),
-                    None => None,
-                };
-
-                // Use latest memory if available
-                if let Some(ref mem) = latest_mem {
-                    ag.memory = mem.clone();
+                // Merge the latest memory from the dedicated table.
+                if let Some(mem_bytes) = memory_table.get(id)?.map(|g| g.value().to_vec()) {
+                    ag.memory = serde_json::from_slice::<AgentMemory>(mem_bytes.as_slice())
+                        .map_err(|e| Error::Serialization(e.to_string()))?;
                 }
 
                 // Update stats
@@ -901,24 +1328,12 @@ impl AgentStore {
                 ag.last_execution_at = Some(chrono::Utc::now().timestamp());
                 ag.updated_at = chrono::Utc::now().timestamp();
 
-                ag
+                // Only write to AGENTS_TABLE, not to AGENT_MEMORY_TABLE
+                // (update_agent_memory handles writing to AGENT_MEMORY_TABLE)
+                let value =
+                    serde_json::to_vec(&ag).map_err(|e| Error::Serialization(e.to_string()))?;
+                table.insert(id, value.as_slice())?;
             }
-            None => return Ok(()),
-        };
-        drop(table);
-        drop(memory_table);
-        drop(read_txn);
-
-        // Only write to AGENTS_TABLE, not to AGENT_MEMORY_TABLE
-        // (update_agent_memory handles writing to AGENT_MEMORY_TABLE)
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(AGENTS_TABLE)?;
-
-            let value =
-                serde_json::to_vec(&agent).map_err(|e| Error::Serialization(e.to_string()))?;
-
-            table.insert(id, value.as_slice())?;
         }
         write_txn.commit()?;
         Ok(())
@@ -927,6 +1342,8 @@ impl AgentStore {
     /// Delete an agent by ID.
     pub async fn delete_agent(&self, id: &str) -> Result<(), Error> {
         let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
         {
             let mut table = write_txn.open_table(AGENTS_TABLE)?;
             table.remove(id)?;
@@ -942,6 +1359,8 @@ impl AgentStore {
     /// Save an execution record.
     pub async fn save_execution(&self, execution: &AgentExecutionRecord) -> Result<(), Error> {
         let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
         {
             let mut table = write_txn.open_table(AGENT_EXECUTIONS_TABLE)?;
 
@@ -963,6 +1382,8 @@ impl AgentStore {
         _conversation_turn: Option<&serde_json::Value>,
     ) -> Result<(), Error> {
         let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
 
         // Save execution record
         {
@@ -1119,6 +1540,8 @@ impl AgentStore {
         }
 
         let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
         {
             let mut table = write_txn.open_table(AGENT_EXECUTIONS_TABLE)?;
             for key in &to_remove {
@@ -1235,6 +1658,8 @@ impl AgentStore {
 
         // Save the updated agent
         let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
         {
             let mut table = write_txn.open_table(AGENTS_TABLE)?;
             let value =
@@ -1287,6 +1712,8 @@ impl AgentStore {
 
             // Save the updated agent
             let write_txn = self.db.begin_write()?;
+            #[cfg(test)]
+            self.test_hook_point();
             {
                 let mut table = write_txn.open_table(AGENTS_TABLE)?;
                 let value =
@@ -1314,6 +1741,8 @@ impl AgentStore {
 
         // Save the updated agent
         let write_txn = self.db.begin_write()?;
+        #[cfg(test)]
+        self.test_hook_point();
         {
             let mut table = write_txn.open_table(AGENTS_TABLE)?;
             let value =
@@ -1330,8 +1759,125 @@ impl AgentStore {
 mod tests {
     use super::*;
 
+    /// Read `export const <name> = <digits>` out of the editor's shared
+    /// constants module. `None` when the file is absent (source tarball without
+    /// `web/`) or the constant is not declared.
+    fn editor_constant(name: &str) -> Option<u64> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/src/pages/agents-components/agent-editor/constants.ts");
+        let text = std::fs::read_to_string(path).ok()?;
+        let marker = format!("export const {} =", name);
+        let start = text.find(&marker)? + marker.len();
+        let rest = &text[start..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '_' && c != ' ')
+            .unwrap_or(rest.len());
+        rest[..end].trim().replace('_', "").parse().ok()
+    }
+
+    /// The editor *shows* this number and uses it as its "untouched" sentinel:
+    /// a create request that leaves the field there sends nothing, and
+    /// `create_agent` applies this same default. Drift, and the form shows one
+    /// budget while the agent is created with another — the lie the lookback
+    /// window used to tell. No constant crosses the Rust/TS boundary, so the
+    /// invariant is held by test.
+    #[test]
+    fn default_max_chain_depth_matches_the_editor_constant() {
+        let Some(editor) = editor_constant("DEFAULT_MAX_CHAIN_DEPTH") else {
+            return; // no web/ tree to compare against
+        };
+        assert_eq!(
+            editor, DEFAULT_MAX_CHAIN_DEPTH as u64,
+            "DEFAULT_MAX_CHAIN_DEPTH (web/.../agent-editor/constants.ts) drifted from \
+             DEFAULT_MAX_CHAIN_DEPTH (heramind-storage/src/agents.rs) — update both"
+        );
+    }
+
     fn test_store() -> Arc<AgentStore> {
         AgentStore::memory().unwrap()
+    }
+
+    /// Minimal agent for the memory-mode derivation tests.
+    fn memory_mode_fixture(
+        execution_mode: ExecutionMode,
+        memory_mode: Option<MemoryMode>,
+    ) -> AiAgent {
+        AiAgent {
+            id: "agent-m".to_string(),
+            name: "fixture".to_string(),
+            description: None,
+            user_prompt: "p".to_string(),
+            llm_backend_id: None,
+            parsed_intent: None,
+            resources: vec![],
+            schedule: AgentSchedule {
+                schedule_type: ScheduleType::Interval,
+                cron_expression: None,
+                interval_seconds: Some(300),
+                event_filter: None,
+                timezone: None,
+            },
+            status: AgentStatus::Active,
+            priority: 128,
+            created_at: 0,
+            updated_at: 0,
+            last_execution_at: None,
+            stats: AgentStats::default(),
+            memory: AgentMemory::default(),
+            conversation_history: vec![],
+            user_messages: vec![],
+            conversation_summary: None,
+            context_window_size: 10,
+            enable_tool_chaining: false,
+            max_chain_depth: 3,
+            tool_config: None,
+            execution_mode,
+            error_message: None,
+            system_prompt: None,
+            max_retries: 0,
+            consecutive_failures: 0,
+            output_schema: None,
+            operator_config: None,
+            memory_mode,
+            notify: None,
+            max_tokens_per_run: None,
+        }
+    }
+
+    /// A scanner (structured) has nothing to learn from past runs, so it must
+    /// not pay to carry their narrative into the prompt.
+    #[test]
+    fn effective_memory_mode_derives_tool_for_structured_agents() {
+        let agent = memory_mode_fixture(ExecutionMode::Structured, None);
+        assert_eq!(agent.effective_memory_mode(), MemoryMode::Tool);
+    }
+
+    /// Everything that reasons across turns defaults to carrying history.
+    #[test]
+    fn effective_memory_mode_derives_assistant_for_the_rest() {
+        for mode in [ExecutionMode::Focused, ExecutionMode::Free] {
+            let agent = memory_mode_fixture(mode, None);
+            assert_eq!(
+                agent.effective_memory_mode(),
+                MemoryMode::Assistant,
+                "mode {mode:?} should carry history by default"
+            );
+        }
+    }
+
+    /// The derived default is only a default — an explicit choice wins, in
+    /// both directions.
+    #[test]
+    fn effective_memory_mode_honours_an_explicit_override() {
+        let pinned_stateless = memory_mode_fixture(ExecutionMode::Free, Some(MemoryMode::Tool));
+        assert_eq!(pinned_stateless.effective_memory_mode(), MemoryMode::Tool);
+
+        let pinned_history =
+            memory_mode_fixture(ExecutionMode::Structured, Some(MemoryMode::Assistant));
+        assert_eq!(
+            pinned_history.effective_memory_mode(),
+            MemoryMode::Assistant
+        );
     }
 
     #[tokio::test]
@@ -1372,6 +1918,11 @@ mod tests {
             system_prompt: None,
             max_retries: 0,
             consecutive_failures: 0,
+            output_schema: None,
+            operator_config: None,
+            memory_mode: None,
+            notify: None,
+            max_tokens_per_run: None,
         };
 
         store.save_agent(&agent).await.unwrap();
@@ -1418,6 +1969,11 @@ mod tests {
             system_prompt: None,
             max_retries: 0,
             consecutive_failures: 0,
+            output_schema: None,
+            operator_config: None,
+            memory_mode: None,
+            notify: None,
+            max_tokens_per_run: None,
         };
 
         store.save_agent(&agent).await.unwrap();
@@ -1446,8 +2002,9 @@ mod tests {
                 reasoning_steps: vec![],
                 decisions: vec![],
                 conclusion: "No action needed".to_string(),
-                confidence: 0.95,
+                confidence: Some(0.95),
                 stop_reason: String::new(),
+                tokens_used: 0,
             },
             result: None,
             duration_ms: 150,
@@ -1498,6 +2055,11 @@ mod tests {
             system_prompt: None,
             max_retries: 0,
             consecutive_failures: 0,
+            output_schema: None,
+            operator_config: None,
+            memory_mode: None,
+            notify: None,
+            max_tokens_per_run: None,
         };
 
         // Save initial agent
@@ -1565,6 +2127,11 @@ mod tests {
             system_prompt: None,
             max_retries: 0,
             consecutive_failures: 0,
+            output_schema: None,
+            operator_config: None,
+            memory_mode: None,
+            notify: None,
+            max_tokens_per_run: None,
         };
 
         store.save_agent(&agent).await.unwrap();
@@ -1590,5 +2157,904 @@ mod tests {
         assert_eq!(retrieved.stats.total_executions, 2);
         assert_eq!(retrieved.stats.failed_executions, 1);
         assert_eq!(retrieved.stats.avg_duration_ms, 150); // (200 + 100) / 2
+    }
+    // ===== Atomic-RMW regression tests (agent resurrection race, 2026-11-04) =====
+    // Root cause under test: update_agent_* did read-(drop)-then-write in two
+    // transactions; a concurrent delete_agent committing between the read and
+    // the blind re-insert resurrected the row (T4 552 trial
+    // full--agent-full-lifecycle--en--r1; repro scripts: /tmp/agent-repro/).
+
+    fn race_agent(id: &str) -> AiAgent {
+        AiAgent {
+            id: id.to_string(),
+            name: format!("race-{id}"),
+            description: None,
+            user_prompt: "check".to_string(),
+            llm_backend_id: None,
+            parsed_intent: None,
+            resources: vec![],
+            schedule: AgentSchedule {
+                schedule_type: ScheduleType::Interval,
+                cron_expression: None,
+                interval_seconds: Some(600),
+                event_filter: None,
+                timezone: None,
+            },
+            status: AgentStatus::Active,
+            priority: 128,
+            created_at: 1,
+            updated_at: 1,
+            last_execution_at: None,
+            stats: AgentStats::default(),
+            memory: AgentMemory::default(),
+            conversation_history: vec![],
+            user_messages: Default::default(),
+            conversation_summary: None,
+            context_window_size: 10,
+            enable_tool_chaining: false,
+            max_chain_depth: 3,
+            tool_config: None,
+            execution_mode: ExecutionMode::Focused,
+            error_message: None,
+            system_prompt: None,
+            max_retries: 0,
+            consecutive_failures: 0,
+            output_schema: None,
+            operator_config: None,
+            memory_mode: None,
+            notify: None,
+            max_tokens_per_run: None,
+        }
+    }
+
+    fn memory_row_present(store: &AgentStore, id: &str) -> bool {
+        let txn = store.db.begin_read().unwrap();
+        let table = txn.open_table(AGENT_MEMORY_TABLE).unwrap();
+        table.get(id).unwrap().is_some()
+    }
+
+    /// Arm this store's hook (per-instance, isolated from other stores).
+    fn arm_hook(store: &AgentStore) {
+        *store.test_hook.lock().unwrap() = crate::agents::TestHookState::Armed;
+    }
+
+    /// Block until the hook on this store has paused (deterministic sync).
+    fn wait_hook_paused(store: &AgentStore) {
+        loop {
+            if *store.test_hook.lock().unwrap() == crate::agents::TestHookState::Paused {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Release the paused hook on this store.
+    fn release_hook(store: &AgentStore) {
+        *store.test_hook.lock().unwrap() = crate::agents::TestHookState::Disarmed;
+    }
+
+    /// Barrier-started delete-vs-update race on the SAME id, N iterations.
+    /// Synchronization is the barrier plus redb's own write-lock contention —
+    /// no sleeps. Any resurrection is a failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_rmw_race_delete_vs_status_no_resurrection() {
+        let store = test_store();
+        let mut resurrections = 0u32;
+        for i in 0..300 {
+            let id = format!("race-status-{i}");
+            store.save_agent(&race_agent(&id)).await.unwrap();
+            let (sa, sb) = (store.clone(), store.clone());
+            let (ida, idb) = (id.clone(), id.clone());
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let (b1, b2) = (barrier.clone(), barrier.clone());
+            let ta = tokio::spawn(async move {
+                b1.wait().await;
+                sa.update_agent_status(&ida, AgentStatus::Executing, None)
+                    .await
+                    .unwrap();
+            });
+            let tb = tokio::spawn(async move {
+                b2.wait().await;
+                sb.delete_agent(&idb).await.unwrap();
+            });
+            let _ = tokio::join!(ta, tb);
+            if store.get_agent(&id).await.unwrap().is_some() {
+                resurrections += 1;
+            }
+        }
+        assert_eq!(
+            resurrections, 0,
+            "delete must be durable: {resurrections}/300 delete-vs-status races resurrected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_rmw_race_delete_vs_stats_no_resurrection() {
+        let store = test_store();
+        let mut resurrections = 0u32;
+        for i in 0..200 {
+            let id = format!("race-stats-{i}");
+            store.save_agent(&race_agent(&id)).await.unwrap();
+            let (sa, sb) = (store.clone(), store.clone());
+            let (ida, idb) = (id.clone(), id.clone());
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let (b1, b2) = (barrier.clone(), barrier.clone());
+            let ta = tokio::spawn(async move {
+                b1.wait().await;
+                sa.update_agent_stats(&ida, true, 7).await.unwrap();
+            });
+            let tb = tokio::spawn(async move {
+                b2.wait().await;
+                sb.delete_agent(&idb).await.unwrap();
+            });
+            let _ = tokio::join!(ta, tb);
+            if store.get_agent(&id).await.unwrap().is_some() {
+                resurrections += 1;
+            }
+        }
+        assert_eq!(
+            resurrections, 0,
+            "{resurrections}/200 delete-vs-stats races resurrected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_rmw_race_delete_vs_memory_no_resurrection_and_no_orphan() {
+        let store = test_store();
+        let mut resurrections = 0u32;
+        let mut orphans = 0u32;
+        for i in 0..200 {
+            let id = format!("race-mem-{i}");
+            store.save_agent(&race_agent(&id)).await.unwrap();
+            let mem = AgentMemory {
+                updated_at: 42,
+                ..AgentMemory::default()
+            };
+            let (sa, sb) = (store.clone(), store.clone());
+            let (ida, idb) = (id.clone(), id.clone());
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let (b1, b2) = (barrier.clone(), barrier.clone());
+            let ta = tokio::spawn(async move {
+                b1.wait().await;
+                sa.update_agent_memory(&ida, mem).await.unwrap();
+            });
+            let tb = tokio::spawn(async move {
+                b2.wait().await;
+                sb.delete_agent(&idb).await.unwrap();
+            });
+            let _ = tokio::join!(ta, tb);
+            let exists = store.get_agent(&id).await.unwrap().is_some();
+            if exists {
+                resurrections += 1;
+            }
+            // Whatever the interleaving, a deleted agent must not leave an
+            // orphan memory row behind either (related-table consistency).
+            if !exists && memory_row_present(&store, &id) {
+                orphans += 1;
+            }
+        }
+        assert_eq!(
+            resurrections, 0,
+            "{resurrections}/200 delete-vs-memory races resurrected"
+        );
+        assert_eq!(
+            orphans, 0,
+            "{orphans}/200 delete-vs-memory races left an orphan memory row"
+        );
+    }
+
+    /// Documents the exact mechanism at the primitive level (always green;
+    /// uses raw table writes, not the fixed functions): a stale-snapshot
+    /// re-insert after a completed delete resurrects the row. This is the
+    /// shape the old update_agent_* functions had.
+    #[tokio::test]
+    async fn agent_rmw_mechanism_documented_stale_reinsert_resurrects() {
+        let store = test_store();
+        let id = "mech-1";
+        store.save_agent(&race_agent(id)).await.unwrap();
+
+        // Old algorithm, step 1: read a snapshot (row exists).
+        let stale = {
+            let txn = store.db.begin_read().unwrap();
+            let table = txn.open_table(AGENTS_TABLE).unwrap();
+            let mut ag: AiAgent =
+                serde_json::from_slice(table.get(id).unwrap().unwrap().value()).unwrap();
+            ag.status = AgentStatus::Executing;
+            serde_json::to_vec(&ag).unwrap()
+        };
+
+        // Concurrent delete completes fully.
+        store.delete_agent(id).await.unwrap();
+        assert!(store.get_agent(id).await.unwrap().is_none());
+
+        // Old algorithm, step 2: blind re-insert of the stale snapshot.
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(AGENTS_TABLE).unwrap();
+            table.insert(id, stale.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert!(
+            store.get_agent(id).await.unwrap().is_some(),
+            "stale-snapshot re-insert resurrects — the fixed functions must never do this"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_rmw_status_normal_and_missing() {
+        let store = test_store();
+        store.save_agent(&race_agent("s-1")).await.unwrap();
+        store
+            .update_agent_status("s-1", AgentStatus::Paused, Some("boom".into()))
+            .await
+            .unwrap();
+        let ag = store.get_agent("s-1").await.unwrap().unwrap();
+        assert_eq!(ag.status, AgentStatus::Paused);
+        assert_eq!(ag.error_message.as_deref(), Some("boom"));
+
+        // Missing record: no re-create.
+        store
+            .update_agent_status("ghost", AgentStatus::Active, None)
+            .await
+            .unwrap();
+        assert!(store.get_agent("ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_rmw_stats_normal_and_missing() {
+        let store = test_store();
+        store.save_agent(&race_agent("st-1")).await.unwrap();
+        for _ in 0..3 {
+            store.update_agent_stats("st-1", true, 10).await.unwrap();
+        }
+        let ag = store.get_agent("st-1").await.unwrap().unwrap();
+        assert_eq!(ag.stats.total_executions, 3);
+        assert_eq!(ag.stats.successful_executions, 3);
+        assert_eq!(ag.stats.last_duration_ms, Some(10));
+
+        store.update_agent_stats("ghost", true, 5).await.unwrap();
+        assert!(store.get_agent("ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_rmw_memory_normal_missing_and_consistency() {
+        let store = test_store();
+        store.save_agent(&race_agent("m-1")).await.unwrap();
+        let mem = AgentMemory {
+            updated_at: 42,
+            ..AgentMemory::default()
+        };
+        store.update_agent_memory("m-1", mem).await.unwrap();
+        assert_eq!(
+            store
+                .get_agent("m-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .memory
+                .updated_at,
+            42
+        );
+        assert!(memory_row_present(&store, "m-1"));
+
+        // Missing record: neither the agent row nor an orphan memory row may
+        // be created.
+        store
+            .update_agent_memory("ghost", AgentMemory::default())
+            .await
+            .unwrap();
+        assert!(store.get_agent("ghost").await.unwrap().is_none());
+        assert!(!memory_row_present(&store, "ghost"));
+
+        // Deleted record: the memory row is gone with the agent, and a late
+        // memory update must not resurrect either table.
+        store.delete_agent("m-1").await.unwrap();
+        assert!(!memory_row_present(&store, "m-1"));
+        store
+            .update_agent_memory("m-1", AgentMemory::default())
+            .await
+            .unwrap();
+        assert!(store.get_agent("m-1").await.unwrap().is_none());
+        assert!(!memory_row_present(&store, "m-1"));
+    }
+
+    /// Deterministic order 1 (status path): the REAL update function is
+    /// parked while it HOLDS the write transaction (rmw_test_hooks), the
+    /// REAL delete is started against it (queues on the write lock), then
+    /// the update is released. The delete must take effect afterwards.
+    /// No timing race: the interleaving is driven by the hook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_rmw_deterministic_update_holds_txn_then_delete_wins_status() {
+        let store = test_store();
+        store.save_agent(&race_agent("d-st")).await.unwrap();
+        arm_hook(&store);
+        let su = store.clone();
+        let up = tokio::spawn(async move {
+            su.update_agent_status("d-st", AgentStatus::Executing, None)
+                .await
+                .unwrap();
+        });
+        tokio::task::spawn_blocking({
+            let s = store.clone();
+            move || wait_hook_paused(&s)
+        })
+        .await
+        .unwrap();
+        let sd = store.clone();
+        let del = tokio::spawn(async move {
+            sd.delete_agent("d-st").await.unwrap();
+        });
+        release_hook(&store);
+        up.await.unwrap();
+        del.await.unwrap();
+        assert!(
+            store.get_agent("d-st").await.unwrap().is_none(),
+            "delete queued behind the update transaction must still win"
+        );
+    }
+
+    /// Deterministic order 1 (memory path, with the related table): update
+    /// parked while holding the txn, delete queued behind it. Afterwards
+    /// neither the agent row nor the memory row may exist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_rmw_deterministic_update_holds_txn_then_delete_wins_memory() {
+        let store = test_store();
+        store.save_agent(&race_agent("d-mem")).await.unwrap();
+        arm_hook(&store);
+        let su = store.clone();
+        let up = tokio::spawn(async move {
+            su.update_agent_memory(
+                "d-mem",
+                AgentMemory {
+                    updated_at: 77,
+                    ..AgentMemory::default()
+                },
+            )
+            .await
+            .unwrap();
+        });
+        tokio::task::spawn_blocking({
+            let s = store.clone();
+            move || wait_hook_paused(&s)
+        })
+        .await
+        .unwrap();
+        let sd = store.clone();
+        let del = tokio::spawn(async move {
+            sd.delete_agent("d-mem").await.unwrap();
+        });
+        release_hook(&store);
+        up.await.unwrap();
+        del.await.unwrap();
+        assert!(store.get_agent("d-mem").await.unwrap().is_none());
+        assert!(
+            !memory_row_present(&store, "d-mem"),
+            "related memory table must be empty after the delete wins"
+        );
+    }
+
+    /// Deterministic order 2: the delete has fully committed BEFORE any
+    /// update runs. None of the three update paths may re-create the agent
+    /// row or the related memory row.
+    #[tokio::test]
+    async fn agent_rmw_deterministic_delete_committed_first_no_recreate() {
+        let store = test_store();
+        store.save_agent(&race_agent("d-first")).await.unwrap();
+        store.delete_agent("d-first").await.unwrap();
+        assert!(store.get_agent("d-first").await.unwrap().is_none());
+
+        store
+            .update_agent_status("d-first", AgentStatus::Executing, None)
+            .await
+            .unwrap();
+        store.update_agent_stats("d-first", true, 5).await.unwrap();
+        store
+            .update_agent_memory(
+                "d-first",
+                AgentMemory {
+                    updated_at: 99,
+                    ..AgentMemory::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store.get_agent("d-first").await.unwrap().is_none(),
+            "no update path may re-create the agent row after a committed delete"
+        );
+        assert!(
+            !memory_row_present(&store, "d-first"),
+            "no update path may re-create the related memory row"
+        );
+    }
+
+    /// Concurrent updates across the three paths must not lose each other's
+    /// fields (each atomic RMW applies against the latest committed row).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_rmw_concurrent_updates_no_field_loss() {
+        let store = test_store();
+        store.save_agent(&race_agent("c-1")).await.unwrap();
+        let mut handles = vec![];
+        for i in 0..10u64 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                s.update_agent_stats("c-1", i % 2 == 0, i + 1)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for _ in 0..5 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                s.update_agent_status("c-1", AgentStatus::Paused, None)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for at in [101i64, 102, 103] {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                s.update_agent_memory(
+                    "c-1",
+                    AgentMemory {
+                        updated_at: at,
+                        ..AgentMemory::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let ag = store.get_agent("c-1").await.unwrap().unwrap();
+        assert_eq!(ag.stats.total_executions, 10, "no stats update may be lost");
+        assert_eq!(ag.stats.successful_executions, 5);
+        assert_eq!(ag.status, AgentStatus::Paused);
+        // Concurrent writers commit in arbitrary order; the guarantee is that
+        // exactly one of the written values survives (no lost/merged fields).
+        assert!(
+            [101i64, 102, 103].contains(&ag.memory.updated_at),
+            "memory must hold exactly one of the written values, got {}",
+            ag.memory.updated_at
+        );
+    }
+}
+
+/// `EventFilter` structured (M2-1) — the polymorphic parse layer.
+///
+/// The stored `event_filter` column stays an `Option<String>`; this module is
+/// what makes it polymorphic, so every shape already in `agents.redb` keeps
+/// working. Change these tests only when the on-disk shape changes.
+#[cfg(test)]
+mod event_filter_tests {
+    use super::*;
+
+    /// An `all` filter WITHOUT an explicit `within_secs` used to be a silent
+    /// dead trigger: the None window discarded partial hits on every event,
+    /// so the AND could only complete if one single event matched every
+    /// spec. The default window makes it compose across events.
+    #[test]
+    fn all_filter_without_window_completes_across_events() {
+        let src = |id: &str| EventSource {
+            source_type: "device".to_string(),
+            id: id.to_string(),
+            field: Some("temp".to_string()),
+        };
+        let filter = EventFilter {
+            any: vec![],
+            all: vec![src("dev-a"), src("dev-b")],
+            within_secs: None,
+        };
+
+        let t0: i64 = 1_700_000_000;
+        let first = filter.observe(None, "device", "dev-a", "temp", t0);
+        assert!(
+            matches!(first, WindowOutcome::Pending(Some(_))),
+            "partial hit must carry over under the default window: {first:?}"
+        );
+
+        let state = match first {
+            WindowOutcome::Pending(Some(s)) => Some(s),
+            _ => None,
+        };
+        let second = filter.observe(state.as_ref(), "device", "dev-b", "temp", t0 + 10);
+        assert!(
+            matches!(second, WindowOutcome::Fire),
+            "the completing event must fire the AND: {second:?}"
+        );
+    }
+
+    /// Boundary: the completing event lands EXACTLY at the window edge
+    /// (opened_at + 300) — inside, the AND completes. One second later the
+    /// window is dead and the same event opens a fresh one instead.
+    #[test]
+    fn all_filter_default_window_boundary_is_inclusive_then_dead() {
+        let src = |id: &str| EventSource {
+            source_type: "device".to_string(),
+            id: id.to_string(),
+            field: Some("temp".to_string()),
+        };
+        let filter = EventFilter {
+            any: vec![],
+            all: vec![src("a"), src("b")],
+            within_secs: None,
+        };
+        let t0: i64 = 1_700_000_000;
+        let first = filter.observe(None, "device", "a", "temp", t0);
+        let state = match first {
+            WindowOutcome::Pending(Some(s)) => s,
+            other => panic!("expected window, got {other:?}"),
+        };
+        // Exactly at the edge (expiry check is `> window`): completes.
+        assert!(matches!(
+            filter.observe(
+                Some(&state),
+                "device",
+                "b",
+                "temp",
+                t0 + DEFAULT_ALL_WINDOW_SECS as i64
+            ),
+            WindowOutcome::Fire
+        ));
+        // One second past: dead — the same hit re-opens instead of firing.
+        let late = filter.observe(
+            Some(&state),
+            "device",
+            "b",
+            "temp",
+            t0 + DEFAULT_ALL_WINDOW_SECS as i64 + 1,
+        );
+        assert!(
+            matches!(late, WindowOutcome::Pending(Some(ref s)) if s.seen.len() == 1),
+            "expired window must not complete: {late:?}"
+        );
+    }
+
+    /// The default window still expires: sources arriving past it must not
+    /// complete an AND whose hits never actually overlapped.
+    #[test]
+    fn all_filter_default_window_expires() {
+        let src = |id: &str| EventSource {
+            source_type: "device".to_string(),
+            id: id.to_string(),
+            field: Some("temp".to_string()),
+        };
+        let filter = EventFilter {
+            any: vec![],
+            all: vec![src("dev-a"), src("dev-b")],
+            within_secs: None,
+        };
+
+        let t0: i64 = 1_700_000_000;
+        let first = filter.observe(None, "device", "dev-a", "temp", t0);
+        let state = match first {
+            WindowOutcome::Pending(Some(s)) => Some(s),
+            other => panic!("expected pending window, got {other:?}"),
+        };
+        // Arrives past the 300s default — the window is dead, a fresh one
+        // opens carrying only this hit.
+        let late = filter.observe(
+            state.as_ref(),
+            "device",
+            "dev-b",
+            "temp",
+            t0 + DEFAULT_ALL_WINDOW_SECS as i64 + 60,
+        );
+        assert!(
+            matches!(late, WindowOutcome::Pending(Some(_))),
+            "an expired default window must not complete: {late:?}"
+        );
+    }
+
+    fn schedule_with(filter: &str) -> AgentSchedule {
+        AgentSchedule {
+            schedule_type: ScheduleType::Event,
+            cron_expression: None,
+            interval_seconds: None,
+            event_filter: Some(filter.to_string()),
+            timezone: None,
+        }
+    }
+
+    /// The shape the web editor has been writing since before this change
+    /// (`AgentEditorFullScreen.tsx` builds `{sources:[{type,id,field}]}`).
+    /// It must keep parsing to exactly the same source triples, or every
+    /// event agent already saved silently stops firing.
+    #[test]
+    fn legacy_sources_shape_parses_to_any() {
+        let s = schedule_with(
+            r#"{"sources":[{"type":"device","id":"cam-01","field":"occupied"},{"type":"device","id":"gate","field":"reserved"}]}"#,
+        );
+
+        let f = s
+            .parsed_event_filter()
+            .expect("the legacy sources shape must parse");
+
+        assert_eq!(f.any.len(), 2);
+        assert_eq!(f.any[0].source_type, "device");
+        assert_eq!(f.any[0].id, "cam-01");
+        assert_eq!(f.any[0].field.as_deref(), Some("occupied"));
+        assert_eq!(f.any[1].id, "gate");
+        assert_eq!(f.any[1].field.as_deref(), Some("reserved"));
+        assert!(
+            f.all.is_empty(),
+            "the legacy shape carries no AND semantics"
+        );
+        assert_eq!(f.within_secs, None);
+    }
+
+    /// The pre-`sources` shape, still present in older rows. Today it matches
+    /// through a dedicated branch in the trigger path; once matching runs off
+    /// the parsed filter, a shape that "parses" into an empty filter turns
+    /// the agent into one that silently never fires — the worst failure mode
+    /// this feature has. So it must translate into an equivalent source.
+    #[test]
+    fn legacy_event_type_shape_parses_to_an_equivalent_source() {
+        let f = schedule_with(r#"{"event_type":"device.metric","device_id":"sensor-01"}"#)
+            .parsed_event_filter()
+            .expect("the legacy event_type shape must parse");
+
+        assert_eq!(f.any.len(), 1, "an empty filter would never fire");
+        assert_eq!(f.any[0].source_type, "device");
+        assert_eq!(f.any[0].id, "sensor-01");
+        assert_eq!(
+            f.any[0].field, None,
+            "the legacy shape names no field, so it matches any field"
+        );
+    }
+
+    #[test]
+    fn new_any_and_all_shapes_parse_with_their_window() {
+        let f = schedule_with(
+            r#"{"any":[{"type":"device","id":"cam-01","field":"occupied"}],"all":[{"type":"device","id":"cam-01","field":"occupied"},{"type":"extension","id":"booking","field":"reserved"}],"within_secs":1200}"#,
+        )
+        .parsed_event_filter()
+        .expect("the new shape must parse");
+
+        assert_eq!(f.any.len(), 1);
+        assert_eq!(f.any[0].field.as_deref(), Some("occupied"));
+        assert_eq!(f.all.len(), 2);
+        assert_eq!(f.all[1].source_type, "extension");
+        assert_eq!(f.all[1].id, "booking");
+        assert_eq!(f.within_secs, Some(1200));
+    }
+
+    /// An `all` entry without a field matches any field of that source.
+    #[test]
+    fn source_without_a_field_matches_any_field() {
+        let f = schedule_with(r#"{"all":[{"type":"device","id":"cam-01"}]}"#)
+            .parsed_event_filter()
+            .expect("must parse");
+
+        assert_eq!(f.all[0].field, None);
+    }
+
+    /// Nothing recognised must yield `None`, never an empty filter: `None`
+    /// sends the caller down the resource-binding fallback (today's
+    /// behaviour), whereas an empty filter would match nothing at all and
+    /// turn the agent into one that silently never fires.
+    #[test]
+    fn unrecognised_filters_fall_back_instead_of_matching_nothing() {
+        for raw in [
+            r#"{"foo":1}"#,
+            r#"{"event_type":"something.else","device_id":"x"}"#,
+            r#"{"sources":[]}"#,
+            r#"{"any":[],"all":[]}"#,
+            "not json at all",
+        ] {
+            assert!(
+                schedule_with(raw).parsed_event_filter().is_none(),
+                "expected None (fall back to resources) for {raw}"
+            );
+        }
+    }
+
+    fn source(source_type: &str, id: &str, field: Option<&str>) -> EventSource {
+        EventSource {
+            source_type: source_type.to_string(),
+            id: id.to_string(),
+            field: field.map(str::to_string),
+        }
+    }
+
+    /// The predicate every `any`/`all` decision runs through. Its semantics
+    /// are read straight off the pre-M2 trigger path
+    /// (`matches_data_source_filter`'s sources branch), so this test is the
+    /// equivalence contract: a change here changes which agents fire.
+    #[test]
+    fn source_requires_the_exact_triple() {
+        let cam = source("device", "cam-01", Some("occupied"));
+
+        assert!(
+            cam.matches_event("device", "cam-01", "occupied"),
+            "the same triple must match"
+        );
+        assert!(
+            !cam.matches_event("device", "cam-01", "temperature"),
+            "a different field on the same source must not match"
+        );
+        assert!(
+            !cam.matches_event("device", "cam-02", "occupied"),
+            "a different source must not match"
+        );
+        assert!(
+            !cam.matches_event("extension", "cam-01", "occupied"),
+            "a different source type must not match"
+        );
+    }
+
+    /// `id: "all"` is the wildcard the editor offers for "any source of this
+    /// type".
+    #[test]
+    fn id_all_matches_every_source_of_its_type() {
+        let any_device = source("device", "all", Some("occupied"));
+
+        assert!(any_device.matches_event("device", "cam-99", "occupied"));
+        assert!(
+            !any_device.matches_event("extension", "cam-99", "occupied"),
+            "the wildcard is scoped to its own source type"
+        );
+    }
+
+    /// Pre-M2 behaviour, pinned deliberately rather than left as an
+    /// accident: the old path returned on `id == "all"` *before* consulting
+    /// the field, so a wildcard with a field set still matches every field.
+    #[test]
+    fn id_all_short_circuits_the_field_check() {
+        let any_device = source("device", "all", Some("occupied"));
+
+        assert!(
+            any_device.matches_event("device", "cam-99", "temperature"),
+            "id=all ignores the configured field (pre-M2 behaviour)"
+        );
+    }
+
+    /// A source with no field matches any field reported by that source.
+    #[test]
+    fn a_source_without_a_field_matches_any_field() {
+        let open = source("device", "cam-01", None);
+
+        assert!(open.matches_event("device", "cam-01", "temperature"));
+        assert!(open.matches_event("device", "cam-01", "occupied"));
+    }
+
+    /// An empty id is ambiguous — the old path skipped such entries rather
+    /// than treating them as a wildcard.
+    #[test]
+    fn an_empty_id_never_matches() {
+        let empty = source("device", "", None);
+
+        assert!(!empty.matches_event("device", "cam-01", "temperature"));
+    }
+
+    // ---- the `all` window state machine (M2-1) ----
+
+    fn filter_with_all(
+        sources: &[(&str, &str, Option<&str>)],
+        within_secs: Option<u64>,
+    ) -> EventFilter {
+        EventFilter {
+            any: Vec::new(),
+            all: sources.iter().map(|(t, i, f)| source(t, i, *f)).collect(),
+            within_secs,
+        }
+    }
+
+    /// Unwrap a Pending outcome, failing loudly if the filter fired.
+    fn pending(outcome: WindowOutcome) -> Option<WindowState> {
+        match outcome {
+            WindowOutcome::Pending(state) => state,
+            WindowOutcome::Fire => panic!("expected Pending, got Fire"),
+        }
+    }
+
+    fn two_source_filter() -> EventFilter {
+        filter_with_all(
+            &[
+                ("device", "cam-01", Some("occupied")),
+                ("extension", "booking", Some("reserved")),
+            ],
+            Some(1200),
+        )
+    }
+
+    /// The whole point of M2: "occupancy AND not-booked" must not fire on
+    /// either source alone — that is exactly what today's OR-only filter
+    /// does, and the reason this feature exists.
+    #[test]
+    fn all_fires_only_once_every_source_is_seen() {
+        let f = two_source_filter();
+
+        let first = pending(f.observe(None, "device", "cam-01", "occupied", 1_000));
+
+        let second = f.observe(first.as_ref(), "extension", "booking", "reserved", 1_010);
+        assert!(
+            matches!(second, WindowOutcome::Fire),
+            "both sources inside the window must fire"
+        );
+    }
+
+    /// A source arriving after the window must NOT complete the AND — those
+    /// two hits never actually happened together. It opens a fresh window.
+    #[test]
+    fn a_source_past_the_window_restarts_instead_of_firing() {
+        let f = two_source_filter(); // within_secs = 1200
+        let opened = pending(f.observe(None, "device", "cam-01", "occupied", 1_000));
+
+        // 1300s later — outside the 1200s window.
+        let outcome = f.observe(opened.as_ref(), "extension", "booking", "reserved", 2_300);
+
+        let state = pending(outcome).expect("a late source opens a fresh window");
+        assert_eq!(
+            state.opened_at, 2_300,
+            "the clock restarts from the late hit"
+        );
+        assert_eq!(
+            state.seen,
+            vec![1],
+            "only the late hit is in the new window"
+        );
+    }
+
+    /// An expired window is dropped rather than revived: otherwise it lingers
+    /// for the life of the process and can be completed by an unrelated event
+    /// hours later.
+    #[test]
+    fn an_expired_window_is_dropped_instead_of_revived() {
+        let f = two_source_filter();
+        let opened = pending(f.observe(None, "device", "cam-01", "occupied", 1_000));
+
+        // Unrelated, and long past the window.
+        let after = f.observe(opened.as_ref(), "device", "cam-01", "temperature", 9_999);
+
+        assert_eq!(pending(after), None, "the expired window must be gone");
+    }
+
+    /// `within_secs: None` reads as "the same instant, the same event"
+    /// (design 001 §5.2.2): nothing carries between events, so the AND must
+    /// be satisfiable by one event alone or not at all.
+    #[test]
+    fn without_a_window_the_all_gets_the_default_window() {
+        // Contract change (chain review M-C2-1): an `all` filter without an
+        // explicit window used to carry NOTHING between events — a documented
+        // but practically unreachable semantics (the AND could only complete
+        // if one single event matched every spec), i.e. a silent dead
+        // trigger for any real multi-source setup. It now defaults to
+        // DEFAULT_ALL_WINDOW_SECS; explicit windows are unchanged, and the
+        // single-event-satisfies-everything case still fires immediately.
+        let two_separate = filter_with_all(
+            &[
+                ("device", "cam-01", Some("occupied")),
+                ("extension", "booking", Some("reserved")),
+            ],
+            None,
+        );
+        let alone = two_separate.observe(None, "device", "cam-01", "occupied", 1_000);
+        assert!(
+            pending(alone).is_some(),
+            "partial hits carry over under the default window"
+        );
+
+        // One event that satisfies every entry (exact + wildcard) still
+        // fires immediately — the default window only ADDS a way to
+        // complete, never delays an already-complete match.
+        let one_event = filter_with_all(
+            &[
+                ("device", "cam-01", Some("occupied")),
+                ("device", "all", None),
+            ],
+            None,
+        );
+        assert!(
+            matches!(
+                one_event.observe(None, "device", "cam-01", "occupied", 1_000),
+                WindowOutcome::Fire
+            ),
+            "a single event satisfying every entry must fire"
+        );
     }
 }

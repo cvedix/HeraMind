@@ -31,9 +31,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        r##"Create or overwrite a file (data dir or HERAMIND_ALLOWED_WRITE_DIRS). Relative paths preferred. No binary (.so/.dll) or security (.env) files. Max 1MB; parent dirs auto-created.
-
-Use for skill files, widget bundles, extension source, configs. For the agent cross-run memory use `memory`; to edit part of a file use `file_edit`."##
+        "Create/overwrite a file (JSON/TOML validated). Prefer file_edit for edits, memory for cross-run notes."
     }
 
     fn parameters(&self) -> Value {
@@ -41,15 +39,20 @@ Use for skill files, widget bundles, extension source, configs. For the agent cr
             serde_json::json!({
                 "path": {
                     "type": "string",
-                    "description": "File path (relative to data/ or absolute). Example: 'skills/my-skill.md', 'extensions/my-ext/src/lib.rs'"
+                    "description": "File path."
                 },
                 "content": {
                     "type": "string",
-                    "description": "The file content to write"
+                    "description": "Full file content."
+                },
+                "expected": {
+                    "type": "object",
+                    "description": "Optional {mtime_ms, size} from file_read.",
+                    "properties": { "mtime_ms": {"type": "integer"}, "size": {"type": "integer"} }
                 },
                 "create_dirs": {
                     "type": "boolean",
-                    "description": "Create parent directories if they don't exist (default: true)"
+                    "description": "Create parent dirs (default true)."
                 }
             }),
             vec!["path".to_string(), "content".to_string()],
@@ -97,6 +100,41 @@ Use for skill files, widget bundles, extension source, configs. For the agent cr
             }
         }
 
+        // Opt-in freshness guard (see file_read): refuse to touch a file
+        // that changed since the caller's last snapshot.
+        if let Err(stale) = super::file_read::check_expected(&resolved, &args["expected"]) {
+            return Ok(*stale);
+        }
+
+        // Idempotency short-circuit: a rewrite with IDENTICAL content is a
+        // no-op. Small models in long tool loops re-emit the same file
+        // verbatim without remembering they wrote it (observed live: the
+        // same manifest written 3× across rounds); answering "already up to
+        // date" gives them the missing signal AND skips the disk churn.
+        if let Ok(existing) = std::fs::read_to_string(&resolved) {
+            if existing == content {
+                tracing::info!(path = %resolved.display(), bytes = content.len(), "File write skipped — identical content already on disk");
+                return Ok(ToolOutput::success(serde_json::json!({
+                    "path": resolved.display().to_string(),
+                    "bytes_written": 0,
+                    "identical": true,
+                    "message": "Identical content already on disk — no write needed. You already wrote this exact file in a previous step; move on to the NEXT step. / 该文件内容已完全相同，无需重写，请继续下一步。"
+                })));
+            }
+        }
+
+        // Syntax gate (shared with file_edit): invalid JSON/TOML never
+        // reaches disk. A typo'd manifest used to surface rounds later as a
+        // mysteriously broken artifact; now it is an immediate, positioned
+        // error the model can fix in one retry.
+        if let Some(err) = super::file_edit::syntax_check(&resolved, content) {
+            tracing::info!(path = %resolved.display(), "File write rejected by syntax gate");
+            return Ok(ToolOutput::error(serde_json::json!({
+                "message": format!("Content is INVALID — nothing written. Fix and retry: {err}"),
+                "syntax_error": err,
+            }).to_string()));
+        }
+
         // Write file atomically (temp file + rename)
         let bytes = content.len();
         super::path_validator::atomic_write(&resolved, content).map_err(|e| {
@@ -114,6 +152,7 @@ Use for skill files, widget bundles, extension source, configs. For the agent cr
         );
 
         Ok(ToolOutput::success(serde_json::json!({
+            "state": super::file_read::FileState::of(&resolved).ok().map(|st| st.to_json()),
             "path": resolved.display().to_string(),
             "bytes_written": bytes,
             "message": format!("Successfully wrote {} bytes to {}", bytes, resolved.display()),
@@ -129,6 +168,65 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.keep();
         FileWriteTool::new(path)
+    }
+
+    #[tokio::test]
+    async fn invalid_json_never_reaches_disk() {
+        let tool = tool();
+        let r = tool
+            .execute(serde_json::json!({
+                "path": "bad.json",
+                "content": "{\"a\": 1,}" // trailing comma
+            }))
+            .await
+            .unwrap();
+        assert!(!r.success, "syntax gate must reject");
+        assert!(
+            r.error.unwrap_or_default().contains("INVALID"),
+            "error must state nothing was written"
+        );
+        assert!(
+            !tool.validator.resolve_path("bad.json").unwrap().exists(),
+            "file must not be created"
+        );
+        // The VALID version writes fine (regression: gate must not block good content).
+        let ok = tool
+            .execute(serde_json::json!({"path": "good.json", "content": "{\"a\": 1}"}))
+            .await
+            .unwrap();
+        assert!(ok.success, "{:?}", ok.data);
+    }
+
+    #[tokio::test]
+    async fn identical_rewrite_is_a_noop_with_signal() {
+        let tool = tool();
+        let args = serde_json::json!({
+            "path": "idem-test.txt",
+            "content": "hello widget"
+        });
+        // First write: real.
+        let first = tool.execute(args.clone()).await.expect("first write");
+        assert!(first.success);
+        assert_eq!(first.data["bytes_written"], serde_json::json!(12));
+        // Second write, IDENTICAL content: short-circuits — bytes_written 0,
+        // identical flag set, and an explicit move-on hint for the model.
+        let second = tool.execute(args).await.expect("second write");
+        assert!(second.success, "idempotent rewrite must still succeed");
+        assert_eq!(second.data["bytes_written"], serde_json::json!(0));
+        assert_eq!(second.data["identical"], serde_json::json!(true));
+        assert!(
+            second.data["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("NEXT step"),
+            "the no-op result must tell the model to move on"
+        );
+        // A CHANGED content still writes for real.
+        let third = tool
+            .execute(serde_json::json!({ "path": "idem-test.txt", "content": "hello widget v2" }))
+            .await
+            .expect("changed write");
+        assert_eq!(third.data["bytes_written"], serde_json::json!(15));
     }
 
     #[test]

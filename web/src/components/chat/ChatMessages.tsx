@@ -10,20 +10,30 @@
  * (no flicker).
  */
 
-import { useMemo, type RefObject } from "react"
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react"
 import { useTranslation } from "react-i18next"
-import { ChevronDown, Sparkles } from "lucide-react"
-import type { ChatImage, Message, UserInfo } from "@/types"
+import { Loader2, Info, Pencil } from "lucide-react"
+import type {
+  ChatImage,
+  GoalEvidenceLevel,
+  Message,
+  StreamEndReason,
+  SystemGoalStatus,
+  UserInfo,
+} from "@/types"
 import { cn } from "@/lib/utils"
-import { textNano } from "@/design-system/tokens/typography"
-import { formatTimestamp } from "@/lib/utils/format"
-import { cleanToolCallJson, mergeMessagesForDisplay } from "@/lib/messageUtils"
-import { isThinkingDuplicate } from "./ToolCallVisualization"
+import { textMini } from "@/design-system/tokens/typography"
+import { formatTimestamp, formatElapsedMs } from "@/lib/utils/format"
+import { cleanToolCallJson, mergeMessagesForDisplay, dropInFlightTurn } from "@/lib/messageUtils"
+import { contentNodesHaveReferences } from "@/lib/chat/contentProtocol"
+import { getServerOrigin } from "@/lib/api"
+import { isThinkingDuplicate } from "./toolCallUtils"
 import { MarkdownMessage } from "./MarkdownMessage"
+import { UserMessageContent } from "./UserMessageContent"
 import { ThinkingBlock } from "./ThinkingBlock"
-import { ToolProcessBlock } from "./ToolCallVisualization"
+import { TurnTimeline } from "./TurnTimeline"
 import { CopyMessageButton } from "./CopyMessageButton"
-import { Avatar, AvatarFallback } from "@/components/ui/avatar"
+import { ZoomableImage } from "@/components/shared/ZoomableImage"
 
 interface ChatMessagesProps {
   /** Raw (filtered) messages — merged here for display. */
@@ -41,32 +51,58 @@ interface ChatMessagesProps {
   currentRound: number
   /** Id the streaming message will keep once persisted (smooth transition). */
   streamingMessageId?: string | null
-  onScrollToBottom?: () => void
+  /** Optional local status shown before the first server event arrives. */
+  streamingPlaceholder?: string
   endRef?: RefObject<HTMLDivElement>
+  /** Older history exists beyond the loaded window — renders the
+   *  "load earlier" affordance at the top of the list. */
+  hasEarlierHistory?: boolean
+  loadingEarlier?: boolean
+  onLoadEarlier?: () => void
+  /**
+   * Fill the composer from a past user message (contentNodes + plain text).
+   * Used for “edit again / resend” after history redraws inline chips.
+   */
+  onReuseUserMessage?: (message: Message) => void
+  /**
+   * In-thread context compaction status (manual or auto). Prefer this over
+   * toast popups so the chat itself shows waiting / done.
+   */
+  contextAction?: {
+    phase: "running" | "done" | "failed"
+    summarizedCount?: number
+  } | null
 }
 
 /** Image gallery for user messages */
 function MessageImages({ images }: { images: ChatImage[] }) {
+  const { t } = useTranslation("chat")
   if (!images || images.length === 0) return null
 
   return (
     <div className={images.length === 1 ? "mb-2" : "mb-2 grid grid-cols-2 gap-2"}>
-      {images.map((img, idx) => (
-        <img
-          key={idx}
-          src={img.data}
-          alt={`Image ${idx + 1}`}
-          className="rounded-lg max-w-full max-h-64 object-cover"
-          loading="lazy"
-        />
-      ))}
+      {images.map((img, idx) => {
+        const src = img.data.startsWith('/api/images/')
+          // Persisted reference form — prepend the server origin (the
+          // webview origin differs from the API in Tauri / Vite dev).
+          ? getServerOrigin() + img.data
+          : img.data
+        return (
+          <ZoomableImage
+            key={idx}
+            src={src}
+            alt={t("chat:image.alt", { index: idx + 1 })}
+            className={images.length === 1 ? "my-0" : "my-0 block w-full"}
+            imgClassName={images.length === 1 ? "max-h-64" : "max-h-48 w-full object-cover"}
+          />
+        )
+      })}
     </div>
   )
 }
 
 export function ChatMessages({
   messages,
-  user,
   isStreaming,
   streamingContent,
   streamingThinking,
@@ -75,13 +111,40 @@ export function ChatMessages({
   roundContents,
   currentRound,
   streamingMessageId,
-  onScrollToBottom,
+  streamingPlaceholder,
   endRef,
+  hasEarlierHistory,
+  loadingEarlier,
+  onLoadEarlier,
+  onReuseUserMessage,
+  contextAction = null,
 }: ChatMessagesProps) {
   const { t } = useTranslation("chat")
-  const getUserInitials = (username: string) => username.slice(0, 2).toUpperCase()
 
-  const displayMessages = useMemo(() => mergeMessagesForDisplay(messages), [messages])
+  // Announce turn boundaries, not every streamed chunk. Screen readers get
+  // "generating" once when a turn starts and "ready" when it ends; the log
+  // itself is not a live region.
+  const [announcement, setAnnouncement] = useState("")
+  const wasStreamingRef = useRef(false)
+  useEffect(() => {
+    if (isStreaming) {
+      setAnnouncement(t("a11y.generating"))
+    } else if (wasStreamingRef.current) {
+      setAnnouncement(t("a11y.answerReady"))
+    }
+    wasStreamingRef.current = isStreaming
+  }, [isStreaming, t])
+
+  const displayMessages = useMemo(() => {
+    const merged = mergeMessagesForDisplay(messages)
+    // While a turn streams (fresh, or restored after switching back), the
+    // history already contains the in-flight turn's fragments (the history
+    // endpoint serves the LIVE agent history). Rendering them alongside the
+    // streaming bubble double-displays the same turn — an extra Thinking
+    // block whose content then "restarts" in the bubble below. The bubble
+    // owns the in-flight display; the completed turn replaces it on end.
+    return isStreaming ? dropInFlightTurn(merged) : merged
+  }, [messages, isStreaming])
 
   // Build display list including the streaming message (same loop = same
   // React key = no flicker between streaming and saved states).
@@ -121,7 +184,39 @@ export function ChatMessages({
   }, [displayMessages, isStreaming, streamingContent, streamingThinking, streamingRoundThinking, streamingToolCalls, roundContents, currentRound, streamingMessageId])
 
   return (
-    <div className="max-w-3xl mx-auto space-y-4 sm:space-y-6">
+    <div
+      role="log"
+      aria-busy={isStreaming}
+      data-testid="messages-container"
+      className="mx-auto w-full min-w-0 max-w-3xl space-y-4 sm:space-y-6 @container"
+    >
+      <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {announcement}
+      </div>
+      {hasEarlierHistory && onLoadEarlier && (
+        <div className="flex justify-center">
+          <button
+            onClick={onLoadEarlier}
+            disabled={loadingEarlier}
+            className={cn(
+              "inline-flex items-center gap-1.5 px-3 py-1 rounded-full",
+              "border border-border bg-card text-muted-foreground",
+              "hover:text-foreground hover:bg-muted-50 transition-colors",
+              "disabled:opacity-60",
+              textMini
+            )}
+          >
+            {loadingEarlier ? (
+              <>
+                <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+                {t("loadEarlierLoading")}
+              </>
+            ) : (
+              t("loadEarlier")
+            )}
+          </button>
+        </div>
+      )}
       {allMessages.map((message, idx) => {
         const isCurrentlyStreaming = !!(message as any)._isStreaming
         // Copy the message as the user sees it: user messages verbatim;
@@ -131,25 +226,48 @@ export function ChatMessages({
           : (message.tool_calls && message.tool_calls.length > 0
               ? cleanToolCallJson(message.content || "")
               : (message.content || ""))
+        // Reply stats stay available in the timestamp tooltip instead of
+        // occupying the action row on every message.
+        const statsTitle = message.role === "assistant" && !isCurrentlyStreaming && message.generationMs != null && message.generationMs > 0
+          ? [
+              formatElapsedMs(message.generationMs),
+              message.content.length > 0
+                ? `${Math.round(message.content.length / (message.generationMs / 1000)).toLocaleString()} ${t("message.charsPerSecond")}`
+                : null,
+            ].filter(Boolean).join(" · ")
+          : undefined
+        const goalStatusDebug = isGoalStatusDebugChromeEnabled()
+        const showGoalStatus =
+          message.role === "assistant" &&
+          !!message.goalStatus &&
+          shouldShowGoalStatusCallout(
+            message.goalStatus,
+            message.endReason,
+            goalStatusDebug,
+          )
         return (
           <div
             key={message.id || `msg-${idx}`}
-            className={`group flex gap-2 sm:gap-3 animate-fade-in-up ${message.role === "user" ? "justify-end" : "justify-start"}`}
+            data-testid={message.role === "assistant" ? "assistant-message" : message.role === "user" ? "user-message" : undefined}
+            className={`group flex min-w-0 gap-2 sm:gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}
           >
-            {message.role === "assistant" && (
-              <div className="flex-shrink-0 w-6 h-6 sm:w-8 sm:h-8 rounded-lg bg-foreground flex items-center justify-center">
-                <Sparkles className={cn(
-                  "h-4 w-4 sm:h-4 sm:w-4 text-background",
-                  isCurrentlyStreaming && "animate-pulse"
-                )} />
-              </div>
-            )}
-
-            <div className={`max-w-[85%] sm:max-w-[80%] ${message.role === "user" ? "order-1" : ""}`}>
+            {/* User bubbles hug their content (right-aligned). Assistant
+                messages span the FULL column: the thinking/tool cards inside
+                size to the widest sibling, so a content-hugging max-width
+                made their width jump (short during early streaming, wide
+                once long text/tables arrive) — a fixed full width keeps the
+                card geometry stable through the whole turn. */}
+            <div
+              className={
+                message.role === "user"
+                  ? "order-1 min-w-0 max-w-[88%] sm:max-w-[76%]"
+                  : "w-full min-w-0"
+              }
+            >
               <div
                 className={cn(
                   message.role === "user"
-                    ? "rounded-lg px-3 py-2 sm:px-4 sm:py-3 bg-[var(--msg-user-bg)] text-[var(--msg-user-text)]"
+                    ? "rounded-xl bg-chat-user-bg px-3 py-2 text-chat-user-text max-md:rounded-[1.25rem] max-md:bg-muted max-md:px-4 max-md:py-3 max-md:text-foreground sm:px-4 sm:py-3"
                     : ""
                 )}
               >
@@ -158,9 +276,12 @@ export function ChatMessages({
                   {message.role === "user" && message.images && message.images.length > 0 && (
                     <MessageImages images={message.images} />
                   )}
-                  {/* User messages: just content */}
-                  {message.role === "user" && message.content && (
-                    <MarkdownMessage content={message.content} variant="user" />
+                  {/* User: contentNodes → inline chips; else markdown */}
+                  {message.role === "user" && (message.content || contentNodesHaveReferences(message.contentNodes)) && (
+                    <UserMessageContent
+                      content={message.content || ""}
+                      contentNodes={message.contentNodes}
+                    />
                   )}
                   {/* Assistant messages: tool process + final content */}
                   {message.role === "assistant" && (() => {
@@ -174,10 +295,11 @@ export function ChatMessages({
                         )
                       : undefined
 
-                    // Three-layer design:
-                    // 1. Thinking (top) - with per-round differentiation
-                    // 2. Task Process (middle) - tool calls + round content
-                    // 3. Final Answer (bottom) - markdown content
+                    // Round-based process: each round owns its thinking, tools,
+                    // and intermediate output. The final answer is rendered
+                    // separately below the timeline.
+                    // 1. Process timeline (rounds of thinking / tools / output)
+                    // 2. Final answer (bottom) - markdown content
 
                     // Determine thinking to show
                     const hasRoundThinking = message.round_thinking && Object.keys(message.round_thinking).length > 0
@@ -209,26 +331,22 @@ export function ChatMessages({
                     if (hasTools) {
                       return (
                         <>
-                          {showThinking && (
-                            <ThinkingBlock
-                              thinking={!hasRoundThinking ? message.thinking : undefined}
-                              roundThinking={filteredRoundThinking}
-                              isStreaming={isCurrentlyStreaming}
-                              defaultExpanded={false}
-                            />
-                          )}
-                          <ToolProcessBlock
+                          <TurnTimeline
                             toolCalls={message.tool_calls!}
+                            roundThinking={filteredRoundThinking}
                             roundContents={cleanedRoundContents}
+                            thinking={!hasRoundThinking && !thinkingDupesContent ? message.thinking : undefined}
                             isStreaming={isCurrentlyStreaming}
+                            currentRound={currentRound}
+                            finalContent={displayContent}
                           />
                           {displayContent ? (
-                            <MarkdownMessage content={displayContent} variant="assistant" className="px-3" />
+                            <MarkdownMessage content={displayContent} variant="assistant" isStreaming={isCurrentlyStreaming} />
                           ) : isCurrentlyStreaming ? (
-                            <div className="flex items-center gap-1 px-3 py-1">
-                              <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '0ms' }} />
-                              <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '150ms' }} />
-                              <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '300ms' }} />
+                            <div className="flex items-center gap-1 py-1">
+                              <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 motion-safe:animate-pulse" style={{ animationDelay: '0ms' }} />
+                              <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 motion-safe:animate-pulse" style={{ animationDelay: '150ms' }} />
+                              <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 motion-safe:animate-pulse" style={{ animationDelay: '300ms' }} />
                             </div>
                           ) : null}
                         </>
@@ -246,65 +364,252 @@ export function ChatMessages({
                           />
                         )}
                         {displayContent ? (
-                          <MarkdownMessage content={displayContent} variant="assistant" className="px-3" />
+                          <MarkdownMessage content={displayContent} variant="assistant" isStreaming={isCurrentlyStreaming} />
                         ) : isCurrentlyStreaming ? (
-                          <div className="flex items-center gap-1 px-3 py-1">
-                            <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '0ms' }} />
-                            <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '150ms' }} />
-                            <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground opacity-40 animate-bounce" style={{ animationDelay: '300ms' }} />
+                          <div className="flex items-center gap-2 py-1 text-xs text-muted-foreground">
+                            <span className="flex items-center gap-1">
+                              <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground opacity-40 motion-safe:animate-pulse" style={{ animationDelay: '0ms' }} />
+                              <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground opacity-40 motion-safe:animate-pulse" style={{ animationDelay: '150ms' }} />
+                              <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground opacity-40 motion-safe:animate-pulse" style={{ animationDelay: '300ms' }} />
+                            </span>
+                            {streamingPlaceholder && <span>{streamingPlaceholder}</span>}
                           </div>
                         ) : null}
                       </>
                     )
                   })()}
+                  {/* Runtime guard notes (incomplete action, guard budget
+                      spent): system callouts, clearly not model speech —
+                      single-language, styled apart from the content. */}
+                  {message.role === 'assistant' && message.systemNotes && message.systemNotes.length > 0 && (
+                    <div className="mt-2 flex flex-col gap-1.5">
+                      {message.systemNotes.map((note, i) => (
+                        <div
+                          key={i}
+                          className="flex items-start gap-2 rounded-lg border border-dashed border-border bg-muted-20 px-3 py-2 text-xs leading-relaxed text-muted-foreground"
+                        >
+                          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                          <span>{note}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* System-judged goal status from End — display only; never
+                      rewrites model text. Default not_applicable + "ended
+                      normally" is debug chrome and stays hidden for users. */}
+                  {showGoalStatus && message.goalStatus && (
+                    <GoalStatusCallout
+                      status={message.goalStatus}
+                      endReason={message.endReason}
+                      showDebugChrome={goalStatusDebug}
+                    />
+                  )}
                 </div>
               </div>
 
-              <div className="flex items-center gap-2.5 mt-1.5 px-3">
-                <p className="text-xs text-muted-foreground">
+              <div className="mt-1.5 flex items-center gap-2 max-md:hidden">
+                <time
+                  title={statsTitle}
+                  className="text-xs text-muted-foreground tabular-nums max-md:hidden"
+                >
                   {formatTimestamp(message.timestamp, false)}
-                </p>
-                {message.role === 'assistant' && !isCurrentlyStreaming && message.generationMs != null && message.generationMs > 0 && (
-                  <>
-                    <span className="text-xs text-muted-foreground/80 tabular-nums">
-                      {(message.generationMs / 1000).toFixed(1)}s
-                    </span>
-                    <span className="text-xs text-muted-foreground/80 tabular-nums">
-                      {Math.round(message.content.length / (message.generationMs / 1000))} chars/s
-                    </span>
-                  </>
-                )}
+                </time>
                 {!isCurrentlyStreaming && (
-                  <CopyMessageButton content={copyContent} />
-                )}
-                {/* Always-visible scroll-to-bottom, next to the copy
-                    button on assistant replies */}
-                {message.role === "assistant" && !isCurrentlyStreaming && onScrollToBottom && (
-                  <button
-                    type="button"
-                    onClick={onScrollToBottom}
-                    className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                    aria-label={t("scrollToBottom", "回到底部")}
-                    title={t("scrollToBottom", "回到底部")}
+                  <div
+                    className={cn(
+                      "flex items-center gap-0.5 transition-opacity duration-fast",
+                      "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 max-md:opacity-100",
+                      "pointer-events-none group-hover:pointer-events-auto group-focus-within:pointer-events-auto max-md:pointer-events-auto"
+                    )}
                   >
-                    <ChevronDown className="h-3.5 w-3.5" />
-                  </button>
+                    {message.role === "user" && onReuseUserMessage && (
+                      <button
+                        type="button"
+                        onClick={() => onReuseUserMessage(message)}
+                        className={cn(
+                          "inline-flex h-8 w-8 sm:h-7 sm:w-7 items-center justify-center rounded text-muted-foreground transition-colors",
+                          "hover:bg-muted hover:text-foreground",
+                          "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                        )}
+                        aria-label={t("mention.reuseInComposer", "填回输入框")}
+                        title={t("mention.reuseInComposer", "填回输入框")}
+                      >
+                        <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                    )}
+                    <CopyMessageButton content={copyContent} />
+                  </div>
                 )}
               </div>
             </div>
 
-            {message.role === "user" && user && (
-              <Avatar className="h-6 w-6 sm:h-8 sm:w-8 order-2">
-                <AvatarFallback className={cn("bg-muted text-muted-foreground", textNano, "sm:text-xs")}>
-                  {getUserInitials(user.username)}
-                </AvatarFallback>
-              </Avatar>
-            )}
           </div>
         )
       })}
 
+      {contextAction && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-context-action={contextAction.phase}
+          className={cn(
+            "mx-auto flex max-w-md items-center justify-center gap-2 rounded-full border px-3 py-1.5 text-xs",
+            contextAction.phase === "failed"
+              ? "border-error bg-error-light text-error"
+              : "border-border bg-card text-muted-foreground",
+          )}
+        >
+          {contextAction.phase === "running" && (
+            <>
+              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+              <span>{t("context.compacting", "Compacting…")}</span>
+            </>
+          )}
+          {contextAction.phase === "done" && (
+            <span>
+              {typeof contextAction.summarizedCount === "number" && contextAction.summarizedCount > 0
+                ? t("context.compactDone", { count: contextAction.summarizedCount })
+                : t("context.compactNothing")}
+            </span>
+          )}
+          {contextAction.phase === "failed" && (
+            <span>{t("context.compactFailed")}</span>
+          )}
+        </div>
+      )}
+
       <div ref={endRef} />
+    </div>
+  )
+}
+
+const LEVEL_KEYS: Record<GoalEvidenceLevel, string> = {
+  none: "chat:goalStatus.level.none",
+  config_success: "chat:goalStatus.level.config_success",
+  command_dispatched: "chat:goalStatus.level.command_dispatched",
+  device_acknowledged: "chat:goalStatus.level.device_acknowledged",
+  physical_effect_verified: "chat:goalStatus.level.physical_effect_verified",
+}
+
+const END_REASON_KEYS: Record<StreamEndReason, string> = {
+  normal: "chat:goalStatus.endReason.normal",
+  interrupted: "chat:goalStatus.endReason.interrupted",
+  timeout: "chat:goalStatus.endReason.timeout",
+  error: "chat:goalStatus.endReason.error",
+  cancelled: "chat:goalStatus.endReason.cancelled",
+  cannot_continue: "chat:goalStatus.endReason.cannot_continue",
+}
+
+/** Default End payload on ordinary turns — not operator-facing chrome. */
+export function isDefaultGoalStatusNoise(
+  status: SystemGoalStatus,
+  endReason?: StreamEndReason,
+): boolean {
+  const noiseStatus = status.status === "not_applicable"
+  const noiseReason = !endReason || endReason === "normal"
+  return noiseStatus && noiseReason
+}
+
+/**
+ * Hide the default "no constrained goal" / "ended normally" footer for users.
+ * Meaningful goal outcomes and abnormal end reasons stay visible. Optional
+ * `showDebugChrome` restores the default payload for harness debug.
+ */
+export function shouldShowGoalStatusCallout(
+  status: SystemGoalStatus,
+  endReason?: StreamEndReason,
+  showDebugChrome = false,
+): boolean {
+  if (!isDefaultGoalStatusNoise(status, endReason)) return true
+  return showDebugChrome
+}
+
+/** Opt-in only: `localStorage.heramind.debug.goalStatus = "1"`. */
+export function isGoalStatusDebugChromeEnabled(): boolean {
+  if (typeof window === "undefined") return false
+  try {
+    return window.localStorage.getItem("heramind.debug.goalStatus") === "1"
+  } catch {
+    return false
+  }
+}
+
+/** Display-only system goal status; never rewrites assistant content. */
+function GoalStatusCallout({
+  status,
+  endReason,
+  showDebugChrome,
+}: {
+  status: SystemGoalStatus
+  endReason?: StreamEndReason
+  showDebugChrome: boolean
+}) {
+  const { t } = useTranslation("chat")
+  let body: string | null = null
+  // Tone: not_applicable / incomplete stay muted — never success styling.
+  let tone: "muted" | "warn" | "ok" = "muted"
+  switch (status.status) {
+    case "not_applicable":
+      // Default N/A line is debug chrome; abnormal endReason still shows.
+      body = showDebugChrome ? t("chat:goalStatus.notApplicable") : null
+      tone = "muted"
+      break
+    case "incomplete":
+      body = t("chat:goalStatus.incomplete", {
+        level: t(LEVEL_KEYS[status.level]),
+        reason: status.reason,
+      })
+      tone = "warn"
+      break
+    case "complete_eligible":
+      body = t("chat:goalStatus.completeEligible", {
+        level: t(LEVEL_KEYS[status.level]),
+        physical: status.physical_ok
+          ? t("chat:goalStatus.completeEligiblePhysical")
+          : t("chat:goalStatus.completeEligibleNoPhysical"),
+      })
+      tone = status.physical_ok ? "ok" : "muted"
+      break
+    case "completed":
+      body = t("chat:goalStatus.completed", { id: status.evidence_id })
+      tone = "ok"
+      break
+    case "halted":
+      body = t("chat:goalStatus.halted", { reason: status.reason })
+      tone = "warn"
+      break
+    case "cancelled":
+      body = t("chat:goalStatus.cancelled")
+      tone = "muted"
+      break
+    default:
+      body = t("chat:goalStatus.label")
+  }
+  // "ended normally" is default turn chrome — only abnormal ends for users.
+  const showReasonLine =
+    !!endReason && (endReason !== "normal" || showDebugChrome)
+  const reasonLine = showReasonLine && endReason ? t(END_REASON_KEYS[endReason]) : null
+  if (!body && !reasonLine) return null
+  return (
+    <div
+      className={cn(
+        "mt-2 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs leading-relaxed",
+        tone === "ok" && "border-success-light bg-success-light text-foreground",
+        tone === "warn" && "border-warning-light bg-warning-light text-foreground",
+        tone === "muted" && "border-dashed border-border bg-muted-20 text-muted-foreground",
+      )}
+      role="status"
+      aria-label={t("chat:goalStatus.label")}
+      data-goal-status={status.status}
+      data-end-reason={endReason || undefined}
+    >
+      <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      <div className="flex flex-col gap-0.5">
+        {body && <span>{body}</span>}
+        {reasonLine && (
+          <span className="text-muted-foreground opacity-80">{reasonLine}</span>
+        )}
+      </div>
     </div>
   )
 }

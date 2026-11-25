@@ -148,6 +148,8 @@
   "defaultRetentionDesc": "Retention period for numeric metrics (temperature, humidity, etc.)",
   "imageRetention": "Image Retention",
   "imageRetentionDesc": "Retention period for image and binary data from camera devices",
+  "sessionRetention": "Session Retention",
+  "sessionRetentionDesc": "Retention period for chat sessions; expired sessions (with history) are pruned periodically — leave unset to keep forever",
   "retentionNever": "Never expire",
   "retention12h": "12 hours",
   "retention1d": "1 day",
@@ -332,7 +334,13 @@
     "copyLink": "Copy Link",
     "linkCopied": "Link copied",
     "copyFailed": "Failed to copy",
-    "deepLinkUnavailable": "Deep link is unavailable until the bot is identified.",
+    "copyCommand": "Copy Command",
+    "commandCopied": "Command copied",
+    "copyToken": "Copy Token",
+    "tokenCopied": "Token copied",
+    "manualBindHint": "Deep link is unavailable until the bot is identified. Send the bot the following command to bind this chat:",
+    "howToGet": "How do I get these values? → Setup guide",
+    "howToPair": "How to pair a chat with an invite → Guide",
     "noInvites": "No invites",
     "noInvitesDesc": "Generate an invite to bind a chat.",
     "token": "Token",
@@ -378,6 +386,9 @@
   "chatHistoryDepthDesc": "Recent conversation turns sent to the model in chat (scheduled agents use their own setting)",
   "chatTurnTimeout": "Chat Turn Time Budget",
   "chatTurnTimeoutDesc": "Total wall-clock budget for one chat turn's multi-step tool loop; exceeding it forces a final summary (default 30 min; raise it for long tasks)",
+  "summaryInstance": "Compaction model",
+  "summaryInstanceDesc": "LLM instance used to summarize conversation history when context fills up. \"Session model\" uses each conversation’s own model; pointing this at a smaller, faster instance keeps compaction from competing with the main model.",
+  "summaryInstanceSessionDefault": "Session model (default)",
   "lan": {
     "title": "Allow LAN devices to connect",
     "description": "When on, devices on the same network can reach this machine by its IP (MQTT device ingest and web access). Default on; turn it off to listen on loopback only when you are on an untrusted network.",
@@ -385,5 +396,13 @@
     "restartNow": "Restart now",
     "compatNotice": "LAN access was kept ON for compatibility (your devices connected to this machine before the update). Turn it off here if you don't need it.",
     "dismiss": "Got it"
-  }
+  },
+  "processUsage": "HeraMind resource usage",
+  "dataDirUsage": "Data directory",
+  "residentMemory": "Resident memory",
+  "ofTotalMemory": "of total",
+  "processCpu": "Process CPU",
+  "ofOneCore": "of one core",
+  "threads": "Threads",
+  "processUptime": "Process uptime"
 }

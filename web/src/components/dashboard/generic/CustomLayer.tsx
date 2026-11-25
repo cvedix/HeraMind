@@ -26,11 +26,11 @@ import {
   Unlock,
   Eye,
   EyeOff,
-  GripVertical,
+
   Maximize2,
   Minimize2,
-  Image as ImageIcon,
-  Square,
+  Image as
+
   MapPin,
   Activity,
   Zap,
@@ -728,7 +728,7 @@ function getBackgroundStyle(
   return backgroundStyle
 }
 
-function LayerBackground({ type, color, image, gridSize = 20 }: LayerBackgroundProps) {
+function _LayerBackground({ type, color, image, gridSize = 20 }: LayerBackgroundProps) {
   const backgroundStyle = getBackgroundStyle(type, color, image, gridSize)
   return (
     <div
@@ -798,7 +798,7 @@ export function CustomLayer({
   backgroundImage,
   gridSize = 20,
   size = 'md',
-  interactive = true,
+  interactive: _interactive = true,
   showControls = true,
   editable = false,
   showFullscreen = true,
@@ -806,7 +806,7 @@ export function CustomLayer({
   aspectRatio,
   onItemsChange,
   onBindingsChange,
-  onLayerClick,
+  onLayerClick: _onLayerClick,
   className,
   title,
 }: CustomLayerProps & { title?: string }) {
@@ -1221,7 +1221,7 @@ export function CustomLayer({
             <Button
               variant="ghost"
               size="icon"
-              className="h-6 w-6"
+              className="h-6 w-6 sm:h-6 sm:w-6"
               onClick={handleZoomOut}
               title={t('customLayer.zoomOut')}
             >
@@ -1231,7 +1231,7 @@ export function CustomLayer({
             <Button
               variant="ghost"
               size="icon"
-              className="h-6 w-6"
+              className="h-6 w-6 sm:h-6 sm:w-6"
               onClick={handleZoomIn}
               title={t('customLayer.zoomIn')}
             >
@@ -1241,7 +1241,7 @@ export function CustomLayer({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-6 w-6"
+                className="h-6 w-6 sm:h-6 sm:w-6"
                 onClick={handleResetZoom}
                 title={t('customLayer.reset')}
               >
@@ -1253,7 +1253,7 @@ export function CustomLayer({
               <Button
                 variant="ghost"
                 size="icon"
-                className={cn('h-6 w-6', isEditing && 'bg-accent')}
+                className={cn('h-6 w-6', isEditing && 'bg-accent', "sm:h-6 sm:w-6")}
                 onClick={() => setIsEditing(!isEditing)}
               >
                 <Settings className="h-4 w-4" />
@@ -1263,7 +1263,7 @@ export function CustomLayer({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-6 w-6"
+                className="h-6 w-6 sm:h-6 sm:w-6"
                 onClick={handleAddItem}
               >
                 <Plus className="h-4 w-4" />
@@ -1273,7 +1273,7 @@ export function CustomLayer({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-6 w-6"
+                className="h-6 w-6 sm:h-6 sm:w-6"
                 onClick={() => setIsFullscreen(!isFullscreen)}
               >
                 {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
@@ -1356,7 +1356,7 @@ export function CustomLayer({
           <Button
             variant="ghost"
             size="icon"
-            className="h-8 w-8"
+            className="h-8 w-8 sm:h-8 sm:w-8"
             onClick={handleZoomOut}
             title={t('customLayer.zoomOut')}
           >
@@ -1366,7 +1366,7 @@ export function CustomLayer({
           <Button
             variant="ghost"
             size="icon"
-            className="h-8 w-8"
+            className="h-8 w-8 sm:h-8 sm:w-8"
             onClick={handleZoomIn}
             title={t('customLayer.zoomIn')}
           >
@@ -1376,7 +1376,7 @@ export function CustomLayer({
             <Button
               variant="ghost"
               size="icon"
-              className="h-8 w-8"
+              className="h-8 w-8 sm:h-8 sm:w-8"
               onClick={handleResetZoom}
               title={t('customLayer.reset')}
             >
@@ -1387,7 +1387,7 @@ export function CustomLayer({
           <Button
             variant="ghost"
             size="icon"
-            className="h-8 w-8"
+            className="h-8 w-8 sm:h-8 sm:w-8"
             onClick={() => setIsFullscreen(false)}
             title={t('customLayer.exitFullscreen')}
           >

@@ -244,7 +244,7 @@ fn test_agent_config_bounds() {
     // Context selector tokens should be less than max context
     assert!(agent::DEFAULT_CONTEXT_SELECTOR_TOKENS <= agent::DEFAULT_MAX_CONTEXT_TOKENS);
 }
-
+#[serial_test::serial]
 #[test]
 fn test_agent_env_var_parsing() {
     // Test that env var parsing functions don't panic on invalid input
@@ -285,7 +285,7 @@ fn test_agent_env_var_parsing() {
         },
     }
 }
-
+#[serial_test::serial]
 #[test]
 fn test_agent_env_var_valid_values() {
     // Test that valid env var values are parsed correctly
@@ -320,7 +320,7 @@ fn test_agent_env_var_valid_values() {
         },
     }
 }
-
+#[serial_test::serial]
 #[test]
 fn test_concurrent_limit_env_var() {
     let orig = std::env::var(agent_env_vars::CONCURRENT_LIMIT);
@@ -340,7 +340,7 @@ fn test_concurrent_limit_env_var() {
         },
     }
 }
-
+#[serial_test::serial]
 #[test]
 fn test_context_selector_tokens_env_var() {
     let orig = std::env::var(agent_env_vars::CONTEXT_SELECTOR_TOKENS);
@@ -360,7 +360,7 @@ fn test_context_selector_tokens_env_var() {
         },
     }
 }
-
+#[serial_test::serial]
 #[test]
 fn test_llm_timeout_env_vars() {
     let orig = std::env::var(agent_env_vars::LLM_TIMEOUT_SECS);
@@ -382,7 +382,7 @@ fn test_llm_timeout_env_vars() {
         },
     }
 }
-
+#[serial_test::serial]
 #[test]
 fn test_llm_timeout_defaults() {
     // Clear env var to test defaults

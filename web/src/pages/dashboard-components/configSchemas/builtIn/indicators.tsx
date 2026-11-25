@@ -3,7 +3,6 @@ import { chartColorsHex } from '@/design-system/tokens/color'
 import { Field } from '@/components/ui/field'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
 import {
   Select,
   SelectContent,
@@ -18,8 +17,7 @@ import { EntityIconPicker } from '@/components/ui/entity-icon-picker'
 import { DataMappingConfig } from '@/components/dashboard/config/UIConfigSections'
 import { LEDStateRulesConfig } from '@/components/dashboard/config/LEDStateRulesConfig'
 import type { StateRule } from '@/components/dashboard/generic/LEDIndicator'
-import type { SingleValueMappingConfig, TimeSeriesMappingConfig, CategoricalMappingConfig } from '@/lib/dataMapping'
-import { DualModeSourceField } from '@/components/dashboard/config'
+import type { SingleValueMappingConfig } from '@/lib/dataMapping'
 import type { ComponentConfigSchema } from '@/components/dashboard/config/ComponentConfigBuilder'
 import { SelectField } from '../../ConfigFieldComponents'
 import type { SchemaContext, Updaters } from '../types'
@@ -145,7 +143,7 @@ export function getValueCardSchema(config: any, ctx: SchemaContext, u: Updaters)
               props: {
                 dataSource: config.dataSource,
                 onChange: updateDataSource,
-                allowedTypes: ['device-metric', 'system', 'extension', 'transform'],
+                allowedTypes: ['device-metric', 'system', 'extension', 'transform', 'ai'],
               },
             },
           ],
@@ -275,7 +273,7 @@ export function getSparklineSchema(config: any, ctx: SchemaContext, u: Updaters)
               props: {
                 dataSource: config.dataSource,
                 onChange: updateDataSource,
-                allowedTypes: ['device-metric', 'system', 'extension', 'transform'],
+                allowedTypes: ['device-metric', 'system', 'extension', 'transform', 'ai'],
               },
             },
           ],
@@ -426,7 +424,7 @@ export function getProgressBarSchema(config: any, ctx: SchemaContext, u: Updater
               props: {
                 dataSource: config.dataSource,
                 onChange: updateDataSource,
-                allowedTypes: ['device-metric', 'system', 'extension', 'transform'],
+                allowedTypes: ['device-metric', 'system', 'extension', 'transform', 'ai'],
               },
             },
           ],
@@ -537,7 +535,7 @@ export function getLEDIndicatorSchema(config: any, ctx: SchemaContext, u: Update
               props: {
                 dataSource: config.dataSource,
                 onChange: updateDataSource,
-                allowedTypes: ['device-metric', 'system', 'extension', 'transform'],
+                allowedTypes: ['device-metric', 'system', 'extension', 'transform', 'ai'],
               },
             },
           ],

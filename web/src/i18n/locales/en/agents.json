@@ -1,7 +1,6 @@
 {
   "title": "AI Agents",
   "description": "Create and manage AI agents — memory, skills, and tools",
-  "createButton": "Create",
   "detailTitle": "Agent Details",
   "preview": {
     "title": "Logic Preview",
@@ -30,18 +29,13 @@
     },
     "actions": {
       "title": "Available Actions",
-      "noCommands": "No commands selected",
-      "canAlert": "Can send alerts/notifications"
+      "noCommands": "No commands selected"
     },
     "issues": {
       "title": "Configuration Check",
       "none": "Configuration looks good",
-      "noName": "Please enter an agent name",
-      "noPrompt": "Please describe what the agent should do",
       "noResources": "No resources selected - add devices or extensions",
-      "noMetrics": "No metrics selected - agent won't have data to analyze",
-      "unclearIntent": "Intent unclear - consider being more specific",
-      "controlNoCommands": "Control intent detected but no commands selected"
+      "noMetrics": "No metrics selected - agent won't have data to analyze"
     },
     "confidence": "confidence",
     "intent": {
@@ -50,7 +44,6 @@
       "analysis": "Analysis",
       "unknown": "General"
     },
-    "moreCommands": "more commands",
     "noResources": "No resources - click \"Add Resources\" to get started"
   },
   "card": {
@@ -61,7 +54,18 @@
     "avgDuration": "Avg Duration",
     "neverExecuted": "Never executed",
     "toggleStatus": "Toggle {{name}} status",
-    "moreOptions": "More options"
+    "moreOptions": "More options",
+    "role": {
+      "recordData": "Records data",
+      "actOrInvestigate": "Acts & investigates",
+      "answer": "Answers"
+    },
+    "memory": {
+      "tool": "Stateless tool",
+      "assistant": "Has memory"
+    },
+    "errorUnknown": "Execution failed — open details for the log",
+    "runsSuffix": " runs"
   },
   "confirm": {
     "pauseTitle": "Confirm pause agent?",
@@ -91,11 +95,8 @@
     "moreResources": "{{count}} more resources...",
     "noMemory": "No memory data",
     "messages": "Messages",
-    "noDataAvailable": "No data",
     "tools": "Tools",
-    "toolsCount": "{{count}} tools available",
     "toolsEmpty": "No tools registered",
-    "toolsLoadError": "Failed to load tools",
     "toolsSourceBuiltIn": "Built-in",
     "toolsSourceExtension": "Extension",
     "toolsParameters": "Parameters",
@@ -117,7 +118,27 @@
     "toolsColumnVersion": "Version",
     "toolsColumnNamespace": "Namespace",
     "toolsParamRequired": "required",
-    "toolsFilterAllSources": "All sources"
+    "toolsFilterAllSources": "All sources",
+    "outputFields": "Output fields",
+    "viewEvidence": "See what it read",
+    "outputFieldsHint": "Each field is a platform data source (ai:{agent}:{field}) — bind it on dashboards, rules and data-push.",
+    "fieldType": {
+      "number": "number",
+      "text": "text",
+      "boolean": "boolean"
+    },
+    "memoryModeNote": {
+      "tool": "Stateless tool — every run sees only the current input (your corrected standards still apply).",
+      "assistant": "Has memory — each run carries the narrative of recent executions; it can say “worse than last time”."
+    },
+    "sections": "Sections",
+    "sectionsDesc": {
+      "overview": "Status, output fields & config",
+      "history": "Every run, step by step",
+      "memory": "Journal & knowledge files",
+      "messages": "Notes for the next run"
+    },
+    "model": "Model"
   },
   "tabs": {
     "agents": "Agents",
@@ -128,7 +149,6 @@
   },
   "agentName": "Agent Name",
   "userPrompt": "User Prompt",
-  "statusColumn": "Status",
   "executions": "Executions",
   "lastExecution": "Last Execution",
   "timestamp": "Timestamp",
@@ -138,23 +158,15 @@
   "noAgents": "No AI agents",
   "noAgentsDesc": "Create your first AI agent to automate your IoT tasks",
   "noExecutions": "No executions yet",
-  "noExecutionsDesc": "Execution history will appear here once the agent runs",
   "createAgent": "Create AI Agent",
-  "createAgentDesc": "Define a new AI agent with natural language",
   "editAgent": "Edit AI Agent",
-  "editAgentDesc": "Modify agent configuration",
   "deleteConfirm": "Are you sure you want to delete this agent?",
   "execute": "Execute Now",
-  "viewMemory": "View Memory",
   "viewDetails": "View Details",
-  "viewExecutions": "View Executions",
   "agentDeleted": "Agent deleted successfully",
   "agentCreated": "Agent created successfully",
   "agentUpdated": "Agent updated successfully",
   "executionStarted": "Execution started: {{id}}",
-  "agentNamePlaceholder": "e.g., Temperature Monitor",
-  "userPromptPlaceholder": "Describe what this agent should do...",
-  "userPromptHint": "Use natural language to describe the automation task. For example: 'Monitor the temperature sensor every 5 minutes and send an alert if it exceeds 30°C for 3 consecutive readings.'",
   "schedule": "Schedule",
   "scheduleTypes": {
     "interval": "Interval",
@@ -163,9 +175,7 @@
     "once": "Run Once"
   },
   "intervalSeconds": "Interval (seconds)",
-  "intervalHint": "Agent will run every {{seconds}} seconds",
   "cronExpression": "Cron Expression",
-  "cronHint": "Format: minute hour day month weekday. Example: 0 * * * * for every hour",
   "timezone": "Timezone",
   "resources": "Resources",
   "noDevices": "No devices available. Add devices first.",
@@ -197,12 +207,40 @@
     "analysis": "Analysis",
     "inputData": "Input Data",
     "inputImage": "Input Image",
-    "dataFieldsCount": "{{count}} data fields",
     "reasoningSteps": "Reasoning Steps",
     "decisions": "Decisions",
     "conclusionLabel": "Conclusion:",
     "actionsExecuted": "Actions Executed",
     "moreFields": "{{count}} more fields"
+  },
+  "evidence": {
+    "title": "Execution evidence",
+    "tokens": "{{count}} tokens",
+    "inputs": "Inputs",
+    "inputsUnknown": "Input evidence unknown",
+    "inputsEmpty": "No inputs recorded",
+    "output": "Output",
+    "outputUnknown": "Output evidence unknown",
+    "outputEmpty": "No output recorded",
+    "actions": "Action results",
+    "actionsUnknown": "Action evidence unknown",
+    "actionsEmpty": "No actions recorded",
+    "resultUnknown": "Result unknown",
+    "timeUnknown": "Time unknown",
+    "unknownDetail": "Failure detail unknown",
+    "stopReason": "Stop reason",
+    "presence": {
+      "known": "Known",
+      "empty": "Empty",
+      "unknown": "Unknown"
+    },
+    "failure": {
+      "none": "No failure node",
+      "error": "Failed — execution error",
+      "failed_action": "Failed — action error",
+      "stop_reason": "Failed — stop reason",
+      "unknown": "Failure node unknown"
+    }
   },
   "thinking": {
     "executing": "Executing...",
@@ -216,15 +254,10 @@
   "memory": {
     "title": "Agent Memory",
     "description": "Persistent memory and learning state of the agent",
-    "stateVariables": "State Variables",
     "baselines": "Historical Baselines",
-    "learnedPatterns": "Learned Patterns",
-    "trendData": "Trend Data",
-    "trendDataHint": "{{count}} data points collected from device metrics",
     "updatedAt": "Updated",
     "noMemory": "No memory data available",
     "clear": "Clear Memory",
-    "clearMemoryConfirm": "Are you sure you want to clear this agent's memory? This action cannot be undone.",
     "executions": "Executions",
     "knowledgeFiles": "Knowledge Files",
     "journal": "Execution Journal",
@@ -259,7 +292,6 @@
     "target": "Target",
     "channel": "Channel",
     "recipient": "Recipient",
-    "lastArchived": "Last archived",
     "inputData": "Input Data",
     "llmResponse": "Llm Response",
     "showLess": "Show Less",
@@ -283,71 +315,26 @@
     "basicInfo": {
       "name": "Name",
       "namePlaceholder": "e.g., Warehouse Temperature Monitor, Equipment Anomaly Analysis",
-      "description": "Description",
-      "descriptionHint": "Brief description of this agent's purpose (optional)",
-      "descriptionPlaceholder": "e.g., Monitor warehouse environment, Analyze equipment energy trends",
       "requirement": "Requirements",
-      "requirementHint": "Describe the goals you want the agent to accomplish in natural language",
-      "requirementPlaceholder": "e.g.:\n• Send alert when temperature exceeds 30°C\n• Generate device status report at 9 AM daily\n• Detect abnormal energy consumption and analyze causes",
-      "autoParseHint": "The system will automatically parse your description and configure the execution logic",
       "llmBackend": "LLM Model (Optional)",
-      "llmBackendHint": "Select the LLM model for this agent. Uses the default model if not specified.",
       "selectLlmBackend": "Select LLM Model",
-      "defaultBackend": "Default Model",
       "useActiveBackend": "Use Global Default",
       "active": "Active",
       "supportsVision": "Supports vision/image input",
       "supportsTools": "Supports function calling",
       "supportsThinking": "Supports thinking/reasoning",
-      "scheduleLabel": "Execution Schedule",
       "promptPlaceholder": "Describe what this agent should do in natural language. For example:\n\n• Monitor temperature sensors in the warehouse\n• Send an alert when temperature exceeds 30°C for 3 consecutive readings\n• Notify all alert channels: email, SMS, and push notifications",
       "promptTip": "Be specific about devices, conditions, and actions. The more details you provide, the better the agent can help you.",
       "runOn": "Run on",
-      "triggerWhen": "Trigger when",
-      "metricUpdates": "Metric updates",
-      "extensionOutput": "Extension output",
-      "manualTrigger": "Manual trigger",
-      "fromDevice": "From device",
-      "fromExtension": "From extension",
-      "fromAiGroup": "AI group name",
-      "manualHint": "The agent will only run when manually triggered via API or UI"
-    },
-    "promptTemplates": {
-      "label": "Template",
-      "empty": {
-        "label": "Custom",
-        "description": "Blank, write your own prompt"
-      },
-      "monitor": {
-        "label": "Monitor",
-        "description": "Continuously monitor data changes, detect anomalies, and send alerts",
-        "template": "Monitor the following metrics and alert when anomalies are detected:\n\nMonitoring Targets:\n- Data Range: Check if values exceed thresholds (e.g., temperature > 30°C)\n- Anomaly Detection: Look for sudden changes or abnormal patterns\n- Alert Method: Send notification when conditions are met\n\nPlease analyze the current data and compare with historical baselines to identify:\n1. Values outside normal range\n2. Sudden spikes or drops\n3. Data gaps or missing readings\n\nWhen an anomaly is detected, send an alert with:\n- What metric is affected\n- Current value vs expected range\n- Severity level (info/warning/critical)"
-      },
-      "control": {
-        "label": "Control",
-        "description": "Automatically execute device control operations based on conditions",
-        "template": "Automatically control devices based on the following conditions:\n\nTrigger Conditions:\n- Check current sensor readings\n- Compare against threshold values\n- Verify device states before taking action\n\nControl Actions:\n- Device ID: [target device]\n- Command: [turn_on / turn_off / adjust]\n- Parameters: [any required settings]\n\nPlease:\n1. First verify the current condition by checking sensor data\n2. Only execute commands when the condition is clearly met\n3. Confirm the action was successful\n4. Avoid rapid repeated switching (add a cooldown between same actions)"
-      },
-      "analysis": {
-        "label": "Analysis",
-        "description": "Periodically analyze data trends and generate reports",
-        "template": "Analyze the following data and generate a comprehensive report:\n\nAnalysis Scope:\n- Time Range: Use available historical data\n- Metrics: All selected metrics\n- Comparison: Compare with previous periods if available\n\nReport Contents:\n1. **Data Overview**: Summary of current values and status\n2. **Trend Analysis**: Increasing, decreasing, or stable patterns\n3. **Anomalies**: Any unusual readings or deviations\n4. **Correlations**: Relationships between different metrics\n5. **Recommendations**: Actionable insights based on the data\n\nPlease provide specific numbers and percentages when describing trends and changes."
-      },
-      "alert": {
-        "label": "Alert",
-        "description": "Send notifications based on conditions",
-        "template": "Monitor the selected metrics and send alerts when specific conditions occur:\n\nAlert Conditions:\n- Threshold exceeded: When metric goes above/below a value\n- Rate of change: When value changes too quickly\n- Status change: When device state changes\n\nAlert Content:\n- Which metric/device triggered the alert\n- Current value and threshold\n- Time of occurrence\n- Suggested actions if applicable\n\nPlease avoid duplicate alerts - only alert when:\n1. This is a new incident (not previously reported)\n2. The condition has significantly worsened\n3. A sufficient cooldown period has passed since the last alert"
-      }
+      "manualTrigger": "Manual trigger"
     },
     "schedule": {
-      "selectStrategy": "Select Execution Strategy",
       "strategies": {
         "timer": "Timer",
         "reactive": "Data-driven",
         "onDemand": "On Demand"
       },
       "config": "Execution Configuration",
-      "onceDescription": "The agent will execute once immediately after saving, and will not trigger again automatically.",
       "timer": {
         "description": "Schedule automatic execution",
         "subTypes": {
@@ -361,11 +348,28 @@
         "preview": "Triggers: {{names}}",
         "hint": "Select the data sources to monitor. The agent will execute automatically when any selected source receives new data.",
         "deviceTrigger": "Device Sources",
-        "extensionTrigger": "Extension Sources",
         "noDevices": "No data sources available",
         "noExtensions": "No extensions available",
         "emptyWarning": "No trigger sources selected. The agent will not run automatically.",
         "fallbackToResources": "No explicit trigger sources configured. Will trigger based on Resources bindings (legacy mode).",
+        "mode": {
+          "any": "Any of them",
+          "all": "All of them"
+        },
+        "modeHint": {
+          "any": "Fires as soon as one of them reports",
+          "all": "Fires only once every one has reported"
+        },
+        "selectedSources": "Trigger sources",
+        "removeAllMetrics": "Stop triggering on any metric of {{name}}",
+        "removeField": "Stop triggering on {{field}} from {{name}}",
+        "windowBefore": "All of them must happen within",
+        "windowAfter": "minutes",
+        "windowLabel": "Time window in minutes",
+        "issue": {
+          "window_required": "Choose a time window. Without one, all sources would have to arrive in a single event and the agent would effectively never run.",
+          "sources_required": "Select at least one trigger source, or bind a resource for the agent to watch."
+        },
         "allMetrics": "All",
         "selectSource": "Select a source to configure",
         "noMetrics": "No metrics available",
@@ -381,7 +385,6 @@
         "every": "Every",
         "minutes": "minutes",
         "hours": "hours",
-        "executeOnce": "execute once",
         "preview": "Every {{value}} {{unit}}"
       },
       "daily": {
@@ -398,7 +401,6 @@
         "preview": "Every {{day}} at {{hour}}:{{minute}}"
       },
       "monthly": {
-        "everyMonth": "Monthly on day",
         "day": "",
         "at": ":00",
         "execute": "execute",
@@ -406,8 +408,6 @@
       },
       "event": {
         "triggerEvent": "Trigger Event",
-        "relatedDevice": "Related Device",
-        "manualHint": "Triggered when selected device metrics update. Backend filters by configured resources.",
         "events": {
           "device.metric": "Metric Update",
           "extension.output": "Extension Output",
@@ -419,10 +419,7 @@
           "extension.output": "Triggered when an extension publishes output data.",
           "ai.metric": "Triggered when an AI metric is written.",
           "manual": "Only triggered manually via API or UI"
-        },
-        "allDevices": "All Devices",
-        "allExtensions": "All Extensions",
-        "extensionHint": "Agent will trigger when this extension publishes output data."
+        }
       },
       "once": {
         "preview": "Execute once immediately"
@@ -443,10 +440,7 @@
     },
     "metricConfig": {
       "timeRange": "Data Time Range",
-      "configureHint": "Configure data strategy in main interface after selection",
       "descriptions": {
-        "fullWeek": "Full weekly report data",
-        "fullDay": "Full day data + trend + baseline",
         "trend": "Historical data + trend",
         "history": "Historical data",
         "baseline": "Current value + baseline comparison"
@@ -457,44 +451,33 @@
         "180": "3 hours",
         "360": "6 hours",
         "720": "12 hours",
-        "1440": "24 hours",
-        "10080": "7 days"
+        "1440": "24 hours"
       }
     },
     "resources": {
-      "title": "Resources",
+      "title": "Data & commands",
       "optional": "Optional",
-      "hintFocused": "Configure data sources for the Agent to focus on. Data will be auto-collected during execution.",
-      "hintFree": "Configure preloaded data sources. If omitted, the Agent will query data via tools as needed.",
-      "preloadTitle": "Preloaded Data Sources",
-      "supplementalTitle": "Additional Data Sources",
-      "hintReactive": "Trigger source data is collected automatically. Add additional sources here for cross-device correlation analysis.",
+      "hintFocused": "Data is the AI’s entire input, collected at run time; binding commands lets the AI act on its own.",
+      "hintFree": "Optional data to preload instead of fetching each run. Without it the AI finds what it needs with tools.",
+      "hintReactive": "The trigger source’s data is collected automatically; add other devices or commands to consult alongside.",
       "searchPlaceholder": "Search resource name or type...",
       "selectedCount": "{{count}} selected",
       "noResourcesFound": "No resources found",
-      "selectResource": "Select a resource from the list",
       "selectDevice": "Select a device",
       "metrics": "Metrics",
       "commands": "Commands",
       "metricCount": "{{count}} metrics",
       "commandCount": "{{count}} commands",
-      "topologyPreview": "Topology Preview",
-      "selectResourceHint": "Please select at least one data resource",
+      "noneAvailable": "This resource has no metrics or commands",
       "noMetrics": "No metrics",
-      "noOutputs": "No outputs",
-      "moreMetrics": "+{{count}} metrics",
-      "moreCommands": "+{{count}} commands",
-      "dataInput": "Data Input",
-      "dataOutput": "Data Output",
-      "selectAfterShow": "Select resources to show details",
       "resources": "resources",
       "selected": "selected",
       "clearAll": "Clear All",
       "selectAll": "Select All",
       "deselectAll": "Deselect All",
-      "dataStream": "Data Stream",
+      "lookback": "Look back",
+      "lookbackUnit": "minutes",
       "device": "Device",
-      "externalData": "External Data",
       "addResources": "Add Resources",
       "dialog": {
         "title": "Select Resources",
@@ -504,50 +487,68 @@
         "searchPlaceholder": "Search resources...",
         "noResourcesHint": "Click \"Add Resources\" to select devices and extensions",
         "done": "Done",
+        "doneWithCount": "Done ({{count}})",
         "selectedCount": "{{count}} resource{{s}} selected"
       }
     },
+    "structured": {
+      "hint": "Each field is published as a platform data source usable by dashboards, rules and data-push. Define what to extract, then bind it to inputs via resources.",
+      "multiRoundCost": "A multi-round conclusion is prose; turning it into fields costs one extra model call at the end of every run.",
+      "colName": "Name",
+      "colType": "Type",
+      "colUnit": "Unit",
+      "colDesc": "Meaning",
+      "fieldName": "e.g. missing_count",
+      "fieldUnit": "e.g. ℃ / pcs",
+      "fieldDescription": "Injected into prompt",
+      "enumValues": "Allowed values, comma-separated (e.g. 正常, 待检, 停线)",
+      "typeNumber": "Number",
+      "typeText": "Text",
+      "typeBoolean": "Boolean",
+      "typeEnum": "Enum (fixed values)",
+      "addField": "Add field",
+      "removeField": "Remove",
+      "debounce": "Debounce (seconds)",
+      "timeout": "Inference timeout (seconds)",
+      "threshold": "Circuit-breaker threshold",
+      "dailyCap": "Daily run cap (optional)",
+      "eventCooldown": "Event cooldown (seconds; 0 = fire when idle, default 60)",
+      "dryRun": "Dry run",
+      "dryRunRunning": "Running…",
+      "dryRunResultTitle": "Dry-run result",
+      "dryRunMeta": "{{sources}} input source(s) · attempt {{attempts}} · nothing saved",
+      "guardrailSummary": "Guardrails: debounce {{debounce}}s · timeout {{timeout}}s · breaker {{threshold}} · daily cap {{cap}}",
+      "guardrailSummaryEveryRun": "Guardrails: timeout {{timeout}}s · breaker {{threshold}} · daily cap {{cap}}",
+      "guardrailToggle": "Adjust"
+    },
     "advanced": {
       "title": "Advanced Configuration",
-      "dataCollection": "Data Collection",
-      "selectMetricsFirst": "Please select metrics first",
       "executionMode": "Execution Mode",
-      "focusedMode": "Focused Mode",
-      "focusedModeDescription": "Bind specific resources and actions for fast, precise analysis. Best for monitoring, alerts, data analysis.",
-      "freeMode": "Free Mode",
-      "freeModeDescription": "LLM freely explores and decides with multi-round tool calling. Best for complex automation and device control.",
-      "focusedModeRequiresResources": "Focused Mode requires at least one resource binding",
-      "saveToken": "Save Tokens",
       "timeRange": "Time Range",
-      "includeHistory": "Include History",
-      "includeTrend": "Include Trend",
-      "includeBaseline": "Include Baseline",
       "recommended": "Recommended",
       "agentPriority": "Agent Priority",
-      "priorityHint": "Execution priority (1=lowest, 10=highest)",
+      "priorityHint": "Higher runs first when agents compete for a slot (128 = default)",
       "contextWindow": "Recent Conversation Turns",
       "contextHint": "Number of recent conversation turns to load for execution context",
       "historyDepth": "Conversation History Depth",
       "systemPrompt": "Custom System Prompt",
       "systemPromptPlaceholder": "e.g., You are a helpful assistant that analyzes dashboard data...",
-      "systemPromptHint": "Override the default agent identity. Leave empty to use the built-in IoT assistant role.",
-      "systemPromptTooLong": "System prompt must be 4000 characters or less",
-      "useDefault": "Use Default",
-      "defaultSystemPrompt": "You are an intelligent IoT assistant. You monitor edge devices, analyze sensor data, and help users manage their IoT environment. Provide clear, actionable insights based on the data you observe."
+      "tools": "Allow tool use",
+      "toolsHint": "Off = a text-only agent. On, the AI may call the platform tools its run needs.",
+      "toolsRestrict": "Restrict tools",
+      "toolsRestrictHint": "Limit which tools this agent may call. Fewer tools is safer — and small models choose better among few.",
+      "toolsSelected": "{{selected}} / {{total}} selected — none selected means all",
+      "toolsDisabledAutonomyHint": "Autonomous work style with tools off degenerates to a single text reply — the multi-round promise cannot be kept without tools."
     },
     "dataCollection": {
       "title": "Data Collection Config",
       "timeRange": "Time Range",
-      "includeHistory": "Historical Data",
-      "includeTrend": "Trend Data",
-      "includeBaseline": "Baseline Comparison",
       "hint": "Configure data collection method for each metric. Different scenarios may require different configurations"
     },
     "validation": {
       "nameRequired": "Please enter agent name",
-      "requirementRequired": "Please describe your requirements",
       "resourceRequired": "Please select at least one device resource",
-      "eventTypeRequired": "Please select trigger event type"
+      "outputFieldRequired": "Please define at least one output field"
     },
     "actions": {
       "cancel": "Cancel",
@@ -583,12 +584,125 @@
       "America/New_York": "New York (UTC-5/-4)",
       "America/Los_Angeles": "Los Angeles (UTC-8/-7)",
       "UTC": "UTC (UTC+0)"
+    },
+    "section": {
+      "what": "What should the AI do",
+      "record": "What it records",
+      "when": "When it runs"
+    },
+    "preset": {
+      "title": "Start from a template",
+      "appliedFrom": "Started from ‘{{name}}’",
+      "repick": "Pick another",
+      "image": {
+        "fDescDesc": "What the frame shows",
+        "fStatusValues": "normal, abnormal",
+        "fStatusDesc": "Frame status verdict",
+        "name": "Image understanding",
+        "desc": "Look at a camera frame, give a verdict",
+        "prompt": "You are the on-site attendant. Look at the bound camera's latest frame:\n1. Describe the key points (equipment, materials, people);\n2. Judge whether anything is wrong (equipment state, stacking, safety);\n3. If something is, say where, the likely cause, and a suggested response; otherwise state clearly that all is normal."
+      },
+      "monitor": {
+        "fStatusDesc": "Overall status verdict",
+        "fStatusValues": "normal, abnormal, review",
+        "fCountDesc": "Number of anomalous items",
+        "fCountUnit": "items",
+        "name": "Data monitoring",
+        "desc": "Multi-source readings, recorded as data",
+        "prompt": "You are the equipment inspector. Read the bound metrics' current values on schedule:\n1. Compare each against its normal range;\n2. Give an overall verdict (normal / abnormal / review);\n3. Count and list the anomalies.\nValues near but not past a threshold are review, not abnormal."
+      },
+      "smart": {
+        "name": "Smart task",
+        "desc": "Analysis linked to action",
+        "prompt": "You are the duty engineer. Watch the bound data sources; when something looks wrong:\n1. Investigate the cause yourself (query other data, use tools);\n2. Operate the bound devices directly when needed (start a fan, lower power, stop a line);\n3. After every action, say what you did and why.\nEscalate gently: prefer adjusting parameters over stopping equipment."
+      },
+      "scheduled": {
+        "name": "Scheduled report",
+        "desc": "Periodic summary",
+        "prompt": "You are the operations analyst. Summarise the bound sources over the last 24 hours:\n1. Overall status and key metric changes;\n2. Events and actions during the period;\n3. Comparison with the previous day (better / worse / flat);\n4. The 1–3 things most worth attention next."
+      },
+      "advanced": {
+        "name": "Advanced",
+        "desc": "High freedom, your words",
+        "prompt": "Describe your task — four things make a good brief:\n1. Goal — what to achieve;\n2. Input — which data or cameras to look at;\n3. Judgement — what counts as normal, what as trouble;\n4. Action — what to do and who to notify when trouble shows."
+      },
+      "event": {
+        "name": "Event judgement",
+        "desc": "Judge each change as it arrives",
+        "prompt": "Something changed — judge it now.\n\nWhen a bound source reports, decide what it means:\n1. Read the current values of the bound sources;\n2. Say whether this is normal, worth watching, or a problem;\n3. Put what happened in one line an operator can act on.\nA single reading is evidence, not proof — when the data is ambiguous, say so rather than picking a verdict.",
+        "fStatusValues": "normal, watch, problem",
+        "fStatusDesc": "What this reading means",
+        "fDetailDesc": "One line on what happened"
+      },
+      "rootCause": {
+        "name": "Root cause",
+        "desc": "Several sources, one conclusion",
+        "prompt": "You are the engineer on call. Something is wrong, or looks like it may be.\n1. Work out what actually happened — query other sources and use your tools to test your hunches; do not stop at the first plausible story;\n2. Keep what the data shows separate from what you are inferring;\n3. Name the most likely cause, and how far the evidence actually goes;\n4. Give the one thing the operator should do next.\nIf the evidence does not support a cause, say that — a wrong root cause costs more than an honest \"not enough to tell\".",
+        "fCauseDesc": "Most likely cause",
+        "fConfValues": "high, medium, low",
+        "fConfDesc": "How far the evidence actually goes",
+        "fSuggestDesc": "The next thing to do"
+      },
+      "weekly": {
+        "name": "Weekly report",
+        "desc": "Summarise the week",
+        "prompt": "You are the operations analyst. Summarise the bound sources over the last 7 days:\n1. The week's overall status and the totals that matter;\n2. Recurring problems — what happened more than once, and how often;\n3. Comparison with the week before (better / worse / flat);\n4. The 1–3 things worth changing next week.\nWrite about the week as a whole; a one-off spike is only worth a mention if it keeps coming back or is still unresolved."
+      },
+      "shift": {
+        "name": "Shift check",
+        "desc": "Look every half hour, report what changed",
+        "prompt": "You are on inspection duty. Take a quick look at the bound sources:\n1. Compare against the last time you looked;\n2. Report only what changed — a reading that held steady is not news;\n3. If something is drifting toward trouble, say which way and how fast.\nTwo lines is usually enough. Say \"nothing new\" when that is the truth; a report that pads every round is one nobody reads."
+      },
+      "all": "All templates",
+      "allTitle": "Start from a template",
+      "allSubtitle": "Starting points, not locks — every field a template fills stays editable.",
+      "next": {
+        "sources": "Bind the data sources it should read",
+        "trigger": "Bind a trigger source, or the data sources it should read",
+        "optional": "Bind the data it should read, or save as-is — it can look things up itself"
+      },
+      "patrol": {
+        "name": "Scheduled patrol",
+        "desc": "Rounds on a clock, remediates what it can",
+        "prompt": "You are the on-duty engineer. Inspect the bound sources on schedule: when something is off, judge its nature and blast radius first; remediate directly what you can (restart a device, resend a command) and verify the fix took; for the rest, write down the symptom, your read of the cause, and a suggested next step. Each round's conclusion must be comparable with the previous one, and every remediation leaves a receipt."
+      },
+      "qa": {
+        "name": "Data Q&A",
+        "desc": "Ask anytime, answers from bound data only",
+        "prompt": "You are a data lookup assistant. Answer only from the bound data sources: look first, then answer; every number carries its timestamp and source; when the data does not have it, say so plainly instead of guessing. Keep answers short and direct."
+      }
+    },
+    "notify": {
+      "title": "Notify",
+      "noChannels": "No external channels yet — alerts still land in Messages either way.",
+      "onLabel": "When to notify",
+      "onFailure": "On failure",
+      "onFailureDesc": "Notify only when a run fails; success stays quiet.",
+      "onAlways": "Every run",
+      "onAlwaysDesc": "Notify on every run, success or failure.",
+      "onJudgment": "Let the task decide",
+      "onJudgmentDesc": "Speak only when there is a conclusion worth acting on; routine rounds stay quiet — and nothing falls back to keyword sniffing.",
+      "hint": "Where to send, and when. \"Let the agent decide\" configures no routed notification and does not fall back to the old keyword sniffing.",
+      "configureChannels": "Configure channels"
+    },
+    "workstyle": {
+      "title": "How it works",
+      "bound": "Bound data only",
+      "auto": "Explore and act",
+      "boundDesc": "Answers strictly from bound devices and data sources — no extra lookups",
+      "autoDesc": "May run tools over multiple rounds before answering"
+    },
+    "memory": {
+      "title": "What it remembers",
+      "auto": "Derived from the mode",
+      "stateless": "Judged fresh each time",
+      "statelessHint": "Sees only this run's data. Cheaper, faster, repeatable",
+      "history": "Remembers past results",
+      "historyHint": "Can say \"worse than last time\". Carries history into every prompt",
+      "standardsKept": "Your standards and corrections always apply, whatever you pick here"
     }
   },
   "skills": {
-    "originAll": "All",
-    "originBuiltin": "Builtin",
-    "originUser": "User",
     "createSkill": "Add Skill",
     "skillCreated": "Skill created",
     "skillUpdated": "Skill updated",
@@ -637,22 +751,15 @@
       "description": "Configure memory storage and scheduling",
       "general": "General Settings",
       "enabled": "Enabled",
-      "maxAgents": "Max Agents",
-      "maxAgentsHint": "Maximum number of agents with memory",
-      "charLimits": "Character Limits",
       "userCharLimit": "User File Limit",
       "userCharLimitHint": "Max characters for user memory file",
       "knowledgeCharLimit": "Knowledge File Limit",
       "knowledgeCharLimitHint": "Max characters for knowledge memory file",
       "proceduresCharLimit": "Procedures File Limit",
       "proceduresCharLimitHint": "Max characters for procedures memory file (SOPs, playbooks, how-tos)",
-      "agentCharLimit": "Agent Memory Limit",
-      "agentCharLimitHint": "Max characters per agent memory",
       "tempFileTtl": "Temp File TTL (Days)",
       "tempFileTtlHint": "Days before temp files are cleaned up",
       "schedule": "Schedule",
-      "scheduleInterval": "Extraction Interval",
-      "scheduleIntervalHint": "Seconds between memory extractions ({{minutes}} min)",
       "refreshInterval": "Refresh Interval",
       "refreshIntervalHint": "How often to refresh agent memory context",
       "summaryInterval": "Summary Interval",
@@ -664,8 +771,6 @@
     "viewEdit": "View/Edit",
     "export": "Export",
     "extract": "Extract",
-    "extractStarted": "Extraction Started",
-    "extractStartedDesc": "Extracting memories from conversations...",
     "saving": "Saving...",
     "save": "Save",
     "cancel": "Cancel",
@@ -675,7 +780,6 @@
       "title": "No Agents",
       "description": "Description"
     },
-    "charsUsed": "{{used}} / {{limit}} chars",
     "noContent": "No content yet",
     "custom": {
       "title": "Custom Files",
@@ -683,7 +787,6 @@
       "createTitle": "Create Custom File",
       "fileName": "File Name",
       "fileNameHint": "Lowercase letters, digits, hyphens, underscores. 1-32 chars.",
-      "fileContent": "Content (Markdown)",
       "empty": "No custom files. Create one to store domain-specific knowledge.",
       "deleted": "Custom file deleted",
       "created": "Custom file created",

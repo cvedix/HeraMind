@@ -6,6 +6,27 @@
  */
 
 import type { Message } from "@/types"
+import { normalizeTimestampMs } from "@/lib/utils/format"
+import { normalizeContentNodes } from "@/lib/chat/contentProtocol"
+
+/**
+ * Normalize a history batch to the store's canonical ms timestamps.
+ *
+ * Server history carries Unix SECONDS (AgentMessage.timestamp =
+ * chrono::Utc::now().timestamp()); locally created messages carry ms.
+ * Display helpers tolerate both, but arithmetic on message.timestamp does
+ * not — `Date.now() - serverSecondsTs` produced a 497,289-hour generation
+ * time (2026-10-15). Every history ingest path funnels through
+ * mergeMessagesForDisplay, so normalizing here canonicalizes the store.
+ */
+function normalizeTimestamps(messages: Message[]): Message[] {
+  return messages.map(m => {
+    if (typeof m.timestamp !== 'number') return m
+    const ms = normalizeTimestampMs(m.timestamp)
+    // Already-ms timestamps (and unparseables) keep their value.
+    return ms != null && ms !== m.timestamp ? { ...m, timestamp: ms } : m
+  })
+}
 
 /**
  * Combine two content strings without duplicating when backend sent the same content twice.
@@ -29,7 +50,8 @@ export function dedupeContentConcat(a: string, b: string): string {
  * Reconstruct ONE message per user turn, combining all tool calls across rounds,
  * building round_contents, and using the final content as message content.
  */
-export function mergeMessagesForDisplay(messages: Message[]): Message[] {
+export function mergeMessagesForDisplay(rawMessages: Message[]): Message[] {
+  const messages = normalizeTimestamps(rawMessages)
   const result: Message[] = []
 
   for (let i = 0; i < messages.length; i++) {
@@ -38,9 +60,13 @@ export function mergeMessagesForDisplay(messages: Message[]): Message[] {
     // Skip tool messages (internal use)
     if ((msg as any).role === "tool") continue
 
-    // User messages and system messages are kept as-is
+    // User / system: keep as-is, but normalize contentNodes aliases so
+    // history reload (camelCase wire or snake_case leftovers) redraws chips.
     if (msg.role !== "assistant") {
-      result.push(msg)
+      const nodes =
+        normalizeContentNodes(msg.contentNodes) ??
+        normalizeContentNodes((msg as { content_nodes?: unknown }).content_nodes)
+      result.push(nodes ? { ...msg, contentNodes: nodes } : msg)
       continue
     }
 
@@ -59,9 +85,13 @@ export function mergeMessagesForDisplay(messages: Message[]): Message[] {
     let allToolCalls: any[] = []
     let roundContents: Record<number, string> = {}
     let roundThinking: Record<number, string> = {}
+    let systemNotes: string[] = []
     let roundCounter = 1
     let finalContent = ''
     let thinking: string | undefined
+    // Prefer the last fragment that carries system-judged goal status.
+    let goalStatus: Message['goalStatus']
+    let endReason: Message['endReason']
 
     // Detect backend storage pattern
     const hasTrailingContentMsg = turnMessages.some(m =>
@@ -91,6 +121,25 @@ export function mergeMessagesForDisplay(messages: Message[]): Message[] {
       if (cur.round_thinking) {
         roundThinking = { ...roundThinking, ...cur.round_thinking }
       }
+      {
+        const raw = cur as Message & {
+          system_notes?: string[]
+          goal_status?: Message['goalStatus']
+          end_reason?: Message['endReason']
+        }
+        if (cur.goalStatus || raw.goal_status) {
+          goalStatus = cur.goalStatus ?? raw.goal_status
+        }
+        if (cur.endReason || raw.end_reason) {
+          endReason = cur.endReason ?? raw.end_reason
+        }
+        // Raw API messages carry the backend's snake_case field (Message's
+        // other history fields keep snake_case; systemNotes is the camelCase
+        // UI field).
+        if (raw.system_notes) {
+          systemNotes = [...systemNotes, ...raw.system_notes]
+        }
+      }
 
       if (hasTools) {
         const roundNum = cur.tool_calls![0]?.round ?? roundCounter
@@ -116,6 +165,9 @@ export function mergeMessagesForDisplay(messages: Message[]): Message[] {
     merged.tool_calls = allToolCalls.length > 0 ? allToolCalls : undefined
     merged.round_contents = Object.keys(roundContents).length > 0 ? roundContents : undefined
     merged.round_thinking = Object.keys(roundThinking).length > 0 ? roundThinking : undefined
+    merged.systemNotes = systemNotes.length > 0 ? systemNotes : undefined
+    merged.goalStatus = goalStatus
+    merged.endReason = endReason
 
     if (merged.content || merged.thinking || merged.tool_calls) {
       result.push(merged)
@@ -125,6 +177,27 @@ export function mergeMessagesForDisplay(messages: Message[]): Message[] {
   }
 
   return result
+}
+
+/**
+ * Drop the in-flight turn's messages: everything AFTER the last user
+ * message. While a turn is streaming (fresh or restored-after-reentry),
+ * the history endpoint serves the LIVE agent history — the running turn's
+ * fragments are already in it and would double-render next to the
+ * streaming bubble (the "extra Thinking process" live-test report). The
+ * streaming bubble owns the in-flight turn's display; the completed turn
+ * replaces it on end/reload.
+ */
+export function dropInFlightTurn(messages: Message[]): Message[] {
+  let lastUser = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      lastUser = i
+      break
+    }
+  }
+  if (lastUser === -1) return messages
+  return messages.slice(0, lastUser + 1)
 }
 
 /**
@@ -168,8 +241,12 @@ export function cleanToolCallJson(content: string): string {
 
   let cleaned = content
 
-  // Remove ```json ... ``` blocks containing tool call JSON
-  cleaned = cleaned.replace(/```(?:json)?\s*\n?\s*(\[\s*\{[\s\S]*?"name"\s*:[\s\S]*?\}\s*\])\s*\n?\s*```/g, '')
+  // Remove ```json ... ``` blocks containing tool call JSON.
+  // Requires "arguments" as well as "name": a fenced DATA array (a device
+  // list quoted as ```json [{"id","name","online"}] ```) carries name
+  // fields but no arguments, and the old name-only pattern deleted the
+  // whole block from the reply (mirror of the backend cleanup fix).
+  cleaned = cleaned.replace(/```(?:json)?\s*\n?\s*(\[\s*\{[\s\S]*?"name"\s*:[\s\S]*?"arguments"\s*:[\s\S]*?\}\s*\])\s*\n?\s*```/g, '')
 
   // Remove bare JSON arrays that look like tool calls: [{"name":"...", ...}]
   cleaned = cleaned.replace(/\[\s*\{\s*"name"\s*:\s*"[^"]*"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}\s*\]/g, '')

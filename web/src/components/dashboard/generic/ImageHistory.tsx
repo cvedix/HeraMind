@@ -180,6 +180,38 @@ function formatTimestamp(timestamp: string | number | undefined): string {
   })
 }
 
+/** Default / recommended fit for PIR-like captures — contain avoids stretch. */
+export const IMAGE_HISTORY_DEFAULT_FIT: NonNullable<ImageHistoryProps['fit']> = 'contain'
+
+/**
+ * Frame classes: fill the grid cell when the parent stretches (`h-full` +
+ * `flex-1`), with a sensible min-height so non-grid hosts stay usable.
+ * Previously forced a tiny fixed `h-[180px]` even inside tall dashboard cells.
+ */
+export function imageHistoryFrameClass(size: 'sm' | 'md' | 'lg' = 'md'): string {
+  const minH = size === 'sm' ? 'min-h-[120px]' : size === 'lg' ? 'min-h-[240px]' : 'min-h-[180px]'
+  return cn('w-full flex-1 relative', minH)
+}
+
+/** Map fit prop → object-* utility. Unknown values fall back to contain. */
+export function imageHistoryObjectFitClass(
+  fit: ImageHistoryProps['fit'] = IMAGE_HISTORY_DEFAULT_FIT,
+): string {
+  switch (fit) {
+    case 'cover':
+      return 'object-cover'
+    case 'fill':
+      return 'object-fill'
+    case 'none':
+      return 'object-none'
+    case 'scale-down':
+      return 'object-scale-down'
+    case 'contain':
+    default:
+      return 'object-contain'
+  }
+}
+
 /**
  * Lightweight fingerprint for image source tracking.
  * Avoids storing full base64 strings (~50KB each) in Sets/arrays.
@@ -190,7 +222,12 @@ function srcFingerprint(src: string): string {
   return `${src.length}:${src.charCodeAt(0)}:${src.slice(-32)}`
 }
 
-function normalizeDataSourceForImages(
+/**
+ * Force image-history telemetry semantics onto a data source.
+ * Always clears `timeWindow` so persisted `last_1hour` cannot shrink a
+ * widget configured for 48h/120h (PIR boards store both).
+ */
+export function normalizeDataSourceForImages(
   ds: DataSource | undefined,
   limit: number = 200,
   timeRange: number = 48,
@@ -226,7 +263,22 @@ function normalizeDataSourceForImages(
     }
   }
 
-  return ds
+  // Every other source type the config dialog offers (extension / system /
+  // transform / agent): merge limit/timeRange onto the source as-is. The
+  // data layer consumes both for these types (extension: timeRange → query
+  // window + client-side limit truncation, useExtensionSource; system:
+  // polling accumulation prunes by timeRange/limit, usePollingSource;
+  // transform/agent fall through the same consumers by source field).
+  // Previously these types were passed through UNTOUCHED, so the
+  // component's configured range/count silently never applied.
+  return {
+    ...ds,
+    limit,
+    timeRange,
+    // Same timeWindow override hazard as the telemetry branch.
+    timeWindow: undefined,
+    params: { ...ds.params, isImage: true },
+  }
 }
 
 // ============================================================================
@@ -238,8 +290,10 @@ export const ImageHistory = memo(function ImageHistory({
   images: propImages,
   title,
   size = 'md',
-  fit = 'fill',
-  rounded = true,
+  // Default contain (matches registry/schema). Stored PIR configs with
+  // explicit fit: 'fill' are left alone — no migration of persisted boards.
+  fit = IMAGE_HISTORY_DEFAULT_FIT,
+  rounded: _rounded = true,
   showTitle = true,
   limit = 200,
   timeRange = 48,
@@ -248,44 +302,19 @@ export const ImageHistory = memo(function ImageHistory({
   const { t } = useTranslation('dashboardComponents')
   const sizeConfig = dashboardComponentSize[size]
 
-  // Two-phase loading: quick (3 images, 1h) for fast first paint, then full history
-  const quickSource = useMemo(
-    () => normalizeDataSourceForImages(dataSource, 3, 1),
-    [dataSource],
-  )
-  const fullSource = useMemo(
+  // Single fetch with the widget's configured limit/timeRange.
+  // A prior two-phase load (quick: limit=3 / 1h → full) left PIR boards
+  // stuck on ~2 frames whenever devices were quiet for >1h: parent
+  // dataSource identity churn reset phase to "quick", and the 1h window
+  // only held a couple of captures (T4: 200366 last_1h total=2 vs 48h=897).
+  const activeSource = useMemo(
     () => normalizeDataSourceForImages(dataSource, limit, timeRange),
     [dataSource, limit, timeRange],
   )
 
-  const [phase, setPhase] = useState<'quick' | 'full'>('quick')
-  const activeSource = phase === 'full' ? fullSource : quickSource
-
-  // Preserve quick-phase data across phase transition to avoid flash
-  const lastDataRef = useRef<unknown>(null)
-
-  // Reset phase when data source changes (new source should start with quick phase)
-  useEffect(() => {
-    setPhase('quick')
-    lastDataRef.current = null
-  }, [dataSource])
-
   const { data, loading, lastUpdate: dataSourceLastUpdate } = useDataSource(activeSource, {
-    fallback: phase === 'full' && lastDataRef.current != null ? lastDataRef.current : propImages,
+    fallback: propImages,
   })
-
-  // Track last valid data for phase transitions
-  useEffect(() => {
-    if (data != null) lastDataRef.current = data
-  }, [data])
-
-  // Transition from quick to full after initial data arrives
-  useEffect(() => {
-    if (phase === 'quick' && dataSourceLastUpdate) {
-      const timer = setTimeout(() => setPhase('full'), 200)
-      return () => clearTimeout(timer)
-    }
-  }, [phase, dataSourceLastUpdate])
 
   // Transform data to images — uses shared cached normalizeImageUrl
   const images = useMemo(
@@ -371,19 +400,12 @@ export const ImageHistory = memo(function ImageHistory({
 
   // --- Main render ---
   return (
-    <div className={cn(dashboardCardBase, 'relative flex flex-col overflow-hidden', className)}>
-      <div className={cn('w-full flex-1 relative', size === 'sm' ? 'h-[120px]' : size === 'md' ? 'h-[180px]' : 'h-[240px]')}>
+    <div className={cn(dashboardCardBase, 'relative flex flex-col overflow-hidden h-full', className)}>
+      <div className={imageHistoryFrameClass(size)}>
         <img
           src={currentImageSrc}
           alt={currentImage?.alt || `Image ${currentIndex + 1}`}
-          className={cn(
-            'w-full h-full',
-            fit === 'contain' && 'object-contain',
-            fit === 'cover' && 'object-cover',
-            fit === 'fill' && 'object-fill',
-            fit === 'none' && 'object-none',
-            fit === 'scale-down' && 'object-scale-down',
-          )}
+          className={cn('w-full h-full', imageHistoryObjectFitClass(fit))}
           onLoad={handleImageLoad}
           onError={handleImageError}
         />
@@ -421,14 +443,14 @@ export const ImageHistory = memo(function ImageHistory({
 
         {/* Loading overlay */}
         {imageLoadState === 'loading' && (
-          <div className="absolute inset-0 flex items-center justify-center bg-bg-50 z-20">
+          <div className="absolute inset-0 flex items-center justify-center bg-glass z-20">
             <RefreshCw className="h-6 w-6 text-muted-foreground animate-spin" />
           </div>
         )}
 
         {/* Error overlay */}
         {imageLoadState === 'error' && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-bg-80 z-20">
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-glass-heavy z-20">
             <AlertTriangle className="h-8 w-8 text-error mb-2" />
             <span className="text-sm text-muted-foreground">{t('imageHistory.failedToLoad')}</span>
           </div>

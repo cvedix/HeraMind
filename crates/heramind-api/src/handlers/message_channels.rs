@@ -1,6 +1,14 @@
 //! Message channel API handlers.
 //!
-//! GET    /api/messages/channels              - List channels
+//! Every route below is admin-only **except** the two that carry no per-channel
+//! data: the static channel-type metadata (`/types`, `/types/:type/schema`) and
+//! `/stats`. `GET /channels` stays reachable for any authenticated caller but
+//! drops each entry's config and recipients unless the caller is an admin — the
+//! config holds the channel's live credentials, and the recipient list is the
+//! set of addresses alerts go to. See `require_admin` for why the check lives
+//! in the handlers rather than in the auth middleware.
+//!
+//! GET    /api/messages/channels              - List channels (config omitted for non-admins)
 //! POST   /api/messages/channels              - Create channel
 //! GET    /api/messages/channels/:name        - Get channel
 //! DELETE /api/messages/channels/:name        - Delete channel
@@ -51,6 +59,31 @@ use super::{
 use crate::models::ErrorResponse;
 use serde_json::json;
 
+/// Managing notification channels is an admin surface: a channel's config
+/// carries live credentials (SMTP password, bot token, webhook key), and
+/// whoever can write one decides where the platform's alerts get delivered.
+///
+/// The auth middleware only *authenticates* — every handler reachable behind
+/// it runs as "some principal" — so the role check has to happen here. This is
+/// the same shape used by the admin-only settings handlers; API keys keep
+/// working because a key with the `*` permission is mapped to
+/// `UserRole::Admin` in the hybrid middleware.
+fn require_admin(admin: &crate::auth_users::SessionInfo) -> Result<(), ErrorResponse> {
+    if admin.role != crate::auth_users::UserRole::Admin {
+        return Err(ErrorResponse::new(
+            "FORBIDDEN",
+            "Admin access required to manage notification channels",
+            axum::http::StatusCode::FORBIDDEN,
+        ));
+    }
+    Ok(())
+}
+
+/// The `SessionInfo` the hybrid auth middleware attaches to authenticated
+/// requests. Extracting it can't fail for a request that got this far: both
+/// the JWT and the API-key path insert it before calling the handler.
+type AdminSession = axum::extract::Extension<crate::auth_users::SessionInfo>;
+
 /// Create channel request.
 #[derive(utoipa::ToSchema, Debug, Deserialize)]
 pub struct CreateChannelRequest {
@@ -80,16 +113,30 @@ pub struct ChannelListResponse {
     path = "/api/messages/channels",
     tag = "channels",
     responses(
-        (status = 200, description = "Configured notification channels"),
+        (status = 200, description = "Configured notification channels. Non-admin callers get names, types and enabled state with config and recipients omitted."),
     )
 )]
 pub async fn list_channels_handler(
     State(state): State<ServerState>,
+    admin: AdminSession,
 ) -> HandlerResult<serde_json::Value> {
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.read().await;
-    let channels = registry_guard.list_info().await;
+    let mut channels = registry_guard.list_info().await;
     let stats = registry_guard.get_stats().await;
+
+    // Pages that are not channel management (the agent editor's notify picker,
+    // the automation page) only need to know which channels exist, so a
+    // non-admin still gets the list — minus the credentials in each config and
+    // the recipient addresses. `ChannelInfo` skips both fields when None, so
+    // the omission is visible in the payload rather than an empty string that
+    // reads like a cleared setting.
+    if require_admin(&admin.0).is_err() {
+        for channel in &mut channels {
+            channel.config = None;
+            channel.recipients = None;
+        }
+    }
 
     ok(json!({
         "channels": channels,
@@ -108,14 +155,18 @@ pub async fn list_channels_handler(
         ("name" = String, Path, description = "Channel name"),
     ),
     responses(
-        (status = 200, description = "One channel with config (secrets redacted)"),
+        (status = 200, description = "One channel with its config verbatim — admin only, because the config holds the channel's credentials"),
+        (status = 403, description = "Caller is not an admin"),
         (status = 404, description = "Not found"),
     )
 )]
 pub async fn get_channel_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
+    admin: AdminSession,
 ) -> HandlerResult<serde_json::Value> {
+    require_admin(&admin.0)?;
+
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.read().await;
     let info = registry_guard
@@ -179,6 +230,8 @@ pub async fn get_channel_type_schema_handler(
         "icon": info.icon,
         "category": info.category,
         "config_schema": schema,
+        "docs_url": info.docs_url,
+        "docs_url_zh": info.docs_url_zh,
     }))
 }
 
@@ -195,76 +248,153 @@ pub async fn get_channel_type_schema_handler(
 )]
 pub async fn create_channel_handler(
     State(state): State<ServerState>,
+    admin: AdminSession,
     Json(req): Json<CreateChannelRequest>,
 ) -> HandlerResult<serde_json::Value> {
+    require_admin(&admin.0)?;
+
+    if req.name.trim().is_empty() {
+        return Err(ErrorResponse::validation("Channel name is required")
+            .with_hint("Provide a non-empty channel name via --name <NAME>."));
+    }
+
+    let valid_types: Vec<String> = heramind_messages::list_channel_types()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    if req.channel_type.trim().is_empty() || !valid_types.iter().any(|t| t == &req.channel_type) {
+        return Err(ErrorResponse::validation(format!(
+            "Unknown channel type '{}'",
+            req.channel_type
+        ))
+        .with_hint(format!(
+            "Valid channel types: {}. Run `heramind message channel-types` for details.",
+            valid_types.join(", ")
+        )));
+    }
+
+    let required_fields: Vec<String> = heramind_messages::get_channel_schema(&req.channel_type)
+        .and_then(|schema| {
+            schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+
+    if !required_fields.is_empty() {
+        let missing: Vec<&str> = match req.config.as_object() {
+            Some(obj) => required_fields
+                .iter()
+                .map(String::as_str)
+                .filter(|field| !obj.contains_key(*field) || obj[*field].is_null())
+                .collect(),
+            None => required_fields.iter().map(String::as_str).collect(),
+        };
+        if !missing.is_empty() {
+            return Err(ErrorResponse::validation(format!(
+                "Missing required config field(s) for '{}' channel: {}",
+                req.channel_type,
+                missing.join(", ")
+            ))
+            .with_hint(format!(
+                "Required fields for '{}': {}. Preferred from Chat/shell tool: put the config JSON object in shell `params` (maps to --config). Human CLI fallback: --config '{{...}}' or --param key=value. Or run `heramind message channel-type-schema {}`.",
+                req.channel_type,
+                required_fields.join(", "),
+                req.channel_type
+            )));
+        }
+    }
+
     let registry = state.core.message_manager.channels().await;
 
     // Check if channel already exists
     {
         let registry_guard = registry.read().await;
         if registry_guard.get(&req.name).await.is_some() {
-            return Err(ErrorResponse::bad_request("Channel already exists"));
+            return Err(ErrorResponse::bad_request(format!(
+                "Channel '{}' already exists",
+                req.name
+            ))
+            .with_hint(
+                "Choose a different channel name, or update/delete the existing channel first.",
+            ));
         }
     }
 
     // Prepare config value for storing
     let config_value = req.config.clone();
 
+    let invalid_config_err = |e: heramind_messages::Error| {
+        let hint = if !required_fields.is_empty() {
+            format!(
+                "Required fields for '{}': {}. Preferred from Chat/shell tool: put the config JSON object in shell `params` (maps to --config). Run `heramind message channel-type-schema {}` for field details.",
+                req.channel_type,
+                required_fields.join(", "),
+                req.channel_type
+            )
+        } else {
+            format!(
+                "Run `heramind message channel-type-schema {}` for field details.",
+                req.channel_type
+            )
+        };
+        ErrorResponse::validation(format!(
+            "Invalid config for '{}' channel: {}",
+            req.channel_type, e
+        ))
+        .with_hint(hint)
+    };
+
     // Create channel based on type
     let channel: std::sync::Arc<dyn MessageChannel> = match req.channel_type.as_str() {
         #[cfg(feature = "webhook")]
         "webhook" => {
             let factory = WebhookChannelFactory;
-            factory
-                .create(&req.config)
-                .map_err(|e| ErrorResponse::bad_request(format!("Invalid config: {}", e)))?
+            factory.create(&req.config).map_err(invalid_config_err)?
         }
         #[cfg(feature = "email")]
         "email" => {
             let factory = EmailChannelFactory;
-            factory
-                .create(&req.config)
-                .map_err(|e| ErrorResponse::bad_request(format!("Invalid config: {}", e)))?
+            factory.create(&req.config).map_err(invalid_config_err)?
         }
         #[cfg(feature = "telegram")]
         "telegram" => {
             let factory = TelegramChannelFactory;
-            factory
-                .create(&req.config)
-                .map_err(|e| ErrorResponse::bad_request(format!("Invalid config: {}", e)))?
+            factory.create(&req.config).map_err(invalid_config_err)?
         }
         #[cfg(feature = "wecom")]
         "wecom" => {
             let factory = WeComChannelFactory;
-            factory
-                .create(&req.config)
-                .map_err(|e| ErrorResponse::bad_request(format!("Invalid config: {}", e)))?
+            factory.create(&req.config).map_err(invalid_config_err)?
         }
         #[cfg(feature = "dingtalk")]
         "dingtalk" => {
             let factory = DingTalkChannelFactory;
-            factory
-                .create(&req.config)
-                .map_err(|e| ErrorResponse::bad_request(format!("Invalid config: {}", e)))?
+            factory.create(&req.config).map_err(invalid_config_err)?
         }
         #[cfg(feature = "slack")]
         "slack" => {
             let factory = SlackChannelFactory;
-            factory
-                .create(&req.config)
-                .map_err(|e| ErrorResponse::bad_request(format!("Invalid config: {}", e)))?
+            factory.create(&req.config).map_err(invalid_config_err)?
         }
         #[cfg(feature = "feishu")]
         "feishu" => {
             let factory = FeishuChannelFactory;
-            factory
-                .create(&req.config)
-                .map_err(|e| ErrorResponse::bad_request(format!("Invalid config: {}", e)))?
+            factory.create(&req.config).map_err(invalid_config_err)?
         }
         _ => {
-            return Err(ErrorResponse::bad_request(format!(
-                "Unknown channel type: {}. Supported types: webhook, email, telegram, wecom, dingtalk, slack, feishu",
+            return Err(ErrorResponse::validation(format!(
+                "Unknown channel type '{}'",
                 req.channel_type
+            ))
+            .with_hint(format!(
+                "Valid channel types: {}. Run `heramind message channel-types` for details.",
+                valid_types.join(", ")
             )));
         }
     };
@@ -306,7 +436,10 @@ pub async fn create_channel_handler(
 pub async fn delete_channel_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
+    admin: AdminSession,
 ) -> HandlerResult<serde_json::Value> {
+    require_admin(&admin.0)?;
+
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.write().await;
 
@@ -340,7 +473,10 @@ pub async fn delete_channel_handler(
 pub async fn test_channel_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
+    admin: AdminSession,
 ) -> HandlerResult<serde_json::Value> {
+    require_admin(&admin.0)?;
+
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.read().await;
 
@@ -376,9 +512,12 @@ pub struct UpdateChannelRequest {
 pub async fn update_channel_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
+    admin: AdminSession,
     Json(req): Json<UpdateChannelRequest>,
 ) -> HandlerResult<serde_json::Value> {
     use std::sync::Arc;
+
+    require_admin(&admin.0)?;
 
     let registry = state.core.message_manager.channels().await;
 
@@ -520,8 +659,11 @@ pub struct ToggleEnabledRequest {
 pub async fn toggle_enabled_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
+    admin: AdminSession,
     Json(req): Json<ToggleEnabledRequest>,
 ) -> HandlerResult<serde_json::Value> {
+    require_admin(&admin.0)?;
+
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.read().await;
 
@@ -591,7 +733,10 @@ pub struct AddRecipientRequest {
 pub async fn list_recipients_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
+    admin: AdminSession,
 ) -> HandlerResult<serde_json::Value> {
+    require_admin(&admin.0)?;
+
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.read().await;
 
@@ -627,8 +772,11 @@ pub async fn list_recipients_handler(
 pub async fn add_recipient_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
+    admin: AdminSession,
     Json(req): Json<AddRecipientRequest>,
 ) -> HandlerResult<serde_json::Value> {
+    require_admin(&admin.0)?;
+
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.read().await;
 
@@ -665,7 +813,10 @@ pub async fn add_recipient_handler(
 pub async fn remove_recipient_handler(
     State(state): State<ServerState>,
     Path((name, email)): Path<(String, String)>,
+    admin: AdminSession,
 ) -> HandlerResult<serde_json::Value> {
+    require_admin(&admin.0)?;
+
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.read().await;
 
@@ -711,7 +862,10 @@ pub async fn remove_recipient_handler(
 pub async fn get_channel_filter_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
+    admin: AdminSession,
 ) -> HandlerResult<serde_json::Value> {
+    require_admin(&admin.0)?;
+
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.read().await;
 
@@ -751,8 +905,11 @@ pub struct UpdateFilterRequest {
 pub async fn update_channel_filter_handler(
     State(state): State<ServerState>,
     Path(name): Path<String>,
+    admin: AdminSession,
     Json(req): Json<UpdateFilterRequest>,
 ) -> HandlerResult<serde_json::Value> {
+    require_admin(&admin.0)?;
+
     let registry = state.core.message_manager.channels().await;
     let registry_guard = registry.read().await;
 

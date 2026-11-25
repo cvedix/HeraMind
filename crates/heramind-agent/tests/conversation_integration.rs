@@ -88,6 +88,10 @@ impl TestContext {
             system_prompt: None,
             max_retries: 0,
             consecutive_failures: 0,
+            output_schema: None,
+            operator_config: None,
+            memory_mode: None,
+            notify: None,
             priority: 128,
             conversation_history: vec![],
             user_messages: vec![],
@@ -95,6 +99,7 @@ impl TestContext {
             context_window_size: 10,
             enable_tool_chaining: false,
             max_chain_depth: 3,
+            max_tokens_per_run: None,
         };
 
         self.store.save_agent(&agent).await?;

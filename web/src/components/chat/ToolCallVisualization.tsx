@@ -1,24 +1,31 @@
 /**
- * ToolCallVisualization - Displays AI tool/function calls as a "task process"
+ * Tool call sub-components for the round-based execution timeline.
  *
- * Mental model: tool calls are a process the AI goes through to complete a task.
- * The final answer (message.content) is always shown separately below this block.
- *
- * Structure:
- *   ┌─ 🔧 N tool calls · M steps  ▾ ─────────┐
- *   │ Step 1: 🧠 Thinking + 🔧 Tools          │  ← collapsible
- *   │ Step 2: 🧠 Thinking + 🔧 Tools          │
- *   └──────────────────────────────────────────┘
- *   Markdown content (the final answer)        ← rendered separately in chat.tsx
+ * TurnTimeline owns the outer process card and round grouping; this file
+ * provides the reusable intermediate-output row (RoundContent) and the
+ * single tool-call row (ToolCallItem).
  */
 
-import { useState, useEffect } from "react"
+import { useId, useState } from "react"
 import { useTranslation } from "react-i18next"
-import { Wrench, ChevronDown, CheckCircle2, Loader2, Code, FileText } from "lucide-react"
+import {
+  ChevronDown,
+  AlertCircle,
+  Loader2,
+} from "lucide-react"
 import { cn } from "@/lib/utils"
-import { textMini, textCode } from "@/design-system/tokens/typography"
+import { formatElapsedMs } from "@/lib/utils/format"
 import type { ToolCall } from "@/types"
-import { BuildCard, parseBuildResponse } from "@/components/chat/BuildCard"
+import {
+  extractToolDelivery,
+  getToolDisplayName,
+  getToolFailureReason,
+  isToolError,
+} from "./toolCallUtils"
+import {
+  deriveCommandDeliveryLadder,
+  type SendCommandDeliveryResult,
+} from "@/lib/commandDeliveryLadder"
 
 // ─── Helpers ───
 
@@ -28,40 +35,6 @@ function getToolStatus(hasResult: boolean, isStreaming: boolean): ToolStatus {
   if (hasResult) return "completed"
   if (isStreaming) return "running"
   return "pending"
-}
-
-function formatDuration(ms?: number): string {
-  if (!ms) return ""
-  if (ms < 1000) return `${ms}ms`
-  return `${(ms / 1000).toFixed(1)}s`
-}
-
-/** "device list --yes" → "device list" */
-function getToolDisplayName(name: string, args?: unknown): string {
-  if (!args || typeof args !== 'object') return name
-  const a = args as Record<string, unknown>
-
-  // Shell tool: parse "heramind device list" → "device list"
-  if (typeof a.command === 'string' && a.command.trim()) {
-    const cmd = a.command.trim()
-    if (cmd.startsWith('heramind ')) {
-      let rest = cmd.slice(8).trim()
-      // Remove cosmetic flags
-      rest = rest.replace(/\s*--(?:json|yes|force)\b/g, '')
-      return rest || name
-    }
-    // Non-heramind shell commands: show as-is (truncated)
-    return cmd.length > 40 ? cmd.slice(0, 37) + '...' : cmd
-  }
-
-  // Legacy aggregated tools: device(action)
-  const action = typeof a.action === 'string' ? a.action : ''
-  if (!action) return name
-  const extras: string[] = []
-  if (typeof a.device_id === 'string') extras.push(a.device_id)
-  if (typeof a.metric === 'string') extras.push(a.metric)
-  const suffix = extras.length > 0 ? ` ${extras.join(' · ')}` : ''
-  return `${name} ${action}${suffix}`
 }
 
 function formatJson(data: unknown): string {
@@ -76,178 +49,46 @@ function formatJson(data: unknown): string {
   return JSON.stringify(data, null, 2)
 }
 
-function groupByRound(toolCalls: ToolCall[]): Map<number, ToolCall[]> {
-  const groups = new Map<number, ToolCall[]>()
-  for (const tc of toolCalls) {
-    const round = tc.round ?? 1
-    if (!groups.has(round)) groups.set(round, [])
-    groups.get(round)!.push(tc)
-  }
-  return groups
+function deliverySubtitleKey(delivery: SendCommandDeliveryResult): string | null {
+  const ladder = deriveCommandDeliveryLadder(delivery)
+  if (!ladder.dispatched && !ladder.reachedKind) return null
+  if (ladder.allowVerifiedSuccess) return "commandDelivery.summaryVerified"
+  if (ladder.reachedKind === "adapter_accepted") return "commandDelivery.summaryAdapter"
+  if (ladder.reachedKind === "extension_accepted") return "commandDelivery.summaryExtension"
+  if (ladder.reachedKind === "device_acknowledged") return "commandDelivery.summaryDeviceAck"
+  if (ladder.dispatched) return "commandDelivery.summaryUnknown"
+  return null
 }
 
-/** Check if thinking duplicates the content (Phase 2 LLM may echo response as "thinking") */
-export function isThinkingDuplicate(thinking: string | undefined, content: string | undefined): boolean {
-  if (!thinking || !content) return false
-  const tPreview = thinking.slice(0, 200)
-  const cPreview = content.slice(0, 200)
-  if (!tPreview || !cPreview) return false
-  return cPreview.includes(tPreview) || tPreview.includes(cPreview)
-}
+// ─── RoundContent: inter-round text shown directly (muted, secondary) ───
 
-// ─── ToolProcessBlock: the main exported component ───
-
-interface ToolProcessBlockProps {
-  toolCalls: ToolCall[]
-  /** Per-round intermediate content (shown alongside tools in each round) */
-  roundContents?: Record<number, string>
-  isStreaming?: boolean
-}
-
-/**
- * Renders the tool-calling process as a collapsible card.
- * Shows: summary header + per-round content & tool calls.
- * Does NOT render thinking or final content — those are handled by chat.tsx.
- */
-export function ToolProcessBlock({
-  toolCalls,
-  roundContents = {},
-  isStreaming = false,
-}: ToolProcessBlockProps) {
-  const { t } = useTranslation("chat")
-  // Expansion is decided ONCE at mount: long completed batches start
-  // collapsed, streaming/short ones start expanded. The previous auto-collapse
-  // effect fired exactly when isStreaming flipped false — a message that
-  // streamed expanded would visually SNAP shut at completion (bubble
-  // re-layout mid-view). A streamed message keeps its expansion until the
-  // user toggles it.
-  const [isExpanded, setIsExpanded] = useState(
-    !(toolCalls.length > 4 && !isStreaming)
-  )
-
-  if (!toolCalls || toolCalls.length === 0) return null
-
-  const toolGroups = groupByRound(toolCalls)
-  const steps = Array.from(toolGroups.keys()).sort((a, b) => a - b)
-  const completedCount = toolCalls.filter(tc => tc.result != null).length
-  const allComplete = completedCount === toolCalls.length && !isStreaming
-  const manyCalls = toolCalls.length > 4
-
-  return (
-    <div className="mb-4 overflow-hidden rounded-lg bg-muted/40">
-      {/* Summary header */}
-      <button
-        onClick={() => setIsExpanded(!isExpanded)}
-        className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-muted-50 transition-colors"
-      >
-        <div className={cn(
-          "h-4 w-4 rounded flex items-center justify-center shrink-0",
-          allComplete && "bg-accent-emerald-light text-accent-emerald",
-          isStreaming && "bg-warning-light text-warning",
-          !allComplete && !isStreaming && "bg-muted text-muted-foreground"
-        )}>
-          {isStreaming ? (
-            <Loader2 className="h-2.5 w-2.5 animate-spin" />
-          ) : allComplete ? (
-            <CheckCircle2 className="h-4 w-4" />
-          ) : (
-            <Wrench className="h-2.5 w-2.5" />
-          )}
-        </div>
-        <span className={cn("text-body sm:text-sm", "font-medium text-foreground")}>
-          {isStreaming
-            ? `${completedCount}/${toolCalls.length} ${t("toolCall.status.running")}`
-            : `${toolCalls.length} ${t("toolCall.title")} · ${steps.length} ${t("toolCall.rounds")}`
-          }
-        </span>
-        <div className="flex-1" />
-        <ChevronDown className={cn(
-          "h-4 w-4 text-muted-foreground transition-transform duration-normal",
-          isExpanded && "rotate-180"
-        )} />
-      </button>
-
-      {/* Steps */}
-      {isExpanded && (
-        <div>
-          {steps.map((step, idx) => {
-            const calls = toolGroups.get(step) ?? []
-            const isLastStep = idx === steps.length - 1
-            const stepStreaming = isStreaming && isLastStep
-            const roundContent = roundContents[step]
-            return (
-              <div key={step} className="mb-1">
-                {/* Round content (intermediate results) */}
-                {roundContent && (
-                  <RoundContent content={roundContent} />
-                )}
-                {calls.map((tc, i) => (
-                  <ToolCallItem
-                    key={`${step}-${i}`}
-                    toolCall={tc}
-                    isStreaming={stepStreaming && tc.result == null}
-                    t={t}
-                  />
-                ))}
-              </div>
-            )
-          })}
-        </div>
-      )}
-    </div>
-  )
-}
-
-/** Round content block - shows intermediate results from each round */
-function RoundContent({ content }: { content: string }) {
-  const [isExpanded, setIsExpanded] = useState(false)
-
+export function RoundContent({ content }: { content: string }) {
   if (!content || content.trim().length === 0) return null
 
   return (
-    <div>
-      <button
-        onClick={() => setIsExpanded(!isExpanded)}
-        className="w-full flex items-center gap-2 px-3 py-1 text-left hover:bg-muted-30 transition-colors"
-      >
-        <FileText className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-        {!isExpanded && (
-          <span className={cn(textMini, "text-muted-foreground truncate")}>
-            {content.slice(0, 80)}{content.length > 80 && "..."}
-          </span>
-        )}
-        {isExpanded && (
-          <span className={cn(textMini, "text-muted-foreground")}>Details</span>
-        )}
-        <div className="flex-1" />
-        <ChevronDown className={cn(
-          "h-4 w-4 text-muted-foreground transition-transform",
-          isExpanded && "rotate-180"
-        )} />
-      </button>
-      {isExpanded && (
-        <div className="px-3 pb-2">
-          <div className={cn("text-body sm:text-sm", "font-mono text-muted-foreground whitespace-pre-wrap break-words leading-relaxed")}>
-            {content}
-          </div>
-        </div>
-      )}
+    <div
+      data-testid="round-intermediate"
+      className="py-2 text-base leading-5 text-muted-foreground whitespace-pre-wrap [overflow-wrap:anywhere]"
+    >
+      {content}
     </div>
   )
 }
 
 // ─── ToolCallItem: single tool call with expandable args/result ───
 
-function ToolCallItem({
+export function ToolCallItem({
   toolCall,
   isStreaming,
-  t
+  t,
 }: {
   toolCall: ToolCall
   isStreaming: boolean
-  t: (key: string) => string
+  t: (key: string, options?: Record<string, unknown>) => string
 }) {
+  const { t: tDevices } = useTranslation("devices")
   const [isExpanded, setIsExpanded] = useState(false)
+  const detailsId = useId()
   const status = getToolStatus(
     toolCall.result !== undefined && toolCall.result !== null,
     isStreaming
@@ -255,75 +96,83 @@ function ToolCallItem({
   const hasArguments = toolCall.arguments !== undefined && toolCall.arguments !== null
   const hasResult = toolCall.result !== undefined && toolCall.result !== null
   const hasDetails = hasArguments || hasResult
-
-  // Check if result contains build_meta for rich card rendering
-  const buildResponse = hasResult ? parseBuildResponse(toolCall.result) : null
-  const isBuildCard = buildResponse !== null
-
-  const statusLabels = {
-    pending: t("toolCall.status.pending"),
-    running: t("toolCall.status.running"),
-    completed: t("toolCall.status.completed"),
-  }
+  const failed = isToolError(toolCall)
+  const failureReason = failed ? getToolFailureReason(toolCall) : null
+  const delivery = !failed ? extractToolDelivery(toolCall) : null
+  const deliveryKey = delivery ? deliverySubtitleKey(delivery) : null
+  const displayName = getToolDisplayName(toolCall.name, toolCall.arguments)
 
   return (
-    <div className="px-3 py-1">
+    <div>
       <button
+        type="button"
         onClick={() => { if (hasDetails) setIsExpanded(!isExpanded) }}
+        aria-expanded={hasDetails ? isExpanded : undefined}
+        aria-controls={hasDetails ? detailsId : undefined}
         className={cn(
-          "w-full flex items-center gap-2 rounded text-left transition-colors",
-          hasDetails && "hover:bg-muted-30"
+          "flex w-full items-center gap-2 rounded py-2 text-left transition-colors",
+          hasDetails && "hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2"
         )}
         aria-label={hasDetails ? t("toolCall.toggleDetails") : undefined}
       >
-        <div className={cn(
-          "h-3.5 w-3.5 rounded-full flex items-center justify-center shrink-0",
-          status === "completed" && "text-accent-emerald",
-          status === "running" && "text-warning",
-          status === "pending" && "text-muted-foreground"
-        )}>
-          {status === "running" ? (
-            <Loader2 className="h-3 w-3 animate-spin" />
-          ) : status === "completed" ? (
-            <CheckCircle2 className="h-3.5 w-3.5" />
-          ) : (
-            <div className="h-1.5 w-1.5 rounded-full bg-muted-foreground" />
-          )}
-        </div>
-        <span className={cn("text-sm", "truncate text-muted-foreground")}>{getToolDisplayName(toolCall.name, toolCall.arguments)}</span>
+        <span className={cn("min-w-0 truncate text-base leading-5", failed ? "text-error" : "text-foreground")}>
+          <span className="mr-2 text-muted-foreground">{t("toolCall.label")}</span>
+          {displayName}
+        </span>
+        {!isStreaming && toolCall.durationMs != null && toolCall.durationMs > 0 && (
+          <span className="shrink-0 text-base tabular-nums text-muted-foreground">
+            {formatElapsedMs(toolCall.durationMs)}
+          </span>
+        )}
         {status === "running" && (
-          <span className={cn(textMini, "px-1.5 py-0.5 rounded bg-warning-light text-warning shrink-0")}>
-            {statusLabels[status]}
+          <span className="shrink-0 text-base text-warning">
+            {t("toolCall.status.running")}
+          </span>
+        )}
+        {failed && (
+          <span className="max-w-[40%] shrink-0 truncate text-base text-error" title={failureReason ?? undefined}>
+            {failureReason || t("toolCall.status.failed")}
           </span>
         )}
         <div className="flex-1" />
+        {/* Status icons share the trailing cluster with the chevron (vertically centered). */}
+        {status === "running" && (
+          <Loader2 className="h-4 w-4 shrink-0 self-center text-warning motion-safe:animate-spin" aria-hidden="true" />
+        )}
+        {failed && <AlertCircle className="h-4 w-4 shrink-0 self-center text-error" aria-hidden="true" />}
         {hasDetails && (
-          <ChevronDown className={cn(
-            "h-4 w-4 text-muted-foreground transition-transform duration-normal shrink-0",
-            isExpanded && "rotate-180"
-          )} />
+          <ChevronDown
+            className={cn(
+              "h-4 w-4 shrink-0 self-center text-current transition-transform duration-normal",
+              isExpanded && "rotate-180"
+            )}
+            aria-hidden="true"
+          />
         )}
       </button>
+      {deliveryKey && (
+        <div className="pl-[2.5rem] text-base text-muted-foreground" data-testid="tool-delivery-subtitle">
+          {tDevices(`devices:${deliveryKey}`)}
+        </div>
+      )}
       {isExpanded && hasDetails && (
-        <div className="ml-5.5 mt-0.5 mb-1 space-y-1">
+        <div id={detailsId} className="mb-1 mt-0.5 space-y-1">
           {hasArguments && (
-            <div className="rounded bg-muted-30 p-1.5">
-              <div className={cn(textMini, "text-muted-foreground mb-0.5 flex items-center gap-1")}>
-                <Code className="h-3 w-3" />{t("toolCall.arguments")}
+            <div className="py-1">
+              <div className="mb-1 flex items-center gap-1.5 text-sm text-muted-foreground">
+                {t("toolCall.arguments")}
               </div>
-              <pre className={cn(textCode, "font-mono text-muted-foreground whitespace-pre-wrap break-words leading-relaxed")}>
+              <pre className="max-h-40 overflow-y-auto overscroll-contain whitespace-pre-wrap font-mono text-sm leading-relaxed text-foreground [overflow-wrap:anywhere]">
                 {formatJson(toolCall.arguments)}
               </pre>
             </div>
           )}
-          {hasResult && isBuildCard ? (
-            <BuildCard response={buildResponse} />
-          ) : hasResult && (
-            <div className="rounded bg-muted-30 p-1.5">
-              <div className={cn(textMini, "text-muted-foreground mb-0.5 flex items-center gap-1")}>
-                <CheckCircle2 className="h-3 w-3" />{t("toolCall.result")}
+          {hasResult && (
+            <div className="py-1">
+              <div className="mb-1 flex items-center gap-1.5 text-sm text-muted-foreground">
+                {t("toolCall.result")}
               </div>
-              <pre className={cn(textCode, "font-mono text-muted-foreground whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed")}>
+              <pre className="max-h-40 overflow-y-auto overscroll-contain whitespace-pre-wrap font-mono text-sm leading-relaxed text-foreground [overflow-wrap:anywhere]">
                 {formatJson(toolCall.result)}
               </pre>
             </div>
@@ -337,9 +186,9 @@ function ToolCallItem({
 // ─── Legacy exports (keep for backward compat if other files import them) ───
 
 export function PerRoundBlocks(_props: any) {
-  return null // Deprecated: use ToolProcessBlock + MarkdownMessage instead
+  return null // Deprecated: use TurnTimeline + MarkdownMessage instead
 }
 
 export function ToolCallVisualization(_props: any) {
-  return null // Deprecated: use ToolProcessBlock instead
+  return null // Deprecated: use TurnTimeline instead
 }

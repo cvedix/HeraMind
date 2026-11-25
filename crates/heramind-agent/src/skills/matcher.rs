@@ -6,7 +6,7 @@ use super::types::*;
 /// Score a skill for **automatic system-prompt injection** (`match_skills`).
 ///
 /// Deliberately a DIFFERENT signal set from
-/// `toolkit::skill_tool::SkillTool::score_skill_query` (the `search`/`load` tool
+/// `toolkit::skill_tool::SkillTool::score_skill_query_parts` (the `search` tool
 /// actions) — do NOT merge the two. This scorer weights `tool_target` +
 /// `anti_triggers` + `priority`: auto-injection must AVOID loading a skill in
 /// the wrong scenario (e.g. exclude the "delete/update rule" skill when the
@@ -24,8 +24,9 @@ fn score_skill(skill: &Skill, user_input: &str) -> f32 {
     // "turn off the pump", "把泵停掉") plus a trailing "Includes 设备接入/..." —
     // extract those and match against the user input, so semantically-equivalent
     // phrasings trigger even when they share no literal keyword.
-    if !skill.metadata.description.is_empty() {
-        let phrases = description_intent_phrases(&skill.metadata.description);
+    let retrieval = retrieval_text(skill);
+    if !retrieval.is_empty() {
+        let phrases = description_intent_phrases(&retrieval);
         let mut desc_hits: f32 = 0.0;
         for p in &phrases {
             let p_lower = p.to_lowercase();
@@ -156,16 +157,35 @@ pub fn match_skills(
 /// targets). The body is excluded — it is instructions, not trigger
 /// vocabulary, and would drown the short fields' IDF signal.
 pub(crate) fn searchable_text(skill: &Skill) -> String {
-    let mut parts: Vec<String> = vec![
-        skill.metadata.name.clone(),
-        skill.metadata.description.clone(),
-    ];
+    let mut parts: Vec<String> = vec![skill.metadata.name.clone()];
+    // `summary` is the primary signal, but the legacy `description` STAYS in
+    // the corpus — it carries the quoted colloquial intent vocabulary
+    // ("把泵停掉", "shut down the pump") that terse summaries lack; dropping
+    // it lost two pinned routings the day this shipped. `not_for` is NEVER
+    // included: boundary wording in the corpus distorts ranking.
+    if !skill.metadata.summary.is_empty() {
+        parts.push(skill.metadata.summary.clone());
+    }
+    parts.push(skill.metadata.description.clone());
+    parts.extend(skill.metadata.aliases.iter().cloned());
     parts.extend(skill.metadata.triggers.keywords.iter().cloned());
     for t in &skill.metadata.triggers.tool_target {
         parts.push(t.tool.clone());
         parts.extend(t.actions.iter().cloned());
     }
     parts.join(" ")
+}
+
+/// The retrieval-facing intent text: `summary` plus the legacy
+/// `description` (the latter carries the quoted colloquial intent
+/// vocabulary). Shared by the matcher and the skill tool so the auto-inject
+/// path and the search path see the same vocabulary.
+pub(crate) fn retrieval_text(skill: &Skill) -> String {
+    if skill.metadata.summary.is_empty() {
+        skill.metadata.description.clone()
+    } else {
+        format!("{} {}", skill.metadata.summary, skill.metadata.description)
+    }
 }
 
 /// Extract intent phrases from a skill description for matching.
@@ -446,6 +466,21 @@ Control."#;
             ("开发一个自定义扩展", "extension-development"),
             ("帮我管理通知渠道", "message-management"),
             ("修改系统时区", "settings-management"),
+            // Welcome-chip phrasings + colloquial agent synonyms (jobs /
+            // AI tasks / 盯着) — these are user-facing copy; if routing
+            // drifts, users hit it first.
+            ("帮我创建一个虚拟设备（模拟数据源）", "device-onboarding"),
+            (
+                "Create a virtual device with simulated data",
+                "device-onboarding",
+            ),
+            ("帮我添加一个大模型后端", "llm-management"),
+            ("Help me add an LLM backend", "llm-management"),
+            ("看看我的 AI 代理都在做什么", "agent-management"),
+            ("What are my AI agents doing?", "agent-management"),
+            ("建个AI job每天检查电池", "agent-management"),
+            ("make an AI task", "agent-management"),
+            ("帮我盯着冷库的温度", "agent-management"),
         ];
         println!("=== BM25 A/B (query -> expected) ===");
         for (q, expect) in cases {

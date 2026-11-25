@@ -87,6 +87,8 @@ pub async fn list_device_types_handler(
                 commands,
                 metric_count: Some(t.metrics.len()),
                 command_count: Some(t.commands.len()),
+                builtin_version: t.builtin_version.clone(),
+                ct_prov: t.ct_prov.clone(),
             }
         })
         .collect();
@@ -140,6 +142,8 @@ pub async fn get_device_type_handler(
         "commands": template.commands,
         "default_offline_timeout_secs": template.default_offline_timeout_secs,
         "store_raw": template.store_raw,
+        "builtin_version": template.builtin_version,
+        "ct_prov": template.ct_prov,
         "metric_count": template.metrics.len(),
         "command_count": template.commands.len(),
     }))
@@ -175,7 +179,6 @@ pub async fn register_device_type_handler(
         })?;
 
     ok(json!({
-        "success": true,
         "registered": true,
         "device_type": type_id,
         "name": type_name,
@@ -208,7 +211,6 @@ pub async fn delete_device_type_handler(
         .map_err(|e| ErrorResponse::internal(format!("Failed to delete device type: {}", e)))?;
 
     ok(json!({
-        "success": true,
         "device_type": device_type,
         "deleted": true,
     }))

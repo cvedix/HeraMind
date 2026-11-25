@@ -99,6 +99,11 @@ pub const BUILTIN_WIDGET_TYPES: &[BuiltinWidgetType] = &[
         category: "display",
     },
     BuiltinWidgetType {
+        type_id: "event-list",
+        display_name: "Event List",
+        category: "display",
+    },
+    BuiltinWidgetType {
         type_id: "web-display",
         display_name: "Web Display",
         category: "display",

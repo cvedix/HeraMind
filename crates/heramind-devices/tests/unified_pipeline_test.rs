@@ -21,6 +21,8 @@ async fn create_test_registry_with_template() -> DeviceRegistry {
         description: "A test sensor with nested data".to_string(),
         categories: vec!["sensor".to_string()],
         mode: heramind_devices::registry::DeviceTypeMode::Simple,
+        builtin_version: None,
+        ct_prov: None,
         metrics: vec![
             MetricDefinition {
                 name: "values.battery".to_string(),
@@ -376,6 +378,8 @@ async fn test_extract_store_raw_false_skips_raw_metric() {
         description: String::new(),
         categories: vec![],
         mode: heramind_devices::registry::DeviceTypeMode::Simple,
+        builtin_version: None,
+        ct_prov: None,
         metrics: vec![MetricDefinition {
             name: "battery".to_string(),
             display_name: "Battery".to_string(),

@@ -13,6 +13,11 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
+/// How long a spawned scheduled task may WAIT for execution permits before
+/// deferring to the next tick. Bounds the running-slot squatter problem:
+/// waiting tasks must not hold concurrency accounting hostage.
+const PERMIT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Shared per-LLM-backend concurrency limiter.
 ///
 /// Maps a backend ID (e.g. "ollama-local") to a semaphore that limits how many
@@ -246,6 +251,11 @@ pub struct ScheduledTask {
 }
 
 /// Agent scheduler for executing agents on schedule.
+/// Structured (L0) circuit-breaker cooldown: seconds in Error before the
+/// scheduler lets a probe execution through. Self-healing — structured
+/// agents never stay dead the way legacy Error agents do.
+const STRUCTURED_CIRCUIT_COOLDOWN_SECS: i64 = 300;
+
 pub struct AgentScheduler {
     /// Scheduled tasks
     tasks: Arc<RwLock<HashMap<String, ScheduledTask>>>,
@@ -348,13 +358,20 @@ impl AgentScheduler {
             .await
             .map_err(|e| crate::HeraMindError::Config(format!("Schedule error: {}", e)))?;
 
+        // Bake the RESOLVED timezone (agent's own, else the scheduler
+        // default) into the task: calculate_next_execution falls back to the
+        // default tz, but update_next_execution reads task.timezone alone —
+        // leaving it None made the FIRST run fire on Shanghai time and every
+        // RESCHEDULE on UTC, drifting the schedule by the tz offset.
+        let default_tz = self.config.read().await.default_timezone.clone();
+        let resolved_tz = agent.schedule.timezone.clone().or(default_tz);
         let task = ScheduledTask {
             agent_id: agent.id.clone(),
             next_execution,
             interval_seconds: agent.schedule.interval_seconds,
             cron_expression: agent.schedule.cron_expression.clone(),
             cron_schedule,
-            timezone: agent.schedule.timezone.clone(),
+            timezone: resolved_tz,
             enabled: agent.status == heramind_storage::AgentStatus::Active,
             priority: agent.priority,
         };
@@ -470,6 +487,7 @@ impl AgentScheduler {
                     let executor = executor_ref.clone();
                     let running_executions_clone = running_executions.clone();
                     let task_handles_clone = running_task_handles.clone();
+                    let tasks_clone = tasks.clone();
                     let semaphore_clone = semaphore.clone();
                     let backend_sems = backend_semaphores.clone();
 
@@ -507,12 +525,41 @@ impl AgentScheduler {
                             task_handles: Some(task_handles_clone.clone()),
                         };
 
-                        // Acquire semaphore permit for concurrency control
-                        // If semaphore is closed, log and skip execution
-                        let _permit = match semaphore_clone.acquire().await {
-                            Ok(p) => p,
-                            Err(_) => {
+                        // Acquire semaphore permit for concurrency control,
+                        // BOUNDED: this task already occupies its
+                        // running_executions slot, and reserve_due_tasks skips
+                        // agents while the running set is full — an unbounded
+                        // wait here meant N tasks queued on one saturated
+                        // backend could starve agents on OTHER backends of
+                        // their turn indefinitely. Give up after the wait
+                        // budget; the next tick retries.
+                        let _permit = match tokio::time::timeout(
+                            PERMIT_WAIT_BUDGET,
+                            semaphore_clone.acquire(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(p)) => p,
+                            Ok(Err(_)) => {
                                 tracing::error!(agent_id = %agent_id, "Semaphore closed, skipping agent execution");
+                                return;
+                            }
+                            Err(_) => {
+                                // The reservation already ADVANCED
+                                // next_execution — returning now would drop
+                                // the entire cycle (the comment used to say
+                                // "deferring to next tick", but the next
+                                // tick is a full interval away). Re-arm to a
+                                // few seconds out so a freed permit is
+                                // picked up almost immediately; the running
+                                // slot is released by the RAII guard below.
+                                tracing::debug!(
+                                    agent_id = %agent_id,
+                                    "Global permit wait exceeded budget — re-arming for a near retry"
+                                );
+                                if let Some(t) = tasks_clone.write().await.get_mut(&agent_id) {
+                                    t.next_execution = chrono::Utc::now().timestamp() + 5;
+                                }
                                 return;
                             }
                         };
@@ -535,10 +582,26 @@ impl AgentScheduler {
                                         "Waiting for backend permit"
                                     );
                                 }
-                                let _backend_permit = match backend_sem.acquire().await {
-                                    Ok(p) => p,
-                                    Err(_) => {
+                                // Bounded for the same reason as the global
+                                // permit above: a saturated backend must not
+                                // hold this task's running slot hostage.
+                                let _backend_permit = match tokio::time::timeout(
+                                    PERMIT_WAIT_BUDGET,
+                                    backend_sem.acquire(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(p)) => p,
+                                    Ok(Err(_)) => {
                                         tracing::warn!(agent_id = %agent_id, "Backend semaphore closed");
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        tracing::debug!(
+                                            agent_id = %agent_id,
+                                            backend_id = %backend_id,
+                                            "Backend permit wait exceeded budget — deferring to next tick"
+                                        );
                                         return;
                                     }
                                 };
@@ -547,6 +610,58 @@ impl AgentScheduler {
                                     backend_id = %backend_id,
                                     "Acquired backend permit"
                                 );
+
+                                // Circuit-breaker self-healing gate, every mode.
+                                // Error means "permanent failure, needs a look" —
+                                // hammering it every tick only burns calls and
+                                // log lines. One probe per cooldown window;
+                                // success restores Active (the executor resets
+                                // status on a good run). Previously Free/Focused
+                                // Error agents kept executing on schedule
+                                // forever while showing a red badge.
+                                if agent.status == heramind_storage::AgentStatus::Error {
+                                    let last = agent.last_execution_at.unwrap_or_default();
+                                    let elapsed =
+                                        chrono::Utc::now().timestamp().saturating_sub(last);
+                                    if elapsed < STRUCTURED_CIRCUIT_COOLDOWN_SECS {
+                                        tracing::trace!(
+                                            agent_id = %agent_id,
+                                            elapsed_secs = elapsed,
+                                            "Agent in Error — circuit cooldown, skipping tick"
+                                        );
+                                        return;
+                                    }
+                                    tracing::info!(
+                                        agent_id = %agent_id,
+                                        elapsed_secs = elapsed,
+                                        "Agent Error cooldown elapsed — probing once"
+                                    );
+                                }
+
+                                // The daily cap applies to every mode: it is about
+                                // how often the agent may run, and a reasoning run
+                                // costs more per run, not less.
+                                if let Some(cap) = agent
+                                    .operator_config
+                                    .as_ref()
+                                    .and_then(|c| c.max_calls_per_day)
+                                {
+                                    let today =
+                                        chrono::Utc::now().format("%Y-%m-%d").to_string();
+                                    let over = crate::ai_agent::executor::global_daily_call_counts()
+                                        .read()
+                                        .get(&agent_id)
+                                        .map(|(d, n)| *d == today && *n >= cap)
+                                        .unwrap_or(false);
+                                    if over {
+                                        tracing::debug!(
+                                            agent_id = %agent_id,
+                                            cap,
+                                            "Daily run cap reached — skipping tick"
+                                        );
+                                        return;
+                                    }
+                                }
 
                                 let max_retries = agent.max_retries;
                                 let consecutive = agent.consecutive_failures;
@@ -564,8 +679,16 @@ impl AgentScheduler {
                                             "Scheduled agent execution completed"
                                         );
 
-                                        // Reset consecutive failures on success
-                                        if consecutive > 0 {
+                                        // Reset consecutive failures on success.
+                                        // Completed only — the executor counts
+                                        // FAILED runs toward the breaker now, and
+                                        // resetting on any Ok record erased that
+                                        // count after every failure (the breaker
+                                        // could never trip for scheduled agents).
+                                        if record.status
+                                            == heramind_storage::ExecutionStatus::Completed
+                                            && consecutive > 0
+                                        {
                                             if let Err(e) = executor
                                                 .store()
                                                 .update_agent_consecutive_failures(&agent_id, 0)
@@ -580,6 +703,21 @@ impl AgentScheduler {
                                         }
                                     }
                                     Err(e) => {
+                                        // Busy, not broken: the re-entrancy
+                                        // guard's rejection means a run we
+                                        // triggered is already in flight —
+                                        // counting it as a failure fed
+                                        // consecutive_failures and could
+                                        // demote a healthy agent after a few
+                                        // overlapping triggers. Return without
+                                        // counting (the slot guard cleans up).
+                                        if e.to_string().contains("already executing") {
+                                            tracing::debug!(
+                                                agent_id = %agent_id,
+                                                "Scheduled run overlapped an in-flight run — not a failure"
+                                            );
+                                            return;
+                                        }
                                         let new_consecutive = consecutive + 1;
 
                                         tracing::error!(
@@ -619,7 +757,35 @@ impl AgentScheduler {
                                             let backoff = std::time::Duration::from_secs(
                                                 5 * 2_u64.pow(new_consecutive.saturating_sub(1)),
                                             );
+                                            // Nap WITHOUT the permits. Sleeping
+                                            // while holding the global and
+                                            // backend permits was a head-of-line
+                                            // block: one failing agent's retry
+                                            // could pin a backend's only permits
+                                            // (and a global slot) for 20s+,
+                                            // stalling every other agent.
+                                            drop(_backend_permit);
+                                            drop(_permit);
                                             tokio::time::sleep(backoff).await;
+                                            // Re-acquire before the retry, with the
+                                            // SAME bounded wait as the initial
+                                            // acquisition — an unbounded wait here
+                                            // would re-introduce the slot-squatting
+                                            // the budget exists to prevent.
+                                            let _permit =
+                                                match tokio::time::timeout(PERMIT_WAIT_BUDGET, semaphore_clone.acquire())
+                                                    .await
+                                                {
+                                                    Ok(Ok(p)) => p,
+                                                    _ => return,
+                                                };
+                                            let _backend_permit =
+                                                match tokio::time::timeout(PERMIT_WAIT_BUDGET, backend_sem.acquire())
+                                                    .await
+                                                {
+                                                    Ok(Ok(p)) => p,
+                                                    _ => return,
+                                                };
 
                                             match executor.execute_agent(agent, None, None).await {
                                                 Ok(retry_record) => {
@@ -791,6 +957,14 @@ impl AgentScheduler {
                     return Ok((i64::MAX, None));
                 }
                 let interval = schedule.interval_seconds.unwrap_or(300);
+                // [no-catch-up, visibly] Rescheduling after downtime starts
+                // from NOW on purpose (a catch-up burst would be wrong);
+                // this trace makes the policy observable instead of silent.
+                tracing::trace!(
+                    interval_secs = interval,
+                    next_at = now.timestamp() + interval as i64,
+                    "Interval schedule anchored to now (downtime ticks are skipped, not caught up)"
+                );
                 Ok((now.timestamp() + interval as i64, None))
             }
             ScheduleType::Cron => {
@@ -845,8 +1019,13 @@ impl AgentScheduler {
     }
 
     /// Parse a cron expression using the standard cron library.
+    ///
+    /// Normalised first. The crate wants seconds in front; every expression a
+    /// user or the CLI writes (the help gives `"0 8 * * *"`) is the five-field
+    /// form, so without this a stored schedule parses at creation and then
+    /// fails here on the first tick.
     fn parse_cron_expression(expression: &str) -> Result<Schedule, SchedulerError> {
-        expression
+        heramind_core::cron::normalize(expression)
             .parse::<Schedule>()
             .map_err(|e| SchedulerError::CronParseError(e.to_string()))
     }

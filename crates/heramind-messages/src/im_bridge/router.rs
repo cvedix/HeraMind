@@ -12,6 +12,54 @@
 use super::*;
 use crate::im_bridge::session_store::{ImSessionStore, SessionKey};
 use std::collections::{HashMap, HashSet};
+
+/// Bounded msg_id dedup set with FIFO eviction (replaces HashSet+clear-at-
+/// cap, whose full reset re-processed every recent id after a redelivery
+/// burst). `insert` returns true when the id is NEW.
+#[derive(Default)]
+pub(crate) struct SeenSet {
+    set: HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl SeenSet {
+    pub fn insert(&mut self, id: String) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        if self.order.len() >= SEEN_CAP {
+            // Evict the oldest QUARTER (not one — amortized O(1) churn; not
+            // all — recent protection survives).
+            let evict = self.order.len() / 4;
+            for _ in 0..evict {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+            tracing::debug!(
+                cap = SEEN_CAP,
+                evicted = evict,
+                "im_router seen-set rotated"
+            );
+        }
+        self.set.insert(id.clone());
+        self.order.push_back(id);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Un-see an id (used when a pre-send failure wants redelivery to be
+    /// re-processable).
+    pub fn remove(&mut self, id: &str) {
+        if self.set.remove(id) {
+            self.order.retain(|x| x != id);
+        }
+    }
+}
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -33,6 +81,11 @@ pub struct InboundMessage {
     pub timestamp: i64,
 }
 
+/// Upper bound for the msg_id dedup set (see `seen`).
+const SEEN_CAP: usize = 10_000;
+/// Upper bound for the per-chat lock table before pruning idle entries.
+const CHAT_LOCKS_CAP: usize = 1_000;
+
 pub struct ImRouter {
     pub registry: ImBridgeRegistry,
     store: Arc<ImSessionStore>,
@@ -40,11 +93,27 @@ pub struct ImRouter {
     default_agent: DefaultAgentResolver,
     /// `None` = 允许所有（生产环境必须配置为 `Some`）。
     allowlist: Mutex<Option<HashSet<String>>>,
-    /// msg_id 去重。
-    seen: Mutex<HashSet<String>>,
+    /// msg_id 去重。带容量上限：每条入站消息的 id 曾永久驻留（进程生命
+    /// 周期内无界内存）；到上限时整表重建只保留现有条目并记一条 warn
+    /// （去重窗口本来就该短——Telegram 重投发生在秒级，不是天级）。
+    seen: Mutex<SeenSet>,
     /// per-chat 串行锁。
     chat_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// How long a run may stay silent before the user is told it is still
+    /// working. A reply that arrives in two seconds should not be preceded by
+    /// "working on it", so the notice is a timeout, not an acknowledgement.
+    interim_after: std::time::Duration,
 }
+
+/// Sent once if a run is still going. Silence for minutes reads as broken;
+/// silence for seconds does not.
+const INTERIM_NOTICE: &str = "⏳ 正在处理，可能需要几分钟，完成后我会回复你";
+
+/// How long a run may run before the notice goes out (production default).
+const INTERIM_AFTER_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hard ceiling on one run.
+const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl ImRouter {
     pub fn new(
@@ -59,9 +128,17 @@ impl ImRouter {
             runner,
             default_agent,
             allowlist: Mutex::new(allowlist),
-            seen: Mutex::new(HashSet::new()),
+            seen: Mutex::new(SeenSet::default()),
             chat_locks: Mutex::new(HashMap::new()),
+            interim_after: INTERIM_AFTER_DEFAULT,
         }
+    }
+
+    /// Override when the "still working" notice goes out. Tests set it low; the
+    /// production default is [`INTERIM_AFTER_DEFAULT`].
+    pub fn with_interim_after(mut self, after: std::time::Duration) -> Self {
+        self.interim_after = after;
+        self
     }
 
     pub async fn handle_inbound(&self, m: InboundMessage) {
@@ -118,7 +195,14 @@ impl ImRouter {
         // 2) msg_id 去重（同一 msg_id 只处理一次）。锁在 await 前显式释放。
         {
             let mut seen = self.seen.lock().await;
-            if !seen.insert(m.msg_id.clone()) {
+            // Bounded with FIFO eviction: the old clear()-on-overflow reset
+            // the WHOLE set at the cap — a redelivery burst right after a
+            // full window re-processed every recently-seen id (double
+            // agent runs, double replies). Evicting only the OLDEST quarter
+            // keeps recent protection while staying bounded.
+            if seen.insert(m.msg_id.clone()) {
+                // newly inserted — dedup MISS, continue processing below
+            } else {
                 return;
             }
         }
@@ -178,6 +262,9 @@ impl ImRouter {
                                 )
                                 .await;
                         }
+                        // Redelivery must be able to reach us once an agent
+                        // exists — forget this msg_id.
+                        self.unsee(&m.msg_id).await;
                         return;
                     }
                 };
@@ -185,6 +272,7 @@ impl ImRouter {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::error!(error=%e, "create_session failed");
+                        self.unsee(&m.msg_id).await;
                         return;
                     }
                 };
@@ -192,29 +280,57 @@ impl ImRouter {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::error!(error=%e, "im_session create failed");
+                        self.unsee(&m.msg_id).await;
                         return;
                     }
                 }
             }
             Err(e) => {
                 tracing::error!(error=%e, "im_session lookup failed");
+                self.unsee(&m.msg_id).await;
                 return;
             }
         };
 
-        // 6) Run agent with a 10-min timeout; surface timeout/failure as the reply
-        //    (English, no silent wait — user gets told instead of hanging).
-        let reply_text = match tokio::time::timeout(
-            std::time::Duration::from_secs(600),
-            self.runner.run(&rec.neo_session_id, &m.text),
-        )
-        .await
-        {
-            Ok(Ok(t)) => t,
-            Ok(Err(e)) => format!("Failed to process: {e}"),
-            Err(_elapsed) => {
-                "Request timed out after 10 minutes. Please try again or simplify your request."
-                    .to_string()
+        // 6) Run the agent. Three things can end the wait:
+        //    - the answer, which is sent as-is;
+        //    - the interim notice, sent ONCE if the run is still going after a
+        //      while. It is a timeout rather than an acknowledgement on purpose:
+        //      a question answered in two seconds must not be preceded by
+        //      "working on it", and a question that takes three minutes must not
+        //      be met with silence;
+        //    - the hard timeout, which reports itself rather than hanging.
+        let run = self.runner.run(&rec.neo_session_id, &m.text);
+        tokio::pin!(run);
+        let mut interim = Box::pin(tokio::time::sleep(self.interim_after));
+        let mut deadline = Box::pin(tokio::time::sleep(RUN_TIMEOUT));
+        let mut announced = false;
+
+        let reply_text = loop {
+            tokio::select! {
+                result = &mut run => {
+                    break match result {
+                        Ok(t) => t,
+                        Err(e) => format!("Failed to process: {e}"),
+                    };
+                }
+                _ = &mut interim, if !announced => {
+                    announced = true;
+                    if let Some(bridge) = self.registry.get(&m.platform).await {
+                        let _ = bridge.reply(&m.chat_id, INTERIM_NOTICE).await;
+                    }
+                }
+                _ = &mut deadline => {
+                    // The run future is abandoned here; its own per-round
+                    // persist never executes. Snapshot once from outside so
+                    // the user's message (already in agent memory) survives a
+                    // restart instead of vanishing with the dropped future.
+                    if let Err(e) = self.runner.persist(&rec.neo_session_id).await {
+                        tracing::warn!(error=%e, session_id=%rec.neo_session_id, "post-timeout persist failed");
+                    }
+                    break "Request timed out after 10 minutes. Please try again or simplify your request."
+                        .to_string();
+                }
             }
         };
         if let Err(e) = self.store.touch(&key) {
@@ -227,10 +343,22 @@ impl ImRouter {
         }
     }
 
-    /// 获取（或创建）per-chat 串行锁。
+    /// 撤销一条 msg_id 的"已见"标记。处理失败（无默认 agent、会话创建失败、
+    /// 映射写失败）时调用：msg_id 在任何处理发生前就进了 seen，若不撤销，
+    /// Telegram 的重投会被去重表拦下——用户的消息永远得不到响应也无人重试。
+    async fn unsee(&self, msg_id: &str) {
+        self.seen.lock().await.remove(msg_id);
+    }
+
+    /// 获取（或创建）per-chat 串行锁。顺手修剪无持有者的条目——锁表曾经
+    /// 只增不减（每个聊天过的 chat 一条，进程生命周期内常驻）；只有本表
+    /// 持有 Arc（strong_count == 1）说明没有在途对话在用它，可安全移除。
     async fn chat_lock_for(&self, platform: &ImPlatform, chat_id: &str) -> Arc<Mutex<()>> {
         let k = format!("{}:{}", platform.as_str(), chat_id);
         let mut g = self.chat_locks.lock().await;
+        if g.len() >= CHAT_LOCKS_CAP {
+            g.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
         g.entry(k)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
@@ -320,6 +448,41 @@ mod tests {
         (r, runner)
     }
 
+    /// The msg_id dedup set is BOUNDED: at SEEN_CAP the handler's guard
+    /// clears it, a fresh id is accepted, and dedup still works after.
+    #[tokio::test]
+    async fn seen_set_resets_at_cap_and_dedup_continues() {
+        let store = Arc::new(ImSessionStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let runner = Arc::new(EchoRunner::new());
+        let (r, _runner) = make_router(store, runner);
+
+        let mut seen = r.seen.lock().await;
+        for i in 0..SEEN_CAP {
+            seen.insert(format!("msg-{i}"));
+        }
+        assert_eq!(seen.len(), SEEN_CAP);
+        // At cap, insertion rotates the OLDEST quarter out; the id being
+        // inserted now is accepted, recent ids stay deduped, and the very
+        // oldest ones are forgotten (bounded).
+        assert!(
+            seen.insert("msg-cap".to_string()),
+            "fresh id accepted at cap (rotation, not reset)"
+        );
+        assert_eq!(seen.len(), SEEN_CAP - SEEN_CAP / 4 + 1);
+        assert!(
+            !seen.insert("msg-cap".to_string()),
+            "dedup still works post-rotation"
+        );
+        assert!(
+            !seen.insert(format!("msg-{}", SEEN_CAP - 2)),
+            "RECENT ids stay protected (no full reset)"
+        );
+        assert!(
+            seen.insert("msg-0".to_string()),
+            "the OLDEST ids are evicted by the rotation"
+        );
+    }
+
     #[tokio::test]
     async fn inbound_message_creates_session_and_replies() {
         let bridge = MockBridge::new(ImPlatform::Telegram);
@@ -343,6 +506,58 @@ mod tests {
         assert_eq!(replies.len(), 1, "agent runs → exactly 1 reply (no ack)");
         assert_eq!(replies[0].1, "echo:hi");
         assert_eq!(runner.creates(), 1, "first inbound creates a session");
+    }
+
+    /// A run that takes a while has to say something. Three minutes of silence
+    /// reads as broken — and the notice is a *timeout*, not an acknowledgement:
+    /// the test above is the other half, asserting a quick reply stays a single
+    /// message.
+    #[tokio::test]
+    async fn a_slow_run_says_it_is_still_working() {
+        struct SlowRunner;
+
+        #[async_trait]
+        impl AgentRunner for SlowRunner {
+            async fn create_session(&self) -> anyhow::Result<String> {
+                Ok("slow-session".into())
+            }
+            async fn run(&self, _sid: &str, text: &str) -> anyhow::Result<String> {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                Ok(format!("done:{text}"))
+            }
+        }
+
+        let bridge = MockBridge::new(ImPlatform::Telegram);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ImSessionStore::open(tmp.path()).unwrap());
+        let router = ImRouter::new(
+            store,
+            Arc::new(SlowRunner),
+            Arc::new(|| Box::pin(async { Some("agent-1".to_string()) })),
+            None,
+        )
+        .with_interim_after(std::time::Duration::from_millis(20));
+        router.registry.register(bridge.clone()).await;
+
+        router
+            .handle_inbound(InboundMessage {
+                platform: ImPlatform::Telegram,
+                chat_id: "123".into(),
+                sender_id: "123".into(),
+                text: "hi".into(),
+                msg_id: "slow-1".into(),
+                timestamp: 1,
+            })
+            .await;
+
+        let replies = bridge.replies_snapshot();
+        assert_eq!(replies.len(), 2, "the notice, then the answer: {replies:?}");
+        assert!(
+            replies[0].1.contains("正在处理"),
+            "the first message is the notice: {:?}",
+            replies[0]
+        );
+        assert_eq!(replies[1].1, "done:hi", "and the answer still arrives");
     }
 
     #[tokio::test]

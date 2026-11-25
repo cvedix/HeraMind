@@ -64,6 +64,11 @@ impl ErrorResponse {
         Self::new("UNAUTHORIZED", message, StatusCode::UNAUTHORIZED)
     }
 
+    /// Forbidden (403).
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new("FORBIDDEN", message, StatusCode::FORBIDDEN)
+    }
+
     /// Not found (404).
     pub fn not_found(resource: impl Into<String>) -> Self {
         Self::new(
@@ -167,10 +172,18 @@ impl From<heramind_devices::DeviceError> for ErrorResponse {
             }
             heramind_devices::DeviceError::InvalidParameter(msg) => {
                 Self::bad_request(msg.to_string()).with_hint(
-                    "Check required fields: --name (string), --type (device type ID), --adapter (mqtt|webhook|http-poll|ble|modbus-tcp|serial).\n\
+                    "Check required fields: name (--name), device_type (--device-type), adapter_type (--adapter-type: mqtt|webhook).\n\
                      Run 'heramind device types list' to see valid device types.",
                 )
             }
+            heramind_devices::DeviceError::BindIncomplete {
+                message,
+                config_applied,
+                retry_hint,
+            } => Self::service_unavailable(format!(
+                "{message}; config_applied={config_applied}"
+            ))
+            .with_hint(retry_hint),
             _ => Self::internal(e.to_string()),
         }
     }
@@ -185,7 +198,7 @@ impl From<heramind_rules::RuleError> for ErrorResponse {
             }
             m if m.contains("condition") || m.contains("threshold") => {
                 "Condition uses JSON format with 'condition_type': 'comparison' (source, operator, threshold), 'range' (source, min, max), or 'logical' (operator, conditions).\n\
-                 Operators: >, <, >=, <=, ==, !=\n\
+                 Operators: greater_than, less_than, greater_equal, less_equal, equal, not_equal\n\
                  Source format: \"device:<id>:<metric>\" or \"extension:<id>:<metric>\"".to_string()
             }
             _ => "Provide a valid JSON rule object. Required: 'name'. Condition types: 'comparison', 'range', 'logical'. Action types: 'notify', 'execute', 'trigger_agent'.".to_string(),
@@ -258,5 +271,55 @@ mod tests {
         let err =
             ErrorResponse::bad_request("invalid input").with_request_id("req-123".to_string());
         assert_eq!(err.request_id, Some("req-123".to_string()));
+    }
+
+    #[test]
+    fn device_invalid_parameter_hint_has_no_drifted_cli_flags() {
+        let err = ErrorResponse::from(heramind_devices::DeviceError::InvalidParameter(
+            "missing device_type".into(),
+        ));
+        let hint = err.hint.expect("InvalidParameter must carry a hint");
+        let flag_tokens: Vec<&str> = hint
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .filter(|tok| tok.starts_with("--"))
+            .collect();
+        assert!(
+            !flag_tokens.contains(&"--type"),
+            "drifted `--type` flag must not appear in hint: {hint}"
+        );
+        assert!(
+            !flag_tokens.contains(&"--adapter"),
+            "drifted `--adapter` flag must not appear in hint: {hint}"
+        );
+        assert!(
+            flag_tokens.contains(&"--device-type"),
+            "hint must reference `--device-type`: {hint}"
+        );
+        assert!(
+            flag_tokens.contains(&"--adapter-type"),
+            "hint must reference `--adapter-type`: {hint}"
+        );
+    }
+
+    #[test]
+    fn rule_condition_hint_uses_canonical_operators() {
+        let err = ErrorResponse::from(heramind_rules::RuleError::Validation(
+            "invalid condition threshold".into(),
+        ));
+        let hint = err.hint.expect("RuleError must carry a hint");
+        for op in [
+            "greater_than",
+            "less_than",
+            "greater_equal",
+            "less_equal",
+            "equal",
+            "not_equal",
+        ] {
+            assert!(hint.contains(op), "missing canonical operator {op}: {hint}");
+        }
+        assert!(
+            !hint.contains("Operators: >,"),
+            "symbol operator list must be replaced with canonical names: {hint}"
+        );
     }
 }

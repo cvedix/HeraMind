@@ -3,6 +3,10 @@
   "closePanel": "关闭",
   "resizePanel": "拖动调整对话面板宽度",
   "panelTitle": "AI 对话",
+  "panelStatus": {
+    "preparing": "正在准备对话",
+    "responding": "AI 正在回复"
+  },
   "streamInProgress": "正在响应中，完成后自动关闭...",
   "title": "智能物联网助手",
   "welcome": {
@@ -10,13 +14,11 @@
     "description": "智能物联网助手，帮你管理设备和自动化",
     "suggestions": {
       "checkDevices": "查看设备状态",
-      "createRule": "创建自动化规则",
-      "viewAlerts": "查看告警"
+      "createRule": "创建自动化规则"
     }
   },
   "input": {
     "placeholder": "输入消息...",
-    "sendHint": "按 <kbd>/</kbd> 显示建议",
     "selectModel": "选择模型",
     "selectLLMModel": "选择 LLM 模型",
     "attachment": "附件",
@@ -25,9 +27,7 @@
     "startNewConversation": "开始输入消息，与 AI 助手对话",
     "fallbackHelpPrompt": "你能做什么",
     "skills": "技能",
-    "selectSkills": "选择技能",
-    "noSkills": "暂无可用技能",
-    "activeSkills": "已激活技能"
+    "cancel": "取消请求"
   },
   "model": {
     "supportsVision": "支持图像",
@@ -35,18 +35,27 @@
     "addImage": "添加图片",
     "notSupportImage": "当前模型不支持图片",
     "visionError": "当前模型不支持图像输入。\n\n请选择一个支持视觉的模型（如 qwen3.5:4b），或者移除图片后重试。\n\n支持视觉的模型会显示 👁️ 图标。",
-    "supportsTools": "支持工具调用"
+    "supportsTools": "支持工具调用",
+    "visionViaCompanion": "图片将由本地视觉模型代为分析",
+    "forConversation": "本次对话使用的模型"
+  },
+  "capability": {
+    "tools": "工具调用",
+    "vision": "视觉",
+    "thinking": "思考"
   },
   "thinking": {
     "title": "思考过程",
+    "inlineTitle": "思考",
     "thinking": "思考中...",
-    "characters": "字符",
-    "rounds": "轮次"
+    "characters": "{{count}} 字",
+    "characters_other": "{{count}} 字",
+    "rounds": "{{count}} 轮",
+    "rounds_other": "{{count}} 轮"
   },
   "progress": {
     "thinking": "思考中",
-    "generating": "生成中",
-    "toolExecution": "执行工具"
+    "generating": "生成中"
   },
   "stage": {
     "thinking": "思考中",
@@ -61,46 +70,44 @@
     "status": {
       "pending": "等待",
       "running": "执行中",
-      "completed": "完成"
+      "completed": "完成",
+      "failed": "失败"
     },
+    "intermediate": "中间说明",
+    "label": "工具",
     "arguments": "参数",
     "result": "结果",
-    "roundTitle": "第 {{round}} 轮",
-    "multiRoundTitle": "工具调用",
     "rounds": "轮",
+    "callsCount": "{{count}} 个工具调用",
+    "callsCount_other": "{{count}} 个工具调用",
+    "countShort": "{{count}} 个工具",
+    "countShort_other": "{{count}} 个工具",
+    "roundsCount": "{{count}} 轮",
+    "roundsCount_other": "{{count}} 轮",
+    "runningWith": "正在执行 {{name}}…",
+    "details": "查看详情",
+    "hideDetails": "收起详情",
     "toggleDetails": "展开/收起详情"
+  },
+  "timeline": {
+    "title": "执行过程",
+    "roundFallback": "第 {{round}} 轮"
   },
   "connection": {
     "connected": "已连接",
     "reconnecting": "重连中",
     "error": "连接错误",
     "disconnected": "未连接",
-    "retryAttempt": "第 {{count}} 次尝试",
-    "retryProgress": "尝试 {{retry}}/{{max}}{{seconds, string}}",
-    "retrySeconds": " · {{seconds}}s",
     "reconnect": "重新连接",
     "authFailed": "连接中断（认证失败）",
     "interruptedSaved": "连接中断 — 本轮回复仍会在后台完成并保存到会话历史，稍后返回本会话即可看到"
   },
   "quickActions": {
     "refreshDevices": "刷新设备状态",
-    "refreshPrompt": "刷新所有设备的状态",
-    "viewDeviceDetails": "查看设备详情",
-    "viewDevicePrompt": "显示设备的详细信息和配置",
     "createAutomation": "创建自动化",
-    "createAutomationPrompt": "帮我创建一个新的自动化规则",
-    "viewAllAutomations": "查看所有自动化",
-    "viewAllAutomationsPrompt": "列出所有已配置的自动化规则",
-    "viewAnalytics": "查看数据分析",
-    "viewAnalyticsPrompt": "显示最近的数据分析和趋势",
     "checkAlerts": "检查告警",
-    "checkAlertsPrompt": "检查当前是否有未处理的告警",
     "openSettings": "打开设置",
-    "openSettingsPrompt": "打开系统设置页面",
-    "continue": "继续对话",
-    "continuePrompt": "继续",
-    "elaborate": "详细说明",
-    "elaboratePrompt": "请详细说明一下"
+    "continue": "继续对话"
   },
   "taskProgress": {
     "title": "任务进度",
@@ -122,61 +129,9 @@
     "stepLabel": "第 {{step}} 步",
     "automationCreated": "自动化已成功创建！"
   },
-  "intent": {
-    "queryData": {
-      "label": "查询数据",
-      "description": "查询设备状态或历史数据"
-    },
-    "analyzeData": {
-      "label": "分析数据",
-      "description": "分析趋势、异常或统计"
-    },
-    "controlDevice": {
-      "label": "控制设备",
-      "description": "控制设备开关或调节参数"
-    },
-    "createAutomation": {
-      "label": "创建自动化",
-      "description": "创建规则或工作流"
-    },
-    "sendMessage": {
-      "label": "发送消息",
-      "description": "发送通知或报告"
-    },
-    "summarize": {
-      "label": "汇总信息",
-      "description": "汇总或总结信息"
-    },
-    "clarify": {
-      "label": "需要澄清",
-      "description": "需要更多信息"
-    },
-    "outOfScope": {
-      "label": "超出范围",
-      "description": "超出系统能力范围"
-    },
-    "confidence": "置信度",
-    "type": "类型",
-    "path": {
-      "fast": "快速路径",
-      "standard": "标准",
-      "quality": "高质量",
-      "multiTurn": "多轮对话",
-      "fallback": "降级"
-    },
-    "entity": {
-      "device": "设备",
-      "location": "位置",
-      "value": "数值",
-      "time": "时间",
-      "action": "动作",
-      "unknown": "未知"
-    }
-  },
   "loading": "加载中...",
   "errors": {
     "sendMessage": "发送消息失败",
-    "connectionLost": "连接已断开",
     "retry": "重试",
     "llmError": "LLM 服务错误",
     "dismiss": "关闭"
@@ -192,28 +147,6 @@
     "goToSettings": "前往设置",
     "downloadBuiltin": "下载内置 AI 模型（推荐）"
   },
-  "build": {
-    "view": "查看",
-    "undo": "撤销",
-    "showDetails": "详情",
-    "hideDetails": "收起",
-    "types": {
-      "device": "设备",
-      "dashboard": "仪表盘",
-      "rule": "规则",
-      "extension": "扩展",
-      "widget": "组件",
-      "transform": "转换",
-      "agent": "智能体",
-      "message": "消息"
-    },
-    "actions": {
-      "create": "已创建",
-      "update": "已更新",
-      "delete": "已删除",
-      "install": "已安装"
-    }
-  },
   "newChat": "新对话",
   "chat": {
     "suggestions": {
@@ -226,13 +159,27 @@
   },
   "code": {
     "copy": "复制",
-    "copied": "已复制"
+    "copied": "已复制",
+    "wrap": "换行显示",
+    "unwrap": "取消换行",
+    "expand": "展开全部",
+    "collapse": "收起"
   },
+  "image": {
+    "view": "查看图片",
+    "close": "关闭图片",
+    "alt": "图片 {{index}}"
+  },
+  "message": {
+    "charsPerSecond": "字符/秒"
+  },
+  "a11y": {
+    "generating": "正在生成回复",
+    "answerReady": "回复已完成"
+  },
+  "newContent": "有新内容",
   "scrollToBottom": "回到底部",
   "copyMessage": "复制消息",
-  "footer": {
-    "disclaimer": "免责声明"
-  },
   "toolLoopProgress": "工具调用中 · 第 {{round}} 轮",
   "context": {
     "title": "上下文占用",
@@ -240,6 +187,94 @@
     "toolDefs": "工具定义",
     "history": "对话历史",
     "estimatedHint": "基于字符估算——下次回复后更新为精确值",
-    "msgCount": " · {{count}} 条"
+    "msgCount": " · {{count}} 条",
+    "compact": "立即压缩",
+    "compacting": "压缩中…",
+    "compactDone": "已压缩 {{count}} 条历史消息",
+    "compactNothing": "暂无可压缩的对话内容",
+    "compactFailed": "压缩失败",
+    "compactConfirmTitle": "压缩上下文？",
+    "compactConfirmDesc": "较早的对话将被压缩为摘要以释放上下文空间。界面中的历史消息保留不变，仅影响之后的请求。",
+    "historyTruncated": "上下文已满，较早的消息不再发送给模型（页面仍保留显示）。可在“上下文”里立即压缩以释放空间。",
+    "clear": "清空对话",
+    "clearDone": "已清空对话历史",
+    "clearFailed": "清空失败",
+    "clearConfirmTitle": "清空对话历史？",
+    "clearConfirmDesc": "该会话的全部对话历史将被删除，此操作无法恢复。",
+    "awaitingMeasurement": "等待模型请求的上下文实测值",
+    "breakdownUnavailable": "本次请求的分类统计不可用；仅总 token 数可用于参考。",
+    "measuredHint": "最近一次模型请求的上下文；不累加整个执行过程。"
+  },
+  "loadEarlier": "加载更早的消息",
+  "loadEarlierLoading": "加载中…",
+  "goalStatus": {
+    "label": "系统目标状态",
+    "notApplicable": "本轮无约束目标可核验（不等于已成功）。",
+    "incomplete": "目标未完成 — 证据等级 {{level}}。{{reason}}",
+    "completeEligible": "命令证据 {{level}}（结构化完成已允许{{physical}}）。",
+    "completeEligiblePhysical": "；物理效果已核验",
+    "completeEligibleNoPhysical": "；物理效果未核验",
+    "completed": "目标已完成（证据 {{id}}）。",
+    "halted": "目标已中止：{{reason}}",
+    "cancelled": "目标已取消。",
+    "level": {
+      "none": "无",
+      "config_success": "仅配置成功",
+      "command_dispatched": "命令已下发",
+      "device_acknowledged": "设备已确认",
+      "physical_effect_verified": "物理效果已核验"
+    },
+    "endReason": {
+      "normal": "正常结束",
+      "interrupted": "已中断",
+      "timeout": "超时",
+      "error": "错误",
+      "cancelled": "已取消",
+      "cannot_continue": "无法继续"
+    }
+  },
+  "suggestions": {
+    "badge": "推荐"
+  },
+  "mention": {
+    "title": "选择要引用的对象",
+    "searching": "搜索中…",
+    "noResults": "没有匹配的对象",
+    "referencesLabel": "引用的对象",
+    "remove": "移除引用",
+    "device": "设备",
+    "rule": "规则",
+    "transform": "转换",
+    "agent": "代理",
+    "invalid": "引用无效",
+    "invalidSend": "部分引用无效，请修正后重发",
+    "contentOverLimit": "消息内容超出单条上限（引用最多 20 个、文本 8000 字），请删减后重发",
+    "reuseInComposer": "填回输入框",
+    "filterTypes": "按类型筛选",
+    "filterAll": "全部",
+    "partialFailure": "部分类型加载失败",
+    "searchFailed": "搜索失败，请重试",
+    "loadMore": "加载更多",
+    "protoTitle": "行内 @ 原型",
+    "protoDesc": "独立编辑器原型：评估行内引用交互；不写入生产 ChatComposer。",
+    "protoHint": "行内引用原型：@ 或工具栏插入；同一对象可出现多次；芯片整块删除。",
+    "protoText": "消息文本",
+    "protoMobile": "移动端引用选择面板",
+    "insertAt": "插入 @ 引用",
+    "insert": "插入引用",
+    "protoPlain": "明文",
+    "protoLegacy": "旧芯片投影",
+    "protoHistory": "发送后历史预览（行内标签）",
+    "protoHistoryEmpty": "输入并插入引用后在此预览",
+    "protoTradeoffLink": "原型取舍文档已归档；生产聊天使用 TipTap Mention。",
+    "protoViewportAuto": "跟随窗口",
+    "protoViewportDesktop": "桌面浮层",
+    "protoViewportMobile": "移动面板"
+  },
+  "authorizeConfirm": {
+    "title": "确认重跑被阻断的写入",
+    "pickOne": "有多个被阻断的操作 — 请选择要重跑的那一个",
+    "button": "重跑 {{opId}}",
+    "buttonWithTarget": "重跑 {{opId}} · {{target}}"
   }
 }

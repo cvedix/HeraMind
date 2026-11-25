@@ -54,9 +54,9 @@
 
 <br/>
 
-## HeraMind 0.9.24
+## HeraMind 1.3.3
 
-Bản mã nguồn này tích hợp [NeoMind v0.9.24](https://github.com/camthink-ai/NeoMind/releases/tag/v0.9.24): hỗ trợ LLM cục bộ tích hợp, kết nối ứng dụng nhắn tin, OpenAPI, bảo vệ cơ sở dữ liệu và SDK extension 0.7.1. HeraMind giữ tiếng Việt mặc định, giao diện xanh và logo riêng, phân tích HeraCam/bodycam, đường dẫn dữ liệu và kênh cập nhật riêng. Xem [ghi chú tích hợp và kiểm chứng](docs/upstream-sync-0.9.24.md). Phiên bản mã nguồn này chưa đồng nghĩa với một bản cài đặt HeraMind đã được phát hành.
+Bản mã nguồn này tích hợp [NeoMind v1.3.3](https://github.com/camthink-ai/NeoMind/releases/tag/v1.3.3). Bản cập nhật bổ sung giao diện di động mới, nhắc đến thiết bị và tác tử ngay trong chat, cải tiến thực thi và thông báo của tác tử, chẩn đoán kết nối MQTT và phân trang trực tiếp từ kho dữ liệu telemetry. HeraMind giữ tiếng Việt mặc định, logo và giao diện xanh, dashboard HeraCam/bodycam, thư mục dữ liệu và kênh cập nhật riêng. Xem [ghi chú tích hợp](docs/upstream-sync-1.3.3.md) và [tham khảo cấu hình](docs/configuration.md).
 
 ## HeraMind là gì?
 

@@ -85,6 +85,27 @@ impl UnifiedValueProvider {
         self
     }
 
+    /// When the cached value for this source was last written (epoch ms).
+    ///
+    /// Read-only observability for rule explanation; does not apply TTL
+    /// expiry (callers pair it with `get_by_source`, which does).
+    pub fn value_cached_at_ms(&self, source: &DataSourceId) -> Option<i64> {
+        let source_type = match source.source_type {
+            DataSourceType::Device => "device",
+            DataSourceType::Extension => "extension",
+            DataSourceType::Transform => "transform",
+            DataSourceType::Ai => "ai",
+        };
+        let cache = self.cache.read();
+        cache
+            .get(&(
+                source_type.to_string(),
+                source.source_id.clone(),
+                source.field_path.clone(),
+            ))
+            .map(|e| e.timestamp)
+    }
+
     /// Update a cached numeric metric value.
     pub async fn update_value(&self, source_type: &str, source_id: &str, metric: &str, value: f64) {
         self.update_rule_value(source_type, source_id, metric, RuleValue::Number(value))
@@ -157,6 +178,7 @@ impl UnifiedValueProvider {
             DataSourceType::Device => "device",
             DataSourceType::Extension => "extension",
             DataSourceType::Transform => "transform",
+            DataSourceType::Ai => "ai",
         };
         self.update_value(
             source_type,
@@ -177,6 +199,7 @@ impl UnifiedValueProvider {
             DataSourceType::Device => "device",
             DataSourceType::Extension => "extension",
             DataSourceType::Transform => "transform",
+            DataSourceType::Ai => "ai",
         };
         self.update_string_value(
             source_type,
@@ -243,6 +266,7 @@ impl ValueProvider for UnifiedValueProvider {
             DataSourceType::Device => "device",
             DataSourceType::Extension => "extension",
             DataSourceType::Transform => "transform",
+            DataSourceType::Ai => "ai",
         };
         // [contention-safe] parking_lot read — the old tokio try_read treated
         // lock contention as "no value", so rule conditions evaluated as
@@ -273,6 +297,43 @@ impl ValueProvider for UnifiedValueProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent's published field is a rule-bindable source like any other
+    /// (M1/M2-2): parse `ai:{agent}:{field}`, feed it a value the way the
+    /// event bus would, and a rule reading the same DataSourceId sees it.
+    /// Guards the `ai` arms added to update/get — before them, parse failed
+    /// and rules could never bind AI output at all.
+    #[test]
+    fn test_unified_value_provider_ai_source() {
+        let provider = UnifiedValueProvider::new();
+
+        // The round trip through the typed DataSourceId — this is what a
+        // rule condition's source parses into.
+        let ds =
+            DataSourceId::parse("ai:agent-1:anomaly_count").expect("ai:{agent}:{field} must parse");
+        assert_eq!(ds.source_part(), "ai:agent-1");
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            provider.update_from_data_source_id(&ds, 3.0).await;
+        });
+
+        assert_eq!(
+            provider.get_by_source(&DataSourceId::ai("agent-1", "anomaly_count")),
+            Some(RuleValue::Number(3.0))
+        );
+
+        // String fields (enum verdicts) ride the string update path too.
+        let verdict = DataSourceId::ai("agent-1", "status");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            provider
+                .update_string_from_data_source_id(&verdict, "异常")
+                .await;
+        });
+        assert_eq!(
+            provider.get_by_source(&verdict),
+            Some(RuleValue::Text("异常".to_string()))
+        );
+    }
 
     #[test]
     fn test_cache_entry_expiration() {

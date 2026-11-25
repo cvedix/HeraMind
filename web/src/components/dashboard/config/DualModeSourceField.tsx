@@ -15,7 +15,7 @@
 
 import { useState, useRef, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Link2, Unlink, Upload, Trash2, Database, Server, Zap, Activity, Puzzle, Workflow, Brain, MapPin } from 'lucide-react'
+import { Link2, Unlink, Upload, Trash2, Database, Server, Zap, Activity, Puzzle, Workflow, MapPin } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { normalizeImageUrl } from '@/lib/imageUtils'
@@ -53,7 +53,7 @@ export interface DualModeSourceFieldProps {
   /** Callback when data source changes */
   onDataSourceChange: (ds: DataSourceOrList | undefined) => void
   /** Allowed data source types */
-  allowedTypes?: Array<'device-metric' | 'device-command' | 'device-info' | 'device' | 'metric' | 'command' | 'system' | 'extension' | 'extension-command' | 'transform'>
+  allowedTypes?: Array<'device-metric' | 'device-command' | 'device-info' | 'device' | 'metric' | 'command' | 'system' | 'extension' | 'extension-command' | 'transform' | 'ai'>
   /** Label for the field */
   label: string
   /** Placeholder text for manual input */
@@ -194,7 +194,7 @@ export function DualModeSourceField({
               variant="ghost"
               size="sm"
               onClick={openPicker}
-              className="h-7 px-2 text-xs text-primary"
+              className="h-7 px-2 text-xs text-primary sm:h-7"
             >
               {t('dualMode.changeSource')}
             </Button>
@@ -202,7 +202,7 @@ export function DualModeSourceField({
               variant="ghost"
               size="sm"
               onClick={handleUnbind}
-              className="h-7 w-7 p-0 text-muted-foreground hover:text-error"
+              className="h-7 w-7 p-0 text-muted-foreground hover:text-error sm:h-7 sm:w-7"
             >
               <Unlink className="h-3.5 w-3.5" />
             </Button>
@@ -232,7 +232,7 @@ export function DualModeSourceField({
                   variant="outline"
                   size="sm"
                   onClick={() => fileInputRef.current?.click()}
-                  className="h-9 px-3 shrink-0"
+                  className="h-9 px-3 shrink-0 sm:h-9"
                 >
                   <Upload className="h-4 w-4 mr-1.5" />
                   {t('dualMode.upload')}
@@ -243,7 +243,7 @@ export function DualModeSourceField({
                 variant="outline"
                 size="sm"
                 onClick={openPicker}
-                className="h-9 px-3 shrink-0"
+                className="h-9 px-3 shrink-0 sm:h-9"
                 title={t('dualMode.bindSource')}
               >
                 <Link2 className="h-4 w-4" />
@@ -270,7 +270,7 @@ export function DualModeSourceField({
                     variant="ghost"
                     size="sm"
                     onClick={handleClearImage}
-                    className="h-7 text-error hover:text-error"
+                    className="h-7 text-error hover:text-error sm:h-7"
                   >
                     <Trash2 className="h-3 w-3 mr-1" />
                     {t('dualMode.clear')}
@@ -299,7 +299,8 @@ export function DualModeSourceField({
 
       {/* Data source picker dialog */}
       <Dialog open={pickerOpen} onOpenChange={(open) => { if (!open) handleCancel() }}>
-        <DialogContent className="z-[110] max-w-2xl !h-[70vh] flex flex-col !p-0 overflow-hidden">
+        {/* sm:!h-[70vh] only — bare !h-[70vh] overrides DialogContent's mobile !h-full. */}
+        <DialogContent className="z-[110] max-w-2xl sm:!h-[70vh] flex flex-col !p-0 overflow-hidden">
           <DialogHeader className="px-5 py-3 border-b shrink-0">
             <DialogTitle className="text-base">{t('dualMode.selectDataSource')}</DialogTitle>
           </DialogHeader>

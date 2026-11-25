@@ -1,4 +1,4 @@
-import { ReactNode, Fragment } from 'react'
+import { ReactNode, Fragment, useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { MobilePageHeader } from '@/components/layout/MobilePageHeader'
@@ -63,6 +63,17 @@ const maxWidthClass = {
 }
 
 /**
+ * Scrolled-header elevation: a two-layer contact+ambient shadow that fades
+ * downward from the header's bottom edge. Deliberately shadow-ONLY — a
+ * hairline border sits flush against the tab underline and the toolbar
+ * buttons/inputs that bottom-align at this edge (they'd read as touching
+ * the line), while a shadow starts at ~4% opacity and immediately falls
+ * off, reading as depth instead of a divider.
+ */
+const ELEVATED_SHADOW =
+  'shadow-[0_1px_2px_rgba(0,0,0,0.04),0_4px_12px_-2px_rgba(0,0,0,0.07)]'
+
+/**
  * Standard page layout container
  *
  * Provides consistent padding, max-width, and optional header across all pages.
@@ -90,12 +101,43 @@ export function PageLayout({
   className,
   borderedHeader = false,
   hideFooterOnMobile = false,
-  fixedActionsOnMobile = false,
+  fixedActionsOnMobile: _fixedActionsOnMobile = false,
   noPadding = false,
   hasBottomNav = false,
   mobileHeader,
 }: PageLayoutProps) {
   const isMobile = useIsMobile()
+  // Scroll-aware header elevation. The scroll container sits BELOW the
+  // title/tabs stack and shares its white bg, so rows scrolling up get
+  // hard-clipped at an invisible boundary (reads as tearing). Once the
+  // container is scrolled, the header stack's bottom edge gains a soft
+  // downward shadow — the Linear/Notion affordance that says "content
+  // continues beneath this line". At rest nothing shows, preserving the
+  // tabs' underline-only design.
+  //
+  // Detection is a 1px sentinel + IntersectionObserver, NOT onScroll:
+  // IO is computed by the rendering engine on every scroll cause
+  // (wheel, programmatic, keyboard, anchor) with no dependency on
+  // scroll-event dispatch, and it clears itself when content swaps
+  // shrink the container back to unscrolled.
+  const [contentScrolled, setContentScrolled] = useState(false)
+  const sentinelRef = useRef<HTMLDivElement>(null)
+  const scrollerRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const sentinel = sentinelRef.current
+    const root = scrollerRef.current
+    if (!sentinel || !root) return
+    const io = new IntersectionObserver(
+      ([entry]) => setContentScrolled(!entry.isIntersecting),
+      { root },
+    )
+    io.observe(sentinel)
+    return () => io.disconnect()
+  }, [])
+  // Only meaningful on desktop: the mobile header is the fixed
+  // MobilePageHeader with its own chrome, and headerContent's wrapper can
+  // be empty there (PageTabsBar lifts its actions away on mobile).
+  const headerElevated = !isMobile && contentScrolled
   // Registry that lets children (e.g. PageTabsBar on mobile) "lift" their
   // action buttons into the MobilePageHeader above the content, and push
   // wide controls (search/filter) into a sticky toolbar inside the content.
@@ -115,7 +157,7 @@ export function PageLayout({
     : showFooter
       ? '14rem'                                          // footer clearance (224px)
       : isMobile
-        ? 'calc(1.5rem + env(safe-area-inset-bottom, 0px))'
+        ? 'calc(6rem + env(safe-area-inset-bottom, 0px))'
         : '2rem'
 
   return (
@@ -142,9 +184,21 @@ export function PageLayout({
       )}
       {/* Desktop: PageHeader with title + description + actions.
           mx-auto + maxWidth mirror the scroll container so the title and
-          content share the same left edge. */}
+          content share the same left edge. Pages without headerContent have
+          the scroll edge directly under this strip — it takes the elevation
+          instead. */}
       {title && !isMobile && (
-        <div className="shrink-0 bg-background">
+        <div
+          className={cn(
+            'shrink-0 bg-background transition-shadow duration-normal',
+            !headerContent && headerElevated && ELEVATED_SHADOW,
+          )}
+        >
+          {/* Title row rhythm — kept IDENTICAL to the dashboard page's
+              hand-rolled title row (VisualDashboard pt-4/5/6 pb-2/3/3):
+              title + tabs fuse into ONE header block, the compact look the
+              dashboard established. The tabs→content separation comes from
+              PageTabsContent's mt-4 plus this row's pb. */}
           <div className={cn('mx-auto w-full px-4 pt-4 pb-2 sm:px-6 sm:pt-5 sm:pb-3 md:px-8 md:pt-6 md:pb-3', maxWidthClass[maxWidth], className)}>
             <PageHeader
               title={title}
@@ -157,9 +211,17 @@ export function PageLayout({
       )}
       {/* Fixed header content (e.g., tabs) - outside scroll container.
           bg-background matches the title strip above and the scroll
-          container below for visual continuity. */}
+          container below for visual continuity. When content scrolls
+          beneath, a SOFT downward shadow fades in (no hairline border — a
+          crisp line hugs the tab/button bottoms sitting flush at this
+          edge; a shadow reads as the header floating above the content). */}
       {headerContent && (
-        <div className="shrink-0 bg-background">
+        <div
+          className={cn(
+            'shrink-0 bg-background transition-shadow duration-normal',
+            headerElevated && ELEVATED_SHADOW,
+          )}
+        >
           {headerContent}
         </div>
       )}
@@ -170,8 +232,8 @@ export function PageLayout({
             container so it stays visible while content scrolls. Desktop is
             unaffected (those actions render in the desktop tab bar instead). */}
         {isMobile && collectedMobileContentActions.length > 0 && (
-          <div className="shrink-0  bg-background px-3 py-2">
-            <div className="flex items-center gap-2 overflow-x-auto scrollbar-none">
+          <div className="shrink-0 bg-background px-4 py-1.5">
+            <div className="flex min-w-0 items-center gap-2 overflow-x-auto scrollbar-none [&_button]:min-h-10">
               {collectedMobileContentActions.map((node, i) => (
                 <Fragment key={i}>{node}</Fragment>
               ))}
@@ -180,17 +242,28 @@ export function PageLayout({
         )}
         {/* Scrollable content. bg-background + overscroll-none so the
             rubber-band / pull-to-refresh bounce on mobile never exposes a
-            transparent strip above the first (often sticky) child. */}
+            transparent strip above the first (often sticky) child. The
+            1px sentinel at the very top drives the header elevation —
+            scrolled ⇔ it has left the viewport. */}
         <div
+          ref={scrollerRef}
           className={cn(
-            '@container flex-1 flex flex-col overflow-auto bg-background overscroll-none',
+            // overflow-x-hidden: long mono IDs / paths must truncate in-cell,
+            // never widen the page and unlock accidental horizontal scroll.
+            '@container flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto overscroll-none bg-background',
             !noPadding && 'px-4 sm:px-6 md:px-8',
             !noPadding && isMobile && 'pt-2',
           )}
           data-page-scroll-container
         >
+          <div ref={sentinelRef} aria-hidden="true" className="h-px shrink-0" />
           <div className={cn('mx-auto w-full flex flex-col min-h-full animate-fade-in', maxWidthClass[maxWidth])}>
             {children}
+            {/* Mount node for infinite-scroll sentinels — Pagination portals its
+                loading / "no more items" hint into this div. It must sit BEFORE
+                the bottom spacer: appended after the spacer, the hint lands
+                underneath the fixed bottom nav. */}
+            <div data-infinite-scroll-mount className="shrink-0" />
             {/* Bottom spacer: ensures content isn't hidden behind fixed footer/nav */}
             {!noPadding && (
               <div className="shrink-0" style={{ height: bottomSpacerHeight }} />

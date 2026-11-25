@@ -10,6 +10,10 @@ pub struct MemoryConfig {
     /// Whether the memory system is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Opt-in LLM extraction after chat turns. Explicit memory-tool writes
+    /// remain available when false; existing configs default to false.
+    #[serde(default)]
+    pub auto_extract: bool,
     /// Storage path for memory files
     #[serde(default = "default_storage_path")]
     pub storage_path: String,
@@ -49,10 +53,15 @@ fn default_storage_path() -> String {
         .to_string()
 }
 fn default_user_limit() -> usize {
-    2000
+    // 4000 (raised from 2000, 2026-10-20): the three marker blocks
+    // (system-context 800 + summaries 500 + tag overhead) alone could eat
+    // ~1400 chars of the old budget — live files hit "markers alone exceed
+    // the budget" with facts squeezed to zero.
+    4000
 }
 fn default_knowledge_limit() -> usize {
-    3000
+    // 6000 (raised with user limit, same marker-pressure rationale).
+    6000
 }
 fn default_procedures_limit() -> usize {
     3000
@@ -74,6 +83,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
+            auto_extract: false,
             storage_path: default_storage_path(),
             user_char_limit: default_user_limit(),
             knowledge_char_limit: default_knowledge_limit(),
@@ -117,11 +127,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_extraction_is_opt_in_for_new_and_existing_configs() {
+        assert!(!MemoryConfig::default().auto_extract);
+        let old: MemoryConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(old.enabled);
+        assert!(!old.auto_extract);
+        let explicit: MemoryConfig = serde_json::from_str(r#"{"auto_extract":true}"#).unwrap();
+        assert!(explicit.auto_extract);
+    }
+
+    #[test]
     fn test_default_config() {
         let config = MemoryConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.user_char_limit, 2000);
-        assert_eq!(config.knowledge_char_limit, 3000);
+        assert_eq!(config.user_char_limit, 4000);
+        assert_eq!(config.knowledge_char_limit, 6000);
         assert_eq!(config.procedures_char_limit, 3000);
         assert_eq!(config.agent_char_limit, 20000);
         assert_eq!(config.temp_file_ttl_days, 7);

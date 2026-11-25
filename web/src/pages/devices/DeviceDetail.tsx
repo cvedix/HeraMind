@@ -6,6 +6,11 @@ import { UnifiedFormDialog } from "@/components/dialog/UnifiedFormDialog"
 import { ParameterForm } from "@/components/devices/ParameterForm"
 import { seedCommandDefaults } from "@/components/devices/seedCommandDefaults"
 import {
+  prepareCommandParams,
+  validateCommandParams,
+} from "@/components/devices/commandParams"
+import { CommandDeliveryLadderPanel } from "@/components/devices/CommandDeliveryLadderPanel"
+import {
   Dialog,
   DialogContent,
   DialogHeader,
@@ -24,6 +29,7 @@ import { ChevronLeft, Send, Clock, Zap, Settings, Info, ChevronRight, X, Image a
 import { toast } from "@/components/ui/use-toast"
 import { formatTimestamp } from "@/lib/utils/format"
 import { useServerUrl } from "@/lib/server-url"
+import { resolveTelemetryPageTotal } from "@/lib/api/telemetry"
 import type { Device, DeviceType, CommandDefinition, TelemetryDataResponse, DeviceCurrentStateResponse } from "@/types"
 import { isBase64Image, getImageDataUrl } from "./utils"
 import { cn } from "@/lib/utils"
@@ -56,9 +62,21 @@ interface DeviceDetailProps {
   selectedMetric: string | null
   onBack: () => void
   onRefresh: () => void
-  onMetricClick: (metricName: string, offset?: number, limit?: number) => Promise<void>
+  onMetricClick: (
+    metricName: string,
+    offset?: number,
+    limit?: number,
+    cursor?: number | null,
+  ) => Promise<void>
   onMetricBack: () => void
-  onSendCommand: (commandName: string, params: string) => void
+  /**
+   * Returns a delivery result when the backend accepted the send, or false.
+   * Truthy ≠ device ACK — inspect `delivery` for the ladder.
+   */
+  onSendCommand: (
+    commandName: string,
+    params: Record<string, unknown>,
+  ) => Promise<import('@/lib/commandDeliveryLadder').SendCommandDeliveryResult | false>
 }
 
 function renderMetricValue(
@@ -163,7 +181,7 @@ export function DeviceDetail({
   telemetryLoading,
   selectedMetric,
   onBack,
-  onRefresh,
+  onRefresh: _onRefresh,
   onMetricClick,
   onMetricBack,
   onSendCommand,
@@ -178,7 +196,11 @@ export function DeviceDetail({
   const [selectedCommandDef, setSelectedCommandDef] = useState<CommandDefinition | null>(null)
   const [dialogParams, setDialogParams] = useState<Record<string, unknown>>({})
   const [commandExecuting, setCommandExecuting] = useState(false)
-  const [commandResult, setCommandResult] = useState<{ success: boolean; data?: unknown; error?: string } | null>(null)
+  const [commandResult, setCommandResult] = useState<{
+    success: boolean
+    delivery?: import('@/lib/commandDeliveryLadder').SendCommandDeliveryResult
+    error?: string
+  } | null>(null)
 
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1)
@@ -187,22 +209,25 @@ export function DeviceDetail({
   const commands = deviceCurrentState?.commands || deviceType?.commands || []
   const templateMetrics = deviceType?.metrics || []
 
-  // Build all metrics from unified response (contains both template and virtual metrics)
+  // Build all metrics from unified response (template + virtual + runtime auto-extracted)
   const metricsMap = deviceCurrentState?.metrics || {}
 
-  // Get metric definitions: template metrics + virtual metrics from unified response
+  // Template metrics first (curated display_name/unit/data_type), then every
+  // non-template metric the device has actually reported. Runtime auto-extracted
+  // metrics have is_virtual=false — filtering on is_virtual hides the only
+  // metrics with live values whenever a type's template doesn't match the
+  // device's real payload (all template cards render "-").
+  const templateMetricNames = new Set(templateMetrics.map((m) => m.name))
   const metricDefinitions = [
-    // Template metrics (for reference - values come from deviceCurrentState.metrics)
     ...templateMetrics,
-    // Virtual metrics (from deviceCurrentState - those with is_virtual=true)
     ...Object.entries(metricsMap)
-      .filter(([, v]) => v.is_virtual)
+      .filter(([name]) => !templateMetricNames.has(name))
       .map(([name, v]) => ({
         name,
         display_name: v.display_name || name,
         data_type: v.data_type as 'float' | 'integer' | 'string' | 'boolean' | 'binary' | 'array',
         unit: v.unit,
-      }))
+      })),
   ]
 
   const handleCommandClick = (cmd: CommandDefinition) => {
@@ -214,13 +239,43 @@ export function DeviceDetail({
 
   const handleSendCommand = async () => {
     if (!selectedCommandDef) return
+
+    const validated = validateCommandParams(
+      selectedCommandDef.parameters,
+      dialogParams,
+    )
+    if (!validated.ok) {
+      setCommandResult({
+        success: false,
+        error: validated.errors.map((e) => e.message).join('\n'),
+      })
+      return
+    }
+
+    const payload = prepareCommandParams(
+      selectedCommandDef.parameters,
+      dialogParams,
+    )
+
     setCommandExecuting(true)
     setCommandResult(null)
     try {
-      await onSendCommand(selectedCommandDef.name, JSON.stringify(dialogParams))
-      setCommandResult({ success: true })
-    } catch (e: any) {
-      setCommandResult({ success: false, error: e?.message || String(e) })
+      const result = await onSendCommand(selectedCommandDef.name, payload)
+      if (result) {
+        setCommandResult({ success: true, delivery: result })
+      } else {
+        setCommandResult({
+          success: false,
+          error: t('devices:sendCommandFailed', {
+            defaultValue: 'Failed to send command',
+          }),
+        })
+      }
+    } catch (e) {
+      setCommandResult({
+        success: false,
+        error: e instanceof Error ? e.message : String(e),
+      })
     } finally {
       setCommandExecuting(false)
     }
@@ -315,17 +370,27 @@ export function DeviceDetail({
     
   // Pagination info from API response
   const pagination = telemetryData?.pagination
-  const totalCount = pagination?.total ?? currentMetricData.length
+  // Cursor pages report only the points still to come; convert to the
+  // whole-window count the pager needs.
+  const totalCount =
+    resolveTelemetryPageTotal(pagination, currentPage, PAGE_SIZE) ?? currentMetricData.length
   const totalPages = Math.ceil(totalCount / PAGE_SIZE)
-  const hasNextPage = currentPage < totalPages
-  const hasPrevPage = currentPage > 1
+  const _hasNextPage = currentPage < totalPages
+  const _hasPrevPage = currentPage > 1
   
   // Handle page change
   const handlePageChange = async (newPage: number) => {
     if (!selectedMetric) return
     const offset = (newPage - 1) * PAGE_SIZE
+    // Sequential next-page: prefer next_cursor (bounds the scan to the older
+    // side and stays stable as new points arrive). Arbitrary jumps still use
+    // storage-side offset (fixed — no more empty pages past 100).
+    const cursor =
+      newPage === currentPage + 1
+        ? telemetryData?.pagination?.next_cursor ?? undefined
+        : undefined
     setCurrentPage(newPage)
-    await onMetricClick(selectedMetric, offset, PAGE_SIZE)
+    await onMetricClick(selectedMetric, offset, PAGE_SIZE, cursor)
   }
 
   // Metric history table columns
@@ -360,7 +425,7 @@ export function DeviceDetail({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-8 w-8 shrink-0"
+                className="h-8 w-8 shrink-0 sm:h-8 sm:w-8"
                 onClick={(e) => {
                   e.stopPropagation()
                   downloadImage(imgSrc, formatTimestamp(point.timestamp))
@@ -402,13 +467,12 @@ export function DeviceDetail({
   return (
     <>
       <div className="flex flex-col flex-1 h-full overflow-hidden bg-background">
-        {/* Header — relative z-20: sits above the app's window-drag strip
-            (z-10, top 56px) so the back/edit/delete buttons stay clickable.
-            Top padding adds the traffic-light / safe-area clearance (the
-            detail view is full-bleed with no page title row). */}
+        {/* Compact device summary. Mobile safe-area and back navigation live
+            in MobilePageHeader above this view; desktop still reserves the
+            title-bar inset for the full-bleed detail surface. */}
         <div
-          className={cn("relative z-[15] flex items-center justify-between shrink-0 gap-2", isMobile ? "px-3 py-3" : "px-4 sm:px-6 md:px-8 py-5")}
-          style={{ paddingTop: "calc(env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px) + 2.75rem)" }}
+          className={cn("relative z-[15] flex shrink-0 items-center justify-between gap-2", isMobile ? "px-4 pb-3 pt-1" : "px-4 py-5 sm:px-6 md:px-8")}
+          style={isMobile ? undefined : { paddingTop: "calc(env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px) + 2.75rem)" }}
         >
           <div className="flex items-center gap-3 min-w-0 flex-1">
             <Button
@@ -432,10 +496,15 @@ export function DeviceDetail({
                 )} />
               </div>
               <div className="min-w-0">
-                <h1 className="text-lg sm:text-xl font-semibold truncate">{device.name || device.id}</h1>
-                <p className="text-xs sm:text-sm text-muted-foreground mt-0.5 truncate">
-                  {device.device_type} · {device.device_id || device.id}
+                {!isMobile && <h1 className="truncate text-xl font-semibold">{device.name || device.id}</h1>}
+                <p className={cn("truncate text-muted-foreground", isMobile ? "text-xs" : "mt-0.5 text-sm")}>
+                  {device.device_type}
                 </p>
+                {isMobile && (
+                  <p className="mt-0.5 truncate font-mono text-mini text-muted-foreground">
+                    {device.device_id || device.id}
+                  </p>
+                )}
               </div>
             </div>
           </div>
@@ -445,11 +514,11 @@ export function DeviceDetail({
         </div>
 
         {/* Content */}
-        <div className={cn("flex-1 overflow-auto", isMobile ? "px-3 pb-3" : "px-6 pb-6")}>
+        <div className={cn("flex-1 overflow-auto", isMobile ? "px-4 pb-[calc(6rem+env(safe-area-inset-bottom,0px))]" : "px-6 pb-6")}>
           <div className="max-w-6xl mx-auto space-y-5">
 
             {/* Device Info Card */}
-            <div className={cn("bg-card border border-border rounded-lg shadow-sm", isMobile ? "p-4" : "p-6")}>
+            <div className={cn("rounded-lg", isMobile ? "py-2" : "border border-border bg-card p-6 shadow-sm")}>
               <div className="flex items-center gap-2 mb-3 sm:mb-4">
                 <Info className="h-5 w-5 text-muted-foreground" />
                 <h2 className="font-semibold">{t('devices:detailPage.deviceInfo')}</h2>
@@ -726,7 +795,6 @@ export function DeviceDetail({
                   flexHeight={false}
                   emptyState={
                     <EmptyState
-                      icon={<Clock className="h-12 w-12" />}
                       title={t('devices:detailPage.noHistoryData')}
                     />
                   }
@@ -798,9 +866,24 @@ export function DeviceDetail({
           submitDisabled={commandExecuting}
         >
           {(!selectedCommandDef.parameters || selectedCommandDef.parameters.length === 0) ? (
-            <p className="text-sm text-muted-foreground py-2">
-              {t('devices:command.dialog.noParameters', { defaultValue: 'No parameters required' })}
-            </p>
+            // Zero-parameter command: an empty form would read as a broken
+            // dialog — present it as a deliberate "direct command" state
+            // instead (icon + what happens on send).
+            <div className="flex flex-col items-center gap-3 py-6 text-center" data-testid="command-no-parameters">
+              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+                <Zap className="h-6 w-6 text-muted-foreground" aria-hidden="true" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm font-medium text-foreground">
+                  {t('devices:command.dialog.noParametersTitle', { defaultValue: 'Direct command' })}
+                </p>
+                <p className="mx-auto max-w-[260px] text-xs leading-relaxed text-muted-foreground">
+                  {t('devices:command.dialog.noParametersHint', {
+                    defaultValue: 'This command takes no parameters — it will execute immediately when you send.',
+                  })}
+                </p>
+              </div>
+            </div>
           ) : (
             <ParameterForm
               parameters={selectedCommandDef.parameters}
@@ -813,16 +896,14 @@ export function DeviceDetail({
             />
           )}
 
-          {/* Execution Result */}
-          {commandResult && (
-            <div className={cn(
-              "rounded-lg p-3 text-xs font-mono overflow-auto max-h-48",
-              commandResult.success ? "bg-success-light" : "bg-error-light"
-            )}>
+          {/* Delivery ladder — dispatch ≠ device ACK / physical effect */}
+          {commandResult?.success && commandResult.delivery && (
+            <CommandDeliveryLadderPanel result={commandResult.delivery} />
+          )}
+          {commandResult && !commandResult.success && (
+            <div className="rounded-lg border border-error bg-error-light p-3 text-xs font-mono overflow-auto max-h-48 text-error">
               <pre className="whitespace-pre-wrap break-words">
-                {commandResult.success
-                  ? t('devices:commandSent')
-                  : commandResult.error}
+                {commandResult.error}
               </pre>
             </div>
           )}

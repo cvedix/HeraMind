@@ -45,7 +45,7 @@ pub async fn upgrade_check_handler(
     axum::extract::Query(query): axum::extract::Query<UpgradeCheckQuery>,
 ) -> HandlerResult<serde_json::Value> {
     if admin.role != UserRole::Admin {
-        return Err(ErrorResponse::bad_request("Admin access required"));
+        return Err(ErrorResponse::forbidden("Admin access required"));
     }
 
     let info = state.upgrade.check(query.force.unwrap_or(false)).await;
@@ -81,7 +81,7 @@ pub async fn start_upgrade_handler(
     payload: Option<axum::Json<serde_json::Value>>,
 ) -> HandlerResult<serde_json::Value> {
     if admin.role != UserRole::Admin {
-        return Err(ErrorResponse::bad_request("Admin access required"));
+        return Err(ErrorResponse::forbidden("Admin access required"));
     }
 
     let version = payload.and_then(|Json(v)| {
@@ -123,7 +123,7 @@ pub async fn upgrade_status_handler(
     Extension(admin): Extension<SessionInfo>,
 ) -> HandlerResult<serde_json::Value> {
     if admin.role != UserRole::Admin {
-        return Err(ErrorResponse::bad_request("Admin access required"));
+        return Err(ErrorResponse::forbidden("Admin access required"));
     }
     let s = state.upgrade.status();
     ok(json!({
@@ -134,4 +134,45 @@ pub async fn upgrade_status_handler(
         "total": s.total,
         "error": s.error,
     }))
+}
+
+#[cfg(test)]
+mod admin_forbidden_tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    fn non_admin_session() -> SessionInfo {
+        SessionInfo {
+            user_id: "u-non-admin".to_string(),
+            username: "viewer".to_string(),
+            role: UserRole::User,
+            created_at: 0,
+            expires_at: i64::MAX,
+        }
+    }
+
+    #[tokio::test]
+    async fn all_three_system_upgrade_admin_handlers_return_403_for_non_admin() {
+        let state = ServerState::new_for_testing().await;
+        let user = non_admin_session();
+
+        let e1 = upgrade_check_handler(
+            State(state.clone()),
+            Extension(user.clone()),
+            axum::extract::Query(UpgradeCheckQuery::default()),
+        )
+        .await
+        .expect_err("upgrade_check must reject non-admin");
+        assert_eq!(e1.status, StatusCode::FORBIDDEN);
+
+        let e2 = start_upgrade_handler(State(state.clone()), Extension(user.clone()), None)
+            .await
+            .expect_err("start_upgrade must reject non-admin");
+        assert_eq!(e2.status, StatusCode::FORBIDDEN);
+
+        let e3 = upgrade_status_handler(State(state), Extension(user))
+            .await
+            .expect_err("upgrade_status must reject non-admin");
+        assert_eq!(e3.status, StatusCode::FORBIDDEN);
+    }
 }

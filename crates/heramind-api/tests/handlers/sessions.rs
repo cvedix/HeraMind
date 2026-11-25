@@ -73,9 +73,18 @@ mod tests {
     #[tokio::test]
     async fn test_get_session_history_handler_not_found() {
         let state = create_test_server_state().await;
-        let result =
-            get_session_history_handler(State(state), Path("nonexistent_session".to_string()))
-                .await;
+        let query = HistoryQuery {
+            limit: None,
+            before: None,
+        };
+        let result = get_session_history_handler(
+            State(state),
+            Path("nonexistent_session".to_string()),
+            Query(query),
+            // No authenticated user → the "apikey" bucket principal.
+            None,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
@@ -85,7 +94,8 @@ mod tests {
     async fn test_delete_session_handler_not_found() {
         let state = create_test_server_state().await;
         let result =
-            delete_session_handler(State(state), Path("nonexistent_session".to_string())).await;
+            delete_session_handler(State(state), Path("nonexistent_session".to_string()), None)
+                .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         // Handler returns NOT_FOUND for sessions that don't exist
@@ -128,7 +138,12 @@ mod tests {
             backend_id: None,
             selected_skills: None,
             page_context: None,
+            references: None,
+            content_version: None,
+            content_nodes: None,
             session_config: None,
+            authorize_new_operation: None,
+            client_request_id: None,
         };
         let result = chat_handler(
             State(state),
@@ -167,7 +182,12 @@ mod tests {
             backend_id: None,
             selected_skills: None,
             page_context: None,
+            references: None,
+            content_version: None,
+            content_nodes: None,
             session_config: None,
+            authorize_new_operation: None,
+            client_request_id: None,
         };
         let result = chat_handler(State(state), Path(session_id.clone()), Json(req)).await;
         // Either Ok with timeout message or Err with something other than NOT_FOUND
@@ -223,13 +243,25 @@ mod tests {
             backend_id: None,
             selected_skills: None,
             page_context: None,
+            references: None,
+            content_version: None,
+            content_nodes: None,
             session_config: None,
+            authorize_new_operation: None,
+            client_request_id: Some("client-req-1".to_string()),
         };
         assert_eq!(req.message, "Test message");
         assert_eq!(req.session_id.unwrap(), "session123");
         // Also test the new fields
         assert!(req.images.is_none());
         assert!(req.backend_id.is_none());
+        assert_eq!(req.client_request_id.as_deref(), Some("client-req-1"));
+        let json = serde_json::json!({
+            "message": "hi",
+            "clientRequestId": "rid-9"
+        });
+        let parsed: ChatRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.client_request_id.as_deref(), Some("rid-9"));
     }
 
     #[tokio::test]

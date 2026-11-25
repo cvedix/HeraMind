@@ -18,7 +18,7 @@ impl AgentExecutor {
 
     async fn parse_intent_with_llm(
         &self,
-        llm: &Arc<dyn heramind_core::llm::backend::LlmRuntime + Send + Sync>,
+        llm: &Arc<dyn heramind_core::llm::backend::LlmRuntime>,
         user_prompt: &str,
     ) -> AgentResult<heramind_storage::ParsedIntent> {
         use heramind_core::llm::backend::{GenerationParams, LlmInput};

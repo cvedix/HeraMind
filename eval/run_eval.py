@@ -30,10 +30,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
+import subprocess
 import sys
+import threading
 import time
+from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Make lib/ importable.
 sys.path.insert(0, str(Path(__file__).parent / "lib"))
@@ -41,13 +46,62 @@ sys.path.insert(0, str(Path(__file__).parent / "lib"))
 import fallback  # noqa: E402
 import hard_signal  # noqa: E402
 import judge  # noqa: E402
+import model_identity  # noqa: E402
 import preflight  # noqa: E402
 import report  # noqa: E402
 import seed  # noqa: E402
 import server  # noqa: E402
 import simulator  # noqa: E402
+import stats  # noqa: E402
 import state_query  # noqa: E402
 import validate  # noqa: E402
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_GUARD_RE = re.compile(
+    r'guard="([^"]+)" outcome="([^"]+)" round=(\d+) reason="([^"]*)"'
+)
+
+
+def _parse_guard_metrics(log_lines: list[str]) -> dict:
+    """Extract the agent's turn-guard ledger from the server's log lines.
+
+    The agent emits one structured line per guard decision:
+        turn guard decision guard="narration_nudge" outcome="fired" round=1 reason="…"
+    and a per-turn summary. The eval reports the per-kind counts plus the
+    nudge effectiveness pair (nudge round acted / still did not act) so guard
+    value can be measured instead of argued about.
+    """
+    events = []
+    for raw in log_lines:
+        line = _ANSI_RE.sub("", raw)
+        if "turn guard decision" not in line:
+            continue
+        m = _GUARD_RE.search(line)
+        if m:
+            events.append(
+                {
+                    "kind": m.group(1),
+                    "outcome": m.group(2),
+                    "round": int(m.group(3)),
+                    "reason": m.group(4),
+                }
+            )
+    fired: dict[str, int] = {}
+    skipped: dict[str, int] = {}
+    suppressed: dict[str, int] = {}
+    for e in events:
+        bucket = {"fired": fired, "skipped": skipped}.get(e["outcome"], suppressed)
+        bucket[e["kind"]] = bucket.get(e["kind"], 0) + 1
+    outcomes = [e for e in events if e["kind"] == "narration_nudge_outcome"]
+    return {
+        "events": events,
+        "fired": fired,
+        "skipped": skipped,
+        "suppressed": suppressed,
+        "nudge_rounds_observed": len(outcomes),
+        "nudge_recovered": sum(1 for e in outcomes if e["outcome"] == "fired"),
+    }
 
 
 def _load_case(path: Path) -> dict:
@@ -86,7 +140,10 @@ def _build_turn_record(user_msg: str, resp: dict, pt_ms: int) -> dict:
             "raw_messages": resp.get("new_messages") or [],
             "transport": "websocket",
             "ws_error": resp.get("error"),
+            "generation_complete": resp.get("generation_complete"),
             "transient_stall_retry_count": resp.get("transient_stall_retry_count", 0),
+            # Measured context meter (ContextUsage WS events; last = final ask).
+            "context_usage": resp.get("context_usage") or [],
         }
 
     # === Fallback: parse history delta (HTTP path or WS without stream data) ===
@@ -163,6 +220,7 @@ def _build_turn_record(user_msg: str, resp: dict, pt_ms: int) -> dict:
         "raw_messages": new_messages,
         "transport": "websocket" if resp.get("tool_calls_stream") is not None else "http",
         "ws_error": resp.get("error") if resp.get("tool_calls_stream") is not None else None,
+        "generation_complete": resp.get("generation_complete"),
         "transient_stall_retry_count": resp.get("transient_stall_retry_count", 0),
     }
 
@@ -190,13 +248,22 @@ def run_case(case_path: str) -> dict:
 
     srv = server.TestServer()
     try:
+        # Prep-phase calls each re-raise _CaseTimeout: the case-cap alarm can
+        # fire during spawn/configure/seed/session-create too, and the generic
+        # handlers below would mislabel it (2026-11-10 review: spawn raising
+        # _CaseTimeout came back as "seed_failure: spawn failed:"). The raise
+        # reaches the case-level handler, which records status="timeout".
         try:
             srv.spawn(case_id=case.get("id"))
+        except _CaseTimeout:
+            raise
         except Exception as e:
             return _error_record(case, "seed_failure", f"spawn failed: {e}")
 
         try:
             srv.configure_llm_backend()
+        except _CaseTimeout:
+            raise
         except Exception as e:
             return _error_record(case, "llm_config_error", str(e))
 
@@ -205,12 +272,16 @@ def run_case(case_path: str) -> dict:
             fix = _load_fixture(case["setup"]["fixture"])
             seed.seed_fixture(srv, fix)
             seed.seed_extras(srv, case["setup"].get("extras", {}) or {})
+        except _CaseTimeout:
+            raise
         except Exception as e:
             return _error_record(case, "seed_failure", str(e))
 
         # Create session + run turns via HTTP chat.
         try:
             sid = srv.create_chat_session()
+        except _CaseTimeout:
+            raise
         except Exception as e:
             return _error_record(case, "seed_failure", f"create session: {e}")
 
@@ -219,7 +290,21 @@ def run_case(case_path: str) -> dict:
             t0 = time.monotonic()
             try:
                 resp = srv.chat(sid, turn["user"],
-                                images=turn.get("images") or case.get("images"))
+                                images=turn.get("images") or case.get("images"),
+                                references=turn.get("references"))
+            except _CaseTimeout:
+                # The per-case SIGALRM cap fired inside this turn's WS wait.
+                # This is a TIMEOUT, not an agent error: before 2026-11-09 the
+                # generic handler below swallowed it, mislabeling every cap
+                # timeout as agent_error ("zero timeouts, frequent stream
+                # breaks" was this bug — 66/66 in the 2026-11-08 batch).
+                # Return a timeout record WITH the bounded server-history
+                # salvage (2026-08-17: plain re-raise lost all trace data) so
+                # the case-level bookkeeping sees status == "timeout".
+                return _timeout_record(
+                    case, turn_records, turn["user"],
+                    salvaged=_salvage_server_history(srv, sid),
+                    guards=_parse_guard_metrics(srv.log_lines()))
             except Exception as e:
                 # Record the turn we have so far, then bail with timeout-style
                 # status so the judge can mark it as agent error.
@@ -241,6 +326,10 @@ def run_case(case_path: str) -> dict:
                 salvaged = _salvage_server_history(srv, sid)
                 if salvaged:
                     rec["server_history"] = salvaged
+                # A wedged turn is exactly where the guard ledger matters
+                # (coercion fired → loop, nudge fired → still no action).
+                # Capture it before srv.shutdown() discards the logs.
+                rec["guards"] = _parse_guard_metrics(srv.log_lines())
                 return rec
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             # Use server-reported processing_time_ms when present; fall back to
@@ -362,6 +451,7 @@ def run_case(case_path: str) -> dict:
             "turn_records": turn_records,
             "state_queries": state_results,
             "suspected_fallback": suspected,
+            "guards": _parse_guard_metrics(srv.log_lines()),
             "status": None,
             "error_type": None,
             "message": None,
@@ -453,6 +543,24 @@ def _filter_multimodal(cases: list[Path], skip: bool) -> list[Path]:
     return kept
 
 
+def _filter_network(cases: list[Path]) -> list[Path]:
+    """Drop `requires_network` cases when HERAMIND_EVAL_OFFLINE=1.
+
+    Seven gate cases reach the outside world (marketplace = raw.githubuser-
+    content.com, httpbin URLs). Offline they fail for connectivity reasons
+    and report MODEL failures that aren't — the eval would be lying. Tagged
+    cases declare the dependency; offline runs exclude them and say so.
+    """
+    if os.environ.get("HERAMIND_EVAL_OFFLINE", "").lower() not in ("1", "true", "yes"):
+        return cases
+    kept = [p for p in cases if not _load_case(p).get("requires_network")]
+    dropped = [ _load_case(p).get("id") for p in cases if _load_case(p).get("requires_network")]
+    if dropped:
+        print(f"  (offline mode: excluded {len(dropped)} requires_network case(s): "
+              f"{sorted(set(dropped))})", file=sys.stderr)
+    return kept
+
+
 def _resume_cases(cases: list[Path], done_keys: set) -> list[Path]:
     """Filter out cases already recorded in a resume run dir.
 
@@ -469,25 +577,53 @@ def _resume_cases(cases: list[Path], done_keys: set) -> list[Path]:
 def _select_cases(root: Path, lang: str, workflows: list[str] | None, case_id: str | None) -> list[Path]:
     out = []
     for p in _walk_json_files(root):
+        # Every filter applies ALWAYS. `--case-id` used to bypass lang/workflow
+        # (`if case_id: ... else: <filters>`), so `--lang zh --case-id X` ran
+        # the en mirror of X too — the zh/en case sets share ids by design.
+        if lang != "both":
+            # Path shape: eval/cases/<lang>/<workflow>/<case>.json
+            parts = p.relative_to(root).parts
+            if not parts or parts[0] != lang:
+                continue
+        if workflows:
+            parts = p.relative_to(root).parts
+            wf = parts[1] if len(parts) > 2 else ""
+            if wf not in workflows:
+                continue
         if case_id:
             try:
                 if _load_case(p).get("id") != case_id:
                     continue
             except Exception:
                 continue
-        else:
-            if lang != "both":
-                # Path shape: eval/cases/<lang>/<workflow>/<case>.json
-                parts = p.relative_to(root).parts
-                if not parts or parts[0] != lang:
-                    continue
-            if workflows:
-                parts = p.relative_to(root).parts
-                wf = parts[1] if len(parts) > 2 else ""
-                if wf not in workflows:
-                    continue
         out.append(p)
     return out
+
+
+def _check_model_identity(run_dir: Path, allow_mismatch: bool) -> int:
+    """Refuse to run when the endpoint serves a DIFFERENT model than requested.
+
+    A run on the wrong model produces plausible numbers that invalidate every
+    conclusion (2026-10-21: an A/B silently ran on lfm25 because 29375 had
+    been swapped). Unknown identity (proxy) is advisory only.
+    """
+    backend_type = os.environ.get("AGENT_LLM_BACKEND_TYPE", "openai")
+    endpoint = os.environ.get("AGENT_LLM_ENDPOINT", "")
+    model = os.environ.get("AGENT_LLM_MODEL", "")
+    api_key = os.environ.get("AGENT_LLM_API_KEY")
+    status, msg = model_identity.check_served_model(
+        backend_type, endpoint, api_key, model
+    )
+    print(f"   served-model check: {msg}", file=sys.stderr)
+    model_identity.record_identity(run_dir, backend_type, endpoint, api_key, model)
+    if status == "mismatch" and not allow_mismatch:
+        print(
+            "   !! Refusing to run on the wrong model "
+            "(pass --allow-model-mismatch to override).",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def _run_preflight() -> int:
@@ -557,6 +693,9 @@ def cmd_run(args):
         run_dir.mkdir(parents=True, exist_ok=True)
 
     cases_jsonl_path = run_dir / "cases.jsonl"
+    if _check_model_identity(run_dir, getattr(args, "allow_model_mismatch", False)) != 0:
+        return 1
+
     scores_jsonl_path = run_dir / "scores.jsonl"
 
     # Config snapshot — the 2026-08-17 official-params experiment could not be
@@ -598,8 +737,13 @@ def cmd_run(args):
                 "case_id": case.get("id"),
                 "lang": case.get("lang"),
                 "category": case.get("category"),
+                "workflow": case.get("workflow"),
+                "scenario_type": case.get("scenario_type"),
+                "tier": hard_signal.tier_of(case.get("id") or ""),
                 "hard": hard,
+                "failure_mode": hard_signal.classify_failure(case, rec, hard),
                 "suspected_fallback": bool(rec.get("suspected_fallback")),
+                "guards": rec.get("guards") or {},
                 "status": rec.get("status"),
                 "message": rec.get("message", ""),
             }
@@ -670,21 +814,29 @@ def _on_alarm(signum, frame):
     raise _CaseTimeout()
 
 
-def _salvage_server_history(srv, sid: str, limit: int = 80):
+def _salvage_server_history(srv, sid: str, limit: int = 80,
+                            total_cap_s: float = 15.0):
     """Fetch a compact copy of the server-side session history.
 
     Used on the agent-error/timeout path: a wedged turn leaves no local
     turn_records, and the server (holding the partial tool calls) is about to
     be shut down. Returns a list of {role, tools, content} dicts, or None if
     the history endpoint is unreachable (best-effort by design).
+
+    TOTAL wall time is hard-bounded by `total_cap_s`: requests' `timeout`
+    only bounds connect and EACH read wait, so a trickling server could
+    otherwise stretch the fetch well past it. The fetch runs on a DAEMON
+    thread so a lingering read can never block interpreter exit either
+    (2026-11-09 review: executor threads are joined at exit — daemon=True is
+    what actually guarantees both bounds; both are covered by tests).
     """
-    try:
-        r = srv.get(f"/api/sessions/{sid}/history")
+    def _fetch():
+        r = srv.get(f"/api/sessions/{sid}/history", timeout=10)
         r.raise_for_status()
-        data = r.json()
-        msgs = data.get("data") if isinstance(data, dict) else data
-        if not isinstance(msgs, list):
+        data = r.json().get("data", r.json())
+        if not isinstance(data, dict):
             return None
+        msgs = data.get("messages") or []
         out = []
         for m in msgs[-limit:]:
             if not isinstance(m, dict):
@@ -702,8 +854,50 @@ def _salvage_server_history(srv, sid: str, limit: int = 80):
                 "content": str(m.get("content") or "")[:200],
             })
         return out or None
-    except Exception:  # noqa: BLE001 — best-effort salvage
-        return None
+
+    box: dict = {}
+    done = threading.Event()
+
+    def _worker():
+        try:
+            box["v"] = _fetch()
+        except BaseException:  # noqa: BLE001 — best-effort by contract
+            pass
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    if done.wait(total_cap_s):
+        return box.get("v")
+    return None
+
+
+def _timeout_record(case: dict, turn_records: list, turn_user: str,
+                    salvaged=None, guards=None) -> dict:
+    """Pure builder for the case-cap timeout record (unit-tested).
+
+    Contract (2026-11-09 review): the record PRESERVES the turn records
+    already captured, carries status=="timeout", and attaches salvage/guards
+    when available. elapsed coverage is the caller's wall clock around
+    run_case, which inherently includes the dying turn.
+    """
+    rec = _error_record_at(
+        case, "timeout",
+        f"case wall-clock cap exceeded during turn ({turn_user[:60]!r})",
+        turn_records)
+    if salvaged:
+        rec["server_history"] = salvaged
+    if guards:
+        rec["guards"] = guards
+    return rec
+
+
+def _note_timeout(timed_out: list, key: str, rec: dict) -> None:
+    """Register a case-cap timeout exactly once, from either return-path or
+    exception-path records (dedup shared so the summary never double-counts)."""
+    if rec.get("status") == "timeout" and key not in timed_out:
+        timed_out.append(key)
 
 
 def _run_case_timeout(p: Path, cap: int):
@@ -726,11 +920,152 @@ def _run_case_timeout(p: Path, cap: int):
         signal.alarm(0)
 
 
+def _bin_version() -> str | None:
+    """Best-effort `heramind --version` — the tool-schema control of the run."""
+    try:
+        out = subprocess.run(
+            [str(server._resolve_heramind_bin()), "--version"],
+            capture_output=True, text=True, timeout=15,
+        )
+        for stream in (out.stdout, out.stderr):
+            line = (stream or "").strip().splitlines()
+            if line:
+                return line[0]
+    except Exception:  # noqa: BLE001 — provenance only
+        pass
+    return None
+
+
+def _controls_block(cap: int, rounds: int, set_path: Path, n_ids: int) -> dict:
+    """Everything held constant (or deliberately not) across models in this
+    run, frozen next to the scores — so "were the controls equal?" is answered
+    by the data instead of memory. NEVER includes the API key or full
+    endpoint (scheme+host only). Sampling params are per-vendor-official BY
+    DESIGN (the 2026-10 batch: wrong-param runs lose 10-23pp) — they are
+    recorded per run, not normalized across models.
+    """
+    endpoint = os.environ.get("AGENT_LLM_ENDPOINT") or ""
+    return {
+        "agent_backend": {
+            "backend_type": os.environ.get("AGENT_LLM_BACKEND_TYPE", "openai"),
+            "model": os.environ.get("AGENT_LLM_MODEL"),
+            "endpoint_host": urlsplit(endpoint).netloc or None,
+            "sampling": {
+                "temperature": float(os.environ.get("AGENT_LLM_TEMPERATURE", "0.6")),
+                "top_p": float(os.environ.get("AGENT_LLM_TOP_P", "0.85")),
+                "top_k": (int(os.environ["AGENT_LLM_TOP_K"])
+                          if os.environ.get("AGENT_LLM_TOP_K") else None),
+                "note": "per-vendor-official by design; compare runs with "
+                        "identical sampling blocks only",
+            },
+            "thinking_enabled": os.environ.get(
+                "AGENT_LLM_THINKING", "false").lower() in ("1", "true"),
+            "token_budget": "not set by the runner — bounded by model context "
+                            "only; record the server's -c value in run notes",
+        },
+        "budgets": {
+            "per_case_wall_s": cap,
+            "per_turn_stream_s": 1200,
+            "per_turn_runner_s": float(os.environ.get("EVAL_CHAT_TIMEOUT", "1400")),
+            "rounds": rounds,
+        },
+        "case_set": {"path": str(set_path), "case_ids": n_ids},
+        "tool_schemas": {"heramind_bin": str(server._resolve_heramind_bin()),
+                         "heramind_version": _bin_version()},
+        "judge": None,  # the gate is hard-signal only; run `run --judge` for soft scores
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def _print_tier_summary(row_details: dict[str, list]):
+    """Tier split / time-to-pass / failure-mode distribution for the gate.
+
+    Extracted from cmd_regression so archived runs can regenerate the exact
+    summary (replay = rebuild row_details from scores.jsonl, call this).
+    row_details: key → [{tier, latency_ms, verdict_prod, failure_mode}, …].
+    """
+    # Tier split (single-step vs multi-step planning) — the 2026-10-29
+    # official report's most decision-relevant cut, in the gate summary itself
+    # instead of a post-hoc analysis. unasserted (None) verdicts stay excluded,
+    # same as rates_for.
+    tier_verdicts: dict[str, list] = {}
+    for rows in row_details.values():
+        for d in rows:
+            if d["verdict_prod"] is not None:
+                tier_verdicts.setdefault(d["tier"], []).append(d["verdict_prod"])
+    if tier_verdicts:
+        parts = []
+        for tier in ("simple", "multi"):
+            vs = tier_verdicts.get(tier) or []
+            if not vs:
+                continue
+            p = sum(1 for v in vs if v is True)
+            parts.append(f"{tier} {p}/{len(vs)} = {p/len(vs):.1%}")
+        if parts:
+            print("  pass rate by tier [product]:            " + " | ".join(parts))
+
+    # Complete wall-clock view over ALL trials (timeouts included). latency_ms
+    # sums recorded turn time only and structurally under-counts capped turns
+    # (the dying turn never reports processing_time — 2026-11-09 finding).
+    all_rows = [d for rows in row_details.values() for d in rows]
+    if all_rows:
+        vals = sorted(d["elapsed_ms"] for d in all_rows
+                      if isinstance(d.get("elapsed_ms"), (int, float)))
+        if vals:
+            med = int(vals[len(vals) // 2] / 1000)
+            to = sum(1 for d in all_rows if d.get("status") == "timeout")
+            print(f"  wall-clock [ALL trials, timeouts incl.]: median ~{med}s | timeouts {to}/{len(all_rows)}")
+        reasons = Counter()
+        for d in all_rows:
+            for r, n in (d.get("failed_cmd_reasons") or {}).items():
+                reasons[r] += n
+        if reasons:
+            print("  rejected-cmd reasons:                   "
+                  + ", ".join(f"{k} {v}" for k, v in reasons.most_common()))
+
+    # Time to a CORRECT end state (median wall clock over PASS executions,
+    # retries included — a tiny model that needs three attempts to finish a
+    # two-tool workflow pays for them here). latency_ms sums the server-side
+    # per-turn processing times, which is pure agent time (seed/spawn excluded).
+    ttp_rows = [d for rows in row_details.values() for d in rows
+                if d["verdict_prod"] is True
+                and isinstance(d["latency_ms"], (int, float))]
+    if ttp_rows:
+        def _med_ms(vals: list) -> int:
+            s = sorted(vals)
+            return int(s[len(s) // 2])
+        parts = []
+        for tier in ("simple", "multi", None):
+            vals = [d["latency_ms"] for d in ttp_rows
+                    if tier is None or d["tier"] == tier]
+            if vals:
+                label = tier or "all"
+                parts.append(f"{label} ~{max(1, round(_med_ms(vals)/1000))}s (n={len(vals)})")
+        print("  time-to-pass [PASS only, retries incl.]: " + " | ".join(parts))
+
+    # Failure-mode distribution (user-facing taxonomy; one deterministic tag
+    # per product-view failure). "lost context" is deliberately absent — it
+    # needs semantic judgement and stays with the opt-in judge.
+    fail_rows = [d for rows in row_details.values() for d in rows
+                 if d["verdict_prod"] is False]
+
+    def _fmt_modes(rows: list) -> str:
+        c = Counter(d["failure_mode"] or "other" for d in rows)
+        return ", ".join(f"{m} {c[m]}" for m in hard_signal.FAILURE_MODES if c.get(m))
+
+    if fail_rows:
+        print(f"  failure modes [product-fail n={len(fail_rows)}]: {_fmt_modes(fail_rows)}")
+        for tier in ("simple", "multi"):
+            t_rows = [d for d in fail_rows if d["tier"] == tier]
+            if t_rows:
+                print(f"    {tier}: {_fmt_modes(t_rows)}")
+
+
 def cmd_regression(args):
     """Fast prompt/agent regression gate on a curated case set.
 
-    Runs the regression set (default eval/regression_set.txt, ~30 stable cases
-    stratified across domains + pass/fail), compares each case's verdict to a
+    Runs the regression set (default eval/regression_set.txt, 50 cases
+    stratified across domains + multi-turn + prompt-injection + pass/fail), compares each case's verdict to a
     committed baseline, and flags PASS->FAIL regressions. Designed to catch
     prompt/agent-change regressions in ~12min (1 round) or ~25min (2 rounds,
     robust against the ~7pp run-to-run noise floor).
@@ -751,64 +1086,196 @@ def cmd_regression(args):
         return 2
     case_ids = [l.strip() for l in set_path.read_text().splitlines() if l.strip()]
     rounds = max(1, args.rounds)
-    baseline_path = Path(args.baseline)
+    baseline_path = Path(args.baseline) if args.baseline else None
 
     run_dir = Path(args.run_dir or f"eval/runs/regression-{time.strftime('%Y%m%d-%H%M%S')}")
     run_dir.mkdir(parents=True, exist_ok=True)
+    if _check_model_identity(
+        run_dir, getattr(args, "allow_model_mismatch", False)
+    ) != 0:
+        return 1
     scores_path = run_dir / "scores.jsonl"
+    cases_path = run_dir / "cases.jsonl"
+
+    if args.update_baseline and not baseline_path:
+        print("--update-baseline needs --baseline <path>", file=sys.stderr)
+        return 2
 
     # Per-case wall-clock cap. A wedged agent (e.g. stuck in a thinking loop
     # after its own 300s timeout fires — the stream-hang-fix class) would
     # otherwise hang the whole gate forever. run_case's `finally: srv.shutdown()`
     # kills the spawned server as the timeout exception unwinds, so no zombie.
     cap = max(30, int(args.case_timeout))
+    # Controls provenance — written once per run dir: everything held constant
+    # (or deliberately not) across models, so comparisons are auditable from
+    # the artifacts alone. No secrets (API key never lands here).
+    controls_path = run_dir / "controls.json"
+    if not controls_path.exists():
+        controls_path.write_text(json.dumps(
+            _controls_block(cap=cap, rounds=rounds, set_path=set_path,
+                            n_ids=len(case_ids)),
+            ensure_ascii=False, indent=2))
     old_handler = signal.signal(signal.SIGALRM, _on_alarm)
     timed_out: list[str] = []
+    # key = "<case_id>[<lang>]": with --lang both every case runs its en AND
+    # zh variant (previously only paths[0] — always en — ran, so "both" was
+    # silently "en" and zh/en spread never entered model rankings).
     results: dict[str, list] = {}
+    results_prod: dict[str, list] = {}
+    # Per-execution detail rows backing the tier/latency/failure-mode summary
+    # lines (kept in-memory; scores.jsonl carries the same fields per line).
+    row_details: dict[str, list] = {}
     try:
-        with scores_path.open("w") as sf:
+        with scores_path.open("w") as sf, cases_path.open("w") as cf:
             for cid in case_ids:
                 paths = _select_cases(root, args.lang, None, cid)
                 paths = _filter_multimodal(paths, args.skip_multimodal)
                 if not paths:
                     print(f"  {cid}: NOT FOUND in {root}", file=sys.stderr)
                     continue
-                case = _load_case(paths[0])
-                vds = []
-                for ridx in range(rounds):
-                    signal.alarm(cap)
-                    try:
-                        rec = run_case(str(paths[0]))
-                    except _CaseTimeout:
-                        # Server already killed by run_case's finally. Record a
-                        # timeout so the case counts as agent_failed (verdict None
-                        # → noisy bucket, reported separately in the summary).
-                        rec = _error_record(
-                            case, "timeout",
-                            f"exceeded {cap}s wall-clock — agent likely wedged")
-                        if cid not in timed_out:
-                            timed_out.append(cid)
-                    finally:
-                        signal.alarm(0)
-                    hard = hard_signal.compute(case, rec)
-                    sf.write(json.dumps({"case_id": cid, "lang": case.get("lang"),
-                                         "hard": hard, "round": ridx}, ensure_ascii=False) + "\n")
-                    sf.flush()
-                    vds.append(hard_signal.pass_for_case(hard))
-                results[cid] = vds
-                tag = ("PASS" if all(v is True for v in vds)
-                       else "FAIL" if all(v is False for v in vds) else "SPLIT")
-                print(f"  {cid:36s} {tag:5s} rounds={vds}", file=sys.stderr)
+                paths = _filter_network(paths)
+                for case_path in paths:
+                    case = _load_case(case_path)
+                    lang = case.get("lang") or "en"
+                    key = f"{cid}[{lang}]"
+                    tier = hard_signal.tier_of(cid)
+                    vds = []
+                    vds_prod = []
+                    for ridx in range(rounds):
+                        t_start = time.monotonic()
+                        signal.alarm(cap)
+                        try:
+                            rec = run_case(str(case_path))
+                            _note_timeout(timed_out, key, rec)
+                        except _CaseTimeout:
+                            # Server already killed by run_case's finally. Record
+                            # a timeout: product view counts it as a fail, the
+                            # diagnostic view excludes it (both printed below).
+                            rec = _error_record(
+                                case, "timeout",
+                                f"exceeded {cap}s wall-clock — agent likely wedged")
+                            _note_timeout(timed_out, key, rec)
+                        finally:
+                            signal.alarm(0)
+                        elapsed_ms = int((time.monotonic() - t_start) * 1000)
+                        # Keep the production conversation/tool trace, not just
+                        # its verdict. Flush before scoring so a later analysis
+                        # failure cannot erase the evidence for this execution.
+                        cf.write(json.dumps({**rec, "case_id": cid, "lang": lang,
+                                             "round": ridx}, ensure_ascii=False) + "\n")
+                        cf.flush()
+                        hard = hard_signal.compute(case, rec)
+                        latency_ms = sum(
+                            (t.get("processing_time_ms") or 0)
+                            for t in (rec.get("turn_records") or []))
+                        fmode = hard_signal.classify_failure(case, rec, hard)
+                        sf.write(json.dumps({"case_id": cid, "lang": lang,
+                                             "category": case.get("category"),
+                                             "workflow": case.get("workflow"),
+                                             "scenario_type": case.get("scenario_type"),
+                                             "tier": tier,
+                                             "hard": hard,
+                                             "failure_mode": fmode,
+                                             "guards": rec.get("guards") or {},
+                                             "latency_ms": latency_ms,
+                                             "elapsed_ms": elapsed_ms,
+                                             "status": rec.get("status"),
+                                             "round": ridx}, ensure_ascii=False) + "\n")
+                        sf.flush()
+                        vds.append(hard_signal.pass_for_case(hard))
+                        vds_prod.append(hard_signal.pass_for_case_product(hard))
+                        row_details.setdefault(key, []).append(
+                            {"tier": tier, "latency_ms": latency_ms,
+                             "elapsed_ms": elapsed_ms,
+                             "verdict_prod": vds_prod[-1],
+                             "failure_mode": fmode,
+                             "status": rec.get("status"),
+                             "failed_cmd_reasons": hard.get("failed_cmd_reasons") or {}})
+                    results[key] = vds
+                    results_prod[key] = vds_prod
+                    tag = ("PASS" if all(v is True for v in vds)
+                           else "FAIL" if all(v is False for v in vds) else "SPLIT")
+                    print(f"  {key:44s} {tag:5s} rounds={vds}", file=sys.stderr)
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
 
     if args.update_baseline:
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
-        # Strip the per-round field + keep one record per (case_id, round) — baseline
-        # is just the scores.jsonl; aggregate compares verdicts recomputed from hard.
+        # Baseline is just the scores.jsonl; aggregate compares verdicts
+        # recomputed from hard on both sides — same rule.
         baseline_path.write_text(scores_path.read_text())
-        print(f"\nbaseline written: {baseline_path} ({len(results)} cases, {rounds} round(s))")
+        print(f"\nbaseline written: {baseline_path} "
+              f"({len(results)} case-variants, {rounds} round(s))")
+        return 0
+
+    # ---- rates: product + diagnostic views, per language ----
+    def _lang_of(key: str) -> str:
+        return key.rsplit("[", 1)[-1].rstrip("]") if "[" in key else "?"
+
+    def rates_for(rmap: dict[str, list]) -> list[str]:
+        """Per-language `p/t = pct` strings for a per-round verdict map."""
+        agg: dict[str, list] = {}
+        for key, vds in rmap.items():
+            agg.setdefault(_lang_of(key), []).extend(vds)
+        out = []
+        for lang in sorted(agg):
+            vs = [v for v in agg[lang] if v is not None]
+            if not vs:
+                continue
+            p = sum(1 for v in vs if v is True)
+            out.append(f"{lang} {p}/{len(vs)} = {p/len(vs):.1%}")
+        return out
+
+    print(f"\n=== Regression gate: {len(results)} case-variants × {rounds} round(s) ===")
+    print("  pass rate [product, timeouts=fail]:      " + "  |  ".join(rates_for(results_prod)))
+    print("  pass rate [diagnostic, timeouts excl.]:  " + "  |  ".join(rates_for(results)))
+    _print_tier_summary(row_details)
+
+    # Wall-clock per variant — the axis the score never shows. A 2B at 120 t/s
+    # and a 35B at 50 t/s can tie on verdicts and feel nothing alike; ranking
+    # without this column is how "same tier" models get mis-sold on speed.
+    lats: list[tuple[str, int]] = []
+    try:
+        for l in scores_path.read_text().splitlines():
+            if not l.strip():
+                continue
+            r = json.loads(l)
+            lm = r.get("latency_ms")
+            if isinstance(lm, (int, float)) and lm >= 0:
+                lats.append((f"{r['case_id']}[{r.get('lang','en')}]", int(lm)))
+        if lats:
+            vals = sorted(v for _, v in lats)
+            med = vals[len(vals)//2] / 1000
+            slow = sorted(((v/1000, k) for k, v in lats), reverse=True)[:3]
+            slow_s = ", ".join(f"{k} {t:.0f}s" for t, k in slow)
+            print(f"  latency: median {med:.0f}s/variant | slowest: {slow_s}")
+    except FileNotFoundError:
+        pass
+
+    if timed_out:
+        print(f"  timed out (agent wedged):    {len(timed_out):2d}  {timed_out}")
+
+    # Statistical power, printed next to the verdict. A gate run is a sample:
+    # at 100 verdicts a 75% pass rate carries a ±8.5pp interval, so a 3-5pp
+    # "ranking" between models is not a ranking at all.
+    all_vds = [v for vds in results.values() for v in vds if v is not None]
+    if all_vds:
+        passes = sum(1 for v in all_vds if v is True)
+        total = len(all_vds)
+        lo, hi = stats.wilson_interval(passes, total)
+        half = stats.resolution_pp(passes, total)
+        p = passes / total
+        need = stats.rounds_for(p, 5.0)
+        print(f"  pass rate: {passes}/{total} = {p:.1%} "
+              f"(95% CI {lo:.1%}–{hi:.1%}, ±{half:.1f}pp)")
+        print(f"  resolution: gaps under ~{2 * half:.1f}pp are within this run's noise; "
+              f"±5pp needs ~{need} rounds")
+
+    if not baseline_path:
+        print("\n(model-eval mode — no --baseline given. Pass one for same-model "
+              "regression comparison; comparing against ANOTHER model's baseline "
+              "produces meaningless improvements/regressions.)")
         return 0
 
     # Compare to baseline (recompute verdicts from hard on both sides — same rule).
@@ -823,32 +1290,32 @@ def cmd_regression(args):
             continue
         r = json.loads(l)
         # If multiple rounds in baseline, take robust (all agree) verdict.
-        cid = r["case_id"]; v = hard_signal.pass_for_case(r.get("hard", {}))
-        if cid in base_verdict:
+        key = f"{r['case_id']}[{r.get('lang', 'en')}]"
+        v = hard_signal.pass_for_case(r.get("hard", {}))
+        if key in base_verdict:
             # multi-round baseline: demote to None if rounds disagree
-            if base_verdict[cid] != v:
-                base_verdict[cid] = None
+            if base_verdict[key] != v:
+                base_verdict[key] = None
         else:
-            base_verdict[cid] = v
+            base_verdict[key] = v
 
     flips, regressions, noisy = [], [], []
-    for cid, vds in results.items():
+    for key, vds in results.items():
         robust = (True if all(v is True for v in vds)
                   else False if all(v is False for v in vds) else None)
-        bv = base_verdict.get(cid)
+        bv = base_verdict.get(key)
         if bv is True and robust is False:
-            regressions.append(cid)
+            regressions.append(key)
         elif bv is False and robust is True:
-            flips.append(cid)
+            flips.append(key)
         elif robust is None:
-            noisy.append(cid)
+            noisy.append(key)
 
-    print(f"\n=== Regression gate: {len(results)} cases × {rounds} round(s) vs {baseline_path.name} ===")
+    print(f"\n  vs baseline {baseline_path.name} (same model expected):")
     print(f"  FAIL->PASS (improvements):   {len(flips):2d}  {flips}")
     print(f"  PASS->FAIL (REGRESSIONS):    {len(regressions):2d}  {regressions}")
     print(f"  noisy (split across rounds): {len(noisy):2d}  {noisy}")
-    if timed_out:
-        print(f"  timed out (agent wedged):    {len(timed_out):2d}  {timed_out}")
+
     if rounds < 2 and (regressions or flips):
         print("  (single-round — rerun with --rounds 2 to confirm signal isn't noise)",
               file=sys.stderr)
@@ -934,6 +1401,8 @@ def main():
                    help="skip LLM-endpoint pre-flight (for confirmed cloud/versioned endpoints)")
     p.add_argument("--skip-multimodal", action="store_true",
                    help="exclude requires_multimodal cases (non-multimodal backend config)")
+    p.add_argument("--allow-model-mismatch", action="store_true",
+                   help="proceed even when the served model differs from AGENT_LLM_MODEL")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("report", help="aggregate scores.jsonl → grade-card.md")
@@ -949,14 +1418,22 @@ def main():
     p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("regression",
-                       help="fast prompt/agent regression gate on a curated case set")
+                       help="agent gate: pass rate + optional baseline comparison")
     p.add_argument("--root", default="eval/cases")
-    p.add_argument("--lang", choices=["zh", "en", "both"], default="en")
+    p.add_argument("--lang", choices=["zh", "en", "both"], default="both",
+                   help="both = run the en AND zh variant of every case and report "
+                        "per-language rates (the product is bilingual; en-only "
+                        "comparisons hid up to 9pp zh/en spread)")
     p.add_argument("--regression-set", default=None,
                    help="case_id list (default eval/regression_set.txt)")
-    p.add_argument("--baseline", default="eval/baselines/regression-qwen35-4b.jsonl")
-    p.add_argument("--rounds", type=int, default=1,
-                   help="runs per case: 1=fast (~12min), 2=robust (~25min, beats noise floor)")
+    p.add_argument("--baseline", default=None,
+                   help="baseline scores.jsonl for SAME-model regression comparison. "
+                        "No default: without it the run is a model-eval (rates + CI "
+                        "only, no improvements/regressions — those only make sense "
+                        "against the same model's own reference)")
+    p.add_argument("--rounds", type=int, default=2,
+                   help="runs per case: 2=robust (default; beats the ~7pp single-round "
+                        "noise floor), 1=fast smoke only")
     p.add_argument("--case-timeout", type=int, default=600,
                    help="per-case wall-clock cap in seconds (default 600); a wedged agent "
                         "is killed and marked timed-out instead of hanging the gate")
@@ -967,6 +1444,8 @@ def main():
                    help="skip LLM-endpoint pre-flight (for confirmed cloud/versioned endpoints)")
     p.add_argument("--skip-multimodal", action="store_true",
                    help="exclude requires_multimodal cases (non-multimodal backend config)")
+    p.add_argument("--allow-model-mismatch", action="store_true",
+                   help="proceed even when the served model differs from AGENT_LLM_MODEL")
     p.set_defaults(func=cmd_regression)
 
     args = ap.parse_args()

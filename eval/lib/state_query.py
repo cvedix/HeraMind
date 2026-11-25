@@ -70,8 +70,14 @@ def _find_by_name(base: str, key: str, list_path: str, name: str) -> bool:
     if isinstance(v, list):
         items = v
     elif isinstance(v, dict):
+        # Collection-key allowlist per endpoint family. Keep in sync with the
+        # router's envelope shapes — a missing key here silently false-fails
+        # every name-based assertion for that resource (found the hard way:
+        # `connector_exists` vs {"data":{"brokers":[...]}}).
         for k in ("devices", "rules", "agents", "channels", "messages",
-                  "dashboards", "automations", "transforms", "data", "items"):
+                  "dashboards", "automations", "transforms", "data", "items",
+                  "brokers", "extensions", "components", "connectors",
+                  "llm_backends", "backends", "keys", "users"):
             arr = v.get(k)
             if isinstance(arr, list):
                 items = arr
@@ -240,6 +246,27 @@ def run_query(q: dict, base: str, key: str, response: str | None = None) -> dict
         v = _get_with_name_fallback(base, key, "/agents", "/agents/{id}", "agents", params)
         stats = v.get("stats") if isinstance(v, dict) else None
         actual = stats.get("total_executions") if isinstance(stats, dict) else 0
+    elif t == "agent_config":
+        # Field-level assertion on the agent record: schedule_type,
+        # cron_expression, timezone, interval_seconds, event_filter,
+        # execution_mode. The 2026-10 audit found 3 of 4 schedule types and
+        # 2 of 3 execution modes had ZERO case coverage — this query (plus
+        # the cases that use it) pins the config matrix. Values are the
+        # API's lowercase storage forms (probed 2026-10-26): "cron",
+        # "0 8 * * *", "Asia/Shanghai", "focused", "structured", …
+        v = _get_with_name_fallback(base, key, "/agents", "/agents/{id}", "agents", params)
+        field = str(params.get("field", ""))
+        if isinstance(v, dict) and field:
+            if field == "schedule_type":
+                sched = v.get("schedule") or {}
+                actual = sched.get("schedule_type") if isinstance(sched, dict) else None
+            elif field in ("cron_expression", "timezone", "interval_seconds", "event_filter"):
+                sched = v.get("schedule") or {}
+                actual = sched.get(field) if isinstance(sched, dict) else None
+            else:
+                actual = v.get(field)
+        else:
+            actual = None
     elif t == "push_enabled":
         # Need the record's id: support name fallback (list + match by name),
         # since agents create pushes with auto-generated ids.
@@ -310,6 +337,10 @@ def run_query(q: dict, base: str, key: str, response: str | None = None) -> dict
                     break
     elif t == "extension_installed":
         actual = _id_or_name_exists(base, key, "/extensions", "/extensions/{id}", params)
+    elif t == "connector_exists":
+        # Data connectors (mqtt/webhook/http) live under /brokers — the CLI's
+        # `connector` domain maps onto the broker registry.
+        actual = _id_or_name_exists(base, key, "/brokers", "/brokers/{id}", params)
     elif t == "widget_exists":
         actual = _id_or_name_exists(base, key, "/frontend-components",
                                     "/frontend-components/{id}", params)
@@ -362,22 +393,28 @@ def run_query(q: dict, base: str, key: str, response: str | None = None) -> dict
         # params.command? Downlink assertion. The platform records every
         # command in history BEFORE routing (service.rs send_command), so this
         # works even for offline simulated devices.
-        want_id = _sid(params, "id")
-        v = _get_json(base, key, f"/devices/{want_id}/commands")
-        records = []
-        if isinstance(v, list):
-            records = v
-        elif isinstance(v, dict):
-            for k in ("commands", "data", "history", "items"):
-                arr = v.get(k)
-                if isinstance(arr, list):
-                    records = arr
-                    break
-        names = [
-            str(c.get("command_name") or c.get("command") or c.get("name") or "").lower()
-            for c in records if isinstance(c, dict)
-        ]
-        actual = str(params.get("command", "")).lower() in names
+        # Accept `id` or `name` (same contract as *_exists): agents often
+        # create devices under a display name while the case asserts by that
+        # name rather than a predictable UUID.
+        resolved = _resolve_id_or_name(base, key, "/devices", "devices", params)
+        if not resolved:
+            actual = False
+        else:
+            v = _get_json(base, key, f"/devices/{resolved}/commands")
+            records = []
+            if isinstance(v, list):
+                records = v
+            elif isinstance(v, dict):
+                for k in ("commands", "data", "history", "items"):
+                    arr = v.get(k)
+                    if isinstance(arr, list):
+                        records = arr
+                        break
+            names = [
+                str(c.get("command_name") or c.get("command") or c.get("name") or "").lower()
+                for c in records if isinstance(c, dict)
+            ]
+            actual = str(params.get("command", "")).lower() in names
     elif t == "rule_references_source":
         # Depth assertion: does a rule's condition reference the expected data
         # source (e.g. a transform output, or a specific device metric)?

@@ -1,14 +1,8 @@
 import { useTranslation } from "react-i18next"
-import { Badge } from "@/components/ui/badge"
-import { Card } from "@/components/ui/card"
-import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu"
-import { IconButton } from "@/components/ui/button"
-import { ResponsiveTable, StatusBadge, EmptyState } from "@/components/shared"
+import { ResponsiveTable, EmptyState, EmptyStateCard } from "@/components/shared"
 import { DeviceStatusBadge } from "@/components/shared/DeviceStatusBadge"
-import { Eye, MoreVertical, Trash2, Cpu, Database, Waves, Pencil } from "lucide-react"
+import { Eye, Trash2, Cpu, Database, Waves, Pencil } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { interactiveCardHover } from "@/design-system/tokens/size"
-import { textMini } from "@/design-system/tokens/typography"
 import { formatTimestamp } from "@/lib/utils/format"
 import type { Device } from "@/types"
 import { TransformsBadge } from "@/components/automation"
@@ -21,6 +15,9 @@ interface DeviceListProps {
   devices: Device[]
   loading: boolean
   paginatedDevices: Device[]
+  /** True while a text search is active — switches the mobile empty state
+      from the "add your first device" pitch to a no-results message. */
+  searching?: boolean
   devicePage: number
   devicesPerPage: number
   onRefresh: () => void
@@ -33,16 +30,17 @@ interface DeviceListProps {
 }
 
 export function DeviceList({
-  devices,
+  devices: _devices,
   loading,
   paginatedDevices,
-  devicePage,
-  devicesPerPage,
+  searching = false,
+  devicePage: _devicePage,
+  devicesPerPage: _devicesPerPage,
   onRefresh,
   onViewDetails,
   onEdit,
   onDelete,
-  onPageChange,
+  onPageChange: _onPageChange,
   onAddDevice: _onAddDevice,
   addDeviceDialog,
 }: DeviceListProps) {
@@ -87,75 +85,57 @@ export function DeviceList({
       {addDeviceDialog}
 
       {isMobile ? (
-        <div className="space-y-3">
+        <div className="space-y-2">
+          {/* Mobile has no ResponsiveTable, so it must carry its own loading
+              and empty states — a bare map() renders as a blank void. */}
+          {loading && paginatedDevices.length === 0 && (
+            [0, 1, 2].map((i) => (
+              <div key={i} className="animate-pulse rounded-2xl border border-border bg-card px-4 py-4">
+                <div className="h-4 w-36 rounded bg-muted" />
+                <div className="mt-2 h-3 w-52 rounded bg-muted" />
+              </div>
+            ))
+          )}
+          {!loading && paginatedDevices.length === 0 && (
+            <EmptyStateCard>
+              {searching ? (
+                <EmptyState
+                  title={t('devices:searchNoResults', 'No devices match your search')}
+                  description={t('devices:searchNoResultsHint', 'Try a different name, type or adapter')}
+                />
+              ) : (
+                <EmptyState
+                  title={t('devices:empty.title', 'No devices')}
+                  description={t('devices:empty.description', 'Add your first device to get started')}
+                />
+              )}
+            </EmptyStateCard>
+          )}
           {paginatedDevices.map((device) => {
-            const AdapterIcon = getAdapterIcon(device.adapter_type)
             return (
-              <Card
+              <div
                 key={device.id}
-                className={cn(
-                  "overflow-hidden border-border shadow-sm cursor-pointer active:scale-[0.99]",
-                  interactiveCardHover,
-                )}
+                role="button"
+                tabIndex={0}
+                className="cursor-pointer rounded-2xl border border-border bg-card px-4 py-3.5 transition-colors active:bg-muted"
                 onClick={() => onViewDetails(device)}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onViewDetails(device) }}
               >
-                <div className="px-3 py-2.5">
-                  {/* Row 1: icon + name + status + actions */}
-                  <div className="flex items-center gap-2.5">
-                    <div className={cn(
-                      "w-8 h-8 rounded-lg flex items-center justify-center shrink-0",
-                      device.status === 'online'
-                        ? "bg-success-light text-success"
-                        : "bg-muted text-muted-foreground"
-                    )}>
-                      <Cpu className="h-4 w-4" />
+                <div className="flex items-start gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <div className="truncate text-heading font-medium text-foreground">{device.name || "-"}</div>
+                      <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", device.online ? "bg-success" : "bg-muted-foreground")} />
+                      <span className="sr-only">
+                        {device.online ? t('common:online', '在线') : t('common:offline', '离线')}
+                      </span>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="font-medium text-sm truncate">{device.name || "-"}</div>
+                    <div className="mt-1 truncate text-xs text-muted-foreground">
+                      {device.device_type} · {device.adapter_type || 'mqtt'}
                     </div>
-                    <DeviceStatusBadge device={device} />
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
-                        <IconButton>
-                          <MoreVertical className="h-4 w-4" />
-                        </IconButton>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onViewDetails(device) }}>
-                          <Eye className="h-4 w-4 mr-2" />
-                          {t('devices:actions.viewDetails')}
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onEdit(device) }}>
-                          <Pencil className="h-4 w-4 mr-2" />
-                          {t('common:edit')}
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          className="text-error"
-                          onClick={(e) => { e.stopPropagation(); onDelete(device.id) }}
-                        >
-                          <Trash2 className="h-4 w-4 mr-2" />
-                          {t('common:delete')}
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                  {/* Row 2: type badge + adapter + last seen */}
-                  <div className="flex items-center gap-1.5 mt-1.5 ml-[42px]">
-                    <Badge variant="outline" className={cn(textMini, "h-5 px-1.5")}>
-                      {device.device_type}
-                    </Badge>
-                    <div className="flex items-center gap-1">
-                      <AdapterIcon className="h-3 w-3 text-muted-foreground" />
-                      <Badge variant="outline" className={cn(textMini, "h-5 px-1.5")}>
-                        {device.adapter_type || 'mqtt'}
-                      </Badge>
-                    </div>
-                    <span className={cn(textMini, "text-muted-foreground ml-auto")}>
-                      {formatTimestamp(device.last_seen, false)}
-                    </span>
                   </div>
                 </div>
-              </Card>
+              </div>
             )
           })}
         </div>
@@ -204,36 +184,38 @@ export function DeviceList({
           switch (columnKey) {
             case 'name':
               return (
-                <div className="flex items-center gap-3">
+                <div className="flex min-w-0 items-center gap-3">
                   <div className={cn(
-                    "w-9 h-9 rounded-lg flex items-center justify-center transition-colors",
+                    "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors",
                     device.status === 'online'
                       ? "bg-success-light text-success"
                       : "bg-muted text-muted-foreground"
                   )}>
                     <Cpu className="h-4 w-4" />
                   </div>
-                  <div>
-                    <div className="font-medium text-sm">{device.name || "-"}</div>
-                    <code className="text-xs text-muted-foreground font-mono">{device.id}</code>
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium" title={device.name || undefined}>{device.name || "-"}</div>
+                    <code className="block min-w-0 truncate text-xs font-mono text-muted-foreground" title={device.id}>{device.id}</code>
                   </div>
                 </div>
               )
 
             case 'type':
+              // Plain muted mono text — non-interactive metadata shouldn't
+              // wear a bordered chip (reads as a button and litters the table).
               return (
-                <Badge variant="outline" className="text-xs">
+                <span className="text-xs text-muted-foreground font-mono">
                   {device.device_type}
-                </Badge>
+                </span>
               )
 
             case 'adapter':
               return (
                 <div className="flex items-center gap-2">
                   <AdapterIcon className="h-4 w-4 text-muted-foreground" />
-                  <Badge variant="outline" className="text-xs">
+                  <span className="text-xs text-muted-foreground">
                     {device.adapter_type || 'mqtt'}
-                  </Badge>
+                  </span>
                 </div>
               )
 
@@ -283,7 +265,6 @@ export function DeviceList({
         ]}
         emptyState={
           <EmptyState
-            icon={<Cpu className="h-12 w-12" />}
             title={t('devices:empty.title', 'No devices')}
             description={t('devices:empty.description', 'Add your first device to get started')}
           />

@@ -36,7 +36,24 @@ export interface AiAgent {
   max_chain_depth?: number
   priority?: number
   context_window_size?: number
-  execution_mode?: 'focused' | 'free'
+  /** Contract field names — card role badge + latest-output keys */
+  output_fields?: string[]
+  /** Latest published ai:{id}:{field} values (list endpoint, best-effort) */
+  latest_output?: Record<string, unknown>
+  /**
+   * The same readings with what it takes to check them: when each was
+   * published, the model's own confidence, and the run that produced it.
+   * Absent pieces are omitted rather than nulled.
+   */
+  latest_output_state?: Record<string, OutputFieldState>
+  /** Last error message (Error status) */
+  error?: string
+  execution_mode?: AgentExecutionMode
+  /** Memory axis — absent means the mode-derived default */
+  memory_mode?: AgentMemoryMode
+  notify?: AgentNotify
+  /** Tool gating for this agent (None = default: tools enabled, all allowed). */
+  tool_config?: AgentToolConfig
 }
 
 /**
@@ -56,10 +73,18 @@ export interface AiAgentDetail extends AiAgent {
   // Tool chaining configuration
   max_chain_depth?: number
   priority?: number
-  /** Execution mode: "focused" for bound-resource agents, "free" for unrestricted tool-calling */
-  execution_mode?: 'focused' | 'free'
+  /** Execution mode: "focused" for bound-resource agents, "free" for unrestricted tool-calling, "structured" for L0 extraction */
+  execution_mode?: AgentExecutionMode
   /** Custom system prompt override */
   system_prompt?: string
+  /** Structured (L0) output contract */
+  output_schema?: OperatorField[]
+  /** Structured (L0) runtime tuning */
+  operator_config?: OperatorConfig
+  memory_mode?: AgentMemoryMode
+  notify?: AgentNotify
+  /** Tool gating: enabled=false → text-only agent; allowed_tools empty → all. */
+  tool_config?: AgentToolConfig
 }
 
 /**
@@ -193,6 +218,16 @@ export interface AgentAvailableResources {
 /**
  * Agent execution record - matches backend AgentExecutionDto
  */
+/** One published output field, as the detail view shows it. */
+export interface OutputFieldState {
+  value: unknown
+  /** Unix seconds. */
+  at: number
+  confidence?: number
+  /** The run that produced it — the way back to its evidence. */
+  execution_id?: string
+}
+
 export interface AgentExecution {
   id: string
   agent_id: string
@@ -231,6 +266,74 @@ export interface AgentResource {
 /**
  * Request to create a new AI Agent - matches backend CreateAgentRequest
  */
+/** Structured (L0) field type: number | text | boolean | enum(values) */
+export type OperatorFieldType =
+  | { type: 'number' }
+  | { type: 'text' }
+  | { type: 'boolean' }
+  | { type: 'enum'; values: string[] }
+
+/** One output field of a structured agent — published as ai:{agentId}:{name} */
+export interface OperatorField {
+  name: string
+  field_type: OperatorFieldType
+  unit?: string
+  description?: string
+}
+
+/** When an agent notifies (mirrors the server's `NotifyOn`). */
+export type AgentNotifyOn = 'failure' | 'always' | 'judgment'
+
+/** Explicit notification routing (mirrors the server's `AgentNotify`). */
+export interface AgentNotify {
+  channels: string[]
+  on: AgentNotifyOn
+}
+
+/**
+ * How much history an agent carries into each run (mirrors the server's
+ * `MemoryMode`). `tool` = judged fresh each time; `assistant` = carries the
+ * recent-execution narrative. Omitted = derived from the execution mode.
+ */
+export type AgentMemoryMode = 'tool' | 'assistant'
+
+/** Structured (L0) runtime tuning */
+export interface OperatorConfig {
+  debounce_secs?: number
+  max_calls_per_day?: number
+  timeout_secs?: number
+  consecutive_failure_threshold?: number
+  /** Event-trigger cooldown in seconds (undefined = platform default 60; 0 = on-demand) */
+  event_cooldown_secs?: number
+}
+
+export type AgentExecutionMode = 'focused' | 'free' | 'structured'
+
+/** Dry-run (试跑) result — one inference, nothing published */
+export interface DryRunResult {
+  agent_id: string
+  context: string
+  data_sources: number
+  fields: Record<string, unknown>
+  raw_text: string
+  attempts: number
+}
+
+/** Save-before dry-run request — transient agent, nothing persisted */
+export interface TestPreviewRequest {
+  user_prompt: string
+  /** Preview mode; omitted = structured (the original dry-run). */
+  execution_mode?: AgentExecutionMode
+  resources?: ResourceRequest[]
+  output_schema?: OperatorField[]
+  operator_config?: OperatorConfig
+  memory_mode?: AgentMemoryMode
+  notify?: AgentNotify
+  llm_backend_id?: string
+  /** Preview fidelity: run the preview with the same tool gating the saved agent will have. */
+  tool_config?: AgentToolConfig
+}
+
 export interface CreateAgentRequest {
   name: string
   description?: string
@@ -248,10 +351,18 @@ export interface CreateAgentRequest {
   priority?: number
   /** Context window size (default: 10) */
   context_window_size?: number
-  /** Execution mode: "focused" for bound-resource agents, "free" for unrestricted tool-calling */
-  execution_mode?: 'focused' | 'free'
+  /** Execution mode: "focused" for bound-resource agents, "free" for unrestricted tool-calling, "structured" for L0 extraction */
+  execution_mode?: AgentExecutionMode
   /** Custom system prompt override */
   system_prompt?: string
+  /** Structured (L0) output contract */
+  output_schema?: OperatorField[]
+  /** Structured (L0) runtime tuning */
+  operator_config?: OperatorConfig
+  memory_mode?: AgentMemoryMode
+  notify?: AgentNotify
+  /** Tool gating: enabled=false → text-only agent; allowed_tools empty → all. */
+  tool_config?: AgentToolConfig
 }
 
 /**
@@ -330,10 +441,18 @@ export interface UpdateAgentRequest {
   priority?: number
   /** Context window size in tokens (default: 8192) */
   context_window_size?: number
-  /** Execution mode: "focused" for bound-resource agents, "free" for unrestricted tool-calling */
-  execution_mode?: 'focused' | 'free'
+  /** Execution mode: "focused" for bound-resource agents, "free" for unrestricted tool-calling, "structured" for L0 extraction */
+  execution_mode?: AgentExecutionMode
   /** Custom system prompt override */
   system_prompt?: string
+  /** Structured (L0) output contract */
+  output_schema?: OperatorField[]
+  /** Structured (L0) runtime tuning */
+  operator_config?: OperatorConfig
+  memory_mode?: AgentMemoryMode
+  notify?: AgentNotify
+  /** Tool gating: enabled=false → text-only agent; allowed_tools empty → all. */
+  tool_config?: AgentToolConfig
 }
 
 /**
@@ -383,7 +502,16 @@ export interface DecisionProcess {
   reasoning_steps: ReasoningStep[]
   decisions: Decision[]
   conclusion: string
-  confidence: number
+  /**
+   * The model's own confidence, 0–1. Absent when it reported none — the
+   * backend omits the key rather than sending `null`, because these consumers
+   * guard on `undefined` and `null * 100` would render as "0%".
+   */
+  confidence?: number
+  /** Why the run stopped; omitted when empty. */
+  stop_reason?: string
+  /** Summed LLM tokens when reported; omitted when 0/unreported. */
+  tokens_used?: number
 }
 
 /**
@@ -405,7 +533,7 @@ export interface ReasoningStep {
   step_type: string
   input?: string
   output: string
-  confidence: number
+  confidence?: number
 }
 
 /**
@@ -479,6 +607,15 @@ export interface NotificationSent {
  * Read-only catalog item describing a tool in the server's ToolRegistry.
  * Returned by GET /api/agents/tools.
  */
+/**
+ * Per-agent tool gating. `enabled: false` → the agent gets NO tools
+ * (text-only responses); `allowed_tools` empty → all available tools.
+ */
+export interface AgentToolConfig {
+  enabled: boolean
+  allowed_tools: string[]
+}
+
 export interface AgentToolCatalogItem {
   name: string
   description: string

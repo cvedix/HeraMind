@@ -25,6 +25,12 @@ pub struct DataPoint {
     pub value: MetricValue,
     /// Quality indicator (0-1, optional)
     pub quality: Option<f32>,
+    /// Optional metadata carried alongside the value. Storage has always had
+    /// this field; this view simply never forwarded it, so anything attached
+    /// to a point — a published AI field's link back to its run, for instance
+    /// — was dropped one layer below the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 impl DataPoint {
@@ -34,6 +40,7 @@ impl DataPoint {
             timestamp,
             value,
             quality: None,
+            metadata: None,
         }
     }
 
@@ -57,7 +64,13 @@ impl DataPoint {
                 let json_arr: Vec<Value> = arr.iter().map(Self::metric_value_to_json).collect();
                 Value::Array(json_arr)
             }
-            MetricValue::Binary(data) => Value::String(BASE64.encode(data)),
+            // Tagged on write so read-back is EXACT: the old plain base64
+            // string relied on a decode heuristic that also swallowed any
+            // ordinary string which happened to be valid base64 with
+            // non-printable bytes (hashes, serials → typed Binary on read).
+            MetricValue::Binary(data) => serde_json::json!({
+                "$binary": BASE64.encode(data),
+            }),
             MetricValue::Null => Value::Null,
         }
     }
@@ -72,6 +85,17 @@ impl DataPoint {
                     n.as_f64().map(MetricValue::Float)
                 }
             }
+            // New form: explicit $binary tag (exact round-trip).
+            Value::Object(map) if map.len() == 1 && map.contains_key("$binary") => map
+                .get("$binary")
+                .and_then(|v| v.as_str())
+                .and_then(|s| BASE64.decode(s).ok())
+                .map(MetricValue::Binary),
+            // Legacy form: plain string. Image URLs stay strings by guard;
+            // everything else keeps the decode heuristic ONLY if it looks
+            // like actual binary — a hash/serial that decodes cleanly to
+            // non-printables used to come back typed Binary (rule/frontend
+            // saw a different type than the writer sent).
             Value::String(s) => {
                 // Image URLs are stored as plain strings — don't base64 decode.
                 // Explicit guard (don't rely on base64-decode failure for URLs).
@@ -79,11 +103,21 @@ impl DataPoint {
                 if s.starts_with("/api/images/") {
                     return Some(MetricValue::String(s.clone()));
                 }
-                // Try to decode as base64 first (for binary data)
-                if let Ok(decoded) = BASE64.decode(s) {
-                    // Check if it looks like valid binary (not just a regular string that happens to be valid base64)
-                    if decoded.iter().any(|&b: &u8| !(32..=126).contains(&b)) {
-                        return Some(MetricValue::Binary(decoded));
+                // LEGACY plain-base64 blobs only (new Binary writes carry
+                // the $binary tag). The heuristic now requires a real blob
+                // shape: long enough to be a payload and MOSTLY non-printable
+                // when decoded — "any non-printable byte" let a 4-char
+                // hash/serial fragment flip the type on read-back.
+                if s.len() >= 16
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '=' || c == '/')
+                {
+                    if let Ok(decoded) = BASE64.decode(s) {
+                        let non_printable =
+                            decoded.iter().filter(|&b| !(32..=126).contains(b)).count();
+                        if decoded.len() >= 8 && non_printable * 2 > decoded.len() {
+                            return Some(MetricValue::Binary(decoded));
+                        }
                     }
                 }
                 Some(MetricValue::String(s.clone()))
@@ -103,6 +137,9 @@ impl DataPoint {
         if let Some(q) = self.quality {
             point = point.with_quality(q);
         }
+        if let Some(m) = &self.metadata {
+            point = point.with_metadata(m.clone());
+        }
         point
     }
 
@@ -113,6 +150,7 @@ impl DataPoint {
             timestamp: storage_point.timestamp,
             value,
             quality: storage_point.quality,
+            metadata: storage_point.metadata,
         })
     }
 }
@@ -147,6 +185,13 @@ pub struct AggregatedData {
 /// All MetricValue types (Integer, Float, String, Boolean, Binary, Null) are stored.
 pub struct TimeSeriesStorage {
     store: std::sync::RwLock<Arc<StorageTimeSeriesStore>>,
+    /// Signals whether the deferred persistent store has been resolved —
+    /// either swapped in, or open failed and memory is final. Holders that
+    /// pin `inner_store()` for their lifetime (the agent executor) wait on
+    /// this first, or they pin the throwaway placeholder forever: every AI
+    /// write then goes to memory and evaporates on restart.
+    loaded_rx: tokio::sync::watch::Receiver<bool>,
+    loaded_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl TimeSeriesStorage {
@@ -165,18 +210,51 @@ impl TimeSeriesStorage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DeviceError> {
         let store = StorageTimeSeriesStore::open(path)
             .map_err(|e| DeviceError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(Self {
-            store: std::sync::RwLock::new(store),
-        })
+        Ok(Self::with_store(store, true))
     }
 
-    /// Create an in-memory time series storage
+    fn with_store(store: Arc<StorageTimeSeriesStore>, loaded: bool) -> Self {
+        let (loaded_tx, loaded_rx) = tokio::sync::watch::channel(loaded);
+        Self {
+            store: std::sync::RwLock::new(store),
+            loaded_tx,
+            loaded_rx,
+        }
+    }
+
+    /// Wait until the deferred persistent store has been resolved (swapped
+    /// in, or open failed and memory is final). Safe to call any number of
+    /// times from any task.
+    pub async fn wait_for_storage_load(&self) {
+        if *self.loaded_rx.borrow() {
+            return;
+        }
+        let _ = self.loaded_rx.clone().wait_for(|v| *v).await;
+    }
+
+    /// Create an in-memory time series storage. This is a FINAL store —
+    /// nothing is deferred, so waiters proceed immediately. (Tests and
+    /// embedded uses construct this directly; making it "unresolved" here
+    /// deadlocked anything that waited for the load.)
     pub fn memory() -> Result<Self, DeviceError> {
         let store = StorageTimeSeriesStore::memory()
             .map_err(|e| DeviceError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(Self {
-            store: std::sync::RwLock::new(store),
-        })
+        Ok(Self::with_store(store, true))
+    }
+
+    /// An in-memory PLACEHOLDER whose persistent replacement is still being
+    /// opened — the server startup state. `wait_for_storage_load` blocks
+    /// until `swap_store_with_drain` or `finalize_memory` resolves it.
+    pub fn memory_deferred() -> Result<Self, DeviceError> {
+        let store = StorageTimeSeriesStore::memory()
+            .map_err(|e| DeviceError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(Self::with_store(store, false))
+    }
+
+    /// Resolve this storage as final without a swap — the open failed and
+    /// memory is where data will live. Unblocks [`wait_for_storage_load`].
+    pub fn finalize_memory(&self) {
+        let _ = self.loaded_tx.send(true);
     }
 
     /// Swap the underlying store (used for deferred persistent storage loading).
@@ -186,6 +264,63 @@ impl TimeSeriesStorage {
             Ok(mut guard) => *guard = new_store,
             Err(poisoned) => *poisoned.into_inner() = new_store,
         }
+    }
+
+    /// [`swap_store`] with a drain: anything written to the placeholder
+    /// before the swap is migrated into the persistent store first, then the
+    /// pointer flips and waiters are released. Without the drain, telemetry
+    /// that arrived during the open window silently evaporates.
+    pub async fn swap_store_with_drain(
+        &self,
+        new_store: Arc<StorageTimeSeriesStore>,
+    ) -> Result<u64, DeviceError> {
+        let old = self.store();
+        let mut migrated = 0u64;
+        if !Arc::ptr_eq(&old, &new_store) {
+            // Flip the pointer BEFORE draining: new writers go straight to
+            // the persistent store. The old order (drain, then flip) left
+            // the ENTIRE copy-duration window un-drained — a concurrent
+            // write that fetched the old pointer mid-scan was silently
+            // evaporated by the flip. Post-swap, the only writes still
+            // landing in the placeholder are those that read the old
+            // pointer in the microseconds before the flip; this drain
+            // catches them.
+            self.swap_store(new_store.clone());
+            let _ = self.loaded_tx.send(true);
+
+            // Buffered writes would be invisible to the scan below — force
+            // them into the placeholder's storage first.
+            if let Err(e) = old.flush() {
+                tracing::warn!(category = "storage", error = %e,
+                    "flush of placeholder telemetry before drain failed — buffered points may be lost");
+            }
+            let series = old
+                .list_series_scan()
+                .await
+                .map_err(|e| DeviceError::Io(std::io::Error::other(e.to_string())))?;
+            for (source_id, metric) in series {
+                let points = old
+                    .query_range(&source_id, &metric, i64::MIN, i64::MAX, None)
+                    .await
+                    .map_err(|e| DeviceError::Io(std::io::Error::other(e.to_string())))?;
+                if points.points.is_empty() {
+                    continue;
+                }
+                migrated += points.points.len() as u64;
+                new_store
+                    .write_batch(&source_id, &metric, points.points)
+                    .await
+                    .map_err(|e| DeviceError::Io(std::io::Error::other(e.to_string())))?;
+            }
+            if let Err(e) = new_store.flush() {
+                tracing::warn!(category = "storage", error = %e,
+                    "flush of migrated telemetry failed — points may sit in the buffer");
+            }
+        } else {
+            self.swap_store(new_store);
+            let _ = self.loaded_tx.send(true);
+        }
+        Ok(migrated)
     }
 
     /// Write a data point (all value types are stored)
@@ -254,32 +389,65 @@ impl TimeSeriesStorage {
         end_timestamp: i64,
         limit: Option<usize>,
     ) -> Result<Vec<DataPoint>, DeviceError> {
+        Ok(self
+            .query_limited_with_total(source_id, metric, start_timestamp, end_timestamp, limit, 0)
+            .await?
+            .0)
+    }
+
+    /// Same as [`query_limited`](Self::query_limited), plus the exact number of
+    /// points in `[start, end]`.
+    ///
+    /// `query_range_rev` already scans the whole range to fill `total_count`.
+    /// Dropping that count and reporting `points.len()` made pagination treat
+    /// a fetch cap (`limit`, often `page_size * 2`) as the series total.
+    ///
+    /// `offset` skips the newest N points (newest-first pagination), matching
+    /// [`Self::query_with_limit`] and `GET /api/telemetry`.
+    pub async fn query_limited_with_total(
+        &self,
+        source_id: &str,
+        metric: &str,
+        start_timestamp: i64,
+        end_timestamp: i64,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<(Vec<DataPoint>, usize), DeviceError> {
         tracing::debug!(
-            "TimeSeriesStorage::query: source_id={}, metric={}, start={}, end={}, limit={:?}",
+            "TimeSeriesStorage::query: source_id={}, metric={}, start={}, end={}, limit={:?}, offset={}",
             source_id,
             metric,
             start_timestamp,
             end_timestamp,
             limit,
+            offset,
         );
 
-        let result = if limit.is_some() {
-            // Reverse scan → newest N points, then reverse to ASC for callers.
+        let (result, total) = if limit.is_some() {
+            // Reverse scan → newest N points after offset, then reverse to ASC.
             let rev = self
                 .store()
-                .query_range_rev(source_id, metric, start_timestamp, end_timestamp, limit, 0)
+                .query_range_rev(
+                    source_id,
+                    metric,
+                    start_timestamp,
+                    end_timestamp,
+                    limit,
+                    offset,
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!("query_range_rev failed for {}/{}: {}", source_id, metric, e);
                     DeviceError::Io(std::io::Error::other(e.to_string()))
                 })?;
+            let total = rev.total_count.unwrap_or(rev.points.len());
             let mut pts: Vec<DataPoint> = rev
                 .points
                 .into_iter()
                 .filter_map(DataPoint::from_storage)
                 .collect();
             pts.reverse(); // DESC → ASC
-            pts
+            (pts, total)
         } else {
             // No limit → standard ASC scan (unchanged behaviour).
             let fwd = self
@@ -290,10 +458,13 @@ impl TimeSeriesStorage {
                     tracing::error!("query_range failed for {}/{}: {}", source_id, metric, e);
                     DeviceError::Io(std::io::Error::other(e.to_string()))
                 })?;
-            fwd.points
+            let pts: Vec<DataPoint> = fwd
+                .points
                 .into_iter()
                 .filter_map(DataPoint::from_storage)
-                .collect()
+                .collect();
+            let total = pts.len();
+            (pts, total)
         };
 
         if result.is_empty() {
@@ -307,13 +478,14 @@ impl TimeSeriesStorage {
         }
 
         tracing::debug!(
-            "query result: {} points for {}/{}",
+            "query result: {} points for {}/{} (total={})",
             result.len(),
             source_id,
-            metric
+            metric,
+            total
         );
 
-        Ok(result)
+        Ok((result, total))
     }
 
     /// Query data points for a time range with an optional limit.
@@ -667,7 +839,74 @@ impl MetricCache {
 }
 
 #[cfg(test)]
+mod binary_heuristic_boundary_tests {
+    use super::*;
+
+    /// Legacy-heuristic edges: 15 chars (below gate) stays String even when
+    /// it decodes binary-ish; 16+ chars with a MAJORITY of non-printables
+    /// decodes; 16+ with only HALF non-printables stays String (the
+    /// strict-majority boundary).
+    #[test]
+    fn legacy_decode_gates_length_and_majority() {
+        let read = |s: &str| {
+            let dp = DataPoint {
+                timestamp: 1,
+                value: MetricValue::String(s.to_string()),
+                quality: None,
+                metadata: None,
+            };
+            DataPoint::from_storage(dp.to_storage()).unwrap().value
+        };
+
+        // 12 base64 chars → 9 decoded bytes; below the 16-char gate.
+        assert!(matches!(read("AAAAAAAAAAA="), MetricValue::String(_)));
+
+        // 16 chars decoding to printable ASCII ("HelloWorld12") — zero
+        // non-printables → stays String.
+        assert!(matches!(read("SGVsbG9Xb3JsZDEy"), MetricValue::String(_)));
+
+        // 16 chars of '/' decodes to 0xFF bytes — majority non-printable
+        // → Binary. (16 '/' = 12 bytes of 0xFF.)
+        assert!(matches!(read("////////////////"), MetricValue::Binary(_)));
+    }
+}
+
+#[cfg(test)]
 mod tests {
+
+    /// Binary round-trips EXACTLY via the $binary tag — and an ordinary
+    /// string that happens to be valid base64 with non-printable bytes
+    /// (hash/serial) stays a String instead of coming back typed Binary.
+    #[test]
+    fn binary_round_trips_and_base64_lookalike_strings_stay_strings() {
+        use super::*;
+        let bin = DataPoint {
+            timestamp: 1,
+            value: MetricValue::Binary(vec![0u8, 1, 2, 0xFF]),
+            quality: None,
+            metadata: None,
+        };
+        let stored = bin.to_storage();
+        let back = DataPoint::from_storage(stored).unwrap();
+        assert!(matches!(back.value, MetricValue::Binary(ref b) if b == &vec![0u8, 1, 2, 0xFF]));
+
+        // A pure-ASCII string that base64-decodes to non-printables used to
+        // be re-typed Binary on read; the write-side tag keeps plain
+        // strings plain.
+        let text = DataPoint {
+            timestamp: 1,
+            value: MetricValue::String("/wA=".to_string()), // decodes to {0xFF, 0x00}
+            quality: None,
+            metadata: None,
+        };
+        let stored = text.to_storage();
+        let back = DataPoint::from_storage(stored).unwrap();
+        assert!(
+            matches!(back.value, MetricValue::String(_)),
+            "plain strings must never be re-typed Binary on read-back"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -703,5 +942,169 @@ mod tests {
         let string_point = DataPoint::new(1000, MetricValue::String("hello".to_string()));
         let storage_point = string_point.to_storage();
         assert_eq!(storage_point.value, serde_json::json!("hello"));
+    }
+
+    /// Regression (T4 PIR / image_data): offset > 100 on a sparse series must
+    /// still return a full page while total stays large. The old device
+    /// handler remapped deep offsets to a ~1Hz estimated time window
+    /// (`end - offset` seconds) which emptied pages for sub-Hz metrics.
+    #[tokio::test]
+    async fn sparse_image_data_offset_past_100_returns_real_page() {
+        let storage = TimeSeriesStorage::memory().expect("memory storage");
+        let source = "device:200366";
+        let metric = "image_data";
+        // 250 sparse captures (~1/hour) — denser than PIR but still << 1 Hz.
+        let start = 1_700_000_000_i64;
+        let total_points = 250usize;
+        let hour = 3600_i64;
+        let mut batch = Vec::with_capacity(total_points);
+        for i in 0..total_points {
+            batch.push(DataPoint {
+                timestamp: start + (i as i64) * hour,
+                value: MetricValue::String(format!(
+                    "/api/images/{}/image_data/{}.jpg",
+                    "200366", i
+                )),
+                quality: None,
+                metadata: None,
+            });
+        }
+        storage
+            .write_batch(source, metric, batch)
+            .await
+            .expect("write_batch");
+        let end = start + (total_points as i64) * hour;
+
+        // Page that used to empty under the 1Hz estimate (offset=110, limit=10).
+        let (page, total) = storage
+            .query_limited_with_total(source, metric, start, end, Some(10), 110)
+            .await
+            .expect("page");
+        assert_eq!(total, total_points);
+        assert_eq!(
+            page.len(),
+            10,
+            "offset=110 must return a full page when total>>offset+limit"
+        );
+        assert!(
+            total > 110 + page.len(),
+            "total must stay larger than this page's window"
+        );
+        // Newest-first page via reverse-scan + ASC return: timestamps decrease
+        // when read newest-first by the handler (.rev()).
+        assert!(page[0].timestamp < page[page.len() - 1].timestamp);
+
+        // Deeper page still non-empty while total covers it.
+        let (page2, total2) = storage
+            .query_limited_with_total(source, metric, start, end, Some(10), 200)
+            .await
+            .expect("page2");
+        assert_eq!(total2, total_points);
+        assert_eq!(page2.len(), 10);
+
+        // Beyond the series: empty page, exact total preserved.
+        let (empty, total3) = storage
+            .query_limited_with_total(source, metric, start, end, Some(10), 250)
+            .await
+            .expect("empty");
+        assert!(empty.is_empty());
+        assert_eq!(total3, total_points);
+    }
+}
+
+#[cfg(test)]
+mod swap_drain_tests {
+    use super::*;
+    use heramind_storage::timeseries::DataPoint;
+
+    fn point(ts: i64, v: f64) -> DataPoint {
+        DataPoint {
+            timestamp: ts,
+            value: serde_json::json!(v),
+            quality: None,
+            metadata: None,
+        }
+    }
+
+    /// The startup race, compressed: telemetry lands in the placeholder
+    /// memory store while the real store is still opening; the swap must
+    /// carry it across, or it evaporates on restart.
+    #[tokio::test]
+    async fn swap_drains_placeholder_writes_into_persistent() {
+        let placeholder =
+            std::sync::Arc::new(TimeSeriesStorage::memory_deferred().expect("memory-deferred"));
+        placeholder
+            .write(
+                "ai:agent-1",
+                "status",
+                crate::telemetry::DataPoint {
+                    timestamp: 100,
+                    value: MetricValue::String("正常".into()),
+                    quality: None,
+                    metadata: None,
+                },
+            )
+            .await
+            .expect("write to placeholder");
+        placeholder
+            .write(
+                "device:dev-1",
+                "temperature",
+                crate::telemetry::DataPoint {
+                    timestamp: 101,
+                    value: MetricValue::Float(21.5),
+                    quality: None,
+                    metadata: None,
+                },
+            )
+            .await
+            .expect("write to placeholder");
+
+        let store_inner = StorageTimeSeriesStore::memory().expect("persistent");
+
+        // Waiters must be released by the swap.
+        let waiter = {
+            let ph = placeholder.clone();
+            tokio::spawn(async move { ph.wait_for_storage_load().await })
+        };
+        assert!(!*placeholder.loaded_rx.borrow(), "memory starts unresolved");
+
+        let migrated = placeholder
+            .swap_store_with_drain(store_inner)
+            .await
+            .expect("drain+swap");
+        assert_eq!(migrated, 2, "both placeholder points migrate");
+
+        waiter.await.expect("waiter released");
+
+        // Read through the wrapper — the swapped store has the data.
+        let status = placeholder
+            .latest("ai:agent-1", "status")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(status.value, MetricValue::String("正常".into()));
+        let temp = placeholder
+            .latest("device:dev-1", "temperature")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(temp.value, MetricValue::Float(21.5));
+        let _ = point(0, 0.0); // keep helper linked
+    }
+
+    /// Open-failure path: memory becomes final and waiters are released with
+    /// no data lost.
+    #[tokio::test]
+    async fn finalize_memory_releases_waiters() {
+        let placeholder =
+            std::sync::Arc::new(TimeSeriesStorage::memory_deferred().expect("memory-deferred"));
+        let waiter = {
+            let ph = placeholder.clone();
+            tokio::spawn(async move { ph.wait_for_storage_load().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        placeholder.finalize_memory();
+        waiter.await.expect("waiter released on finalize");
     }
 }

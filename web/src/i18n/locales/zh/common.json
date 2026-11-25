@@ -10,11 +10,25 @@
     "moreAlerts": "还有{{count}}条"
   },
   "messages": {
+    "chain": {
+      "title": "为什么发出来的",
+      "description": "这条告警背后的规则执行，以及它依据了什么",
+      "rule": "规则",
+      "evidence": "依据",
+      "firedAt": "触发时刻",
+      "actions": "已执行",
+      "noActions": "无",
+      "expired": "这条告警指向的规则执行记录已过期 —— 规则历史保留 30 天。",
+      "trackRecord": "历史准确率",
+      "dismissedOf": "共 {{total}} 次告警，其中 {{fp}} 次被标记为误报",
+      "thresholdAdvice": "这条规则可能过于敏感，建议收紧触发条件"
+    },
     "title": "消息",
     "description": "查看通知消息，管理通知通道与 IM 会话",
     "tabs": {
       "messages": "消息",
-      "channels": "通知通道"
+      "channels": "通知通道",
+      "im": "IM 会话"
     },
     "create": "创建消息",
     "createTitle": "创建新消息",
@@ -29,6 +43,9 @@
     "resolve": "解决",
     "archive": "归档",
     "acknowledge": "确认",
+    "markFalsePositive": "不是真告警",
+    "falsePositiveSuccess": "已标记为误报",
+    "falsePositiveError": "操作失败",
     "source": "来源",
     "filter": {
       "title": "筛选",
@@ -106,7 +123,7 @@
       "channelDetails": "通道详情",
       "empty": {
         "title": "暂无通道",
-        "description": "创建通知通道来发送消息"
+        "description": "告警始终会出现在这里。添加通道，可以同时推送到你更快看到的地方。"
       },
       "webhookUrl": "Webhook URL",
       "webhookUrlPlaceholder": "https://example.com/webhook",
@@ -157,6 +174,8 @@
       "typeSlackDesc": "Incoming Webhook",
       "typeFeishu": "飞书",
       "typeFeishuDesc": "自定义机器人",
+      "howToGet": "这些信息怎么获取？→ 官方文档",
+      "pasteAddressHint": "直接粘贴那个页面上显示的完整 Webhook 地址即可，需要的部分会自动解析出来",
       "webhookConfig": "Webhook 配置",
       "emailConfig": "邮件配置",
       "botToken": "机器人令牌",
@@ -242,7 +261,20 @@
     "messageDetails": "消息详情",
     "basicInfo": "基本信息",
     "basicInfoDesc": "基本信息",
-    "metadataDesc": "附加元数据"
+    "metadataDesc": "附加元数据",
+    "im": {
+      "chatId": "会话 ID",
+      "boundAgent": "绑定智能体",
+      "lastActive": "最近活跃",
+      "reset": "重置",
+      "resetSuccess": "会话已重置",
+      "confirmReset": "确定要重置该会话的绑定吗？",
+      "goToSettings": "配置 IM 网桥",
+      "noBridge": "尚未配置 IM 网桥",
+      "noBridgeDesc": "在设置中配置 IM 网桥后，即可在这里管理会话。",
+      "noSessions": "暂无会话",
+      "noSessionsDesc": "还没有活跃会话。与机器人开始聊天后会自动创建。"
+    }
   },
   "connection": {
     "connected": "已连接",
@@ -250,6 +282,7 @@
   },
   "nav": {
     "dashboard": "对话",
+    "dashboardShort": "仪表板",
     "visual-dashboard": "可视化仪表板",
     "devices": "设备",
     "automation": "自动化",
@@ -257,7 +290,8 @@
     "data": "数据",
     "messages": "消息",
     "extensions": "扩展",
-    "settings": "设置"
+    "settings": "设置",
+    "mobilePrimary": "主要导航"
   },
   "add": "添加",
   "edit": "编辑",
@@ -355,13 +389,7 @@
       "evening": "晚上好",
       "night": "夜深了"
     },
-    "tagline": "{{appName}} 智能物联网助手，随时为你服务",
-    "stats": {
-      "devicesOnline": "{{online}}/{{total}} 设备在线",
-      "activeRules": "{{count}} 活跃规则",
-      "pendingAlerts": "{{count}} 待处理告警",
-      "pendingAlertsShort": "告警"
-    },
+    "askLine": "{{greeting}}！有什么需要问我就行",
     "aiSuggestion": "AI 建议",
     "suggestions": {
       "pendingAlerts": "有 {{count}} 条告警待处理",
@@ -369,11 +397,20 @@
       "noRules": "还没有启用自动化规则"
     },
     "suggestionPrompts": {
-      "title": "试试这些问题：",
       "checkDevices": "查看当前在线的设备状态",
       "createRule": "帮我创建一个温度监控规则",
       "checkAlerts": "有哪些告警需要处理?",
-      "showLogs": "显示今天的设备活动日志"
+      "showLogs": "显示今天的设备活动日志",
+      "createAgent": "帮我创建一个定时监控任务（AI 代理）",
+      "checkAgents": "看看我的 AI 代理都在做什么",
+      "addLlmBackend": "帮我添加一个大模型后端",
+      "createVirtualDevice": "帮我创建一个虚拟设备（模拟数据源）"
+    },
+    "mobileSuggestions": {
+      "devices": "设备状态",
+      "alerts": "查看告警",
+      "rules": "自动化",
+      "agent": "AI 代理"
     },
     "quickActions": {
       "devices": "查看设备",
@@ -470,8 +507,10 @@
   "session": {
     "history": "会话历史",
     "sessions": "会话",
+    "recent": "最近对话",
+    "openDrawer": "打开菜单",
     "newChat": "新建对话",
-    "search": "搜索...",
+    "search": "搜索对话...",
     "noSessions": "暂无会话",
     "noMatch": "没有找到匹配的会话",
     "messages": "{{count}} 条消息",
@@ -479,10 +518,8 @@
     "deleteTitle": "删除会话",
     "deleteDescription": "确定要删除这个会话吗？此操作无法撤销。",
     "sessionDeleted": "会话已删除",
-    "resumeResponseTitle": "恢复未完成的响应？",
-    "resumeResponseDesc": "检测到之前断线时有正在进行的响应",
-    "discard": "放弃",
-    "resume": "恢复"
+    "generating": "生成中",
+    "rename": "重命名"
   },
   "language": {
     "switchToEnglish": "切换到英文",
@@ -570,7 +607,10 @@
     "toggle": "启停",
     "nameRequired": "名称为必填项",
     "urlRequired": "URL 为必填项",
-    "topicRequired": "Topic 不能为空"
+    "topicRequired": "Topic 不能为空",
+    "source": "数据源",
+    "payload": "负载",
+    "searchTargets": "搜索推送目标..."
   },
   "active": "活跃",
   "test": "测试连接",
@@ -737,8 +777,11 @@
     "retry": "重试连接"
   },
   "system": {
-    "pageTitle": "系统",
+    "pageTitle": "工作台",
     "menu": "菜单",
+    "openWorkspace": "工作台",
+    "moreEntries": "全部入口",
+    "workspaceHint": "设备、智能体、看板与设置",
     "sectionBusiness": "业务",
     "sectionSystem": "系统",
     "sectionAbout": "关于",
@@ -747,7 +790,17 @@
     "about": "帮助 / 关于",
     "version": "v{{version}}",
     "back": "返回",
+    "localInstance": "本地实例",
+    "connected": "已连接",
+    "disconnected": "未连接",
+    "mobileSummary": "{{online}} / {{total}} 台设备在线 · {{alerts}} 条未处理告警",
+    "extensionPage": "扩展页面",
+    "preferences": "偏好与账户",
+    "account": "账户",
     "cards": {
+      "devices": "设备与设备类型",
+      "agents": "AI 智能体与能力",
+      "dashboard": "可视化看板",
       "automation": "Transform 与数据推送",
       "data": "遥测数据查询",
       "messages": "通知中心",
@@ -795,5 +848,11 @@
     "ownCta": "去配置",
     "downloadingTitle": "内置模型下载中",
     "downloading": "下载中"
-  }
+  },
+  "opacity": "不透明度",
+  "size": "尺寸",
+  "saveChanges": "保存修改",
+  "priority": "优先级",
+  "send": "发送",
+  "selectPlaceholder": "请选择..."
 }

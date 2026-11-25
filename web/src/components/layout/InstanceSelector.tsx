@@ -4,7 +4,7 @@
  * Click opens the full-screen InstanceManagerDialog for switching + managing.
  */
 
-import { useEffect } from 'react'
+import { forwardRef, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useStore } from '@/store'
 import { cn } from '@/lib/utils'
@@ -16,7 +16,11 @@ interface InstanceSelectorProps {
   compact?: boolean
 }
 
-export function InstanceSelector({ onManageInstances, compact = false }: InstanceSelectorProps) {
+// forwardRef: the collapsed rail wraps this in TooltipTrigger asChild, which
+// forwards a ref onto the rendered element — a plain function component
+// drops it and React warns ("Function components cannot be given refs").
+export const InstanceSelector = forwardRef<HTMLButtonElement, InstanceSelectorProps>(
+  function InstanceSelector({ onManageInstances, compact = false }, ref) {
   const { t } = useTranslation('instances')
   const instances = useStore((s) => s.instances)
   const currentInstanceId = useStore((s) => s.currentInstanceId)
@@ -37,28 +41,35 @@ export function InstanceSelector({ onManageInstances, compact = false }: Instanc
 
   return (
     <button
+      ref={ref}
       disabled={isSwitching}
       onClick={onManageInstances}
       className={cn(
-        "rounded-lg text-sm font-medium transition-colors cursor-pointer hover:opacity-80 disabled:opacity-50",
+        "rounded-lg text-sm font-medium transition-colors cursor-pointer disabled:opacity-50",
+        // Same muted resting color + hover as every other sidebar utility
+        // row/icon (nav items, Setup Guide, collapse toggle) — an unstyled
+        // inherit renders the Server icon a step darker than its neighbors.
+        "text-muted-foreground hover:text-foreground hover:bg-muted-50",
         compact
           ? "flex items-center justify-center h-10 w-10"
           // Expanded: full-width row matching the other sidebar footer rows
           // (w-full h-10 px-3 text-sm) so the rail doesn't reflow per
           // instance-name length; name truncates, status shows as a dot.
           : "w-full flex items-center px-3 h-10",
-        isOnline
-          ? cn("bg-success-light text-success", !compact && "border border-success-light")
-          : cn("bg-error-light text-error", !compact && "border border-error-light")
+        // Neutral surface — status lives on the dot alone. A tinted block
+        // here out-shouted the active-page indicator (inverted hierarchy).
       )}
     >
       <div className="relative shrink-0">
-        <Server className="h-5 w-5" />
+        {/* 18px, not the rail's 20px: the Server glyph is the densest ink in
+            the rail (full-width stacked slabs vs. airy Rocket/gear) — at the
+            shared size it reads a step larger. Optical, not pixel, parity. */}
+        <Server className="h-[18px] w-[18px]" />
         {/* Status dot on the icon's top-right corner — same anchor as the
             Setup Guide badge, so both markers align across rows. */}
         <span
           className={cn(
-            'absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full ring-2 ring-background',
+            'absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full',
             isOnline ? 'bg-success' : 'bg-error'
           )}
           aria-label={isOnline ? t('status.online') : t('status.offline')}
@@ -71,4 +82,4 @@ export function InstanceSelector({ onManageInstances, compact = false }: Instanc
       )}
     </button>
   )
-}
+})

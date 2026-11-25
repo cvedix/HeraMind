@@ -1,0 +1,2054 @@
+//! `context` — split from the former agent/mod.rs monolith.
+
+use super::*;
+
+use std::sync::Arc;
+
+pub fn compact_tool_results(messages: &[AgentMessage], keep_recent: usize) -> Vec<AgentMessage> {
+    let mut result = Vec::new();
+    let mut tool_result_count = 0;
+
+    for msg in messages.iter().rev() {
+        // Always keep user and system messages
+        if msg.role == "user" || msg.role == "system" {
+            result.push(msg.clone());
+            continue;
+        }
+
+        // Handle role:tool messages (tool result messages from LargeDataCache)
+        if msg.role == "tool" {
+            tool_result_count += 1;
+            if tool_result_count <= keep_recent && msg.content.len() <= 8000 {
+                result.push(msg.clone());
+            } else if msg.tool_call_name.as_deref() == Some("skill") {
+                let compact =
+                    crate::agent::streaming::compact_skill_tool_reference(msg.content.as_ref());
+                result.push(AgentMessage {
+                    content: compact.into(),
+                    ..msg.clone()
+                });
+            } else {
+                // Compress tool result — preserve meaningful preview
+                let summary: Arc<str> = if msg.content.len() > 800 {
+                    let name = msg.tool_call_name.as_deref().unwrap_or("unknown");
+                    let preview: String = msg.content.chars().take(500).collect();
+                    format!(
+                        "[Tool: {} result ({} chars): {}...]",
+                        name,
+                        msg.content.len(),
+                        preview
+                    )
+                    .into()
+                } else {
+                    msg.content.clone()
+                };
+                result.push(AgentMessage {
+                    content: summary,
+                    ..msg.clone()
+                });
+            }
+            continue;
+        }
+
+        // Check if this is a tool result message (has tool_calls)
+        if msg.tool_calls.is_some() && msg.tool_calls.as_ref().is_some_and(|t| !t.is_empty()) {
+            tool_result_count += 1;
+
+            // Keep recent tool results intact (stale cached read-back
+            // windows were already previewed by
+            // `preview_stale_cached_windows` before this pass).
+            if tool_result_count <= keep_recent {
+                result.push(msg.clone());
+            } else {
+                // Compress old tool results to a descriptive summary
+                // that preserves action type, key arguments, and result preview
+                let summaries: Vec<String> = msg
+                    .tool_calls
+                    .as_ref()
+                    .iter()
+                    .flat_map(|calls| calls.iter())
+                    .map(|tc| {
+                        let args_summary = types::summarize_tool_args(&tc.name, &tc.arguments);
+                        let result_preview = tc
+                            .result
+                            .as_ref()
+                            .map(|r| {
+                                let s = if let Some(s) = r.as_str() {
+                                    s.to_string()
+                                } else {
+                                    r.to_string()
+                                };
+                                // Read actions need more preview to preserve data
+                                let is_data_action = args_summary.contains("list")
+                                    || args_summary.contains("get")
+                                    || args_summary.contains("history");
+                                let preview_len = if is_data_action { 300 } else { 80 };
+                                s.chars().take(preview_len).collect::<String>()
+                            })
+                            .unwrap_or_default();
+                        if result_preview.is_empty() {
+                            format!("the {} tool with {}", tc.name, args_summary)
+                        } else {
+                            format!(
+                                "the {} tool with {} and received: {}",
+                                tc.name, args_summary, result_preview
+                            )
+                        }
+                    })
+                    .collect();
+
+                let summary = format!(
+                    "Previously called {}. These are past results, do not repeat.",
+                    summaries.join(", then ")
+                );
+
+                result.push(AgentMessage {
+                    role: msg.role.clone(),
+                    content: summary.into(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    tool_call_name: None,
+                    thinking: None,
+                    images: None,
+                    round_contents: None,
+                    round_thinking: None,
+                    system_notes: None,
+                    goal_status: None,
+                    end_reason: None,
+                    content_nodes: None,
+                    content_version: None,
+                    timestamp: msg.timestamp,
+                });
+            }
+        } else {
+            // Regular assistant message - keep it
+            result.push(msg.clone());
+        }
+    }
+
+    result.reverse();
+    result
+}
+
+/// === ENHANCED: Conversation-Level Compression ===
+///
+/// Extends compression beyond tool results to include conversation messages.
+/// This follows the "tiered compression" strategy from LangChain:
+/// - Level 1: Keep recent messages intact
+/// - Level 2: Summarize older assistant messages to key points
+/// - Level 3: Compress very old messages to brief topic markers
+///
+/// Rules:
+/// - Keep N most recent messages intact (default: 6)
+/// - Preserve user messages verbatim (higher priority for user intent)
+/// - Compress assistant messages to key points (remove verbose explanations)
+/// - Group very old messages into topic summaries
+/// - Never compress system messages
+///
+/// Expected impact: 30-50% token reduction for long conversations.
+/// Cap history to the last N user turns (configurable chat depth,
+/// /api/settings/agent). Walks back to the Nth-from-last user message
+/// and drops everything before it — tool/assistant messages belonging
+/// to those turns go with them. Shared by every chat path (streaming
+/// SSE/WS, multimodal, non-streaming) so the advertised setting behaves
+/// identically everywhere. Scheduled agents are unaffected — they carry
+/// their own per-agent context_window_size.
+pub(crate) fn apply_chat_history_depth(history: &mut Vec<AgentMessage>) -> usize {
+    let depth = heramind_storage::AgentDefaults::get().chat_history_depth;
+    apply_chat_history_depth_with(history, depth)
+}
+
+/// Cap history to the last `depth` user turns (the boundary turn is kept).
+/// Returns how many messages were drained from the front — callers holding
+/// full-history index metadata (e.g. `summary_up_to_index`) MUST shift those
+/// indices by this amount, or their filters misalign against the summary's
+/// coverage and silently drop uncovered messages.
+pub(crate) fn apply_chat_history_depth_with(
+    history: &mut Vec<AgentMessage>,
+    depth: usize,
+) -> usize {
+    let mut user_turns_seen = 0usize;
+    let mut cut_idx = None;
+    for (i, m) in history.iter().enumerate().rev() {
+        if m.role == "user" {
+            user_turns_seen += 1;
+            if user_turns_seen >= depth {
+                cut_idx = Some(i);
+                break;
+            }
+        }
+    }
+    if let Some(idx) = cut_idx {
+        if idx > 0 {
+            tracing::debug!(
+                before = history.len(),
+                after = history.len() - idx,
+                depth,
+                "Applied chat history depth"
+            );
+            history.drain(..idx);
+            return idx;
+        }
+    }
+    0
+}
+
+/// Shift a stored `summary_up_to_index` (full-history index space) into the
+/// index space of a front-drained history.
+///
+/// `checked_sub`: when the drain removed everything the summary covers, there
+/// is nothing left to filter — `None` keeps the whole remaining window (the
+/// summary text itself is injected separately and stays valid).
+pub(crate) fn adjust_summary_index_after_drain(
+    summary_up_to: Option<u64>,
+    drained: usize,
+) -> Option<u64> {
+    summary_up_to.and_then(|i| i.checked_sub(drained as u64))
+}
+
+/// Default keep count when max_context is unknown / large.
+const KEEP_IMAGES_ON_RECENT_USER_MSGS_DEFAULT: usize = 2;
+
+/// Dynamic image-history budget: ≤16K (16_384) windows keep 1 recent
+/// image-bearing user message; larger windows keep 2 (aligned with S1-1/S3-2).
+pub(crate) fn keep_images_on_recent_user_msgs(max_context: Option<usize>) -> usize {
+    match max_context {
+        Some(m) if m <= 16_384 => 1,
+        _ => KEEP_IMAGES_ON_RECENT_USER_MSGS_DEFAULT,
+    }
+}
+
+/// Phrases where the model PROMISES a tool action in words. Matched against
+/// a text-only (no tool call) LLM round to detect the "narration collapse":
+/// the model writes "我现在使用 image_edit 工具…" and the loop would
+/// otherwise end the turn with that promise as the final answer (observed:
+/// 0.3s turn end while the user waits for a watermarked image that never
+/// comes). English patterns are lowercase — the text is lowercased before
+/// matching, which leaves the Chinese patterns untouched.
+///
+/// Only matched against the HEAD of the reply (see [`PROMISE_HEAD_CHARS`]):
+/// narration collapse LEADS with the promise; politeness closings ("随时
+/// 告诉我，我来帮你实现！") live at the tail of a complete answer.
+const ACTION_PROMISE_PATTERNS: &[&str] = &[
+    // Chinese
+    "我将使用",
+    "我会使用",
+    "我将调用",
+    "我会调用",
+    "我将执行",
+    "我会执行",
+    "让我使用",
+    "让我调用",
+    "让我执行",
+    "接下来我将",
+    "现在我将",
+    "现在我会",
+    "我将通过",
+    "我会通过",
+    "接着我将",
+    "我将先",
+    "我会先",
+    "我来使用",
+    "我来调用",
+    // "现在 + action verb" — covers the observed "我现在使用 X 工具…" form
+    "现在使用",
+    "现在调用",
+    "现在执行",
+    "现在运行",
+    // 2026-10-08 widget-task session: the small model ended FOUR turns with
+    // promise-narrations none of the patterns above matched — "现在让我重新
+    // 安装…到平台：", "现在最后一步：将气象站组件添加到…", "让我修正命令
+    // 语法：", "现在我来将气象站组件添加到…中：". Each read as a task
+    // "interruption" to the user, who had to nudge five times.
+    "现在让我",
+    "让我重新",
+    "让我继续",
+    "让我完成",
+    "让我修正",
+    "让我修复",
+    "让我安装",
+    "让我创建",
+    "让我添加",
+    "让我配置",
+    "让我检查",
+    "让我验证",
+    "让我试试",
+    "我来将",
+    "现在我来",
+    "接下来我",
+    "下一步我",
+    "最后一步",
+    // 2026-10-19 incident session tail (reproduced via conversation replay):
+    // after the dashboard was built, THREE consecutive turns answered with
+    // promise-only replies none of the patterns above matched — 「我来检查
+    // 仪表盘和组件的当前状态，确认是否正确绑定。」「我来帮您继续处理…
+    // 首先让我了解仪表盘的可用操作…」. The table had 让我检查 but not
+    // 我来检查; the nudge never fired, the user pressed 继续 twice and got
+    // the same promise again — this read as the task being "interrupted".
+    "我来检查",
+    "我来查看",
+    "我来帮",
+    "我来处理",
+    "我来确认",
+    "让我了解",
+    "首先让我",
+    // 2026-11-18 NM-250: foreshadow-only weather turns used 「我来获取 /
+    // 我将查询 / 我会尝试…」shapes the older table missed — auto-continue
+    // and the incomplete-end label share this detector, so both missed.
+    "我将尝试",
+    "我会尝试",
+    "我来尝试",
+    "让我尝试",
+    "我将获取",
+    "我会获取",
+    "我来获取",
+    "让我获取",
+    "我将查询",
+    "我会查询",
+    "我来查询",
+    "让我查询",
+    "我将拉取",
+    "我会拉取",
+    "我来拉取",
+    "让我拉取",
+    // English
+    "i will use",
+    "i'll use",
+    "i will call",
+    "i'll call",
+    "i will run",
+    "i'll run",
+    "i will invoke",
+    "i'll invoke",
+    "let me use",
+    "let me call",
+    "let me run",
+    "let me check",
+    "let me look",
+    "let me inspect",
+    "i will check",
+    "i'll check",
+    // 2026-11-18 NM-250 desktop: "I'll try fetching…" / "I'll fetch…" ended
+    // the turn with tools still available — table had use/run/check only.
+    "i will try",
+    "i'll try",
+    "i will fetch",
+    "i'll fetch",
+    "i will get",
+    "i'll get",
+    "let me try",
+    "let me fetch",
+    "let me get",
+    "i'm going to use",
+    "i'm going to call",
+    "i'm going to run",
+    "i'm going to try",
+    "i'm going to fetch",
+    "i'm going to get",
+    // 2026-11-21 tip overnight + T1.3 retest deep-memory-transform: foreshadow
+    // turns used list/read/delete/disable/re-enable/test/query/add shapes the
+    // table missed — NM-250 continue never fired, soft-asserts failed.
+    "i will list",
+    "i'll list",
+    "let me list",
+    "i will read",
+    "i'll read",
+    "let me read",
+    "i will re-read",
+    "i'll re-read",
+    "let me re-read",
+    "i will delete",
+    "i'll delete",
+    "let me delete",
+    "i will disable",
+    "i'll disable",
+    "let me disable",
+    "i will enable",
+    "i'll enable",
+    "let me enable",
+    "i will re-enable",
+    "i'll re-enable",
+    "let me re-enable",
+    "i will test",
+    "i'll test",
+    "let me test",
+    "i will query",
+    "i'll query",
+    "let me query",
+    "i will add",
+    "i'll add",
+    "let me add",
+    "i'm going to list",
+    "i'm going to read",
+    "i'm going to re-read",
+    "i'm going to delete",
+    "i'm going to disable",
+    "i'm going to enable",
+    "i'm going to re-enable",
+    "i'm going to test",
+    "i'm going to query",
+    "i'm going to add",
+    "我来列出",
+    "我将列出",
+    "我会列出",
+    "让我列出",
+    "我来读取",
+    "我将读取",
+    "我会读取",
+    "让我读取",
+    "我来删除",
+    "我将删除",
+    "我会删除",
+    "让我删除",
+    "我来禁用",
+    "我将禁用",
+    "我会禁用",
+    "让我禁用",
+    "我来启用",
+    "我将启用",
+    "我会启用",
+    "让我启用",
+    "我来重新启用",
+    "我将重新启用",
+    "我会重新启用",
+    "让我重新启用",
+    "我来测试",
+    "我将测试",
+    "我会测试",
+    "让我测试",
+    "我来查询",
+    "我将查询",
+    "我会查询",
+    "让我查询",
+    "我来添加",
+    "我将添加",
+    "我会添加",
+    "让我添加",
+];
+
+/// Max narration length eligible for the nudge — a long, complete analysis
+/// that merely contains "let me use" somewhere is a legitimate final answer.
+const NARRATION_MAX_CHARS: usize = 500;
+
+/// How deep into the reply a promise pattern may sit and still count. A real
+/// narration collapse opens with the promise ("我来检查仪表盘…", "Let me
+/// check…"); the same words at the tail of a complete answer are a politeness
+/// closing. Live 2026-10-20: a full ~300-char capability-list answer ending
+/// in "随时告诉我，我来帮你一步步实现！" was misclassified, the nudge round
+/// ran, and the small model answered the nudge with a bare `[]` — replacing
+/// the real answer in the UI. Position, not just presence, decides.
+const PROMISE_HEAD_CHARS: usize = 80;
+
+/// True when `text` is a short reply that promises a tool action — the
+/// narration-without-action failure the tool loops nudge once before
+/// accepting the turn as complete.
+/// Simple greeting ("你好" / "hi" / "hello" …) under the greeting length
+/// cap. Shared by the non-streaming fast path and the streaming guards —
+/// a greeting requests no action, so a promise-shaped model reply to one is
+/// small-model chatter, not a stalled turn (do NOT label it).
+pub fn is_simple_greeting(text: &str) -> bool {
+    const GREETING_CJK: [&str; 7] = ["你好", "您好", "嗨", "在吗", "早上好", "下午好", "晚上好"];
+    const GREETING_EN: [&str; 2] = ["hi", "hello"];
+    let trimmed = text.trim();
+    if trimmed.chars().count() >= 20 {
+        return false;
+    }
+    if GREETING_CJK
+        .iter()
+        .any(|&pat| trimmed == pat || trimmed.starts_with(pat))
+    {
+        return true;
+    }
+    // English greetings need a word/punct boundary so "history"/"high"
+    // never match the `hi` prefix.
+    let lower = trimmed.to_lowercase();
+    GREETING_EN.iter().any(|&pat| {
+        if lower == pat {
+            return true;
+        }
+        if !lower.starts_with(pat) {
+            return false;
+        }
+        let rest = &lower[pat.len()..];
+        rest.is_empty()
+            || rest
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_')
+    })
+}
+
+fn narration_has_promise_actor(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    const ACTORS: &[&str] = &[
+        "我",
+        "咱",
+        "让我",
+        "我来",
+        "我会",
+        "我将",
+        "我现在",
+        "i ",
+        "i'll",
+        "i will",
+        "i am going",
+        "i'm going",
+        "let me",
+        "ok i",
+        "okay i",
+    ];
+    ACTORS.iter().any(|a| lower.contains(a))
+}
+
+fn english_promise_pattern_hits(lower: &str, pattern: &str) -> bool {
+    // ASCII patterns need leading + trailing word boundaries so "let me add"
+    // does not match "Let me address…" / "I'll list" does not match
+    // "I'll listen…". Scan every hit — a false-friend earlier in the head
+    // must not hide a later real promise ("Let me address that — let me add…").
+    lower.match_indices(pattern).any(|(idx, _)| {
+        let start_ok = if idx == 0 {
+            true
+        } else {
+            let b = lower.as_bytes()[idx - 1];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        };
+        if !start_ok {
+            return false;
+        }
+        let end = idx + pattern.len();
+        match lower.as_bytes().get(end) {
+            None => true,
+            Some(b) => !b.is_ascii_alphanumeric() && *b != b'_',
+        }
+    })
+}
+
+pub fn is_narration_without_action(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.chars().count() > NARRATION_MAX_CHARS {
+        return false;
+    }
+    // Trailing-colon heuristic: ONLY when the short reply also carries a
+    // first-person / promise actor. Bare times or tip lists ending in ":"
+    // must not be labelled "no result".
+    if (trimmed.ends_with('：') || trimmed.ends_with(':')) && narration_has_promise_actor(trimmed)
+    {
+        return true;
+    }
+    // Complete list summaries after a successful tool round: first line may
+    // still open with "I'll list…" / "我来列出…" but the body already has
+    // bullet items — do not foreshadow-continue those.
+    if trimmed.contains('\n')
+        && (trimmed.contains("\n- ")
+            || trimmed.contains("\n* ")
+            || trimmed
+                .lines()
+                .skip(1)
+                .any(|l| l.trim().starts_with(|c: char| c.is_ascii_digit())))
+        && trimmed.chars().count() > 40
+    {
+        return false;
+    }
+    let head: String = trimmed.chars().take(PROMISE_HEAD_CHARS).collect();
+    let lower = head.to_lowercase();
+    ACTION_PROMISE_PATTERNS.iter().any(|p| {
+        if p.is_ascii() {
+            english_promise_pattern_hits(&lower, p)
+        } else {
+            lower.contains(*p)
+        }
+    })
+}
+
+/// True when `text` contains Chinese text — the language selector for
+/// model-facing guard prompts.
+///
+/// Any CJK ideograph counts: Chinese conversations routinely embed English
+/// identifiers (`heramind dashboard add-components`), while English
+/// conversations essentially never embed CJK, so "contains CJK" is the
+/// reliable discriminator. One prompt language per turn matters: a prompt
+/// that states the instruction in BOTH languages makes small models drift
+/// into the language they read LAST (observed as English replies to Chinese
+/// questions after the old bilingual nudge).
+pub fn text_prefers_chinese(text: &str) -> bool {
+    text.chars()
+        .any(|c| matches!(c, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'))
+}
+
+/// Phrases with which a user explicitly asks for a PLAN or EXPLANATION only —
+/// "先不要执行", "只告诉我怎么做", "don't run it, just tell me". When one is
+/// present the narration guard is suppressed for the turn: a promise-shaped
+/// reply IS the requested output, and nudging the model into executing would
+/// contradict the user's instruction (and the progress-report label would
+/// mislabel a perfectly good plan as a failed turn).
+const NO_EXECUTION_PATTERNS: &[&str] = &[
+    // Chinese
+    "不要执行",
+    "别执行",
+    "不要运行",
+    "别运行",
+    "不要调用",
+    "不要操作",
+    "不要动手",
+    "只告诉我",
+    "只需要告诉我",
+    "只说明",
+    "仅说明",
+    "只解释",
+    "先说明",
+    "先告诉我",
+    // English
+    "do not execute",
+    "don't execute",
+    "do not run",
+    "don't run",
+    "do not call",
+    "don't call",
+    "without executing",
+    "just tell me",
+    "only tell me",
+    "just explain",
+    "only explain",
+    "don't actually",
+    "do not actually",
+    "no need to execute",
+];
+
+/// True when the user's message asks for a plan/explanation WITHOUT running
+/// anything. Suppresses the narration nudge, the promise backstop, the
+/// turn-end completeness note, and the list-only coercion for that turn.
+pub fn user_requested_no_execution(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    NO_EXECUTION_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// The one-shot nudge injected when narration collapse is detected.
+///
+/// Decision-first: small models follow the FIRST imperative they see, so the
+/// old prompt (which led with "output the tool calls as a JSON array") got
+/// literal compliance — a bare `[]` — whenever no tool was actually needed
+/// (live 2026-10-20: the complete capability-list answer was replaced by
+/// `[]`). The branch order and the explicit empty-array ban exist so the
+/// model must judge before it emits anything.
+///
+/// ONE language per call, chosen from the narration being corrected (see
+/// [`narration_nudge_prompt`]) — never both at once.
+const NARRATION_NUDGE_PROMPT_ZH: &str = "你上一条回复承诺了要执行操作，但没有发出任何工具调用——这不是最终答复。请先判断：\n\
+1. 如果确实需要工具才能完成用户的需求，现在立即只输出工具调用 JSON 数组：[{\"name\":\"工具名\",\"arguments\":{...}}]，不要输出其他文字。\n\
+2. 如果不需要任何工具，就不要输出 JSON 数组（绝对不要输出空数组 []），直接用文字给用户完整的最终答复。";
+
+const NARRATION_NUDGE_PROMPT_EN: &str = "Your previous reply promised an action but emitted no tool call — that is not a final answer. Decide first:\n\
+1. If a tool is genuinely required, output ONLY the tool-call JSON array now: [{\"name\":\"...\",\"arguments\":{...}}] — no other text.\n\
+2. If no tool is needed, do NOT output a JSON array (never an empty array \"[]\") — give the user the complete final answer as plain text.";
+
+/// Pick the nudge prompt in the same language as `language_hint` (the
+/// narration that triggered the guard), so the model continues in the
+/// conversation's language.
+pub fn narration_nudge_prompt(language_hint: &str) -> &'static str {
+    if text_prefers_chinese(language_hint) {
+        NARRATION_NUDGE_PROMPT_ZH
+    } else {
+        NARRATION_NUDGE_PROMPT_EN
+    }
+}
+
+/// Strip images from every user message older than the most recent
+/// [`keep_images_on_recent_user_msgs`] image-bearing ones, leaving a short
+/// note in the text so the model knows an image was there.
+///
+/// History images are re-sent to the LLM on EVERY turn, and each costs
+/// hundreds to thousands of REAL tokens on vision backends. Old ones are
+/// already described in the assistant's own replies, so dropping the payloads
+/// (while keeping an explicit marker) keeps the prompt within what the token
+/// budget math promised. The current turn's images are not in history yet —
+/// both streaming paths push them after the window is built.
+pub(crate) fn strip_stale_images(history: &mut [AgentMessage], max_context: Option<usize>) {
+    let keep = keep_images_on_recent_user_msgs(max_context);
+    let album = super::session_album::build_session_album(history);
+    let mut kept_with_images = 0usize;
+    for msg in history.iter_mut().rev() {
+        if msg.role != "user" {
+            continue;
+        }
+        let image_count = match msg.images.as_ref() {
+            Some(imgs) if !imgs.is_empty() => imgs.len(),
+            _ => continue,
+        };
+        kept_with_images += 1;
+        if kept_with_images <= keep {
+            // Annotate durable handles into text BEFORE hydrating to data URLs
+            // so NM-231 text-only strip still leaves `/api/images/…` for tools.
+            let paths = super::session_album::durable_paths_from_images(
+                msg.images.as_deref().unwrap_or(&[]),
+            );
+            if !paths.is_empty() {
+                let pairs = paths.into_iter().map(|path| {
+                    let index = super::session_album::album_index_for_path(&album, &path);
+                    (index, path)
+                });
+                msg.content =
+                    super::session_album::append_attached_handles(msg.content.as_ref(), pairs)
+                        .into();
+            }
+            // Hydrate persisted file references to data URLs — the LLM needs
+            // actual image bytes, not an /api/images/ path. Restored sessions
+            // hold references; active ones already hold data URLs (no-op).
+            if let Some(imgs) = msg.images.as_mut() {
+                for image in imgs.iter_mut() {
+                    if image.data.starts_with("/api/images/") {
+                        if let Some(data_url) = super::types::load_image_reference(&image.data) {
+                            image.data = data_url;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // Stale images: drop pixels but keep durable path handles in text.
+        let paths =
+            super::session_album::durable_paths_from_images(msg.images.as_deref().unwrap_or(&[]));
+        msg.images = None;
+        if paths.is_empty() {
+            let note = format!("[{image_count} image(s) omitted from history to save context]");
+            if msg.content.is_empty() {
+                msg.content = note.into();
+            } else {
+                msg.content = format!("{} {}", msg.content, note).into();
+            }
+        } else {
+            let pairs = paths.into_iter().map(|path| {
+                let index = super::session_album::album_index_for_path(&album, &path);
+                (index, path)
+            });
+            msg.content =
+                super::session_album::append_attached_handles(msg.content.as_ref(), pairs).into();
+        }
+    }
+}
+
+pub fn compact_conversation(
+    messages: &[AgentMessage],
+    keep_recent: usize,
+    target_tokens: usize,
+) -> Vec<AgentMessage> {
+    if messages.len() <= keep_recent {
+        return messages.to_vec();
+    }
+
+    let mut result = Vec::new();
+    let mut _current_tokens = 0;
+
+    // First pass: keep recent messages intact
+    let recent_start = messages.len().saturating_sub(keep_recent);
+    for msg in &messages[recent_start..] {
+        result.push(msg.clone());
+        _current_tokens += tokenizer::estimate_message_tokens(msg);
+    }
+
+    // If we're already under the token limit, return early
+    if _current_tokens <= target_tokens {
+        // Still need to add older messages in reverse order
+        for msg in messages[..recent_start].iter().rev() {
+            let msg_tokens = tokenizer::estimate_message_tokens(msg);
+            if _current_tokens + msg_tokens > target_tokens {
+                break;
+            }
+            result.insert(0, msg.clone());
+            _current_tokens += msg_tokens;
+        }
+        return result;
+    }
+
+    // Second pass: compress older messages
+    let mut compressed_older = Vec::new();
+    let mut topic_batches: Vec<String> = Vec::new();
+
+    for msg in messages[..recent_start].iter() {
+        // Always keep system messages
+        if msg.role == "system" {
+            compressed_older.push(msg.clone());
+            _current_tokens += tokenizer::estimate_message_tokens(msg);
+            continue;
+        }
+
+        // Keep user messages verbatim (they contain critical intent).
+        // Tightening to 1000 chars happens in the LAST RESORT block below
+        // and only when the assembled set is over budget — truncating here
+        // unconditionally used to destroy intent even when the window had
+        // ample room (and made the last-resort pass dead code).
+        if msg.role == "user" {
+            compressed_older.push(msg.clone());
+            _current_tokens += tokenizer::estimate_message_tokens(msg);
+            continue;
+        }
+
+        // Assistant messages: create brief summary
+        if msg.role == "assistant" {
+            let summary = summarize_assistant_message(msg);
+            topic_batches.push(summary);
+        }
+    }
+
+    // Create a single summary for old conversation
+    if !topic_batches.is_empty() {
+        let old_summary = if topic_batches.len() <= 3 {
+            format!("[Previous conversation: {}]", topic_batches.join("; "))
+        } else {
+            format!(
+                "[Previous conversation: {} rounds, topics include {}]",
+                topic_batches.len(),
+                if topic_batches.len() > 5 {
+                    "multiple topics"
+                } else {
+                    "related content"
+                }
+            )
+        };
+
+        // Create a synthetic summary message
+        let timestamp = messages
+            .first()
+            .map(|m| m.timestamp)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+        compressed_older.push(AgentMessage {
+            role: "system".to_string(),
+            content: old_summary.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_call_name: None,
+            thinking: None,
+            images: None,
+            round_contents: None,
+            round_thinking: None,
+            system_notes: None,
+            goal_status: None,
+            end_reason: None,
+            content_nodes: None,
+            content_version: None,
+            timestamp,
+        });
+    }
+
+    // LAST RESORT — only when tool outputs are cleared and assistants are
+    // summarized and the assembly is STILL over target: truncate the
+    // verbatim user messages (1000 chars each, not the old 200 — user
+    // intent loses fidelity fast below that).
+    if _current_tokens > target_tokens {
+        for msg in compressed_older.iter_mut() {
+            if msg.role == "user" && msg.content.len() > 1000 {
+                let s: String = msg.content.chars().take(1000).collect();
+                msg.content = format!("{}... (message truncated)", s).into();
+            }
+        }
+    }
+
+    // Combine compressed older messages with recent messages
+    let mut final_result = compressed_older;
+    final_result.extend(result);
+
+    final_result
+}
+
+/// Summarize an assistant message to its key points.
+fn summarize_assistant_message(msg: &AgentMessage) -> String {
+    let content = msg.content.trim();
+
+    // Early return for short content
+    if content.len() <= 50 {
+        return content.to_string();
+    }
+
+    // Check for common patterns and extract key info
+    if content.contains("成功")
+        || content.contains("已完成")
+        || content.contains("success")
+        || content.contains("completed")
+    {
+        if let Some(tool_name) = &msg.tool_call_name {
+            return format!("Executed {}", tool_name);
+        }
+        return "Operation completed".to_string();
+    }
+
+    if content.contains("失败")
+        || content.contains("错误")
+        || content.contains("failed")
+        || content.contains("error")
+    {
+        return format!("Operation failed: {}", extract_first_phrase(content, 30));
+    }
+
+    if content.contains("查询到")
+        || content.contains("数据显示")
+        || content.contains("found")
+        || content.contains("data shows")
+    {
+        return format!("Queried data: {}", extract_first_phrase(content, 30));
+    }
+
+    // Generic: extract first meaningful phrase
+    extract_first_phrase(content, 40)
+}
+
+/// Extract the first meaningful phrase from text.
+fn extract_first_phrase(text: &str, max_len: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() <= max_len {
+        return trimmed.to_string();
+    }
+
+    // Try to break at sentence boundary
+    if let Some(pos) = trimmed.find('。') {
+        if pos <= max_len {
+            return trimmed[..pos + 1].to_string();
+        }
+    }
+
+    if let Some(pos) = trimmed.find('.') {
+        if pos <= max_len {
+            return trimmed[..pos + 1].to_string();
+        }
+    }
+
+    if let Some(pos) = trimmed.find('，') {
+        if pos <= max_len {
+            return trimmed[..pos].to_string();
+        }
+    }
+
+    if let Some(pos) = trimmed.find(',') {
+        if pos <= max_len {
+            return trimmed[..pos].to_string();
+        }
+    }
+
+    // Hard truncate with ellipsis (UTF-8 safe — byte slicing panics on
+    // multi-byte chars; floor_char_boundary lands on a valid boundary).
+    let end = trimmed.floor_char_boundary(max_len.saturating_sub(3));
+    format!("{}...", &trimmed[..end])
+}
+
+/// === ENHANCED: Context Window with Importance-Based Selection ===
+///
+/// Builds conversation context with:
+/// 1. Tool result clearing for old messages
+/// 2. Conversation-level compression for long histories
+/// 3. Importance-based message selection (P1.2)
+/// 4. Token-based windowing with accurate estimation
+/// 5. Always keep recent messages (minimum 4) for context continuity
+///
+/// The `max_tokens` parameter allows dynamic context sizing based on the model's actual capacity.
+/// This prevents wasting model capability (e.g., using 5k context with a 32k model) while
+/// also preventing errors from exceeding the model's limit (e.g., using 12k context with an 8k model).
+pub(crate) fn build_context_window(
+    messages: &[AgentMessage],
+    max_tokens: usize,
+) -> Vec<AgentMessage> {
+    // Use the improved tokenizer module for accurate token estimation
+    use tokenizer::select_messages_with_importance;
+
+    // Adaptive compaction: scale parameters with model context capacity
+    // Larger contexts (32k+) should preserve far more history
+    let (keep_tools, compress_threshold, keep_recent, min_recent) = if max_tokens > 16000 {
+        (6, 30, 14, 8) // Large context: very gentle
+    } else if max_tokens > 8000 {
+        (4, 20, 10, 6) // Medium context: moderate
+    } else {
+        (2, 12, 6, 4) // Small context: aggressive (original)
+    };
+
+    // First, apply tool result clearing
+    let tool_compacted = compact_tool_results(messages, keep_tools);
+
+    // Then apply conversation-level compression if we have many messages
+    let conversation_compacted = if tool_compacted.len() > compress_threshold {
+        compact_conversation(&tool_compacted, keep_recent, max_tokens)
+    } else {
+        tool_compacted
+    };
+
+    // Use importance-based selection for better context quality (P1.2)
+    // This prioritizes system messages, user intent, and error handling
+    let selected_refs = select_messages_with_importance(
+        &conversation_compacted,
+        max_tokens,
+        min_recent,
+        0.15, // Minimum importance threshold
+    );
+
+    // Convert references to owned messages
+    selected_refs.into_iter().cloned().collect()
+}
+
+/// Calculate adaptive context size adjustment based on conversation complexity.
+///
+/// Returns a multiplier (0.9 to 1.2) that adjusts the context window:
+/// - 1.2: High complexity (many entities, topics, recent errors)
+/// - 1.0: Normal complexity
+/// - 0.9: Low complexity (simple greetings, repetitive)
+///
+/// Complexity factors:
+/// - High entity diversity: +10%
+/// - Multiple active topics: +10%
+/// - Recent errors: +15%
+/// - Simple greetings: -10%
+pub(crate) fn calculate_adaptive_context_adjustment(messages: &[AgentMessage]) -> f64 {
+    if messages.is_empty() {
+        return 1.0;
+    }
+
+    let mut adjustment = 1.0f64;
+
+    // Analyze recent messages (last 10) for complexity
+    let recent_count = messages.len().min(10);
+    let recent = &messages[messages.len().saturating_sub(recent_count)..];
+
+    // 1. Entity diversity: Count unique device/rule/agent mentions
+    let mut entities = std::collections::HashSet::new();
+    for msg in recent {
+        let content = msg.content.to_lowercase();
+
+        // Extract device IDs
+        for word in content.split_whitespace() {
+            if word.starts_with("device_") || word.starts_with("设备") {
+                entities.insert(word.to_string());
+            }
+            // Rule mentions
+            if word.contains("rule") || word.contains("规则") {
+                entities.insert("rule".to_string());
+            }
+            // Agent mentions
+            if word.contains("agent") || word.contains("智能体") {
+                entities.insert("agent".to_string());
+            }
+            // Location mentions
+            if word.contains("客厅")
+                || word.contains("卧室")
+                || word.contains("厨房")
+                || word.contains("living")
+                || word.contains("bedroom")
+                || word.contains("kitchen")
+            {
+                entities.insert("location".to_string());
+            }
+        }
+    }
+
+    // High entity diversity: +10%
+    if entities.len() >= 4 {
+        adjustment += 0.1;
+        tracing::debug!(
+            "Adaptive context: +10% for high entity diversity ({})",
+            entities.len()
+        );
+    }
+
+    // 2. Topic variety: Count distinct topics
+    let mut topics = std::collections::HashSet::new();
+    for msg in recent {
+        let content = msg.content.to_lowercase();
+
+        if content.contains("温度") || content.contains("temperature") {
+            topics.insert("temperature");
+        }
+        if content.contains("灯") || content.contains("light") {
+            topics.insert("lighting");
+        }
+        if content.contains("湿度") || content.contains("humidity") {
+            topics.insert("humidity");
+        }
+        if content.contains("创建") || content.contains("create") {
+            topics.insert("creation");
+        }
+        if content.contains("查询") || content.contains("query") || content.contains("list") {
+            topics.insert("query");
+        }
+        if content.contains("控制") || content.contains("control") {
+            topics.insert("control");
+        }
+    }
+
+    // Multiple active topics: +10%
+    if topics.len() >= 3 {
+        adjustment += 0.1;
+        tracing::debug!(
+            "Adaptive context: +10% for multiple topics ({})",
+            topics.len()
+        );
+    }
+
+    // 3. Recent errors: +15%
+    let has_recent_errors = recent.iter().any(|msg| {
+        let content = msg.content.to_lowercase();
+        content.contains("错误")
+            || content.contains("失败")
+            || content.contains("error")
+            || content.contains("fail")
+            || msg.role == "tool" && content.contains("\"success\":false")
+    });
+    if has_recent_errors {
+        adjustment += 0.15;
+        tracing::debug!("Adaptive context: +15% for recent errors");
+    }
+
+    // 4. Simple greetings: -10%
+    let is_simple_greeting = messages.len() <= 3
+        && recent.iter().all(|msg| {
+            let content = msg.content.to_lowercase();
+            let tokens = content.split_whitespace().count();
+            tokens <= 5
+                || content.contains("你好")
+                || content.contains("hello")
+                || content.contains("hi")
+                || content.contains("嗨")
+        });
+    if is_simple_greeting {
+        adjustment -= 0.1;
+        tracing::debug!("Adaptive context: -10% for simple greeting");
+    }
+
+    // 5. Repetitive content penalty: -5%
+    let unique_contents: std::collections::HashSet<_> =
+        recent.iter().map(|m| m.content.as_ref()).collect();
+    if recent.len() > 3 && unique_contents.len() < recent.len() / 2 {
+        adjustment -= 0.05;
+        tracing::debug!("Adaptive context: -5% for repetitive content");
+    }
+
+    // Clamp adjustment to reasonable bounds
+    let adjustment = adjustment.clamp(0.9, 1.2);
+
+    tracing::debug!(
+        "Adaptive context adjustment: {:.2} (entities={}, topics={}, has_errors={}, is_greeting={})",
+        adjustment,
+        entities.len(),
+        topics.len(),
+        has_recent_errors,
+        is_simple_greeting
+    );
+
+    adjustment
+}
+
+#[cfg(test)]
+mod depth_and_image_tests {
+    use super::*;
+
+    fn img() -> AgentMessageImage {
+        AgentMessageImage {
+            data: "data:image/png;base64,x".to_string(),
+            mime_type: Some("image/png".to_string()),
+            caption: None,
+        }
+    }
+
+    /// user at indices 0,3,6,9; assistants between. depth=2 keeps the last
+    /// two user turns (from idx 6 on) → drains 6 messages.
+    #[test]
+    fn depth_drain_returns_count_and_keeps_boundary_turn() {
+        let mut history = Vec::new();
+        for turn in 0..4u32 {
+            history.push(AgentMessage::user(format!("u{turn}")));
+            history.push(AgentMessage::assistant("a"));
+            history.push(AgentMessage::assistant("a"));
+        }
+        let drained = apply_chat_history_depth_with(&mut history, 2);
+        assert_eq!(drained, 6);
+        // Remaining window starts at the boundary user turn u2.
+        assert_eq!(history.len(), 6);
+        assert_eq!(history[0].content.as_ref(), "u2");
+    }
+
+    #[test]
+    fn summary_index_shifts_by_drain() {
+        assert_eq!(adjust_summary_index_after_drain(Some(10), 4), Some(6));
+        // Drain consumed everything the summary covers → nothing to filter.
+        assert_eq!(adjust_summary_index_after_drain(Some(3), 4), None);
+        assert_eq!(adjust_summary_index_after_drain(None, 4), None);
+        assert_eq!(adjust_summary_index_after_drain(Some(5), 0), Some(5));
+    }
+
+    /// End-to-end alignment: after drain + adjust, "keep local > adjusted"
+    /// keeps exactly the messages whose FULL index exceeds the summary
+    /// boundary — no gap, no double-coverage.
+    #[test]
+    fn drain_plus_adjust_has_no_coverage_gap() {
+        let mut history = Vec::new();
+        for turn in 0..4u32 {
+            history.push(AgentMessage::user(format!("u{turn}")));
+            history.push(AgentMessage::assistant("a"));
+            history.push(AgentMessage::assistant("a"));
+        }
+        let up_to = 5u64; // summary covers full indices 0..=5
+        let drained = apply_chat_history_depth_with(&mut history, 2);
+        let adjusted = adjust_summary_index_after_drain(Some(up_to), drained);
+
+        // depth=2 drains 6 → adjusted = 5-6 underflows → summary fully
+        // drained: keep the whole window.
+        assert_eq!(adjusted, None);
+        // Every remaining message (full indices 6..11) is NOT covered by the
+        // summary — correct, since the summary stopped at 5.
+
+        // Now a shallower drain: depth=3 cuts at u1 (idx 3) → drained 3.
+        let mut history = Vec::new();
+        for turn in 0..4u32 {
+            history.push(AgentMessage::user(format!("u{turn}")));
+            history.push(AgentMessage::assistant("a"));
+            history.push(AgentMessage::assistant("a"));
+        }
+        let drained = apply_chat_history_depth_with(&mut history, 3);
+        assert_eq!(drained, 3);
+        let adjusted = adjust_summary_index_after_drain(Some(up_to), drained);
+        assert_eq!(adjusted, Some(2));
+        // Filter "local > 2" keeps full indices 6..=11 — exactly the ones the
+        // summary (0..=5) does not cover. Full idx 6 sits at local idx 3.
+        assert_eq!(history[3].content.as_ref(), "u2");
+    }
+
+    #[test]
+    fn strip_stale_images_keeps_two_most_recent() {
+        let mut history = vec![
+            AgentMessage::assistant("a0"),
+            {
+                let mut m = AgentMessage::user("oldest");
+                m.images = Some(vec![img()]);
+                m
+            },
+            AgentMessage::assistant("a1"),
+            {
+                let mut m = AgentMessage::user("middle");
+                m.images = Some(vec![img()]);
+                m
+            },
+            {
+                let mut m = AgentMessage::user("recent");
+                m.images = Some(vec![img(), img()]);
+                m
+            },
+        ];
+        strip_stale_images(&mut history, Some(32_768));
+        // Most recent two image-bearing user messages (idx 3, 4) keep images.
+        assert_eq!(history[3].images.as_ref().unwrap().len(), 1);
+        assert_eq!(history[4].images.as_ref().unwrap().len(), 2);
+        // Oldest is stripped and carries an explicit marker.
+        assert!(history[1].images.is_none());
+        let c = history[1].content.as_ref();
+        assert!(c.contains("oldest"), "original text preserved: {c}");
+        assert!(c.contains("1 image(s) omitted"), "marker appended: {c}");
+        // Non-user messages untouched.
+        assert!(history[0].images.is_none());
+    }
+
+    #[test]
+    fn strip_stale_images_annotates_durable_paths_before_hydrate() {
+        let path = "/api/images/chat-deadbeefdeadbeef.jpg";
+        let mut history = vec![{
+            let mut m = AgentMessage::user("meter shot");
+            m.images = Some(vec![AgentMessageImage {
+                data: path.to_string(),
+                mime_type: Some("image/jpeg".to_string()),
+                caption: Some("a beige meter".into()),
+            }]);
+            m
+        }];
+        // Missing file → hydrate no-ops, but handle must still land in text.
+        strip_stale_images(&mut history, Some(32_768));
+        let c = history[0].content.as_ref();
+        assert!(c.contains("meter shot"), "original text preserved: {c}");
+        assert!(
+            c.contains(path),
+            "durable path must survive for text-only strip / tools: {c}"
+        );
+        assert!(
+            c.contains("img_1") || c.contains("[attached"),
+            "album-aware handle expected: {c}"
+        );
+        // Path still on the image field (hydrate failed → left as reference).
+        assert_eq!(history[0].images.as_ref().unwrap()[0].data.as_str(), path);
+    }
+
+    #[test]
+    fn strip_stale_images_keeps_one_on_8k_window() {
+        let mut history = vec![
+            {
+                let mut m = AgentMessage::user("oldest");
+                m.images = Some(vec![img()]);
+                m
+            },
+            {
+                let mut m = AgentMessage::user("middle");
+                m.images = Some(vec![img()]);
+                m
+            },
+            {
+                let mut m = AgentMessage::user("recent");
+                m.images = Some(vec![img()]);
+                m
+            },
+        ];
+        strip_stale_images(&mut history, Some(8_192));
+        assert!(history[0].images.is_none());
+        assert!(history[1].images.is_none());
+        assert_eq!(history[2].images.as_ref().unwrap().len(), 1);
+        assert_eq!(keep_images_on_recent_user_msgs(Some(8_192)), 1);
+        assert_eq!(keep_images_on_recent_user_msgs(Some(16_384)), 1);
+        assert_eq!(keep_images_on_recent_user_msgs(Some(16_385)), 2);
+        assert_eq!(keep_images_on_recent_user_msgs(None), 2);
+    }
+}
+
+#[cfg(test)]
+mod narration_tests {
+    use super::*;
+
+    /// The exact failure text from the field conversation.
+    #[test]
+    fn detects_chinese_promise() {
+        assert!(is_narration_without_action(
+            "好的，我现在使用 image_edit 工具在图像上绘制时间文字水印。"
+        ));
+        assert!(is_narration_without_action("我将调用工具来获取设备列表。"));
+        assert!(is_narration_without_action(
+            "让我使用 vision 分析这张图片。"
+        ));
+    }
+
+    #[test]
+    fn detects_english_promise_case_insensitive() {
+        assert!(is_narration_without_action(
+            "OK, I will use the image_edit tool to draw the watermark."
+        ));
+        assert!(is_narration_without_action(
+            "Let me call the device list tool."
+        ));
+        assert!(is_narration_without_action(
+            "I'm going to run the command now."
+        ));
+        // False-friend earlier must not hide a later real promise.
+        assert!(is_narration_without_action(
+            "Let me address that — let me add the rule."
+        ));
+        assert!(!is_narration_without_action(
+            "Let me address the customer concern carefully."
+        ));
+    }
+
+    /// 2026-11-18 NM-250 desktop: weather turns ended on these foreshadow
+    /// shapes while tools were still available. Detector shared by
+    /// auto-continue and incomplete-end — both missed.
+    #[test]
+    fn detects_try_fetch_foreshadow_variants() {
+        assert!(is_narration_without_action(
+            "I'll try fetching the weather for you."
+        ));
+        assert!(is_narration_without_action(
+            "I'll fetch the current weather now."
+        ));
+        assert!(is_narration_without_action(
+            "I will try to get today's forecast."
+        ));
+        assert!(is_narration_without_action(
+            "Let me try fetching that for you."
+        ));
+        assert!(is_narration_without_action(
+            "I'm going to fetch the weather data."
+        ));
+        assert!(is_narration_without_action(
+            "好的，我来获取今天的天气信息。"
+        ));
+        assert!(is_narration_without_action("我会查询一下当前天气。"));
+        assert!(is_narration_without_action("我将尝试拉取天气预报。"));
+    }
+
+    /// 2026-11-21 tip overnight + T1.3 retest: tool-free foreshadows the prior
+    /// table missed — verbatim assistant_message strings from failing turns.
+    #[test]
+    fn detects_list_read_delete_disable_foreshadow_variants() {
+        assert!(is_narration_without_action(
+            "I'll list the transform's output metrics."
+        ));
+        assert!(is_narration_without_action(
+            "I'll list c2f's metrics and output."
+        ));
+        assert!(is_narration_without_action(
+            "I'll list the transform's virtual metrics."
+        ));
+        assert!(is_narration_without_action(
+            "I'll read c2f's current details to confirm its state."
+        ));
+        assert!(is_narration_without_action(
+            "I'll re-read c2f's current status and code to confirm the final state."
+        ));
+        assert!(is_narration_without_action(
+            "I'll delete c2f and verify the result."
+        ));
+        assert!(is_narration_without_action("I'll delete transform c2f."));
+        assert!(is_narration_without_action("I'll disable transform c2f."));
+        assert!(is_narration_without_action("I'll re-enable the transform."));
+        assert!(is_narration_without_action("I'll re-enable c2f."));
+        assert!(is_narration_without_action("I'll re-enable transform c2f."));
+        assert!(is_narration_without_action(
+            "I'll test the transform code with input 25 using the test-code command."
+        ));
+        assert!(is_narration_without_action(
+            "I'll query the transform details and its execution records in parallel."
+        ));
+        assert!(is_narration_without_action(
+            "I'll add the note to c2f via its update path (description field)."
+        ));
+        assert!(is_narration_without_action("让我列出 c2f 的输出指标。"));
+        assert!(is_narration_without_action("我来删除这个 transform。"));
+        assert!(is_narration_without_action("让我重新启用 c2f。"));
+
+        // Negatives: English prefix word-boundary + completed list summaries.
+        assert!(!is_narration_without_action(
+            "Let me address your question about the transform scope."
+        ));
+        assert!(!is_narration_without_action(
+            "I'll address both issues in order."
+        ));
+        assert!(!is_narration_without_action(
+            "Let me listen to the next event."
+        ));
+        assert!(!is_narration_without_action(
+            "I'll readily confirm the state."
+        ));
+        let list_summary =
+            "我来列出当前已注册的 3 台设备：\n- sensor-a\n- sensor-b\n- pump-1\n以上是完整列表。";
+        assert!(
+            !is_narration_without_action(list_summary),
+            "complete list body must not foreshadow-continue"
+        );
+    }
+
+    /// The exact promise-only replies from the 2026-10-19 incident session
+    /// tail (verbatim from sessions.redb; reproduced by the conversation
+    /// replay eval). None matched the previous pattern list — the nudge
+    /// never fired and the user read the repeat promises as the task being
+    /// interrupted.
+    #[test]
+    fn detects_incident_tail_promise_phrasing() {
+        assert!(is_narration_without_action(
+            "我来检查仪表盘和组件的当前状态，确认是否正确绑定。"
+        ));
+        assert!(is_narration_without_action(
+            "我来检查仪表盘的当前状态和组件详情。"
+        ));
+        assert!(is_narration_without_action(
+            "我来帮您继续处理设备指标绑定问题。首先让我了解仪表盘的可用操作和现有配置。"
+        ));
+    }
+
+    /// Long analyses that merely contain a promise phrase are legitimate
+    /// final answers — the length gate keeps the nudge off them.
+    #[test]
+    fn long_text_is_not_narration() {
+        let long = format!("分析结果：{}", "设备读数正常。".repeat(200));
+        assert!(!is_narration_without_action(&long));
+    }
+
+    #[test]
+    fn normal_answers_are_not_narration() {
+        assert!(!is_narration_without_action("设备在线，温度 23.5°C。"));
+        assert!(!is_narration_without_action(
+            "The image shows an electricity meter reading 8270.8 kWh."
+        ));
+        assert!(!is_narration_without_action(""));
+        // A final answer that legitimately mentions a tool in the past tense
+        // without a promise phrase.
+        assert!(!is_narration_without_action(
+            "已完成：水印已绘制并通过 vision 验证。"
+        ));
+    }
+    #[test]
+    fn stage1_greeting_and_colon_adversarial() {
+        assert!(!is_simple_greeting("history of temp"));
+        assert!(!is_simple_greeting("high cpu?"));
+        assert!(!is_simple_greeting("History of the device"));
+        assert!(is_simple_greeting("hi"));
+        assert!(is_simple_greeting("hi!"));
+        assert!(is_simple_greeting("hello"));
+        assert!(is_simple_greeting("你好"));
+        // Colon alone is not narration without a promise actor.
+        assert!(!is_narration_without_action("当前系统时间 10:30:"));
+        assert!(!is_narration_without_action("Tips:"));
+        assert!(is_narration_without_action("好的，我来重新安装组件："));
+        assert!(is_narration_without_action(
+            "OK, let me install the widget:"
+        ));
+    }
+
+    /// Live 2026-10-20 regression (verbatim shape): a COMPLETE ~300-char
+    /// capability-list answer whose politeness closing contains "我来帮你
+    /// …实现！". The promise pattern at the tail is a closing formula, not
+    /// an unexecuted action — the nudge round it triggered answered with a
+    /// bare `[]` and replaced the real answer. Promise phrases now only
+    /// count when they LEAD the reply.
+    #[test]
+    fn tail_politeness_closing_is_not_narration() {
+        let reply = format!(
+            "你好！我是 HeraMind，一个驻扎在 IoT 边缘平台上的 AI 工程师助手。我可以帮你处理以下工作：{}如果你有具体需求，随时告诉我，我来帮你一步步实现！",
+            "平台操作、设备管理、数据处理、模型调用、系统设置。".repeat(6)
+        );
+        assert!(reply.chars().count() > 200, "fixture must be substantial");
+        assert!(!is_narration_without_action(&reply));
+        // The English twin: "let me know"/"I'll help" closings under a long
+        // complete answer.
+        let english = format!(
+            "Here is the full capability overview of the platform. {}If you have a concrete task, just tell me and I'll help you implement it step by step!",
+            "Device management, dashboards, rules, data transforms. ".repeat(4)
+        );
+        assert!(!is_narration_without_action(&english));
+    }
+
+    /// The same closing words ARE a collapse when they lead the reply —
+    /// position is the discriminator, not presence.
+    #[test]
+    fn head_promise_still_detected() {
+        assert!(is_narration_without_action("我来帮你创建设备。"));
+        assert!(is_narration_without_action("好的，我来处理这个问题。"));
+        assert!(is_narration_without_action(
+            "Sure! I can help with that. Let me check your devices first."
+        ));
+    }
+
+    /// The nudge prompt must be ONE language, matching the narration being
+    /// corrected. A bilingual instruction made small models drift into the
+    /// language they read last (English replies to Chinese questions).
+    #[test]
+    fn nudge_prompt_is_single_language() {
+        let zh = narration_nudge_prompt("我现在使用 shell 工具执行命令。");
+        assert!(zh.contains("请先判断"), "{zh}");
+        assert!(
+            !zh.contains("Your previous reply"),
+            "no English sentence in the Chinese nudge: {zh}"
+        );
+        // Chinese conversations embed English identifiers — still Chinese.
+        assert_eq!(
+            zh,
+            narration_nudge_prompt("我用 heramind dashboard add-components 来添加组件。")
+        );
+
+        let en = narration_nudge_prompt("Let me run the command now.");
+        assert!(en.contains("Decide first"), "{en}");
+        assert!(
+            !en.chars().any(|c| matches!(c, '\u{4e00}'..='\u{9fff}')),
+            "no CJK in the English nudge: {en}"
+        );
+    }
+
+    #[test]
+    fn language_selector_detects_cjk() {
+        assert!(text_prefers_chinese("你好"));
+        assert!(text_prefers_chinese("混合 English 文本"));
+        assert!(!text_prefers_chinese("hello world"));
+        assert!(!text_prefers_chinese("heramind device list --json"));
+        assert!(!text_prefers_chinese(""));
+    }
+
+    /// A user who asks for a PLAN must not be nudged into executing it.
+    #[test]
+    fn detects_plan_only_requests() {
+        assert!(user_requested_no_execution(
+            "先不要执行，只告诉我你打算怎么做"
+        ));
+        assert!(user_requested_no_execution("帮我创建设备，但先说明步骤"));
+        assert!(user_requested_no_execution("只告诉我怎么删除规则"));
+        assert!(user_requested_no_execution(
+            "Don't run anything yet, just tell me your plan."
+        ));
+        assert!(user_requested_no_execution(
+            "Just explain how to create a device."
+        ));
+        // Genuine execution requests are NOT suppressed.
+        assert!(!user_requested_no_execution("帮我创建设备"));
+        assert!(!user_requested_no_execution("create a device for me"));
+        assert!(!user_requested_no_execution("检查一下设备状态"));
+        // Past-tense report is not an instruction not to execute.
+        assert!(!user_requested_no_execution("刚才没有执行成功"));
+    }
+}
+
+#[cfg(test)]
+mod greeting_tests {
+    use super::is_simple_greeting;
+
+    #[test]
+    fn greetings_match_under_length_cap() {
+        // Case-insensitive word-boundary greeting match under length cap.
+        for s in [
+            "你好",
+            "您好",
+            "hi",
+            "HI",
+            "Hi there",
+            "hello",
+            "hello!",
+            "嗨",
+            "在吗",
+            "早上好",
+            "下午好",
+            "晚上好",
+        ] {
+            assert!(is_simple_greeting(s), "{s:?} should be a greeting");
+        }
+    }
+
+    #[test]
+    fn tasks_and_long_text_are_not_greetings() {
+        for s in [
+            "帮我查一下设备",
+            "list the devices",
+            "你好，帮我创建一个温度报警规则，温度超过30度时发消息", // starts with 你好 but >20 chars
+            "history of temp",
+            "high cpu?",
+        ] {
+            assert!(!is_simple_greeting(s), "{s:?} should NOT be a greeting");
+        }
+    }
+}
+
+#[cfg(test)]
+mod stale_window_preview_tests {
+    use super::*;
+
+    fn window_result(offset: i64, body_chars: usize) -> serde_json::Value {
+        let next = if offset + (body_chars as i64) < 65600 {
+            serde_json::json!(offset + (body_chars as i64))
+        } else {
+            serde_json::Value::Null
+        };
+        serde_json::json!({
+            "reference": "$cached:shell.stdout#ab12cd34",
+            "content_type": "text/plain",
+            "total_chars": 65600,
+            "char_offset": offset,
+            "returned_chars": body_chars,
+            "content": "z".repeat(body_chars),
+            "next_char_offset": next,
+            "truncated": true
+        })
+    }
+
+    fn window_call(offset: i64, body_chars: usize) -> types::ToolCall {
+        types::ToolCall {
+            name: "file_read".to_string(),
+            id: String::new(),
+            arguments: serde_json::json!({
+                "path": "$cached:shell.stdout#ab12cd34",
+                "char_offset": offset
+            }),
+            result: Some(window_result(offset, body_chars)),
+            round: Some(1),
+        }
+    }
+
+    fn msg_with(calls: Vec<types::ToolCall>, body: &str) -> AgentMessage {
+        AgentMessage {
+            tool_calls: Some(calls),
+            content: body.to_string().into(),
+            ..AgentMessage::assistant("")
+        }
+    }
+
+    /// Stale window → its RESULT is swapped for the structured summary
+    /// (call granularity); the message, sibling calls, and assistant body
+    /// all survive.
+    #[test]
+    fn stale_window_swapped_at_call_granularity() {
+        let older = msg_with(
+            vec![
+                window_call(0, 8_000),
+                types::ToolCall {
+                    name: "device".to_string(),
+                    id: String::new(),
+                    arguments: serde_json::json!({"action": "get", "device_id": "cam-1"}),
+                    result: Some(serde_json::json!({"status": "online", "battery": 84})),
+                    round: Some(1),
+                },
+            ],
+            "并行批次正文",
+        );
+        let newest = msg_with(vec![window_call(8_000, 8_000)], "最新窗");
+        let out = preview_stale_cached_windows(&[older, newest]);
+
+        let stale = &out[0];
+        let calls = stale.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2, "sibling call survives");
+        let swapped = calls[0].result.as_ref().unwrap();
+        let summary = swapped.as_str().expect("summary is a string result");
+        assert!(
+            summary.contains("re-read $cached:shell.stdout#ab12cd34"),
+            "{summary}"
+        );
+        assert!(summary.contains("chars 0..8000 of 65600"), "{summary}");
+        assert!(summary.contains("next_char_offset=8000"), "{summary}");
+        assert!(
+            summary.matches('z').count() <= 200,
+            "body collapses to the head"
+        );
+        assert_eq!(
+            calls[1].result,
+            Some(serde_json::json!({"status": "online", "battery": 84})),
+            "sibling device result untouched"
+        );
+        assert!(
+            stale.content.to_string().contains("并行批次正文"),
+            "assistant body survives"
+        );
+        assert!(out[1].tool_calls.is_some(), "newest stays intact");
+    }
+
+    /// Ordinary large tool results are NOT touched by the scoped rule.
+    #[test]
+    fn ordinary_large_results_untouched() {
+        let big = msg_with(
+            vec![types::ToolCall {
+                name: "shell".to_string(),
+                id: String::new(),
+                arguments: serde_json::json!({"command": "cat huge.log"}),
+                result: Some(serde_json::json!({"stdout": "y".repeat(50_000)})),
+                round: Some(1),
+            }],
+            "",
+        );
+        let out = preview_stale_cached_windows(std::slice::from_ref(&big));
+        assert_eq!(
+            out[0].tool_calls.as_ref().map(|c| c.len()),
+            Some(1),
+            "non-window results pass through untouched"
+        );
+        assert!(
+            out[0].tool_calls.as_ref().unwrap()[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("yyyy"),
+            "body untouched"
+        );
+    }
+
+    /// A DEFAULT-size CJK window (8,000 chars * 3 bytes ≈ 24KB body +
+    /// metadata) must stay intact as the newest — the keep budget leaves
+    /// headroom for the JSON metadata (2026-11-10 review fix).
+    #[test]
+    fn default_cjk_newest_window_stays_intact() {
+        let mut cjk = window_result(0, 8_000);
+        // 8,000 CJK chars instead of ASCII.
+        cjk["content"] = serde_json::json!("烫".repeat(8_000));
+        let msg = msg_with(
+            vec![types::ToolCall {
+                name: "file_read".to_string(),
+                id: String::new(),
+                arguments: serde_json::json!({"path": "$cached:x"}),
+                result: Some(cjk.clone()),
+                round: Some(1),
+            }],
+            "",
+        );
+        assert!(
+            cjk.to_string().len() > 24_000,
+            "precondition: CJK window exceeds the old 24KB budget"
+        );
+        let out = preview_stale_cached_windows(std::slice::from_ref(&msg));
+        let kept = out[0].tool_calls.as_ref().unwrap()[0]
+            .result
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            kept.get("content")
+                .and_then(|c| c.as_str())
+                .map(|c| c.chars().count()),
+            Some(8_000),
+            "default CJK newest window is delivered INTACT"
+        );
+    }
+
+    /// Same-batch parallel reads: two windows whose TOTALS exceed the keep
+    /// budget but whose NEWEST fits individually — the newest window must
+    /// stay intact (call-granularity selection, 2026-11-10 review fix);
+    /// its same-batch sibling is summarized.
+    #[test]
+    fn same_batch_two_windows_newest_kept_individually() {
+        let mut w1 = window_result(0, 8_000);
+        let mut w2 = window_result(8_000, 8_000);
+        // Two default CJK windows: each ~24.5KB serialized (< 32K budget),
+        // together ~49KB (> 32K) — message-granularity would preview BOTH.
+        w1["content"] = serde_json::json!("烫".repeat(8_000));
+        w2["content"] = serde_json::json!("烫".repeat(8_000));
+        let call = |result: serde_json::Value, offset: i64| types::ToolCall {
+            name: "file_read".to_string(),
+            id: String::new(),
+            arguments: serde_json::json!({
+                "path": "$cached:shell.stdout#ab12cd34",
+                "char_offset": offset
+            }),
+            result: Some(result),
+            round: Some(1),
+        };
+        assert!(
+            w2.to_string().len() <= CACHED_WINDOW_KEEP_MAX_BYTES,
+            "precondition: newest window individually within budget"
+        );
+        let batch = msg_with(vec![call(w1, 0), call(w2, 8_000)], "同批两窗");
+
+        let out = preview_stale_cached_windows(std::slice::from_ref(&batch));
+        let calls = out[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        // Older sibling → structured summary.
+        assert!(
+            calls[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .is_some_and(|s| s.contains("re-read")),
+            "older same-batch window is summarized"
+        );
+        // Newest → intact original JSON with full body.
+        let kept = calls[1].result.as_ref().unwrap();
+        assert_eq!(
+            kept.get("char_offset").and_then(|v| v.as_i64()),
+            Some(8_000),
+            "newest window kept intact (original object, not a summary string)"
+        );
+        assert_eq!(
+            kept.get("content")
+                .and_then(|c| c.as_str())
+                .map(|c| c.chars().count()),
+            Some(8_000),
+            "newest window body fully present"
+        );
+        assert!(
+            out[0].content.to_string().contains("同批两窗"),
+            "assistant body survives"
+        );
+    }
+
+    /// A max-size window (> CACHED_WINDOW_KEEP_MAX_BYTES serialized) is
+    /// previewed even as the newest — intact retention is budget-bounded.
+    #[test]
+    fn oversized_newest_window_is_previewed() {
+        let huge = msg_with(vec![window_call(0, 60_000)], "");
+        let out = preview_stale_cached_windows(std::slice::from_ref(&huge));
+        let r = out[0].tool_calls.as_ref().unwrap()[0]
+            .result
+            .as_ref()
+            .unwrap();
+        assert!(
+            r.as_str().is_some_and(|s| s.contains("re-read")),
+            "oversized newest previews"
+        );
+    }
+}
+
+/// Byte budget for keeping the NEWEST cached read-back window intact in
+/// history. Unified with the door's default window: 8,000 chars of CJK
+/// (the worst common case) is ~24,000 bytes of body ALONE, so the budget
+/// must leave room for the surrounding JSON metadata — 32,000 bytes keeps
+/// any default-size window intact regardless of language while still
+/// bounding history cost. Max-size windows (64K chars) are previewed.
+/// Bytes, not chars — the check uses `String::len`.
+pub(crate) const CACHED_WINDOW_KEEP_MAX_BYTES: usize = 32_000;
+
+/// Structured metadata extracted EXPLICITLY from a cached read-back window
+/// result — never from serialized-field order (the result object may place
+/// `content` before `next_char_offset`, so a string prefix is not a
+/// contract).
+struct CachedWindowInfo {
+    reference: String,
+    char_offset: i64,
+    returned_chars: i64,
+    total_chars: i64,
+    next_char_offset: Option<i64>,
+    body_head: String,
+}
+
+fn cached_window_info(result: &serde_json::Value) -> Option<CachedWindowInfo> {
+    let reference = result.get("reference")?.as_str()?;
+    if !reference.starts_with("$cached:") {
+        return None;
+    }
+    Some(CachedWindowInfo {
+        reference: reference.to_string(),
+        char_offset: result.get("char_offset")?.as_i64()?,
+        returned_chars: result.get("returned_chars")?.as_i64()?,
+        total_chars: result.get("total_chars")?.as_i64()?,
+        next_char_offset: result.get("next_char_offset").and_then(|v| v.as_i64()),
+        body_head: result
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect(),
+    })
+}
+
+fn window_summary_text(info: &CachedWindowInfo, tool_name: &str) -> String {
+    let next_hint = match info.next_char_offset {
+        Some(n) => format!("next_char_offset={n}"),
+        None => "complete".to_string(),
+    };
+    format!(
+        "[stale cached window: {tool_name} re-read {} covered chars {}..{} of {} ({next_hint}); re-read with file_read(path=\"{ref}\", char_offset=<offset>) if the body is needed again. body head: {head}]",
+        info.reference,
+        info.char_offset,
+        info.char_offset + info.returned_chars,
+        info.total_chars,
+        ref = info.reference,
+        head = info.body_head
+    )
+}
+
+/// History pre-pass for cached read-back windows (2026-11-09 A2 fix,
+/// scoped + call-granular after the 2026-11-10 review rounds):
+///
+/// - ONLY `file_read` results carrying a `$cached:` window are touched —
+///   ordinary tool results keep their existing budget-driven retention.
+/// - Replacement happens at TOOL-CALL granularity: sibling calls in the
+///   same batch, their results, and the assistant body all survive; only
+///   the window call's `result` is swapped for a structured summary.
+/// - The NEWEST window-bearing message stays intact within
+///   `CACHED_WINDOW_KEEP_MAX_BYTES` (sized so a default CJK window fits
+///   with its metadata), so multi-window analysis can still reason over
+///   the page it just read.
+/// - Older windows keep explicitly-extracted metadata (reference, window
+///   range, total, continuation offset) — the body is re-readable via
+///   `file_read` at any time.
+pub(crate) fn preview_stale_cached_windows(messages: &[AgentMessage]) -> Vec<AgentMessage> {
+    // Tool results live in TWO history shapes: assistant messages with
+    // `tool_calls[].result`, AND role="tool" messages whose content is the
+    // serialized result (stream_core pushes both). A window in either shape
+    // must be found or the missed one leaks verbatim. `tool_call_id` is
+    // never set in this codebase, so occurrences can only be ordered by
+    // position (message index, then call index within the message): the
+    // LAST occurrence is kept as "newest", earlier ones are previewed.
+    // This is keep-last-occurrence, NOT proven same-call de-duplication —
+    // without a call identifier, "same result in both shapes" cannot be
+    // established, only observed when it happens to hold.
+    fn window_calls_in(msg: &AgentMessage) -> Vec<usize> {
+        msg.tool_calls
+            .as_ref()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tc)| {
+                        tc.name == "file_read"
+                            && tc
+                                .result
+                                .as_ref()
+                                .is_some_and(|r| cached_window_info(r).is_some())
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn window_in_msg(msg: &AgentMessage) -> bool {
+        let in_calls = !window_calls_in(msg).is_empty();
+        let in_tool_role = msg.role == "tool"
+            && msg.tool_call_name.as_deref() == Some("file_read")
+            && serde_json::from_str::<serde_json::Value>(msg.content.as_ref())
+                .ok()
+                .as_ref()
+                .and_then(cached_window_info)
+                .is_some();
+        in_calls || in_tool_role
+    }
+
+    // Locate the NEWEST window occurrence at CALL granularity: the last
+    // window call of the last window-bearing message, or the last
+    // role="tool" window message. (Message-granularity selection would
+    // preview EVERY window of a parallel batch whose totals exceed the
+    // keep budget — losing "newest window intact" exactly when the model
+    // read two pages in one round. 2026-11-10 review fix.)
+    let mut newest: Option<(usize, Option<usize>)> = None; // (msg_idx, call_idx)
+    for (mi, msg) in messages.iter().enumerate() {
+        let calls = window_calls_in(msg);
+        if let Some(&ci) = calls.last() {
+            newest = Some((mi, Some(ci)));
+        } else if msg.role == "tool"
+            && msg.tool_call_name.as_deref() == Some("file_read")
+            && serde_json::from_str::<serde_json::Value>(msg.content.as_ref())
+                .ok()
+                .as_ref()
+                .and_then(cached_window_info)
+                .is_some()
+        {
+            newest = Some((mi, None));
+        }
+    }
+    let Some((newest_msg, newest_call)) = newest else {
+        return messages.to_vec();
+    };
+
+    // Budget check on THAT single window, not the message total.
+    let newest_bytes = match newest_call {
+        Some(ci) => messages[newest_msg].tool_calls.as_ref().unwrap()[ci]
+            .result
+            .as_ref()
+            .map(|r| r.to_string().len())
+            .unwrap_or(0),
+        None => messages[newest_msg].content.len(),
+    };
+    let newest_kept = newest_bytes <= CACHED_WINDOW_KEEP_MAX_BYTES;
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(mi, msg)| {
+            if !window_in_msg(msg) {
+                return msg.clone();
+            }
+            // Assistant-with-tool_calls shape: rebuild at CALL granularity —
+            // only window calls' results swap; sibling calls, their results,
+            // and the assistant body survive (a parallel batch must not lose
+            // its non-window payloads).
+            if let Some(calls) = msg.tool_calls.as_ref() {
+                let rebuilt: Vec<types::ToolCall> = calls
+                    .iter()
+                    .enumerate()
+                    .map(|(ci, tc)| {
+                        let Some(info) = tc.result.as_ref().and_then(cached_window_info) else {
+                            return tc.clone();
+                        };
+                        let is_newest = mi == newest_msg && newest_call == Some(ci) && newest_kept;
+                        if is_newest {
+                            return tc.clone();
+                        }
+                        let mut swapped = tc.clone();
+                        swapped.result = Some(serde_json::Value::String(window_summary_text(
+                            &info, &tc.name,
+                        )));
+                        swapped
+                    })
+                    .collect();
+                let mut out = msg.clone();
+                out.tool_calls = Some(rebuilt);
+                return out;
+            }
+            // role="tool" shape: the content IS the single result. The
+            // newest occurrence (this shape is pushed AFTER the assistant
+            // message) is the one kept intact.
+            let is_newest = mi == newest_msg && newest_call.is_none() && newest_kept;
+            if is_newest {
+                return msg.clone();
+            }
+            let parsed: serde_json::Value =
+                serde_json::from_str(msg.content.as_ref()).expect("window_in_msg checked");
+            let info = cached_window_info(&parsed).expect("window_in_msg checked");
+            let name = msg
+                .tool_call_name
+                .clone()
+                .unwrap_or_else(|| "file_read".to_string());
+            let mut out = msg.clone();
+            out.content = window_summary_text(&info, &name).into();
+            out
+        })
+        .collect()
+}

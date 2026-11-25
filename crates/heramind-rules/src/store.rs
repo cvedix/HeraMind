@@ -113,20 +113,35 @@ impl RuleStore {
         Ok(store)
     }
 
-    /// Create an in-memory store.
+    /// An in-memory store.
+    ///
+    /// Genuinely in memory. It used to create a temp file and rely on `Drop`
+    /// to remove it, which a killed process never runs — so the temp directory
+    /// accumulated their corpses.
+    ///
+    /// Isolated by construction: deliberately NOT routed through `open()`,
+    /// whose path-keyed singleton hands every `:memory:` caller the SAME
+    /// database. Tests run in parallel threads, so one shared store made
+    /// `list_all()` count other tests' rows (flaky 1-vs-2 in CI). Production
+    /// never opens `:memory:`; a fresh backend per call is what an in-memory
+    /// store means for its callers.
     pub fn memory() -> Result<Arc<Self>> {
-        let temp_path =
-            std::env::temp_dir().join(format!("rules_store_{}.redb", uuid::Uuid::new_v4()));
-        Self::open(temp_path)
+        let (db, temp_path) = Self::open_db(":memory:")?;
+        Ok(Arc::new(RuleStore {
+            db: Arc::new(db),
+            path: ":memory:".to_string(),
+            temp_path,
+        }))
     }
 
     fn open_db(path_str: &str) -> Result<(Database, Option<PathBuf>)> {
         let (db, temp_path) = if path_str == ":memory:" {
-            // Use temp file for in-memory mode
-            let temp_path =
-                std::env::temp_dir().join(format!("rules_store_{}.redb", uuid::Uuid::new_v4()));
-            let db = Database::create(&temp_path)?;
-            (db, Some(temp_path))
+            // redb has an in-memory backend; the note that it did not is stale.
+            // Nothing is written, so there is no temp file to clean up and no
+            // `Drop` to depend on — a killed process leaves nothing behind.
+            let db =
+                Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
+            (db, None)
         } else {
             let path_ref = Path::new(path_str);
             if let Some(parent) = path_ref.parent() {
@@ -252,6 +267,30 @@ impl RuleStore {
         // Sort by triggered_at descending (most recent first)
         results.sort_by_key(|r| std::cmp::Reverse(r.triggered_at));
         Ok(results)
+    }
+
+    /// Latest history row for one rule without collecting the full list.
+    ///
+    /// Keys are `history:{timestamp_ms}:{rule_id}` — reverse iteration finds
+    /// the newest matching row and returns early (explain only needs one).
+    pub fn load_latest_history(
+        &self,
+        rule_id: &RuleId,
+    ) -> Result<Option<crate::models::RuleExecutionResult>> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(HISTORY_TABLE) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+
+        for item in table.iter()?.rev() {
+            let (_, value) = item?;
+            let entry: crate::models::RuleExecutionResult = serde_json::from_slice(value.value())?;
+            if &entry.rule_id == rule_id {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
     }
 
     /// Count history entries since a timestamp (only actual triggers with executed actions).

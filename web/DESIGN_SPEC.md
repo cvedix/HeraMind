@@ -12,6 +12,19 @@ All colors are defined as OKLCH CSS variables in `src/index.css` (`:root` for li
 
 **NEVER use hardcoded Tailwind palette colors** (`bg-blue-500`, `text-green-600`, `bg-orange-100`, etc.).
 
+### Elevation & Shadow Standard
+
+Shadows signal **hover and float**, never resting state. Four tiers:
+
+| Tier | Treatment | Applies to |
+|---|---|---|
+| Resting static card | `cardBase` — border only, **no shadow** | Setting cards, info cards, list panels |
+| Interactive card | `interactiveCard` — rest = border only; hover = `shadow-md` + `--border-hover` | Agent/extension/device cards, clickable rows |
+| Dashboard card | `dashboardCardBase` — `shadow-sm` + sheen (dense grid needs a hair of lift) | Dashboard widgets |
+| Floating layer | `shadow-lg`/`shadow-xl` (tokenized) | Popover, dialog, dropdown, toast, sheet, FAB, overlay cards |
+
+Never put `shadow-sm`+ on a resting static card — on the white canvas an always-on shadow reads as a dirty halo and flattens the border's job. If a card looks "unanchored" without shadow, the problem is usually missing border contrast, not missing shadow.
+
 ### Semantic Color Tokens
 
 | Purpose | Text Class | Background Class | CSS Variable |
@@ -63,7 +76,7 @@ CSS variables defined as plain `oklch()` values do NOT support Tailwind's `/` op
 ```
 
 **Workarounds:**
-- Use pre-defined alpha variables: `bg-muted-20`, `bg-muted-30`, `bg-muted-50`, `bg-bg-50`, `bg-bg-70`, etc.
+- Use pre-defined alpha variables: `bg-muted-20`, `bg-muted-30`, `bg-muted-50`; the surface-alpha ladder is `bg-glass` (55%) / `bg-bg-70` / `bg-glass-heavy` (82%) / `bg-bg-90` / `bg-bg-95` (the old 50/80 steps were folded into the glass family).
 - Use inline styles: `style={{ backgroundColor: 'oklch(0.18 0.02 270 / 10%)' }}`
 - Use `bg-success-light` / `bg-error-light` etc. (pre-defined at 8-10% opacity)
 
@@ -287,15 +300,19 @@ Every page must use `PageLayout` from `@/components/layout/PageLayout`.
 ```
 
 **Rules:**
-- Desktop title row via PageHeader: **title + one-line description** (subtitle prop); the row is `mx-auto` + maxWidth so the title left-aligns with the content below. The visual-dashboard page is the exception — title only (its toolbar with the dashboard name follows)
+- Desktop title row via PageHeader: **title only** — no `subtitle` on top-level pages. The tab labels already enumerate the page's sections; a description restating them is redundant text (audit 2026-09). Keep `subtitle` for drill-down sub-pages and dialogs where it carries real context. The row is `mx-auto` + maxWidth so the title left-aligns with the content below
 - Content area uses `overflow-auto` via PageLayout's scroll container — do NOT add your own scroll
-- Fixed headers (tabs/toolbars) go in `headerContent` prop — toolbar rows use `px-4 sm:px-6 md:px-8` matching the title row; NO border-b under the row (content separation is the capsule/toolbar's own affordances)
+- Fixed headers (tabs/toolbars) go in `headerContent` prop — toolbar rows use `px-4 sm:px-6 md:px-8` matching the title row; NO border under the toolbar row — the active tab's own 2px underline is the only line (other toolbars stay line-free)
 - Fixed footers (pagination) go in `footer` prop; the footer offsets past both sidebars via `--app-sidebar-width`
 - Page-level loading MUST use skeleton screens, never spinners
 
 ### Tabs Pattern: `PageTabsBar` + `PageTabsContent`
 
-**Page-level primary actions (Add / Configure / Create) live in `PageTabsBar` `actions` — level with the tabs, top-right — NOT inside the tab content.** Build `actions` per `activeTab` (e.g. "Add Channel" on the channels tab, "Configure IM bridge" on the IM tab). Do not render a separate toolbar or button row inside `PageTabsContent` for a primary add/configure action.
+**Tab-less pages** (e.g. Extensions) mirror the tabbed toolbar: **search in the tab slot (utility first), page actions right — anchored to the content's right edge** (`ml-auto` on the action group, `max-w-md` search, `h-9` input). Same `px-4 pt-2 sm:px-6 md:px-8` row rhythm as `PageTabsBar`. A status-filter row may sit between the toolbar and the content — pills left, a filtered count (`x / y`) right only while filters are active — and it hides entirely when every item shares one state (pills would just echo the total; they return when a second category exists). Content below gets the same `mt-3` gap as `PageTabsContent`.
+
+**Tab style (desktop): underline, not capsules.** The strip has no card surface (`border`/`bg-card` are gone) and the row has no full-width divider — tabs are plain text (`text-muted-foreground`, hover `text-foreground` + a quiet `bg-muted-50` wash over the whole item so the icon joins the hover cue). The active tab is `text-foreground` + a 2px `foreground` underline spanning the full tab width, with rounded (`rounded-full`) ends. The underline is ONE shared sliding indicator (`UnderlineTabs`, `data-tab-indicator`): measured against the active button and transitioned on switch, so it slides between tabs instead of jumping (per-tab `after:` bars can't animate across tabs — never hand-roll the pattern again; every desktop strip renders through `UnderlineTabs`). It stays hidden until the first measurement (no slide-in from 0) and re-measures on resize/webfont load. Mono accent — the indicator is `foreground`, not brand color. Disabled tabs get `opacity-50` + `pointer-events-none`. Overflowing strips scroll with edge fade hints (`from-background` gradients) while content hides beyond an edge. Grouping rhythm: title + tabs fuse into ONE header block — the title→tabs gap (title row `pb-2 sm:pb-3 md:pb-3`) is the smaller gap, deliberately identical to the dashboard page's hand-rolled title row (VisualDashboard), while `PageTabsContent`'s `mt-4` separates the header block from the content it controls. Mobile keeps bottom nav (icon + label) / segmented controls — the segmented active chip is the raised-card style (`bg-muted` track + `bg-card shadow-sm` chip), same as `ui/tabs`, never the solid inverted chip.
+
+**Page actions share the tab row's baseline, and the PRIMARY action anchors the trailing edge.** `PageTabsBar`'s group order is: `actionsExtra` (search/filter wide controls, e.g. the shared `SearchInput`) FIRST, then `secondaryActions` (the `More` overflow), then `actions` LAST — the row's trailing edge is the strongest position and belongs to the page's primary CTA, not a utility input (GitHub/Linear toolbar convention); all bottom edges flush with the tabs' indicator baseline, right edge aligned with the content below. If the group wraps, the search takes its own full-width line under the buttons — intentional. Do not render a separate toolbar or button row inside `PageTabsContent` for a primary add/configure action, and do not place page actions in the PageHeader title row — that corner is reserved for `GlobalControlsFloating` (theme/language/alerts).
 
 ```tsx
 <PageLayout title="Title" headerContent={<PageTabsBar tabs={tabs} />}>
@@ -465,8 +482,23 @@ Default page size is **10** across all pages.
 ### Empty States: `EmptyState`
 
 ```tsx
-<EmptyState icon={Server} title="No devices" description="Add your first device" />
+// Routine absence and search misses stay text-only.
+<EmptyState title="No results" description="Try a different search" />
+
+// Keep one quiet line icon only when the state leads to a meaningful action.
+<EmptyState
+  icon={<Server />}
+  title="No devices"
+  description="Add your first device to begin"
+  action={{ label: "Add device", onClick: openCreate }}
+/>
 ```
+
+**Visual hierarchy:** Empty states are supporting UI, not hero content. Table
+empties, search misses, completed inboxes, and read-only “nothing yet” states
+are text-only. A first-run state may use one small monochrome line icon when it
+also offers a clear next action. Do not add colored icon tiles, oversized icons,
+or repeat the same symbol in the empty state and its action button.
 
 ---
 
@@ -985,11 +1017,13 @@ CSS variables:
 --bottom-nav-height: 0px;
 /* Mobile (set dynamically by useVisualViewport) */
 --topnav-height: calc(0px + env(safe-area-inset-top, 0px));
---bottom-nav-height: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+/* Floating Chat|System capsule is NOT a full-width bar — keep 0 and clear
+   content with explicit pb (see MobilePrimaryNav below). */
+--bottom-nav-height: 0px;
 --chat-content-padding-top: calc(6.5rem + env(safe-area-inset-top, 0px));
 ```
 
-### Mobile Layout: Hamburger Menu + Per-Page Header
+### Mobile Layout: Hamburger Menu + Per-Page Header + Primary Capsule
 
 Mobile-only navigation restructure (desktop unchanged).
 
@@ -1014,8 +1048,17 @@ slide-in `Sheet` rendered once at the App shell. Contains brand header
 Agent / 设备 / 仪表板; System: 自动化 / 数据 / 消息 / 扩展 / 设置), and a
 logout entry. Messages entry shows unread-alerts badge.
 
-**`--bottom-nav-height`** is `0px` on mobile (no bottom nav in the hamburger
-approach). `--topnav-height` is `0px`; page headers carry their own `safe-top`.
+**Floating primary capsule** (`MobilePrimaryNav`, `@/components/layout/MobilePrimaryNav`):
+on non-chat mobile routes, a centered Chat | System pill floats above the
+home indicator (`fixed`, `z-40`, ≈`3.75rem` tall + `0.5rem` bottom offset +
+`safe-area-inset-bottom`). Chat hides it (composer owns the bottom edge).
+Hide/dim while the keyboard is open (`body.keyboard-open`) or while the
+dashboard `MobileEditBar` owns the bottom edge (`body.mobile-edit-chrome-open`).
+Scrollable page content must clear the capsule — prefer
+`pb-[calc(6rem+env(safe-area-inset-bottom))]` (see `PageLayout`,
+`SystemPage`, `VisualDashboard`). `--bottom-nav-height` stays `0px` because
+this is a floating capsule, not a layout-consuming bottom bar.
+`--topnav-height` is `0px`; page headers carry their own `safe-top`.
 
 **Desktop is fully unchanged.**
 
@@ -1593,9 +1636,9 @@ Three drag surfaces, all via `lib/windowDrag.ts` (mousedown → `startDragging`,
 
 ### Page chrome pattern (all desktop pages)
 
-Title row (`PageHeader`, single compact line, no descriptions, mx-auto maxWidth aligned with content) → optional toolbar row (PageTabsBar / DashboardToolbar: tabs left, actions right, `px-4 sm:px-6 md:px-8`, no border-b) → content. Chat has no title row; its floating controls carry a faint `bg-background/60` pill.
+Title row (`PageHeader`, single compact line, no descriptions, mx-auto maxWidth aligned with content; its right side is reserved for `GlobalControlsFloating`) → optional toolbar row (PageTabsBar / DashboardToolbar: tabs left, page actions + `actionsExtra` right on the tabs' baseline, `px-4 sm:px-6 md:px-8`, no full-width divider) → content. Chat has no title row; its floating controls carry a faint `bg-background/60` pill.
 
-Style: mono accent — no brand color in UI chrome (orange lives in the logo, semantic/data colors, login/setup washes). Rail = `--sidebar-bg` (light ~#F8F9FA, dark 0.10), drawers = content tone, separated by color contrast + the drawer's border-r.
+Style: mono accent — no brand color in UI chrome (orange lives in the logo, semantic/data colors, login/setup washes). Rail = `--sidebar-bg` (light ~#F9FAFB, near-white Mono direction, dark 0.10), drawers = content tone, separated by color contrast + the drawer's border-r.
 
 ---
 

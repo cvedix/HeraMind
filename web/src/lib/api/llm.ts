@@ -1,0 +1,297 @@
+/** llm api — split from api.ts 2026-09. */
+import type { LlmBackendInstance, CreateLlmBackendRequest, UpdateLlmBackendRequest, LlmBackendListResponse, BuiltinLlmStatus, BuiltinModelDef, BackendTypeDefinition, BackendTestResult } from '@/types'
+import type { ReasoningCapabilities, BuiltinRuntimeInfo} from '@/types/llm-backend'
+import { fetchAPI } from "./client"
+
+export const llmApi = {
+  // ========== LLM Backends API ==========
+  listLlmBackends: (params?: { type?: string; active_only?: boolean; include_vlm?: boolean }) =>
+    fetchAPI<LlmBackendListResponse>(
+      `/llm-backends${params ? `?${new URLSearchParams(
+        Object.entries(params).reduce((acc, [key, value]) => {
+          if (value !== undefined) acc[key] = String(value)
+          return acc
+        }, {} as Record<string, string>)
+      )}` : ''}`
+    ),
+  getLlmBackend: (id: string) =>
+    fetchAPI<{ backend: LlmBackendInstance }>(`/llm-backends/${id}`),
+  createLlmBackend: (backend: CreateLlmBackendRequest) =>
+    fetchAPI<{ id: string; message: string }>('/llm-backends', {
+      method: 'POST',
+      body: JSON.stringify(backend),
+    }),
+  updateLlmBackend: (id: string, backend: UpdateLlmBackendRequest) =>
+    fetchAPI<{ id: string; message: string }>(`/llm-backends/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(backend),
+    }),
+  deleteLlmBackend: (id: string) =>
+    fetchAPI<{ message: string }>(`/llm-backends/${id}`, {
+      method: 'DELETE',
+    }),
+  activateLlmBackend: (id: string) =>
+    fetchAPI<{ id: string; message: string }>(`/llm-backends/${id}/activate`, {
+      method: 'POST',
+    }),
+  testLlmBackend: (id: string) =>
+    fetchAPI<{ backend_id: string; result: BackendTestResult }>(`/llm-backends/${id}/test`, {
+      method: 'POST',
+    }),
+  listLlmBackendTypes: () =>
+    fetchAPI<{ types: BackendTypeDefinition[] }>('/llm-backends/types'),
+  getLlmBackendSchema: (backendType: string) =>
+    fetchAPI<{ backend_type: string; schema: Record<string, unknown> }>(`/llm-backends/types/${backendType}/schema`),
+  getLlmBackendStats: () =>
+    fetchAPI<{ total_backends: number; active_backends: number; by_type: Record<string, number> }>('/llm-backends/stats'),
+  /**
+   * Fetch available models from an Ollama server
+   * GET /api/llm-backends/ollama/models?endpoint=http://localhost:11434
+   */
+  listOllamaModels: (endpoint?: string) =>
+    fetchAPI<{
+      models: Array<{
+        name: string
+        size?: number
+        modified_at?: string
+        digest?: string
+        details?: {
+          format?: string
+          family?: string
+          families?: string[]
+          parameter_size?: string
+          quantization_level?: string
+        }
+        supports_multimodal: boolean
+        supports_thinking: boolean
+        supports_tools: boolean
+        max_context: number
+        reasoning?: ReasoningCapabilities
+      }>
+      count: number
+    }>(`/llm-backends/ollama/models${endpoint ? `?endpoint=${encodeURIComponent(endpoint)}` : ''}`),
+
+  /**
+   * Fetch server info from a llama.cpp server
+   * GET /api/llm-backends/llamacpp/server-info?endpoint=http://127.0.0.1:8080
+   */
+  listLlamaCppServerInfo: (endpoint?: string, apiKey?: string) => {
+    const params = new URLSearchParams()
+    if (endpoint) params.set('endpoint', endpoint)
+    if (apiKey) params.set('api_key', apiKey)
+    const qs = params.toString()
+    return fetchAPI<{
+      status: string
+      health: { status: string; latency_ms: number }
+      server: {
+        model_name?: string
+        n_ctx?: number
+        total_slots?: number
+        version?: string
+      }
+      capabilities: {
+        supports_streaming: boolean
+        supports_multimodal: boolean
+        supports_thinking: boolean
+        supports_tools: boolean
+        max_context: number
+      }
+    }>(`/llm-backends/llamacpp/server-info${qs ? `?${qs}` : ''}`)
+  },
+
+  /**
+   * Set or clear the user override on a backend's multimodal/vision capability.
+   * PATCH /api/llm-backends/:id/capabilities
+   *
+   * - `multimodal: true/false` pins the value, auto-detection is skipped.
+   * - `multimodal: null` clears the override, backend re-runs layered detection.
+   */
+  updateLlmBackendCapabilitiesOverride: (id: string, body: { multimodal: boolean | null }) =>
+    fetchAPI<{
+      id: string
+      supports_multimodal: boolean
+      multimodal_user_override: boolean | null
+      multimodal_source: string | null
+      message: string
+    }>(`/llm-backends/${id}/capabilities`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+      // Caller handles error toast via useErrorHandler — skip fetchAPI's
+      // automatic notifyFromError to avoid double-toasting on PATCH failure.
+      skipErrorToast: true,
+    }),
+
+  // ========== Builtin LLM API (bundled LFM2.5-2.6B) ==========
+  /**
+   * Status of the built-in bundled model + server.
+   * GET /api/builtin-llm/status
+   */
+  getBuiltinLlmStatus: () =>
+    fetchAPI<BuiltinLlmStatus>('/builtin-llm/status'),
+  /** POST /api/builtin-llm/download/cancel — stop the in-flight model
+   * download (partial file is kept; re-download resumes; another model can
+   * be downloaded right after). */
+  cancelModelDownload: () =>
+    fetchAPI<{ cancelled: boolean; active?: boolean }>('/builtin-llm/download/cancel', {
+      method: 'POST',
+    }),
+
+  /**
+   * Start / resume the model download (single-flight on the server).
+   * POST /api/builtin-llm/download
+   */
+  /** POST /api/builtin-llm/restart?model=<id> — multi-model coexistence:
+   *  switch the builtin server to a DOWNLOADED model in seconds (pointer +
+   *  respawn), never a re-download. */
+  switchBuiltinModel: (modelId: string) =>
+    fetchAPI<{ restarted: boolean; already_running: boolean; endpoint: string }>(`/builtin-llm/restart?model=${encodeURIComponent(modelId)}`, {
+      method: 'POST',
+    }),
+
+  downloadBuiltinLlm: (modelId?: string) =>
+    fetchAPI<{ started: boolean; already_running: boolean; already_installed?: boolean; switched?: boolean }>('/builtin-llm/download', {
+      method: 'POST',
+      body: modelId ? JSON.stringify({ model_id: modelId }) : undefined,
+    }),
+  /**
+   * List installable builtin models with per-entry install state.
+   * GET /api/builtin-llm/models
+   */
+  getBuiltinModels: () =>
+    fetchAPI<{ models: BuiltinModelDef[]; default_model_id: string; catalog_fallback?: boolean }>('/builtin-llm/models'),
+
+  /**
+   * Delete the downloaded model files (stops the server first).
+   * DELETE /api/builtin-llm/model — `modelId` targets a specific model
+   * (vision companions); omitted = the active main model (legacy contract).
+   */
+  deleteBuiltinLlmModel: (modelId?: string) =>
+    fetchAPI<{ deleted: boolean; model_id?: string; companion?: boolean }>(
+      modelId ? `/builtin-llm/model?model=${encodeURIComponent(modelId)}` : '/builtin-llm/model',
+      {
+        method: 'DELETE',
+      },
+    ),
+  /**
+   * Ensure the bundled llama-server is running (starts it if stopped).
+   * POST /api/builtin-llm/restart
+   */
+  restartBuiltinLlm: (
+    opts?:
+      | number
+      | {
+          ctx?: number
+          parallel?: number | 'auto'
+          kv?: 'q8_0' | 'f16'
+          /** GPU layer pin for the main engine; 'auto' = VRAM auto-sizing. */
+          ngl?: number | 'auto'
+          vlm_ctx?: number
+          vlm_kv?: 'q8_0' | 'f16'
+          vlm_ngl?: number | 'auto'
+        },
+  ) => {
+    const o = typeof opts === 'number' ? { ctx: opts } : (opts ?? {})
+    const qs = new URLSearchParams()
+    if (o.ctx) qs.set('ctx', String(o.ctx))
+    if (o.vlm_ctx) qs.set('vlm_ctx', String(o.vlm_ctx))
+    if (o.vlm_kv) qs.set('vlm_kv', o.vlm_kv)
+    // 'auto' = omit the flag; upstream picks (4 slots on current builds).
+    if (o.parallel !== undefined) qs.set('parallel', o.parallel === 'auto' ? '0' : String(o.parallel))
+    if (o.kv) qs.set('kv', o.kv)
+    // GPU layers: 'auto' hands sizing back to the spawn path's VRAM planner.
+    if (o.ngl !== undefined) qs.set('ngl', o.ngl === 'auto' ? 'auto' : String(o.ngl))
+    if (o.vlm_ngl !== undefined) qs.set('vlm_ngl', o.vlm_ngl === 'auto' ? 'auto' : String(o.vlm_ngl))
+    const suffix = qs.toString() ? `?${qs.toString()}` : ''
+    return fetchAPI<{ restarted: boolean; already_running: boolean; endpoint?: string }>(
+      `/builtin-llm/restart${suffix}`,
+      { method: 'POST' }
+    )
+  },
+  /**
+   * Deliberately stop the builtin engine (main + companion llama-server).
+   * No files are deleted; the persisted flag suppresses bootstrap/watchdog
+   * respawn. The next `restart` (any params) clears it and starts again.
+   * POST /api/builtin-llm/stop
+   */
+  stopBuiltinLlm: () =>
+    fetchAPI<{ stopped: boolean }>('/builtin-llm/stop', {
+      method: 'POST',
+    }),
+  /**
+   * Activate the built-in backend as the active LLM backend.
+   * POST /api/builtin-llm/activate
+   */
+  activateBuiltinLlm: () =>
+    fetchAPI<{ id: string; message: string }>('/builtin-llm/activate', {
+      method: 'POST',
+    }),
+
+  // ========== Builtin LLM runtime (standalone llama.cpp upgrades) ==========
+  /** GET /api/builtin-llm/runtime — resolved/installed runtimes + channel. */
+  getBuiltinRuntime: () =>
+    fetchAPI<BuiltinRuntimeInfo>('/builtin-llm/runtime'),
+
+  /** POST /api/builtin-llm/runtime/check — force a channel refresh (admin). */
+  checkBuiltinRuntimeUpdate: () =>
+    fetchAPI<BuiltinRuntimeInfo>('/builtin-llm/runtime/check', { method: 'POST' }),
+
+  /** POST /api/builtin-llm/runtime/upgrade — install the recommended runtime
+   *  (admin). Progress arrives via RuntimeUpgradeProgress events + polling. */
+  upgradeBuiltinRuntime: () =>
+    fetchAPI<{ started: boolean; already_running: boolean }>('/builtin-llm/runtime/upgrade', {
+      method: 'POST',
+    }),
+
+  /** POST /api/builtin-llm/runtime/revert — drop the newest cached runtime,
+   *  falling back to the previous cache / the bundled binary (admin). */
+  revertBuiltinRuntime: () =>
+    fetchAPI<{ reverted: boolean; removed_tag: string }>('/builtin-llm/runtime/revert', {
+      method: 'POST',
+    }),
+
+  /** POST /api/builtin-llm/runtime/variant — persist ('cpu'|'cuda'|'vulkan'|
+   *  'jetson') or clear ('auto'/'') the variant override (admin). */
+  setBuiltinRuntimeVariant: (variant: string) =>
+    fetchAPI<{ saved: string }>('/builtin-llm/runtime/variant', {
+      method: 'POST',
+      body: JSON.stringify({ variant }),
+    }),
+
+  // ========== Builtin LLM download sources (mirror config, admin) ==========
+  /** GET /api/settings/llm-sources — effective HF/catalog/channel URLs. */
+  getLlmSources: () =>
+    fetchAPI<{
+      hf_base_url: string; hf_custom: boolean; hf_default_url: string
+      catalog_url: string; catalog_custom: boolean; catalog_default_url: string
+      runtime_channel_url: string; runtime_channel_custom: boolean; runtime_channel_default_url: string
+      last_download_error?: string | null
+    }>('/settings/llm-sources'),
+
+  /** PUT /api/settings/llm-sources — set (or reset, empty url) one source. */
+  putLlmSource: (kind: 'hf_base_url' | 'catalog_url' | 'runtime_channel_url', url: string) =>
+    fetchAPI<{ kind: string; url: string }>('/settings/llm-sources', {
+      method: 'PUT',
+      body: JSON.stringify({ kind, url }),
+    }),
+
+  /** POST /api/builtin-llm/import-local — import a GGUF already on the
+   *  server's filesystem (offline path; validated, rolled back on spawn
+   *  failure). */
+  importBuiltinModelLocal: (path: string) =>
+    fetchAPI<{ success: boolean; model_id: string; name: string }>('/builtin-llm/import-local', {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    }),
+
+  /** POST /api/builtin-llm/upload-model — multipart GGUF upload (offline
+   *  path; streamed server-side, 12 GiB cap). */
+  uploadBuiltinModel: (file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return fetchAPI<{ success: boolean; model_id: string; name: string }>(
+      '/builtin-llm/upload-model',
+      { method: 'POST', body: form },
+    )
+  },
+
+}

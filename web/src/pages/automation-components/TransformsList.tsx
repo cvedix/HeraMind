@@ -6,14 +6,11 @@ import { useState } from "react"
 import { Switch } from "@/components/ui/switch"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
-import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu"
-import { IconButton } from "@/components/ui/button"
 import { ResponsiveTable, EmptyState } from "@/components/shared"
-import { Edit, Trash2, Code, Globe, Cpu, HardDrive, Download, MoreVertical } from "lucide-react"
+import { Edit, Trash2, Code, Globe, Cpu, HardDrive, Download } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import { cn } from "@/lib/utils"
 import { formatTimestamp } from "@/lib/utils/format"
-import { textMini } from "@/design-system/tokens/typography"
 import type { TransformAutomation } from "@/types"
 import { useIsMobile } from "@/hooks/useMobile"
 
@@ -30,16 +27,22 @@ interface TransformsListProps {
 }
 
 // Scope configuration
-const SCOPE_CONFIG: Record<string, { label: string; icon: typeof Globe; color: string }> = {
-  global: { label: 'automation:transformBuilder.scopes.global', icon: Globe, color: 'text-accent-purple bg-accent-purple-light border-accent-purple-light' },
-  device_type: { label: 'automation:transformBuilder.scopes.deviceType', icon: Cpu, color: 'text-info bg-info-light border-info' },
-  device: { label: 'automation:transformBuilder.scopes.device', icon: HardDrive, color: 'text-success bg-success-light border-success-light dark:text-success dark:bg-success-light dark:border-success-light' },
+const SCOPE_CONFIG: Record<string, { label: string; icon: typeof Globe }> = {
+  global: { label: 'automation:transformBuilder.scopes.global', icon: Globe },
+  device_type: { label: 'automation:transformBuilder.scopes.deviceType', icon: Cpu },
+  device: { label: 'automation:transformBuilder.scopes.device', icon: HardDrive },
+}
+
+function listSubtitle(value?: string | null): string | null {
+  const text = value?.trim()
+  if (!text || text === '-') return null
+  return text
 }
 
 export const ITEMS_PER_PAGE = 10
 
 // Get code summary for display
-function getCodeSummary(jsCode: string): string {
+function _getCodeSummary(jsCode: string): string {
   if (!jsCode) return '-'
 
   const TRUNCATE_LEN = 45
@@ -119,14 +122,20 @@ export function TransformsList({
 
   // Use props if provided, otherwise use internal state (backward compatibility)
   const page = propsPage ?? internalPage
-  const setPage = onPageChange ?? setInternalPage
+  const _setPage = onPageChange ?? setInternalPage
 
-  const totalPages = Math.ceil(transforms.length / ITEMS_PER_PAGE) || 1
+  const _totalPages = Math.ceil(transforms.length / ITEMS_PER_PAGE) || 1
   const startIndex = (page - 1) * ITEMS_PER_PAGE
   const endIndex = startIndex + ITEMS_PER_PAGE
-  const paginatedTransforms = propsPaginatedTransforms ?? transforms.slice(startIndex, endIndex)
+  // Mobile infinite-scroll parents pass a cumulative window; if props are
+  // omitted, mirror that here so footer load-more cannot replace-slice.
+  const paginatedTransforms = propsPaginatedTransforms ?? (
+    isMobile
+      ? transforms.slice(0, page * ITEMS_PER_PAGE)
+      : transforms.slice(startIndex, endIndex)
+  )
 
-  function getScopeInfo(scope: any): { label: string; icon: typeof Globe; color: string } {
+  function getScopeInfo(scope: any): { label: string; icon: typeof Globe } {
     if (!scope || scope === 'global' || (typeof scope === 'string' && scope === 'global')) {
       return SCOPE_CONFIG.global
     }
@@ -155,86 +164,43 @@ export function TransformsList({
   return (
     isMobile ? (
       <div className="space-y-2">
+        {/* Mobile has no ResponsiveTable — carry its own loading skeleton. */}
+        {loading && paginatedTransforms.length === 0 && (
+          [0, 1, 2].map((i) => (
+            <Card key={i} className="overflow-hidden rounded-2xl border-border bg-card shadow-none">
+              <div className="px-3 py-2.5 animate-pulse space-y-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-muted" />
+                  <div className="h-4 w-36 rounded bg-muted" />
+                </div>
+                <div className="ml-[42px] h-3 w-48 rounded bg-muted" />
+              </div>
+            </Card>
+          ))
+        )}
         {paginatedTransforms.map((transform) => {
-          const scopeInfo = getScopeInfo(transform.scope)
-          const ScopeIcon = scopeInfo.icon
-
           return (
             <Card
               key={transform.id}
               className={cn(
-                "overflow-hidden border-border shadow-sm cursor-pointer active:scale-[0.99] transition-all",
+                "cursor-pointer overflow-hidden rounded-2xl border border-border bg-card shadow-none transition-colors active:bg-muted",
                 !transform.enabled && "opacity-50"
               )}
               onClick={() => onEdit(transform)}
             >
-              <div className="px-3 py-2.5">
-                {/* Row 1: icon + name + switch + actions */}
-                <div className="flex items-center gap-2.5">
-                  <div className={cn(
-                    "w-8 h-8 rounded-lg flex items-center justify-center shrink-0",
-                    transform.enabled ? "bg-accent-cyan-light text-accent-cyan" : "bg-muted text-muted-foreground"
-                  )}>
-                    <Code className="h-4 w-4" />
-                  </div>
+              <div className="px-4 py-3.5">
+                <div className="flex items-center gap-2">
                   <div className="flex-1 min-w-0">
-                    <div className="font-medium text-sm truncate">{transform.name}</div>
+                    <div className="truncate text-heading font-medium">{transform.name}</div>
+                    <p className="mt-1 truncate text-xs text-muted-foreground">
+                      {getScopeLabel(transform.scope)}
+                    </p>
                   </div>
                   <Switch
                     checked={transform.enabled}
                     onCheckedChange={() => onToggleStatus(transform)}
-                    className="scale-75"
                     onClick={(e) => e.stopPropagation()}
                   />
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
-                      <IconButton>
-                        <MoreVertical className="h-4 w-4" />
-                      </IconButton>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onEdit(transform) }}>
-                        <Edit className="h-4 w-4 mr-2" />
-                        {t('common:edit')}
-                      </DropdownMenuItem>
-                      {onExport && (
-                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onExport(transform) }}>
-                          <Download className="h-4 w-4 mr-2" />
-                          {t('common:export')}
-                        </DropdownMenuItem>
-                      )}
-                      <DropdownMenuItem
-                        className="text-error"
-                        onClick={(e) => { e.stopPropagation(); onDelete(transform) }}
-                      >
-                        <Trash2 className="h-4 w-4 mr-2" />
-                        {t('common:delete')}
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-                {/* Row 2: scope badge + last executed */}
-                <div className="flex items-center gap-1.5 mt-1.5 ml-[42px]">
-                  <Badge variant="outline" className={cn(textMini, "h-5 px-1.5 gap-0.5", scopeInfo.color)}>
-                    <ScopeIcon className="h-3 w-3" />
-                    {getScopeLabel(transform.scope)}
-                  </Badge>
-                  {(() => {
-                    const hasExecuted = transform.last_executed && transform.last_executed !== 0
-                    const execCount = transform.execution_count || 0
-                    return (
-                      <span className={cn(textMini, "text-muted-foreground ml-auto flex items-center gap-1")}>
-                        {hasExecuted ? (
-                          <>
-                            {formatTimestamp(transform.last_executed ?? undefined)}
-                            {execCount > 1 && <span>{execCount}x</span>}
-                          </>
-                        ) : (
-                          t('automation:never', 'Never')
-                        )}
-                      </span>
-                    )
-                  })()}
                 </div>
               </div>
             </Card>
@@ -247,22 +213,22 @@ export function TransformsList({
         {
           key: 'name',
           label: t('automation:name'),
-          width: '28%',
+          width: '20%',
         },
         {
           key: 'scope',
           label: t('automation:scope'),
-          width: '18%',
+          width: '30%',
         },
         {
           key: 'createdAt',
           label: t('common:createdAt', 'Created'),
-          width: '18%',
+          width: '16%',
         },
         {
           key: 'lastExecuted',
           label: t('automation:lastExecuted', 'Last Executed'),
-          width: '18%',
+          width: '16%',
         },
         {
           key: 'status',
@@ -284,29 +250,28 @@ export function TransformsList({
         const ScopeIcon = scopeInfo.icon
 
         switch (columnKey) {
-          case 'name':
+          case 'name': {
+            const subtitle = listSubtitle(transform.description)
             return (
               <div className="flex items-center gap-3">
-                <div className={cn(
-                  "w-9 h-9 rounded-lg flex items-center justify-center transition-colors shrink-0",
-                  transform.enabled ? "bg-accent-cyan-light text-accent-cyan" : "bg-muted text-muted-foreground"
-                )}>
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
                   <Code className="h-4 w-4" />
                 </div>
                 <div className="min-w-0">
-                  <div className="font-medium text-sm truncate">{transform.name}</div>
-                  <div className="text-xs text-muted-foreground line-clamp-1">
-                    {transform.description || <code>{(transform.output_prefix || 'transform')}.</code>}
-                  </div>
+                  <div className="truncate text-sm font-medium">{transform.name}</div>
+                  {subtitle && (
+                    <div className="line-clamp-1 text-xs text-muted-foreground">{subtitle}</div>
+                  )}
                 </div>
               </div>
             )
+          }
 
           case 'scope':
             return (
-              <Badge variant="outline" className={cn("text-xs gap-1", scopeInfo.color)}>
-                <ScopeIcon className="h-3 w-3" />
-                {getScopeLabel(transform.scope)}
+              <Badge variant="outline" className="max-w-full gap-1 text-xs text-muted-foreground">
+                <ScopeIcon className="h-3 w-3 shrink-0" />
+                <span className="truncate">{getScopeLabel(transform.scope)}</span>
               </Badge>
             )
 
@@ -371,7 +336,6 @@ export function TransformsList({
       ]}
       emptyState={
         <EmptyState
-          icon={<Code className="h-12 w-12" />}
           title={t('automation:emptyTransforms.title', 'No transforms')}
           description={t('automation:emptyTransforms.description', 'Create your first transform to process device data')}
         />

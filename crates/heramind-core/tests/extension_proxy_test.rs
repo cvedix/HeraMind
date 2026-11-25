@@ -81,6 +81,10 @@ fn test_extension_descriptor_with_capabilities() {
         fixed_values: Default::default(),
         samples: vec![],
         parameter_groups: vec![],
+        ai_exposed: true,
+        effect: Default::default(),
+        replay_safety: Default::default(),
+        execution: Default::default(),
     }];
 
     let metrics = vec![MetricDescriptor {
@@ -436,6 +440,7 @@ impl Extension for MockProxyExtension {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_mock_extension_via_trait() {
     let ext = MockProxyExtension::new();
 
@@ -454,6 +459,7 @@ async fn test_mock_extension_via_trait() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_mock_extension_command_not_found() {
     let ext = MockProxyExtension::new();
 

@@ -18,7 +18,7 @@ use std::time::Duration;
 pub const FAST: Duration = Duration::from_secs(10);
 
 /// Default tier — interactive tools that the agent waits on
-/// turn-by-turn. Used for the shell tool's default per-invocation cap.
+/// turn-by-turn unless the tool declares a longer execution budget.
 pub const DEFAULT: Duration = Duration::from_secs(30);
 
 /// Network tier — single-resource HTTP fetches where 10s is too tight
@@ -36,7 +36,8 @@ pub const HARD_MAX: Duration = Duration::from_secs(600);
 
 #[inline]
 pub fn shell_default() -> Duration {
-    DEFAULT
+    // CLI HTTP waits can last 70s (server async-operation patience: 60s).
+    Duration::from_secs(90)
 }
 
 #[inline]
@@ -51,6 +52,13 @@ pub fn vision_capture() -> Duration {
 
 #[inline]
 pub fn web_fetch() -> Duration {
+    NETWORK
+}
+
+/// Web search shares the network tier: one engine round-trip the agent
+/// waits on. The tool throttles itself to 1 request/second on top.
+#[inline]
+pub fn web_search() -> Duration {
     NETWORK
 }
 
@@ -83,6 +91,7 @@ mod tests {
             shell_max(),
             vision_capture(),
             web_fetch(),
+            web_search(),
             extension_invoke(),
         ] {
             assert!(v >= lo && v <= hi, "timeout {v:?} outside [{lo:?}, {hi:?}]");

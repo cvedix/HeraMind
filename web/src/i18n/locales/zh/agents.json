@@ -1,7 +1,6 @@
 {
   "title": "AI 智能体",
   "description": "创建与管理 AI 智能体，配置记忆、技能与工具",
-  "createButton": "创建",
   "detailTitle": "智能体详情",
   "preview": {
     "title": "逻辑预览",
@@ -30,18 +29,13 @@
     },
     "actions": {
       "title": "可用操作",
-      "noCommands": "未选择指令",
-      "canAlert": "可发送告警/通知"
+      "noCommands": "未选择指令"
     },
     "issues": {
       "title": "配置检查",
       "none": "配置完整",
-      "noName": "请输入智能体名称",
-      "noPrompt": "请描述智能体应该做什么",
       "noResources": "未选择资源 - 请添加设备或扩展",
-      "noMetrics": "未选择指标 - 智能体将没有数据可分析",
-      "unclearIntent": "意图不明确 - 建议更具体地描述",
-      "controlNoCommands": "检测到控制意图但未选择指令"
+      "noMetrics": "未选择指标 - 智能体将没有数据可分析"
     },
     "confidence": "置信度",
     "intent": {
@@ -50,7 +44,6 @@
       "analysis": "分析",
       "unknown": "通用"
     },
-    "moreCommands": "更多指令",
     "noResources": "暂无资源 - 点击\"添加资源\"开始配置"
   },
   "card": {
@@ -61,7 +54,18 @@
     "avgDuration": "平均耗时",
     "neverExecuted": "从未执行",
     "toggleStatus": "切换 {{name}} 状态",
-    "moreOptions": "更多选项"
+    "moreOptions": "更多选项",
+    "role": {
+      "recordData": "记成数据",
+      "actOrInvestigate": "自主行动/排查",
+      "answer": "给出结论"
+    },
+    "memory": {
+      "tool": "一次性工具",
+      "assistant": "有记性"
+    },
+    "errorUnknown": "执行失败——打开详情查看记录",
+    "runsSuffix": "次"
   },
   "confirm": {
     "pauseTitle": "确认暂停智能体？",
@@ -91,11 +95,8 @@
     "moreResources": "还有 {{count}} 个资源...",
     "noMemory": "暂无记忆数据",
     "messages": "消息",
-    "noDataAvailable": "无数据",
     "tools": "工具",
-    "toolsCount": "可用工具 {{count}} 个",
     "toolsEmpty": "暂无已注册工具",
-    "toolsLoadError": "加载工具失败",
     "toolsSourceBuiltIn": "内置",
     "toolsSourceExtension": "扩展",
     "toolsParameters": "参数",
@@ -117,7 +118,27 @@
     "toolsColumnVersion": "版本",
     "toolsColumnNamespace": "命名空间",
     "toolsParamRequired": "必填",
-    "toolsFilterAllSources": "全部来源"
+    "toolsFilterAllSources": "全部来源",
+    "outputFields": "输出字段",
+    "viewEvidence": "查看依据",
+    "outputFieldsHint": "每个字段都是平台数据源（ai:{agent}:{field}）——可在仪表盘、规则、数据推送中绑定使用。",
+    "fieldType": {
+      "number": "数值",
+      "text": "文本",
+      "boolean": "布尔"
+    },
+    "memoryModeNote": {
+      "tool": "一次性工具——每次运行只看当前输入（你纠正过的标准仍会生效）。",
+      "assistant": "有记性——每次运行携带最近执行的叙事，能做“比上次更差”这类判断。"
+    },
+    "sections": "内容分区",
+    "sectionsDesc": {
+      "overview": "状态、输出字段与配置",
+      "history": "每一次执行的完整记录",
+      "memory": "执行日志与知识文件",
+      "messages": "留给下次执行的备注"
+    },
+    "model": "模型"
   },
   "tabs": {
     "agents": "智能体",
@@ -128,7 +149,6 @@
   },
   "agentName": "智能体名称",
   "userPrompt": "用户指令",
-  "statusColumn": "状态",
   "executions": "执行次数",
   "lastExecution": "最后执行",
   "timestamp": "时间戳",
@@ -138,23 +158,15 @@
   "noAgents": "暂无 AI 智能体",
   "noAgentsDesc": "创建您的第一个 AI 智能体来自动化物联网任务",
   "noExecutions": "暂无执行记录",
-  "noExecutionsDesc": "智能体运行后，执行记录将显示在这里",
   "createAgent": "创建 AI 智能体",
-  "createAgentDesc": "使用自然语言定义新的 AI 智能体",
   "editAgent": "编辑 AI 智能体",
-  "editAgentDesc": "修改智能体配置",
   "deleteConfirm": "确定要删除此智能体吗？",
   "execute": "立即执行",
-  "viewMemory": "查看记忆",
   "viewDetails": "查看详情",
-  "viewExecutions": "执行记录",
   "agentDeleted": "智能体已删除",
   "agentCreated": "智能体已创建",
   "agentUpdated": "智能体已更新",
   "executionStarted": "执行已启动：{{id}}",
-  "agentNamePlaceholder": "例如：温度监控器",
-  "userPromptPlaceholder": "描述此智能体应该做什么...",
-  "userPromptHint": "使用自然语言描述自动化任务。例如：每 5 分钟监控一次温度传感器，如果连续 3 次读数超过 30°C 则发送警报。",
   "schedule": "调度设置",
   "scheduleTypes": {
     "interval": "定时间隔",
@@ -163,9 +175,7 @@
     "once": "单次执行"
   },
   "intervalSeconds": "间隔（秒）",
-  "intervalHint": "智能体将每 {{seconds}} 秒运行一次",
   "cronExpression": "Cron 表达式",
-  "cronHint": "格式：分钟 小时 日 月 星期。例如：0 * * * * 表示每小时执行",
   "timezone": "时区",
   "resources": "资源选择",
   "noDevices": "暂无可用设备，请先添加设备",
@@ -182,8 +192,7 @@
     "active": "运行中",
     "paused": "已暂停",
     "error": "错误",
-    "executing": "执行中"
- ,
+    "executing": "执行中",
     "completed": "已完成"
   },
   "executionStatus": {
@@ -198,12 +207,40 @@
     "analysis": "分析",
     "inputData": "输入数据",
     "inputImage": "输入图像",
-    "dataFieldsCount": "{{count}} 个数据字段",
     "reasoningSteps": "推理步骤",
     "decisions": "决策",
     "conclusionLabel": "结论:",
     "actionsExecuted": "执行动作",
     "moreFields": "还有 {{count}} 个字段"
+  },
+  "evidence": {
+    "title": "执行证据",
+    "tokens": "{{count}} tokens",
+    "inputs": "输入",
+    "inputsUnknown": "输入证据未知",
+    "inputsEmpty": "未记录输入",
+    "output": "输出",
+    "outputUnknown": "输出证据未知",
+    "outputEmpty": "未记录输出",
+    "actions": "动作结果",
+    "actionsUnknown": "动作证据未知",
+    "actionsEmpty": "未记录动作",
+    "resultUnknown": "结果未知",
+    "timeUnknown": "时间未知",
+    "unknownDetail": "失败细节未知",
+    "stopReason": "停止原因",
+    "presence": {
+      "known": "已知",
+      "empty": "空",
+      "unknown": "未知"
+    },
+    "failure": {
+      "none": "无失败节点",
+      "error": "失败 — 执行错误",
+      "failed_action": "失败 — 动作错误",
+      "stop_reason": "失败 — 停止原因",
+      "unknown": "失败节点未知"
+    }
   },
   "thinking": {
     "executing": "执行中...",
@@ -217,15 +254,10 @@
   "memory": {
     "title": "智能体记忆",
     "description": "智能体的持久化记忆和学习状态",
-    "stateVariables": "状态变量",
     "baselines": "历史基线",
-    "learnedPatterns": "学习到的模式",
-    "trendData": "趋势数据",
-    "trendDataHint": "从设备指标收集的 {{count}} 个数据点",
     "updatedAt": "更新时间",
     "noMemory": "暂无记忆数据",
     "clear": "清除记忆",
-    "clearMemoryConfirm": "确定要清除此智能体的记忆吗？此操作无法撤销。",
     "executions": "执行次数",
     "knowledgeFiles": "知识文件",
     "journal": "执行日志",
@@ -260,7 +292,6 @@
     "target": "目标",
     "channel": "渠道",
     "recipient": "接收者",
-    "lastArchived": "上次归档",
     "inputData": "输入数据",
     "llmResponse": "LLM 响应",
     "showLess": "收起",
@@ -284,71 +315,26 @@
     "basicInfo": {
       "name": "名称",
       "namePlaceholder": "例如：仓库温度监控、设备异常分析",
-      "description": "描述",
-      "descriptionHint": "简短描述此智能体的用途（可选）",
-      "descriptionPlaceholder": "例如：监控仓库环境、分析设备能耗趋势",
       "requirement": "需求描述",
-      "requirementHint": "用自然语言描述你希望智能体完成的目标",
-      "requirementPlaceholder": "例如：\n• 当温度超过30度时发送告警\n• 每天早上9点生成设备状态报告\n• 检测异常能耗并分析原因",
-      "autoParseHint": "系统会自动解析你的描述并配置相应的执行逻辑",
       "llmBackend": "LLM 模型（可选）",
-      "llmBackendHint": "选择此智能体使用的 LLM 模型。如未指定则使用默认模型。",
       "selectLlmBackend": "选择 LLM 模型",
-      "defaultBackend": "默认模型",
       "useActiveBackend": "使用全局默认",
       "active": "已激活",
       "supportsVision": "支持视觉/图片输入",
       "supportsTools": "支持函数调用",
       "supportsThinking": "支持思考/推理",
-      "scheduleLabel": "执行计划",
       "promptPlaceholder": "用自然语言描述这个智能体应该做什么。例如：\n\n• 监控仓库温度传感器\n• 当温度连续3次超过30°C时发送告警\n• 通知所有告警渠道：邮件、短信和推送通知",
       "promptTip": "具体说明设备、条件和操作。您提供的细节越多，智能体就能更好地帮助您。",
       "runOn": "执行于",
-      "triggerWhen": "触发条件",
-      "metricUpdates": "指标更新",
-      "extensionOutput": "扩展输出",
-      "manualTrigger": "手动触发",
-      "fromDevice": "来自设备",
-      "fromExtension": "来自扩展",
-      "fromAiGroup": "AI 分组名称",
-      "manualHint": "智能体仅在通过 API 或 UI 手动触发时运行"
-    },
-    "promptTemplates": {
-      "label": "模板",
-      "empty": {
-        "label": "自定义",
-        "description": "空白，自行编写提示词"
-      },
-      "monitor": {
-        "label": "监控告警",
-        "description": "持续监控数据变化，检测异常并发送告警",
-        "template": "请监控以下数据指标，当出现异常时及时告警：\n\n监控目标：\n- 数据范围：检查数值是否超出阈值（如温度 > 30°C）\n- 异常检测：查找突变或异常模式\n- 告警方式：满足条件时发送通知\n\n请分析当前数据并与历史基线对比，识别：\n1. 超出正常范围的数值\n2. 突然上升或下降\n3. 数据缺失或空白\n\n检测到异常时，发送包含以下内容的告警：\n- 受影响的指标\n- 当前值与预期范围的对比\n- 严重级别（信息/警告/严重）"
-      },
-      "control": {
-        "label": "自动控制",
-        "description": "根据条件自动执行设备控制操作",
-        "template": "请根据以下条件自动控制设备：\n\n触发条件：\n- 检查当前传感器读数\n- 与阈值进行对比\n- 验证设备状态后再执行\n\n控制动作：\n- 设备ID：[目标设备]\n- 指令：[turn_on / turn_off / adjust]\n- 参数：[任何必需的设置]\n\n请按以下步骤执行：\n1. 首先通过检查传感器数据验证当前条件\n2. 仅在条件明确满足时执行指令\n3. 确认操作已成功执行\n4. 避免频繁重复切换（相同操作间添加冷却时间）"
-      },
-      "analysis": {
-        "label": "数据分析",
-        "description": "定期分析数据趋势并生成报告",
-        "template": "请分析以下数据并生成综合报告：\n\n分析范围：\n- 时间范围：使用可用的历史数据\n- 指标：所有选定的指标\n- 对比：如有可能与之前的数据进行对比\n\n报告内容：\n1. **数据概览**：当前值和状态摘要\n2. **趋势分析**：上升、下降或稳定模式\n3. **异常**：任何异常读数或偏差\n4. **关联性**：不同指标之间的关系\n5. **建议**：基于数据的可操作洞察\n\n请在描述趋势和变化时提供具体数字和百分比。"
-      },
-      "alert": {
-        "label": "告警通知",
-        "description": "基于条件发送通知",
-        "template": "请监控选定的指标，在特定条件发生时发送告警：\n\n告警条件：\n- 阈值超出：当指标高于/低于某个值\n- 变化速率：当数值变化过快\n- 状态变化：当设备状态改变\n\n告警内容：\n- 哪个指标/设备触发了告警\n- 当前值和阈值\n- 发生时间\n- 适用时的建议操作\n\n请避免重复告警 - 仅在以下情况告警：\n1. 这是一个新事件（之前未报告过）\n2. 情况明显恶化\n3. 距上次告警已过足够长的冷却时间"
-      }
+      "manualTrigger": "手动触发"
     },
     "schedule": {
-      "selectStrategy": "选择执行策略",
       "strategies": {
         "timer": "定时执行",
         "reactive": "数据驱动",
         "onDemand": "按需调用"
       },
       "config": "执行配置",
-      "onceDescription": "智能体将在保存后立即执行一次，执行后不会自动再次触发。",
       "timer": {
         "description": "定时自动执行",
         "subTypes": {
@@ -362,11 +348,28 @@
         "preview": "触发源: {{names}}",
         "hint": "选择要监控的数据源，当任意选定源收到新数据时，Agent 将自动执行。",
         "deviceTrigger": "设备触发源",
-        "extensionTrigger": "扩展触发源",
         "noDevices": "暂无可用数据源",
         "noExtensions": "暂无可用扩展",
         "emptyWarning": "未选择触发源。Agent 将不会自动执行。",
         "fallbackToResources": "未配置显式触发源。将根据已绑定的 Resources 触发（兼容模式）。",
+        "mode": {
+          "any": "任一命中",
+          "all": "全部命中"
+        },
+        "modeHint": {
+          "any": "任意一个源有新数据就触发",
+          "all": "所有源都在时间窗内出现才触发"
+        },
+        "selectedSources": "已选触发源",
+        "removeAllMetrics": "不再由 {{name}} 的任意指标触发",
+        "removeField": "不再由 {{name}} 的 {{field}} 触发",
+        "windowBefore": "全部命中需发生在",
+        "windowAfter": "分钟内",
+        "windowLabel": "时间窗（分钟）",
+        "issue": {
+          "window_required": "请设置时间窗。不设时间窗意味着所有来源必须在同一个事件里凑齐，Agent 实际上永远不会执行。",
+          "sources_required": "请至少选择一个触发源，或绑定一个资源供 Agent 监控。"
+        },
         "allMetrics": "全部",
         "selectSource": "选择一个源进行配置",
         "noMetrics": "暂无可用指标",
@@ -382,7 +385,6 @@
         "every": "每",
         "minutes": "分钟",
         "hours": "小时",
-        "executeOnce": "执行一次",
         "preview": "每 {{value}} {{unit}}执行一次"
       },
       "daily": {
@@ -399,7 +401,6 @@
         "preview": "每{{day}} {{hour}}:{{minute}} 执行"
       },
       "monthly": {
-        "everyMonth": "每月",
         "day": "日",
         "at": "点",
         "execute": "执行",
@@ -407,8 +408,6 @@
       },
       "event": {
         "triggerEvent": "触发事件",
-        "relatedDevice": "关联设备",
-        "manualHint": "当选择的设备指标更新时触发。后端根据配置的资源进行过滤。",
         "events": {
           "device.metric": "指标更新",
           "extension.output": "扩展输出",
@@ -420,10 +419,7 @@
           "extension.output": "当扩展发布输出数据时触发。",
           "ai.metric": "当 AI 指标被写入时触发。",
           "manual": "仅通过API或UI手动触发"
-        },
-        "allDevices": "全部设备",
-        "allExtensions": "全部扩展",
-        "extensionHint": "当此扩展发布输出数据时触发智能体。"
+        }
       },
       "once": {
         "preview": "立即执行一次"
@@ -444,10 +440,7 @@
     },
     "metricConfig": {
       "timeRange": "数据时间范围",
-      "configureHint": "选中后可在主界面配置数据策略",
       "descriptions": {
-        "fullWeek": "完整周报数据",
-        "fullDay": "全天数据+趋势+基线",
         "trend": "历史数据+趋势",
         "history": "历史数据",
         "baseline": "当前值+基线对比"
@@ -458,44 +451,33 @@
         "180": "3小时",
         "360": "6小时",
         "720": "12小时",
-        "1440": "24小时",
-        "10080": "7天"
+        "1440": "24小时"
       }
     },
     "resources": {
-      "title": "资源",
+      "title": "数据与指令",
       "optional": "可选",
-      "hintFocused": "配置 Agent 关注的数据源，执行时将自动收集这些数据用于分析。",
-      "hintFree": "配置预加载数据源。不配置时 Agent 将通过工具自行查询所需数据。",
-      "preloadTitle": "预加载数据源",
-      "supplementalTitle": "补充数据源",
-      "hintReactive": "触发源数据将自动收集。如需关联分析其他设备或指标，可在此补充。",
+      "hintFocused": "数据是 AI 的全部输入，执行时自动收集；绑定指令后 AI 就能自己动手。",
+      "hintFree": "可选：预先加载的数据，不用每次现查。不配置时 AI 会自己用工具找。",
+      "hintReactive": "触发源的数据自动收集；这里补充的是需要一起参考的其他设备或指令。",
       "searchPlaceholder": "搜索资源名称或类型...",
       "selectedCount": "已选 {{count}} 项",
       "noResourcesFound": "暂无可用资源",
-      "selectResource": "请从列表中选择资源",
       "selectDevice": "选择设备",
       "metrics": "数据指标",
       "commands": "控制指令",
       "metricCount": "{{count}} 项指标",
       "commandCount": "{{count}} 项指令",
-      "topologyPreview": "拓扑预览",
-      "selectResourceHint": "请至少选择一项数据资源",
+      "noneAvailable": "该资源没有可用的指标或指令",
       "noMetrics": "无指标",
-      "noOutputs": "无输出",
-      "moreMetrics": "+{{count}} 项指标",
-      "moreCommands": "+{{count}} 项指令",
-      "dataInput": "数据输入",
-      "dataOutput": "结果输出",
-      "selectAfterShow": "选择资源后显示详情",
       "resources": "项资源",
       "selected": "项已选",
       "clearAll": "清空",
       "selectAll": "全选",
       "deselectAll": "取消全选",
-      "dataStream": "数据流",
+      "lookback": "回看",
+      "lookbackUnit": "分钟",
       "device": "设备",
-      "externalData": "外部数据",
       "addResources": "添加资源",
       "dialog": {
         "title": "选择资源",
@@ -505,50 +487,68 @@
         "searchPlaceholder": "搜索资源...",
         "noResourcesHint": "点击\"添加资源\"来选择设备和扩展",
         "done": "完成",
+        "doneWithCount": "完成（{{count}}）",
         "selectedCount": "已选 {{count}} 个资源"
       }
     },
+    "structured": {
+      "hint": "每个字段都会发布为平台数据源，仪表盘、规则、数据推送可直接使用。定义要提取什么，再用资源绑定输入。",
+      "multiRoundCost": "多轮推理的结论是文字，要变成字段会在每次执行收尾多问一次模型。",
+      "colName": "字段名",
+      "colType": "类型",
+      "colUnit": "单位",
+      "colDesc": "含义",
+      "fieldName": "如 missing_count",
+      "fieldUnit": "如 ℃ / 件",
+      "fieldDescription": "会注入提示词",
+      "enumValues": "允许的取值，逗号分隔（如 正常, 待检, 停线）",
+      "typeNumber": "数值",
+      "typeText": "文本",
+      "typeBoolean": "布尔",
+      "typeEnum": "枚举（固定取值）",
+      "addField": "添加字段",
+      "removeField": "移除",
+      "debounce": "防抖（秒）",
+      "timeout": "推理超时（秒）",
+      "threshold": "熔断阈值（连续失败）",
+      "dailyCap": "每日运行上限（可选）",
+      "eventCooldown": "事件触发冷却（秒，0=空闲即触发，默认60）",
+      "dryRun": "试跑一次",
+      "dryRunRunning": "试跑中…",
+      "dryRunResultTitle": "试跑结果",
+      "dryRunMeta": "{{sources}} 个输入源 · 第 {{attempts}} 次尝试 · 未保存任何内容",
+      "guardrailSummary": "护栏：防抖 {{debounce}}s · 超时 {{timeout}}s · 熔断 {{threshold}} · 日上限 {{cap}}",
+      "guardrailSummaryEveryRun": "护栏：超时 {{timeout}}s · 熔断 {{threshold}} · 日上限 {{cap}}",
+      "guardrailToggle": "调整"
+    },
     "advanced": {
       "title": "高级配置",
-      "dataCollection": "数据采集",
-      "selectMetricsFirst": "请先选择指标",
       "executionMode": "执行模式",
-      "focusedMode": "精准模式",
-      "focusedModeDescription": "绑定特定资源和操作，快速精准分析。适合监控、告警、数据分析。",
-      "freeMode": "自由模式",
-      "freeModeDescription": "LLM 自主探索和决策，支持多轮工具调用。适合复杂自动化和设备控制。",
-      "focusedModeRequiresResources": "精准模式需要至少绑定一个资源",
-      "saveToken": "省 Token",
       "timeRange": "时间范围",
-      "includeHistory": "包含历史数据",
-      "includeTrend": "包含趋势分析",
-      "includeBaseline": "包含基线对比",
       "recommended": "推荐",
       "agentPriority": "优先级",
-      "priorityHint": "执行优先级（1=最低，10=最高）",
+      "priorityHint": "执行优先级：数字越大越先执行（128 为默认）",
       "contextWindow": "历史对话轮数",
       "contextHint": "载入最近的对话轮数，用于提供执行上下文",
       "historyDepth": "历史对话轮数",
       "systemPrompt": "自定义系统提示词",
       "systemPromptPlaceholder": "例如：你是一个仪表盘数据分析助手，负责分析设备运行状况...",
-      "systemPromptHint": "覆盖默认的物联网助手身份。留空则使用内置角色。",
-      "systemPromptTooLong": "系统提示词不能超过 4000 个字符",
-      "useDefault": "使用默认",
-      "defaultSystemPrompt": "你是一个智能物联网助手。你负责监控边缘设备、分析传感器数据，帮助用户管理物联网环境。根据观测到的数据提供清晰、可操作的洞察。"
+      "tools": "允许使用工具",
+      "toolsHint": "关闭＝纯文本回复的 agent；开启后 AI 可按需调用平台工具。",
+      "toolsRestrict": "限制可用工具",
+      "toolsRestrictHint": "限定此 agent 可调用的工具。工具更少更安全——小模型在少量选项中也选得更准。",
+      "toolsSelected": "已选 {{selected}} / {{total}}——不选即允许全部",
+      "toolsDisabledAutonomyHint": "自主工作方式下关闭工具会退化为单轮文本回复——没有工具就兑现不了多轮行动。"
     },
     "dataCollection": {
       "title": "数据收集配置",
       "timeRange": "时间范围",
-      "includeHistory": "历史数据",
-      "includeTrend": "趋势数据",
-      "includeBaseline": "基线对比",
       "hint": "为每个指标配置数据收集方式，不同场景可能需要不同的配置"
     },
     "validation": {
       "nameRequired": "请输入智能体名称",
-      "requirementRequired": "请描述你的需求",
       "resourceRequired": "请至少选择一个设备资源",
-      "eventTypeRequired": "请选择触发事件类型"
+      "outputFieldRequired": "请至少定义一个输出字段"
     },
     "actions": {
       "cancel": "取消",
@@ -584,12 +584,125 @@
       "America/New_York": "纽约 (UTC-5/-4)",
       "America/Los_Angeles": "洛杉矶 (UTC-8/-7)",
       "UTC": "UTC (UTC+0)"
+    },
+    "section": {
+      "what": "AI 要做什么",
+      "record": "记什么",
+      "when": "什么时候执行"
+    },
+    "preset": {
+      "title": "从模板开始",
+      "appliedFrom": "已从『{{name}}』开始",
+      "repick": "重选",
+      "image": {
+        "fDescDesc": "画面要点描述",
+        "fStatusValues": "正常, 异常",
+        "fStatusDesc": "画面状态判定",
+        "name": "图像理解",
+        "desc": "看一眼摄像头画面，给出结论",
+        "prompt": "你是现场值守员。查看绑定的摄像头最新画面：\n1. 描述画面要点（设备、物料、人员）；\n2. 判断是否异常（设备状态、堆放规范、安全隐患）；\n3. 有异常时指出位置和可能原因，并给出建议处置；没有异常就明确说正常。"
+      },
+      "monitor": {
+        "fStatusDesc": "整体状态判定",
+        "fStatusValues": "正常, 异常, 待检",
+        "fCountDesc": "异常项数量",
+        "fCountUnit": "项",
+        "name": "数据监控分析",
+        "desc": "多数据源定时读数，记成数据",
+        "prompt": "你是设备巡检员。定期读取绑定的各指标当前值：\n1. 与正常运行范围对比；\n2. 给出整体状态判定（正常 / 异常 / 待检）；\n3. 统计异常项数量并逐项说明。\n接近阈值但未超出的，标为待检而不是异常。"
+      },
+      "smart": {
+        "name": "智能任务",
+        "desc": "数据分析与执行联动",
+        "prompt": "你是现场值班工程师。监控绑定的数据源，发现异常时：\n1. 自主排查原因（可以查询其他数据、调用工具）；\n2. 需要处置时直接对绑定的设备执行指令（如开风机、降功率、停机）；\n3. 每次行动后说明做了什么、为什么。\n处置从轻：能调参数就不停机。"
+      },
+      "scheduled": {
+        "name": "定期任务",
+        "desc": "定时汇总成简报",
+        "prompt": "你是运营分析师。汇总绑定的数据源过去 24 小时的运行情况：\n1. 整体状态与关键指标变化；\n2. 期间发生过的事件与处置；\n3. 与前一天对比（变好 / 变差 / 持平）；\n4. 列出接下来最需要关注的 1–3 件事。"
+      },
+      "advanced": {
+        "name": "高级任务",
+        "desc": "高自由度，自己写",
+        "prompt": "描述你的任务，建议写清四件事：\n1. 目标——要达成什么；\n2. 输入——看哪些数据或画面；\n3. 判断——怎样算正常、怎样算异常；\n4. 行动——发现问题时做什么、通知谁。"
+      },
+      "event": {
+        "name": "事件判定",
+        "desc": "有变化就判一次",
+        "prompt": "有变化发生了——现在就判定。\n\n绑定的数据源上报时，判断它意味着什么：\n1. 读取绑定数据源的当前值；\n2. 说明这是正常、值得留意，还是出了问题；\n3. 用一句运维能直接行动的话说明发生了什么。\n单次读数只是证据，不是结论——数据含糊时直说，不要硬给一个判定。",
+        "fStatusValues": "正常, 留意, 有问题",
+        "fStatusDesc": "这次读数意味着什么",
+        "fDetailDesc": "一句话说明发生了什么"
+      },
+      "rootCause": {
+        "name": "根因分析",
+        "desc": "多源排查，给出结论",
+        "prompt": "你是值班工程师。出事了，或者看起来快出事了。\n1. 查清到底发生了什么——去查别的数据源、用工具验证你的猜测，不要停在第一个说得通的解释上；\n2. 把数据本身显示的和你的推断分开写；\n3. 给出最可能的原因，以及证据实际支持到哪一步；\n4. 给出运维下一步该做的一件事。\n证据不支持某个原因时就直说——一个错的根因比一句诚实的「信息不足」代价更大。",
+        "fCauseDesc": "最可能的原因",
+        "fConfValues": "高, 中, 低",
+        "fConfDesc": "证据实际支持的确定程度",
+        "fSuggestDesc": "下一步该做什么"
+      },
+      "weekly": {
+        "name": "周报",
+        "desc": "汇总一周",
+        "prompt": "你是运营分析师。汇总绑定数据源过去 7 天的情况：\n1. 本周整体状态与几个关键总量；\n2. 反复出现的问题——哪些发生了不止一次、各多少次；\n3. 与前一周对比（变好 / 变差 / 持平）；\n4. 下周值得改变的 1–3 件事。\n按整周来写；一次性的尖峰只有在反复出现或仍未解决时才值得提一句。"
+      },
+      "shift": {
+        "name": "短周期巡检",
+        "desc": "每半小时看一眼，只说变化",
+        "prompt": "你在做巡检。快速看一眼绑定的数据源：\n1. 和上次看的时候对比；\n2. 只报告发生变化的部分——没变的值不是新闻；\n3. 如果某项正在往坏的方向漂，说明方向和速度。\n通常两行就够。没事就说「无变化」——每一轮都凑字数的报告，最后没人看。"
+      },
+      "all": "全部模板",
+      "allTitle": "从模板开始",
+      "allSubtitle": "模板只是起点，不是锁死——填进去的每一项都能改。",
+      "next": {
+        "sources": "绑定它要读的数据源",
+        "trigger": "绑定触发源，或它要读的数据源",
+        "optional": "绑定它要读的数据；也可以直接保存，它会自己去查"
+      },
+      "patrol": {
+        "name": "定时巡检处置",
+        "desc": "定时巡检，异常自动处置",
+        "prompt": "你是值班工程师。按计划巡检绑定的数据源：发现异常先判断性质和影响范围，能自动处置的直接执行（如重启设备、重新下发命令），处置后验证是否恢复；不能自动处置的，写清现象、原因判断和建议下一步。每次巡检的结论要能和上一次对比，处置过的要有回执。"
+      },
+      "qa": {
+        "name": "数据问答员",
+        "desc": "随问随答，只看绑定的数据",
+        "prompt": "你是数据查询助手。只依据绑定的数据源回答问题：先查数、再作答；每个数字都注明时间和来源；数据里没有的就明说没有，不要推测。回答保持简短直接。"
+      }
+    },
+    "notify": {
+      "title": "通知",
+      "noChannels": "还没有外部通道 —— 告警仍会出现在「消息」里，不会漏。",
+      "onLabel": "何时通知",
+      "onFailure": "失败时",
+      "onFailureDesc": "只在执行失败时提醒，成功保持安静。",
+      "onAlways": "每次执行",
+      "onAlwaysDesc": "无论成败，每次执行都提醒。",
+      "onJudgment": "由任务判断",
+      "onJudgmentDesc": "只在有值得说的结论时提醒；例行轮次保持安静，也不回落到旧的关键词推断。",
+      "hint": "选择往哪发、什么时候发。「由 AI 判断」不给机制配通知，也不回落到旧的关键词推断。",
+      "configureChannels": "去配置通道"
+    },
+    "workstyle": {
+      "title": "工作方式",
+      "bound": "只看绑定的数据",
+      "auto": "自己查、自己动手",
+      "boundDesc": "回答严格来自绑定的设备与数据源，不做额外查询",
+      "autoDesc": "可多轮调用工具查数据、执行操作后再作答"
+    },
+    "memory": {
+      "title": "记住多少",
+      "auto": "按模式自动",
+      "stateless": "每次都从零判断",
+      "statelessHint": "只看这次的数据。更省、更快、结果可复现",
+      "history": "记得历史结果",
+      "historyHint": "能说“比上次更差”这类判断。每次会多带历史",
+      "standardsKept": "你的标准与纠正始终生效，不受此项影响"
     }
   },
   "skills": {
-    "originAll": "全部",
-    "originBuiltin": "内置",
-    "originUser": "自定义",
     "createSkill": "添加技能",
     "skillCreated": "技能已创建",
     "skillUpdated": "技能已更新",
@@ -638,22 +751,15 @@
       "description": "配置记忆存储和调度",
       "general": "通用设置",
       "enabled": "启用",
-      "maxAgents": "最大智能体数",
-      "maxAgentsHint": "拥有记忆的最大智能体数量",
-      "charLimits": "字符限制",
       "userCharLimit": "用户文件限制",
       "userCharLimitHint": "用户记忆文件的最大字符数",
       "knowledgeCharLimit": "知识文件限制",
       "knowledgeCharLimitHint": "知识记忆文件的最大字符数",
       "proceduresCharLimit": "操作流程文件限制",
       "proceduresCharLimitHint": "操作流程记忆文件的最大字符数（SOP、操作手册、how-to）",
-      "agentCharLimit": "智能体记忆限制",
-      "agentCharLimitHint": "每个智能体记忆的最大字符数",
       "tempFileTtl": "临时文件保留天数",
       "tempFileTtlHint": "临时文件清理前的保留天数",
       "schedule": "调度",
-      "scheduleInterval": "提取间隔",
-      "scheduleIntervalHint": "记忆提取间隔秒数（{{minutes}} 分钟）",
       "refreshInterval": "刷新间隔",
       "refreshIntervalHint": "刷新智能体记忆上下文的频率",
       "summaryInterval": "摘要间隔",
@@ -665,8 +771,6 @@
     "viewEdit": "查看/编辑",
     "export": "导出",
     "extract": "提取",
-    "extractStarted": "提取已开始",
-    "extractStartedDesc": "正在从对话中提取记忆...",
     "saving": "保存中...",
     "save": "保存",
     "cancel": "取消",
@@ -676,7 +780,6 @@
       "title": "暂无智能体",
       "description": "暂无智能体，创建一个来自动执行任务"
     },
-    "charsUsed": "已使用 {{used}} / {{limit}} 字符",
     "noContent": "暂无内容",
     "custom": {
       "title": "自定义文件",
@@ -684,7 +787,6 @@
       "createTitle": "创建自定义文件",
       "fileName": "文件名",
       "fileNameHint": "小写字母、数字、连字符、下划线，1-32 个字符。",
-      "fileContent": "内容（Markdown）",
       "empty": "暂无自定义文件。创建一个来存储领域特定知识。",
       "deleted": "自定义文件已删除",
       "created": "自定义文件已创建",

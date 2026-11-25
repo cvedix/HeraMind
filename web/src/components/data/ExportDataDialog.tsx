@@ -275,7 +275,7 @@ export function ExportDataDialog({ open, onOpenChange, source }: ExportDataDialo
       {source && (
         <div className="space-y-4">
           {/* Source Info */}
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <p className="text-xs text-muted-foreground">{t('columns.source')}</p>
               <p className="text-sm font-medium">{source.source_display_name}</p>
@@ -294,8 +294,8 @@ export function ExportDataDialog({ open, onOpenChange, source }: ExportDataDialo
             </div>
           </div>
 
-          {/* Time Range - two columns: start | end */}
-          <div className="grid grid-cols-2 gap-4">
+          {/* Time Range - two columns: start | end (stacks on phones) */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {/* Start */}
             <div className="space-y-2">
               <label className="text-xs text-muted-foreground block">{t('export.startTime')}</label>
@@ -408,7 +408,7 @@ async function generateZip(
 ) {
   const JSZip = (await import('jszip')).default
   const zip = new JSZip()
-  let imageCount = 0
+  let _imageCount = 0
 
   // manifest.json with metadata
   zip.file('manifest.json', JSON.stringify({
@@ -435,7 +435,7 @@ async function generateZip(
       if (resolved) {
         const filename = `${String(i + 1).padStart(4, '0')}_${timeStr}.${resolved.ext}`
         zip.file(`images/${filename}`, resolved.bytes)
-        imageCount++
+        _imageCount += 1
         csvRows.push(`${i + 1},${filename},${formatTimestamp(p.timestamp)},${q},${resolved.bytes.length} bytes`)
       } else {
         csvRows.push(`${i + 1},-,${formatTimestamp(p.timestamp)},${q},"${valStr.replace(/"/g, '""')}"`)

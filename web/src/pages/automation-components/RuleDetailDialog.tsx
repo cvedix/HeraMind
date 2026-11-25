@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Zap, Clock, Hand, Activity, Bell, Code2, Bot,
@@ -6,7 +7,9 @@ import {
 import { UnifiedFormDialog } from '@/components/dialog/UnifiedFormDialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import type { Rule } from '@/types/rule'
+import { RuleWhyNotTriggeredPanel, type ExplainLoadStatus } from '@/components/automation/RuleWhyNotTriggeredPanel'
+import type { Rule, RuleExplanation } from '@/types/rule'
+import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { textMini, textNano } from '@/design-system/tokens/typography'
 
@@ -68,6 +71,15 @@ function getActionInfo(action: Rule['actions'][number], t: (k: string, o?: any) 
       return { icon: Code2, label: t('actions.execute', { defaultValue: 'Execute' }), detail: `${action.target_type}: ${action.target} → ${action.command}` }
     case 'trigger_agent':
       return { icon: Bot, label: t('actions.triggerAgent', { defaultValue: 'Trigger Agent' }), detail: action.agent_id }
+    case 'run_operator':
+      // Keyed off ruleBuilder.actionType — the `actions.*` keys the sibling
+      // cases reference do not exist in the locale files, so those always
+      // render their English defaultValue.
+      return {
+        icon: Bot,
+        label: t('ruleBuilder.actionType.runOperator', { defaultValue: 'Run Operator' }),
+        detail: action.agent_id,
+      }
     default:
       return { icon: Zap, label: String((action as any).type), detail: '' }
   }
@@ -75,6 +87,34 @@ function getActionInfo(action: Rule['actions'][number], t: (k: string, o?: any) 
 
 export function RuleDetailDialog({ rule, open, onOpenChange, onEdit }: Props) {
   const { t } = useTranslation(['automation', 'common'])
+  const [explain, setExplain] = useState<RuleExplanation | null>(null)
+  const [explainStatus, setExplainStatus] = useState<ExplainLoadStatus>('idle')
+  const [fetchNonce, setFetchNonce] = useState(0)
+
+  useEffect(() => {
+    if (!open || !rule?.id) {
+      setExplain(null)
+      setExplainStatus('idle')
+      return
+    }
+    let cancelled = false
+    setExplainStatus('loading')
+    api
+      .getRuleExplain(rule.id)
+      .then((data) => {
+        if (cancelled) return
+        setExplain(data)
+        setExplainStatus('ready')
+      })
+      .catch(() => {
+        if (cancelled) return
+        setExplain(null)
+        setExplainStatus('error')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, rule?.id, fetchNonce])
 
   if (!rule) return null
 
@@ -141,6 +181,13 @@ export function RuleDetailDialog({ rule, open, onOpenChange, onEdit }: Props) {
             ))}
           </div>
         )}
+
+        {/* Why not triggered — live explain snapshot */}
+        <RuleWhyNotTriggeredPanel
+          explanation={explain}
+          status={explainStatus}
+          onRetry={() => setFetchNonce((n) => n + 1)}
+        />
 
         {/* Trigger */}
         <div>

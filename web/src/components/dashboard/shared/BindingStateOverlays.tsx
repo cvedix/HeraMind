@@ -32,7 +32,11 @@ export function DanglingBindingState({ deviceIds: _deviceIds, className }: Dangl
   return (
     <EmptyState
       className={cn('border-warning-light', className)}
-      icon={<Unplug className="h-8 w-8 text-warning" />}
+      // Accent orange, not text-warning: the AA-tuned warning text color is
+      // an olive amber that reads muddy at icon sizes. Icons are graphics —
+      // they don't carry the 4.5:1 text bar, and this matches the stale-dot
+      // orange used elsewhere on the dashboard.
+      icon={<Unplug className="h-8 w-8 text-accent-orange" />}
       message={t('bindingDeviceRemoved', 'Bound device was removed')}
       subMessage={t('bindingDeviceRemovedHint', 'Rebind this component to an existing device')}
     />

@@ -16,6 +16,40 @@ use super::{
 
 use super::super::AgentExecutor;
 
+/// Matches a backend image URL as tool results embed it — flat
+/// `/api/images/<uuid>.png` and structured `/api/images/<dev>/<metric>/<ts>.jpg`.
+static BARE_IMAGE_URL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+/// Upgrade bare `/api/images/...` URLs in an agent conclusion to markdown
+/// image syntax so the UI renders the produced image instead of showing the
+/// path as plain text (models routinely write the URL bare despite the
+/// system-prompt instruction to use `![desc](url)`). URLs already inside a
+/// markdown link/image target (preceded by `](`) are left untouched, and text
+/// without image URLs is returned unchanged.
+pub(crate) fn embed_bare_image_urls(text: &str) -> String {
+    if !text.contains("/api/images/") {
+        return text.to_string();
+    }
+    let re = BARE_IMAGE_URL_RE.get_or_init(|| {
+        regex::Regex::new(r"/api/images/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*").unwrap()
+    });
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut last = 0usize;
+    for m in re.find_iter(text) {
+        // Already a markdown/image link target — keep as-is.
+        if text[..m.start()].ends_with("](") {
+            continue;
+        }
+        out.push_str(&text[last..m.start()]);
+        out.push_str("![image](");
+        out.push_str(m.as_str());
+        out.push(')');
+        last = m.end();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Targeted guidance when the LLM hallucinates a tool name that doesn't exist.
 ///
 /// LLMs trained on many agent frameworks often invent a `message`/`notify`/`alert`
@@ -111,6 +145,17 @@ impl AgentExecutor {
         let result_cap = TOOL_RESULT_MAX_LEN.min(context_window / 4);
         for result in results {
             all_tool_results.push(result.clone());
+            // Replay safety decides timeout semantics: a replay-UNSAFE tool
+            // (shell `device control`, writes…) that timed out may have
+            // already taken effect — the model must verify state before
+            // re-issuing, not treat it as a plain failure to retry.
+            let replay_safe = self
+                .tool_registry
+                .read()
+                .as_ref()
+                .map(|reg| reg.replay_safety(&result.name))
+                .unwrap_or(crate::toolkit::tool::ReplaySafety::Unsafe)
+                == crate::toolkit::tool::ReplaySafety::Safe;
             let result_text = match &result.result {
                 Ok(output) => {
                     let raw = serde_json::to_string(&output.data)
@@ -145,7 +190,20 @@ impl AgentExecutor {
                     // UTF-8 safe truncation (has fast-path for short strings)
                     // 128KB limit: large enough for compact time-series and multi-device
                     // queries. The compaction layer handles context window limits later.
-                    crate::agent::streaming::truncate_result_utf8(&sanitized, result_cap)
+                    let mut text =
+                        crate::agent::streaming::truncate_result_utf8(&sanitized, result_cap);
+                    // Shell was killed at its timeout cap but the command may
+                    // have already fired its effect — append outcome-unknown
+                    // guidance so the model verifies before re-issuing.
+                    let timed_out = output
+                        .data
+                        .get("timed_out")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if timed_out && !replay_safe {
+                        text.push_str(crate::toolkit::tool::outcome_unknown_guidance());
+                    }
+                    text
                 }
                 Err(e) => {
                     let err_msg = format!("Error: {}", e);
@@ -168,7 +226,14 @@ impl AgentExecutor {
                     {
                         " Check parameter names and types.".to_string()
                     } else if e.to_string().contains("timed out") {
-                        " The operation took too long. Try a simpler query.".to_string()
+                        if replay_safe {
+                            // Read-only tool: a retry is harmless.
+                            " The operation took too long. Try a simpler query.".to_string()
+                        } else {
+                            // Side-effectful tool: the effect may have landed —
+                            // "try again" advice would double-apply it.
+                            crate::toolkit::tool::outcome_unknown_guidance().to_string()
+                        }
                     } else if e.to_string().contains("Permission denied") {
                         " This action is not allowed. Try an alternative approach.".to_string()
                     } else {
@@ -178,17 +243,57 @@ impl AgentExecutor {
                 }
             };
 
-            // Skill tool results go to separate reference buffer, not messages history
+            // Skill tool results go to separate reference buffer, not messages history.
+            // Cap under the same shared skill-body budget as chat (`skill_bodies_token_budget`)
+            // so scheduled-agent production runs cannot accumulate 15+ full guides.
             if result.name == "skill" {
-                if !skill_reference.is_empty() {
-                    skill_reference.push_str("\n\n");
+                let budget = crate::llm::skill_bodies_token_budget(context_window);
+                let (outcome, piece) =
+                    crate::llm::plan_skill_body_append(skill_reference, &result_text, budget);
+                // Acknowledge per ACTUAL outcome — a Skipped retrieval
+                // appended zero bytes, and telling the model a guide backs
+                // its behavior when none exists in context is exactly the
+                // dishonest status this release removes.
+                match outcome {
+                    crate::llm::SkillBodyAppendOutcome::Skipped => {
+                        tracing::warn!(
+                            budget_tokens = budget,
+                            "executor skill reference skipped: total skill body budget exhausted"
+                        );
+                        messages.push(Message::new(
+                            MessageRole::User,
+                            Content::text(
+                                "Skill reference budget is exhausted — the guide content is \
+                                 NOT in your context. Do not claim to follow it; answer from \
+                                 general knowledge or ask the user.",
+                            ),
+                        ));
+                    }
+                    crate::llm::SkillBodyAppendOutcome::Truncated => {
+                        tracing::warn!(
+                            budget_tokens = budget,
+                            "executor skill reference truncated to fit total skill body budget"
+                        );
+                        skill_reference.push_str(&piece);
+                        messages.push(Message::new(
+                            MessageRole::User,
+                            Content::text(
+                                "Skill guide partially retrieved (truncated to fit the \
+                                 reference budget) and will be used as reference.",
+                            ),
+                        ));
+                    }
+                    crate::llm::SkillBodyAppendOutcome::Full => {
+                        skill_reference.push_str(&piece);
+                        messages.push(Message::new(
+                            MessageRole::User,
+                            Content::text("Skill guide retrieved and will be used as reference."),
+                        ));
+                    }
+                    // plan_skill_body_append never returns this; the
+                    // session-level setter uses it for same-turn dedup.
+                    crate::llm::SkillBodyAppendOutcome::AlreadyPresent => {}
                 }
-                skill_reference.push_str(&result_text);
-                // Add a concise acknowledgment to messages so LLM knows the skill was retrieved
-                messages.push(Message::new(
-                    MessageRole::User,
-                    Content::text("Skill guide retrieved and will be used as reference."),
-                ));
             } else {
                 // Use sanitized name for LLM message so it matches what the LLM used
                 let msg_name = original_to_sanitized
@@ -225,7 +330,7 @@ impl AgentExecutor {
     pub(crate) async fn generate_phase2_summary(
         &self,
         agent: &AiAgent,
-        llm_runtime: &Arc<dyn LlmRuntime + Send + Sync>,
+        llm_runtime: &Arc<dyn LlmRuntime>,
         all_tool_results: &[crate::toolkit::ToolResult],
         round_count: usize,
     ) -> Option<String> {
@@ -302,7 +407,11 @@ impl AgentExecutor {
             Ok(output) => {
                 let text = output.text.trim().to_string();
                 let response_len = text.len();
-                if !text.is_empty() {
+                // Degenerate summaries (bare `[]`/`{}` — small models answer
+                // format directives literally) carry no analysis value; treat
+                // them as failure so the caller falls back to tool results.
+                if !text.is_empty() && !crate::agent::tool_parser::is_degenerate_final_output(&text)
+                {
                     tracing::debug!(
                         agent_id = %agent.id,
                         response_len,
@@ -310,6 +419,11 @@ impl AgentExecutor {
                     );
                     Some(text)
                 } else {
+                    tracing::warn!(
+                        agent_id = %agent.id,
+                        response_len,
+                        "Phase 2 analysis degenerate/empty — falling back to tool results"
+                    );
                     None
                 }
             }
@@ -363,6 +477,7 @@ pub(crate) fn build_tool_result(
         all_tool_results,
         round_data_list_raw,
         last_llm_error: _,
+        tokens_used,
     } = loop_output;
 
     tracing::info!(
@@ -413,6 +528,12 @@ pub(crate) fn build_tool_result(
         "No tools were executed during this agent run.".to_string()
     };
 
+    // Deterministic belt-and-suspenders for the "path as plain text" failure:
+    // the system prompt asks the model to embed produced images as
+    // `![desc](url)`, but agent conclusions routinely write the bare URL.
+    // The UI renders conclusions as markdown, so upgrade bare URLs here.
+    let conclusion = embed_bare_image_urls(&conclusion);
+
     // --- reasoning steps ---
     let mut reasoning_steps: Vec<ReasoningStep> = Vec::new();
     let mut step_counter = 0u32;
@@ -426,7 +547,7 @@ pub(crate) fn build_tool_result(
                 step_type: "thought".to_string(),
                 input: None,
                 output: String::new(),
-                confidence: 0.8,
+                confidence: Some(0.8),
             });
         }
 
@@ -435,7 +556,11 @@ pub(crate) fn build_tool_result(
             let (desc, conf, step_type) = match &tc.result.result {
                 Ok(output) => (
                     format!("Executed tool '{}'", tc.name),
-                    if output.success { 0.9 } else { 0.3 },
+                    if crate::toolkit::tool::effective_success(&tc.name, output) {
+                        0.9
+                    } else {
+                        0.3
+                    },
                     "tool_call",
                 ),
                 Err(e) => (format!("Tool '{}' failed: {}", tc.name, e), 0.2, "error"),
@@ -453,7 +578,7 @@ pub(crate) fn build_tool_result(
                 step_type: step_type.to_string(),
                 input: input_str,
                 output: output_str,
-                confidence: conf,
+                confidence: Some(conf),
             });
         }
     }
@@ -493,8 +618,12 @@ pub(crate) fn build_tool_result(
         reasoning_steps,
         decisions,
         conclusion,
-        confidence: final_confidence,
+        // The share of tool calls that succeeded. Real data, but it answers
+        // "did the tools work", not "how sure is the model" — see the note on
+        // `DecisionProcess::confidence`.
+        confidence: Some(final_confidence),
         stop_reason: stop_reason.label().to_string(),
+        tokens_used,
     };
 
     let actions_executed: Vec<heramind_storage::ActionExecuted> = all_tool_results
@@ -504,7 +633,11 @@ pub(crate) fn build_tool_result(
             // failure (the command ran but reported failure) — it must not
             // count as success, or success_rate pins to 1.0 and the journal
             // learns nothing. Mirrors the dedup set's success semantics.
-            let success = matches!(&r.result, Ok(o) if o.success);
+            // effective_success, not o.success: the shell tool reports
+            // success=true with the exit code in data — plain success pinned
+            // failure rates to 0 and taught the journal nothing.
+            let success =
+                matches!(&r.result, Ok(o) if crate::toolkit::tool::effective_success(&r.name, o));
             heramind_storage::ActionExecuted {
                 action_type: "tool_call".to_string(),
                 description: format!("Execute tool '{}'", r.name),
@@ -514,7 +647,12 @@ pub(crate) fn build_tool_result(
                 result: if success {
                     r.result.as_ref().ok().map(|o| o.data.to_string())
                 } else {
-                    r.result.as_ref().err().map(|e| e.to_string())
+                    r.result.as_ref().err().map(|e| e.to_string()).or_else(|| {
+                        r.result
+                            .as_ref()
+                            .ok()
+                            .map(|o| o.error.clone().unwrap_or_else(|| o.data.to_string()))
+                    })
                 },
             }
         })
@@ -578,6 +716,83 @@ mod tests {
                 "hint must show the correct shell command"
             );
         }
+    }
+
+    #[test]
+    fn embed_bare_image_urls_wraps_plain_url() {
+        // The exact failure shape from the field: watermark applied, path
+        // written into the conclusion as plain prose.
+        let src = "水印已添加，结果保存在 /api/images/ea53e561-9e33-4f87-94a2-28f6f084f640.png。";
+        let out = embed_bare_image_urls(src);
+        assert_eq!(
+            out,
+            "水印已添加，结果保存在 ![image](/api/images/ea53e561-9e33-4f87-94a2-28f6f084f640.png)。"
+        );
+    }
+
+    #[test]
+    fn embed_bare_image_urls_wraps_structured_layout() {
+        let src = "最新帧: /api/images/1A06A9/image_data/1790762534_ab12.png (see above)";
+        let out = embed_bare_image_urls(src);
+        assert_eq!(
+            out,
+            "最新帧: ![image](/api/images/1A06A9/image_data/1790762534_ab12.png) (see above)"
+        );
+    }
+
+    #[test]
+    fn embed_bare_image_urls_leaves_markdown_targets_alone() {
+        let src = "![水印图](/api/images/abc.png) and [detail](/api/images/dev/m/1.jpg)";
+        assert_eq!(embed_bare_image_urls(src), src);
+    }
+
+    #[test]
+    fn embed_bare_image_urls_noop_without_urls() {
+        let src = "设备 NE302 TEST 检测到 person，置信度 63.78%。";
+        assert_eq!(embed_bare_image_urls(src), src);
+    }
+
+    #[test]
+    fn embed_bare_image_urls_wraps_every_bare_occurrence() {
+        let src = "a /api/images/one.png b /api/images/two.png c ![ok](/api/images/three.png)";
+        let out = embed_bare_image_urls(src);
+        assert_eq!(
+            out,
+            "a ![image](/api/images/one.png) b ![image](/api/images/two.png) c ![ok](/api/images/three.png)"
+        );
+    }
+
+    #[test]
+    fn executor_skill_reference_respects_shared_skill_body_budget() {
+        use crate::agent::tokenizer::estimate_tokens;
+        use crate::llm::{
+            plan_skill_body_append, skill_bodies_token_budget, SkillBodyAppendOutcome,
+        };
+
+        // Same loop shape as process_tool_results skill branch (production
+        // scheduled-agent path) — 15 full guides must not accumulate unbound.
+        let context_window = 4_096;
+        let budget = skill_bodies_token_budget(context_window);
+        let mut skill_reference = String::new();
+        for i in 0..15 {
+            let result_text = format!("GUIDE{i} {}", "技能正文".repeat(200));
+            let (outcome, piece) = plan_skill_body_append(&skill_reference, &result_text, budget);
+            match outcome {
+                SkillBodyAppendOutcome::Skipped => {}
+                SkillBodyAppendOutcome::AlreadyPresent => {}
+                SkillBodyAppendOutcome::Truncated | SkillBodyAppendOutcome::Full => {
+                    skill_reference.push_str(&piece);
+                }
+            }
+        }
+        assert!(
+            estimate_tokens(&skill_reference) <= budget + 16,
+            "executor skill_reference must stay under shared budget {budget}"
+        );
+        assert!(
+            skill_reference.contains("GUIDE0"),
+            "first skill body should be retained"
+        );
     }
 
     #[test]

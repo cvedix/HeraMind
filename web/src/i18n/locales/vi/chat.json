@@ -26,7 +26,8 @@
     "selectSkills": "Chọn kỹ năng",
     "noSkills": "Không có kỹ năng khả dụng",
     "activeSkills": "Kỹ năng đang bật",
-    "fallbackHelpPrompt": "Bạn có thể làm gì?"
+    "fallbackHelpPrompt": "Bạn có thể làm gì?",
+    "cancel": "Hủy yêu cầu"
   },
   "model": {
     "supportsVision": "Hỗ trợ thị giác",
@@ -34,13 +35,20 @@
     "addImage": "Thêm ảnh",
     "notSupportImage": "Mô hình hiện tại không hỗ trợ ảnh",
     "visionError": "Mô hình hiện tại không hỗ trợ đầu vào hình ảnh.\n\nVui lòng chọn mô hình có hỗ trợ thị giác (ví dụ qwen3.5:4b), hoặc xóa ảnh và thử lại.\n\nCác mô hình hỗ trợ thị giác có biểu tượng 👁️.",
-    "supportsTools": "Hỗ trợ công cụ"
+    "supportsTools": "Hỗ trợ công cụ",
+    "visionViaCompanion": "Hình ảnh sẽ được mô tả bởi mô hình thị giác cục bộ",
+    "forConversation": "Mô hình dùng cho cuộc trò chuyện này"
   },
   "thinking": {
     "title": "Quá trình suy luận",
     "thinking": "Đang suy luận...",
-    "characters": "nhân vật",
-    "rounds": "Vòng"
+    "characters": "{{count}} ký tự",
+    "rounds": "{{count}} vòng",
+    "inlineTitle": "Đang suy nghĩ",
+    "characters_other": "{{count}} ký tự",
+    "characters_one": "{{count}} ký tự",
+    "rounds_other": "{{count}} vòng",
+    "rounds_one": "{{count}} vòng"
   },
   "progress": {
     "thinking": "Suy luận",
@@ -60,14 +68,29 @@
     "status": {
       "pending": "Chờ xử lý",
       "running": "Đang chạy",
-      "completed": "Hoàn tất"
+      "completed": "Hoàn tất",
+      "failed": "Thất bại"
     },
     "arguments": "Tham số",
     "result": "Kết quả",
     "roundTitle": "Vòng {{round}}",
     "multiRoundTitle": "Lần gọi công cụ",
     "rounds": "vòng",
-    "toggleDetails": "Bật/tắt chi tiết"
+    "toggleDetails": "Bật/tắt chi tiết",
+    "roundsCount_other": "{{count}} vòng",
+    "roundsCount": "{{count}} vòng",
+    "roundsCount_one": "{{count}} vòng",
+    "intermediate": "Ghi chú trong quá trình thực thi",
+    "label": "Công cụ",
+    "callsCount": "{{count}} lần gọi công cụ",
+    "callsCount_one": "{{count}} lần gọi công cụ",
+    "callsCount_other": "{{count}} lần gọi công cụ",
+    "countShort": "{{count}} công cụ",
+    "countShort_other": "{{count}} công cụ",
+    "countShort_one": "{{count}} công cụ",
+    "runningWith": "Đang chạy {{name}}...",
+    "details": "Chi tiết",
+    "hideDetails": "Ẩn chi tiết"
   },
   "connection": {
     "connected": "Đã kết nối",
@@ -229,7 +252,11 @@
   "resizePanel": "Kéo để đổi kích thước khung chat",
   "code": {
     "copy": "Sao chép",
-    "copied": "Đã sao chép"
+    "copied": "Đã sao chép",
+    "wrap": "Tự động ngắt dòng",
+    "unwrap": "Tắt tự động ngắt dòng",
+    "expand": "Hiển thị tất cả",
+    "collapse": "Hiện ít hơn"
   },
   "scrollToBottom": "Cuộn xuống cuối",
   "copyMessage": "Sao chép tin nhắn",
@@ -240,6 +267,120 @@
     "toolDefs": "Định nghĩa công cụ",
     "history": "Lịch sử hội thoại",
     "estimatedHint": "Ước tính theo ký tự — cập nhật sau câu trả lời tiếp theo",
-    "msgCount": " · {{count}} tin nhắn"
+    "msgCount": " · {{count}} tin nhắn",
+    "compact": "Rút gọn ngữ cảnh",
+    "compacting": "Đang rút gọn ngữ cảnh…",
+    "compactDone": "Đã rút gọn {{count}} tin nhắn",
+    "compactNothing": "Chưa có nội dung để rút gọn",
+    "compactFailed": "Không thể rút gọn ngữ cảnh",
+    "compactConfirmTitle": "Rút gọn ngữ cảnh?",
+    "compactConfirmDesc": "Thông điệp trước đó được thay thế bằng một bản tóm tắt về không gian văn cảnh tự do. Lịch sử vẫn còn hiển thị trên UI; chỉ những yêu cầu sau này mới bị ảnh hưởng.",
+    "historyTruncated": "Văn cảnh đầy đủ; các thông điệp cũ không còn được gửi cho mô hình (họ vẫn còn thấy ở đây). Hãy dùng ngữ cảnh máy tính để giải phóng không gian.",
+    "clear": "Xóa",
+    "clearDone": "Đã xóa lịch sử trò chuyện",
+    "clearFailed": "Không thể xóa lịch sử trò chuyện",
+    "clearConfirmTitle": "Xóa lịch sử trò chuyện?",
+    "clearConfirmDesc": "Thao tác này xóa vĩnh viễn toàn bộ tin nhắn trong phiên.",
+    "awaitingMeasurement": "Đang chờ kết quả đo ngữ cảnh của yêu cầu",
+    "breakdownUnavailable": "Yêu cầu này chỉ có số token tổng hợp.",
+    "measuredHint": "Số đo của yêu cầu gần nhất gửi đến mô hình. Kết quả thực thi tích lũy được tính riêng."
+  },
+  "panelStatus": {
+    "preparing": "Đang chuẩn bị cuộc trò chuyện",
+    "responding": "AI đang trả lời"
+  },
+  "capability": {
+    "tools": "Gọi công cụ",
+    "vision": "Thị giác",
+    "thinking": "Đang suy nghĩ"
+  },
+  "timeline": {
+    "title": "Tiến trình thực hiện",
+    "roundFallback": "Vòng {{round}}"
+  },
+  "image": {
+    "view": "Xem ảnh",
+    "close": "Đóng ảnh",
+    "alt": "Ảnh {{index}}"
+  },
+  "message": {
+    "charsPerSecond": "ký tự/s"
+  },
+  "a11y": {
+    "generating": "Đang tạo câu trả lời",
+    "answerReady": "Hoàn tất phản hồi"
+  },
+  "newContent": "Nội dung mới",
+  "loadEarlier": "Tải các tin nhắn trước",
+  "loadEarlierLoading": "Đang tải…",
+  "goalStatus": {
+    "label": "Trạng thái mục tiêu hệ thống",
+    "notApplicable": "Lượt này không có mục tiêu cần xác minh.",
+    "incomplete": "Mục tiêu chưa hoàn thành. Mức bằng chứng: {{level}}. {{reason}}",
+    "completeEligible": "Mức bằng chứng của lệnh: {{level}} (đủ điều kiện hoàn tất theo tiêu chí{{physical}}).",
+    "completeEligiblePhysical": ", đã xác minh tác động thực tế",
+    "completeEligibleNoPhysical": ", chưa xác minh tác động thực tế",
+    "completed": "Hoàn tất mục tiêu (bằng chứng {{id}}).",
+    "halted": "Dừng mục tiêu: {{reason}}",
+    "cancelled": "Đã hủy bỏ mục tiêu.",
+    "level": {
+      "none": "không có",
+      "config_success": "Chỉ cấu hình",
+      "command_dispatched": "lệnh đã gửi",
+      "device_acknowledged": "thiết bị đã xác nhận",
+      "physical_effect_verified": "đã xác minh tác động thực tế"
+    },
+    "endReason": {
+      "normal": "kết thúc bình thường",
+      "interrupted": "bị gián đoạn",
+      "timeout": "hết thời gian chờ",
+      "error": "lỗi",
+      "cancelled": "Đã hủy",
+      "cannot_continue": "không thể tiếp tục"
+    }
+  },
+  "suggestions": {
+    "badge": "Gợi ý"
+  },
+  "mention": {
+    "title": "Chọn đối tượng để nhắc đến",
+    "searching": "Đang tìm kiếm...",
+    "noResults": "Không tìm thấy đối tượng phù hợp",
+    "referencesLabel": "Đối tượng được nhắc đến",
+    "remove": "Bỏ tham chiếu",
+    "device": "thiết bị",
+    "rule": "quy tắc",
+    "transform": "phép chuyển đổi",
+    "agent": "tác tử",
+    "invalid": "Tham chiếu không hợp lệ",
+    "invalidSend": "Một số tham chiếu không hợp lệ. Hãy sửa rồi gửi lại.",
+    "contentOverLimit": "Tin nhắn vượt quá giới hạn 20 tham chiếu hoặc 8000 ký tự. Hãy rút ngắn rồi gửi lại.",
+    "reuseInComposer": "Dùng lại trong ô soạn tin nhắn",
+    "filterTypes": "Lọc theo loại",
+    "filterAll": "Tất cả",
+    "partialFailure": "Một số loại không tải được",
+    "searchFailed": "Không thể tìm kiếm. Hãy thử lại.",
+    "loadMore": "Tải thêm",
+    "protoTitle": "Nguyên mẫu nhắc đến bằng @",
+    "protoDesc": "Trình soạn thảo thử nghiệm cho phép chèn tham chiếu ngay trong câu. Trình soạn chat đang chạy có triển khai riêng.",
+    "protoHint": "Gõ @ hoặc dùng thanh công cụ. Có thể chèn nhiều tham chiếu đến cùng một đối tượng. Khi xóa, thẻ tham chiếu được xóa nguyên khối.",
+    "protoText": "Nội dung tin nhắn",
+    "protoMobile": "Bộ chọn đối tượng trên thiết bị di động",
+    "insertAt": "Chèn tham chiếu @",
+    "insert": "Chèn tham chiếu",
+    "protoPlain": "Văn bản thường",
+    "protoLegacy": "Cách hiển thị thẻ tham chiếu cũ",
+    "protoHistory": "Xem trước lịch sử sau khi gửi (tham chiếu trong câu)",
+    "protoHistoryEmpty": "Nhập nội dung và chèn tham chiếu để xem trước",
+    "protoTradeoffLink": "Thiết kế thử nghiệm đã được lưu lại. Chat đang dùng TipTap Mention.",
+    "protoViewportAuto": "Theo kích thước màn hình",
+    "protoViewportDesktop": "Cửa sổ nổi trên máy tính",
+    "protoViewportMobile": "Bảng trượt trên thiết bị di động"
+  },
+  "authorizeConfirm": {
+    "title": "Xác nhận chạy lại thao tác ghi bị chặn",
+    "pickOne": "Nhiều thao tác bị chặn. Chọn thao tác cần chạy lại.",
+    "button": "Chạy lại {{opId}}",
+    "buttonWithTarget": "Chạy lại {{opId}} · {{target}}"
   }
 }

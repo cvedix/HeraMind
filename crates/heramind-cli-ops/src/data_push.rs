@@ -3,8 +3,7 @@
 use anyhow::Result;
 use serde_json::json;
 
-use crate::api_client::extract_inner_data;
-use crate::types::{BuildMeta, CliResponse};
+use crate::types::CliResponse;
 use crate::ApiClient;
 
 /// Parse comma-separated source patterns into a Vec<String>.
@@ -38,15 +37,14 @@ fn lift_top_level_fields(config: &mut serde_json::Value, body: &mut serde_json::
 /// Full config is available via `heramind push-target get <id>`.
 pub async fn list_targets(client: &ApiClient) -> Result<CliResponse> {
     let data = client.get("/data-push").await?;
-    let inner = extract_inner_data(data);
 
-    let targets: Option<&Vec<serde_json::Value>> = inner
+    let targets: Option<&Vec<serde_json::Value>> = data
         .as_array()
-        .or_else(|| inner.get("targets").and_then(|v| v.as_array()))
-        .or_else(|| inner.get("data").and_then(|d| d.as_array()));
+        .or_else(|| data.get("targets").and_then(|v| v.as_array()))
+        .or_else(|| data.get("data").and_then(|d| d.as_array()));
 
     let Some(targets) = targets else {
-        return Ok(CliResponse::success(inner, "Push targets listed"));
+        return Ok(CliResponse::success(data, "Push targets listed"));
     };
 
     let total = targets.len();
@@ -56,8 +54,10 @@ pub async fn list_targets(client: &ApiClient) -> Result<CliResponse> {
             json!({
                 "id": t.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
                 "name": t.get("name").and_then(|v| v.as_str()).unwrap_or("(unnamed)"),
-                "target_type": t.get("target_type").or_else(|| t.get("type")).and_then(|v| v.as_str()).unwrap_or("unknown"),
-                "enabled": t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                "target_type": t.get("target_type").or_else(|| t.get("type")).cloned().unwrap_or(serde_json::Value::Null),
+                "enabled": t.get("enabled").cloned().unwrap_or(serde_json::Value::Null),
+                "last_error": t.get("last_error").cloned().unwrap_or(serde_json::Value::Null),
+                "last_executed": t.get("last_executed").or_else(|| t.get("updated_at")).cloned().unwrap_or(serde_json::Value::Null),
             })
         })
         .collect();
@@ -71,10 +71,7 @@ pub async fn list_targets(client: &ApiClient) -> Result<CliResponse> {
 /// Get a push target by ID.
 pub async fn get_target(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client.get(&format!("/data-push/{}", id)).await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Push target retrieved",
-    ))
+    Ok(CliResponse::success(data, "Push target retrieved"))
 }
 
 /// Create a push target.
@@ -104,7 +101,7 @@ pub async fn create_target(
     }
 
     // 3. Validate config is valid JSON
-    let mut config_val: serde_json::Value = match serde_json::from_str(config) {
+    let mut config_val: serde_json::Value = match crate::json_arg::parse_json_arg(config) {
         Ok(v) => v,
         Err(e) => {
             return Ok(CliResponse::error_with_suggestion(
@@ -157,22 +154,8 @@ pub async fn create_target(
     body["config"] = config_val;
 
     let data = client.post("/data-push", &body).await?;
-    let data = extract_inner_data(data);
-    let target_id = data["id"].as_str().unwrap_or("unknown").to_string();
 
-    let meta = BuildMeta {
-        r#type: "push".to_string(),
-        action: "create".to_string(),
-        entity_id: target_id.clone(),
-        entity_name: Some(name.to_string()),
-        undo_command: format!("heramind push delete {}", target_id),
-    };
-
-    Ok(CliResponse::success_with_meta(
-        data,
-        "Push target created",
-        meta,
-    ))
+    Ok(CliResponse::success(data, "Push target created"))
 }
 
 /// Update a push target.
@@ -196,17 +179,30 @@ pub async fn update_target(
         // Parse config; lift any mistakenly-nested top-level fields out so they
         // take effect instead of being silently swallowed by the webhook/mqtt
         // config parser.
-        let mut cfg_val: serde_json::Value =
-            serde_json::from_str(c).unwrap_or_else(|_| json!({"url": c}));
+        let mut cfg_val: serde_json::Value = match crate::json_arg::parse_json_arg(c) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(CliResponse::error_with_suggestion(
+                    format!("Invalid --config JSON: {}", e),
+                    "INVALID_JSON",
+                    r#"Pass a JSON object, e.g. --config {"url":"https://example.com/webhook"}."#,
+                ));
+            }
+        };
         lift_top_level_fields(&mut cfg_val, &mut body);
         body["config"] = cfg_val;
     }
     if let Some(e) = enabled {
         body["enabled"] = json!(e);
     }
-    // Source filter. only_changes only takes effect together with --sources,
-    // because data_filter is replaced as a whole (we can't patch one field
-    // without knowing the existing patterns from the server side).
+    // Source filter. only_changes without --sources used to be silently dropped.
+    if only_changes.is_some() && sources.is_none() {
+        return Ok(CliResponse::error_with_suggestion(
+            "--only-changes requires --sources (data_filter is replaced as a whole)",
+            "MISSING_SOURCES",
+            "Pass both flags, e.g. --sources 'device:temp:' --only-changes",
+        ));
+    }
     if let Some(src) = sources {
         body["data_filter"] = json!({
             "source_patterns": parse_source_patterns(src),
@@ -223,23 +219,17 @@ pub async fn update_target(
         };
     }
     if let Some(tpl) = template {
-        body["template"] = serde_json::from_str(tpl).unwrap_or_else(|_| json!(tpl));
+        body["template"] = crate::json_arg::parse_json_arg(tpl).unwrap_or_else(|_| json!(tpl));
     }
 
     let data = client.put(&format!("/data-push/{}", id), &body).await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Push target updated",
-    ))
+    Ok(CliResponse::success(data, "Push target updated"))
 }
 
 /// Delete a push target.
 pub async fn delete_target(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client.delete(&format!("/data-push/{}", id)).await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Push target deleted",
-    ))
+    Ok(CliResponse::success(data, "Push target deleted"))
 }
 
 /// Start a push target.
@@ -247,10 +237,7 @@ pub async fn start_target(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client
         .post(&format!("/data-push/{}/start", id), &json!({}))
         .await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Push target started",
-    ))
+    Ok(CliResponse::success(data, "Push target started"))
 }
 
 /// Stop a push target.
@@ -258,10 +245,7 @@ pub async fn stop_target(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client
         .post(&format!("/data-push/{}/stop", id), &json!({}))
         .await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Push target stopped",
-    ))
+    Ok(CliResponse::success(data, "Push target stopped"))
 }
 
 /// Test a push target.
@@ -269,10 +253,7 @@ pub async fn test_target(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client
         .post(&format!("/data-push/{}/test", id), &json!({}))
         .await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Push target test completed",
-    ))
+    Ok(CliResponse::success(data, "Push target test completed"))
 }
 
 /// List delivery logs for a push target.
@@ -283,19 +264,13 @@ pub async fn list_logs(client: &ApiClient, id: &str, limit: Option<usize>) -> Re
         format!("/data-push/{}/logs", id)
     };
     let data = client.get(&path).await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Delivery logs listed",
-    ))
+    Ok(CliResponse::success(data, "Delivery logs listed"))
 }
 
 /// Get push statistics.
 pub async fn get_stats(client: &ApiClient) -> Result<CliResponse> {
     let data = client.get("/data-push/stats").await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Push stats retrieved",
-    ))
+    Ok(CliResponse::success(data, "Push stats retrieved"))
 }
 
 #[cfg(test)]
@@ -348,5 +323,30 @@ mod tests {
         lift_top_level_fields(&mut config, &mut body);
         assert!(body.as_object().unwrap().is_empty());
         assert_eq!(config["url"], "https://example.com");
+    }
+}
+
+#[cfg(test)]
+mod honesty_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn only_changes_without_sources_errors() {
+        let client = crate::ApiClient::with_base_url("http://127.0.0.1:9/api");
+        let out = update_target(
+            &client,
+            "t1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+        )
+        .await
+        .unwrap();
+        assert!(!out.success);
+        assert_eq!(out.code.as_deref(), Some("MISSING_SOURCES"));
     }
 }

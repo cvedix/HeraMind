@@ -11,6 +11,7 @@
 //! - Error recovery for long-running stability
 
 pub mod executor;
+pub mod notify;
 pub mod scheduler;
 
 use heramind_storage::{
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub use executor::{AgentExecutor, AgentExecutorConfig};
+pub use notify::default_agent_notify;
 pub use scheduler::{AgentScheduler, BackendSemaphores, SchedulerConfig};
 
 /// AI Agent manager - the main entry point for user-defined agents.
@@ -179,6 +181,10 @@ impl AiAgentManager {
             system_prompt: None,
             max_retries: 0,
             consecutive_failures: 0,
+            output_schema: None,
+            operator_config: None,
+            memory_mode: None,
+            notify: None,
             conversation_history: Default::default(),
             user_messages: Default::default(),
             conversation_summary: Default::default(),
@@ -187,6 +193,7 @@ impl AiAgentManager {
             max_chain_depth: 3,          // Default max depth
             tool_config: None,
             execution_mode: Default::default(),
+            max_tokens_per_run: None,
         };
 
         // Save agent to storage
@@ -235,6 +242,27 @@ impl AiAgentManager {
                 None
             };
 
+        // Concurrency accounting, same as the scheduler and event paths:
+        // manual invoke used to bypass BOTH the global execution semaphore
+        // and the per-backend permits, adding unaccounted load alongside
+        // scheduled/event runs (the executor's re-entrancy guard now rejects
+        // the same-agent race outright).
+        let _global_permit = self
+            .scheduler
+            .execution_semaphore()
+            .clone()
+            .acquire_owned()
+            .await
+            .ok();
+        let backend_id = agent
+            .llm_backend_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let backend_sems = Some(self.scheduler.backend_semaphores().clone());
+        let _backend_permit =
+            AgentExecutor::acquire_backend_permit_public(&backend_sems, &agent.id, &backend_id)
+                .await;
+
         // Execute the agent with optional invocation input
         let result = self
             .executor
@@ -276,24 +304,63 @@ impl AiAgentManager {
             },
         };
 
-        // Update agent status based on result
-        let new_status = if result.is_ok() {
-            // A manual task idles as Completed (not Active): it has no
-            // standing duty and the scheduler must not pick it up. Manual
-            // invoke always works — Completed is a ready-state, not terminal.
-            if agent.schedule.schedule_type == ScheduleType::Manual {
-                AgentStatus::Completed
-            } else {
-                AgentStatus::Active
-            }
-        } else {
-            AgentStatus::Error
-        };
+        // Status semantics, aligned with the scheduler path. The executor
+        // has ALREADY classified a failed run before returning (transient →
+        // Active, permanent → Error); overwriting that back to Active here
+        // made a persistently-failing agent look healthy after every manual
+        // probe. And pre-flight errors used to unconditionally demote to
+        // Error — including "already executing" (busy, not broken) and
+        // transient network failures, contradicting the scheduler path.
         let error_msg = result.as_ref().err().map(|e| e.to_string());
-        self.executor
-            .store()
-            .update_agent_status(agent_id, new_status, error_msg)
-            .await?;
+        match &result {
+            Ok(_record) => {
+                if agent.schedule.schedule_type == ScheduleType::Manual {
+                    // Manual agents idle as Completed (not Active), including
+                    // after a non-breaker business failure — otherwise the
+                    // executor's Active write sticks and reload_active_agents
+                    // would pick them up on restart. Only a tripped breaker
+                    // (store status Error) stays demoted.
+                    let demoted = self
+                        .executor
+                        .store()
+                        .get_agent(agent_id)
+                        .await?
+                        .is_some_and(|a| a.status == AgentStatus::Error);
+                    if !demoted {
+                        self.executor
+                            .store()
+                            .update_agent_status(agent_id, AgentStatus::Completed, None)
+                            .await?;
+                    } else {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            "manual run tripped breaker — keeping Error"
+                        );
+                    }
+                } else if _record.error.is_none() {
+                    self.executor
+                        .store()
+                        .update_agent_status(agent_id, AgentStatus::Active, None)
+                        .await?;
+                } else {
+                    // Failed run — the executor's own status verdict stands.
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        "manual run failed — keeping the executor's status verdict"
+                    );
+                }
+            }
+            Err(e) => {
+                let transient = e.to_string().contains("already executing")
+                    || crate::ai_agent::executor::is_transient_failure_shared(Some(&e.to_string()));
+                if !transient {
+                    self.executor
+                        .store()
+                        .update_agent_status(agent_id, AgentStatus::Error, error_msg)
+                        .await?;
+                }
+            }
+        }
 
         Ok(summary)
     }
@@ -482,14 +549,11 @@ impl AiAgentManager {
     /// (process died), not a flaw in the agent itself — the user expects the
     /// agent to keep running on its schedule after a restart.
     ///
-    /// Also reactivates agents in `Error` status. Without this, any agent
-    /// that landed in `Error` before the restart (transient failure, config
-    /// bug, OOM, etc.) is permanently dropped from the scheduler — the user
-    /// has to manually reactivate each one from the UI, with no log clue
-    /// about why it stopped. After restart, all `Active` + `Error` agents
-    /// are re-scheduled; if the failure condition still exists the agent
-    /// will fail again and land back in `Error`, surfacing the problem in
-    /// logs/UI rather than silently disappearing.
+    /// Also REPORTS agents in `Error` status at startup (kept in Error — the
+    /// circuit breaker probes them once per cooldown window; the older
+    /// behavior mass-reactivated every failing agent on restart, defeating
+    /// that gate and burning a full run per tick on persistently-broken
+    /// agents).
     async fn reset_stale_executing_agents(&self) {
         use heramind_storage::{AgentFilter, AgentStatus};
 
@@ -546,8 +610,16 @@ impl AiAgentManager {
             );
         }
 
-        // Reactivate agents in Error status so they get rescheduled.
-        // See function docstring for rationale.
+        // [changed] Error agents are NOT mass-reactivated anymore. The
+        // rationale was "after restart everything reschedules and a
+        // persistent failure lands back in Error, visibly" — but that
+        // defeated the circuit-breaker gate (one probe per cooldown
+        // window): every restart revived every failing agent to Active,
+        // and a persistently-broken one burned a full run per tick until
+        // it failed its way back to Error. Leaving them in Error preserves
+        // the verdict AND keeps the probe cadence; the operator re-enables
+        // from the UI when the underlying condition is fixed. We still
+        // LOG them so a restart surfaces what is degraded.
         let errored = match self
             .list_agents(AgentFilter {
                 status: Some(AgentStatus::Error),
@@ -560,7 +632,7 @@ impl AiAgentManager {
                 tracing::warn!(
                     category = "agent",
                     error = %e,
-                    "Failed to scan for Error agents; skipping reactivation"
+                    "Failed to scan for Error agents; skipping report"
                 );
                 return;
             }
@@ -571,37 +643,19 @@ impl AiAgentManager {
         }
 
         let count = errored.len();
-        tracing::info!(
+        tracing::warn!(
             error_count = count,
-            "Reactivating agents in Error status at startup (will re-fail if condition persists)"
+            "Agents starting in Error status (kept — the circuit breaker probes once per cooldown; re-enable from the UI once fixed)"
         );
 
         for agent in &errored {
-            let id = agent.id.clone();
-            if let Err(e) = self
-                .executor
-                .store()
-                .update_agent_status(&id, AgentStatus::Active, None)
-                .await
-            {
-                tracing::warn!(
-                    agent_id = %id,
-                    error = %e,
-                    "Failed to reactivate Error agent"
-                );
-            } else {
-                tracing::info!(
-                    agent_id = %id,
-                    name = %agent.name,
-                    "Reactivated Error agent to Active"
-                );
-            }
+            tracing::info!(
+                agent_id = %agent.id,
+                name = %agent.name,
+                error = ?agent.error_message,
+                "Agent in Error at startup"
+            );
         }
-
-        tracing::info!(
-            reactivated_count = count,
-            "Error agents reactivated to Active"
-        );
     }
 
     /// Stop the scheduler.

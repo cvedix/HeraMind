@@ -128,6 +128,10 @@ impl Extension for WeatherExtension {
                         fixed_values: Default::default(),
                         samples: vec![json!({"city": "Beijing", "days": 3})],
                         parameter_groups: vec![],
+                        ai_exposed: true,
+                        effect: Default::default(),
+                        replay_safety: Default::default(),
+                        execution: Default::default(),
                     },
                     ExtensionCommand {
                         name: "get_current".to_string(),
@@ -148,6 +152,10 @@ impl Extension for WeatherExtension {
                         fixed_values: Default::default(),
                         samples: vec![json!({"city": "Shanghai"})],
                         parameter_groups: vec![],
+                        ai_exposed: true,
+                        effect: Default::default(),
+                        replay_safety: Default::default(),
+                        execution: Default::default(),
                     },
                 ]
             })
@@ -318,6 +326,10 @@ impl Extension for SensorExtension {
                         fixed_values: Default::default(),
                         samples: vec![],
                         parameter_groups: vec![],
+                        ai_exposed: true,
+                        effect: Default::default(),
+                        replay_safety: Default::default(),
+                        execution: Default::default(),
                     },
                     ExtensionCommand {
                         name: "read_sensor".to_string(),
@@ -345,6 +357,10 @@ impl Extension for SensorExtension {
                         fixed_values: Default::default(),
                         samples: vec![json!({"sensor": "temperature"})],
                         parameter_groups: vec![],
+                        ai_exposed: true,
+                        effect: Default::default(),
+                        replay_safety: Default::default(),
+                        execution: Default::default(),
                     },
                 ]
             })
@@ -438,6 +454,7 @@ impl Extension for SensorExtension {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_complete_weather_extension_workflow() {
     let registry = ExtensionRegistry::new();
 
@@ -512,6 +529,7 @@ async fn test_complete_weather_extension_workflow() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_complete_sensor_extension_workflow() {
     let registry = ExtensionRegistry::new();
 
@@ -556,6 +574,7 @@ async fn test_complete_sensor_extension_workflow() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_multi_extension_coordination() {
     let registry = ExtensionRegistry::new();
 
@@ -652,6 +671,7 @@ impl heramind_core::extension::context::ExtensionCapabilityProvider for MockCapa
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_extension_with_capabilities() {
     let providers = Arc::new(RwLock::new(HashMap::new()));
     let config = ExtensionContextConfig {
@@ -695,6 +715,7 @@ async fn test_extension_with_capabilities() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_extension_runtime_workflow() {
     let registry = Arc::new(ExtensionRegistry::new());
     let service = ExtensionRuntime::with_defaults(registry.clone());
@@ -722,6 +743,7 @@ async fn test_extension_runtime_workflow() {
 // ============================================================================
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_high_volume_command_execution() {
     let registry = Arc::new(ExtensionRegistry::new());
 
@@ -757,6 +779,7 @@ async fn test_high_volume_command_execution() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_concurrent_multi_extension_operations() {
     let registry = Arc::new(ExtensionRegistry::new());
 

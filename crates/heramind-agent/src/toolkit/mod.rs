@@ -5,6 +5,7 @@
 pub mod error;
 pub mod extension_tools;
 pub mod file_edit;
+pub mod file_read;
 pub mod file_write;
 pub mod image_edit;
 pub mod memory_tool;
@@ -18,6 +19,7 @@ pub mod timeouts;
 pub mod tool;
 pub mod vision;
 pub mod web_fetch;
+pub mod web_search;
 
 // Re-exports consumed via shortcut path (toolkit::TypeName)
 pub use error::{Result, ToolError};
@@ -34,12 +36,14 @@ pub use shell::ShellConfig;
 pub use memory_tool::MemoryTool;
 
 pub use file_edit::FileEditTool;
+pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use vision::{VisionConfig, VisionTool};
 
 pub use image_edit::ImageEditTool;
 
 pub use web_fetch::WebFetchTool;
+pub use web_search::WebSearchTool;
 
 /// Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

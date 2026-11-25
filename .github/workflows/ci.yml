@@ -1,14 +1,22 @@
 name: CI Checks
 
-# Continuous-integration checks that don't gate the release pipeline.
-# Runs on every PR and every push to main; cheap enough that we don't
-# cache aggressively here (the release pipeline in build.yml owns caching).
+# Continuous-integration quality gates: frontend lint/typecheck/unit tests,
+# Rust fmt/clippy/tests, skill↔CLI drift, llama.cpp pin sync, desktop compile
+# check, cargo-audit.
+# Runs standalone on every PR and push to main, and — via workflow_call — as
+# the first stage of the release pipelines (build.yml, docker.yml), so no
+# compilation starts until every gate passes.
+# Kept affordable rather than exhaustively cached (the release pipeline in
+# build.yml owns the aggressive caching).
 
 on:
   pull_request:
     branches: [main]
   push:
     branches: [main]
+  # Called as the quality-gate stage of build.yml / docker.yml. The trigger
+  # filters above don't apply to workflow_call invocations — all jobs run.
+  workflow_call:
   workflow_dispatch:
 
 env:
@@ -39,6 +47,20 @@ jobs:
       # that lands.
       - name: Lint (error-level only)
         run: npm run lint:ci
+
+      # Warning ratchet: the legacy warning count is frozen in .eslint-baseline
+      # and may only go DOWN. New warnings fail CI immediately; cleanup lowers
+      # the baseline in the same PR that removes them.
+      - name: Lint warning ratchet (must not exceed baseline)
+        run: |
+          BASELINE=$(cat .eslint-baseline)
+          COUNT=$(npx eslint . --ext ts,tsx --report-unused-disable-directives --format json \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const r=JSON.parse(d);console.log(r.reduce((s,f)=>s+f.warningCount,0))})")
+          echo "ESLint warnings: $COUNT (baseline: $BASELINE)"
+          if [ "$COUNT" -gt "$BASELINE" ]; then
+            echo "::error::ESLint warnings grew past the frozen baseline ($COUNT > $BASELINE). Fix the new warnings; lower .eslint-baseline only as part of warning cleanup."
+            exit 1
+          fi
 
       - name: Typecheck
         run: npx tsc --noEmit
@@ -80,6 +102,19 @@ jobs:
           HERAMIND_SKILL_MANIFEST: /tmp/skill_manifest.json
         run: |
           cargo test -p heramind-cli-ops --test skill_cli_drift -- --nocapture --test-threads=1
+
+  llama-pin-sync:
+    name: llama.cpp pin sync check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Check llama.cpp version pins are in sync
+        run: python3 scripts/check_llama_pin_sync.py
 
   skill-parser-tests:
     name: Skill parser / matcher tests
@@ -151,7 +186,7 @@ jobs:
         # The serve tests run the real binary with HERAMIND_EXIT_AFTER_READY_MS
         # (graceful exit after startup) + a per-test temp data dir, so they
         # need no special environment beyond free ports on a fresh runner.
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --features heramind-agent/test-utils
 
   desktop-checks:
     name: Desktop (web/src-tauri) compile check
@@ -222,8 +257,25 @@ jobs:
             --ignore RUSTSEC-2026-0098 \
             --ignore RUSTSEC-2026-0099 \
             --ignore RUSTSEC-2026-0049 \
-            --ignore RUSTSEC-2024-0437
-          # webpki 0.102 (0104/0098/0099/0049): upstream-blocked — rumqttc 0.25.1
-          #   pins webpki 0.102; re-check on each rumqttc release.
+            --ignore RUSTSEC-2026-0382 \
+            --ignore RUSTSEC-2024-0437 \
+            --ignore RUSTSEC-2026-0002 \
+            --ignore RUSTSEC-2026-0367 \
+            --ignore RUSTSEC-2026-0368 \
+            --ignore RUSTSEC-2026-0369
+          # webpki 0.102 (0104/0098/0099/0049/0382): upstream-blocked — rumqttc
+          #   0.25.1 pins webpki 0.102 and is itself the latest 0.x; re-check on
+          #   each rumqttc release. 0382 (distrusted intermediates accepted) only
+          #   bites MQTT-over-TLS client verification; the platform's default
+          #   broker is plain TCP on localhost. The rustls 0.23 line used by
+          #   reqwest was updated to webpki 0.103.16 in the same commit.
           # protobuf RUSTSEC-2024-0437: prometheus output-only (encodes, never
           #   parses external protobuf) -> unexploitable; re-check if we parse untrusted input.
+          # lru RUSTSEC-2026-0002 (unsound IterMut under Stacked Borrows):
+          #   we never call IterMut on the LRU (plain get/put hot paths only),
+          #   and 0.13 still carries the advisory; re-check on each lru release.
+          # zip 2.x 0367/0368/0369: all three are extract()-path privilege
+          #   escalations (SUID bits, symlink escape, perms-through-symlinks).
+          #   We NEVER call ZipArchive::extract — runtime.rs/frontend_components
+          #   open entries by name and copy bytes explicitly. Blocked at zip
+          #   "^2.1" (workspace pin); revisit on the zip 9 migration.

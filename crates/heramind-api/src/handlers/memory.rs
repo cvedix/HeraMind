@@ -16,7 +16,11 @@ use heramind_storage::{
     CategoryStats, MarkdownMemoryStore, MemoryCategory, MemoryConfig, MemoryFileInfo,
 };
 
-use super::ServerState;
+use super::{
+    common::{ok, HandlerResult},
+    ServerState,
+};
+use crate::models::ErrorResponse;
 
 // ============================================================================
 // Response Types
@@ -85,7 +89,8 @@ pub struct AddMemoryRequest {
 
 /// Get the memory store
 fn get_memory_store(_state: &ServerState) -> MarkdownMemoryStore {
-    MarkdownMemoryStore::new(heramind_core::paths::data_dir().join("memory"))
+    let config = heramind_storage::MemoryConfig::load();
+    MarkdownMemoryStore::with_config(&config.storage_path, config.clone())
 }
 
 /// Create error response
@@ -175,36 +180,25 @@ pub async fn update_category(
     State(state): State<ServerState>,
     Path(category): Path<String>,
     Json(req): Json<UpdateMemoryRequest>,
-) -> Response {
-    let cat = match MemoryCategory::parse_category(&category) {
-        Some(c) => c,
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid category: {}", category),
-            )
-        }
-    };
+) -> HandlerResult<serde_json::Value> {
+    let cat = MemoryCategory::parse_category(&category).ok_or_else(|| {
+        ErrorResponse::bad_request(format!("Invalid category: {}", category)).with_hint(
+            "Valid categories: user_profile, domain_knowledge, task_patterns, system_evolution",
+        )
+    })?;
 
     let store = get_memory_store(&state);
-    if let Err(e) = store.init() {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to initialize store: {}", e),
-        );
-    }
+    store
+        .init()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to initialize store: {}", e)))?;
 
-    match store.write_category(&cat, &req.content) {
-        Ok(()) => Json(serde_json::json!({
-            "success": true,
-            "message": format!("Category {} updated", cat.display_name())
-        }))
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write category: {}", e),
-        ),
-    }
+    store
+        .write_category(&cat, &req.content)
+        .map_err(|e| ErrorResponse::internal(format!("Failed to write category: {}", e)))?;
+
+    ok(serde_json::json!({
+        "message": format!("Category {} updated", cat.display_name())
+    }))
 }
 
 /// GET /api/memory/stats - Get all file statistics (unified response)
@@ -302,18 +296,14 @@ pub async fn get_config(State(_state): State<ServerState>) -> Response {
 pub async fn update_config(
     State(_state): State<ServerState>,
     Json(req): Json<UpdateConfigRequest>,
-) -> Response {
-    match req.config.save() {
-        Ok(()) => Json(serde_json::json!({
-            "success": true,
-            "config": req.config
-        }))
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to save config: {}", e),
-        ),
-    }
+) -> HandlerResult<serde_json::Value> {
+    req.config
+        .save()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to save config: {}", e)))?;
+
+    ok(serde_json::json!({
+        "config": req.config
+    }))
 }
 
 /// POST /api/memory/add - Manually add a memory entry
@@ -321,33 +311,20 @@ pub async fn update_config(
 pub async fn add_memory_entry(
     State(state): State<ServerState>,
     Json(req): Json<AddMemoryRequest>,
-) -> Response {
+) -> HandlerResult<serde_json::Value> {
     // Parse category
-    let category = match MemoryCategory::parse_category(&req.category) {
-        Some(c) => c,
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "Invalid category: {}. Valid: user_profile, domain_knowledge, task_patterns, system_evolution",
-                    req.category
-                ),
-            )
-        }
-    };
+    let category = MemoryCategory::parse_category(&req.category).ok_or_else(|| {
+        ErrorResponse::bad_request(format!("Invalid category: {}", req.category)).with_hint(
+            "Valid categories: user_profile, domain_knowledge, task_patterns, system_evolution",
+        )
+    })?;
 
     let store = state.agents.system_memory_store.clone();
 
     // Read existing content
-    let mut content = match store.read_category(&category) {
-        Ok(c) => c,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to read category: {}", e),
-            )
-        }
-    };
+    let mut content = store
+        .read_category(&category)
+        .map_err(|e| ErrorResponse::internal(format!("Failed to read category: {}", e)))?;
 
     // Format the entry
     let timestamp = chrono::Utc::now().format("%Y-%m-%d");
@@ -363,17 +340,13 @@ pub async fn add_memory_entry(
     content.push_str(&entry);
 
     // Write back
-    match store.write_category(&category, &content) {
-        Ok(()) => Json(serde_json::json!({
-            "success": true,
-            "message": format!("Memory added to {}", category.display_name())
-        }))
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write memory: {}", e),
-        ),
-    }
+    store
+        .write_category(&category, &content)
+        .map_err(|e| ErrorResponse::internal(format!("Failed to write memory: {}", e)))?;
+
+    ok(serde_json::json!({
+        "message": format!("Memory added to {}", category.display_name())
+    }))
 }
 
 /// POST /api/memory/compress - Trigger manual eviction
@@ -385,51 +358,42 @@ pub async fn add_memory_entry(
         (status = 200, description = "Memory compression triggered"),
     )
 )]
-pub async fn trigger_compress(State(state): State<ServerState>) -> Response {
+pub async fn trigger_compress(
+    State(state): State<ServerState>,
+) -> HandlerResult<serde_json::Value> {
     use heramind_agent::memory::compressor::evict_to_limit;
 
     tracing::info!("Starting memory eviction request");
 
     let config = heramind_storage::MemoryConfig::load();
-    let store = (*state.agents.system_memory_store).clone();
+    // Clone the Arc handle, keeping identity with the canonical store the
+    // background jobs write through (store clones share the locks since the
+    // manual Clone, but the Arc leaves no room for future drift).
+    let store = state.agents.system_memory_store.clone();
 
-    // Evict user file to limit
-    let user_content = store.read_file("user").await.unwrap_or_default();
-    let user_result = evict_to_limit(&user_content, config.user_char_limit);
-    let mut total_evicted = 0;
-    if user_result.evicted {
-        if let Err(e) = store.write_file("user", &user_result.content).await {
-            tracing::warn!(error = %e, "Failed to write evicted user content");
-        } else {
-            total_evicted += user_result.lines_removed;
-        }
-    }
-
-    // Evict knowledge file to limit
-    let knowledge_content = store.read_file("knowledge").await.unwrap_or_default();
-    let knowledge_result = evict_to_limit(&knowledge_content, config.knowledge_char_limit);
-    if knowledge_result.evicted {
-        if let Err(e) = store
-            .write_file("knowledge", &knowledge_result.content)
-            .await
-        {
-            tracing::warn!(error = %e, "Failed to write evicted knowledge content");
-        } else {
-            total_evicted += knowledge_result.lines_removed;
-        }
-    }
-
-    // Evict procedures file to limit
-    let procedures_content = store.read_file("procedures").await.unwrap_or_default();
-    let procedures_result = evict_to_limit(&procedures_content, config.procedures_char_limit);
-    if procedures_result.evicted {
-        if let Err(e) = store
-            .write_file("procedures", &procedures_result.content)
-            .await
-        {
-            tracing::warn!(error = %e, "Failed to write evicted procedures content");
-        } else {
-            total_evicted += procedures_result.lines_removed;
+    let mut total_evicted = 0usize;
+    for (target, limit) in [
+        ("user", config.user_char_limit),
+        ("knowledge", config.knowledge_char_limit),
+        ("procedures", config.procedures_char_limit),
+    ] {
+        // Atomic read-evict-write under the shared write lock — a plain
+        // read_file→write_file pair could revert a concurrent background
+        // marker write landing between its two halves.
+        let mut lines_removed = 0usize;
+        let result = store
+            .modify_file(target, |current| {
+                let r = evict_to_limit(current, limit);
+                lines_removed = r.lines_removed;
+                r.content
+            })
+            .await;
+        match result {
+            Ok(true) => total_evicted += lines_removed,
+            Ok(false) => {} // within limit, nothing evicted
+            Err(e) => {
+                tracing::warn!(target, error = %e, "Failed to evict memory file");
+            }
         }
     }
 
@@ -442,12 +406,10 @@ pub async fn trigger_compress(State(state): State<ServerState>) -> Response {
         )
     };
 
-    Json(serde_json::json!({
-        "success": true,
+    ok(serde_json::json!({
         "lines_evicted": total_evicted,
         "message": message
     }))
-    .into_response()
 }
 
 /// GET /api/memory/export - Export all categories as Markdown
@@ -575,20 +537,16 @@ pub async fn update_memory_content(
     State(state): State<ServerState>,
     Path((source_type, id)): Path<(String, String)>,
     Json(request): Json<UpdateMemoryRequest>,
-) -> Response {
+) -> HandlerResult<serde_json::Value> {
     let store = get_memory_store(&state);
 
-    match store.write_raw_markdown(&source_type, &id, &request.content) {
-        Ok(()) => Json(serde_json::json!({
-            "success": true,
-            "message": "Memory updated"
-        }))
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to update memory: {}", e),
-        ),
-    }
+    store
+        .write_raw_markdown(&source_type, &id, &request.content)
+        .map_err(|e| ErrorResponse::internal(format!("Failed to update memory: {}", e)))?;
+
+    ok(serde_json::json!({
+        "message": "Memory updated"
+    }))
 }
 
 /// DELETE /api/memory/:source_type/:id - Delete a memory file
@@ -609,37 +567,27 @@ pub async fn update_memory_content(
 pub async fn delete_memory_file(
     State(state): State<ServerState>,
     Path((source_type, id)): Path<(String, String)>,
-) -> Response {
+) -> HandlerResult<serde_json::Value> {
     let store = get_memory_store(&state);
 
-    match store.delete_file(&source_type, &id) {
-        Ok(()) => Json(serde_json::json!({
-            "success": true,
-            "message": "Memory file deleted"
-        }))
-        .into_response(),
-        Err(e) => {
-            use heramind_storage::Error as StoreError;
-            match e {
-                // "system" (and any other non-agent/chat source_type) is a
-                // client mistake — 400, not 500.
-                StoreError::Storage(ref msg) if msg.contains("Cannot delete system memory") => {
-                    error_response(
-                        StatusCode::BAD_REQUEST,
-                        format!("Failed to delete memory: {e}"),
-                    )
-                }
-                StoreError::NotFound(ref msg) => error_response(
-                    StatusCode::NOT_FOUND,
-                    format!("Failed to delete memory: {msg}"),
-                ),
-                other => error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to delete memory: {other}"),
-                ),
+    store.delete_file(&source_type, &id).map_err(|e| {
+        use heramind_storage::Error as StoreError;
+        match e {
+            // "system" (and any other non-agent/chat source_type) is a
+            // client mistake — 400, not 500.
+            StoreError::Storage(ref msg) if msg.contains("Cannot delete system memory") => {
+                ErrorResponse::bad_request(format!("Failed to delete memory: {e}"))
             }
+            StoreError::NotFound(ref msg) => {
+                ErrorResponse::not_found(format!("Memory file ({msg})"))
+            }
+            other => ErrorResponse::internal(format!("Failed to delete memory: {other}")),
         }
-    }
+    })?;
+
+    ok(serde_json::json!({
+        "message": "Memory file deleted"
+    }))
 }
 
 /// GET /api/memory/export - Export all memory as a single Markdown (Legacy)
@@ -664,38 +612,29 @@ pub async fn export_memory(State(state): State<ServerState>) -> Response {
 pub async fn get_memory_file(
     State(state): State<ServerState>,
     Path(target): Path<String>,
-) -> Response {
+) -> HandlerResult<serde_json::Value> {
     if !matches!(target.as_str(), "user" | "knowledge" | "procedures") {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Invalid target: {}. Must be 'user', 'knowledge', or 'procedures'",
-                target
-            ),
+        return Err(
+            ErrorResponse::bad_request(format!("Invalid target: {}", target))
+                .with_hint("Target must be 'user', 'knowledge', or 'procedures'."),
         );
     }
 
     let store = get_memory_store(&state);
-    if let Err(e) = store.init() {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to initialize store: {}", e),
-        );
-    }
+    store
+        .init()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to initialize store: {}", e)))?;
 
-    match store.read_file(&target).await {
-        Ok(content) => Json(serde_json::json!({
-            "success": true,
-            "target": target,
-            "content": content,
-            "chars": content.chars().count(),
-        }))
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read {}: {}", target, e),
-        ),
-    }
+    let content = store
+        .read_file(&target)
+        .await
+        .map_err(|e| ErrorResponse::internal(format!("Failed to read {}: {}", target, e)))?;
+
+    ok(serde_json::json!({
+        "target": target,
+        "content": content,
+        "chars": content.chars().count(),
+    }))
 }
 
 /// PUT /api/memory/file/:target - Update memory file content (user, knowledge, or procedures)
@@ -716,40 +655,29 @@ pub async fn update_memory_file(
     State(state): State<ServerState>,
     Path(target): Path<String>,
     Json(req): Json<UpdateMemoryRequest>,
-) -> Response {
+) -> HandlerResult<serde_json::Value> {
     if !matches!(target.as_str(), "user" | "knowledge" | "procedures") {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Invalid target: {}. Must be 'user', 'knowledge', or 'procedures'",
-                target
-            ),
+        return Err(
+            ErrorResponse::bad_request(format!("Invalid target: {}", target))
+                .with_hint("Target must be 'user', 'knowledge', or 'procedures'."),
         );
     }
 
     let store = get_memory_store(&state);
-    if let Err(e) = store.init() {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to initialize store: {}", e),
-        );
-    }
+    store
+        .init()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to initialize store: {}", e)))?;
 
-    match store.write_file(&target, &req.content).await {
-        Ok(()) => {
-            tracing::info!(target = %target, chars = req.content.len(), "Memory file updated via API");
-            Json(serde_json::json!({
-                "success": true,
-                "message": format!("{} updated", target),
-                "chars": req.content.chars().count(),
-            }))
-            .into_response()
-        }
-        Err(e) => error_response(
-            StatusCode::BAD_REQUEST,
-            format!("Failed to write {}: {}", target, e),
-        ),
-    }
+    store
+        .write_file(&target, &req.content)
+        .await
+        .map_err(|e| ErrorResponse::bad_request(format!("Failed to write {}: {}", target, e)))?;
+
+    tracing::info!(target = %target, chars = req.content.chars().count(), "Memory file updated via API");
+    ok(serde_json::json!({
+        "message": format!("{} updated", target),
+        "chars": req.content.chars().count(),
+    }))
 }
 
 // ============================================================================
@@ -765,37 +693,30 @@ pub async fn update_memory_file(
         (status = 200, description = "Custom memory files"),
     )
 )]
-pub async fn list_custom_files(State(state): State<ServerState>) -> Response {
+pub async fn list_custom_files(
+    State(state): State<ServerState>,
+) -> HandlerResult<serde_json::Value> {
     let store = get_memory_store(&state);
-    if let Err(e) = store.init() {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to initialize store: {}", e),
-        );
-    }
+    store
+        .init()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to initialize store: {}", e)))?;
 
-    match store.list_custom_files() {
-        Ok(files) => {
-            let files_json: Vec<serde_json::Value> = files
-                .into_iter()
-                .map(|(name, chars)| {
-                    serde_json::json!({
-                        "name": name,
-                        "chars": chars,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({
-                "success": true,
-                "files": files_json,
-            }))
-            .into_response()
-        }
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to list custom files: {}", e),
-        ),
-    }
+    let files = store
+        .list_custom_files()
+        .map_err(|e| ErrorResponse::internal(format!("Failed to list custom files: {}", e)))?;
+
+    let files_json: Vec<serde_json::Value> = files
+        .into_iter()
+        .map(|(name, chars)| {
+            serde_json::json!({
+                "name": name,
+                "chars": chars,
+            })
+        })
+        .collect();
+    ok(serde_json::json!({
+        "files": files_json,
+    }))
 }
 
 /// GET /api/memory/custom/:name - Read a custom file
@@ -814,22 +735,18 @@ pub async fn list_custom_files(State(state): State<ServerState>) -> Response {
 pub async fn get_custom_file(
     State(state): State<ServerState>,
     Path(name): Path<String>,
-) -> Response {
+) -> HandlerResult<serde_json::Value> {
     let store = get_memory_store(&state);
 
-    match store.read_custom_file(&name) {
-        Ok(content) => Json(serde_json::json!({
-            "success": true,
-            "name": name,
-            "content": content,
-            "chars": content.chars().count(),
-        }))
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::NOT_FOUND,
-            format!("Custom file not found: {}", e),
-        ),
-    }
+    let content = store
+        .read_custom_file(&name)
+        .map_err(|e| ErrorResponse::not_found(format!("Custom file '{}' ({})", name, e)))?;
+
+    ok(serde_json::json!({
+        "name": name,
+        "content": content,
+        "chars": content.chars().count(),
+    }))
 }
 
 /// PUT /api/memory/custom/:name - Create or update a custom file
@@ -850,24 +767,21 @@ pub async fn update_custom_file(
     State(state): State<ServerState>,
     Path(name): Path<String>,
     Json(req): Json<UpdateMemoryRequest>,
-) -> Response {
+) -> HandlerResult<serde_json::Value> {
     let store = get_memory_store(&state);
 
-    match store.write_custom_file(&name, &req.content) {
-        Ok(()) => {
-            tracing::info!(name = %name, chars = req.content.len(), "Custom memory file updated via API");
-            Json(serde_json::json!({
-                "success": true,
-                "message": format!("Custom file '{}' updated", name),
-                "chars": req.content.chars().count(),
-            }))
-            .into_response()
-        }
-        Err(e) => error_response(
-            StatusCode::BAD_REQUEST,
-            format!("Failed to write custom file '{}': {}", name, e),
-        ),
-    }
+    store
+        .write_custom_file(&name, &req.content)
+        .await
+        .map_err(|e| {
+            ErrorResponse::bad_request(format!("Failed to write custom file '{}': {}", name, e))
+        })?;
+
+    tracing::info!(name = %name, chars = req.content.chars().count(), "Custom memory file updated via API");
+    ok(serde_json::json!({
+        "message": format!("Custom file '{}' updated", name),
+        "chars": req.content.chars().count(),
+    }))
 }
 
 /// DELETE /api/memory/custom/:name - Delete a custom file
@@ -886,18 +800,14 @@ pub async fn update_custom_file(
 pub async fn delete_custom_file(
     State(state): State<ServerState>,
     Path(name): Path<String>,
-) -> Response {
+) -> HandlerResult<serde_json::Value> {
     let store = get_memory_store(&state);
 
-    match store.delete_custom_file(&name) {
-        Ok(()) => Json(serde_json::json!({
-            "success": true,
-            "message": format!("Custom file '{}' deleted", name),
-        }))
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to delete custom file '{}': {}", name, e),
-        ),
-    }
+    store.delete_custom_file(&name).map_err(|e| {
+        ErrorResponse::internal(format!("Failed to delete custom file '{}': {}", name, e))
+    })?;
+
+    ok(serde_json::json!({
+        "message": format!("Custom file '{}' deleted", name),
+    }))
 }

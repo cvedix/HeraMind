@@ -47,6 +47,33 @@ interface SystemInfo {
   gpus: GpuInfo[]
   disks: DiskInfo[]
   networks: NetInfo[]
+  /**
+   * What the HeraMind process itself is using. Absent (not zeroed) when the OS
+   * will not report it — a sandbox without process visibility — so the block
+   * renders only when there is something true to say.
+   */
+  process?: ProcessInfo | null
+  /**
+   * Disk footprint of HeraMind's own data directory. Null until the first
+   * server-side walk completes (it runs in the background, once); refreshed
+   * only via the manual refresh button — never by the polling loop.
+   */
+  data_dir?: { path: string; bytes: number } | null
+}
+
+interface ProcessInfo {
+  pid: number
+  memory_bytes: number
+  virtual_memory_bytes: number
+  /**
+   * Percentage of **one** core, as `top` reports it — can exceed 100.
+   * Null on the first reading after boot, which has nothing to difference
+   * against; the row is absent rather than showing a zero that means "no idea".
+   */
+  cpu_usage?: number | null
+  /** Absent on platforms where the OS will not report it (anything but Linux). */
+  threads?: number | null
+  uptime_secs: number
 }
 
 interface DiskInfo {
@@ -83,13 +110,13 @@ function MetricTile({
   mono?: boolean
 }) {
   return (
-    <div className="rounded-lg border bg-card p-4 space-y-2 transition-colors hover:bg-muted-50">
-      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-        <Icon className="h-3.5 w-3.5" />
-        <span className="uppercase tracking-wide truncate">{label}</span>
+    <div className="min-w-0 overflow-hidden rounded-lg border bg-card p-4 space-y-2 transition-colors hover:bg-muted-50">
+      <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+        <Icon className="h-3.5 w-3.5 shrink-0" />
+        <span className="truncate uppercase tracking-wide">{label}</span>
       </div>
       <div
-        className={`text-2xl font-semibold leading-none truncate ${mono ? "font-mono" : ""}`}
+        className={`truncate text-2xl font-semibold leading-none ${mono ? "font-mono" : ""}`}
       >
         {value}
       </div>
@@ -123,27 +150,27 @@ function UsageGauge({
   const textColor = clamped >= 80 ? "text-error" : clamped >= 60 ? "text-info" : "text-success"
 
   return (
-    <div className="rounded-lg border bg-card p-4 space-y-3">
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div className="space-y-1">
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Icon className="h-3.5 w-3.5" />
-            <span className="uppercase tracking-wide">{label}</span>
+    <div className="min-w-0 overflow-hidden rounded-lg border bg-card p-4 space-y-3">
+      <div className="flex min-w-0 flex-wrap items-end justify-between gap-3">
+        <div className="min-w-0 space-y-1">
+          <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+            <Icon className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate uppercase tracking-wide" title={label}>{label}</span>
           </div>
-          <div className="flex items-baseline gap-2">
+          <div className="flex min-w-0 flex-wrap items-baseline gap-2">
             <span className="font-mono text-2xl font-semibold leading-none">
               {clamped}
               <span className="text-lg text-muted-foreground">%</span>
             </span>
-            {sub && <span className={`text-xs font-mono ${textColor}`}>{sub}</span>}
+            {sub && <span className={`min-w-0 truncate text-xs font-mono ${textColor}`}>{sub}</span>}
           </div>
         </div>
         {rightLabel && (
-          <div className="text-right">
+          <div className="min-w-0 text-right">
             <div className="text-xs text-muted-foreground uppercase tracking-wide">
               {rightLabel}
             </div>
-            {rightValue && <div className="font-mono text-sm font-medium">{rightValue}</div>}
+            {rightValue && <div className="truncate font-mono text-sm font-medium">{rightValue}</div>}
           </div>
         )}
       </div>
@@ -178,10 +205,39 @@ function InfoRow({
   children: ReactNode
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 py-3">
-      <span className="text-sm text-muted-foreground">{label}</span>
-      <div className="text-sm text-right">{children}</div>
+    <div className="flex min-w-0 items-center justify-between gap-3 py-3">
+      <span className="shrink-0 text-sm text-muted-foreground">{label}</span>
+      <div className="min-w-0 flex-1 overflow-hidden text-right text-sm">{children}</div>
     </div>
+  )
+}
+
+/** Right-aligned two-line value: the metric on top, a muted caption beneath.
+    Inline value+caption made these rows run too wide to scan. */
+function TwoLineValue({
+  value,
+  caption,
+  captionTitle,
+  mono = false,
+}: {
+  value: ReactNode
+  caption?: ReactNode
+  /** Hover text for the caption (e.g. a truncated path's full form). */
+  captionTitle?: string
+  mono?: boolean
+}) {
+  return (
+    <span className="flex min-w-0 max-w-full flex-col items-end">
+      <span className="max-w-full truncate font-medium tabular-nums">{value}</span>
+      {caption != null && caption !== "" && (
+        <span
+          title={captionTitle}
+          className={"max-w-full truncate text-xs text-muted-foreground" + (mono ? " font-mono" : "")}
+        >
+          {caption}
+        </span>
+      )}
+    </span>
   )
 }
 
@@ -191,10 +247,10 @@ function ExternalLinkValue({ href, text }: { href: string; text: string }) {
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      className="inline-flex items-center gap-1 font-mono text-info hover:underline"
+      className="inline-flex max-w-full min-w-0 items-center gap-1 font-mono text-info hover:underline"
     >
-      <span>{text}</span>
-      <ExternalLink className="h-3 w-3 text-muted-foreground" />
+      <span className="min-w-0 truncate">{text}</span>
+      <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
     </a>
   )
 }
@@ -254,6 +310,22 @@ export function AboutTab() {
     }
   }
 
+  const [refreshingDataDir, setRefreshingDataDir] = useState(false)
+  // Manual, on-demand only: the server walks the data directory once at
+  // startup and otherwise caches the number; this button is the only thing
+  // that recomputes it (a fresh walk can take seconds on big data dirs).
+  const refreshDataDir = async () => {
+    setRefreshingDataDir(true)
+    try {
+      const { data_dir } = await api.refreshDataDirUsage()
+      setSystemInfo((prev) => (prev ? { ...prev, data_dir } : prev))
+    } catch (error) {
+      handleError(error, { operation: "Refresh data directory usage" })
+    } finally {
+      setRefreshingDataDir(false)
+    }
+  }
+
   const handleCheckForUpdates = async () => {
     setCheckingUpdate(true)
     try {
@@ -307,15 +379,15 @@ export function AboutTab() {
         : t("settings:checkForUpdates")
 
   return (
-    <div className="space-y-8">
+    <div className="min-w-0 space-y-8 overflow-x-hidden">
       {/* Hero — brand wordmark + build (borderless) */}
-      <div className="flex flex-col gap-6 md:flex-row md:items-end md:justify-between">
-        <div className="space-y-3 min-w-0">
-          <h1 className="text-4xl md:text-5xl font-bold tracking-tight leading-none">
+      <div className="flex min-w-0 flex-col gap-6 md:flex-row md:items-end md:justify-between">
+        <div className="min-w-0 space-y-3">
+          <h1 className="truncate text-4xl font-bold leading-none tracking-tight md:text-5xl">
             <BrandName />
           </h1>
-          <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground font-mono">
-            <span>{t("settings:aboutDesc")}</span>
+          <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs font-mono uppercase tracking-wide text-muted-foreground">
+            <span className="min-w-0 break-words">{t("settings:aboutDesc")}</span>
             <span className="relative flex h-2 w-2">
               <span className="absolute inline-flex h-full w-full rounded-full bg-success opacity-75 animate-ping" />
               <span className="relative inline-flex rounded-full h-2 w-2 bg-success" />
@@ -378,6 +450,9 @@ export function AboutTab() {
           ) : systemInfo ? (
             (() => {
               const uptime = formatUptimeParts(systemInfo.uptime)
+              // Only read when the block renders; the fallback keeps the type
+              // non-optional rather than threading a `!` through the JSX.
+              const processUptime = formatUptimeParts(systemInfo.process?.uptime_secs ?? 0)
               return (
             <>
               {/* Telemetry tiles */}
@@ -455,6 +530,88 @@ export function AboutTab() {
                 ))}
               </div>
 
+              {/* What HeraMind itself is taking. The gauges above describe the
+                  box; on a small device the question an operator actually has
+                  is what of it this app is holding, and the two only mean
+                  something side by side. */}
+              {(systemInfo.process || systemInfo.data_dir) && (
+                <div className="space-y-2">
+                  {/* Label OUTSIDE the card, in the section-header spec (same
+                      classes as the System Information h3 above) — it used to
+                      be a weightless icon+span caption that read as neither
+                      header nor body. */}
+                  <div className="flex items-center justify-between gap-2">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      {t("settings:processUsage")}
+                    </h3>
+                    {/* Manual refresh — the data-dir number is cached
+                        server-side and only recomputed on demand. */}
+                    <button
+                      type="button"
+                      onClick={refreshDataDir}
+                      disabled={refreshingDataDir}
+                      title={t("common:refresh")}
+                      aria-label={t("common:refresh")}
+                      className="flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted-30 hover:text-foreground disabled:opacity-50"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 ${refreshingDataDir ? "animate-spin" : ""}`} />
+                    </button>
+                  </div>
+                  <div className="rounded-lg border bg-card px-4">
+                    <div className="divide-y divide-border">
+                    {systemInfo.process && (
+                      <>
+                    <InfoRow label={t("settings:residentMemory")}>
+                      <TwoLineValue
+                        value={formatBytes(systemInfo.process.memory_bytes)}
+                        caption={
+                          systemInfo.total_memory > 0
+                            ? `${((systemInfo.process.memory_bytes / systemInfo.total_memory) * 100).toFixed(1)}% ${t("settings:ofTotalMemory")}`
+                            : undefined
+                        }
+                      />
+                    </InfoRow>
+                    {/* Absent on the first reading after boot, which has no
+                        previous sample to difference against. A zero there
+                        would read like a measurement. */}
+                    {systemInfo.process.cpu_usage != null && (
+                      <InfoRow label={t("settings:processCpu")}>
+                        <TwoLineValue
+                          value={`${systemInfo.process.cpu_usage.toFixed(1)}%`}
+                          caption={t("settings:ofOneCore")}
+                        />
+                      </InfoRow>
+                    )}
+                    {/* Only where the OS actually counts them — Linux. Everywhere
+                        else this row is absent rather than showing a made-up 1. */}
+                    {systemInfo.process.threads != null && (
+                      <InfoRow label={t("settings:threads")}>
+                        <span className="tabular-nums">{systemInfo.process.threads}</span>
+                      </InfoRow>
+                    )}
+                    <InfoRow label={t("settings:processUptime")}>
+                      <TwoLineValue
+                        value={processUptime.primary}
+                        caption={processUptime.secondary}
+                      />
+                    </InfoRow>
+                      </>
+                    )}
+                    {systemInfo.data_dir && (
+                      <InfoRow label={t("settings:dataDirUsage")}>
+                        <TwoLineValue
+                          value={formatBytes(systemInfo.data_dir.bytes)}
+                          caption={systemInfo.data_dir.path}
+                          captionTitle={systemInfo.data_dir.path}
+                          mono
+                        />
+                      </InfoRow>
+                    )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Network interfaces */}
               {(systemInfo.networks ?? []).length > 0 && (
                 <div className="rounded-lg border bg-card p-4">
@@ -466,15 +623,17 @@ export function AboutTab() {
                     {(systemInfo.networks ?? []).map((net, idx) => (
                       <div
                         key={`net-${idx}-${net.name}`}
-                        className="flex flex-wrap items-center justify-between gap-2 text-xs"
+                        className="flex min-w-0 flex-wrap items-center justify-between gap-2 text-xs"
                       >
-                        <div className="flex items-center gap-2 min-w-0">
-                          <span className="font-medium">{net.name}</span>
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="truncate font-medium" title={net.name}>{net.name}</span>
                           {net.ip && (
-                            <span className="font-mono text-xs text-muted-foreground">{net.ip}</span>
+                            <span className="min-w-0 truncate font-mono text-xs text-muted-foreground" title={net.ip}>
+                              {net.ip}
+                            </span>
                           )}
                         </div>
-                        <div className="flex items-center gap-3 font-mono text-xs">
+                        <div className="flex shrink-0 items-center gap-3 font-mono text-xs">
                           <span className="inline-flex items-center gap-1 text-info">
                             <Download className="h-3 w-3" />
                             {formatBytes(net.rx_bytes)}
@@ -539,10 +698,10 @@ export function AboutTab() {
         <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           {t("settings:projectInfo")}
         </h3>
-        <div className="mt-4 rounded-lg border border-border shadow-sm bg-card p-5">
-          <div>
+        <div className="mt-4 min-w-0 overflow-hidden rounded-lg border border-border bg-card p-5">
+          <div className="min-w-0">
             <InfoRow label={t("settings:version")}>
-              <div className="flex items-center gap-2">
+              <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
                 <Badge variant="secondary" className="font-mono">
                   {versionTag || "---"}
                 </Badge>
@@ -550,7 +709,7 @@ export function AboutTab() {
                   updateInfo.version !== systemInfo?.version && (
                     <Badge
                       variant="default"
-                      className="text-xs gap-1 cursor-pointer"
+                      className="cursor-pointer gap-1 text-xs"
                       onClick={() =>
                         isTauriEnv()
                           ? setUpdateDialogOpen(true)

@@ -12,8 +12,40 @@ input[type="number"]::-webkit-outer-spin-button {
   -webkit-appearance: none;
   margin: 0;
 }
+
+/* A soft keyboard already owns the lower viewport. Hiding the global mobile
+   navigation prevents it from jumping above the keyboard and competing with
+   the focused form control. */
+body.keyboard-open .mobile-primary-nav {
+  display: none;
+}
+
+/* Dashboard MobileEditBar owns the bottom edge while a component is selected.
+   Hide the Chat|System capsule so confirm/delete actions are not competing
+   with the pill footprint (same pattern as keyboard-open). */
+body.mobile-edit-chrome-open .mobile-primary-nav {
+  display: none;
+}
+
+/* iOS zooms the viewport when a focused form control renders below 16px.
+   Keep the editing surface stable; surrounding helper copy remains compact. */
+@media (max-width: 767px) {
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+}
 input[type="number"] {
   -moz-appearance: textfield;
+}
+
+/* Search inputs render their own clear affordance (SearchInput's ✕ button);
+ * WebKit additionally draws a native cancel glyph — hide it so the box never
+ * shows two clear controls. type="search" itself stays (semantics + ESC). */
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
 }
 
 /* Stabilize password masking glyph: the project font stack ("Plus Jakarta Sans"
@@ -212,6 +244,12 @@ body,
   .group-hover\:opacity-50 {
     opacity: 0.55 !important;
   }
+  /* Message action rows use pointer-events-none while hidden so the
+     invisible buttons cannot be tapped. Touch devices need the same
+     override as the opacity rule above. */
+  .group-hover\:pointer-events-auto {
+    pointer-events: auto !important;
+  }
 }
 
 /* iOS touch scrolling for overflow-y-auto containers */
@@ -299,16 +337,30 @@ html {
        above the gray content canvas. In dark mode this token falls back to
        --card so the same class works in both. */
     --chrome: oklch(1 0 0);
-    /* Sidebar rail — the one gray chrome layer (~#F8F9FA), separating from
-       the white canvas by color contrast; no border (reference palette). */
-    --sidebar-bg: oklch(0.97 0 0);
+    /* Sidebar rail — near-white (~#F9FAFB, Mono direction): the rail sits
+       one breath below the white canvas instead of reading as a separate
+       gray layer, so the whole shell feels like one clean surface
+       (Vercel-style) while still separating by color contrast. */
+    --sidebar-bg: oklch(0.984 0.002 270);
+    /* Active nav chip on the rail — DARKER than the rail (#E9E9EB), the
+       same direction dark mode uses. The previous half-white wash composited
+       to ≈#FAFAFB, visually indistinguishable from the rail itself. */
+    --sidebar-active: oklch(0.935 0.003 270);
     --foreground: oklch(0.21 0.01 264);
     --card: oklch(1 0 0);
     --card-foreground: oklch(0.13 0.02 255);
     --popover: oklch(1 0 0);
     --popover-foreground: oklch(0.13 0.02 255);
+    /* Primary — near-black ink (#0C0E13, Mono direction): the CTA reads as
+       pure black against the white canvas for a crisp high-contrast anchor,
+       keeping the theme's faint cool tint so it stays in-family with
+       --foreground. */
     --primary: oklch(0.52 0.23 255);
     --primary-foreground: oklch(1 0 0);
+    /* Gray surfaces carry the theme's micro cool tint (0.003 @ 270) — the
+       same tint as text/borders/hover washes. Pure achromatic grays here
+       (old oklch(0.962 0 0) = #F5F5F5) read warm/dirty next to the tinted
+       neighbors; dark mode tints its whole ladder, light mode must too. */
     --secondary: oklch(0.965 0.012 255);
     --secondary-foreground: oklch(0.13 0.02 255);
     --muted: oklch(0.965 0.012 255);
@@ -317,9 +369,14 @@ html {
     --accent-foreground: oklch(0.13 0.02 255);
     --destructive: oklch(0.42 0.14 255);
     --destructive-foreground: oklch(1 0 0);
-    --border: oklch(0.21 0.01 264 / 9%);
-    --input: oklch(0.21 0.01 264 / 10%);
-    /* Focus ring — neutral foreground tint, NOT brand orange. The previous
+    --border: oklch(0.21 0.01 264 / 11.5%);
+    /* Softer outline for chat process cards: their fill is intentionally
+       faint, so the standard border reads as a drawn frame. */
+    --chat-card-border: oklch(0.21 0.01 264 / 8%);
+    --input: oklch(0.21 0.01 264 / 12.5%);
+    /* Hover-deepened border for interactive cards (see interactiveCard). */
+    --border-hover: oklch(0.21 0.01 264 / 18%);
+    /* Focus ring — neutral foreground tint, NOT brand blue. The previous
      * `--ring: var(--brand)` made every focused input/tab/button flash a
      * bright orange halo, which users read as "random orange edges". A
      * subtle foreground-tinted ring still satisfies WCAG focus-indicator
@@ -372,8 +429,12 @@ html {
     --ease-spring-snappy: cubic-bezier(0.5, 1.5, 0.5, 1); /* light overshoot: micro-interactions, toggles, small elements */
     --ease-spring-soft: cubic-bezier(0.34, 1.4, 0.64, 1); /* soft overshoot: large elements, dialog/sheet entrance */
 
-    /* Semantic colors */
-    --color-success: oklch(0.55 0.21 250);
+    /* Semantic colors (light). L is tuned so colored TEXT passes WCAG AA
+       (4.5:1) on cards and tinted pills — verified by
+       scripts/check-contrast.mjs. Warning hue 85 (matching the dark theme)
+       keeps the yellow clean; hue ~78 sat in mustard territory and read as
+       mud. Washes (10%) stay light — they're carriers, not text. */
+    --color-success: oklch(0.50 0.18 250);
     --color-success-bg: oklch(0.55 0.21 250 / 9%);
     --color-warning: oklch(0.36 0.06 255);
     --color-warning-bg: oklch(0.36 0.06 255 / 8%);
@@ -385,16 +446,15 @@ html {
     /* Tint backgrounds for primary & destructive (mirror semantic *-bg pattern) */
     --primary-bg: oklch(0.52 0.23 255 / 10%);
     --primary-bg-hover: oklch(0.52 0.23 255 / 18%);
-    --destructive-bg: oklch(0.42 0.14 255 / 10%);
+    --destructive-bg: oklch(0.577 0.245 27 / 8%);
 
     /* Overlay (semi-transparent black masks) */
     --overlay-light: oklch(0 0 0 / 30%);
     --overlay-medium: oklch(0 0 0 / 50%);
     --overlay-heavy: oklch(0 0 0 / 80%);
 
-    /* Accent category colors (light) - blue family aliases for existing UI classes */
-    --accent-blue: oklch(0.52 0.23 255);
-    --accent-blue-bg: oklch(0.52 0.23 255 / 10%);
+    /* Accent category colors (light) - chroma-boosted to match the dark
+       theme's vibrancy (L/hue unchanged); washes at 10% like dark. */
     --accent-purple: oklch(0.50 0.20 265);
     --accent-purple-bg: oklch(0.50 0.20 265 / 9%);
     --accent-orange: oklch(0.55 0.21 250);
@@ -409,8 +469,9 @@ html {
     /* Shadow system — layered (contact + ambient) for soft, realistic
        elevation. Each step up adds a wider, fainter ambient layer rather than
        just scaling one shadow. */
-    --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 6%);
-    --shadow-md: 0 1px 2px 0 oklch(0 0 0 / 5%), 0 2px 6px -1px oklch(0 0 0 / 7%);
+    --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 8%);
+    --shadow-xs: 0 1px 1.5px 0 oklch(0 0 0 / 5%);
+    --shadow-md: 0 1px 2px 0 oklch(0 0 0 / 7%), 0 2px 6px -1px oklch(0 0 0 / 9%);
     --shadow-lg: 0 1px 2px 0 oklch(0 0 0 / 5%), 0 4px 12px -2px oklch(0 0 0 / 9%), 0 12px 24px -8px oklch(0 0 0 / 6%);
     --shadow-xl: 0 2px 4px 0 oklch(0 0 0 / 5%), 0 8px 20px -4px oklch(0 0 0 / 10%), 0 20px 40px -12px oklch(0 0 0 / 8%);
 
@@ -424,7 +485,11 @@ html {
     --shadow-glass-lg: 0 2px 8px 0 oklch(0 0 0 / 8%);
     --shadow-brand: 0 2px 12px 0 oklch(0.52 0.23 255 / 18%);
 
-    /* Brand color - HeraMind blue, full scale. hover = press-deep,
+    /* Scrollbar — theme-aware thumb (light: ink alpha). */
+    --scrollbar-thumb: oklch(0.5 0.01 264 / 30%);
+    --scrollbar-thumb-hover: oklch(0.5 0.01 264 / 50%);
+
+    /* Brand color - HeraMind blue (#E05727), full scale. hover = press-deep,
        active = pressed, bg = soft tint for selected/active states (nav pills). */
     --brand: oklch(0.52 0.23 255);
     --brand-hover: oklch(0.46 0.24 255);
@@ -435,10 +500,12 @@ html {
        does not resolve CSS vars reliably across renderers) */
     --brand-shadow: #006dff;
 
-    /* Semi-transparent background tokens (Tailwind v3 workaround) */
-    --bg-50: oklch(1 0 0 / 50%);
+    /* Semi-transparent background tokens (Tailwind v3 workaround).
+       Ladder: --bg-70 / --bg-90 / --bg-95 for near-opaque frosted layers
+       (login inputs, onboarding canvas, media toolbars). The 50/80 steps
+       were folded into the glass family (--glass 55% / --glass-heavy 82%)
+       — they were exact duplicates. */
     --bg-70: oklch(1 0 0 / 70%);
-    --bg-80: oklch(1 0 0 / 80%);
     --bg-90: oklch(1 0 0 / 90%);
     --bg-95: oklch(1 0 0 / 95%);
     --muted-20: oklch(0.96 0.012 255 / 20%);
@@ -446,12 +513,17 @@ html {
     --muted-50: oklch(0.96 0.012 255 / 50%);
     --primary-hover: oklch(0.46 0.24 255 / 95%);
     --secondary-hover: oklch(0.94 0.018 255 / 86%);
-    --destructive-hover: oklch(0.36 0.16 255 / 95%);
+    --destructive-hover: oklch(0.577 0.245 27 / 90%);
 
     /* Chat-specific colors - light mode */
     --msg-user-bg: oklch(0.52 0.23 255);
     --msg-user-text: oklch(1 0 0);
-    --msg-ai-bg: oklch(0.97 0.003 270);
+    /* Code sits ON the user bubble: a light wash over the dark bubble keeps
+       inherited white text readable (the old var(--muted) rule produced
+       white-on-near-white). Dark theme below mirrors this with a dark wash. */
+    --msg-user-code-bg: oklch(0 0 0 / 12%);
+    --msg-user-code-hover: oklch(1 0 0 / 18%);
+    --msg-user-code-border: oklch(1 0 0 / 18%);
     --msg-ai-text: oklch(0.18 0.02 270);
     /* Syntax-highlighting palette (rehype-highlight / hljs). GitHub-based,
        tuned for the muted code background. Light theme. */
@@ -467,19 +539,13 @@ html {
     --msg-system-bg: oklch(0.95 0.003 270);
     --msg-system-text: oklch(0.45 0.01 270);
 
-    --tool-bg: oklch(0.97 0.012 255);
-    --tool-border: oklch(0.52 0.23 255);
-    --tool-header-bg: oklch(0.94 0.025 255);
-
-    --thinking-bg: oklch(0.96 0.018 255);
-    --thinking-border: oklch(0.52 0.18 255);
     --thinking-text: oklch(0.34 0.045 255);
 
     --card-hover-bg: oklch(0.995 0 0);
     --input-focus-bg: oklch(1 0 0);
 
     --session-drawer-bg: oklch(0.99 0.004 255);
-    --session-drawer-border: oklch(0 0 0 / 8%);
+    --session-drawer-border: oklch(0.21 0.01 264 / 9%);
     --session-item-hover: oklch(0.95 0.018 255);
     --session-item-active: oklch(0.92 0.03 255);
 
@@ -488,10 +554,11 @@ html {
      * Used by web/src/components/ui/code-editor.tsx. Theme-agnostic — the editor
      * reads these CSS vars directly, so light/dark switching is instant with no
      * JS re-render. Hue conventions:
-     *   255 = keyword/cursor/number/property/bool (blue)
-     *   225 = string (sky blue)
-     *   260 = def (deep blue)
-     *   264 = base text/gutter/comment (neutral)
+     *   25  = keyword/operator/null (red — control flow)
+     *   250 = cursor/number/property/bool (blue — literal/identifier accent)
+     *   220 = string (cyan-leaning blue)
+     *   300 = def (purple — user definitions)
+     *   264 = base text/gutter/comment (neutral with foreground hue)
      * ========================================================================== */
     --syntax-text: oklch(0.22 0.015 255);
     --syntax-gutter: oklch(0.55 0.008 255);
@@ -525,8 +592,11 @@ html {
     --chrome: oklch(0.13 0.018 255);
     /* Sidebar rail — clearly BELOW the page/drawer background (0.135) so
        the rail vs content step reads in dark mode just like light mode
-       (#F8F9FA rail vs white content). */
+       (#F9FAFB rail vs white content). */
     --sidebar-bg: oklch(0.085 0.018 255);
+    /* Active nav chip on the rail — same gray the expanded list uses; a
+       clear lightness step above the very dark rail. */
+    --sidebar-active: oklch(0.205 0.01 270);
     --card-foreground: oklch(0.97 0.004 255);
     /* Popovers/menus float above cards — one step up, just under chrome. */
     --popover: oklch(0.145 0.018 255);
@@ -542,7 +612,10 @@ html {
     --destructive: oklch(0.577 0.245 27);
     --destructive-foreground: oklch(0.95 0.006 270);
     --border: oklch(1 0 0 / 10%);
+    --chat-card-border: oklch(1 0 0 / 8%);
     --input: oklch(1 0 0 / 12%);
+    /* Hover-deepened border for interactive cards (see interactiveCard). */
+    --border-hover: oklch(1 0 0 / 16%);
     /* Neutral focus ring (see light-mode --ring rationale). */
     --ring: color-mix(in oklch, var(--primary) 48%, transparent);
 
@@ -550,24 +623,22 @@ html {
     --color-success-bg: oklch(0.72 0.19 155 / 10%);
     --color-warning: oklch(0.72 0.16 85);
     --color-warning-bg: oklch(0.72 0.16 85 / 10%);
-    --color-error: oklch(0.577 0.245 27);
-    --color-error-bg: oklch(0.577 0.245 27 / 10%);
+    --color-error: oklch(0.63 0.23 27);
+    --color-error-bg: oklch(0.62 0.23 27 / 10%);
     --color-info: oklch(0.65 0.15 250);
     --color-info-bg: oklch(0.65 0.15 250 / 10%);
 
     /* Tint backgrounds (dark: white-based for visibility on dark bg) */
-    --primary-bg: oklch(0.68 0.19 255 / 16%);
+    --primary-bg: oklch(0.68 0.19 255 / 11%);
     --primary-bg-hover: oklch(0.68 0.19 255 / 24%);
-    --destructive-bg: oklch(0.62 0.18 255 / 16%);
+    --destructive-bg: oklch(0.577 0.245 27 / 12%);
 
     /* Overlay (dark theme: slightly heavier masks) */
     --overlay-light: oklch(0 0 0 / 40%);
     --overlay-medium: oklch(0 0 0 / 60%);
     --overlay-heavy: oklch(0 0 0 / 85%);
 
-    /* Accent category colors (dark) - blue family aliases for existing UI classes */
-    --accent-blue: oklch(0.68 0.19 255);
-    --accent-blue-bg: oklch(0.68 0.19 255 / 16%);
+    /* Accent category colors (dark) - brighter for dark bg */
     --accent-purple: oklch(0.66 0.18 265);
     --accent-purple-bg: oklch(0.66 0.18 265 / 15%);
     --accent-orange: oklch(0.68 0.19 250);
@@ -583,6 +654,7 @@ html {
        on dark surfaces), still layered. Real dark elevation comes from the
        surface lightness ladder + borders above; shadows add depth cue only. */
     --shadow-sm: 0 1px 2px 0 oklch(0 0 0 / 25%);
+    --shadow-xs: 0 1px 2px 0 oklch(0 0 0 / 18%);
     --shadow-md: 0 1px 2px 0 oklch(0 0 0 / 20%), 0 2px 8px -1px oklch(0 0 0 / 30%);
     --shadow-lg: 0 2px 4px 0 oklch(0 0 0 / 20%), 0 4px 16px -3px oklch(0 0 0 / 40%), 0 10px 28px -8px oklch(0 0 0 / 25%);
     --shadow-xl: 0 2px 6px 0 oklch(0 0 0 / 22%), 0 8px 24px -5px oklch(0 0 0 / 45%), 0 18px 40px -12px oklch(0 0 0 / 30%);
@@ -596,6 +668,10 @@ html {
     --shadow-glass-lg: 0 4px 16px 0 oklch(0 0 0 / 25%);
     --shadow-brand: 0 2px 12px 0 oklch(0.68 0.19 255 / 22%);
 
+    /* Scrollbar — dark: lighter thumb so it reads against the dark canvas. */
+    --scrollbar-thumb: oklch(0.65 0.01 264 / 30%);
+    --scrollbar-thumb-hover: oklch(0.72 0.01 264 / 45%);
+
     /* Brand color - HeraMind blue (brighter for dark bg), full scale.
        Dark hover/active go BRIGHTER (light-mode goes darker) — the surface
        direction that reads as "engaged" against a dark canvas. */
@@ -603,13 +679,12 @@ html {
     --brand-hover: oklch(0.74 0.18 255);
     --brand-active: oklch(0.80 0.16 255);
     --brand-bg: oklch(0.68 0.19 255 / 16%);
-    --brand-foreground: oklch(1 0 0);
+    --brand-foreground: oklch(0.13 0.008 270);
     --brand-shadow: #2f83ff;
 
-    /* Semi-transparent background tokens (dark) */
-    --bg-50: oklch(0.10 0.018 255 / 50%);
+    /* Semi-transparent background tokens (dark) — see light block for the
+       ladder note; 50/80 steps live in the glass family now. */
     --bg-70: oklch(0.10 0.018 255 / 70%);
-    --bg-80: oklch(0.10 0.018 255 / 80%);
     --bg-90: oklch(0.10 0.018 255 / 90%);
     --bg-95: oklch(0.10 0.018 255 / 95%);
     --muted-20: oklch(0.19 0.02 255 / 20%);
@@ -628,9 +703,11 @@ html {
     --chart-5: oklch(0.56 0.06 255);
     --chart-6: oklch(0.76 0.09 225);
 
-    --msg-user-bg: oklch(0.68 0.19 255);
-    --msg-user-text: oklch(1 0 0);
-    --msg-ai-bg: oklch(0.16 0.018 255);
+    --msg-user-bg: oklch(0.72 0.18 255);
+    --msg-user-text: oklch(0.13 0.018 255);
+    --msg-user-code-bg: oklch(0 0 0 / 10%);
+    --msg-user-code-hover: oklch(0 0 0 / 14%);
+    --msg-user-code-border: oklch(0 0 0 / 14%);
     --msg-ai-text: oklch(0.92 0.006 255);
     /* Syntax-highlighting palette — dark theme */
     --syn-text: oklch(0.92 0.004 270);
@@ -645,12 +722,6 @@ html {
     --msg-system-bg: oklch(0.19 0.02 255);
     --msg-system-text: oklch(0.68 0.018 255);
 
-    --tool-bg: oklch(0.20 0.008 270);
-    --tool-border: oklch(1 0 0 / 15%);
-    --tool-header-bg: oklch(0.21 0.03 255);
-
-    --thinking-bg: oklch(0.18 0.02 255);
-    --thinking-border: oklch(0.68 0.19 255 / 30%);
     --thinking-text: oklch(0.70 0.02 255);
 
     --card-hover-bg: oklch(0.18 0.02 255);
@@ -708,9 +779,12 @@ html {
 
   /* Checkbox border is handled by the Checkbox component itself */
 
-  /* Exception: Tabs component - no border */
+  /* Exception: Tabs component - no border.
+     PageTabs' underline indicators are ::after pseudo-elements, not
+     borders, so a border reset can't erase them — [role="tab"] doesn't
+     need an exception here either (Radix triggers carry no border
+     classes to begin with). */
   [role="tablist"],
-  [role="tab"],
   [role="tabpanel"] {
     border: none !important;
   }
@@ -745,8 +819,10 @@ html {
     transition-timing-function: var(--ease-out, cubic-bezier(0.16, 1, 0.3, 1));
   }
 
-  /* Exception: Small icon buttons - add padding instead of forcing size */
-  button:where([class*="h-6"], [class*="h-7"], [class*="h-8"], [class*="h-9"]) {
+  /* Exception: Small icon buttons - add padding instead of forcing size.
+     h-4/h-5 cover inline badge-sized buttons (explicit small height must
+     win over the 44px min — min-height otherwise overrides height). */
+  button:where([class*="h-4"], [class*="h-5"], [class*="h-6"], [class*="h-7"], [class*="h-8"], [class*="h-9"]) {
     min-height: auto;
     min-width: auto;
   }
@@ -795,10 +871,11 @@ html {
     transform: scale(0.985);
   }
 
-  /* Scrollbar styles */
+  /* Scrollbar styles — colors come from --scrollbar-thumb(-hover), set
+     per theme in the :root/.dark blocks above. */
   * {
     scrollbar-width: thin;
-    scrollbar-color: oklch(0.5 0.01 264 / 30%) transparent;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
   }
 
   *::-webkit-scrollbar {
@@ -811,12 +888,12 @@ html {
   }
 
   *::-webkit-scrollbar-thumb {
-    background-color: oklch(0.5 0.01 270 / 30%);
+    background-color: var(--scrollbar-thumb);
     border-radius: 4px;
   }
 
   *::-webkit-scrollbar-thumb:hover {
-    background-color: oklch(0.5 0.01 270 / 50%);
+    background-color: var(--scrollbar-thumb-hover);
   }
 }
 
@@ -870,6 +947,57 @@ html {
       transparent 1px
     );
     background-size: 32px 32px;
+  }
+
+  /* Welcome-area backdrop: a quiet dot field — each dot an edge device,
+     one grid unit — behind the greeting group. Dots use var(--foreground)
+     so light theme reads as ink specks and dark as faint stars; a radial
+     mask concentrates the field behind the greeting and dissolves it
+     toward every edge. A very slow background-position pan keeps the
+     field barely alive (compositor paint, no per-frame JS). Honors
+     prefers-reduced-motion. */
+  .welcome-dots {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image: radial-gradient(
+      circle,
+      color-mix(in oklch, var(--foreground) 10%, transparent) 1px,
+      transparent 1.5px
+    );
+    background-size: 22px 22px;
+    -webkit-mask-image: radial-gradient(
+      ellipse 62% 58% at 50% 44%,
+      black 25%,
+      transparent 78%
+    );
+    mask-image: radial-gradient(
+      ellipse 62% 58% at 50% 44%,
+      black 25%,
+      transparent 78%
+    );
+    animation: welcome-dots-pan 90s linear infinite;
+  }
+  .dark .welcome-dots {
+    background-image: radial-gradient(
+      circle,
+      color-mix(in oklch, var(--foreground) 14%, transparent) 1px,
+      transparent 1.5px
+    );
+  }
+  @keyframes welcome-dots-pan {
+    from {
+      background-position: 0 0;
+    }
+    to {
+      background-position: 22px 44px;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .welcome-dots {
+      animation: none;
+    }
   }
 
   /* ============================================================================
@@ -1086,39 +1214,29 @@ html {
   }
 }
 
-/* ============================================================================
- * Chat message prose text color override
- * User messages: white text in light theme, dark text in dark theme
- * AI messages: use theme variables
- * ============================================================================ */
-
-/* Light theme - User messages: white text on blue background.
-   `.prose *` covers every descendant (p/li/span/strong/em/h1-h6/td/th/blockquote/
-   code/pre). The element enumeration that used to follow is redundant — these
-   rules all carry `!important`, so specificity is irrelevant and `*` suffices. */
+/* User Markdown inherits the bubble's foreground. The bubble changes surface
+   on mobile and by theme; hard-coded light/dark colors can make a freshly sent
+   message disappear when those two states cross. */
 .message-bubble-user .prose,
 .message-bubble-user .prose * {
-  color: #fff !important;
+  color: inherit !important;
 }
 
-/* Dark theme - User messages: dark text on blue background */
 .dark .message-bubble-user .prose,
 .dark .message-bubble-user .prose *,
 .dark .message-bubble-user .dark\:prose-invert,
 .dark .message-bubble-user .dark\:prose-invert * {
-  color: #1a1a1a !important;
+  color: inherit !important;
 }
 
-/* Target using data-variant attribute - light theme */
 .prose[data-variant="user"],
 .prose[data-variant="user"] * {
-  color: #fff !important;
+  color: inherit !important;
 }
 
-/* Target using data-variant attribute - dark theme */
 .dark .prose[data-variant="user"],
 .dark .prose[data-variant="user"] * {
-  color: #1a1a1a !important;
+  color: inherit !important;
 }
 
 /* AI messages - use theme variables */
@@ -1142,13 +1260,32 @@ html {
   color: var(--msg-ai-text) !important;
 }
 
+/* Code surfaces are variant-scoped: assistant code uses the neutral muted
+ * surface; user code sits on the user bubble and needs a wash derived from
+ * the bubble foreground, not the page muted color. MarkdownMessage reads
+ * these variables so both inline code and fenced blocks follow the bubble. */
+.prose[data-variant="assistant"] {
+  --code-bg: var(--muted);
+  --inline-code-bg: var(--muted);
+  --code-border: var(--border);
+  --code-control-hover: var(--muted-50);
+}
+
+.prose[data-variant="user"] {
+  --code-bg: var(--msg-user-code-bg);
+  --inline-code-bg: var(--msg-user-code-bg);
+  --code-border: var(--msg-user-code-border);
+  --code-control-hover: var(--msg-user-code-hover);
+}
+
 /* Links: inherit the per-bubble text color so they stay readable on every
- * background. We previously hardcoded `var(--primary)`, but chat bubbles can
- * now use the same saturated brand blue as primary actions, so links inside
- * user messages need to inherit the bubble text color. The MarkdownMessage
- * component supplies the underline affordance via Tailwind classes; color just
- * needs to contrast with the bubble, which `inherit`/`currentColor` guarantees
- * because the surrounding prose color is already themed per variant above. */
+ * background. We previously hardcoded `var(--primary)`, but in light theme
+ * `--primary` is near-white (oklch 0.95) which collides with the user
+ * bubble's `--msg-user-bg` (also near-white, oklch 0.97) — making URLs in
+ * user messages invisible. The MarkdownMessage component supplies the
+ * underline affordance via Tailwind classes; color just needs to contrast
+ * with the bubble, which `inherit`/`currentColor` guarantees because the
+ * surrounding prose color is already themed per variant above. */
 .message-bubble-user .prose a,
 .message-bubble-user .prose * a,
 .message-bubble-assistant .prose a,
@@ -1164,7 +1301,10 @@ html {
   color: inherit !important;
 }
 
-/* Code blocks background - keep readable */
+/* Code text follows the bubble foreground. The surface itself is owned by
+ * MarkdownMessage via the variant-scoped --code-* variables above — the old
+ * `background-color: var(--muted) !important` made user code white-on-white
+ * in light mode and dark-on-dark in dark mode. */
 .message-bubble-user .prose pre,
 .message-bubble-assistant .prose pre,
 .message-bubble-user .prose code:not(pre code),
@@ -1173,7 +1313,6 @@ html {
 .dark .message-bubble-assistant .prose pre,
 .dark .message-bubble-user .prose code:not(pre code),
 .dark .message-bubble-assistant .prose code:not(pre code) {
-  background-color: var(--muted) !important;
   color: inherit !important;
 }
 
@@ -1380,9 +1519,9 @@ html {
 }
 
 /* Brand icon gradient (dark mode only) — paints an SVG icon's stroke with the
-   logo's segmented blue gradient (see <BrandGradientDef/>).
+   logo's segmented #FF8C00 → #FF4500 orange gradient (see <BrandGradientDef/>).
    Active nav icons use solid text-brand in light mode and this gradient stroke
-   in dark mode, where a flat fill reads too heavy. CSS `stroke`/`stroke-width`
+   in dark mode, where a flat orange reads too heavy. CSS `stroke`/`stroke-width`
    (specificity 0,2,0) override lucide's stroke="currentColor" /
    stroke-width="2" presentation attributes. NOTE: consumers apply the plain
    `brand-icon-stroke` class — a `dark:`-prefixed variant can't work (Tailwind
@@ -1423,4 +1562,37 @@ html {
    (e.g. large display numerals). */
 html {
   font-variant-numeric: tabular-nums;
+}
+
+/* Chat is a fullscreen surface: the bottom navigation capsule is not
+   rendered there, so the composer rests directly above the safe-area edge. */
+@media (max-width: 767px) {
+  .chat-composer-dock {
+    /* Compact bottom pad + short fade. Keep the dock tight to the composer —
+       tall blur bands overflow and hurt the blend more than they help. */
+    padding-bottom: calc(1.25rem + env(safe-area-inset-bottom, 0px));
+    overflow: visible;
+    background-image: linear-gradient(
+      to top,
+      var(--background) 0%,
+      var(--background) 55%,
+      color-mix(in srgb, var(--background) 82%, transparent) 82%,
+      transparent 100%
+    );
+  }
+
+  /* Soft keyboard already owns the lower inset. Drop safe-area + the large
+     resting pad so the composer sits just above the keyboard with a hairline
+     gap (2px). Restored when body.keyboard-open is cleared by
+     useVisualViewport (not by input-focus alone). */
+  body.keyboard-open .chat-composer-dock {
+    padding-bottom: 2px;
+  }
+
+  .message-bubble-user .prose,
+  .message-bubble-user .prose *,
+  .prose[data-variant="user"],
+  .prose[data-variant="user"] * {
+    color: var(--foreground) !important;
+  }
 }

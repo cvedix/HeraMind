@@ -2,6 +2,14 @@
 //!
 //! This module provides the bridge between the Extension system and the Tool system,
 //! automatically generating tools from extension command descriptors.
+//!
+//! **Chat entry policy (CLI-only default):** [`extension_direct_tools_for_llm`] is
+//! false unless `HERAMIND_EXTENSION_DIRECT_TOOLS=1|true|on`. Extension commands are
+//! **not** registered into the model tool pool; ops go through
+//! `heramind extension list|commands|invoke` via shell. Historical sanitized names
+//! still parse via [`heramind_core::extension::parse_extension_tool_name`] for
+//! ledger/resume compat and for a CLI redirect hint — they do **not** bypass AI
+//! policy by executing here when unregistered.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -16,6 +24,37 @@ use heramind_core::extension::registry::ExtensionRegistry;
 use heramind_core::extension::*;
 use heramind_core::extension::{DynExtension, ExtensionCommand};
 use heramind_core::tools::ToolCategory;
+
+/// Env: `HERAMIND_EXTENSION_DIRECT_TOOLS`.
+///
+/// - unset / `0` / `false` / `off` → **CLI-only default** (do not register
+///   extension commands as LLM tools). Chat uses
+///   `heramind extension list|commands|invoke`; AI disable / `ai_exposed` still
+///   apply on invoke.
+/// - `1` / `true` / `on` → restore legacy direct-tool registration (debug /
+///   baseline compare only).
+pub fn extension_direct_tools_for_llm() -> bool {
+    match std::env::var("HERAMIND_EXTENSION_DIRECT_TOOLS") {
+        Ok(v) => {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
+}
+
+/// CLI redirect when the model still emits a historical `ext:cmd` /
+/// `ext_cmd` tool name that is not registered (CLI-only mode or removed tool).
+pub fn historical_extension_tool_cli_hint(tool_name: &str) -> Option<String> {
+    let (ext, cmd) = parse_extension_tool_name(tool_name)?;
+    Some(format!(
+        "Tool '{tool_name}' is not registered for chat. Use CLI discovery then invoke \
+         (AI disable / ai_exposed still apply on invoke):\n\
+         heramind extension commands --search \"<task>\"\n\
+         heramind extension commands {ext}\n\
+         heramind extension invoke {ext} {cmd} --params '{{...}}'"
+    ))
+}
 
 /// Maximum length for a string value before truncation in extension output.
 const MAX_STRING_VALUE_LEN: usize = 200;
@@ -61,6 +100,10 @@ pub struct ExtensionTool {
     extension_id: String,
     /// Extension name for display (reserved for future use)
     _extension_name: String,
+    /// Installed package version (for version-bound capability resolve).
+    extension_version: String,
+    /// Load-lifecycle generation captured at tool construction. Stale after reload.
+    capability_generation: heramind_core::extension::CapabilityGeneration,
     /// Full tool name in format "{extension_id}:{command_name}"
     /// This is computed once and stored for efficient name() calls
     full_name: String,
@@ -68,33 +111,90 @@ pub struct ExtensionTool {
 
 impl ExtensionTool {
     /// Create a new ExtensionTool from an extension and command descriptor.
+    ///
+    /// `capability_generation` must come from the same load snapshot as the
+    /// command list (e.g. [`ExtensionInfo::capability_generation`]).
     pub fn new(
         extension: DynExtension,
         command: ExtensionCommand,
         extension_id: String,
         extension_name: String,
+        extension_version: String,
+        capability_generation: heramind_core::extension::CapabilityGeneration,
     ) -> Self {
         let full_name = format!("{}:{}", extension_id, command.name);
+        let def = heramind_core::extension::from_extension_command(
+            &extension_id,
+            &command,
+            Some(extension_version.as_str()),
+            None,
+        );
+        let _ = heramind_core::extension::remember_capability(
+            &extension_id,
+            &command.name,
+            def.effect,
+            def.replay_safety,
+            def.execution,
+            &capability_generation,
+        );
         Self {
             extension,
             command,
             extension_id,
             _extension_name: extension_name,
+            extension_version,
+            capability_generation,
             full_name,
         }
     }
 
-    /// Create extension tools from an extension.
-    ///
-    /// Returns all commands provided by the extension as Tool trait objects.
+    /// Create tools from a registered load snapshot (commands + generation).
+    pub async fn from_registered(
+        extension: DynExtension,
+        info: &heramind_core::extension::registry::ExtensionInfo,
+    ) -> Vec<ExtensionTool> {
+        let extension_id = info.metadata.id.clone();
+        let extension_name = info.metadata.name.clone();
+        let extension_version = info.metadata.version.clone();
+        let generation = info.capability_generation.clone();
+
+        info.commands
+            .iter()
+            .cloned()
+            .map(|cmd| {
+                ExtensionTool::new(
+                    extension.clone(),
+                    cmd,
+                    extension_id.clone(),
+                    extension_name.clone(),
+                    extension_version.clone(),
+                    generation.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Test helper: mint a generation, publish a prepareable snapshot, then
+    /// build tools (NM-240 execute requires classify-time tickets).
+    #[cfg(test)]
     pub async fn from_extension(extension: DynExtension) -> Vec<ExtensionTool> {
-        // Access metadata and commands through RwLock
         let ext = extension.read().await;
         let extension_id = ext.metadata().id.to_string();
         let extension_name = ext.metadata().name.to_string();
+        let extension_version = ext.metadata().version.to_string();
         let commands = ext.commands().to_vec();
         drop(ext);
-
+        heramind_core::extension::invalidate_instance_capability(&extension_id);
+        let generation = heramind_core::extension::begin_instance_generation(&extension_id);
+        heramind_core::extension::ExtensionCommandSnapshot::build(
+            &extension_id,
+            &extension_version,
+            None,
+            commands.clone(),
+            generation.clone(),
+        )
+        .publish_capabilities()
+        .expect("test fixture must publish prepareable snapshot");
         commands
             .into_iter()
             .map(|cmd| {
@@ -103,6 +203,8 @@ impl ExtensionTool {
                     cmd,
                     extension_id.clone(),
                     extension_name.clone(),
+                    extension_version.clone(),
+                    generation.clone(),
                 )
             })
             .collect()
@@ -162,6 +264,16 @@ impl ExtensionTool {
                 "description": param.description,
             });
 
+            if matches!(
+                param.name.as_str(),
+                "image" | "image_base64" | "base64_data" | "image_data" | "img"
+            ) {
+                param_schema["description"] = json!(format!(
+                    "{} Platform image references /api/images/... and data:image/... URLs are accepted here; the platform resolves them to image bytes. Do not manually copy large base64 through the model.",
+                    param.description
+                ));
+            }
+
             // Add enum options if present
             if let MetricDataType::Enum { options } = &param.param_type {
                 param_schema["enum"] = json!(options);
@@ -218,57 +330,18 @@ impl ExtensionTool {
         })
     }
 
-    /// Normalize image-related arguments for extensions.
-    ///
-    /// Extensions run in a separate process and cannot resolve a hostless
-    /// internal path, so two image forms must be reduced to raw base64 before
-    /// crossing the process boundary:
-    ///
-    /// - `/api/images/...` internal file URLs (the v0.9.6 image-storage form):
-    ///   resolved to bytes via
-    ///   `resolve_internal_image_to_data_url`, which applies the same
-    ///   symlink/size/magic-byte guards as the public `GET /api/images/` route.
-    /// - `data:image/...;base64,<data>` data URIs: the prefix is stripped.
-    ///
-    /// Both become a `data:` URL, then the `;base64,` strip below reduces them
-    /// to the raw base64 payload extensions expect. Handles direct strings and
-    /// strings nested in objects/arrays.
-    fn normalize_image_args(args: &Value, data_dir: &Path) -> Value {
-        match args {
-            Value::String(s) => {
-                // Resolve internal /api/images/ URLs → data URL. If resolution
-                // fails (missing file, too large, non-image, traversal) fall
-                // back to the original string so the extension surfaces its own
-                // error instead of the arg being silently dropped.
-                let resolved: String = if s.starts_with("/api/images/") {
-                    heramind_devices::image_storage::resolve_internal_image_to_data_url(s, data_dir)
-                        .unwrap_or_else(|| s.clone())
-                } else {
-                    s.clone()
-                };
-                // Strip data URI prefix: "data:image/jpeg;base64,<data>" → "<data>"
-                if let Some(comma_pos) = resolved.find(";base64,") {
-                    let base64_data = &resolved[comma_pos + 8..]; // skip ";base64,"
-                    if !base64_data.is_empty() {
-                        return Value::String(base64_data.to_string());
-                    }
-                }
-                Value::String(resolved)
-            }
-            Value::Object(map) => {
-                let normalized: serde_json::Map<String, Value> = map
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Self::normalize_image_args(v, data_dir)))
-                    .collect();
-                Value::Object(normalized)
-            }
-            Value::Array(arr) => Value::Array(
-                arr.iter()
-                    .map(|v| Self::normalize_image_args(v, data_dir))
-                    .collect(),
-            ),
-            _ => args.clone(),
-        }
+    /// Resolve internal image references to raw base64 before process dispatch.
+    /// Delegates to [`heramind_devices::image_storage::materialize_internal_image_refs_in_value`]
+    /// (shared with HTTP / CLI-only `extension invoke`).
+    fn normalize_image_args(args: &Value, data_dir: &Path) -> ToolResult<Value> {
+        use super::error::ToolError;
+        heramind_devices::image_storage::materialize_internal_image_refs_in_value(args, data_dir)
+            .map_err(|e| {
+                ToolError::InvalidArguments(format!(
+                    "{e} {}",
+                    crate::image_utils::INTERNAL_IMAGE_INPUT_HINT
+                ))
+            })
     }
 }
 
@@ -292,21 +365,79 @@ impl Tool for ExtensionTool {
         self.build_parameters_schema()
     }
 
+    fn replay_safety(&self) -> crate::toolkit::tool::ReplaySafety {
+        let (_, replay, _, _) = heramind_core::extension::resolve_capability(
+            &heramind_core::extension::type_base_of(&self.extension_id),
+            &self.command.name,
+            self.command.effect,
+            self.command.replay_safety,
+            self.command.execution,
+            Some(self.extension_version.as_str()),
+            None,
+        );
+        match replay {
+            heramind_core::extension::CommandReplaySafety::Safe => {
+                crate::toolkit::tool::ReplaySafety::Safe
+            }
+            heramind_core::extension::CommandReplaySafety::Unsafe => {
+                crate::toolkit::tool::ReplaySafety::Unsafe
+            }
+        }
+    }
+
     async fn execute(&self, args: Value) -> ToolResult<ToolOutput> {
-        // Normalize image data in parameters so extensions receive raw base64:
-        // - resolve /api/images/ internal URLs to bytes (extensions are a
-        //   separate process and can't read hostless internal paths);
-        // - strip the data:image/...;base64, prefix (extensions fail with
-        //   "Invalid base64: Invalid symbol 58" when they get the data URI).
-        let data_dir = std::env::var("HERAMIND_DATA_DIR").unwrap_or_else(|_| "data".to_string());
-        let normalized_args = Self::normalize_image_args(&args, std::path::Path::new(&data_dir));
+        // NM-240: claim the classify-time PreparedInvoke id carried on this
+        // dispatch only — never mint or FIFO-claim by params.
+        //
+        // Claim MUST use the mint-time param form (often `/api/images/...`).
+        // Materializing to base64 *before* claim would fingerprint-mismatch
+        // the ticket. Resolve images only for IPC after consume (NM-314).
+        let op_id = args
+            .get(crate::agent::task_continuity::PREPARED_OPERATION_ARG)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                super::error::ToolError::InvalidArguments(
+                    "unbound PreparedInvoke: extension tool call is missing \
+                     _prepared_operation_id; re-classify and invoke again"
+                        .into(),
+                )
+            })?;
+        // Strip host-only token before fingerprint / extension params.
+        let mut for_dispatch = args.clone();
+        if let Some(obj) = for_dispatch.as_object_mut() {
+            obj.remove(crate::agent::task_continuity::PREPARED_OPERATION_ARG);
+        }
+        let claimed = heramind_core::extension::claim_prepared_for_dispatch(
+            op_id,
+            &self.extension_id,
+            &self.command.name,
+            &for_dispatch,
+        )
+        .map_err(super::error::ToolError::InvalidArguments)?;
+        if claimed.capability_generation != self.capability_generation.as_str() {
+            return Err(super::error::ToolError::InvalidArguments(format!(
+                "stale prepared invoke '{}': tool load generation expired after reload",
+                claimed.operation_id
+            )));
+        }
+        let prepared = heramind_core::extension::consume_authorized_prepared(
+            &claimed.operation_id,
+            &claimed.capability_generation,
+            &claimed.param_fingerprint,
+        )
+        .map_err(super::error::ToolError::InvalidArguments)?;
+
+        // Host-side materialize: extensions are a separate process and cannot
+        // fetch hostless `/api/images/` paths (or parse data-URI headers).
+        let data_dir = heramind_core::paths::data_dir();
+        let for_extension = Self::normalize_image_args(&prepared.canonical_params, &data_dir)?;
 
         // Execute with the centralized SLOW tier timeout (300s) for extensions that
         // need longer inference. Routed through `timeouts` so the ceiling is tunable
         // from a single source of truth.
         let result = tokio::time::timeout(crate::toolkit::timeouts::extension_invoke(), async {
             let ext = self.extension.read().await;
-            ext.execute_command(&self.command.name, &normalized_args)
+            ext.execute_command(&self.command.name, &for_extension)
                 .await
         })
         .await;
@@ -366,9 +497,8 @@ impl ExtensionToolExecutor {
         let mut all_tools = Vec::new();
 
         for info in extensions {
-            // Get the extension instance by ID
             if let Some(extension) = self.registry.get(&info.metadata.id).await {
-                let tools = ExtensionTool::from_extension(extension).await;
+                let tools = ExtensionTool::from_registered(extension, &info).await;
                 all_tools.extend(tools);
             }
         }
@@ -473,7 +603,11 @@ mod tests {
     }
 
     fn create_mock_extension() -> DynExtension {
-        let metadata = ExtensionMetadata::new("test.extension", "Test Extension", "1.0.0")
+        // Unique id per call — parallel tests must not share capability generation.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("test.extension.{n}");
+        let metadata = ExtensionMetadata::new(&id, "Test Extension", "1.0.0")
             .with_description("A test extension");
 
         let commands = vec![ExtensionCommand {
@@ -495,6 +629,10 @@ mod tests {
             fixed_values: HashMap::new(),
             samples: vec![],
             parameter_groups: vec![],
+            ai_exposed: true,
+            effect: Default::default(),
+            replay_safety: Default::default(),
+            execution: Default::default(),
         }];
 
         let ext = MockExtension { metadata, commands };
@@ -508,7 +646,7 @@ mod tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].command.name, "test_command");
-        assert_eq!(tools[0].extension_id, "test.extension");
+        assert!(tools[0].extension_id.starts_with("test.extension."));
     }
 
     #[tokio::test]
@@ -517,7 +655,17 @@ mod tests {
         let tools = ExtensionTool::from_extension(extension).await;
 
         let tool = &tools[0];
-        let args = json!({"input": "hello"});
+        let mut args = json!({"input": "hello"});
+        // NM-240: classify/bind and carry prepared_operation_id on this dispatch.
+        let bind = heramind_core::extension::classify_and_bind_chat_invoke(
+            &tool.extension_id,
+            &tool.command.name,
+            &args,
+        );
+        args.as_object_mut().unwrap().insert(
+            crate::agent::task_continuity::PREPARED_OPERATION_ARG.into(),
+            json!(bind.prepared_operation_id.expect("classify must issue id")),
+        );
 
         let result = tool.execute(args).await.unwrap();
         assert!(result.success);
@@ -532,9 +680,50 @@ mod tests {
         let tool = &tools[0];
         let def = tool.to_tool_definition();
 
-        assert_eq!(def.name, "test.extension:test_command");
-        assert_eq!(def.namespace, Some("test.extension".to_string()));
+        assert!(def.name.ends_with(":test_command"));
+        assert!(def.name.starts_with("test.extension."));
+        assert!(def
+            .namespace
+            .as_ref()
+            .unwrap()
+            .starts_with("test.extension."));
         assert_eq!(def.version, "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn image_parameter_schema_explains_platform_reference_adapter() {
+        let mut tools = ExtensionTool::from_extension(create_mock_extension()).await;
+        tools[0].command.parameters[0].name = "image_base64".into();
+        let schema = tools[0].parameters();
+        assert!(schema["properties"]["image_base64"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("/api/images/"));
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("image_base64")));
+    }
+
+    #[tokio::test]
+    async fn missing_internal_image_fails_before_extension_execution() {
+        let tools = ExtensionTool::from_extension(create_mock_extension()).await;
+        let args = json!({"image_base64":format!("/api/images/missing-{}/image/0.png", uuid::Uuid::new_v4())});
+        let result = tools[0].execute(args).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::super::error::ToolError::InvalidArguments(_))
+            ),
+            "must reject missing reference before dispatch: {result:?}"
+        );
+    }
+
+    #[test]
+    fn non_image_text_is_not_resolved_as_an_image() {
+        let args = json!({"prompt":"/api/images/missing/image/file.jpg", "notes":["/api/images/missing/image/file.jpg"]});
+        let actual = ExtensionTool::normalize_image_args(&args, Path::new("data")).unwrap();
+        assert_eq!(actual, args);
     }
 
     #[test]
@@ -544,7 +733,8 @@ mod tests {
             "image": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ==",
             "prompt": "Analyze this image"
         });
-        let normalized = ExtensionTool::normalize_image_args(&args, std::path::Path::new("data"));
+        let normalized =
+            ExtensionTool::normalize_image_args(&args, std::path::Path::new("data")).unwrap();
         assert_eq!(normalized["image"], "/9j/4AAQSkZJRgABAQ==");
         assert_eq!(normalized["prompt"], "Analyze this image"); // unchanged
     }
@@ -556,7 +746,8 @@ mod tests {
             "image": "/9j/4AAQSkZJRgABAQ==",
             "prompt": "Analyze"
         });
-        let normalized = ExtensionTool::normalize_image_args(&args, std::path::Path::new("data"));
+        let normalized =
+            ExtensionTool::normalize_image_args(&args, std::path::Path::new("data")).unwrap();
         assert_eq!(normalized["image"], "/9j/4AAQSkZJRgABAQ==");
     }
 
@@ -569,7 +760,8 @@ mod tests {
                 "model": "yolov8"
             }
         });
-        let normalized = ExtensionTool::normalize_image_args(&args, std::path::Path::new("data"));
+        let normalized =
+            ExtensionTool::normalize_image_args(&args, std::path::Path::new("data")).unwrap();
         assert_eq!(normalized["params"]["image"], "iVBORw0KGgo=");
         assert_eq!(normalized["params"]["model"], "yolov8");
     }
@@ -583,7 +775,8 @@ mod tests {
                 "data:image/png;base64,iVBORw0K=="
             ]
         });
-        let normalized = ExtensionTool::normalize_image_args(&args, std::path::Path::new("data"));
+        let normalized =
+            ExtensionTool::normalize_image_args(&args, std::path::Path::new("data")).unwrap();
         assert_eq!(normalized["images"][0], "/9j/AAA==");
         assert_eq!(normalized["images"][1], "iVBORw0K==");
     }
@@ -596,7 +789,8 @@ mod tests {
             "count": 42,
             "enabled": true
         });
-        let normalized = ExtensionTool::normalize_image_args(&args, std::path::Path::new("data"));
+        let normalized =
+            ExtensionTool::normalize_image_args(&args, std::path::Path::new("data")).unwrap();
         assert_eq!(normalized["city"], "Beijing");
         assert_eq!(normalized["count"], 42);
         assert_eq!(normalized["enabled"], true);
@@ -621,7 +815,7 @@ mod tests {
         std::fs::write(images_dir.join("1234567890.png"), png).unwrap();
 
         let args = json!({ "image": "/api/images/dev/image/1234567890.png" });
-        let normalized = ExtensionTool::normalize_image_args(&args, &temp);
+        let normalized = ExtensionTool::normalize_image_args(&args, &temp).unwrap();
         let got = normalized["image"]
             .as_str()
             .expect("image should be a string");
@@ -639,18 +833,56 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_image_args_api_images_missing_falls_back() {
-        // A /api/images/ URL whose file is missing must fall back to the
-        // original string (so the extension surfaces its own error) rather than
-        // panic or silently drop the arg.
+    fn test_normalize_image_args_api_images_missing_is_rejected() {
+        // A missing internal reference must fail before the extension sees a URL
+        // where it expects base64. Preserve the real read error.
         let temp = std::env::temp_dir().join(format!(
             "heramind_test_ext_tool_empty_{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&temp).unwrap();
         let args = json!({ "image": "/api/images/nope/image/0.png" });
-        let normalized = ExtensionTool::normalize_image_args(&args, &temp);
-        assert_eq!(normalized["image"], "/api/images/nope/image/0.png");
+        let error = ExtensionTool::normalize_image_args(&args, &temp).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Cannot read internal image reference"));
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn historical_extension_tool_cli_hint_covers_colon_and_sanitized() {
+        let colon = historical_extension_tool_cli_hint("weather-forecast-v2:get_weather").unwrap();
+        assert!(colon.contains("heramind extension commands weather-forecast-v2"));
+        assert!(colon.contains("heramind extension invoke weather-forecast-v2 get_weather"));
+        assert!(colon.contains("AI disable"));
+
+        let sanitized =
+            historical_extension_tool_cli_hint("weather-forecast-v2_get_weather").unwrap();
+        assert!(sanitized.contains("heramind extension invoke weather-forecast-v2 get_weather"));
+
+        assert!(historical_extension_tool_cli_hint("shell").is_none());
+        assert!(historical_extension_tool_cli_hint("file_read").is_none());
+    }
+
+    #[test]
+    fn extension_direct_tools_env_gate() {
+        let prev = std::env::var_os("HERAMIND_EXTENSION_DIRECT_TOOLS");
+        std::env::remove_var("HERAMIND_EXTENSION_DIRECT_TOOLS");
+        assert!(
+            !extension_direct_tools_for_llm(),
+            "unset defaults to CLI-only (direct tools off)"
+        );
+        std::env::set_var("HERAMIND_EXTENSION_DIRECT_TOOLS", "0");
+        assert!(!extension_direct_tools_for_llm());
+        std::env::set_var("HERAMIND_EXTENSION_DIRECT_TOOLS", "false");
+        assert!(!extension_direct_tools_for_llm());
+        std::env::set_var("HERAMIND_EXTENSION_DIRECT_TOOLS", "1");
+        assert!(extension_direct_tools_for_llm());
+        std::env::set_var("HERAMIND_EXTENSION_DIRECT_TOOLS", "true");
+        assert!(extension_direct_tools_for_llm());
+        match prev {
+            Some(v) => std::env::set_var("HERAMIND_EXTENSION_DIRECT_TOOLS", v),
+            None => std::env::remove_var("HERAMIND_EXTENSION_DIRECT_TOOLS"),
+        }
     }
 }

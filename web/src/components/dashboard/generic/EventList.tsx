@@ -538,7 +538,7 @@ export const EventList = memo(function EventList({
         {filteredEvents.length > pageSize && (
           <div className="flex items-center justify-between gap-3 border-t px-3 py-2">
             <span className="text-xs text-muted-foreground">
-              {t('eventList.page', { page, total: totalPages })}
+              {t('dashboardComponents:eventList.page', { page, total: totalPages })}
             </span>
             <div className="flex gap-1">
               <IconButton

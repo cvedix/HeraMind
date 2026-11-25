@@ -11,6 +11,7 @@
  */
 
 import { useMemo, useId, memo } from 'react'
+import { useTranslation } from 'react-i18next'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { DataMapper } from '@/lib/dataMapping'
@@ -70,9 +71,10 @@ export const ProgressBar = memo(function ProgressBar({
   variant = 'default',
   icon,
   iconColor,
-  backgroundColor,
+  backgroundColor: _backgroundColor,
   className,
 }: ProgressBarProps) {
+  const { t } = useTranslation('dashboardComponents')
   const stableId = useId()
   // Check if dataSource is configured
   const hasDataSource = dataSource !== undefined
@@ -115,7 +117,7 @@ export const ProgressBar = memo(function ProgressBar({
   const state = getProgressState(percentage, effectiveWarningThreshold, effectiveDangerThreshold)
   const progressColor = getValueStateColor(value, max, effectiveWarningThreshold, effectiveDangerThreshold, color)
   const textColor = getValueTextColor(value, max, effectiveWarningThreshold, effectiveDangerThreshold)
-  const colorConfig = indicatorColors[state]
+  const _colorConfig = indicatorColors[state]
 
   // Get gradient for the progress fill
   const progressGradient = useMemo(() => getLinearGradient(state, 'to right', color), [state, color])
@@ -127,7 +129,7 @@ export const ProgressBar = memo(function ProgressBar({
 
   // Unified empty state for all variants (only when dataSource is configured but no value)
   if (!loading && !error && hasDataSource && (data === null || data === undefined || (Array.isArray(data) && data.length === 0))) {
-    return <EmptyState size={size} className={className} message={title ? `${title} - No Data Available` : undefined} />
+    return <EmptyState size={size} className={className} message={title ? `${title} - ${t('defaultStates.noData')}` : undefined} />
   }
 
   // ============================================================================

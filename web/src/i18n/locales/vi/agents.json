@@ -61,7 +61,18 @@
     "avgDuration": "Thời lượng trung bình",
     "neverExecuted": "Chưa bao giờ thực hiện",
     "toggleStatus": "Chuyển đổi trạng thái {{name}}",
-    "moreOptions": "Nhiều lựa chọn hơn"
+    "moreOptions": "Nhiều lựa chọn hơn",
+    "role": {
+      "recordData": "Dữ liệu thu",
+      "actOrInvestigate": "Công việc & điều tra",
+      "answer": "Câu trả lời"
+    },
+    "memory": {
+      "tool": "Công cụ không có tính trạng thái",
+      "assistant": "Có bộ nhớ"
+    },
+    "errorUnknown": "Việc thực hiện bị lỗi — mở chi tiết cho bản ghi",
+    "runsSuffix": "chạy"
   },
   "confirm": {
     "pauseTitle": "Xác nhận tác nhân tạm dừng?",
@@ -117,7 +128,27 @@
     "toolsColumnVersion": "Phiên bản",
     "toolsColumnNamespace": "Không gian tên",
     "toolsParamRequired": "bắt buộc",
-    "toolsFilterAllSources": "Tất cả các nguồn"
+    "toolsFilterAllSources": "Tất cả các nguồn",
+    "outputFields": "Trường xuất",
+    "viewEvidence": "Xem nó ghi gì.",
+    "outputFieldsHint": "Mỗi trường là một nguồn dữ liệu (ai:{Agentt}:{field} — buộc nó trên bảng điều khiển, quy tắc và dữ liệu.",
+    "fieldType": {
+      "number": "số",
+      "text": "chữ",
+      "boolean": "(Tiếng Tây Ban Nha)"
+    },
+    "memoryModeNote": {
+      "tool": "Công cụ vô chính phủ — mỗi lần chạy chỉ thấy đầu vào hiện thời (các tiêu chuẩn sửa đổi của bạn vẫn còn áp dụng).",
+      "assistant": "Có bộ nhớ — mỗi lần chạy mang theo lời tường thuật về những vụ hành hình gần đây; có thể nói “sai hơn lần trước ”."
+    },
+    "sections": "Phần",
+    "sectionsDesc": {
+      "overview": "Trạng thái, trường xuất và cấu hình",
+      "history": "Từng bước, từng bước một",
+      "memory": "Tập tin & kiến thức nhật kí",
+      "messages": "Ghi chú cho lần chạy tiếp"
+    },
+    "model": "người mẫu"
   },
   "tabs": {
     "agents": "Tác nhân",
@@ -375,6 +406,24 @@
           "ai": "Chỉ số AI",
           "transform": "chuyển đổi",
           "system": "Hệ thống"
+        },
+        "mode": {
+          "any": "Bất cứ ai trong số họ",
+          "all": "Tất cả bọn họ"
+        },
+        "modeHint": {
+          "any": "Bắn ngay khi một trong số chúng báo cáo",
+          "all": "Bắn chỉ một lần mỗi người báo cáo"
+        },
+        "selectedSources": "Nguồn kích hoạt",
+        "removeAllMetrics": "Dừng kích hoạt trên bất kỳ số đo của {{name}}",
+        "removeField": "Dừng kích hoạt {{field}} từ {{name}}",
+        "windowBefore": "Tất cả chúng phải xảy ra bên trong.",
+        "windowAfter": "phút",
+        "windowLabel": "Thời gian trong phút",
+        "issue": {
+          "window_required": "Chọn thời gian. tất cả các nguồn sẽ phải đến trong một sự kiện duy nhất và tác tử sẽ không bao giờ chạy.",
+          "sources_required": "Chọn ít nhất một nguồn kích hoạt hoặc liên kết tài nguyên mà tác tử cần theo dõi."
         }
       },
       "interval": {
@@ -504,8 +553,12 @@
         "searchPlaceholder": "Tìm kiếm tài nguyên...",
         "noResourcesHint": "Nhấp vào \"Thêm tài nguyên\" để chọn thiết bị và extension",
         "done": "Xong",
-        "selectedCount": "Đã chọn tài nguyên {{count}}{{s}}"
-      }
+        "selectedCount": "Đã chọn tài nguyên {{count}}{{s}}",
+        "doneWithCount": "Hoàn tất ({{count}})"
+      },
+      "lookbackUnit": "phút",
+      "noneAvailable": "Tài nguyên này không có thước đo hay lệnh",
+      "lookback": "Nhìn lại đi."
     },
     "advanced": {
       "title": "Cấu hình nâng cao",
@@ -533,7 +586,13 @@
       "systemPromptHint": "Ghi đè danh tính tác nhân mặc định. Để trống để sử dụng vai trò trợ lý IoT tích hợp.",
       "systemPromptTooLong": "Lời nhắc hệ thống phải có 4000 ký tự trở xuống",
       "useDefault": "Sử dụng mặc định",
-      "defaultSystemPrompt": "Bạn là một trợ lý IoT thông minh. Bạn giám sát các thiết bị biên, phân tích dữ liệu cảm biến và giúp người dùng quản lý môi trường IoT của họ. Cung cấp thông tin chi tiết rõ ràng, có thể hành động dựa trên dữ liệu bạn quan sát."
+      "defaultSystemPrompt": "Bạn là một trợ lý IoT thông minh. Bạn giám sát các thiết bị biên, phân tích dữ liệu cảm biến và giúp người dùng quản lý môi trường IoT của họ. Cung cấp thông tin chi tiết rõ ràng, có thể hành động dựa trên dữ liệu bạn quan sát.",
+      "tools": "Cho phép sử dụng công cụ",
+      "toolsHint": "Khi tắt, tác tử chỉ xử lý văn bản. Khi bật, tác tử có thể gọi các công cụ cần cho lần chạy.",
+      "toolsRestrict": "Công cụ hạn chế",
+      "toolsRestrictHint": "Một số công cụ có thể hạn chế, ít dụng cụ hơn thì an toàn hơn, và mô hình nhỏ thì chọn cách tốt hơn trong số ít người.",
+      "toolsSelected": "{{selected}} / {{total}} được chọn — không có phương tiện nào được chọn có nghĩa là tất cả",
+      "toolsDisabledAutonomyHint": "Phong cách làm việc tự động với các công cụ tắt các nhà thoái hóa để trả lời một văn bản duy nhất — lời hứa đa vòng không thể được giữ nếu không có công cụ."
     },
     "dataCollection": {
       "title": "Cấu hình thu thập dữ liệu",
@@ -547,7 +606,8 @@
       "nameRequired": "Vui lòng nhập tên tác nhân",
       "requirementRequired": "Hãy mô tả yêu cầu của bạn",
       "resourceRequired": "Vui lòng chọn ít nhất một tài nguyên thiết bị",
-      "eventTypeRequired": "Vui lòng chọn loại sự kiện kích hoạt"
+      "eventTypeRequired": "Vui lòng chọn loại sự kiện kích hoạt",
+      "outputFieldRequired": "Hãy xác định ít nhất một trường xuất"
     },
     "actions": {
       "cancel": "Hủy bỏ",
@@ -583,6 +643,152 @@
       "America/New_York": "New York (UTC-5/-4)",
       "America/Los_Angeles": "Los Angeles (UTC-8/-7)",
       "UTC": "UTC (UTC+0)"
+    },
+    "structured": {
+      "hint": "Mỗi trường được xuất bản như là một nền tảng dữ liệu nguồn có thể sử dụng bởi bảng điều khiển, quy tắc và dữ liệu-push. xác định những gì cần trích xuất, sau đó kết nối nó với các đầu vào thông qua các nguồn tài nguyên.",
+      "multiRoundCost": "Một kết luận đa diện là văn xuôi; biến nó thành các cánh đồng tốn thêm một cuộc gọi mô hình vào cuối mỗi lần chạy.",
+      "colName": "Tên",
+      "colType": "Loại",
+      "colUnit": "Đơn vị",
+      "colDesc": "Nghĩa là",
+      "fieldName": "e.g. mất tích_ dig",
+      "fieldUnit": "e.g. °C / pcs",
+      "fieldDescription": "Nhiễm trùng thành dấu nhắc",
+      "enumValues": "Các giá trị được cho phép, dấu phẩy phân cách (v. d. _, tôm)",
+      "typeNumber": "Số",
+      "typeText": "văn bản",
+      "typeBoolean": "Boolant",
+      "typeEnum": "Số lượng (giá trị được sửa)",
+      "addField": "Thêm trường",
+      "removeField": "Xóa",
+      "debounce": "Debounce (giây)",
+      "timeout": "Thời hạn vô hạn (giây)",
+      "threshold": "Ngưỡng ngắt mạch điện",
+      "dailyCap": "Mũ chạy hàng ngày (tùy chọn)",
+      "eventCooldown": "Sự kiện làm mát (giây; 0 = lửa khi nhàn rỗi, mặc định 60)",
+      "dryRun": "Chạy khô",
+      "dryRunRunning": "Đang chạy...",
+      "dryRunResultTitle": "Kết quả chạy thử",
+      "dryRunMeta": "{{sources}} nguồn đầu vào · lần thử {{attempts}} · không lưu thay đổi",
+      "guardrailSummary": "Giới hạn thực thi: chống lặp {{debounce}} giây · hết hạn sau {{timeout}} giây · ngắt sau {{threshold}} lỗi · tối đa {{cap}} lần/ngày",
+      "guardrailSummaryEveryRun": "Giới hạn thực thi: hết hạn sau {{timeout}} giây · ngắt sau {{threshold}} lỗi · tối đa {{cap}} lần/ngày",
+      "guardrailToggle": "Điều chỉnh"
+    },
+    "section": {
+      "what": "AI nên làm gì",
+      "record": "Những gì nó ghi lại",
+      "when": "♪ Khi nó chạy ♪"
+    },
+    "preset": {
+      "title": "Chạy từ mẫu",
+      "allTitle": "Chạy từ mẫu",
+      "appliedFrom": "Bắt đầu từ ‘ {{name}} ’",
+      "repick": "Chọn cái khác",
+      "image": {
+        "fDescDesc": "Những gì khung cho thấy",
+        "fStatusValues": "chuẩn, bất thường",
+        "fStatusDesc": "Phán quyết trạng thái khung",
+        "name": "Hiểu ảnh",
+        "desc": "Hãy nhìn vào khung hình camera, đưa ra phán quyết",
+        "prompt": "Bạn là người phụ trách nội bộ. Hãy nhìn vào khung mới nhất của máy ảnh: 1. Mô tả các điểm then chốt (các vật liệu, vật liệu, con người); 2 đánh giá xem có điều gì sai (tình trạng sắp xếp, xếp, an toàn); 3. Nếu có điều gì xảy ra, hãy nói, nguyên nhân có thể là nguyên nhân, và một câu trả lời được gợi ý; nếu không, tất cả đều bình thường."
+      },
+      "monitor": {
+        "fStatusDesc": "Phán quyết toàn bộ tình trạng",
+        "fStatusValues": "bình thường, bất thường, ôn lại",
+        "fCountDesc": "Số điểm ảnh",
+        "fCountUnit": "đồ vật",
+        "name": "Bộ theo dõi dữ liệu",
+        "desc": "Đọc nhiều nguồn, ghi lại dạng dữ liệu",
+        "prompt": "Bạn là thanh tra thiết bị. Đọc các giá trị đo lường giới hạn theo thời biểu: 1. So sánh mỗi đối với phạm vi bình thường của nó; 2. đưa ra một phán quyết tổng quát (bình thường / bình thường / xem xét); 3. Đếm và liệt kê các dị thường. Giá trị gần nhưng không qua ngưỡng là xem xét, không phải là bất thường."
+      },
+      "smart": {
+        "name": "Tác vụ thông minh",
+        "desc": "Phân tích liên quan đến hành động",
+        "prompt": "Bạn là kỹ sư nhiệm vụ. Xem các nguồn dữ liệu bị ràng buộc; khi một cái gì đó có vẻ không đúng: 1. Hãy tự đầu tư nguyên nhân (tự kiểm tra các dữ liệu khác, sử dụng công cụ); 2. Chạy trực tiếp các thiết bị kết nối khi cần thiết (bắt đầu một quạt, năng lượng thấp, dừng lại một dòng); 3. Sau mỗi hành động, hãy nói những gì bạn đã làm và tại sao. Escalate nhẹ nhàng: thích điều chỉnh các tham số hơn thiết bị dừng lại."
+      },
+      "scheduled": {
+        "name": "Đã lên lịch báo cáo",
+        "desc": "Tóm tắt định kỳ",
+        "prompt": "Bạn là chuyên viên phân tích vận hành. Tổng hợp dữ liệu từ các nguồn đã liên kết trong 24 giờ qua:\n1. Trạng thái tổng thể và các chỉ số thay đổi đáng kể.\n2. Sự kiện và hành động trong kỳ.\n3. So với ngày trước (tốt hơn, xấu hơn hoặc ổn định).\n4. Từ 1 đến 3 vấn đề cần ưu tiên theo dõi tiếp."
+      },
+      "advanced": {
+        "name": "Nâng cao",
+        "desc": "Tự do, lời nói của anh.",
+        "prompt": "Hãy miêu tả công việc của bạn — bốn điều sẽ tóm tắt: 1. Mục tiêu — những gì cần đạt được; 2. Nhập dữ liệu hoặc máy ảnh — những dữ liệu cần xem; 3. Phán xét — những gì được xem là bình thường, như là rắc rối; 4 hành động — phải làm gì và thông báo khi có vấn đề xảy ra."
+      },
+      "event": {
+        "name": "Phán xét sự kiện",
+        "desc": "Xem xét mỗi thay đổi khi nó đến",
+        "prompt": "Đánh giá thay đổi vừa xảy ra.\n\nKhi nguồn đã liên kết báo dữ liệu:\n1. Đọc giá trị hiện tại của các nguồn đã liên kết.\n2. Xác định tình trạng bình thường, cần theo dõi hay có vấn đề.\n3. Tóm tắt trong một dòng để người vận hành biết cần làm gì.\nMột phép đo chỉ là một phần bằng chứng. Hãy nêu rõ nếu dữ liệu chưa đủ để kết luận.",
+        "fStatusValues": "bình thường, xem, vấn đề",
+        "fStatusDesc": "Điều này có nghĩa là gì?",
+        "fDetailDesc": "Một câu nói về chuyện đã xảy ra"
+      },
+      "rootCause": {
+        "name": "Nguyên nhân gốc",
+        "desc": "Một vài nguồn, một kết luận",
+        "prompt": "Bạn là kỹ sư trực điện thoại, có điều gì đó không ổn, hoặc có vẻ như nó sai. 1. điều gì đã xảy ra, hãy tìm ra những gì thực sự xảy ra — truy vấn các nguồn khác và sử dụng công cụ của bạn để kiểm tra linh cảm của bạn; đừng dừng lại ở câu chuyện hợp lý đầu tiên; 2. Giữ những gì dữ liệu cho thấy khác biệt với những gì bạn đang suy luận; 3, tên có thể là nguyên nhân, và các bằng chứng có thể thực sự đi bao xa; 4. Nếu các bằng chứng không hỗ trợ một nguyên nhân, hãy nói rằng — một cái rễ sai gây ra một cái gì đó gây ra nhiều hơn là không đủ thành thật.",
+        "fCauseDesc": "Rất có thể là nguyên nhân",
+        "fConfValues": "cao, vừa, thấp",
+        "fConfDesc": "Các bằng chứng thực sự đi xa đến đâu",
+        "fSuggestDesc": "Điều tiếp theo phải làm"
+      },
+      "weekly": {
+        "name": "Báo cáo hàng tuần",
+        "desc": "Summarise trong tuần",
+        "prompt": "Bạn là nhà phân tích các hoạt động. Hãy tóm tắt các nguồn tài liệu bị giới hạn trong 7 ngày qua: 1. Toàn bộ trạng thái của tuần và tổng số các vấn đề quan trọng; 2. tái phát hiện vấn đề — những gì đã xảy ra nhiều hơn một lần, và thường xuyên như thế nào; 3 lần so sánh với tuần trước (tốt hơn / xấu hơn / phẳng); 4. 1–3 điều đáng thay đổi tuần sau. Viết về tuần sau như một toàn bộ; một cây gai một kết thúc chỉ đáng giá một lần đề cập đến nếu nó tiếp tục trở lại hoặc vẫn chưa được giải quyết."
+      },
+      "shift": {
+        "name": "Kiểm tra dịch",
+        "desc": "Cứ mỗi nửa giờ, hãy tìm xem có gì thay đổi.",
+        "prompt": "Hãy xem qua các nguồn tài liệu sau cùng: 1. So sánh với lần cuối cùng bạn xem xét; 2. Báo cáo chỉ thay đổi những gì — đọc một cách chắc chắn không phải là tin tức; 3, nếu có điều gì đó đang trôi dạt đến rắc rối, hãy nói theo cách nào và nhanh cỡ nào. hai dòng thường là đủ rồi. nói \"không có gì mới\" khi đó là sự thật; một báo cáo nói về mỗi vòng là không ai đọc được."
+      },
+      "all": "Mọi mẫu",
+      "allSubtitle": "Điểm bắt đầu, chứ không phải khóa — mỗi trường điền mẫu đều có thể được sửa đổi.",
+      "next": {
+        "sources": "Đóng kết các nguồn dữ liệu nó nên đọc",
+        "trigger": "Trói một nguồn kích hoạt, hoặc các nguồn dữ liệu mà nó nên đọc",
+        "optional": "Kết hợp dữ liệu mà nó nên đọc, hoặc tiết kiệm - nó có thể tự tìm kiếm mọi thứ"
+      },
+      "patrol": {
+        "name": "Lên lịch tuần tra",
+        "desc": "Quay vòng trên đồng hồ, sửa chữa những gì nó có thể",
+        "prompt": "Bạn là kỹ sư trực tiếp. Kiểm tra các nguồn bị ràng buộc theo lịch trình: khi một cái gì đó bị tắt, đánh giá bản chất và bán kính nổ của nó đầu tiên; sửa chữa trực tiếp những gì bạn có thể (bắt đầu một thiết bị, resend một lệnh) và xác nhận lại một sửa chữa đã được thực hiện; phần còn lại, viết ra các triệu chứng, đọc của bạn về nguyên nhân, và một bước gợi ý. Mỗi kết luận vòng phải được so sánh với một trong những thứ trước đó, và mỗi lần sửa chữa lá cải tạo lại một hóa đơn."
+      },
+      "qa": {
+        "name": "Dữ liệu Q&A",
+        "desc": "Hỏi bất cứ lúc nào, đáp án chỉ từ dữ liệu bị hạn chế",
+        "prompt": "Bạn là một trợ lý tra dữ liệu. Câu trả lời chỉ từ các nguồn dữ liệu bị hạn chế: tìm kiếm đầu tiên, rồi trả lời; mỗi số mang nhãn thời gian và nguồn; khi dữ liệu không có nó, hãy nói rõ ràng thay vì đoán. Giữ trả lời ngắn gọn và trực tiếp."
+      }
+    },
+    "notify": {
+      "title": "Thông báo",
+      "noChannels": "Chưa có kênh nào bên ngoài — vẫn còn cảnh giác trong thông điệp.",
+      "onLabel": "Khi nào cần thông báo",
+      "onFailure": "Thất bại",
+      "onFailureDesc": "Thông báo chỉ khi một cuộc chạy đua thất bại; thành công giữ yên lặng.",
+      "onAlways": "Mỗi lần chạy",
+      "onAlwaysDesc": "Thông báo về mọi cuộc chạy đua, thành công hay thất bại.",
+      "onJudgment": "Hãy để nhiệm vụ quyết định.",
+      "onJudgmentDesc": "Chỉ nói khi có một kết luận đáng để hành động; những hiệp hội thường xuyên im lặng — và không có gì trở lại để ngửi từ điển.",
+      "hint": "Nơi cần gửi, và khi. \"Hãy để cho các đại lý quyết định\" cấu hình không có thông báo đã được định tuyến và không rơi lại để ngửi thấy từ khóa cũ.",
+      "configureChannels": "Cấu hình kênh"
+    },
+    "workstyle": {
+      "title": "Nó hoạt động thế nào?",
+      "bound": "Chỉ giới hạn dữ liệu",
+      "auto": "Khám phá và hành động",
+      "boundDesc": "Những câu trả lời hoàn toàn từ các thiết bị và nguồn dữ liệu bị ràng buộc — không xem xét thêm",
+      "autoDesc": "Có thể chạy công cụ qua nhiều vòng trước khi trả lời"
+    },
+    "memory": {
+      "title": "Những gì nó nhớ",
+      "auto": "Đã thu hút từ chế độ",
+      "stateless": "Đánh giá mới mỗi lần",
+      "statelessHint": "Chỉ thấy dữ liệu chạy này, rẻ hơn, nhanh hơn, có thể lặp lại",
+      "history": "Nhớ kết quả đã qua",
+      "historyHint": "Có thể nói là \"thời gian hơn lần trước\".",
+      "standardsKept": "Tiêu chuẩn và sự sửa trị của bạn luôn luôn áp dụng, bất cứ điều gì bạn chọn ở đây"
     }
   },
   "skills": {
@@ -699,5 +905,34 @@
     "saving": "Đang lưu"
   },
   "executionNotFound": "Không tìm thấy việc thực thi",
-  "noAgentsNoBackendDesc": "Agent cần mô hình AI để hoạt động. Tải mô hình tích hợp (chạy ngoại tuyến, không cần API key) hoặc cấu hình backend của bạn trước."
+  "noAgentsNoBackendDesc": "Agent cần mô hình AI để hoạt động. Tải mô hình tích hợp (chạy ngoại tuyến, không cần API key) hoặc cấu hình backend của bạn trước.",
+  "evidence": {
+    "title": "Bằng chứng tử hình",
+    "tokens": "Tín hiệu {{count}}",
+    "inputs": "Nhập",
+    "inputsUnknown": "Không biết bằng chứng nhập",
+    "inputsEmpty": "Không ghi dữ liệu vào",
+    "output": "đầu ra",
+    "outputUnknown": "Không biết bằng chứng xuất",
+    "outputEmpty": "Không ghi kết xuất",
+    "actions": "Kết quả hành động",
+    "actionsUnknown": "Không biết bằng chứng hành động",
+    "actionsEmpty": "Không có hành động nào được ghi lại",
+    "resultUnknown": "Kết quả không rõ",
+    "timeUnknown": "Thời gian không rõ",
+    "unknownDetail": "Không rõ chi tiết lỗi",
+    "stopReason": "Dừng lý do",
+    "presence": {
+      "known": "Đã biết",
+      "empty": "Trống",
+      "unknown": "Không xác định"
+    },
+    "failure": {
+      "none": "Không có nút trục trặc",
+      "error": "Lỗi: lỗi thực hiện",
+      "failed_action": "Thất bại — lỗi hành động",
+      "stop_reason": "Thất bại — Dừng lý do",
+      "unknown": "Lỗi nút không rõ"
+    }
+  }
 }

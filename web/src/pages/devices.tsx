@@ -10,20 +10,16 @@ import { confirm } from "@/hooks/use-confirm"
 import { fetchCache } from "@/lib/utils/async"
 import { useNavigate, useLocation, useParams } from "react-router-dom"
 import { PageLayout } from "@/components/layout/PageLayout"
-import { PageTabsBar, PageTabsContent, PageTabsBottomNav, Pagination, type TabAction } from "@/components/shared"
-import { Upload, Download, Settings, Server, Layers, FileEdit, Cloud, ChevronLeft } from "lucide-react"
+import { PageTabsBar, PageTabsContent, Pagination, SearchInput, type TabAction } from "@/components/shared"
+import { Upload, Download, Settings, Server, Layers, FileEdit, Cloud, ChevronLeft, Pencil } from "lucide-react"
 import { LoadingState } from "@/components/shared/LoadingState"
 import { Button } from "@/components/ui/button"
-import { UnifiedFormDialog } from "@/components/dialog/UnifiedFormDialog"
-import { Switch } from "@/components/ui/switch"
-import { Label } from "@/components/ui/label"
-import { Input } from "@/components/ui/input"
 import { api } from "@/lib/api"
 import type { Device, DeviceType } from "@/types"
 import {
   DeviceList,
   DeviceDetail,
-  AddDeviceDialog,
+
   EditDeviceDialog,
   DeviceTypeList,
   AddDeviceTypeDialog,
@@ -40,7 +36,7 @@ type DeviceTabValue = "devices" | "types" | "drafts"
 export function DevicesPage() {
   const { t } = useTranslation(['common', 'devices'])
   const { toast } = useToast()
-  const { handleError, withErrorHandling } = useErrorHandler()
+  const { handleError: _handleError, withErrorHandling } = useErrorHandler()
   const { id: urlDeviceId } = useParams<{ id?: string }>()
   const isMobile = useIsMobile()
 
@@ -50,6 +46,16 @@ export function DevicesPage() {
     devices: s.devices,
     devicesLoading: s.devicesLoading,
   }), shallow)
+
+  // Attached device count per device-type id — drives the types-tab column
+  // and the delete confirmation warning
+  const deviceTypeDeviceCounts = useMemo(() => {
+    const counts: Record<string, number> = {}
+    for (const d of devices) {
+      if (d.device_type) counts[d.device_type] = (counts[d.device_type] ?? 0) + 1
+    }
+    return counts
+  }, [devices])
 
   // Group device type data selectors (change together)
   const { deviceTypes, deviceTypesLoading } = useStore((s) => ({
@@ -64,7 +70,7 @@ export function DevicesPage() {
   }), shallow)
 
   // Group detail view data selectors (change together when viewing a device)
-  const { deviceTypeDetails, deviceDetails, telemetryData, telemetrySummary, deviceCurrentState, telemetryLoading } = useStore((s) => ({
+  const { deviceTypeDetails, deviceDetails, telemetryData, telemetrySummary: _telemetrySummary, deviceCurrentState, telemetryLoading } = useStore((s) => ({
     deviceTypeDetails: s.deviceTypeDetails,
     deviceDetails: s.deviceDetails,
     telemetryData: s.telemetryData,
@@ -86,7 +92,7 @@ export function DevicesPage() {
   const validateDeviceType = useStore((s) => s.validateDeviceType)
   const sendCommand = useStore((s) => s.sendCommand)
   const fetchTelemetryData = useStore((s) => s.fetchTelemetryData)
-  const fetchTelemetrySummary = useStore((s) => s.fetchTelemetrySummary)
+  const _fetchTelemetrySummary = useStore((s) => s.fetchTelemetrySummary)
   const fetchDeviceCurrentState = useStore((s) => s.fetchDeviceCurrentState)
   const clearDeviceDetails = useStore((s) => s.clearDeviceDetails)
   const updateDeviceStatus = useStore((s) => s.updateDeviceStatus)
@@ -176,19 +182,37 @@ export function DevicesPage() {
     }
   }, [activeTab])
 
+  // Device-list search — client-side over the full device array (the list
+  // is client-paginated from the store, so a filter must sit BEFORE the
+  // pagination slice). Matches name / id / type / adapter.
+  const [deviceSearch, setDeviceSearch] = useState('')
+  const filteredDevices = useMemo(() => {
+    const q = deviceSearch.trim().toLowerCase()
+    if (!q) return devices
+    return devices.filter((d) =>
+      [d.name, d.device_id, d.device_type, d.adapter_type]
+        .some((field) => field?.toLowerCase().includes(q))
+    )
+  }, [devices, deviceSearch])
+
+  // Entering/leaving a query must land the user on page 1 of the result set.
+  useEffect(() => {
+    setDevicePage(1)
+  }, [deviceSearch])
+
   // Paginated devices
   // On mobile: show cumulative data (all pages up to current)
   // On desktop: show only current page
   const paginatedDevices = useMemo(() => {
     if (isMobile) {
-      return devices.slice(0, devicePage * devicesPerPage)
+      return filteredDevices.slice(0, devicePage * devicesPerPage)
     } else {
-      return devices.slice(
+      return filteredDevices.slice(
         (devicePage - 1) * devicesPerPage,
         devicePage * devicesPerPage
       )
     }
-  }, [devices, devicePage, devicesPerPage, isMobile])
+  }, [filteredDevices, devicePage, devicesPerPage, isMobile])
 
   // Device detail view state
   const [deviceDetailView, setDeviceDetailView] = useState<string | null>(null)
@@ -445,38 +469,48 @@ export function DevicesPage() {
     }
   }
 
-  const handleMetricClick = async (metricName: string, offset?: number, limit?: number) => {
+  const handleMetricClick = async (
+    metricName: string,
+    offset?: number,
+    limit?: number,
+    cursor?: number | null,
+  ) => {
     if (!deviceDetailView) return
     setSelectedMetric(metricName)
     // Use current timestamp as end to ensure we get the latest data
     const end = Math.floor(Date.now() / 1000)
     // Max 30 days to match backend limit (MAX_TIME_RANGE_SECS = 30 * 86400)
     const start = end - 30 * 24 * 60 * 60
-    // Fetch with pagination support
-    await fetchTelemetryData(deviceDetailView, metricName, start, end, limit ?? 50, offset ?? 0)
+    // Offset for page jumps; cursor for sequential next when available.
+    await fetchTelemetryData(
+      deviceDetailView,
+      metricName,
+      start,
+      end,
+      limit ?? 50,
+      offset ?? 0,
+      cursor,
+    )
   }
 
-  const handleSendCommand = async (commandName: string, paramsJson: string) => {
-    if (!deviceDetailView) return
+  const handleSendCommand = async (
+    commandName: string,
+    params: Record<string, unknown>,
+  ) => {
+    if (!deviceDetailView) return false as const
 
     try {
-      let params: Record<string, unknown> = {}
-      if (paramsJson.trim()) {
-        try {
-          params = JSON.parse(paramsJson)
-        } catch {
-          toast({ title: t('devices:paramsError'), variant: "destructive" })
-          return
-        }
-      }
-      const success = await sendCommand(deviceDetailView, commandName, params)
-      if (success) {
+      const result = await sendCommand(deviceDetailView, commandName, params)
+      if (result) {
+        // Detail dialog shows the ladder; toast stays dispatch-honest (not ACK).
         toast({ title: t('devices:commandSent') })
       } else {
         toast({ title: t('devices:sendCommandFailed'), variant: "destructive" })
       }
+      return result
     } catch {
       toast({ title: t('devices:sendCommandFailed'), variant: "destructive" })
+      return false as const
     }
   }
 
@@ -562,9 +596,12 @@ export function DevicesPage() {
   }
 
   const handleDeleteDeviceType = async (id: string) => {
+    const attachedCount = deviceTypeDeviceCounts[id] ?? 0
     const confirmed = await confirm({
       title: t('common:delete'),
-      description: t('devices:deleteTypeConfirm'),
+      description: attachedCount > 0
+        ? t('devices:deleteTypeConfirmWithDevices', { count: attachedCount })
+        : t('devices:deleteTypeConfirm'),
       confirmText: t('common:delete'),
       cancelText: t('common:cancel'),
       variant: "destructive"
@@ -638,20 +675,22 @@ export function DevicesPage() {
       if (successCount > 0) {
         toast({
           title: t('common:success'),
-          description: `Imported ${successCount} device type${successCount > 1 ? 's' : ''}${errorCount > 0 ? ` (${errorCount} failed)` : ''}`
+          description: errorCount > 0
+            ? t('devices:types.importTypesPartial', { count: successCount, failed: errorCount })
+            : t('devices:types.importTypesSuccess', { count: successCount }),
         })
         fetchDeviceTypes()
       } else {
         toast({
           title: t('common:failed'),
-          description: 'No device types were imported',
+          description: t('devices:types.importTypesNone'),
           variant: 'destructive'
         })
       }
     } catch (error) {
       toast({
         title: t('common:failed'),
-        description: 'Failed to parse JSON file',
+        description: t('devices:types.importTypesParseFailed'),
         variant: 'destructive'
       })
     } finally {
@@ -743,25 +782,32 @@ export function DevicesPage() {
     <>
       <PageLayout
         title={deviceDetailView ? undefined : t('devices:title')}
-        subtitle={deviceDetailView ? undefined : t('devices:subtitle')}
+        actions={deviceDetailView && deviceDetails ? (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => handleEditDevice(deviceDetails)}
+            aria-label={t('common:edit')}
+          >
+            <Pencil className="h-4 w-4" />
+          </Button>
+        ) : undefined}
         noPadding={!!deviceDetailView}
         hideFooterOnMobile
-        hasBottomNav
         mobileHeader={
           deviceDetailView
             ? {
                 // Show the device name as the MobilePageHeader title instead of
                 // an empty header. Lift the back chevron into the header's
-                // leftExtra and hide the hamburger — the in-page header still
-                // has its own back button for redundancy, but the top-of-screen
-                // header is the primary touch target.
+                // leftExtra and hide the hamburger. The top-of-screen header
+                // is the detail view's single mobile back target.
                 titleOverride: deviceDetails?.name || t('devices:detailTitle', 'Device detail'),
                 hideMenu: true,
                 leftExtra: (
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="h-9 w-9 shrink-0"
+                    className="-ml-2 h-11 w-11 shrink-0 rounded-full sm:h-11 sm:w-11"
                     onClick={handleCloseDeviceDetail}
                     aria-label={t('common:back', 'Back')}
                   >
@@ -783,12 +829,23 @@ export function DevicesPage() {
               onTabChange={(v) => handleTabChange(v as DeviceTabValue)}
               actions={tabActions.primary}
               secondaryActions={tabActions.secondary}
+              actionsExtra={
+                activeTab === 'devices' ? (
+                  <SearchInput
+                    value={deviceSearch}
+                    onChange={setDeviceSearch}
+                    placeholder={t('devices:searchDevices', { defaultValue: 'Search devices...' })}
+                    aria-label={t('devices:searchDevices', { defaultValue: 'Search devices...' })}
+                    className="w-full sm:w-[min(16rem,calc(100vw-3rem))]"
+                  />
+                ) : undefined
+              }
             />
           ) : undefined
         }
         footer={
           !deviceDetailView && (
-            activeTab === 'devices' && devices.length > devicesPerPage ? (
+            activeTab === 'devices' && filteredDevices.length > devicesPerPage ? (
               <Pagination
                 total={devices.length}
                 pageSize={devicesPerPage}
@@ -842,6 +899,7 @@ export function DevicesPage() {
                 devices={devices}
                 loading={devicesLoading}
                 paginatedDevices={paginatedDevices}
+                searching={!!deviceSearch.trim()}
                 devicePage={devicePage}
                 devicesPerPage={devicesPerPage}
                 onRefresh={fetchDevices}
@@ -873,6 +931,7 @@ export function DevicesPage() {
                 paginatedDeviceTypes={paginatedDeviceTypes}
                 deviceTypePage={deviceTypePage}
                 deviceTypesPerPage={deviceTypesPerPage}
+                deviceCounts={deviceTypeDeviceCounts}
                 onRefresh={handleRefreshDeviceTypes}
                 onViewDetails={handleViewDeviceType}
                 onEdit={handleEditDeviceType}
@@ -907,19 +966,6 @@ export function DevicesPage() {
           </>
         )}
       </PageLayout>
-
-      {/* Mobile: Bottom navigation bar */}
-      {!deviceDetailView && (
-        <PageTabsBottomNav
-          tabs={[
-            { value: 'devices', label: t('devices:deviceList'), icon: <Server className="h-4 w-4" /> },
-            { value: 'types', label: t('devices:deviceTypes'), icon: <Layers className="h-4 w-4" /> },
-            { value: 'drafts', label: t('devices:pending.tab'), icon: <FileEdit className="h-4 w-4" /> },
-          ]}
-          activeTab={activeTab}
-          onTabChange={(v) => handleTabChange(v as DeviceTabValue)}
-        />
-      )}
 
       {/* Device Edit Dialog */}
       <EditDeviceDialog

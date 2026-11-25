@@ -305,11 +305,32 @@ impl DashboardStore {
         Ok(store)
     }
 
-    /// Create an in-memory dashboard store for testing.
+    /// An in-memory dashboard store.
+    ///
+    /// Genuinely in memory — it used to write a redb file into the temp
+    /// directory on every call and never remove it, so a test run left
+    /// thousands of them behind.
     pub fn memory() -> Result<Arc<Self>, Error> {
-        let temp_path =
-            std::env::temp_dir().join(format!("dashboards_test_{}.redb", uuid::Uuid::new_v4()));
-        Self::open(temp_path)
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        // Rollback guard: refuse databases stamped by a newer build (see schema.rs).
+        crate::schema::check_or_stamp(&db)
+            .map_err(|e| Error::Storage(format!("schema version: {e}")))?;
+
+        let store = Arc::new(DashboardStore {
+            db: Arc::new(db),
+            // Not a path anything can be opened by; kept because the struct
+            // carries one and `open` keys the singleton on it.
+            path: ":memory:".to_string(),
+        });
+
+        {
+            let mut singleton = DASHBOARD_STORE_SINGLETON.lock();
+            *singleton = Some(store.clone());
+        }
+
+        Ok(store)
     }
 
     /// Save a dashboard.
@@ -326,6 +347,46 @@ impl DashboardStore {
 
         write_txn.commit()?;
         Ok(())
+    }
+
+    /// Load → mutate → save inside **one** write transaction.
+    ///
+    /// Concurrent Chat/shell `add-components` calls previously did a lock-free
+    /// RMW (read → extend → save) and silently dropped each other's appends.
+    /// redb allows only one writer at a time, so serializing the full mutate
+    /// under `begin_write` makes each caller see the latest committed row.
+    pub fn mutate_dashboard<F, T>(&self, id: &str, f: F) -> Result<T, Error>
+    where
+        F: FnOnce(&mut Dashboard) -> Result<T, Error>,
+    {
+        let write_txn = self.db.begin_write()?;
+        let mut dashboard = {
+            let table = match write_txn.open_table(DASHBOARDS_TABLE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(Error::NotFound(format!("Dashboard '{id}' not found")));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let bytes = match table.get(id)? {
+                Some(value) => value.value().to_vec(),
+                None => {
+                    return Err(Error::NotFound(format!("Dashboard '{id}' not found")));
+                }
+            };
+            drop(table);
+            let d: Dashboard = serde_json::from_slice(&bytes)?;
+            d
+        };
+
+        let result = f(&mut dashboard)?;
+        let serialized = serde_json::to_vec(&dashboard)?;
+        {
+            let mut table = write_txn.open_table(DASHBOARDS_TABLE)?;
+            table.insert(dashboard.id.as_str(), serialized)?;
+        }
+        write_txn.commit()?;
+        Ok(result)
     }
 
     /// Load a dashboard by ID.
@@ -645,6 +706,7 @@ mod tests {
 
     /// Helper to create a temporary DashboardStore for tests
     fn create_temp_store() -> Arc<DashboardStore> {
+        crate::prune_stale_temp_entries("dashboard_test_", std::time::Duration::from_secs(3600));
         let temp_dir =
             std::env::temp_dir().join(format!("dashboard_test_{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -726,6 +788,70 @@ mod tests {
         assert_eq!(loaded.components.len(), 1);
         assert_eq!(loaded.components[0].id, "comp-1");
         assert_eq!(loaded.components[0].title, Some("Test Card".to_string()));
+    }
+
+    /// Parallel appends via `mutate_dashboard` must keep every component
+    /// (fixes Chat parallel add-components lost-update).
+    #[test]
+    fn parallel_mutate_appends_do_not_drop_components() {
+        let store = create_temp_store();
+        let mut dashboard =
+            Dashboard::new("Race Board".to_string(), DashboardLayout::default_layout());
+        dashboard.id = "race-dash".to_string();
+        store.save(&dashboard).unwrap();
+
+        let mk = |id: &str| DashboardComponent {
+            id: id.to_string(),
+            component_type: "value-card".to_string(),
+            position: ComponentPosition {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 1,
+                min_w: None,
+                min_h: None,
+                max_w: None,
+                max_h: None,
+            },
+            title: Some(id.to_string()),
+            data_source: None,
+            display: None,
+            config: None,
+            actions: None,
+        };
+
+        let ids = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        std::thread::scope(|scope| {
+            for id in ids {
+                let store = store.clone();
+                scope.spawn(move || {
+                    store
+                        .mutate_dashboard("race-dash", |d| {
+                            d.components.push(mk(id));
+                            d.updated_at = chrono::Utc::now().timestamp();
+                            Ok(())
+                        })
+                        .expect("mutate append");
+                });
+            }
+        });
+
+        let loaded = store.load("race-dash").unwrap().unwrap();
+        assert_eq!(
+            loaded.components.len(),
+            ids.len(),
+            "parallel appends lost updates: {:?}",
+            loaded
+                .components
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let mut got: Vec<_> = loaded.components.iter().map(|c| c.id.clone()).collect();
+        got.sort();
+        let mut expect: Vec<_> = ids.iter().map(|s| (*s).to_string()).collect();
+        expect.sort();
+        assert_eq!(got, expect);
     }
 
     #[test]

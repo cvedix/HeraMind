@@ -10,9 +10,11 @@ import { useState, useEffect, useRef, useMemo } from "react"
 import { useTranslation } from "react-i18next"
 import { useNavigate, useParams } from "react-router-dom"
 import { useStore } from "@/store"
+import { sessionsApi } from '@/lib/api/sessions'
 import { createPortal } from "react-dom"
 import type { ChatSession } from "@/types"
 import { cn } from "@/lib/utils"
+import { getSessionDisplayTitle } from "@/lib/utils/sessionTitle"
 import { textNano } from "@/design-system/tokens/typography"
 import { formatTimestamp } from "@/lib/utils/format"
 import {
@@ -24,7 +26,14 @@ import {
   Clock,
   Pencil,
   Check,
+  Loader2,
+  Cpu,
+  Bot,
+  LayoutDashboard,
+  Bell,
+  ChevronRight,
 } from "lucide-react"
+import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -61,14 +70,15 @@ export function SessionSidebar({
   const { sessionId: urlSessionId } = useParams<{ sessionId?: string }>()
 
   const sessions = useStore((s) => s.sessions)
-  const storeSessionId = useStore((s) => s.sessionId)
+  const _storeSessionId = useStore((s) => s.sessionId)
   const sessionsHasMore = useStore((s) => s.sessionsHasMore)
   const sessionsLoading = useStore((s) => s.sessionsLoading)
   const createSession = useStore((s) => s.createSession)
-  const switchSession = useStore((s) => s.switchSession)
+  const _switchSession = useStore((s) => s.switchSession)
   const deleteSession = useStore((s) => s.deleteSession)
   const updateSessionTitle = useStore((s) => s.updateSessionTitle)
   const loadMoreSessions = useStore((s) => s.loadMoreSessions)
+  const user = useStore((s) => s.user)
 
   // Use URL sessionId for active highlight, not store sessionId.
   // This ensures no session is highlighted in welcome mode (/chat without sessionId).
@@ -87,6 +97,52 @@ export function SessionSidebar({
   const editInputRef = useRef<HTMLInputElement>(null)
   const scrollViewportRef = useRef<HTMLDivElement>(null)
   const savedScrollTop = useRef<number>(0)
+  const drawerRef = useRef<HTMLDivElement>(null)
+  /** True while this drawer owns a history.pushState entry for system-back. */
+  const historyPushedRef = useRef(false)
+
+  // Close-time focus handoff: if focus is still inside the (now hidden)
+  // drawer, return it to the opener (chat hamburger) — otherwise typed keys
+  // keep landing in the invisible search field. Falls back to blur.
+  useEffect(() => {
+    if (open) return
+    const root = drawerRef.current
+    if (root && root.contains(document.activeElement)) {
+      const opener = document.querySelector<HTMLElement>('[data-testid="chat-drawer-button"]')
+      if (opener) opener.focus()
+      else (document.activeElement as HTMLElement | null)?.blur()
+    }
+  }, [open])
+
+  // Mobile system-back: opening pushes a history entry; Back closes the
+  // panel instead of leaving the chat session. UI close pops that entry.
+  useEffect(() => {
+    if (isDesktop) return
+    const onPopState = () => {
+      if (!historyPushedRef.current) return
+      historyPushedRef.current = false
+      onClose()
+    }
+    window.addEventListener("popstate", onPopState)
+    return () => window.removeEventListener("popstate", onPopState)
+  }, [isDesktop, onClose])
+
+  useEffect(() => {
+    if (isDesktop) return
+    if (open) {
+      if (!historyPushedRef.current) {
+        history.pushState({ nmSessionDrawer: true }, "")
+        historyPushedRef.current = true
+      }
+      return
+    }
+    if (historyPushedRef.current) {
+      historyPushedRef.current = false
+      if ((history.state as { nmSessionDrawer?: boolean } | null)?.nmSessionDrawer) {
+        history.back()
+      }
+    }
+  }, [open, isDesktop])
 
   // Save scroll position before re-render caused by session switch
   useEffect(() => {
@@ -100,16 +156,6 @@ export function SessionSidebar({
     viewport.addEventListener('scroll', handleScroll, { passive: true })
     return () => viewport.removeEventListener('scroll', handleScroll)
   }, [])
-
-  // Focus search when opened (mobile only)
-  useEffect(() => {
-    if (open && !isDesktop) {
-      const raf = requestAnimationFrame(() => {
-        searchInputRef.current?.focus()
-      })
-      return () => cancelAnimationFrame(raf)
-    }
-  }, [open, isDesktop])
 
   // Infinite scroll using Intersection Observer
   useEffect(() => {
@@ -128,6 +174,40 @@ export function SessionSidebar({
     observer.observe(trigger)
     return () => observer.disconnect()
   }, [sessionsHasMore, sessionsLoading, searchQuery, loadMoreSessions])
+
+  // Sessions with an in-flight generation (server truth — a session left
+  // mid-turn keeps generating server-side; local streaming state dies on
+  // navigation). Polled only while the sidebar is VISIBLE (desktop is always
+  // mounted/visible; the mobile drawer polls while open — an always-mounted
+  // closed drawer must not keep a permanent 5s background loop, e.g. in
+  // welcome mode). Stale pending entries (>10 min, hard-killed servers) are
+  // already filtered server-side.
+  const [generatingIds, setGeneratingIds] = useState<Set<string>>(new Set())
+  useEffect(() => {
+    if (!(isDesktop || open)) return
+    let stopped = false
+    // Circuit breaker: an old backend predating the endpoint 404s forever
+    // (the legacy router even matches /sessions/:id with id="pending").
+    // Three consecutive failures = no endpoint there — stop polling until
+    // the sidebar remounts/reopens; transient failures reset the count.
+    let failures = 0
+    const poll = () => {
+      if (stopped || failures >= 3) return
+      sessionsApi.listPendingSessions()
+        .then(r => {
+          if (stopped) return
+          failures = 0
+          setGeneratingIds(new Set(r.sessionIds ?? []))
+        })
+        .catch(() => {
+          if (stopped) return
+          failures += 1
+        })
+    }
+    poll()
+    const timer = setInterval(poll, 5000)
+    return () => { stopped = true; clearInterval(timer) }
+  }, [isDesktop, open])
 
   // Filter and sort sessions - memoized to prevent unnecessary re-renders
   const sortedSessions = useMemo(() => {
@@ -225,7 +305,7 @@ export function SessionSidebar({
       toast({
         title: t('session.sessionDeleted'),
       })
-    } catch (error: any) {
+    } catch (error) {
       showErrorToast(toast, error, t('error'))
     } finally {
       setDeletingId(null)
@@ -285,193 +365,286 @@ export function SessionSidebar({
     }
   }
 
-  // Get session title
-  const getSessionTitle = (session: ChatSession): string => {
-    if (session.title && session.title !== "新对话" && session.title !== "New Chat") {
-      return session.title
-    }
-    if (session.preview) {
-      return session.preview.length > 30 ? session.preview.slice(0, 30) + '...' : session.preview
-    }
-    return t('session.defaultTitle')
+  const defaultTitle = t('session.defaultTitle')
+
+  const renderSessionRow = (session: ChatSession, opts: { roomy: boolean }) => {
+    const isActive = session.sessionId === currentSessionId
+    const isDeleting = deletingId === session.sessionId
+    const isEditing = editingId === session.sessionId
+    const isGenerating = generatingIds.has(session.sessionId)
+    const roomy = opts.roomy
+
+    return (
+      <div
+        key={session.sessionId}
+        onClick={() => !isEditing && handleSwitchSession(session.sessionId)}
+        className={cn(
+          "group relative flex cursor-pointer items-center gap-2 transition-colors focus-within:bg-muted-50",
+          roomy ? "rounded-2xl px-3.5 py-3" : "rounded-lg px-2 py-2",
+          isActive ? "bg-muted" : "hover:bg-muted-50",
+          isEditing && "bg-muted",
+        )}
+      >
+        {isEditing ? (
+          <div className="flex min-w-0 flex-1 items-center gap-1" onClick={(e) => e.stopPropagation()}>
+            <Input
+              ref={editInputRef}
+              value={editingTitle}
+              onChange={(e) => setEditingTitle(e.target.value)}
+              onKeyDown={(e) => handleEditKeyDown(e, session.sessionId)}
+              className="h-8 min-w-0 flex-1 rounded-md text-sm"
+              autoFocus
+              disabled={isUpdating}
+            />
+            <button
+              aria-label={t('common:confirm')}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-success hover:bg-success-light transition-colors"
+              onClick={() => handleEditSave(session.sessionId)}
+              disabled={isUpdating || !editingTitle.trim()}
+            >
+              <Check className="h-3.5 w-3.5" />
+            </button>
+            <button
+              aria-label={t('common:cancel')}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md hover:bg-muted transition-colors"
+              onClick={handleEditCancel}
+              disabled={isUpdating}
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        ) : (
+          <>
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              {isGenerating && (
+                <Loader2
+                  className="h-4 w-4 shrink-0 animate-spin text-primary motion-reduce:animate-none"
+                  aria-label={t('session.generating')}
+                />
+              )}
+              <div className="min-w-0 flex-1">
+                <h4 className={cn(
+                  "truncate",
+                  roomy ? "text-[0.9375rem] leading-5" : "text-sm",
+                  isActive ? "font-medium text-foreground" : "text-muted-foreground",
+                )}>
+                  {getSessionDisplayTitle(session, defaultTitle)}
+                </h4>
+                <div className={cn("mt-0.5 flex items-center gap-1.5 overflow-hidden text-muted-foreground", textNano)}>
+                  <Clock className="h-2.5 w-2.5 shrink-0" />
+                  <span className="truncate">
+                    {session.updatedAt
+                      ? formatTimestamp(session.updatedAt / 1000, false)
+                      : formatTimestamp(session.createdAt / 1000, false)}
+                  </span>
+                  {session.messageCount ? (
+                    <>
+                      <span className="shrink-0">·</span>
+                      <span className="truncate">{t('session.messages', { count: session.messageCount })}</span>
+                    </>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+
+            {/* Desktop: hover-reveal. Mobile: single delete to keep rows clean. */}
+            <div className={cn(
+              "flex shrink-0 items-center gap-0.5 overflow-hidden transition-[width] duration-fast",
+              isDesktop
+                ? "w-8 group-hover:w-[4.125rem] group-focus-within:w-[4.125rem]"
+                : "w-9",
+            )}>
+              {isDesktop && (
+                <button
+                  onClick={(e) => handleEditClick(e, session)}
+                  aria-label={t('common:edit')}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  title={t('session.rename')}
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                </button>
+              )}
+              <button
+                onClick={(e) => handleDeleteClick(e, session.sessionId)}
+                aria-label={t('common:delete')}
+                disabled={isDeleting}
+                className={cn(
+                  "flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-error-light hover:text-error focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  isDeleting && "opacity-50",
+                )}
+                title={t('delete')}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    )
   }
 
-  // Sidebar content - shared between desktop and mobile
-  const SidebarContent = ({ showHeader = true }: { showHeader?: boolean }) => (
-    <>
-      {/* Header */}
-      {showHeader && (
-        <div className="relative z-[1] flex items-center justify-between px-3 py-2" onMouseDown={handleWindowDragMouseDown}>
-          <h2 className="text-base font-semibold">{t('session.sessions')}</h2>
-          {!isDesktop && (
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={onClose}
-              className="h-6 w-6 rounded-lg"
-            >
-              <X className="h-4 w-4" />
-            </Button>
-          )}
-        </div>
-      )}
+  const renderSessionList = (roomy: boolean) => (
+    sortedSessions.length === 0 ? (
+      <div className={cn("text-center", roomy ? "px-2 py-12" : "py-8")}>
+        <MessageSquare className={cn("mx-auto mb-2 text-muted-foreground", roomy ? "h-9 w-9" : "h-8 w-8")} />
+        <p className={cn("text-muted-foreground", roomy ? "text-sm" : "text-xs")}>
+          {searchQuery ? t('session.noMatch') : t('session.noSessions')}
+        </p>
+      </div>
+    ) : (
+      <>
+        {sortedSessions.map((session) => renderSessionRow(session, { roomy }))}
+        <div ref={loadMoreTriggerRef} className="h-1" />
+        {sessionsLoading && (
+          <div className="flex items-center justify-center py-3">
+            <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+          </div>
+        )}
+      </>
+    )
+  )
 
-      {/* Search */}
+  const goWorkspace = (path: string) => {
+    onClose()
+    navigate(path)
+  }
+
+  // Top four icon tiles; All destinations lives on the avatar bar (right).
+  const workspaceShortcuts = [
+    { id: 'devices', path: '/devices', icon: Cpu, labelKey: 'nav.devices' },
+    { id: 'agents', path: '/agents', icon: Bot, labelKey: 'nav.agents' },
+    { id: 'dashboard', path: '/visual-dashboard', icon: LayoutDashboard, labelKey: 'nav.visual-dashboard' },
+    { id: 'messages', path: '/messages', icon: Bell, labelKey: 'nav.messages' },
+  ] as const
+
+  // IMPORTANT: keep these as JSX values, not inner components. Defining
+  // MobileDrawerContent/DesktopContent as nested function components remounts
+  // the search input on every keystroke and breaks continuous typing/delete.
+  const desktopContent = (
+    <>
+      <div
+        className="relative z-[1] flex items-center justify-between px-3 py-2"
+        onMouseDown={handleWindowDragMouseDown}
+      >
+        <h2 className="text-base font-semibold tracking-[-0.02em] text-foreground">
+          {t('session.sessions')}
+        </h2>
+      </div>
+
       <div className="px-3 py-2">
         <div className="relative">
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             ref={searchInputRef}
             type="text"
             placeholder={t('session.search')}
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="pl-8 h-8 text-sm rounded-lg bg-muted-50 border-0"
-              />
-            </div>
-          </div>
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="h-8 rounded-lg bg-muted-50 pl-9 text-sm"
+          />
+        </div>
+      </div>
 
-          {/* New Session Button */}
-          <div className="px-3 pb-2">
-            <Button
-              onClick={handleNewSession}
-              disabled={isCreating}
-              variant="outline"
-              className="w-full h-8 text-sm rounded-lg"
+      <div className="px-3 pb-2">
+        <Button
+          onClick={handleNewSession}
+          disabled={isCreating}
+          variant="outline"
+          className="h-8 w-full rounded-lg text-sm shadow-none"
+        >
+          <Plus className="mr-1.5 h-4 w-4" strokeWidth={2} />
+          {t('session.newChat')}
+        </Button>
+      </div>
+
+      <ScrollArea className="min-h-0 flex-1" viewportRef={scrollViewportRef}>
+        <div className="space-y-0.5 overflow-x-hidden px-2 pb-2">
+          {renderSessionList(false)}
+        </div>
+      </ScrollArea>
+    </>
+  )
+
+  const workspaceAvatarLabel = user?.username
+    ? user.username.slice(0, 2).toUpperCase()
+    : 'NM'
+
+  // Mobile: title+close → 4 icon tiles → recent → solid avatar bar (no fade/blur).
+  const mobileDrawerContent = (
+    <>
+      <div className="flex items-center justify-between gap-3 px-4 pb-2 pt-2">
+        <h2 className="min-w-0 truncate text-lg font-semibold tracking-[-0.03em] text-foreground">
+          HeraMind
+        </h2>
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={onClose}
+          className="h-10 w-10 shrink-0 rounded-full sm:h-10 sm:w-10"
+          aria-label={t('close')}
+        >
+          <X className="h-4 w-4" />
+        </Button>
+      </div>
+
+      <div className="px-2 pb-3" aria-label={t('system.openWorkspace')}>
+        <div className="grid grid-cols-4">
+          {workspaceShortcuts.map(({ id, path, icon: Icon, labelKey }) => (
+            <button
+              key={id}
+              type="button"
+              data-testid={`session-drawer-shortcut-${id}`}
+              onClick={() => goWorkspace(path)}
+              className="flex min-h-[4.25rem] flex-col items-center justify-center gap-1.5 rounded-xl px-1 py-2.5 text-center transition-colors active:bg-muted"
             >
-              <Plus className="h-4 w-4 mr-1.5" />
-              {t('session.newChat')}
-            </Button>
-          </div>
+              <Icon className="h-5 w-5 text-foreground" strokeWidth={1.75} aria-hidden="true" />
+              <span className="max-w-full truncate text-[0.6875rem] leading-tight text-muted-foreground">
+                {t(labelKey)}
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
 
-          {/* Session List */}
-          <ScrollArea className="flex-1 min-h-0" viewportRef={scrollViewportRef}>
-            <div className="px-2 pb-2 space-y-0.5 overflow-x-hidden">
-              {sortedSessions.length === 0 ? (
-                <div className="py-8 text-center">
-                  <MessageSquare className="h-8 w-8 mx-auto text-muted-foreground mb-2" />
-                  <p className="text-xs text-muted-foreground">
-                    {searchQuery ? t('session.noMatch') : t('session.noSessions')}
-                  </p>
-                </div>
-              ) : (
-                <>
-                  {sortedSessions.map((session) => {
-                    const isActive = session.sessionId === currentSessionId
-                    const isDeleting = deletingId === session.sessionId
-                    const isEditing = editingId === session.sessionId
+      <div className="px-5 pb-1.5 pt-1">
+        <h3 className="text-sm font-medium text-muted-foreground">
+          {t('session.recent')}
+        </h3>
+      </div>
 
-                    return (
-                      <div
-                        key={session.sessionId}
-                        onClick={() => !isEditing && handleSwitchSession(session.sessionId)}
-                        className={cn(
-                          // Flat list: selected = plain muted block (no
-                          // raised card / shadow — the 3D look was overkill)
-                          "group relative flex items-start gap-2 p-2 rounded-lg cursor-pointer transition-colors",
-                          isActive
-                            ? "bg-muted"
-                            : "hover:bg-muted-50",
-                          isEditing && "bg-muted"
-                        )}
-                      >
-                        {isEditing ? (
-                          // Edit mode
-                          <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-                            <Input
-                              ref={editInputRef}
-                              value={editingTitle}
-                              onChange={(e) => setEditingTitle(e.target.value)}
-                              onKeyDown={(e) => handleEditKeyDown(e, session.sessionId)}
-                              className="h-7 text-sm flex-1 rounded-md"
-                              autoFocus
-                              disabled={isUpdating}
-                            />
-                            <button
-                              aria-label={t('common:confirm')}
-                              className="h-6 w-6 shrink-0 flex items-center justify-center rounded-md text-success hover:bg-success-light transition-colors"
-                              onClick={() => handleEditSave(session.sessionId)}
-                              disabled={isUpdating || !editingTitle.trim()}
-                            >
-                              <Check className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              aria-label={t('common:cancel')}
-                              className="h-6 w-6 shrink-0 flex items-center justify-center rounded-md hover:bg-muted transition-colors"
-                              onClick={handleEditCancel}
-                              disabled={isUpdating}
-                            >
-                              <X className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-                        ) : (
-                          // Normal mode
-                          <>
-                            <div className="flex items-center gap-2 min-w-0 flex-1">
-                              <MessageSquare className={cn(
-                                "h-4 w-4 shrink-0",
-                                isActive ? "text-foreground" : "text-muted-foreground"
-                              )} />
-                              <div className="min-w-0 flex-1">
-                                <h4 className={cn(
-                                  "text-sm truncate",
-                                  isActive ? "text-foreground font-medium" : "text-muted-foreground"
-                                )}>
-                                  {getSessionTitle(session)}
-                                </h4>
-                                <div className={cn("flex items-center gap-1.5 mt-0.5 overflow-hidden", textNano, "text-muted-foreground")}>
-                                  <Clock className="h-2.5 w-2.5 shrink-0" />
-                                  <span className="truncate">{session.updatedAt ? formatTimestamp(session.updatedAt / 1000, false) : formatTimestamp(session.createdAt / 1000, false)}</span>
-                                  {session.messageCount ? (
-                                    <>
-                                      <span className="shrink-0">·</span>
-                                      <span className="truncate">{t('session.messages', { count: session.messageCount })}</span>
-                                    </>
-                                  ) : null}
-                                </div>
-                              </div>
-                            </div>
+      <ScrollArea className="min-h-0 flex-1" viewportRef={scrollViewportRef}>
+        <div className="space-y-0.5 overflow-x-hidden px-2 pb-3">
+          {renderSessionList(true)}
+        </div>
+      </ScrollArea>
 
-                            {/* Action buttons */}
-                            <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 translate-x-1 transition-all duration-fast group-hover:translate-x-0 group-hover:opacity-100">
-                              <button
-                                onClick={(e) => handleEditClick(e, session)}
-                                aria-label={t('common:edit')}
-                                className="h-6 w-6 flex items-center justify-center rounded hover:bg-muted transition-colors"
-                                title={t('session.rename')}
-                              >
-                                <Pencil className="h-3 w-3" />
-                              </button>
-                              <button
-                                onClick={(e) => handleDeleteClick(e, session.sessionId)}
-                                aria-label={t('common:delete')}
-                                disabled={isDeleting}
-                                className={cn(
-                                  "h-6 w-6 flex items-center justify-center rounded hover:bg-error-light text-muted-foreground hover:text-error transition-colors",
-                                  isDeleting && "opacity-50"
-                                )}
-                                title={t('delete')}
-                              >
-                                <Trash2 className="h-3 w-3" />
-                              </button>
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    )
-                  })}
-                  {/* Load more trigger */}
-                  <div ref={loadMoreTriggerRef} className="h-1" />
-                  {/* Loading indicator */}
-                  {sessionsLoading && (
-                    <div className="flex items-center justify-center py-3">
-                      <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          </ScrollArea>
+      <div
+        data-testid="session-drawer-userbar"
+        className="shrink-0 border-0 bg-background px-4 pb-[calc(0.5rem+env(safe-area-inset-bottom,0px))] pt-2 shadow-none"
+      >
+        <div className="flex min-h-14 items-center gap-3">
+          <Avatar className="h-9 w-9 shrink-0 rounded-full">
+            <AvatarFallback className="bg-primary text-xs font-semibold text-primary-foreground">
+              {workspaceAvatarLabel}
+            </AvatarFallback>
+          </Avatar>
+          <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
+            {user?.username ?? 'HeraMind'}
+          </span>
+          <button
+            type="button"
+            data-testid="session-drawer-workspace"
+            onClick={() => goWorkspace('/system')}
+            className="flex max-w-[48%] shrink-0 items-center gap-1 rounded-lg px-1.5 py-2 text-left transition-colors active:bg-muted"
+            aria-label={t('system.moreEntries')}
+          >
+            <span className="truncate text-sm text-muted-foreground">
+              {t('system.moreEntries')}
+            </span>
+            <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
     </>
   )
 
@@ -501,7 +674,7 @@ export function SessionSidebar({
             style={{ height: "calc(env(safe-area-inset-top, 0px) + var(--titlebar-inset, 0px) + 2.75rem)" }}
             onMouseDown={handleWindowDragMouseDown}
           />
-          {SidebarContent({})}
+          {desktopContent}
         </div>
 
         {/* Delete Confirmation Dialog */}
@@ -541,21 +714,27 @@ export function SessionSidebar({
         />
       )}
 
-      {/* Sidebar */}
+      {/* Fullscreen mobile workspace — covers the visible viewport (keyboard-
+          aware via --app-height / --visual-viewport-offset-top). Desktop keeps
+          the fixed sidebar above. `inert` when closed so focus cannot land in
+          the offscreen search field. */}
       <div
+        id="session-workspace-drawer"
+        ref={drawerRef}
         className={cn(
-          "fixed top-0 left-0 h-full w-72 z-50 lg:hidden safe-top",
-          // bg-popover matches the desktop persistent sidebar and every
-          // other drawer / popup in the app. Previously bg-background,
-          // which is /97% alpha in dark mode and let the page + backdrop
-          // bleed through, making the drawer read darker than the chrome
-          // layer it slides out from.
-          "bg-popover shadow-xl flex flex-col",
-          "transform transition-transform duration-slow ease-out",
-          open ? "translate-x-0" : "-translate-x-full"
+          "relative fixed inset-x-0 z-50 flex w-full flex-col overflow-hidden bg-background lg:hidden",
+          "safe-top transform transition-transform duration-slow ease-out",
+          open ? "translate-x-0" : "-translate-x-full",
         )}
+        style={{
+          top: "var(--visual-viewport-offset-top, 0px)",
+          height: "var(--app-height, 100dvh)",
+        }}
+        data-testid="session-workspace-drawer"
+        aria-hidden={!open}
+        {...(!open ? ({ inert: '' } as Record<string, string>) : {})}
       >
-        {SidebarContent({})}
+        {mobileDrawerContent}
       </div>
 
       {/* Delete Confirmation Dialog */}

@@ -6,16 +6,14 @@ import { useState, useEffect } from "react"
 import { Switch } from "@/components/ui/switch"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
-import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu"
-import { IconButton } from "@/components/ui/button"
 import {
   FullScreenDialog,
   FullScreenDialogHeader,
   FullScreenDialogContent,
   FullScreenDialogMain,
 } from "@/components/automation/dialog"
-import { ResponsiveTable, EmptyState, Pagination } from "@/components/shared"
-import { Edit, Play, Trash2, Bell, Sparkles, Zap, MoreVertical, Timer, History, CheckCircle2, XCircle, Clock, Download } from "lucide-react"
+import { ResponsiveTable, EmptyState, EmptyStateCard, Pagination } from "@/components/shared"
+import { Edit, Play, Trash2, Bell, Bot, Sparkles, Zap, Timer, History, CheckCircle2, XCircle, Clock, Download } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import type { Rule, RuleAction, RuleExecutionResult } from "@/types"
 import { cn } from "@/lib/utils"
@@ -39,10 +37,17 @@ interface RulesListProps {
 }
 
 // Action configuration for display
-const ACTION_CONFIG: Record<string, { icon: typeof Zap; label: string; color: string }> = {
-  execute: { icon: Zap, label: 'automation:ruleBuilder.actionType.execute', color: 'text-warning bg-warning-light border-warning' },
-  notify: { icon: Bell, label: 'automation:ruleBuilder.actionType.notify', color: 'text-info bg-info-light border-info' },
-  trigger_agent: { icon: Sparkles, label: 'automation:ruleBuilder.actionType.triggerAgent', color: 'text-accent-purple bg-accent-purple-light border-accent-purple-light' },
+const ACTION_CONFIG: Record<string, { icon: typeof Zap; label: string }> = {
+  execute: { icon: Zap, label: 'automation:ruleBuilder.actionType.execute' },
+  notify: { icon: Bell, label: 'automation:ruleBuilder.actionType.notify' },
+  trigger_agent: { icon: Sparkles, label: 'automation:ruleBuilder.actionType.triggerAgent' },
+  run_operator: { icon: Bot, label: 'automation:ruleBuilder.actionType.runOperator' },
+}
+
+function listSubtitle(value?: string | null): string | null {
+  const text = value?.trim()
+  if (!text || text === '-') return null
+  return text
 }
 
 export const ITEMS_PER_PAGE = 10
@@ -179,7 +184,6 @@ function RuleHistoryDialog({ rule, open, onOpenChange }: {
                 flexHeight={false}
                 emptyState={
                   <EmptyState
-                    icon={<History className="h-12 w-12" />}
                     title={t('automation:noHistory')}
                   />
                 }
@@ -244,7 +248,7 @@ function parseForClause(rule: Rule): { duration: number; unit: string } | null {
 }
 
 // Check if rule has FOR clause
-function hasForClause(rule: Rule): boolean {
+function _hasForClause(rule: Rule): boolean {
   return rule.dsl_preview?.includes('\nFOR ') || false
 }
 
@@ -342,118 +346,69 @@ export function RulesList({
 
   // Use props if provided, otherwise use internal state (backward compatibility)
   const page = propsPage ?? internalPage
-  const setPage = onPageChange ?? setInternalPage
+  const _setPage = onPageChange ?? setInternalPage
 
-  const totalPages = Math.ceil(rules.length / ITEMS_PER_PAGE) || 1
+  const _totalPages = Math.ceil(rules.length / ITEMS_PER_PAGE) || 1
   const startIndex = (page - 1) * ITEMS_PER_PAGE
   const endIndex = startIndex + ITEMS_PER_PAGE
-  const paginatedRules = propsPaginatedRules ?? rules.slice(startIndex, endIndex)
+  // Mobile infinite-scroll parents pass a cumulative window; if props are
+  // omitted, mirror that here so footer load-more cannot replace-slice.
+  const paginatedRules = propsPaginatedRules ?? (
+    isMobile
+      ? rules.slice(0, page * ITEMS_PER_PAGE)
+      : rules.slice(startIndex, endIndex)
+  )
 
   const content = (
     isMobile ? (
       <div className="space-y-2">
-        {paginatedRules.length === 0 ? (
-          <EmptyState
-            icon={<Sparkles className="h-12 w-12" />}
-            title={t('automation:emptyRules.title', 'No rules')}
-            description={t('automation:emptyRules.description', 'Create your first rule to automate actions based on conditions')}
-          />
+        {/* Mobile has no ResponsiveTable — carry its own loading skeleton. */}
+        {loading && paginatedRules.length === 0 && (
+          [0, 1, 2].map((i) => (
+            <Card key={i} className="overflow-hidden rounded-2xl border-border bg-card shadow-none">
+              <div className="px-3 py-2.5 animate-pulse space-y-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-muted" />
+                  <div className="h-4 w-36 rounded bg-muted" />
+                </div>
+                <div className="ml-[42px] h-3 w-48 rounded bg-muted" />
+              </div>
+            </Card>
+          ))
+        )}
+        {paginatedRules.length === 0 && !loading ? (
+          <EmptyStateCard>
+            <EmptyState
+              title={t('automation:emptyRules.title', 'No rules')}
+              description={t('automation:emptyRules.description', 'Create your first rule to automate actions based on conditions')}
+            />
+          </EmptyStateCard>
         ) : null}
         {paginatedRules.map((rule) => {
-          const actions = rule.actions && rule.actions.length > 0
-            ? rule.actions
-            : parseActionsFromDSL(rule.dsl_preview)
           const condition = formatConditionDisplay(rule)
-          const hasTriggered = rule.last_triggered && rule.last_triggered !== '-'
-          const forClause = parseForClause(rule)
 
           return (
             <Card
               key={rule.id}
               className={cn(
-                "overflow-hidden border-border shadow-sm cursor-pointer active:scale-[0.99] transition-all",
+                "cursor-pointer overflow-hidden rounded-2xl border border-border bg-card shadow-none transition-colors active:bg-muted",
                 !rule.enabled && "opacity-50"
               )}
               onClick={() => onView(rule)}
             >
-              <div className="px-3 py-2.5">
-                {/* Row 1: icon + name + switch + actions */}
-                <div className="flex items-center gap-2.5">
-                  <div className={cn(
-                    "w-8 h-8 rounded-lg flex items-center justify-center shrink-0",
-                    rule.enabled ? "bg-warning-light text-warning" : "bg-muted text-muted-foreground"
-                  )}>
-                    <Sparkles className="h-4 w-4" />
-                  </div>
+              <div className="px-4 py-3.5">
+                <div className="flex items-center gap-2">
                   <div className="flex-1 min-w-0">
-                    <div className="font-medium text-sm truncate">{rule.name}</div>
+                    <div className="truncate text-heading font-medium">{rule.name}</div>
+                    <p className="mt-1 truncate text-xs text-muted-foreground" title={condition.full}>
+                      {condition.text}
+                    </p>
                   </div>
                   <Switch
                     checked={rule.enabled}
                     onCheckedChange={() => onToggleStatus(rule)}
-                    className="scale-75"
                     onClick={(e) => e.stopPropagation()}
                   />
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
-                      <IconButton>
-                        <MoreVertical className="h-4 w-4" />
-                      </IconButton>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onEdit(rule) }}>
-                        <Edit className="h-4 w-4 mr-2" />
-                        {t('common:edit')}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onExecute(rule) }}>
-                        <Play className="h-4 w-4 mr-2" />
-                        {t('automation:execute')}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleExportRule(rule) }}>
-                        <Download className="h-4 w-4 mr-2" />
-                        {t('common:export')}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onClick={(e) => { e.stopPropagation(); setHistoryRule(rule); setShowHistory(true) }}>
-                        <History className="h-4 w-4 mr-2" />
-                        {t('automation:executionHistory', 'History')}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        className="text-error"
-                        onClick={(e) => { e.stopPropagation(); onDelete(rule) }}
-                      >
-                        <Trash2 className="h-4 w-4 mr-2" />
-                        {t('common:delete')}
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-                {/* Row 2: condition + action badges + last triggered */}
-                <div className="mt-1.5 ml-[42px]">
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <code className={cn(textMini, "font-mono bg-muted px-1.5 py-0.5 rounded truncate max-w-[180px]")}>
-                      {condition.text}
-                    </code>
-                    {forClause && (
-                      <Badge variant="outline" className={cn(textMini, "h-5 px-1.5 gap-0.5 text-info border-info")}>
-                        <Timer className="h-3 w-3" />
-                        {forClause.duration}{forClause.unit}
-                      </Badge>
-                    )}
-                    {actions.slice(0, 2).map((action, i) => {
-                      const config = ACTION_CONFIG[action.type] || ACTION_CONFIG.execute
-                      return (
-                        <Badge key={i} variant="outline" className={cn(textMini, "h-5 px-1.5 gap-0.5", config.color)}>
-                          {t(config.label)}
-                        </Badge>
-                      )
-                    })}
-                    {actions.length > 2 && (
-                      <span className={cn(textMini, "text-muted-foreground")}>+{actions.length - 2}</span>
-                    )}
-                    <span className={cn(textMini, "text-muted-foreground ml-auto")}>
-                      {hasTriggered ? formatTimestamp(rule.last_triggered) : t('automation:never', 'Never')}
-                    </span>
-                  </div>
                 </div>
               </div>
             </Card>
@@ -506,23 +461,22 @@ export function RulesList({
         const rule = rowData
 
         switch (columnKey) {
-          case 'name':
+          case 'name': {
+            const subtitle = listSubtitle(rule.description)
             return (
               <div className="flex items-center gap-3">
-                <div className={cn(
-                  "w-9 h-9 rounded-lg flex items-center justify-center transition-colors shrink-0",
-                  rule.enabled ? "bg-warning-light text-warning" : "bg-muted text-muted-foreground"
-                )}>
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
                   <Sparkles className="h-4 w-4" />
                 </div>
                 <div className="min-w-0">
-                  <div className="font-medium text-sm truncate">{rule.name}</div>
-                  <div className="text-xs text-muted-foreground line-clamp-1">
-                    {rule.description || '-'}
-                  </div>
+                  <div className="truncate text-sm font-medium">{rule.name}</div>
+                  {subtitle && (
+                    <div className="line-clamp-1 text-xs text-muted-foreground">{subtitle}</div>
+                  )}
                 </div>
               </div>
             )
+          }
 
           case 'trigger': {
             const condition = formatConditionDisplay(rule)
@@ -561,7 +515,7 @@ export function RulesList({
                     <Badge
                       key={i}
                       variant="outline"
-                      className={cn("text-xs gap-1", config.color)}
+                      className="gap-1 text-xs text-muted-foreground"
                     >
                       <Icon className="h-3 w-3" />
                       {t(config.label)}
@@ -661,7 +615,6 @@ export function RulesList({
       ]}
       emptyState={
         <EmptyState
-          icon={<Sparkles className="h-12 w-12" />}
           title={t('automation:emptyRules.title', 'No rules')}
           description={t('automation:emptyRules.description', 'Create your first rule to automate actions based on conditions')}
         />

@@ -3,6 +3,10 @@
   "closePanel": "Close",
   "resizePanel": "Drag to resize chat panel",
   "panelTitle": "AI Chat",
+  "panelStatus": {
+    "preparing": "Preparing conversation",
+    "responding": "AI is responding"
+  },
   "streamInProgress": "Stream in progress, closing after completion...",
   "title": "Smart IoT Assistant",
   "welcome": {
@@ -10,13 +14,11 @@
     "description": "Smart IoT assistant to help you manage devices and automation",
     "suggestions": {
       "checkDevices": "Check device status",
-      "createRule": "Create automation rule",
-      "viewAlerts": "View alerts"
+      "createRule": "Create automation rule"
     }
   },
   "input": {
     "placeholder": "Enter message...",
-    "sendHint": "Press <kbd>/</kbd> for suggestions",
     "selectModel": "Select model",
     "selectLLMModel": "Select LLM Model",
     "attachment": "Attachment",
@@ -25,9 +27,7 @@
     "startNewConversation": "Start typing to chat with AI assistant",
     "fallbackHelpPrompt": "What can you do?",
     "skills": "Skills",
-    "selectSkills": "Select skills",
-    "noSkills": "No skills available",
-    "activeSkills": "Active skills"
+    "cancel": "Cancel request"
   },
   "model": {
     "supportsVision": "Supports vision",
@@ -35,18 +35,29 @@
     "addImage": "Add image",
     "notSupportImage": "Current model doesn't support images",
     "visionError": "The current model doesn't support image input.\n\nPlease select a model that supports vision (like qwen3.5:4b), or remove the image and try again.\n\nModels that support vision show the 👁️ icon.",
-    "supportsTools": "Supports Tools"
+    "supportsTools": "Supports Tools",
+    "visionViaCompanion": "Images will be described by the local vision model",
+    "forConversation": "Model used for this conversation"
+  },
+  "capability": {
+    "tools": "Tool use",
+    "vision": "Vision",
+    "thinking": "Thinking"
   },
   "thinking": {
     "title": "Thinking process",
+    "inlineTitle": "Thinking",
     "thinking": "Thinking...",
-    "characters": "characters",
-    "rounds": "Rounds"
+    "characters": "{{count}} characters",
+    "characters_one": "{{count}} character",
+    "characters_other": "{{count}} characters",
+    "rounds": "{{count}} rounds",
+    "rounds_one": "{{count}} round",
+    "rounds_other": "{{count}} rounds"
   },
   "progress": {
     "thinking": "Thinking",
-    "generating": "Generating",
-    "toolExecution": "Running tool"
+    "generating": "Generating"
   },
   "stage": {
     "thinking": "Thinking",
@@ -61,46 +72,47 @@
     "status": {
       "pending": "Pending",
       "running": "Running",
-      "completed": "Completed"
+      "completed": "Completed",
+      "failed": "Failed"
     },
+    "intermediate": "Intermediate notes",
+    "label": "Tool",
     "arguments": "Arguments",
     "result": "Result",
-    "roundTitle": "Round {{round}}",
-    "multiRoundTitle": "Tool Calls",
     "rounds": "rounds",
+    "callsCount": "{{count}} tool call",
+    "callsCount_one": "{{count}} tool call",
+    "callsCount_other": "{{count}} tool calls",
+    "countShort": "{{count}} tools",
+    "countShort_one": "{{count}} tool",
+    "countShort_other": "{{count}} tools",
+    "roundsCount": "{{count}} round",
+    "roundsCount_one": "{{count}} round",
+    "roundsCount_other": "{{count}} rounds",
+    "runningWith": "Running {{name}}…",
+    "details": "Details",
+    "hideDetails": "Hide details",
     "toggleDetails": "Toggle details"
+  },
+  "timeline": {
+    "title": "Execution process",
+    "roundFallback": "Round {{round}}"
   },
   "connection": {
     "connected": "Connected",
     "reconnecting": "Reconnecting",
     "error": "Connection error",
     "disconnected": "Disconnected",
-    "retryAttempt": "Attempt {{count}}",
-    "retryProgress": "Attempt {{retry}}/{{max}}{{seconds, string}}",
-    "retrySeconds": " · {{seconds}}s",
     "reconnect": "Reconnect",
     "authFailed": "Connection lost (authentication failed)",
     "interruptedSaved": "Connection lost — this reply still completes in the background and is saved to the session history; return to this session later to see it"
   },
   "quickActions": {
     "refreshDevices": "Refresh devices",
-    "refreshPrompt": "Refresh status of all devices",
-    "viewDeviceDetails": "View device details",
-    "viewDevicePrompt": "Show device details and configuration",
     "createAutomation": "Create automation",
-    "createAutomationPrompt": "Help me create a new automation rule",
-    "viewAllAutomations": "View all automations",
-    "viewAllAutomationsPrompt": "List all configured automation rules",
-    "viewAnalytics": "View analytics",
-    "viewAnalyticsPrompt": "Show recent data analysis and trends",
     "checkAlerts": "Check alerts",
-    "checkAlertsPrompt": "Check for any unhandled alerts",
     "openSettings": "Open settings",
-    "openSettingsPrompt": "Open system settings page",
-    "continue": "Continue",
-    "continuePrompt": "Continue",
-    "elaborate": "Elaborate",
-    "elaboratePrompt": "Please elaborate"
+    "continue": "Continue"
   },
   "taskProgress": {
     "title": "Task progress",
@@ -122,61 +134,9 @@
     "stepLabel": "Step {{step}}",
     "automationCreated": "Automation created successfully!"
   },
-  "intent": {
-    "queryData": {
-      "label": "Query data",
-      "description": "Query device status or historical data"
-    },
-    "analyzeData": {
-      "label": "Analyze data",
-      "description": "Analyze trends, anomalies, or statistics"
-    },
-    "controlDevice": {
-      "label": "Control device",
-      "description": "Toggle devices or adjust parameters"
-    },
-    "createAutomation": {
-      "label": "Create automation",
-      "description": "Create rules or workflows"
-    },
-    "sendMessage": {
-      "label": "Send message",
-      "description": "Send notifications or reports"
-    },
-    "summarize": {
-      "label": "Summarize",
-      "description": "Summarize information"
-    },
-    "clarify": {
-      "label": "Needs clarification",
-      "description": "More information needed"
-    },
-    "outOfScope": {
-      "label": "Out of scope",
-      "description": "Beyond system capabilities"
-    },
-    "confidence": "Confidence",
-    "type": "Type",
-    "path": {
-      "fast": "Fast path",
-      "standard": "Standard",
-      "quality": "High quality",
-      "multiTurn": "Multi-turn",
-      "fallback": "Fallback"
-    },
-    "entity": {
-      "device": "Device",
-      "location": "Location",
-      "value": "Value",
-      "time": "Time",
-      "action": "Action",
-      "unknown": "Unknown"
-    }
-  },
   "loading": "Loading...",
   "errors": {
     "sendMessage": "Failed to send message",
-    "connectionLost": "Connection lost",
     "retry": "Retry",
     "llmError": "LLM Service Error",
     "dismiss": "Dismiss"
@@ -192,28 +152,6 @@
     "goToSettings": "Go to Settings",
     "downloadBuiltin": "Download Built-in Model (Recommended)"
   },
-  "build": {
-    "view": "View",
-    "undo": "Undo",
-    "showDetails": "Details",
-    "hideDetails": "Hide details",
-    "types": {
-      "device": "Device",
-      "dashboard": "Dashboard",
-      "rule": "Rule",
-      "extension": "Extension",
-      "widget": "Widget",
-      "transform": "Transform",
-      "agent": "Agent",
-      "message": "Message"
-    },
-    "actions": {
-      "create": "Created",
-      "update": "Updated",
-      "delete": "Deleted",
-      "install": "Installed"
-    }
-  },
   "newChat": "New Chat",
   "chat": {
     "suggestions": {
@@ -226,13 +164,27 @@
   },
   "code": {
     "copy": "Copy",
-    "copied": "Copied"
+    "copied": "Copied",
+    "wrap": "Wrap lines",
+    "unwrap": "Disable line wrapping",
+    "expand": "Show all",
+    "collapse": "Show less"
   },
+  "image": {
+    "view": "View image",
+    "close": "Close image",
+    "alt": "Image {{index}}"
+  },
+  "message": {
+    "charsPerSecond": "chars/s"
+  },
+  "a11y": {
+    "generating": "Generating a response",
+    "answerReady": "Response complete"
+  },
+  "newContent": "New content",
   "scrollToBottom": "Scroll to bottom",
   "copyMessage": "Copy message",
-  "footer": {
-    "disclaimer": "Disclaimer"
-  },
   "toolLoopProgress": "Working · tool round {{round}}",
   "context": {
     "title": "Context usage",
@@ -240,6 +192,94 @@
     "toolDefs": "Tool definitions",
     "history": "Conversation history",
     "estimatedHint": "Character-based estimate — updates after the next reply",
-    "msgCount": " · {{count}} msgs"
+    "msgCount": " · {{count}} msgs",
+    "compact": "Compact",
+    "compacting": "Compacting…",
+    "compactDone": "Compacted {{count}} messages",
+    "compactNothing": "Nothing to compact yet",
+    "compactFailed": "Compact failed",
+    "compactConfirmTitle": "Compact context?",
+    "compactConfirmDesc": "Earlier messages are replaced by a summary to free context space. History stays visible in the UI; only later requests are affected.",
+    "historyTruncated": "The context is full; older messages are no longer sent to the model (they remain visible here). Use Compact context to free space.",
+    "clear": "Clear",
+    "clearDone": "Conversation history cleared",
+    "clearFailed": "Clear failed",
+    "clearConfirmTitle": "Clear conversation history?",
+    "clearConfirmDesc": "All messages in this session will be deleted. This cannot be undone.",
+    "awaitingMeasurement": "Waiting for request context measurement",
+    "breakdownUnavailable": "Breakdown unavailable for this request; only the total token count is reliable.",
+    "measuredHint": "Last measured model request; excludes accumulated execution output."
+  },
+  "loadEarlier": "Load earlier messages",
+  "loadEarlierLoading": "Loading…",
+  "goalStatus": {
+    "label": "System goal status",
+    "notApplicable": "No constrained goal to verify for this turn (not a success claim).",
+    "incomplete": "Goal incomplete — evidence {{level}}. {{reason}}",
+    "completeEligible": "Command evidence {{level}} (structured complete allowed{{physical}}).",
+    "completeEligiblePhysical": "; physical effect verified",
+    "completeEligibleNoPhysical": "; physical effect not verified",
+    "completed": "Goal completed (evidence {{id}}).",
+    "halted": "Goal halted: {{reason}}",
+    "cancelled": "Goal cancelled.",
+    "level": {
+      "none": "none",
+      "config_success": "config only",
+      "command_dispatched": "command dispatched",
+      "device_acknowledged": "device acknowledged",
+      "physical_effect_verified": "physical effect verified"
+    },
+    "endReason": {
+      "normal": "ended normally",
+      "interrupted": "interrupted",
+      "timeout": "timed out",
+      "error": "error",
+      "cancelled": "cancelled",
+      "cannot_continue": "cannot continue"
+    }
+  },
+  "suggestions": {
+    "badge": "Suggested"
+  },
+  "mention": {
+    "title": "Pick an object to reference",
+    "searching": "Searching…",
+    "noResults": "No matching objects",
+    "referencesLabel": "Referenced objects",
+    "remove": "Remove reference",
+    "device": "device",
+    "rule": "rule",
+    "transform": "transform",
+    "agent": "agent",
+    "invalid": "Invalid reference",
+    "invalidSend": "Some references are invalid — fix them and resend",
+    "contentOverLimit": "Message exceeds the per-message limit (max 20 references, 8000 characters of text) — trim it and resend",
+    "reuseInComposer": "Reuse in composer",
+    "filterTypes": "Filter by type",
+    "filterAll": "All",
+    "partialFailure": "Some types failed to load",
+    "searchFailed": "Search failed — try again",
+    "loadMore": "Load more",
+    "protoTitle": "Inline @ prototype",
+    "protoDesc": "Standalone editor prototype for in-sentence references; not wired into production ChatComposer.",
+    "protoHint": "Inline @ prototype: type @ or use the toolbar; the same object may appear twice; chips delete atomically.",
+    "protoText": "Message text",
+    "protoMobile": "Mobile mention picker sheet",
+    "insertAt": "Insert @ mention",
+    "insert": "Insert reference",
+    "protoPlain": "Plain text",
+    "protoLegacy": "Legacy chip projection",
+    "protoHistory": "Post-send history preview (inline tags)",
+    "protoHistoryEmpty": "Type and insert references to preview here",
+    "protoTradeoffLink": "Prototype trade-offs archived; production chat uses TipTap Mention.",
+    "protoViewportAuto": "Follow viewport",
+    "protoViewportDesktop": "Desktop popover",
+    "protoViewportMobile": "Mobile sheet"
+  },
+  "authorizeConfirm": {
+    "title": "Confirm re-run of blocked write",
+    "pickOne": "Multiple blocked operations — pick which to re-run",
+    "button": "Re-run {{opId}}",
+    "buttonWithTarget": "Re-run {{opId}} · {{target}}"
   }
 }

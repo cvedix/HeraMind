@@ -8,7 +8,124 @@ use futures::{Stream, StreamExt};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::llm::LlmInterface;
+/// Drop-safe mid-clear mark: removes `session_id` from `clearing_sessions` on
+/// Drop so a cancelled/panicked `clear_history` Future cannot leave the
+/// session permanently refusing new turns.
+struct ClearingGuard {
+    clearing_sessions: Arc<std::sync::Mutex<HashMap<String, ()>>>,
+    session_id: String,
+}
+
+impl ClearingGuard {
+    fn arm(
+        clearing_sessions: Arc<std::sync::Mutex<HashMap<String, ()>>>,
+        session_id: &str,
+    ) -> Self {
+        clearing_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.to_string(), ());
+        Self {
+            clearing_sessions,
+            session_id: session_id.to_string(),
+        }
+    }
+}
+
+impl Drop for ClearingGuard {
+    fn drop(&mut self) {
+        self.clearing_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+/// Optional barriers used only by session persist/clear race tests.
+///
+/// Kept on [`SessionManager`] (not process globals) so parallel `cargo test`
+/// workers cannot steal each other's pauses.
+#[derive(Default)]
+struct PersistClearHooks {
+    /// After persist snapshots messages/gen, before `history_io`.
+    persist_after_snapshot: std::sync::Mutex<Option<PersistClearPause>>,
+    /// After clearing mark is armed, before durable clear IO.
+    clear_after_mark: std::sync::Mutex<Option<PersistClearPause>>,
+    /// Test hook: next turn-start save returns Storage error (MessageReceived reject).
+    fail_next_turn_start_save: std::sync::atomic::AtomicBool,
+}
+
+struct PersistClearPause {
+    entered: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+impl PersistClearHooks {
+    #[cfg(test)]
+    fn arm_fail_next_turn_start_save(&self) {
+        self.fail_next_turn_start_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn take_fail_next_turn_start_save(&self) -> bool {
+        self.fail_next_turn_start_save
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn install_persist_pause(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *self
+            .persist_after_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(PersistClearPause {
+            entered: entered.clone(),
+            resume: resume.clone(),
+        });
+        (entered, resume)
+    }
+
+    #[cfg(test)]
+    fn install_clear_hold(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *self
+            .clear_after_mark
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(PersistClearPause {
+            entered: entered.clone(),
+            resume: resume.clone(),
+        });
+        (entered, resume)
+    }
+
+    async fn yield_after_persist_snapshot(&self) {
+        let pause = self
+            .persist_after_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(p) = pause {
+            p.entered.notify_one();
+            p.resume.notified().await;
+        }
+    }
+
+    async fn yield_after_clear_mark(&self) {
+        let hold = self
+            .clear_after_mark
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(h) = hold {
+            h.entered.notify_one();
+            h.resume.notified().await;
+        }
+    }
+}
+
+use crate::llm::{BackendRequestDefaults, LlmInterface};
 
 use heramind_storage::SessionStore;
 
@@ -21,6 +138,12 @@ pub use crate::llm_backends::{
 };
 
 use heramind_storage::LlmBackendInstance;
+
+#[derive(Clone)]
+struct SessionBackend {
+    runtime: LlmBackend,
+    defaults: Option<BackendRequestDefaults>,
+}
 
 /// Optional overrides applied on top of `SessionManager::default_config` when
 /// creating a new session. All fields are `Option<...>`; `None` means "inherit
@@ -167,6 +290,20 @@ fn instance_to_llm_backend(instance: &LlmBackendInstance) -> Result<LlmBackend> 
     })
 }
 
+/// How many leading messages the session listing reads to find its preview.
+/// A session opens with the user's request (after at most a system line).
+const LISTING_PREVIEW_SCAN: usize = 8;
+
+/// First user message of a history, trimmed to 50 characters.
+fn listing_preview(messages: &[heramind_storage::SessionMessage]) -> Option<String> {
+    let content = messages.iter().find(|m| m.role == "user")?.content.trim();
+    Some(if content.chars().count() > 50 {
+        format!("{}...", content.chars().take(50).collect::<String>())
+    } else {
+        content.to_string()
+    })
+}
+
 /// Information about a session for listing.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionInfo {
@@ -188,8 +325,15 @@ pub struct SessionInfo {
     pub memory_enabled: bool,
 }
 
-/// Type alias for the cancel-sender map shared between manager and stream wrappers.
-type CancelSenderMap = Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>;
+/// Type alias for the cancel-sender map shared between manager and stream
+/// wrappers. The `u64` is a per-registration identity token: removals are
+/// owner-checked so a timed-out clear's zombie cleanup can never evict a
+/// NEWER stream's registration (remove by identity, never by bare session
+/// key — the same class of bug the stream-lease owner token fixed).
+type CancelSenderMap = Arc<RwLock<HashMap<String, (u64, tokio::sync::watch::Sender<bool>)>>>;
+
+/// Monotonic identity tokens for cancel-sender registrations.
+static CANCEL_SENDER_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// RAII guard that ensures a registered cancel sender is removed from the
 /// `cancel_senders` map when the stream wrapper is dropped — regardless of
@@ -205,16 +349,20 @@ type CancelSenderMap = Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<boo
 struct CancelSenderGuard {
     senders: CancelSenderMap,
     session_id: String,
+    /// Registration identity captured at sign-up; `Drop` removes only when
+    /// the map still holds THIS token.
+    token: u64,
     /// Set to true once the natural-end cleanup has run, so `Drop` doesn't
     /// double-spawn a redundant removal.
     cleaned_up: bool,
 }
 
 impl CancelSenderGuard {
-    fn new(senders: CancelSenderMap, session_id: String) -> Self {
+    fn new(senders: CancelSenderMap, session_id: String, token: u64) -> Self {
         Self {
             senders,
             session_id,
+            token,
             cleaned_up: false,
         }
     }
@@ -234,13 +382,19 @@ impl Drop for CancelSenderGuard {
         }
         let senders = self.senders.clone();
         let session_id = std::mem::take(&mut self.session_id);
+        let token = self.token;
         tokio::spawn(async move {
-            senders.write().await.remove(&session_id);
+            SessionManager::remove_cancel_sender_if_token(&senders, &session_id, token).await;
         });
     }
 }
 
-/// Session manager for managing multiple agent sessions with persistence.
+/// Serializes first-claim ownership stamping (see
+/// [`SessionManager::claim_session_owner`]): the read-check-write must be
+/// atomic within this process. Process-wide rather than a manager field —
+/// there is one session store per process, so there is one claim order.
+static OWNER_CLAIM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct SessionManager {
     /// Active sessions (in-memory cache)
     sessions: Arc<RwLock<HashMap<String, Arc<Agent>>>>,
@@ -251,13 +405,28 @@ pub struct SessionManager {
     /// Default agent config
     default_config: AgentConfig,
     /// Default LLM backend (configured for new sessions)
-    default_llm_backend: Arc<RwLock<Option<LlmBackend>>>,
+    default_llm_backend: Arc<RwLock<Option<SessionBackend>>>,
     /// Tool registry for all sessions
     tool_registry: Arc<RwLock<Option<Arc<crate::toolkit::ToolRegistry>>>>,
     /// Skill registry for scenario-driven prompt injection
     skill_registry: crate::skills::SharedSkillRegistry,
-    /// Cancel signal senders for active streaming sessions (session_id → watch::Sender)
-    cancel_senders: Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+    /// Cancel signal senders for active streaming sessions
+    /// (session_id → (identity token, watch::Sender))
+    cancel_senders: CancelSenderMap,
+    /// Sessions mid-`clear_history`: new turns are refused until clear finishes
+    /// (cancel + await stream → memory wipe → durable deletes).
+    ///
+    /// `std::sync::Mutex` (not tokio) so [`ClearingGuard`] can release the mark
+    /// from `Drop` when a clear Future is cancelled mid-flight.
+    clearing_sessions: Arc<std::sync::Mutex<HashMap<String, ()>>>,
+    /// Serializes durable history IO: `persist_history` (generation recheck →
+    /// `save_history`) and `clear_history` (generation bump → store clear /
+    /// ledger delete). Closes the generation-check → unlock → save race with
+    /// clear without relying on a post-save undo that could wipe a newer turn.
+    history_io: Arc<tokio::sync::Mutex<()>>,
+    /// Per-manager test barriers for persist/clear interleave + mid-cancel
+    /// coverage (production paths leave these empty).
+    persist_clear_hooks: Arc<PersistClearHooks>,
     /// Per-session event subscribers. ChatSessionCapabilityProvider
     /// registers one mpsc::Sender per session-stream subscription. Each
     /// AgentEvent yielded by `process_message_events` is teed (best-effort,
@@ -269,13 +438,230 @@ pub struct SessionManager {
     /// extension. A slow subscriber that fills its channel just drops events
     /// (deliberate: voice workloads should never accumulate backlog).
     event_subscribers: Arc<RwLock<HashMap<String, Vec<tokio::sync::mpsc::Sender<AgentEvent>>>>>,
-    /// Per-session frozen memory snapshot (loaded once, cached for the session).
-    /// `MemorySnapshot::load` reads 3 files synchronously + token-truncates on
-    /// every call; the "frozen snapshot" design (snapshot.rs) loads once per
-    /// session, so re-reading on each message was redundant work on the hot
-    /// path. Memory-tool writes intentionally do NOT invalidate this — the
-    /// snapshot stays frozen for the session and is re-read on the next one.
-    memory_snapshots: Arc<RwLock<HashMap<String, crate::memory::MemorySnapshot>>>,
+}
+
+// ---------------------------------------------------------------------------
+// Memory-extraction output parsing (pure — unit-tested without an LLM)
+// ---------------------------------------------------------------------------
+
+/// Strip one round of tag-separator junk from the front of a fact.
+///
+/// Separators `:` `：` `-` strip freely (no word boundary); the template word
+/// `fact` strips ONLY as a standalone word — followed by whitespace, a
+/// colon, or end (a bare `strip_prefix("fact")` mangled real facts
+/// ("factory line 3" → "ory line 3"), and treating a following `-` as a
+/// separator ate the word "fact-checking"). Both caught in review,
+/// 2026-10-14.
+fn strip_leading_separators(f: &str) -> String {
+    let mut s = f.trim().to_string();
+    loop {
+        let before = s.clone();
+        for sep in [":", "：", "-"] {
+            if let Some(stripped) = s.strip_prefix(sep) {
+                s = stripped.to_string();
+            }
+        }
+        if let Some(rest) = s.strip_prefix("fact") {
+            let standalone = rest.is_empty()
+                || rest.starts_with(|c: char| c.is_whitespace() || c == ':' || c == '：');
+            if standalone {
+                s = rest.to_string();
+            }
+        }
+        s = s.trim().to_string();
+        if s == before {
+            break;
+        }
+    }
+    s
+}
+
+/// Case-insensitive tagged-bullet match: accepts `- [user]: x`,
+/// `- [User] x`, `- [USER] fact x`. `rest` is one trimmed output line.
+fn strip_tag(line: &str, tag: &str) -> Option<String> {
+    let raw = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("• "))?;
+    // Boundary-safe: `raw[..tag.len()]` PANICS when the tag length lands
+    // inside a multibyte char — any unlabeled Chinese bullet line hit this
+    // ("- [knowledge]" is 11 bytes = mid-4th-CJK-char), killing the whole
+    // extraction task and losing every fact that turn. `get` returns None
+    // on a non-boundary → the line is simply not a tagged fact.
+    if raw.len() < tag.len()
+        || !raw
+            .get(..tag.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag))
+    {
+        return None;
+    }
+    Some(strip_leading_separators(&raw[tag.len()..]))
+}
+
+/// Quality gate: 2B-class models pad extraction output with meta chatter
+/// about the ASSISTANT itself and degenerate fragments — neither is a
+/// durable fact, and both pollute KNOWLEDGE.md semantically (exact-text
+/// dedup cannot catch reworded repeats of the same observation).
+fn is_junk_fact(f: &str) -> bool {
+    const META_OPENERS: [&str; 9] = [
+        "the assistant",
+        "assistant can",
+        "assistant mentions",
+        "assistant provides",
+        "assistant includes",
+        "assistant needs",
+        "assistant offers",
+        "the model",
+        "the ai",
+    ];
+    let lowered = f.to_lowercase();
+    // The <6 gate targets English filler ("ok", "yes"); CJK carries ~3x
+    // the information per char, so a 2-char Chinese fact ("住沪") is real —
+    // CJK floor is 2, non-CJK stays 6. Single-char CJK ("好") is still
+    // interjection noise.
+    let has_cjk = f.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c));
+    let floor = if has_cjk { 2 } else { 6 };
+    f.chars().count() < floor || META_OPENERS.iter().any(|p| lowered.starts_with(p))
+}
+
+/// Parse extraction LLM output into (user, knowledge) fact lists. Lines that
+/// are not tagged bullets, or whose content fails the quality gate, are
+/// dropped.
+fn parse_extracted_facts(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut user = Vec::new();
+    let mut knowledge = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(f) = strip_tag(line, "[user]") {
+            if !is_junk_fact(&f) {
+                user.push(f);
+            }
+        } else if let Some(f) = strip_tag(line, "[knowledge]") {
+            if !is_junk_fact(&f) {
+                knowledge.push(f);
+            }
+        }
+    }
+    (user, knowledge)
+}
+
+/// Result of companion image delegation for a text-only primary.
+struct ImageDelegation {
+    /// One-shot prompt for the current LLM turn (includes captions + paths).
+    prompt: String,
+    /// Per-image captions in upload order (persisted onto history images).
+    captions: Vec<String>,
+    /// Durable `/api/images/…` paths in upload order (when persistence succeeded).
+    paths: Vec<Option<String>>,
+}
+
+async fn delegate_images_to_companion(message: &str, images: &[String]) -> Option<ImageDelegation> {
+    if let Ok(v) = std::env::var("HERAMIND_BUILTIN_VLM_DELEGATE") {
+        if v.trim().eq_ignore_ascii_case("off") {
+            return None;
+        }
+    }
+    let manager = get_instance_manager().ok()?;
+    let companion = manager
+        .list_instances()
+        .into_iter()
+        .find(|i| i.id.starts_with("builtin-vlm-") && i.capabilities.supports_multimodal)?;
+    let runtime = manager.get_runtime(&companion.id).await.ok()?;
+
+    use heramind_core::llm::backend::{GenerationParams, LlmInput};
+    use heramind_core::message::{Content, ContentPart, Message, MessageRole};
+
+    let images_dir = heramind_core::paths::data_dir().join("images");
+    let mut captions = Vec::with_capacity(images.len());
+    let mut paths = Vec::with_capacity(images.len());
+    for img in images {
+        // Prefer durable path early so the turn prompt and history share it.
+        let path = if img.starts_with("/api/images/") {
+            Some(img.trim().to_string())
+        } else if img.starts_with("data:image/") {
+            SessionManager::persist_image_to_file(img, &images_dir)
+        } else {
+            None
+        };
+        paths.push(path.clone());
+
+        // Chat uploads arrive as data URLs — anything else takes the
+        // legacy error path rather than guessing the encoding.
+        let raw = img.trim().strip_prefix("data:")?;
+        let (mime, data) = raw.split_once(",")?;
+        let mime = mime.strip_suffix(";base64")?.to_string();
+        let msg = Message::new(
+            MessageRole::User,
+            Content::Parts(vec![
+                ContentPart::text(
+                    "Describe this image factually and concisely: objects, people, visible text, colors, and the overall scene. Describe only what is visible — do not speculate. Keep under 120 Chinese characters or ~60 English words.",
+                ),
+                ContentPart::image_base64(data, &mime),
+            ]),
+        );
+        let input = LlmInput {
+            messages: vec![msg],
+            params: GenerationParams {
+                max_tokens: Some(200),
+                ..Default::default()
+            },
+            model: None,
+            stream: false,
+            tools: None,
+        };
+        let out =
+            tokio::time::timeout(std::time::Duration::from_secs(120), runtime.generate(input))
+                .await
+                .ok()?
+                .ok()?;
+        let text = out.text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        // Soft-clip caption for album/prompt budget.
+        let clipped: String = text.chars().take(160).collect();
+        captions.push(clipped);
+    }
+
+    let mut combined = message.to_string();
+    // Pixels are not inline on the text-only primary; durable paths remain
+    // usable with vision / OCR / image_edit. Short captions ≠ OCR full text.
+    combined.push_str(&format!(
+        "\n\n[The user attached {} image(s). A local vision companion wrote short \
+         captions below — useful for orientation, NOT a substitute for OCR. \
+         Pixels are not inline on this text model. Pass the /api/images/… path \
+         (or img_N from Session images) to vision / OCR / image_edit when you \
+         need exact text or finer analysis.]\n",
+        captions.len()
+    ));
+    for (i, d) in captions.iter().enumerate() {
+        let path_note = paths
+            .get(i)
+            .and_then(|p| p.as_deref())
+            .map(|p| format!(" path={p}"))
+            .unwrap_or_default();
+        combined.push_str(&format!("[Image {}{}] {}\n", i + 1, path_note, d));
+    }
+    tracing::info!(
+        companion = %companion.id,
+        images = captions.len(),
+        "session: delegated chat images to the vision companion"
+    );
+    Some(ImageDelegation {
+        prompt: combined,
+        captions,
+        paths,
+    })
+}
+
+async fn apply_image_delegation(
+    llm: std::sync::Arc<crate::llm::LlmInterface>,
+    delegation: ImageDelegation,
+) {
+    // Paths are re-derived idempotently (content-hash) when accepting the
+    // user message; captions must stage here for history persistence.
+    let _paths = delegation.paths;
+    llm.set_image_delegation_captions(delegation.captions).await;
+    llm.set_image_delegation_prompt(delegation.prompt).await;
 }
 
 impl SessionManager {
@@ -306,8 +692,10 @@ impl SessionManager {
             tool_registry: Arc::new(RwLock::new(None)),
             skill_registry: crate::skills::create_shared_registry(None),
             cancel_senders: Arc::new(RwLock::new(HashMap::new())),
+            clearing_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            history_io: Arc::new(tokio::sync::Mutex::new(())),
+            persist_clear_hooks: Arc::new(PersistClearHooks::default()),
             event_subscribers: Arc::new(RwLock::new(HashMap::new())),
-            memory_snapshots: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -327,8 +715,10 @@ impl SessionManager {
             tool_registry: Arc::new(RwLock::new(None)),
             skill_registry: crate::skills::create_shared_registry(Some(data_dir)),
             cancel_senders: Arc::new(RwLock::new(HashMap::new())),
+            clearing_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            history_io: Arc::new(tokio::sync::Mutex::new(())),
+            persist_clear_hooks: Arc::new(PersistClearHooks::default()),
             event_subscribers: Arc::new(RwLock::new(HashMap::new())),
-            memory_snapshots: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Restore sessions from database on startup
@@ -365,8 +755,65 @@ impl SessionManager {
         result.map_err(|e| HeraMindError::Storage(format!("Failed to delete session: {}", e)))
     }
 
+    /// Write a `data:image/...;base64,...` payload to `<images_dir>/<uuid>.<ext>`
+    /// and return the served reference (`/api/images/<file>`).
+    ///
+    /// `None` on any failure (decode / write) — the caller then keeps the
+    /// original data URL, degrading to the legacy inline form.
+    pub(crate) fn persist_image_to_file(
+        data_url: &str,
+        images_dir: &std::path::Path,
+    ) -> Option<String> {
+        let parsed = crate::image_utils::parse_data_image_url(data_url)?;
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(parsed.base64)
+            .ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        std::fs::create_dir_all(images_dir).ok()?;
+        let ext = mime_to_ext(parsed.mime_type);
+        // Content-hash filename — idempotent across re-saves. `save_history`
+        // runs EVERY turn over the full history while in-memory images stay
+        // data URLs, so a fresh uuid per save would orphan one file per image
+        // per turn. SipHash-1-3 via DefaultHasher (std, fixed keys —
+        // deterministic) is ample: a collision needs ~4 billion images, and
+        // the worst case is one orphaned duplicate, never data loss.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let name = format!("chat-{:016x}.{}", hasher.finish(), ext);
+        std::fs::write(images_dir.join(&name), &bytes).ok()?;
+        tracing::debug!(file = %name, bytes = bytes.len(), "Persisted chat image to file");
+        Some(format!("/api/images/{}", name))
+    }
+
     /// Save message history for a session to persistent storage.
     fn save_history(&self, session_id: &str, messages: &[AgentMessage]) -> Result<()> {
+        let session_messages = Self::agent_messages_to_session_messages(messages);
+        self.store.save_history(session_id, &session_messages)?;
+        Ok(())
+    }
+
+    /// Convert in-memory [`AgentMessage`]s to the persisted
+    /// [`SessionMessage`] form. Associated (no `&self`) so the turn-start
+    /// snapshot writer inside a 'static stream can reuse the exact same
+    /// conversion — including image persistence — as `save_history`.
+    ///
+    /// [storage economy] Image payloads live on disk, not in redb: the
+    /// persisted form is the served reference `/api/images/<file>`, not
+    /// the full base64 data URL (a 5MB photo ≈ 6.7MB of base64 PER
+    /// MESSAGE otherwise — bloating the DB, the history API payload, and
+    /// session-restore RAM). In-memory AgentMessages keep data URLs; the
+    /// streaming window-build hydrates references back to bytes for the
+    /// few images still eligible to reach the LLM (strip_stale_images).
+    /// Legacy base64 rows from older sessions pass through unchanged and
+    /// convert naturally on their session's next save.
+    fn agent_messages_to_session_messages(
+        messages: &[AgentMessage],
+    ) -> Vec<heramind_storage::SessionMessage> {
+        let images_dir = heramind_core::paths::data_dir().join("images");
         // Convert AgentMessage to SessionMessage
         let session_messages: Vec<heramind_storage::SessionMessage> = messages
             .iter()
@@ -401,9 +848,18 @@ impl SessionManager {
                 // Convert images from AgentMessageImage to SessionMessageImage
                 let images = msg.images.as_ref().map(|imgs| {
                     imgs.iter()
-                        .map(|img| heramind_storage::SessionMessageImage {
-                            data: img.data.clone(),
-                            mime_type: img.mime_type.clone(),
+                        .map(|img| {
+                            let data = if img.data.starts_with("data:image/") {
+                                Self::persist_image_to_file(&img.data, &images_dir)
+                                    .unwrap_or_else(|| img.data.clone())
+                            } else {
+                                img.data.clone()
+                            };
+                            heramind_storage::SessionMessageImage {
+                                data,
+                                mime_type: img.mime_type.clone(),
+                                caption: img.caption.clone(),
+                            }
                         })
                         .collect()
                 });
@@ -418,14 +874,20 @@ impl SessionManager {
                     images,
                     round_contents: msg.round_contents.clone(),
                     round_thinking: msg.round_thinking.clone(),
+                    system_notes: msg.system_notes.clone(),
+                    goal_status: msg
+                        .goal_status
+                        .as_ref()
+                        .and_then(|g| serde_json::to_value(g).ok()),
+                    end_reason: msg.end_reason.as_ref().map(|r| r.as_str().to_string()),
+                    content_nodes: msg.content_nodes.clone(),
+                    content_version: msg.content_version,
                     timestamp: msg.timestamp,
                 }
             })
             .collect();
 
-        self.store
-            .save_history(session_id, &session_messages)
-            .map_err(|e| HeraMindError::Storage(format!("Failed to save history: {}", e)))
+        session_messages
     }
 
     /// Load message history for a session from persistent storage.
@@ -493,6 +955,7 @@ impl SessionManager {
                         .map(|img| super::agent::AgentMessageImage {
                             data: img.data,
                             mime_type: img.mime_type,
+                            caption: img.caption,
                         })
                         .collect()
                 });
@@ -507,6 +970,13 @@ impl SessionManager {
                     images,
                     round_contents: sm.round_contents,
                     round_thinking: sm.round_thinking,
+                    system_notes: sm.system_notes,
+                    goal_status: sm.goal_status.and_then(|v| serde_json::from_value(v).ok()),
+                    end_reason: sm
+                        .end_reason
+                        .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
+                    content_nodes: sm.content_nodes,
+                    content_version: sm.content_version,
                     timestamp: sm.timestamp,
                 }
             })
@@ -518,7 +988,10 @@ impl SessionManager {
     /// Set the default LLM backend for NEW sessions only.
     /// Does NOT modify existing sessions (they may have their own backend configuration).
     pub async fn set_default_llm_backend(&self, backend: LlmBackend) {
-        *self.default_llm_backend.write().await = Some(backend);
+        *self.default_llm_backend.write().await = Some(SessionBackend {
+            runtime: backend,
+            defaults: None,
+        });
     }
 
     /// Set the default LLM backend for all new and existing sessions.
@@ -527,7 +1000,10 @@ impl SessionManager {
     /// Use set_default_llm_backend() instead unless you specifically need this behavior.
     pub async fn set_llm_backend(&self, backend: LlmBackend) -> Result<()> {
         // Store as default for new sessions
-        *self.default_llm_backend.write().await = Some(backend.clone());
+        *self.default_llm_backend.write().await = Some(SessionBackend {
+            runtime: backend.clone(),
+            defaults: None,
+        });
 
         // Configure LLM for all existing sessions
         let sessions = self.sessions.read().await;
@@ -538,9 +1014,67 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Activate a persisted backend for chat sessions, retaining its request settings.
+    /// Scheduled agents remain bound to their own backend IDs.
+    pub async fn set_llm_backend_instance(&self, instance: &LlmBackendInstance) -> Result<()> {
+        let backend = instance_to_llm_backend(instance)?;
+        let defaults = BackendRequestDefaults::from(instance);
+        *self.default_llm_backend.write().await = Some(SessionBackend {
+            runtime: backend.clone(),
+            defaults: Some(defaults.clone()),
+        });
+        let agents: Vec<_> = self.sessions.read().await.values().cloned().collect();
+        for agent in agents {
+            agent.configure_llm(backend.clone()).await?;
+            agent
+                .llm_interface()
+                .set_backend_defaults(defaults.clone())
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Refresh the request-defaults snapshot of sessions bound to `instance`.
+    ///
+    /// Snapshots are captured at bind time (activation, session creation, or
+    /// a per-call `backend_id`), so editing a backend must retune every
+    /// session still holding its snapshot — otherwise a mid-session
+    /// thinking-effort or sampling PATCH applies only after a restart or
+    /// manual re-activation. The backend PATCH handler historically retuned
+    /// only when the edited backend was the globally ACTIVE one, leaving
+    /// sessions pinned to a non-active backend stale. Matching is by the
+    /// snapshot's recorded backend id; sessions bound elsewhere keep their
+    /// own settings (isolation by design). Returns how many sessions were
+    /// retuned, for the caller's log line.
+    pub async fn retune_sessions_bound_to_instance(&self, instance: &LlmBackendInstance) -> usize {
+        let defaults = BackendRequestDefaults::from(instance);
+        let agents: Vec<_> = self.sessions.read().await.values().cloned().collect();
+        let mut retuned = 0usize;
+        for agent in agents {
+            if agent
+                .llm_interface()
+                .bound_backend_id()
+                .await
+                .is_some_and(|bound| bound == instance.id)
+            {
+                agent
+                    .llm_interface()
+                    .set_backend_defaults(defaults.clone())
+                    .await;
+                retuned += 1;
+            }
+        }
+        retuned
+    }
+
     /// Get the default LLM backend if configured.
     pub async fn get_llm_backend(&self) -> Result<Option<LlmBackend>> {
-        Ok(self.default_llm_backend.read().await.clone())
+        Ok(self
+            .default_llm_backend
+            .read()
+            .await
+            .as_ref()
+            .map(|backend| backend.runtime.clone()))
     }
 
     /// Configure LLM using the LlmBackendInstanceManager.
@@ -559,7 +1093,10 @@ impl SessionManager {
         let backend = instance_to_llm_backend(&active_instance)?;
 
         // Only set as default for new sessions, don't modify existing sessions
-        self.set_default_llm_backend(backend).await;
+        *self.default_llm_backend.write().await = Some(SessionBackend {
+            runtime: backend,
+            defaults: Some(BackendRequestDefaults::from(&active_instance)),
+        });
         Ok(())
     }
 
@@ -598,7 +1135,11 @@ impl SessionManager {
     ) -> Result<()> {
         tracing::debug!(session_id = %session_id, backend_id = %backend_id, "configure_agent_by_backend_id called");
 
-        let backend = Self::get_backend_by_id(backend_id)?;
+        let manager = get_instance_manager().map_err(|e| HeraMindError::Llm(e.to_string()))?;
+        let instance = manager
+            .get_instance(backend_id)
+            .ok_or_else(|| HeraMindError::Llm(format!("Backend '{}' not found", backend_id)))?;
+        let backend = instance_to_llm_backend(&instance)?;
 
         tracing::debug!(
             session_id = %session_id,
@@ -607,7 +1148,12 @@ impl SessionManager {
         );
 
         let agent = self.get_session(session_id).await?;
-        agent.configure_llm(backend).await
+        agent.configure_llm(backend).await?;
+        agent
+            .llm_interface()
+            .set_backend_defaults(BackendRequestDefaults::from(&instance))
+            .await;
+        Ok(())
     }
 
     /// Set the tool registry for all new sessions.
@@ -630,31 +1176,212 @@ impl SessionManager {
         self.store.clone()
     }
 
+    /// Choose the more authoritative of two records for the same `operation_id`:
+    /// - Confirmed terminal (`succeeded`/`failed`/`rejected`/`cancelled`) beats non-terminal (`unknown`/`in_progress`)
+    /// - Live `in_progress` beats persisted restart-sanitized `unknown`
+    /// - Otherwise newer `updated_at_ms` wins.
+    fn merge_operation_record(
+        a: heramind_storage::PersistedOperationRecord,
+        b: heramind_storage::PersistedOperationRecord,
+    ) -> heramind_storage::PersistedOperationRecord {
+        if a.is_terminal() && !b.is_terminal() {
+            return a;
+        }
+        if b.is_terminal() && !a.is_terminal() {
+            return b;
+        }
+        if a.status == "in_progress" && b.status == "unknown" {
+            return a;
+        }
+        if b.status == "in_progress" && a.status == "unknown" {
+            return b;
+        }
+        if b.updated_at_ms > a.updated_at_ms {
+            b
+        } else {
+            a
+        }
+    }
+
+    /// Look up one operation by `operation_id` across the persistent index,
+    /// live in-memory sessions, and persisted session `op_ledgers`.
+    pub async fn get_operation_record(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<heramind_storage::PersistedOperationRecord>> {
+        let mut best = self
+            .store
+            .get_operation_record(operation_id)
+            .map_err(|e| HeraMindError::Storage(format!("Failed to query operation index: {e}")))?;
+
+        let live_agents: Vec<Arc<Agent>> = {
+            let guard = self.sessions.read().await;
+            guard.values().cloned().collect()
+        };
+        for agent in live_agents {
+            for rec in agent.list_operation_records().await {
+                if rec.operation_id == operation_id {
+                    best = Some(match best {
+                        Some(cur) => Self::merge_operation_record(cur, rec),
+                        None => rec,
+                    });
+                }
+            }
+        }
+
+        // Fall back to persisted `op_ledgers` for evicted / pre-upgrade sessions.
+        if best.is_none() {
+            let ledgers = self
+                .store
+                .list_op_ledgers()
+                .map_err(|e| HeraMindError::Storage(format!("Failed to list op ledgers: {e}")))?;
+            for (sid, bytes) in ledgers {
+                let Ok(ledger) = serde_json::from_slice::<
+                    crate::agent::task_continuity::PersistedOpLedger,
+                >(&bytes) else {
+                    continue;
+                };
+                for op in &ledger.operations {
+                    if op.operation_id == operation_id {
+                        let rec = op.to_persisted_record(&sid);
+                        best = Some(match best {
+                            Some(cur) => Self::merge_operation_record(cur, rec),
+                            None => rec,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(best)
+    }
+
+    /// List operations across persisted index, live sessions, and persisted
+    /// `op_ledgers`, ordered newest-first.
+    pub async fn list_operation_records(
+        &self,
+        session_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<heramind_storage::PersistedOperationRecord>> {
+        let mut by_id: std::collections::HashMap<
+            String,
+            heramind_storage::PersistedOperationRecord,
+        > = std::collections::HashMap::new();
+
+        for rec in self
+            .store
+            .list_operation_records(session_id, None, 0)
+            .map_err(|e| HeraMindError::Storage(format!("Failed to list operation index: {e}")))?
+        {
+            by_id.insert(rec.operation_id.clone(), rec);
+        }
+
+        if let Ok(ledgers) = self.store.list_op_ledgers() {
+            for (sid, bytes) in ledgers {
+                if let Some(want_sid) = session_id {
+                    if sid != want_sid {
+                        continue;
+                    }
+                }
+                let Ok(ledger) = serde_json::from_slice::<
+                    crate::agent::task_continuity::PersistedOpLedger,
+                >(&bytes) else {
+                    continue;
+                };
+                for op in &ledger.operations {
+                    let rec = op.to_persisted_record(&sid);
+                    let id = rec.operation_id.clone();
+                    if let Some(existing) = by_id.remove(&id) {
+                        by_id.insert(id, Self::merge_operation_record(existing, rec));
+                    } else {
+                        by_id.insert(id, rec);
+                    }
+                }
+            }
+        }
+
+        let live_agents: Vec<(String, Arc<Agent>)> = {
+            let guard = self.sessions.read().await;
+            guard
+                .iter()
+                .filter(|(sid, _)| session_id.is_none_or(|want| sid.as_str() == want))
+                .map(|(sid, a)| (sid.clone(), a.clone()))
+                .collect()
+        };
+        for (_sid, agent) in live_agents {
+            for rec in agent.list_operation_records().await {
+                let id = rec.operation_id.clone();
+                if let Some(existing) = by_id.remove(&id) {
+                    by_id.insert(id, Self::merge_operation_record(existing, rec));
+                } else {
+                    by_id.insert(id, rec);
+                }
+            }
+        }
+
+        let mut out: Vec<_> = by_id
+            .into_values()
+            .filter(|rec| status.is_none_or(|st| rec.status.eq_ignore_ascii_case(st)))
+            .collect();
+        out.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.operation_id.cmp(&b.operation_id))
+        });
+        if limit > 0 && out.len() > limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
     /// Register a cancel signal sender for an active streaming session.
     /// The sender is stored so that `cancel_session` can interrupt the stream.
     ///
-    /// [single-stream mutex] Returns `false` WITHOUT registering when a
+    /// [single-stream mutex] Returns `None` WITHOUT registering when a
     /// stream is already active for the session — the registration doubles
     /// as the per-session mutual exclusion. Previously a second concurrent
     /// stream silently OVERWROTE the first's sender (making it
     /// uncancellable) and interleaved history writes into the same
     /// AgentInternalState.
+    ///
+    /// On success returns the registration's identity token; all removals
+    /// must present it ([`Self::remove_cancel_sender_if_token`]) so a stale
+    /// wrapper can never evict a newer stream's sender.
     pub async fn register_cancel_sender(
         &self,
         session_id: &str,
         sender: tokio::sync::watch::Sender<bool>,
-    ) -> bool {
+    ) -> Option<u64> {
         let mut map = self.cancel_senders.write().await;
         if map.contains_key(session_id) {
-            return false;
+            return None;
         }
-        map.insert(session_id.to_string(), sender);
-        true
+        let token = CANCEL_SENDER_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        map.insert(session_id.to_string(), (token, sender));
+        Some(token)
+    }
+
+    /// Remove the session's cancel sender only when `token` still identifies
+    /// the registered entry. Identity-checked: a zombie wrapper left over
+    /// from a timed-out clear holds an older token and must NOT evict a
+    /// newer stream's registration.
+    async fn remove_cancel_sender_if_token(
+        senders: &CancelSenderMap,
+        session_id: &str,
+        token: u64,
+    ) {
+        let mut map = senders.write().await;
+        if map.get(session_id).is_some_and(|(t, _)| *t == token) {
+            map.remove(session_id);
+        }
     }
 
     /// Remove a cancel sender (called when streaming ends naturally).
-    pub async fn remove_cancel_sender(&self, session_id: &str) {
-        self.cancel_senders.write().await.remove(session_id);
+    /// Identity-checked: only removes when `token` matches the registration.
+    pub async fn remove_cancel_sender(&self, session_id: &str, token: u64) {
+        Self::remove_cancel_sender_if_token(&self.cancel_senders, session_id, token).await;
     }
 
     // ---- Direct event subscribers (Phase 2: ChatSession direct routing) ----
@@ -721,7 +1448,7 @@ impl SessionManager {
     /// Returns true if a stream was active and interrupted.
     pub async fn cancel_session(&self, session_id: &str) -> bool {
         let mut senders = self.cancel_senders.write().await;
-        if let Some(sender) = senders.remove(session_id) {
+        if let Some((_, sender)) = senders.remove(session_id) {
             // Send the interrupt signal
             let _ = sender.send(true);
             tracing::info!(session_id = %session_id, "Sent interrupt signal to streaming session");
@@ -747,6 +1474,50 @@ impl SessionManager {
             .await
     }
 
+    /// Wire durable op-ledger commit on a freshly constructed Agent.
+    async fn attach_op_ledger_commit(&self, agent: &Agent) {
+        struct StoreOpLedgerCommit {
+            store: Arc<SessionStore>,
+            session_id: String,
+        }
+        impl crate::agent::task_continuity::OpLedgerCommit for StoreOpLedgerCommit {
+            fn commit(&self, ledger_json: &[u8]) -> std::result::Result<(), String> {
+                self.store
+                    .save_op_ledger(&self.session_id, ledger_json)
+                    .map_err(|e| e.to_string())?;
+                // Best-effort index sync for O(1) `GET /api/v1/operations/:id` lookup.
+                // Never clobber an already-terminal indexed record with a restart-sanitized
+                // `unknown` snapshot.
+                if let Ok(ledger) = serde_json::from_slice::<
+                    crate::agent::task_continuity::PersistedOpLedger,
+                >(ledger_json)
+                {
+                    for op in &ledger.operations {
+                        let candidate = op.to_persisted_record(&self.session_id);
+                        let should_skip = self
+                            .store
+                            .get_operation_record(&candidate.operation_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|existing| {
+                                existing.is_terminal() && !candidate.is_terminal()
+                            });
+                        if !should_skip {
+                            let _ = self.store.upsert_operation_record(&candidate);
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+        let commit: Arc<dyn crate::agent::task_continuity::OpLedgerCommit> =
+            Arc::new(StoreOpLedgerCommit {
+                store: self.store.clone(),
+                session_id: agent.session_id().to_string(),
+            });
+        agent.set_op_ledger_commit(Some(commit)).await;
+    }
+
     /// Create a new session with the given (full) `AgentConfig`.
     ///
     /// This is the canonical implementation; the no-arg and options variants
@@ -767,7 +1538,10 @@ impl SessionManager {
         // Configure LLM if a default backend is set
         let llm_backend = self.default_llm_backend.read().await.clone();
         if let Some(backend) = llm_backend {
-            let _ = agent.configure_llm(backend).await;
+            agent.configure_llm(backend.runtime).await?;
+            if let Some(defaults) = backend.defaults {
+                agent.llm_interface().set_backend_defaults(defaults).await;
+            }
         }
 
         // Inject skill registry into agent's LLM interface
@@ -776,6 +1550,7 @@ impl SessionManager {
             .set_skill_registry(self.skill_registry.clone())
             .await;
 
+        self.attach_op_ledger_commit(&agent).await;
         let agent = Arc::new(agent);
 
         self.sessions
@@ -793,14 +1568,61 @@ impl SessionManager {
         Ok(session_id)
     }
 
-    /// Create a new session with the supplied options merged on top of the
-    /// manager's `default_config`. Fields left `None` in `opts` fall back to
-    /// the default. Use this when you need per-session overrides (e.g. a
-    /// voice-assistant extension baking in a system prompt) without changing
-    /// global defaults.
+    /// Stamp the owning principal on a session (first attachment wins).
+    /// Best-effort: a failure to stamp never blocks the conversation.
+    /// Raw stamper — for the race-free first-CLAIM decision use
+    /// [`SessionManager::claim_session_owner`].
+    pub fn set_session_owner(&self, session_id: &str, owner: &str) {
+        if let Ok(mut meta) = self.store.get_session_metadata(session_id) {
+            if meta.owner.as_deref() != Some(owner) && meta.owner.is_none() {
+                meta.owner = Some(owner.to_string());
+                let _ = self.store.save_session_metadata(session_id, &meta);
+            }
+        }
+    }
+
+    /// The session's owning principal, if stamped. `None` = unclaimed
+    /// (created before ownership tracking, or created outside WS) — callers
+    /// treat unclaimed as attachable-once and stamp it.
+    pub fn session_owner(&self, session_id: &str) -> Option<String> {
+        self.store
+            .get_session_metadata(session_id)
+            .ok()
+            .and_then(|m| m.owner)
+    }
+
+    /// First-claim ownership decision, ATOMIC within this process: returns
+    /// `true` (stamping `principal` as owner) for an unclaimed session or
+    /// one this principal already owns; `false` when a different principal
+    /// holds it. The naive read-check-write raced: two concurrent FIRST
+    /// attachments (a WS attach and a REST history read on a fresh session)
+    /// could both observe "unclaimed" and each stamp themselves. The claim
+    /// runs under [`OWNER_CLAIM_LOCK`].
+    pub fn claim_session_owner(&self, session_id: &str, principal: &str) -> bool {
+        let _guard = OWNER_CLAIM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match self.session_owner(session_id) {
+            Some(owner) if owner != principal => false,
+            _ => {
+                self.set_session_owner(session_id, principal);
+                true
+            }
+        }
+    }
+
     pub async fn create_session_with_options(&self, opts: CreateSessionOptions) -> Result<String> {
+        let temperature = opts.temperature;
         let config = self.merge_options(opts);
-        self.create_session_with_config(config).await
+        let session_id = self.create_session_with_config(config).await?;
+        if let Some(temperature) = temperature {
+            self.get_session(&session_id)
+                .await?
+                .llm_interface()
+                .set_temperature_override(temperature)
+                .await;
+        }
+        Ok(session_id)
     }
 
     /// Merge `CreateSessionOptions` on top of `default_config`. Any `None`
@@ -842,6 +1664,7 @@ impl SessionManager {
     pub async fn get_session(&self, session_id: &str) -> Result<Arc<Agent>> {
         // First check if session is in memory
         if let Some(agent) = self.sessions.read().await.get(session_id).cloned() {
+            agent.set_memory_enabled(self.is_memory_enabled(session_id).await);
             return Ok(agent);
         }
 
@@ -871,10 +1694,15 @@ impl SessionManager {
             Agent::new(self.default_config.clone(), session_id.to_string())
         };
 
+        agent.set_memory_enabled(self.is_memory_enabled(session_id).await);
+
         // Configure LLM if a default backend is set
         let llm_backend = self.default_llm_backend.read().await.clone();
         if let Some(backend) = llm_backend {
-            let _ = agent.configure_llm(backend).await;
+            let _ = agent.configure_llm(backend.runtime).await;
+            if let Some(defaults) = backend.defaults {
+                agent.llm_interface().set_backend_defaults(defaults).await;
+            }
         }
 
         // Inject skill registry into agent's LLM interface
@@ -883,6 +1711,7 @@ impl SessionManager {
             .set_skill_registry(self.skill_registry.clone())
             .await;
 
+        self.attach_op_ledger_commit(&agent).await;
         let agent = Arc::new(agent);
 
         // Load message history from database
@@ -892,6 +1721,44 @@ impl SessionManager {
         if !history.is_empty() {
             agent.restore_history(history.clone()).await;
             tracing::debug!(session_id = %session_id, count = history.len(), "Restored messages for session");
+        }
+
+        // Restore minimal op ledger (Succeeded / Unknown survive; Running→Unknown;
+        // auth grants and stream leases are never restored).
+        // Deserialize/load failure → mark untrusted (fail closed); never silent empty.
+        match self.store.load_op_ledger(session_id) {
+            Ok(Some(bytes)) => {
+                match serde_json::from_slice::<crate::agent::task_continuity::PersistedOpLedger>(
+                    &bytes,
+                ) {
+                    Ok(ledger) => {
+                        let op_count = ledger.operations.len();
+                        agent.restore_op_ledger(ledger).await;
+                        tracing::debug!(
+                            session_id = %session_id,
+                            op_count,
+                            "Restored op ledger for session"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            session_id = %session_id,
+                            error = %e,
+                            "Failed to deserialize op ledger — marking untrusted (fail closed)"
+                        );
+                        agent.mark_op_ledger_untrusted().await;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to load op ledger — marking untrusted (fail closed)"
+                );
+                agent.mark_op_ledger_untrusted().await;
+            }
         }
 
         // Save to in-memory cache.
@@ -912,6 +1779,9 @@ impl SessionManager {
             drop(sessions);
             return Ok(existing);
         }
+        // Configuration can change while the backend/history is restoring.
+        // Refresh under the cache lock so a concurrent toggle cannot miss it.
+        agent.set_memory_enabled(self.is_memory_enabled(session_id).await);
         sessions.insert(session_id.to_string(), agent.clone());
         drop(sessions);
 
@@ -1073,26 +1943,28 @@ impl SessionManager {
             .toggle_memory(session_id, enabled)
             .map_err(|e| HeraMindError::Storage(format!("Failed to toggle memory: {}", e)))?;
 
+        let agent = self.sessions.read().await.get(session_id).cloned();
+        if let Some(agent) = agent {
+            // Read the latest value: another toggle may have completed while
+            // this call waited for the sessions lock.
+            agent.set_memory_enabled(self.is_memory_enabled(session_id).await);
+            agent.update_tool_definitions().await;
+        }
+
         Ok(enabled)
     }
 
-    /// Get whether memory is enabled for a session.
-    /// Lightweight background memory extraction after a chat turn.
-    ///
-    /// Chat had NO automatic memory write — only what the model chose to
-    /// write via the memory tool, which small models almost never do — so
-    /// USER.md/KNOWLEDGE.md stayed empty and cross-session memory was dead
-    /// in practice. This runs a small thinking-disabled LLM call over the
-    /// last exchange, merges durable facts into the snapshot files
-    /// (deduped, budget-capped), and invalidates the frozen-snapshot cache
-    /// so the next turn sees them. Fire-and-forget; never blocks the reply.
+    /// Optional background memory extraction, disabled by default.
+    /// Explicit memory-tool writes remain available; ordinary conversation
+    /// must not silently turn temporary tasks or assistant claims into facts.
     pub async fn maybe_extract_memory(
         &self,
         session_id: &str,
         user_message: &str,
         assistant_reply: &str,
     ) {
-        if !self.is_memory_enabled(session_id).await {
+        let mem_cfg = heramind_storage::MemoryConfig::load();
+        if !mem_cfg.enabled || !mem_cfg.auto_extract || !self.is_memory_enabled(session_id).await {
             tracing::info!(session_id, "memory extraction: memory disabled, skip");
             return;
         }
@@ -1123,22 +1995,25 @@ impl SessionManager {
         };
         let model = runtime.model_name().to_string();
 
-        // The snapshot cache is invalidated after a write so the next turn
-        // re-loads the updated files. Rebuild from the store fresh each time.
+        // Explicit reads use the latest files; no snapshot is injected into chat.
         // Path AND merge limits come from the configured MemorySystemConfig —
         // hardcoding 2000/3000 here would truncate files the user had raised
         // the limits for (Settings → Preferences), silently destroying memory.
-        let mem_cfg = heramind_storage::MemoryConfig::load();
-        let store = heramind_storage::MarkdownMemoryStore::new(&mem_cfg.storage_path);
+        // with_config — `new` silently uses DEFAULT limits, so a user who
+        // raised the limits had the fit pass (configured limit) and the
+        // write rejected (default limit) on every extraction.
+        let store = heramind_storage::MarkdownMemoryStore::with_config(
+            &mem_cfg.storage_path,
+            mem_cfg.clone(),
+        );
         // new() does NOT create the directory tree — only the server's
         // init() does. Core-path consumers (CLI/eval/embedded) run before or
         // without that init, and every write into the missing dir failed
         // silently (write_file error swallowed by the merge below), so
         // extracted facts vanished. Initialize best-effort; idempotent.
         let _ = store.init();
-        let (user_limit, knowledge_limit) = (mem_cfg.user_char_limit, mem_cfg.knowledge_char_limit);
-        let snapshots = self.memory_snapshots.clone();
         let session_id = session_id.to_string();
+        let session_store = self.store.clone();
 
         tokio::spawn(async move {
             use heramind_core::llm::backend::{GenerationParams, LlmInput};
@@ -1151,7 +2026,9 @@ facts that would help FUTURE conversations. Two kinds, tagged exactly:\n\
 [user] fact        — durable facts about the user (preferences, identity, context)\n\
 [knowledge] fact   — durable facts about the system/domain (device names, locations, conventions)\n\
 Output ONLY bullet lines starting with \"- \", one per fact, each tagged. \
-Skip transient or session-specific chatter. Empty output if nothing durable.\n\n\
+Skip transient or session-specific chatter. NEVER record facts about the \
+assistant itself (what it mentioned, can do, or did) — those are not knowledge. \
+Do not restate what a previous fact already covers. Empty output if nothing durable.\n\n\
 User: {um}\n\
 Assistant: {ar}\n"
             );
@@ -1172,6 +2049,54 @@ Assistant: {ar}\n"
                 stream: false,
                 tools: None,
             };
+            // [shared-backend contention] This extraction rides the same
+            // runtime as the user's chat. On a small local llama-server a
+            // background call landing mid-turn queues behind / steals decode
+            // from the foreground stream (observed 2026-10-14: a 34s
+            // extraction overlapped the next turn's generation, and the turns
+            // right after returned empty content after retry). Wait for
+            // foreground silence — bounded, because extraction must never
+            // starve forever.
+            // The initial delay covers the common rhythm where the user sends
+            // the next message within seconds of the previous End: without
+            // it, the extraction LLM call is already in flight when that
+            // turn starts (the wait below can only gate calls not yet sent,
+            // it cannot cancel one already running on the server).
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+            let mut deferred = false;
+            while crate::llm::FOREGROUND_CHAT_INFLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+            {
+                if !deferred {
+                    deferred = true;
+                    tracing::info!(
+                        session_id,
+                        "memory extraction: deferring — foreground chat stream active (shared backend)"
+                    );
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        session_id,
+                        "memory extraction: foreground chat still active after 120s — proceeding anyway"
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+
+            let memory_still_enabled = || {
+                let config = heramind_storage::MemoryConfig::load();
+                config.enabled
+                    && config.auto_extract
+                    && session_store
+                        .get_session_metadata(&session_id)
+                        .map(|m| m.memory_enabled)
+                        .unwrap_or(false)
+            };
+            if !memory_still_enabled() {
+                return;
+            }
             let out = match runtime.generate(input).await {
                 Ok(o) => o,
                 Err(e) => {
@@ -1185,34 +2110,9 @@ Assistant: {ar}\n"
                 "memory extraction: LLM responded"
             );
 
-            // Parse tagged bullets: `- [user] ...` / `- [knowledge] ...`
-            let mut new_user: Vec<String> = Vec::new();
-            let mut new_knowledge: Vec<String> = Vec::new();
-            for line in out.text.lines() {
-                let line = line.trim();
-                let rest = line.strip_prefix("- ").or_else(|| line.strip_prefix("• "));
-                let Some(rest) = rest else { continue };
-                let strip_tag = |tag: &str| -> Option<String> {
-                    // Accept both "- [user] fact …" and "- [user]: fact …" —
-                    // the model varies the tag separator between runs.
-                    let mut f = rest.strip_prefix(tag)?.trim().to_string();
-                    for sep in [":", "fact", "-"] {
-                        if let Some(stripped) = f.strip_prefix(sep) {
-                            f = stripped.trim_start().to_string();
-                        }
-                    }
-                    if f.is_empty() {
-                        None
-                    } else {
-                        Some(f)
-                    }
-                };
-                if let Some(f) = strip_tag("[user]") {
-                    new_user.push(f);
-                } else if let Some(f) = strip_tag("[knowledge]") {
-                    new_knowledge.push(f);
-                }
-            }
+            // Parse tagged bullets (pure fn above — see its unit tests for
+            // the separator/quality edge cases).
+            let (new_user, new_knowledge) = parse_extracted_facts(&out.text);
             if new_user.is_empty() && new_knowledge.is_empty() {
                 tracing::info!(session_id, "memory extraction: no tagged facts in output");
                 return;
@@ -1224,98 +2124,81 @@ Assistant: {ar}\n"
                 "memory extraction: parsed facts"
             );
 
-            // Merge: exact-normalized dedup against existing bullets; cap to
-            // the file budget keeping the OLDEST facts (durable base facts
-            // outrank recent chatter).
-            let norm =
-                |s: &str| -> String { s.to_lowercase().split_whitespace().collect::<String>() };
-            let merged = |target: &str, additions: &[String]| -> Option<String> {
-                let existing = store.read_file_sync(target);
-                let existing_norms: std::collections::HashSet<String> = existing
-                    .lines()
-                    .filter_map(|l| {
-                        let l = l.trim().trim_start_matches("- ").trim_start_matches("• ");
-                        if l.is_empty() {
-                            None
-                        } else {
-                            Some(norm(l))
-                        }
-                    })
-                    .collect();
-                let fresh: Vec<&String> = additions
-                    .iter()
-                    .filter(|f| !existing_norms.contains(&norm(f)))
-                    .collect();
-                if fresh.is_empty() {
-                    return None;
+            // Persist via the store's marker-aware append: one locked
+            // read-modify-write per target (the shared per-path lock also
+            // serializes against background marker jobs), exact dedup
+            // inside, marker bodies shrink BEFORE facts when over budget.
+            // Pre-filter here: cap runaway per-fact length, then fuzzy
+            // dedup (n-gram Jaccard — the store's exact normalizer cannot
+            // catch reworded repeats, which Chinese produces a lot of since
+            // it has no whitespace to normalize).
+            const FACT_CHAR_CAP: usize = 300;
+            let cap_fact = |f: &str| -> String {
+                if f.chars().count() <= FACT_CHAR_CAP {
+                    f.to_string()
+                } else {
+                    let cut: String = f.chars().take(FACT_CHAR_CAP - 1).collect();
+                    format!("{cut}…")
                 }
-                let mut merged = existing.trim_end().to_string();
-                for f in &fresh {
-                    if !merged.is_empty() {
-                        merged.push('\n');
-                    }
-                    merged.push_str("- ");
-                    merged.push_str(f);
-                }
-                merged.push('\n');
-                let limit = match target {
-                    "user" => user_limit,
-                    _ => knowledge_limit,
-                };
-                if merged.chars().count() > limit {
-                    let mut kept = String::new();
-                    for line in merged.lines() {
-                        if kept.chars().count() + line.chars().count() + 1 > limit {
-                            break;
-                        }
-                        if !kept.is_empty() {
-                            kept.push('\n');
-                        }
-                        kept.push_str(line);
-                    }
-                    merged = kept;
-                    merged.push('\n');
-                }
-                Some(merged)
             };
-
-            // Serialize the read-modify-write: two concurrent extractions
-            // reading the same base then writing would lose one's facts (the
-            // store's write lock only serializes the write, not the merge).
-            static MEMORY_EXTRACT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-            let _guard = MEMORY_EXTRACT_LOCK.lock().await;
+            let fuzzy = crate::memory::dedup::DedupProcessor::with_defaults();
+            let prep = |target: &str, additions: &[String]| -> Vec<String> {
+                let existing_bullets: Vec<String> = store
+                    .read_file_sync(target)
+                    .lines()
+                    .map(|l| {
+                        l.trim()
+                            .trim_start_matches("- ")
+                            .trim_start_matches("• ")
+                            .to_string()
+                    })
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                additions
+                    .iter()
+                    .map(|f| cap_fact(f))
+                    .filter(|f| fuzzy.find_similar(f, &existing_bullets).is_none())
+                    .collect()
+            };
+            if !memory_still_enabled() {
+                return;
+            }
+            let user_fresh = prep("user", &new_user);
+            let knowledge_fresh = prep("knowledge", &new_knowledge);
 
             let mut wrote_any = false;
-            if let Some(content) = merged("user", &new_user) {
-                match store.write_file("user", &content).await {
-                    Ok(()) => wrote_any = true,
-                    Err(e) => tracing::warn!(
-                        category = "memory",
-                        error = %e,
-                        "Failed to persist extracted user facts — this extraction's \
-                         facts are lost and the snapshot cache stays stale"
-                    ),
+            let mut fresh_user = 0usize;
+            let mut fresh_knowledge = 0usize;
+            match store.append_facts("user", &user_fresh).await {
+                Ok((wrote, n)) => {
+                    wrote_any |= wrote;
+                    fresh_user = n;
                 }
+                Err(e) => tracing::warn!(
+                    category = "memory",
+                    error = %e,
+                    "Failed to persist extracted user facts — this extraction's \
+                         facts are lost"
+                ),
             }
-            if let Some(content) = merged("knowledge", &new_knowledge) {
-                match store.write_file("knowledge", &content).await {
-                    Ok(()) => wrote_any = true,
-                    Err(e) => tracing::warn!(
-                        category = "memory",
-                        error = %e,
-                        "Failed to persist extracted knowledge facts — this \
-                         extraction's facts are lost and the snapshot cache stays stale"
-                    ),
+            match store.append_facts("knowledge", &knowledge_fresh).await {
+                Ok((wrote, n)) => {
+                    wrote_any |= wrote;
+                    fresh_knowledge = n;
                 }
+                Err(e) => tracing::warn!(
+                    category = "memory",
+                    error = %e,
+                    "Failed to persist extracted knowledge facts — this \
+                         extraction's facts are lost"
+                ),
             }
 
             if wrote_any {
-                // Invalidate the frozen snapshot so the next turn re-loads.
-                snapshots.write().await.remove(&session_id);
                 tracing::info!(
                     session_id,
-                    user_facts = new_user.len(),
-                    knowledge_facts = new_knowledge.len(),
+                    fresh_user_facts = fresh_user,
+                    fresh_knowledge_facts = fresh_knowledge,
                     "chat memory extraction: merged durable facts"
                 );
             }
@@ -1326,48 +2209,9 @@ Assistant: {ar}\n"
         self.store
             .get_session_metadata(session_id)
             .map(|m| m.memory_enabled)
-            // Bare sessions (no metadata row — core-path consumers like the
-            // CLI/eval create exactly these) default ON: extraction is
-            // budget-capped and background, and a default-off gate was one
-            // half of why cross-session memory stayed empty in practice.
+            // Bare sessions allow explicit memory-tool access. Automatic
+            // chat extraction has a separate opt-in configuration flag.
             .unwrap_or(true)
-    }
-
-    /// Ensure the session's frozen memory snapshot is loaded and set on the
-    /// agent. Loads once per session and caches the result — `MemorySnapshot`
-    /// is a "frozen snapshot" (see `memory/snapshot.rs`) that reads 3 files
-    /// synchronously per load, so reloading on every message was redundant
-    /// work on the hot path. Memory-tool writes deliberately do NOT invalidate
-    /// this cache: the snapshot stays frozen for the session and is re-read on
-    /// the next session, matching the original frozen-snapshot semantics.
-    async fn ensure_memory_snapshot(&self, session_id: &str, agent: &Arc<Agent>) {
-        if !self.is_memory_enabled(session_id).await {
-            return;
-        }
-        {
-            let cache = self.memory_snapshots.read().await;
-            if let Some(snapshot) = cache.get(session_id) {
-                if !snapshot.is_empty() {
-                    agent.set_memory_snapshot(snapshot.clone()).await;
-                }
-                return;
-            }
-        }
-        let memory_store = heramind_storage::MarkdownMemoryStore::new(
-            heramind_core::paths::data_dir().join("memory"),
-        );
-        let snapshot = crate::memory::MemorySnapshot::load(&memory_store);
-        if !snapshot.is_empty() {
-            tracing::info!(
-                session_id = %session_id,
-                "Loaded memory snapshot for session"
-            );
-            self.memory_snapshots
-                .write()
-                .await
-                .insert(session_id.to_string(), snapshot.clone());
-            agent.set_memory_snapshot(snapshot).await;
-        }
     }
 
     /// List all active sessions with their metadata.
@@ -1397,29 +2241,42 @@ Assistant: {ar}\n"
             let timestamp_ms =
                 timestamp_seconds.unwrap_or_else(|| chrono::Utc::now().timestamp()) * 1000;
 
-            // Try to get messages from memory first, then from database
+            // Try to get messages from memory first, then from database.
+            // The store counts persisted keys without deserializing them.
             let message_count =
                 if let Some(msgs) = self.session_messages.read().await.get(&session_id) {
                     msgs.len() as u32
                 } else {
-                    // Load from database to get message count
-                    self.load_history(&session_id)
-                        .map(|msgs| msgs.len() as u32)
+                    self.store
+                        .message_count(&session_id)
+                        .map(|n| n as u32)
                         .unwrap_or(0)
                 };
 
-            // Get preview from database (first user message)
-            let preview = self.load_history(&session_id).ok().and_then(|msgs| {
-                msgs.iter().find(|m| m.role == "user").map(|m| {
-                    // Truncate content to 50 chars (using char boundary for Unicode safety)
-                    let content = m.content.trim();
-                    if content.chars().count() > 50 {
-                        format!("{}...", content.chars().take(50).collect::<String>())
-                    } else {
-                        content.to_string()
-                    }
-                })
-            });
+            // Preview: the first user message. A session opens with the
+            // user's request, so its first few messages are enough — this
+            // listing used to read and deserialize every session's whole
+            // history twice (300KB tool results included) just to cut 50
+            // characters out of the first one, and the chat input's
+            // suggestion request did that for all of T4's 81 sessions on
+            // every keystroke.
+            let preview = match self
+                .store
+                .load_history_prefix(&session_id, LISTING_PREVIEW_SCAN)
+            {
+                Ok(prefix) => match listing_preview(&prefix) {
+                    Some(preview) => Some(preview),
+                    // No user message up front (a restored or imported
+                    // session): rare — only then look at the rest.
+                    None if prefix.len() >= LISTING_PREVIEW_SCAN => self
+                        .store
+                        .load_history(&session_id)
+                        .ok()
+                        .and_then(|msgs| listing_preview(&msgs)),
+                    None => None,
+                },
+                Err(_) => None,
+            };
 
             // Get title and memory_enabled from metadata
             let metadata = self
@@ -1523,10 +2380,8 @@ Assistant: {ar}\n"
         message: &str,
     ) -> Result<super::agent::AgentResponse> {
         tracing::debug!(session_id = %session_id, message = %message, "SessionManager::process_message");
+        self.refuse_if_clearing(session_id).await?;
         let agent = self.get_session(session_id).await?;
-
-        // Load memory snapshot if enabled and not yet loaded (parity with process_message_events)
-        self.ensure_memory_snapshot(session_id, &agent).await;
 
         let response = agent.process(message).await?;
 
@@ -1542,26 +2397,11 @@ Assistant: {ar}\n"
             tracing::error!(session_id = %session_id, error = %e, message = "Failed to save history");
         }
 
-        // Background chat memory extraction — the REST chat path runs this
-        // after every turn (handlers/sessions.rs); the core path must too,
-        // or every non-REST consumer (CLI, embedded, eval) leaves USER.md
-        // empty forever and the memory tool answers from nothing. Awaiting
-        // (not spawning) matches the non-streaming REST semantics and keeps
-        // the next turn's snapshot deterministic.
+        // Optional extraction uses the same opt-in gate as the REST path.
         self.maybe_extract_memory(session_id, message, &response.message.content)
             .await;
 
         Ok(response)
-    }
-
-    /// Process a message in a session with streaming response.
-    pub async fn process_message_stream(
-        &self,
-        session_id: &str,
-        message: &str,
-    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send>>> {
-        let agent = self.get_session(session_id).await?;
-        agent.process_stream(message).await
     }
 
     /// Process a message in a session with optional LLM backend override.
@@ -1590,16 +2430,27 @@ Assistant: {ar}\n"
         self.process_message(session_id, message).await
     }
 
-    /// Process a message in a session with event streaming (rich response).
     pub async fn process_message_events(
         &self,
         session_id: &str,
         message: &str,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentEvent> + Send>>> {
-        let agent = self.get_session(session_id).await?;
+        self.process_message_events_with_authorize(session_id, message, None, None)
+            .await
+    }
 
-        // Load memory snapshot if enabled and not yet loaded
-        self.ensure_memory_snapshot(session_id, &agent).await;
+    /// Like [`Self::process_message_events`], with optional host/UI
+    /// `AuthorizeNewOperation` and content nodes traveling with the message
+    /// into atomic accept (not shared pending hops).
+    pub async fn process_message_events_with_authorize(
+        &self,
+        session_id: &str,
+        message: &str,
+        authorize_new_operation: Option<crate::agent::task_continuity::AuthorizeNewOpSubmit>,
+        content_nodes: Option<(Vec<serde_json::Value>, u32)>,
+    ) -> Result<Pin<Box<dyn Stream<Item = AgentEvent> + Send>>> {
+        self.refuse_if_clearing(session_id).await?;
+        let agent = self.get_session(session_id).await?;
 
         // Read conversation summary from session metadata for context compression
         let (conversation_summary, summary_up_to_index) = self
@@ -1610,11 +2461,11 @@ Assistant: {ar}\n"
 
         // Create a cancel signal channel so the stream can be interrupted
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        if !self.register_cancel_sender(session_id, cancel_tx).await {
+        let Some(cancel_token) = self.register_cancel_sender(session_id, cancel_tx).await else {
             return Err(HeraMindError::validation(
                 "A response is already being generated for this session — wait for it to finish or cancel it first",
             ));
-        }
+        };
 
         let safeguards = super::agent::StreamSafeguards::default().with_interrupt_signal(cancel_rx);
 
@@ -1627,21 +2478,51 @@ Assistant: {ar}\n"
                 conversation_summary,
                 summary_up_to_index,
                 safeguards,
+                authorize_new_operation,
+                content_nodes,
             )
             .await?;
+
+        // [crash window] Persist the turn's start NOW. The user message is
+        // already in agent memory at this point, and until persist_history
+        // ran at stream end / disconnect the whole exchange lived only in
+        // RAM — a kill -9 mid-turn (window up to the 1200s stream timeout)
+        // silently dropped the user's words. Fail closed: a save error
+        // aborts the turn so WS MessageReceived stays rejected (composer
+        // draft restore). Same persist/clear guards as persist_history.
+        // Accept already mutated Turn/auth/memory — on save failure roll that
+        // back so rejected ≡ server (retry must not duplicate user msg / auth).
+        if let Err(e) = self.snapshot_history_at_turn_start(session_id).await {
+            let rolled = agent.rollback_pending_accept().await;
+            tracing::warn!(
+                session_id = %session_id,
+                rolled,
+                error = %e,
+                "turn-start save failed; rolled back accept"
+            );
+            Self::remove_cancel_sender_if_token(&cancel_senders, session_id, cancel_token).await;
+            return Err(e);
+        }
+        agent.clear_pending_accept_rollback().await;
 
         // Wrap the stream with a scopeguard so the cancel sender is removed
         // even if the consumer drops the stream early (client disconnect,
         // downstream error). The guard lives inside the async block, so it
         // drops naturally on both natural-end and early-drop paths.
         let cleanup_stream = Box::pin(async_stream::stream! {
-            let mut guard = CancelSenderGuard::new(cancel_senders.clone(), session_id_owned.clone());
+            let mut guard = CancelSenderGuard::new(
+                cancel_senders.clone(),
+                session_id_owned.clone(),
+                cancel_token,
+            );
             let mut stream = stream;
             while let Some(event) = stream.next().await {
                 yield event;
             }
-            // Stream ended naturally — remove the cancel sender inline.
-            cancel_senders.write().await.remove(&session_id_owned);
+            // Stream ended naturally — remove the cancel sender inline
+            // (identity-checked: a newer registration is left alone).
+            Self::remove_cancel_sender_if_token(&cancel_senders, &session_id_owned, cancel_token)
+                .await;
             guard.mark_cleaned_up();
         });
 
@@ -1655,20 +2536,26 @@ Assistant: {ar}\n"
         message: &str,
         backend_id: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentEvent> + Send>>> {
-        self.process_message_events_with_backend_and_skills(session_id, message, backend_id, None)
-            .await
+        self.process_message_events_with_backend_and_skills(
+            session_id, message, backend_id, None, None, None,
+        )
+        .await
     }
 
     /// Process a message in a session with event streaming, optional backend override, and pinned skills.
     ///
     /// `selected_skills`: `None` = leave the session's pins untouched;
     /// `Some(list)` = replace the pins (an empty list clears them).
+    /// `authorize_new_operation` / `content_nodes` travel with the message into
+    /// atomic accept (no shared pending hops).
     pub async fn process_message_events_with_backend_and_skills(
         &self,
         session_id: &str,
         message: &str,
         backend_id: Option<&str>,
         selected_skills: Option<&[String]>,
+        authorize_new_operation: Option<crate::agent::task_continuity::AuthorizeNewOpSubmit>,
+        content_nodes: Option<(Vec<serde_json::Value>, u32)>,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentEvent> + Send>>> {
         // If a specific backend is requested, configure the agent with it
         if let Some(backend) = backend_id {
@@ -1692,7 +2579,13 @@ Assistant: {ar}\n"
             }
         }
 
-        self.process_message_events(session_id, message).await
+        self.process_message_events_with_authorize(
+            session_id,
+            message,
+            authorize_new_operation,
+            content_nodes,
+        )
+        .await
     }
 
     /// Process a multimodal message with images in a session.
@@ -1747,10 +2640,23 @@ Assistant: {ar}\n"
         if !images.is_empty() {
             let agent = self.get_session(session_id).await?;
             if !agent.llm_interface().supports_multimodal().await {
-                return Err(super::error::HeraMindError::Validation(
-                    "Current model does not support image input. Please select a vision-capable model or remove images before retrying."
-                        .to_string(),
-                ));
+                // Text-only active model: a healthy vision companion can
+                // describe the images and the turn continues as text.
+                // Companion describes the images; the ORIGINAL message +
+                // attachments still go to history (clean bubble), while the
+                // LLM turn consumes the combined prompt via the one-shot
+                // transient on the agent's LLM interface.
+                match delegate_images_to_companion(message, &images).await {
+                    Some(delegation) => {
+                        apply_image_delegation(agent.llm_interface(), delegation).await;
+                    }
+                    None => {
+                        return Err(super::error::HeraMindError::Validation(
+                            "Current model does not support image input. Please select a vision-capable model or remove images before retrying."
+                                .to_string(),
+                        ));
+                    }
+                }
             }
         }
 
@@ -1766,6 +2672,23 @@ Assistant: {ar}\n"
         images: Vec<String>,
         backend_id: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = super::agent::AgentEvent> + Send>>> {
+        self.process_message_multimodal_with_backend_stream_authorize(
+            session_id, message, images, backend_id, None, None,
+        )
+        .await
+    }
+
+    /// Multimodal stream with optional `AuthorizeNewOperation` / content nodes
+    /// traveling with the message into atomic accept.
+    pub async fn process_message_multimodal_with_backend_stream_authorize(
+        &self,
+        session_id: &str,
+        message: &str,
+        images: Vec<String>,
+        backend_id: Option<&str>,
+        authorize_new_operation: Option<crate::agent::task_continuity::AuthorizeNewOpSubmit>,
+        content_nodes: Option<(Vec<serde_json::Value>, u32)>,
+    ) -> Result<Pin<Box<dyn Stream<Item = super::agent::AgentEvent> + Send>>> {
         // If a specific backend is requested, configure the agent with it
         if let Some(backend) = backend_id {
             self.configure_agent_by_backend_id(session_id, backend)
@@ -1776,19 +2699,16 @@ Assistant: {ar}\n"
                 })?;
         }
 
-        // Check if images are provided and model supports vision
-        if !images.is_empty() {
-            let agent = self.get_session(session_id).await?;
-            if !agent.llm_interface().supports_multimodal().await {
-                return Err(super::error::HeraMindError::Validation(
-                    "Current model does not support image input. Please select a vision-capable model or remove images before retrying."
-                        .to_string(),
-                ));
-            }
-        }
-
-        self.process_message_multimodal_stream(session_id, message, images)
-            .await
+        // Companion delegation runs once inside
+        // `process_message_multimodal_stream_authorize` (avoid double MiniCPM).
+        self.process_message_multimodal_stream_authorize(
+            session_id,
+            message,
+            images,
+            authorize_new_operation,
+            content_nodes,
+        )
+        .await
     }
 
     /// Process a multimodal message (text + images) with streaming response.
@@ -1798,25 +2718,50 @@ Assistant: {ar}\n"
         message: &str,
         images: Vec<String>,
     ) -> Result<Pin<Box<dyn Stream<Item = super::agent::AgentEvent> + Send>>> {
+        self.process_message_multimodal_stream_authorize(session_id, message, images, None, None)
+            .await
+    }
+
+    /// Multimodal stream with authorization / content nodes traveling into atomic accept.
+    pub async fn process_message_multimodal_stream_authorize(
+        &self,
+        session_id: &str,
+        message: &str,
+        images: Vec<String>,
+        authorize_new_operation: Option<crate::agent::task_continuity::AuthorizeNewOpSubmit>,
+        content_nodes: Option<(Vec<serde_json::Value>, u32)>,
+    ) -> Result<Pin<Box<dyn Stream<Item = super::agent::AgentEvent> + Send>>> {
+        self.refuse_if_clearing(session_id).await?;
         // Check if images are provided and model supports vision
         if !images.is_empty() {
             let agent = self.get_session(session_id).await?;
             if !agent.llm_interface().supports_multimodal().await {
-                return Err(super::error::HeraMindError::Validation(
-                    "Current model does not support image input. Please select a vision-capable model or remove images before retrying."
-                        .to_string(),
-                ));
+                // Companion describes the images; the ORIGINAL message +
+                // attachments still go to history (clean bubble), while the
+                // LLM turn consumes the combined prompt via the one-shot
+                // transient on the agent's LLM interface.
+                match delegate_images_to_companion(message, &images).await {
+                    Some(delegation) => {
+                        apply_image_delegation(agent.llm_interface(), delegation).await;
+                    }
+                    None => {
+                        return Err(super::error::HeraMindError::Validation(
+                            "Current model does not support image input. Please select a vision-capable model or remove images before retrying."
+                                .to_string(),
+                        ));
+                    }
+                }
             }
         }
         let agent = self.get_session(session_id).await?;
 
         // Create a cancel signal channel
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        if !self.register_cancel_sender(session_id, cancel_tx).await {
+        let Some(cancel_token) = self.register_cancel_sender(session_id, cancel_tx).await else {
             return Err(HeraMindError::validation(
                 "A response is already being generated for this session — wait for it to finish or cancel it first",
             ));
-        }
+        };
 
         let safeguards = super::agent::StreamSafeguards::default().with_interrupt_signal(cancel_rx);
 
@@ -1824,18 +2769,45 @@ Assistant: {ar}\n"
         let cancel_senders = self.cancel_senders.clone();
 
         let stream = agent
-            .process_multimodal_stream_events_with_safeguards(message, images, safeguards)
+            .process_multimodal_stream_events_with_safeguards(
+                message,
+                images,
+                safeguards,
+                authorize_new_operation,
+                content_nodes,
+            )
             .await?;
+
+        // Accept already ran inside process_multimodal_* (eager). Persist
+        // BEFORE returning Ok so WS MessageReceived:accepted means the user
+        // message is on disk — same contract as the text path.
+        if let Err(e) = self.snapshot_history_at_turn_start(session_id).await {
+            let rolled = agent.rollback_pending_accept().await;
+            tracing::warn!(
+                session_id = %session_id,
+                rolled,
+                error = %e,
+                "multimodal turn-start save failed; rolled back accept"
+            );
+            Self::remove_cancel_sender_if_token(&cancel_senders, session_id, cancel_token).await;
+            return Err(e);
+        }
+        agent.clear_pending_accept_rollback().await;
 
         // Wrap with scopeguard so cancel sender is removed on both natural
         // stream end and early drop (matches the text streaming path above).
         let cleanup_stream = Box::pin(async_stream::stream! {
-            let mut guard = CancelSenderGuard::new(cancel_senders.clone(), session_id_owned.clone());
+            let mut guard = CancelSenderGuard::new(
+                cancel_senders.clone(),
+                session_id_owned.clone(),
+                cancel_token,
+            );
             let mut stream = stream;
             while let Some(event) = stream.next().await {
                 yield event;
             }
-            cancel_senders.write().await.remove(&session_id_owned);
+            Self::remove_cancel_sender_if_token(&cancel_senders, &session_id_owned, cancel_token)
+                .await;
             guard.mark_cleaned_up();
         });
 
@@ -1844,6 +2816,22 @@ Assistant: {ar}\n"
 
     /// Get conversation history for a session.
     /// If session doesn't exist, returns empty history (soft fail for dirty data).
+    /// History in the PERSISTED client form: images are served references
+    /// (`/api/images/<file>`), not in-memory base64 data URLs. The HTTP
+    /// history endpoint used to serialize `AgentMessage.images` verbatim —
+    /// a session with a few 5MB photos answered every pull with tens of
+    /// megabytes of base64, and disagreed with the WS replay (which sends
+    /// no images at all). Reuses the exact save_history conversion, so
+    /// images land on disk content-hash named (idempotent) and the client
+    /// gets stable URLs.
+    pub async fn get_history_for_client(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<heramind_storage::SessionMessage>> {
+        let messages = self.get_history(session_id).await?;
+        Ok(Self::agent_messages_to_session_messages(&messages))
+    }
+
     pub async fn get_history(&self, session_id: &str) -> Result<Vec<AgentMessage>> {
         // Try to get the session - this will restore from DB if needed
         match self.get_session(session_id).await {
@@ -1876,26 +2864,97 @@ Assistant: {ar}\n"
         }
     }
 
+    /// Whether this session is mid-clear (new turns must refuse).
+    fn is_clearing(&self, session_id: &str) -> bool {
+        self.clearing_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(session_id)
+    }
+
+    /// Refuse new turns while `clear_history` is in flight.
+    async fn refuse_if_clearing(&self, session_id: &str) -> Result<()> {
+        if self.is_clearing(session_id) {
+            return Err(HeraMindError::validation(
+                "Session history is being cleared — wait for clear to finish before sending a new message",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cancel any active stream and wait until its cancel-sender is gone.
+    async fn cancel_and_await_stream(&self, session_id: &str) {
+        let _ = self.cancel_session(session_id).await;
+        // Poll until the stream wrapper removes its cancel sender (natural
+        // end or CancelSenderGuard Drop). Bound wait so a wedged consumer
+        // cannot block clear forever.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if !self.cancel_senders.read().await.contains_key(session_id) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "clear_history: stream cancel await timed out — proceeding with generation bump"
+                );
+                // Force-drop the registration so new turns are not stuck
+                // behind a zombie sender after clear unmarks. Safe to be
+                // unconditional: tokens are monotonic, so the zombie's own
+                // later cleanup (old token) can never evict whatever newer
+                // stream registers here.
+                self.cancel_senders.write().await.remove(session_id);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Clear conversation history for a session.
+    ///
+    /// Order (ledger-consistency): mark clearing (block new turns), cancel and
+    /// await in-flight stream, acquire [`Self::history_io`], bump history
+    /// generation and wipe memory, durable history clear, then durable
+    /// op-ledger delete.
+    ///
+    /// DB failures propagate to the caller (no silent Ok). The clearing mark
+    /// is Drop-safe ([`ClearingGuard`]) so Future cancel cannot leave the
+    /// session stuck. Stale stream persists that observed a pre-clear
+    /// generation are no-ops under `history_io`.
     pub async fn clear_history(&self, session_id: &str) -> Result<()> {
         let agent = self.get_session(session_id).await?;
+
+        // Armed for the whole Future — Drop releases even on abort/cancel.
+        let _clearing = ClearingGuard::arm(self.clearing_sessions.clone(), session_id);
+
+        self.cancel_and_await_stream(session_id).await;
+
+        self.persist_clear_hooks.yield_after_clear_mark().await;
+
+        // Serialize with persist_history so a snapshotted pre-clear generation
+        // cannot save_history after we wipe disk.
+        let _io = self.history_io.lock().await;
+
+        // Generation bump happens inside clear_memory — any concurrent /
+        // late persist_history that snapshotted the old generation skips
+        // once it rechecks under history_io.
         agent.clear_history().await;
 
-        // Update in-memory cache
         self.session_messages
             .write()
             .await
             .insert(session_id.to_string(), Vec::new());
 
-        // Clear persisted history using the dedicated clear method
-        if let Err(e) = self.store.clear_history(session_id) {
-            tracing::error!(session_id = %session_id, error = %e, message = "Failed to clear history");
-        }
+        self.store
+            .clear_history(session_id)
+            .map_err(|e| HeraMindError::Storage(format!("Failed to clear session history: {e}")))?;
 
-        // [ghost-summary fix] The conversation summary survives a history
-        // clear unless reset — the next turn then injected a summary of the
-        // DELETED conversation as a system message. Reset both fields so a
-        // cleared session starts truly fresh.
+        self.store.delete_op_ledger(session_id).map_err(|e| {
+            HeraMindError::Storage(format!("Failed to clear op ledger on history clear: {e}"))
+        })?;
+
+        // [ghost-summary fix] Reset conversation summary so a cleared
+        // session starts truly fresh.
         match self.store.get_session_metadata(session_id) {
             Ok(mut meta) => {
                 if meta.conversation_summary.is_some() || meta.summary_up_to_index.is_some() {
@@ -1920,24 +2979,166 @@ Assistant: {ar}\n"
         }
 
         Ok(())
+        // _clearing Drop unmarks here (and on cancel/panic).
+    }
+
+    /// Turn-start history snapshot under the same guards as
+    /// [`Self::persist_history`]: refuse while clearing, hold `history_io`,
+    /// and refuse if history generation advanced (cleared mid-flight).
+    ///
+    /// Failures propagate so callers (WS MessageReceived) can reject the
+    /// client request id instead of clearing the composer draft.
+    async fn snapshot_history_at_turn_start(&self, session_id: &str) -> Result<()> {
+        let agent = self.get_session(session_id).await?;
+        Self::guarded_turn_start_save(
+            &self.store,
+            &self.history_io,
+            &self.clearing_sessions,
+            &agent,
+            session_id,
+            &self.persist_clear_hooks,
+        )
+        .await
+    }
+
+    /// Shared crash-window / multimodal turn-start save (Arcs for stream move).
+    async fn guarded_turn_start_save(
+        store: &Arc<SessionStore>,
+        history_io: &Arc<tokio::sync::Mutex<()>>,
+        clearing_sessions: &Arc<std::sync::Mutex<HashMap<String, ()>>>,
+        agent: &Arc<Agent>,
+        session_id: &str,
+        persist_clear_hooks: &PersistClearHooks,
+    ) -> Result<()> {
+        if persist_clear_hooks.take_fail_next_turn_start_save() {
+            return Err(HeraMindError::Storage(
+                "Failed to save user message: injected test failure".into(),
+            ));
+        }
+        let clearing = || {
+            clearing_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(session_id)
+        };
+        if clearing() {
+            return Err(HeraMindError::validation(
+                "Session history is being cleared — wait for clear to finish before sending a new message",
+            ));
+        }
+        let generation = agent.history_generation().await;
+        let messages = agent.history().await;
+        let converted = Self::agent_messages_to_session_messages(&messages);
+
+        let _io = history_io.lock().await;
+        if clearing() {
+            return Err(HeraMindError::validation(
+                "Session history is being cleared — wait for clear to finish before sending a new message",
+            ));
+        }
+        if agent.history_generation().await != generation {
+            return Err(HeraMindError::validation(
+                "Session history was cleared during turn start — message was not saved",
+            ));
+        }
+        store.save_history(session_id, &converted).map_err(|e| {
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "turn-start history snapshot failed"
+            );
+            HeraMindError::Storage(format!("Failed to save user message: {e}"))
+        })?;
+        Ok(())
     }
 
     /// Persist the current history for a session to the database.
     pub async fn persist_history(&self, session_id: &str) -> Result<()> {
-        let messages = if let Ok(agent) = self.get_session(session_id).await {
-            agent.history().await
+        if self.is_clearing(session_id) {
+            tracing::debug!(
+                session_id = %session_id,
+                "Skipping persist_history — session clear in progress"
+            );
+            return Ok(());
+        }
+
+        let (messages, generation) = if let Ok(agent) = self.get_session(session_id).await {
+            let generation = agent.history_generation().await;
+            (agent.history().await, Some((agent, generation)))
         } else if let Some(cached) = self.session_messages.read().await.get(session_id) {
-            cached.clone()
+            (cached.clone(), None)
         } else {
             return Ok(());
         };
 
-        if let Err(e) = self.save_history(session_id, &messages) {
+        // Optional test pause after snapshot / before history_io so clear can
+        // interleave (the production race window this fix closes).
+        self.persist_clear_hooks
+            .yield_after_persist_snapshot()
+            .await;
+
+        // Hold history_io across generation recheck + save_history so clear
+        // cannot wipe-and-lose to a stale rewrite that checked gen unlocked.
+        let _io = self.history_io.lock().await;
+
+        if self.is_clearing(session_id) {
             tracing::debug!(
                 session_id = %session_id,
-                error = %e,
-                "Failed to persist history"
+                "Skipping persist_history — session clear in progress (under history_io)"
             );
+            return Ok(());
+        }
+
+        // Stale stream after clear: generation bumped → refuse rewrite.
+        if let Some((agent, generation)) = generation.as_ref() {
+            if agent.history_generation().await != *generation {
+                tracing::debug!(
+                    session_id = %session_id,
+                    "Skipping persist_history — history generation advanced (cleared)"
+                );
+                return Ok(());
+            }
+        }
+
+        // Authoritative end-of-turn persist. A failure here loses the
+        // exchange on crash — log at ERROR so silent durability gaps are
+        // visible. Still Ok(()) on purpose: the turn already reached the
+        // user, and failing it now would misreport a delivered answer; the
+        // pre-side-effect write-INTENT path stays the fail-closed one.
+        if let Err(e) = self.save_history(session_id, &messages) {
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "DURABILITY: end-of-turn history persist failed — exchange may be lost on crash"
+            );
+        }
+
+        // Persist minimal op ledger via the single versioned commit path.
+        // Never snapshot-then-write out-of-band: that raced with mid-turn
+        // write-intent commits and could clobber newer durable intent.
+        // Untrusted sessions skip entirely so empty memory cannot replace
+        // a failed on-disk ledger (explicit clear_history recovers).
+        if let Some((agent, generation)) = generation {
+            if agent.history_generation().await != generation {
+                tracing::debug!(
+                    session_id = %session_id,
+                    "Skipping op ledger persist — history generation advanced (cleared)"
+                );
+            } else if agent.op_ledger_untrusted().await {
+                tracing::debug!(
+                    session_id = %session_id,
+                    "Skipping op ledger persist — untrusted until clear/recover"
+                );
+            } else if let Err(e) = agent.commit_op_ledger_now().await {
+                // Distinct from history loss above: the durable ledger is
+                // now staler than memory until the next successful persist
+                // (write-intent commits before side effects are unaffected).
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "DURABILITY: op-ledger terminal persist failed — ledger stale until next persist"
+                );
+            }
         }
 
         // Update preview from first user message if not already set
@@ -2006,10 +3207,32 @@ Assistant: {ar}\n"
                     // Session has messages, keep it
                 }
                 Err(e) => {
-                    // Failed to load history - corrupted data
-                    tracing::warn!(session_id = %session_id, error = %e, "Found corrupted session, removing");
-                    let _ = self.delete_session_id(&session_id);
-                    invalid_count += 1;
+                    // Failed to load history. Only CORRUPTION-shaped errors
+                    // delete: this handler is reachable over HTTP, and a
+                    // transient IO / lock / disk-full failure used to
+                    // PHYSICALLY DELETE the session and its entire history —
+                    // irreversible loss from a blip. Anything not clearly a
+                    // deserialization failure is kept and re-checked next
+                    // cycle.
+                    let msg = e.to_string().to_lowercase();
+                    let corrupt = [
+                        "deserialize",
+                        "serde",
+                        "json",
+                        "corrupt",
+                        "bincode",
+                        "utf-8",
+                        "invalid data",
+                    ]
+                    .iter()
+                    .any(|k| msg.contains(k));
+                    if corrupt {
+                        tracing::warn!(session_id = %session_id, error = %e, "Found corrupted session, removing");
+                        let _ = self.delete_session_id(&session_id);
+                        invalid_count += 1;
+                    } else {
+                        tracing::warn!(session_id = %session_id, error = %e, "Session temporarily unreadable — keeping, will re-check next cycle");
+                    }
                 }
             }
         }
@@ -2058,10 +3281,25 @@ impl Default for SessionManager {
                 tool_registry: Arc::new(RwLock::new(None)),
                 skill_registry: crate::skills::create_shared_registry(None),
                 cancel_senders: Arc::new(RwLock::new(HashMap::new())),
+                clearing_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                history_io: Arc::new(tokio::sync::Mutex::new(())),
+                persist_clear_hooks: Arc::new(PersistClearHooks::default()),
                 event_subscribers: Arc::new(RwLock::new(HashMap::new())),
-                memory_snapshots: Arc::new(RwLock::new(HashMap::new())),
             }
         })
+    }
+}
+
+/// MIME subtype → file extension for persisted chat images. Mirrors the
+/// images handler's allowed-extension list.
+fn mime_to_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        _ => "png",
     }
 }
 
@@ -2069,11 +3307,221 @@ impl Default for SessionManager {
 mod tests {
     use super::*;
 
+    /// Real stream: cancel before first assistant → stamp terminal → save →
+    /// reload keeps panel goalStatus/endReason (not lost when stamp would
+    /// previously no-op with no assistant row).
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn early_interrupt_stream_save_reload_keeps_goal_status() {
+        use crate::agent::task_continuity::StreamEndReason;
+        use crate::agent::types::AgentInternalState;
+        use crate::agent::StreamSafeguards;
+        use crate::testing_helpers::mock_llm::{MockLlmRuntime, MockResponse};
+        use crate::toolkit::registry::ToolRegistry;
+        use futures::StreamExt;
+        use heramind_core::llm::backend::LlmRuntime;
+
+        let rt = MockLlmRuntime::new(vec![MockResponse::text(
+            "should not land — cancel precedes first token",
+        )]);
+        let iface = crate::llm::LlmInterface::default();
+        futures::executor::block_on(iface.set_llm(Arc::new(rt) as Arc<dyn LlmRuntime>));
+        let state = Arc::new(tokio::sync::RwLock::new(AgentInternalState::new(
+            "early-end-session".into(),
+        )));
+        state
+            .write()
+            .await
+            .push_message(AgentMessage::user("please start the task"));
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        cancel_tx.send(true).expect("pre-cancel");
+
+        let stream = crate::agent::streaming::process_stream_events_with_safeguards(
+            Arc::new(iface),
+            state.clone(),
+            Arc::new(ToolRegistry::new()),
+            "please start the task",
+            StreamSafeguards::default().with_interrupt_signal(cancel_rx),
+            None,
+            None,
+            0,
+        )
+        .await
+        .expect("stream");
+        let mut saw_interrupted_end = false;
+        let mut stream = stream;
+        while let Some(ev) = stream.next().await {
+            if let crate::agent::AgentEvent::End {
+                end_reason: Some(StreamEndReason::Interrupted),
+                goal_status: Some(_),
+                ..
+            } = ev
+            {
+                saw_interrupted_end = true;
+            }
+        }
+        assert!(
+            saw_interrupted_end,
+            "live End must carry Interrupted + goal_status"
+        );
+
+        let memory = state.read().await.memory.clone();
+        let last_live = memory
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .expect("terminal assistant in memory");
+        assert_eq!(last_live.end_reason, Some(StreamEndReason::Interrupted));
+        assert!(last_live.goal_status.is_some());
+
+        let manager = create_temp_manager();
+        let sid = manager.create_session().await.unwrap();
+        manager.save_history(&sid, &memory).unwrap();
+        manager.sessions.write().await.remove(&sid);
+        manager.session_messages.write().await.remove(&sid);
+
+        let client = manager.get_history_for_client(&sid).await.unwrap();
+        let last = client
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .expect("terminal assistant after early End");
+        assert_eq!(last.end_reason.as_deref(), Some("interrupted"));
+        assert!(
+            last.goal_status
+                .as_ref()
+                .and_then(|v| v.get("status"))
+                .is_some(),
+            "reload must keep stored goalStatus: {:?}",
+            last.goal_status
+        );
+        let wire = serde_json::to_value(last).unwrap();
+        assert_eq!(wire["endReason"], "interrupted");
+        assert!(wire.get("goalStatus").is_some());
+    }
+
+    /// End → save → reload: stored goalStatus/endReason come back as-is.
+    /// History must NOT recompute from live TaskState (fresh session has
+    /// empty TaskState that would otherwise claim not_applicable).
+    #[tokio::test]
+    async fn goal_status_end_reason_persist_across_reload_as_is() {
+        use crate::agent::task_continuity::{GoalEvidenceLevel, StreamEndReason, SystemGoalStatus};
+
+        let manager = create_temp_manager();
+        let sid = manager.create_session().await.unwrap();
+
+        let stored = SystemGoalStatus::Incomplete {
+            reason: "missing delivery".into(),
+            level: GoalEvidenceLevel::None,
+            operation_id: Some("op-42".into()),
+            task_complete_ok: false,
+            physical_ok: false,
+        };
+        let mut assistant = AgentMessage::assistant("done for now");
+        assistant.goal_status = Some(stored.clone());
+        assistant.end_reason = Some(StreamEndReason::Normal);
+
+        manager
+            .save_history(
+                &sid,
+                &[AgentMessage::user("please complete the task"), assistant],
+            )
+            .unwrap();
+
+        // Evict so get_history restores from DB (empty live TaskState).
+        manager.sessions.write().await.remove(&sid);
+        manager.session_messages.write().await.remove(&sid);
+
+        let client = manager.get_history_for_client(&sid).await.unwrap();
+        let last = client.last().expect("assistant message");
+        assert_eq!(last.role, "assistant");
+        assert_eq!(last.end_reason.as_deref(), Some("normal"));
+        let gs = last.goal_status.as_ref().expect("goalStatus stored");
+        assert_eq!(gs["status"], "incomplete");
+        assert_eq!(gs["reason"], "missing delivery");
+        assert_eq!(gs["level"], "none");
+        assert_eq!(gs["operation_id"], "op-42");
+
+        let wire = serde_json::to_value(last).unwrap();
+        assert!(
+            wire.get("goalStatus").is_some(),
+            "history wire key must be camelCase goalStatus"
+        );
+        assert!(wire.get("endReason").is_some());
+        assert!(wire.get("goal_status").is_none());
+
+        let agent_msgs = manager.get_history(&sid).await.unwrap();
+        let am = agent_msgs.last().unwrap();
+        assert_eq!(am.goal_status.as_ref(), Some(&stored));
+        assert_eq!(am.end_reason, Some(StreamEndReason::Normal));
+
+        // Reloaded TaskState is default — must NOT overwrite stored message fields.
+        let agent = manager.get_session(&sid).await.unwrap();
+        let live = agent.history().await;
+        assert_eq!(
+            live.last().and_then(|m| m.goal_status.clone()),
+            Some(stored),
+            "reload must echo stored goalStatus, not recompute from TaskState"
+        );
+    }
+
+    /// [crash window] The user's message must be on disk at TURN START —
+    /// before any stream events are consumed. Pre-fix, everything lived in
+    /// RAM until the end-of-turn persist: a kill -9 mid-turn (a window up to
+    /// the 1200s stream timeout) silently dropped the exchange.
+    #[tokio::test]
+    async fn user_message_persists_at_turn_start_not_stream_end() {
+        let manager = SessionManager::memory();
+        let session_id = manager.create_session().await.unwrap();
+
+        // No LLM configured: the stream falls back, but the user message is
+        // pushed into memory BEFORE the stream is created — the snapshot must
+        // have captured it by the time process_message_events returns.
+        let stream = manager
+            .process_message_events(&session_id, "冷库最近怎么样")
+            .await
+            .expect("stream must start");
+        drop(stream); // do NOT consume the stream — crash right here
+
+        let persisted = manager.store.load_history(&session_id).unwrap();
+        assert!(
+            persisted
+                .iter()
+                .any(|m| m.role == "user" && m.content.contains("冷库最近怎么样")),
+            "user message must be durable at turn start, got {} messages: {:?}",
+            persisted.len(),
+            persisted.iter().map(|m| m.role.clone()).collect::<Vec<_>>()
+        );
+    }
+
     /// Helper to create a temporary SessionManager for tests
     fn create_temp_manager() -> SessionManager {
         let temp_dir = std::env::temp_dir();
         let test_path = temp_dir.join(format!("heramind_test_{}", uuid::Uuid::new_v4()));
         SessionManager::with_path(test_path).unwrap()
+    }
+
+    /// Isolated file-backed manager (no process singleton) for kill/reopen tests.
+    fn create_isolated_file_manager(db_path: &std::path::Path) -> SessionManager {
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let store = SessionStore::open_isolated(db_path).expect("open_isolated session store");
+        SessionManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            session_messages: Arc::new(RwLock::new(HashMap::new())),
+            store,
+            default_config: AgentConfig::default(),
+            default_llm_backend: Arc::new(RwLock::new(None)),
+            tool_registry: Arc::new(RwLock::new(None)),
+            skill_registry: crate::skills::create_shared_registry(None),
+            cancel_senders: Arc::new(RwLock::new(HashMap::new())),
+            clearing_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            history_io: Arc::new(tokio::sync::Mutex::new(())),
+            persist_clear_hooks: Arc::new(PersistClearHooks::default()),
+            event_subscribers: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     #[tokio::test]
@@ -2396,8 +3844,11 @@ mod tests {
 
         // Re-register and remove manually (simulating stream end)
         let (tx2, _rx2) = tokio::sync::watch::channel(false);
-        manager.register_cancel_sender("stream-session", tx2).await;
-        manager.remove_cancel_sender("stream-session").await;
+        let token2 = manager
+            .register_cancel_sender("stream-session", tx2)
+            .await
+            .expect("re-register");
+        manager.remove_cancel_sender("stream-session", token2).await;
 
         // Now cancel should return false
         let cancelled = manager.cancel_session("stream-session").await;
@@ -2483,13 +3934,17 @@ mod tests {
 
         // Register a sender
         let (tx, _rx) = tokio::sync::watch::channel(false);
-        manager.register_cancel_sender("dropped-session", tx).await;
+        let token = manager
+            .register_cancel_sender("dropped-session", tx)
+            .await
+            .expect("register");
 
         // Drop a guard WITHOUT calling mark_cleaned_up — simulating early drop
         {
             let _guard = CancelSenderGuard::new(
                 manager.cancel_senders.clone(),
                 "dropped-session".to_string(),
+                token,
             );
             // _guard goes out of scope here → Drop spawns a removal task
         }
@@ -2505,6 +3960,65 @@ mod tests {
         );
     }
 
+    /// Regression (identity-scoped cancel senders): a zombie wrapper left
+    /// over from a timed-out clear holds an OLD token. When it finally ends,
+    /// its cleanup must NOT evict a newer stream's registration — removal is
+    /// owner-checked. Before the token fix both removed by bare session key,
+    /// so the zombie could delete the next turn's sender (making it
+    /// uncancellable) and let a third stream register concurrently.
+    #[tokio::test]
+    async fn test_stale_cancel_guard_cannot_evict_newer_registration() {
+        let manager = create_temp_manager();
+
+        // Stream 1 registers, then a timed-out clear force-drops the entry.
+        let (tx1, _rx1) = tokio::sync::watch::channel(false);
+        let stale_token = manager
+            .register_cancel_sender("race-session", tx1)
+            .await
+            .expect("first registration");
+        manager.cancel_senders.write().await.remove("race-session");
+
+        // Stream 2 (the next turn) registers while stream 1's wrapper is
+        // still alive.
+        let (tx2, rx2) = tokio::sync::watch::channel(false);
+        manager
+            .register_cancel_sender("race-session", tx2)
+            .await
+            .expect("newer registration must succeed after force-drop");
+
+        // Stream 1's wrapper finally ends: identity-checked cleanup runs with
+        // the STALE token. It must leave stream 2's registration alone.
+        SessionManager::remove_cancel_sender_if_token(
+            &manager.cancel_senders,
+            "race-session",
+            stale_token,
+        )
+        .await;
+        assert!(
+            manager
+                .cancel_senders
+                .read()
+                .await
+                .contains_key("race-session"),
+            "stale-token cleanup must not evict the newer registration"
+        );
+
+        // The newer stream stays cancellable.
+        assert!(manager.cancel_session("race-session").await);
+        assert!(*rx2.borrow());
+
+        // And the matching token still removes normally.
+        manager.cancel_senders.write().await.remove("race-session");
+        assert!(
+            !manager
+                .cancel_senders
+                .read()
+                .await
+                .contains_key("race-session"),
+            "force/unconditional removal (clear path) still evicts"
+        );
+    }
+
     /// Regression: when the stream completes naturally and we call
     /// `mark_cleaned_up`, the Drop handler must NOT double-spawn a removal.
     #[tokio::test]
@@ -2512,13 +4026,19 @@ mod tests {
         let manager = create_temp_manager();
 
         let (tx, _rx) = tokio::sync::watch::channel(false);
-        manager.register_cancel_sender("clean-session", tx).await;
+        let token = manager
+            .register_cancel_sender("clean-session", tx)
+            .await
+            .expect("register");
 
         // Simulate natural stream end: explicit removal + mark_cleaned_up
         {
-            let mut guard =
-                CancelSenderGuard::new(manager.cancel_senders.clone(), "clean-session".to_string());
-            manager.remove_cancel_sender("clean-session").await;
+            let mut guard = CancelSenderGuard::new(
+                manager.cancel_senders.clone(),
+                "clean-session".to_string(),
+                token,
+            );
+            manager.remove_cancel_sender("clean-session", token).await;
             guard.mark_cleaned_up();
             // guard drops here — Drop should be a no-op
         }
@@ -2532,5 +4052,1228 @@ mod tests {
                 .contains_key("clean-session"),
             "mark_cleaned_up should suppress the Drop-spawned removal"
         );
+    }
+
+    /// GPT tip e328cf9f P1: `load_op_ledger` must Err on non-missing table
+    /// errors; `restore_session_from_db` must mark untrusted (not silent empty).
+    ///
+    /// Needs `heramind-storage/test-utils` (via this crate's `test-utils`) for
+    /// the corrupt-table seam — never available in release builds.
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn op_ledger_load_table_error_marks_untrusted_via_get_session() {
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        manager
+            .save_history(&session_id, &[AgentMessage::user("seed")])
+            .unwrap();
+
+        // Force a non-missing table error (type mismatch). Pre-fix this was
+        // swallowed as Ok(None) and restore trusted an empty ledger.
+        manager
+            .session_store()
+            .debug_corrupt_op_ledger_table_type()
+            .unwrap();
+
+        // Evict so the next get_session hits restore_session_from_db → load_op_ledger.
+        manager.sessions.write().await.remove(&session_id);
+
+        let agent = manager.get_session(&session_id).await.unwrap();
+        assert!(
+            agent.op_ledger_untrusted().await,
+            "non-missing load_op_ledger error must fail closed via real restore path"
+        );
+    }
+
+    /// GPT tip af5e3548: clear blocks new turns while in flight.
+    #[tokio::test]
+    async fn clear_history_blocks_new_turns_while_clearing() {
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        manager
+            .clearing_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), ());
+        match manager
+            .process_message_events(&session_id, "hello during clear")
+            .await
+        {
+            Err(err) => assert!(
+                err.to_string().to_lowercase().contains("clear"),
+                "got: {err}"
+            ),
+            Ok(_) => panic!("new turns must refuse mid-clear"),
+        }
+        manager
+            .clearing_sessions
+            .lock()
+            .unwrap()
+            .remove(&session_id);
+    }
+
+    /// MessageReceived reject path: session busy (active cancel sender).
+    #[tokio::test]
+    async fn process_events_rejects_when_session_busy() {
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        manager
+            .register_cancel_sender(&session_id, tx)
+            .await
+            .expect("first registration");
+        match manager
+            .process_message_events(&session_id, "second turn")
+            .await
+        {
+            Err(err) => assert!(
+                err.to_string().contains("already being generated"),
+                "got: {err}"
+            ),
+            Ok(_) => panic!("busy session must reject new turns"),
+        }
+    }
+
+    /// MessageReceived reject path: turn-start save failure (injected).
+    #[tokio::test]
+    async fn process_events_rejects_when_turn_start_save_fails() {
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        manager.persist_clear_hooks.arm_fail_next_turn_start_save();
+        match manager.process_message_events(&session_id, "hello").await {
+            Err(err) => {
+                let msg = err.to_string().to_lowercase();
+                assert!(
+                    msg.contains("save") || msg.contains("storage"),
+                    "expected save/storage failure, got: {err}"
+                );
+            }
+            Ok(_) => panic!("turn-start save failure must reject"),
+        }
+    }
+
+    /// Save fail → reject rolls back accept; retry must not duplicate the user msg.
+    #[tokio::test]
+    async fn turn_start_save_fail_retry_does_not_duplicate_user_message() {
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        let agent = manager.get_session(&session_id).await.unwrap();
+
+        manager.persist_clear_hooks.arm_fail_next_turn_start_save();
+        let err = match manager
+            .process_message_events(&session_id, "hello once")
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("injected save failure must reject"),
+        };
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("save") || msg.contains("storage"),
+            "got: {err}"
+        );
+
+        let after_fail = agent.history().await;
+        assert!(
+            after_fail
+                .iter()
+                .all(|m| m.content.as_ref() != "hello once"),
+            "rolled-back accept must leave no user message: {after_fail:?}"
+        );
+        let disk_empty = manager
+            .load_history(&session_id)
+            .map(|h| h.is_empty())
+            .unwrap_or(true);
+        assert!(disk_empty, "DB must stay empty when save failed");
+
+        // Hook is one-shot; retry persists exactly one user message.
+        let _stream = manager
+            .process_message_events(&session_id, "hello once")
+            .await
+            .expect("retry after save fail");
+        drop(_stream);
+
+        let hist = agent.history().await;
+        let user_hits: Vec<_> = hist
+            .iter()
+            .filter(|m| m.role == "user" && m.content.as_ref() == "hello once")
+            .collect();
+        assert_eq!(
+            user_hits.len(),
+            1,
+            "retry must not duplicate user message: {hist:?}"
+        );
+    }
+
+    /// Confirm submit + save fail must restore pending confirm / clear grant;
+    /// retry consumes confirm once (no double-exec grant).
+    #[tokio::test]
+    async fn confirm_save_fail_retry_keeps_auth_no_double_exec() {
+        use crate::agent::task_continuity::{
+            write_fingerprint, AuthorizeNewOpSubmit, StructuredResult,
+        };
+
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        let agent = manager.get_session(&session_id).await.unwrap();
+
+        let (op, fp, submit, turns_before) = agent
+            .test_with_task_state_mut(|ts| {
+                let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+                let op = ts.begin_new_operation(
+                    "run_now",
+                    None,
+                    r#"{"agent_id":"A"}"#,
+                    Some(fp.clone()),
+                );
+                ts.mark_operation_running(&op);
+                ts.complete_operation_unknown(
+                    &op,
+                    StructuredResult {
+                        success: false,
+                        summary: "interrupted".into(),
+                        body: String::new(),
+                        details_ref: None,
+                    },
+                );
+                let req = ts.issue_or_reuse_confirm_request(&op, &fp, "run_now", None);
+                let submit = AuthorizeNewOpSubmit {
+                    request_id: req.request_id,
+                    prior_operation_id: req.prior_operation_id,
+                    write_fingerprint: req.write_fingerprint,
+                };
+                let turns = ts.turn_count;
+                (op, fp, submit, turns)
+            })
+            .await;
+
+        manager.persist_clear_hooks.arm_fail_next_turn_start_save();
+        let err = match manager
+            .process_message_events_with_authorize(
+                &session_id,
+                "confirm re-run",
+                Some(submit.clone()),
+                None,
+            )
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("injected save failure must reject"),
+        };
+        assert!(
+            err.to_string().to_lowercase().contains("save")
+                || err.to_string().to_lowercase().contains("storage"),
+            "got: {err}"
+        );
+
+        agent
+            .test_with_task_state_mut(|ts| {
+                assert_eq!(ts.turn_count, turns_before, "Turn must roll back");
+                assert!(
+                    ts.user_authorized_new_op.is_none(),
+                    "grant must not stick after rejected save"
+                );
+                assert!(
+                    ts.pending_confirm(&submit.request_id).is_some(),
+                    "pending confirm restored for retry"
+                );
+                assert_eq!(ts.pending_confirm_requests.len(), 1);
+            })
+            .await;
+        assert!(
+            agent
+                .history()
+                .await
+                .iter()
+                .all(|m| m.content.as_ref() != "confirm re-run"),
+            "confirm user message rolled back"
+        );
+
+        // Retry: confirm consumed once → single grant (no double-exec).
+        let _stream = manager
+            .process_message_events_with_authorize(
+                &session_id,
+                "confirm re-run",
+                Some(submit.clone()),
+                None,
+            )
+            .await
+            .expect("retry after save fail");
+        drop(_stream);
+
+        agent
+            .test_with_task_state_mut(|ts| {
+                assert_eq!(ts.turn_count, turns_before + 1);
+                assert!(
+                    ts.pending_confirm(&submit.request_id).is_none(),
+                    "confirm consumed exactly once on successful retry"
+                );
+                let grant = ts
+                    .user_authorized_new_op
+                    .as_ref()
+                    .expect("single grant after one successful accept");
+                assert_eq!(grant.prior_operation_id, op);
+                assert_eq!(grant.write_fingerprint, fp);
+            })
+            .await;
+        let user_hits = agent
+            .history()
+            .await
+            .iter()
+            .filter(|m| m.role == "user" && m.content.as_ref() == "confirm re-run")
+            .count();
+        assert_eq!(user_hits, 1);
+    }
+
+    /// accept confirm → clear history → save-fail rollback must leave
+    /// history/ops/auth cleared (generation-bound AcceptRollback).
+    #[tokio::test]
+    async fn accept_clear_save_fail_rollback_stays_cleared() {
+        use crate::agent::task_continuity::{
+            write_fingerprint, AuthorizeNewOpSubmit, StructuredResult,
+        };
+
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        let agent = manager.get_session(&session_id).await.unwrap();
+
+        let submit = agent
+            .test_with_task_state_mut(|ts| {
+                let fp = write_fingerprint("run_now", r#"{"agent_id":"A"}"#);
+                let op = ts.begin_new_operation(
+                    "run_now",
+                    None,
+                    r#"{"agent_id":"A"}"#,
+                    Some(fp.clone()),
+                );
+                ts.mark_operation_running(&op);
+                ts.complete_operation_unknown(
+                    &op,
+                    StructuredResult {
+                        success: false,
+                        summary: "interrupted".into(),
+                        body: String::new(),
+                        details_ref: None,
+                    },
+                );
+                let req = ts.issue_or_reuse_confirm_request(&op, &fp, "run_now", None);
+                AuthorizeNewOpSubmit {
+                    request_id: req.request_id,
+                    prior_operation_id: req.prior_operation_id,
+                    write_fingerprint: req.write_fingerprint,
+                }
+            })
+            .await;
+
+        agent
+            .test_accept_user_message(AgentMessage::user("confirm re-run"), Some(submit))
+            .await;
+        agent
+            .test_with_task_state_mut(|ts| {
+                assert!(ts.user_authorized_new_op.is_some());
+                assert!(!ts.operations.is_empty());
+            })
+            .await;
+        assert_eq!(agent.history().await.len(), 1);
+
+        manager.clear_history(&session_id).await.unwrap();
+        assert!(agent.history().await.is_empty());
+
+        // Save-fail path after clear: rollback must refuse / stay cleared.
+        assert!(
+            !agent.rollback_pending_accept().await,
+            "clear invalidates accept rollback"
+        );
+        assert!(agent.history().await.is_empty());
+        agent
+            .test_with_task_state_mut(|ts| {
+                assert!(ts.operations.is_empty(), "ops stay cleared");
+                assert!(ts.user_authorized_new_op.is_none(), "auth stay cleared");
+                assert!(ts.pending_confirm_requests.is_empty());
+                assert_eq!(ts.turn_count, 0);
+            })
+            .await;
+    }
+
+    /// GPT tip af5e3548: clear cancels + awaits stream; stale persist cannot
+    /// rewrite history/ledger after generation bump.
+    #[tokio::test]
+    async fn clear_history_cancels_stream_and_rejects_stale_persist() {
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        manager
+            .save_history(&session_id, &[AgentMessage::user("before clear")])
+            .unwrap();
+        let agent = manager.get_session(&session_id).await.unwrap();
+        // Put a durable ledger byte so clear must delete it.
+        let ledger = br#"{"version":1,"operations":[],"write_ledger":[],"current_operation_id":"","turn_count":0}"#;
+        manager
+            .session_store()
+            .save_op_ledger(&session_id, ledger)
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let token = manager
+            .register_cancel_sender(&session_id, tx)
+            .await
+            .expect("register");
+
+        let mgr = SessionManager {
+            sessions: manager.sessions.clone(),
+            session_messages: manager.session_messages.clone(),
+            store: manager.store.clone(),
+            default_config: manager.default_config.clone(),
+            default_llm_backend: manager.default_llm_backend.clone(),
+            tool_registry: manager.tool_registry.clone(),
+            skill_registry: manager.skill_registry.clone(),
+            cancel_senders: manager.cancel_senders.clone(),
+            clearing_sessions: manager.clearing_sessions.clone(),
+            history_io: manager.history_io.clone(),
+            persist_clear_hooks: manager.persist_clear_hooks.clone(),
+            event_subscribers: manager.event_subscribers.clone(),
+        };
+        let sid = session_id.clone();
+        let clear_task = tokio::spawn(async move { mgr.clear_history(&sid).await });
+
+        // Stream observes cancel, then removes its sender (stream end).
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.changed())
+            .await
+            .expect("clear must cancel the active stream")
+            .expect("watch channel");
+        assert!(*rx.borrow());
+        manager.remove_cancel_sender(&session_id, token).await;
+
+        clear_task
+            .await
+            .expect("join")
+            .expect("clear_history must succeed");
+
+        assert!(agent.history().await.is_empty(), "memory wiped after clear");
+        assert!(
+            manager.load_history(&session_id).unwrap().is_empty(),
+            "DB history cleared"
+        );
+        assert!(
+            manager
+                .session_store()
+                .load_op_ledger(&session_id)
+                .unwrap()
+                .is_none(),
+            "op ledger deleted on clear"
+        );
+        assert!(agent.history_generation().await >= 1);
+
+        // Stale persist: generation already advanced — even if we re-inject
+        // messages into the session_messages cache, live agent gen gate +
+        // empty agent history means persist writes empty, not the old turn.
+        manager.session_messages.write().await.insert(
+            session_id.clone(),
+            vec![AgentMessage::user("stale rewrite attempt")],
+        );
+        manager.persist_history(&session_id).await.unwrap();
+        let disk = manager.load_history(&session_id).unwrap();
+        assert!(
+            disk.iter().all(|m| {
+                let c = m.content.as_ref();
+                c != "stale rewrite attempt" && c != "before clear"
+            }),
+            "post-clear persist must not resurrect pre-clear or stale cache text: {disk:?}"
+        );
+    }
+
+    /// Workstream 2: real interleave — persist snapshots pre-clear generation,
+    /// clear runs in the unlock gap, persist must not resurrect after recheck
+    /// under `history_io` (not merely clear-then-persist).
+    #[tokio::test]
+    async fn persist_clear_interleaved_snapshot_does_not_resurrect() {
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        let seed = AgentMessage::user("before clear race");
+        manager
+            .save_history(&session_id, std::slice::from_ref(&seed))
+            .unwrap();
+
+        // Live agent memory holds the pre-clear turn (persist will snapshot it).
+        let agent = manager.get_session(&session_id).await.unwrap();
+        agent.restore_history(vec![seed.clone()]).await;
+        assert_eq!(agent.history_generation().await, 0);
+
+        let (entered, resume) = manager.persist_clear_hooks.install_persist_pause();
+        let mgr = SessionManager {
+            sessions: manager.sessions.clone(),
+            session_messages: manager.session_messages.clone(),
+            store: manager.store.clone(),
+            default_config: manager.default_config.clone(),
+            default_llm_backend: manager.default_llm_backend.clone(),
+            tool_registry: manager.tool_registry.clone(),
+            skill_registry: manager.skill_registry.clone(),
+            cancel_senders: manager.cancel_senders.clone(),
+            clearing_sessions: manager.clearing_sessions.clone(),
+            history_io: manager.history_io.clone(),
+            persist_clear_hooks: manager.persist_clear_hooks.clone(),
+            event_subscribers: manager.event_subscribers.clone(),
+        };
+        let sid = session_id.clone();
+        let persist_task = tokio::spawn(async move { mgr.persist_history(&sid).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("persist must reach post-snapshot pause");
+
+        // Clear runs while persist holds a stale snapshot outside history_io.
+        manager.clear_history(&session_id).await.unwrap();
+        assert!(agent.history().await.is_empty());
+        assert!(manager.load_history(&session_id).unwrap().is_empty());
+        assert!(agent.history_generation().await >= 1);
+
+        resume.notify_one();
+        persist_task
+            .await
+            .expect("join")
+            .expect("persist_history must succeed (as no-op)");
+
+        let disk = manager.load_history(&session_id).unwrap();
+        assert!(
+            disk.iter()
+                .all(|m| m.content.as_ref() != "before clear race"),
+            "interleaved stale persist must not resurrect pre-clear history: {disk:?}"
+        );
+        assert!(disk.is_empty(), "disk must stay cleared: {disk:?}");
+    }
+
+    /// Workstream 2: clearing mark is Drop-safe — abort mid-clear unmarks.
+    #[tokio::test]
+    async fn clear_history_mark_drop_safe_on_future_cancel() {
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        manager
+            .save_history(&session_id, &[AgentMessage::user("seed")])
+            .unwrap();
+
+        let (entered, _resume) = manager.persist_clear_hooks.install_clear_hold();
+        let mgr = SessionManager {
+            sessions: manager.sessions.clone(),
+            session_messages: manager.session_messages.clone(),
+            store: manager.store.clone(),
+            default_config: manager.default_config.clone(),
+            default_llm_backend: manager.default_llm_backend.clone(),
+            tool_registry: manager.tool_registry.clone(),
+            skill_registry: manager.skill_registry.clone(),
+            cancel_senders: manager.cancel_senders.clone(),
+            clearing_sessions: manager.clearing_sessions.clone(),
+            history_io: manager.history_io.clone(),
+            persist_clear_hooks: manager.persist_clear_hooks.clone(),
+            event_subscribers: manager.event_subscribers.clone(),
+        };
+        let sid = session_id.clone();
+        let clear_task = tokio::spawn(async move { mgr.clear_history(&sid).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("clear must arm mark then hold");
+        assert!(
+            manager.is_clearing(&session_id),
+            "mark must be armed during mid-clear hold"
+        );
+
+        clear_task.abort();
+        let join = clear_task.await;
+        assert!(join.is_err(), "aborted clear Future must report cancel");
+
+        assert!(
+            !manager.is_clearing(&session_id),
+            "ClearingGuard Drop must release mark after Future cancel"
+        );
+
+        // New turns must not see a leaked mid-clear refusal.
+        if let Err(e) = manager
+            .process_message_events(&session_id, "after aborted clear")
+            .await
+        {
+            assert!(
+                !e.to_string().to_lowercase().contains("being cleared"),
+                "leaked clearing mark: {e}"
+            )
+        }
+    }
+
+    /// GPT tip af5e3548 P1: stale snapshot-then-write must not clobber a newer
+    /// durable write-intent (store version gate + single commit path).
+    #[tokio::test]
+    async fn persist_history_interleaved_stale_snapshot_keeps_newer_intent() {
+        use crate::agent::task_continuity::{OperationStatus, PersistedOpLedger, TaskState};
+
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+
+        // Newer mid-turn write intent already on disk (version 2).
+        let mut live = TaskState::default();
+        let fp = "shell|heramind device command send --id cam-race";
+        let op = live.begin_new_operation_for_owner(
+            "shell",
+            Some("cam-race".into()),
+            r#"{"command":"heramind device command send --id cam-race"}"#,
+            Some(fp.into()),
+            Some("owner-race"),
+        );
+        live.mark_operation_running(&op);
+        let mut newer = live.snapshot_op_ledger();
+        newer.version = 2;
+        assert_eq!(
+            newer.operations.last().unwrap().status,
+            OperationStatus::Unknown
+        );
+        let newer_bytes = serde_json::to_vec(&newer).unwrap();
+        manager
+            .session_store()
+            .save_op_ledger(&session_id, &newer_bytes)
+            .unwrap();
+
+        // Stale empty persist_history snapshot (version 1) — pre-fix overwrite.
+        let stale = PersistedOpLedger {
+            version: 1,
+            ..PersistedOpLedger::default()
+        };
+        let stale_bytes = serde_json::to_vec(&stale).unwrap();
+        let err = manager
+            .session_store()
+            .save_op_ledger(&session_id, &stale_bytes)
+            .expect_err("stale version must be rejected");
+        assert!(
+            err.to_string().contains("stale op ledger write rejected"),
+            "got: {err}"
+        );
+
+        let loaded = manager
+            .session_store()
+            .load_op_ledger(&session_id)
+            .unwrap()
+            .unwrap();
+        let kept: PersistedOpLedger = serde_json::from_slice(&loaded).unwrap();
+        assert_eq!(kept.version, 2);
+        assert_eq!(kept.operations.len(), 1);
+        assert_eq!(kept.operations[0].status, OperationStatus::Unknown);
+    }
+
+    /// GPT tip af5e3548: DB op-ledger delete failure must surface to caller.
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn clear_history_propagates_op_ledger_delete_failure() {
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        manager
+            .save_history(&session_id, &[AgentMessage::user("seed")])
+            .unwrap();
+        manager
+            .session_store()
+            .debug_corrupt_op_ledger_table_type()
+            .unwrap();
+
+        let err = manager
+            .clear_history(&session_id)
+            .await
+            .expect_err("corrupt op_ledgers delete must not look like success");
+        assert!(
+            err.to_string().contains("op ledger") || err.to_string().contains("op_ledgers"),
+            "got: {err}"
+        );
+        // Clearing flag must be released even on failure.
+        assert!(!manager.is_clearing(&session_id));
+        // New turns allowed again after failed clear unmarks.
+        let stream = manager.process_message_events(&session_id, "after failed clear");
+        // May succeed or fail on LLM — must not be the mid-clear refusal.
+        if let Err(e) = stream.await {
+            assert!(
+                !e.to_string().to_lowercase().contains("being cleared"),
+                "clearing flag leaked: {e}"
+            );
+        }
+    }
+
+    /// GPT tip af5e3548 P1: load-fail → chat (`persist_history`) → restart
+    /// must still block writes; empty untrusted memory must not clear disk.
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn untrusted_persist_history_keeps_corrupt_ledger_across_restart() {
+        use crate::agent::task_continuity::{write_fingerprint, MutatingGateOutcome};
+
+        let manager = create_temp_manager();
+        let session_id = manager.create_session().await.unwrap();
+        manager
+            .save_history(&session_id, &[AgentMessage::user("seed")])
+            .unwrap();
+
+        manager
+            .session_store()
+            .debug_write_op_ledger_raw(&session_id, b"not-json{{{")
+            .unwrap();
+
+        // load-fail → untrusted
+        manager.sessions.write().await.remove(&session_id);
+        let agent = manager.get_session(&session_id).await.unwrap();
+        assert!(agent.op_ledger_untrusted().await);
+
+        // chat end would call persist_history — must not replace corrupt bytes
+        manager.persist_history(&session_id).await.unwrap();
+        let disk = manager
+            .session_store()
+            .load_op_ledger(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            disk, b"not-json{{{",
+            "persist_history must not write empty ledger over corrupt bytes"
+        );
+
+        // restart
+        manager.sessions.write().await.remove(&session_id);
+        let agent2 = manager.get_session(&session_id).await.unwrap();
+        assert!(
+            agent2.op_ledger_untrusted().await,
+            "restart must still see untrusted after skipped persist"
+        );
+
+        // Writes still blocked (same gate the stream path uses).
+        let mut state = crate::agent::types::AgentInternalState::new(session_id.clone());
+        state.mark_op_ledger_untrusted();
+        let args = serde_json::json!({"command":"heramind device command send --id cam-u"});
+        let fp = write_fingerprint("shell", &args.to_string());
+        match state.evaluate_mutating_gate_durable("shell", &args, &fp, None, 1) {
+            MutatingGateOutcome::Block { .. } => {}
+            other => panic!("untrusted after restart must Block writes, got {other:?}"),
+        }
+    }
+
+    /// GPT tip Task3: kill mid-write-intent → drop DB handle → reopen → durable
+    /// gate blocks auto-replay (production StoreOpLedgerCommit + restore path).
+    #[tokio::test]
+    async fn process_kill_mid_write_intent_reopen_db_blocks_auto_replay() {
+        use crate::agent::task_continuity::{
+            write_fingerprint, MutatingGateOutcome, OperationStatus, PersistedOpLedger,
+            WriteDispatch,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "heramind_op_ledger_reopen_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db_path = dir.join("sessions.redb");
+        let args = serde_json::json!({
+            "command": "heramind device control cam-kill reboot"
+        });
+        let fp = write_fingerprint("shell", args["command"].as_str().unwrap());
+
+        // Phase 1: live manager commits durable write-intent, then "dies".
+        let session_id = {
+            let manager = create_isolated_file_manager(&db_path);
+            let session_id = manager.create_session().await.unwrap();
+            // Ensure history table exists so reopen restore does not Err on
+            // a missing table (create_session alone only stamps session id).
+            manager
+                .save_history(&session_id, &[AgentMessage::user("pre-kill seed")])
+                .unwrap();
+            let agent = manager.get_session(&session_id).await.unwrap();
+
+            match agent
+                .evaluate_mutating_gate_durable("shell", &args, &fp, Some("owner-kill"), 1)
+                .await
+            {
+                MutatingGateOutcome::Proceed { .. } => {}
+                other => panic!("intent commit must Proceed, got {other:?}"),
+            }
+
+            let bytes = manager
+                .session_store()
+                .load_op_ledger(&session_id)
+                .unwrap()
+                .expect("write intent must be on disk before side-effect");
+            let snap: PersistedOpLedger = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                snap.operations.last().unwrap().status,
+                OperationStatus::Unknown,
+                "persisted intent sanitizes Running → Unknown"
+            );
+            // Process kill: drop all handles (release redb file lock).
+            drop(agent);
+            drop(manager);
+            session_id
+        };
+
+        // Phase 2: reopen same DB file (new process shape).
+        let manager2 = create_isolated_file_manager(&db_path);
+        let agent2 = manager2.get_session(&session_id).await.unwrap();
+        assert!(
+            !agent2.op_ledger_untrusted().await,
+            "clean Unknown restore must be trusted"
+        );
+        assert!(
+            !agent2.may_execute_write(&fp).await,
+            "reopen must not auto-allow the interrupted write"
+        );
+        assert!(
+            matches!(
+                agent2.dispatch_mutating_write(&fp).await,
+                WriteDispatch::InquireStatus { .. }
+            ),
+            "crash-window reopen must inquire — never auto re-side-effect"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GPT tip Task3: clear deletes ledger; reopen must not resurrect intent.
+    #[tokio::test]
+    async fn clear_history_then_reopen_has_no_op_ledger_to_replay() {
+        let dir = std::env::temp_dir().join(format!(
+            "heramind_op_ledger_clear_reopen_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db_path = dir.join("sessions.redb");
+        let session_id = {
+            let manager = create_isolated_file_manager(&db_path);
+            let session_id = manager.create_session().await.unwrap();
+            manager
+                .save_history(&session_id, &[AgentMessage::user("pre-clear seed")])
+                .unwrap();
+            let agent = manager.get_session(&session_id).await.unwrap();
+            let args = serde_json::json!({
+                "command": "heramind device delete cam-clear"
+            });
+            let fp = crate::agent::task_continuity::write_fingerprint(
+                "shell",
+                args["command"].as_str().unwrap(),
+            );
+            let _ = agent
+                .evaluate_mutating_gate_durable("shell", &args, &fp, Some("owner-clear"), 1)
+                .await;
+            assert!(manager
+                .session_store()
+                .load_op_ledger(&session_id)
+                .unwrap()
+                .is_some());
+            manager.clear_history(&session_id).await.unwrap();
+            assert!(manager
+                .session_store()
+                .load_op_ledger(&session_id)
+                .unwrap()
+                .is_none());
+            drop(agent);
+            drop(manager);
+            session_id
+        };
+        let manager2 = create_isolated_file_manager(&db_path);
+        let agent2 = manager2.get_session(&session_id).await.unwrap();
+        assert!(!agent2.op_ledger_untrusted().await);
+        assert!(manager2
+            .session_store()
+            .load_op_ledger(&session_id)
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod extraction_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_standard_tagged_bullets() {
+        let (u, k) = parse_extracted_facts(
+            "- [user] prefers concise answers\n- [knowledge] MQTT broker runs on port 1883",
+        );
+        assert_eq!(u, vec!["prefers concise answers"]);
+        assert_eq!(k, vec!["MQTT broker runs on port 1883"]);
+    }
+
+    #[test]
+    fn strips_doubled_and_fullwidth_separators() {
+        // The incident entry (2026-10-14): model doubled the separator and a
+        // literal "- : 平台名称：" landed in KNOWLEDGE.md.
+        let (_, k) = parse_extracted_facts("- [knowledge]: : 平台名称是 HeraMind 边缘平台");
+        assert_eq!(k, vec!["平台名称是 HeraMind 边缘平台"]);
+        let (u, _) = parse_extracted_facts("- [user]：喜欢深色主题");
+        assert_eq!(u, vec!["喜欢深色主题"]);
+    }
+
+    #[test]
+    fn template_word_fact_strips_only_standalone() {
+        // The prompt's format table shows "[user] fact" — models copy it.
+        let (u, _) = parse_extracted_facts("- [user] fact 用户偏好中文交流");
+        assert_eq!(u, vec!["用户偏好中文交流"]);
+        // ... but real words starting with "fact" must survive intact
+        // (strip_prefix("fact") mangled "factory" → "ory").
+        let (_, k) = parse_extracted_facts("- [knowledge] factory floor has 3 production lines");
+        assert_eq!(k, vec!["factory floor has 3 production lines"]);
+        let (_, k2) = parse_extracted_facts("- [knowledge] fact-checking workflow is manual");
+        assert_eq!(k2, vec!["fact-checking workflow is manual"]);
+    }
+
+    #[test]
+    fn tags_match_case_insensitively() {
+        let (u, _) = parse_extracted_facts("- [USER] prefers dark mode\n- [Knowledge] uses MQTT");
+        assert_eq!(u, vec!["prefers dark mode"]);
+        let (_, k) = parse_extracted_facts("- [Knowledge] uses MQTT");
+        assert_eq!(k, vec!["uses MQTT"]);
+    }
+
+    #[test]
+    fn rejects_short_and_meta_facts() {
+        let (u, k) = parse_extracted_facts(
+            "- [user] 好\n\
+             - [user] The assistant mentions weather forecasts\n\
+             - [knowledge] assistant can help with dashboards\n\
+             - [knowledge] The model uses MiniCPM\n\
+             - [knowledge] devices report over MQTT every 20 seconds",
+        );
+        assert!(u.is_empty(), "short + meta user facts must be dropped");
+        // CJK floor is 2: single-char interjections stay junk, a real
+        // short Chinese fact survives the gate.
+        let (u2, _) = parse_extracted_facts("- [user] 住上海\n- [user] 嗯");
+        assert_eq!(u2, vec!["住上海"], "2+ char CJK facts must survive");
+        assert_eq!(
+            k,
+            vec!["devices report over MQTT every 20 seconds"],
+            "only the real fact survives"
+        );
+    }
+
+    #[test]
+    fn ignores_untagged_and_empty_lines() {
+        let (u, k) = parse_extracted_facts(
+            "Here are the facts:\n- untagged bullet\n- [user]\nrandom prose\n\n",
+        );
+        assert!(u.is_empty());
+        assert!(k.is_empty());
+    }
+
+    /// Regression: "[knowledge]" is 11 BYTES; byte 11 lands mid-character
+    /// on a 4th CJK char, and the old raw[..tag.len()] PANICKED — killing
+    /// the spawned extraction task and losing every fact of that turn
+    /// (the recurring "user_facts=1 persisted 0" signature).
+    #[test]
+    fn unlabeled_chinese_bullet_does_not_panic() {
+        assert_eq!(strip_tag("- 今天天气很不错的样子哦", "[user]"), None);
+        assert_eq!(strip_tag("• 四个汉字的行也安全", "[knowledge]"), None);
+        assert!(strip_tag("- [user] 喜欢喝茶", "[user]").is_some());
+        assert!(strip_tag("- [KNOWLEDGE] 温度阈值 25 度", "[knowledge]").is_some());
+    }
+
+    #[test]
+    fn bullet_dot_variant_accepted() {
+        let (u, _) = parse_extracted_facts("• [user] likes sailing on weekends");
+        assert_eq!(u, vec!["likes sailing on weekends"]);
+    }
+}
+
+#[cfg(test)]
+mod companion_delegation_tests {
+    use super::delegate_images_to_companion;
+    use crate::llm_backends::{set_instance_manager, LlmBackendInstanceManager};
+    use heramind_storage::{LlmBackendInstance, LlmBackendStore, LlmBackendType};
+    use std::sync::Arc;
+
+    fn test_store(tag: &str) -> Arc<LlmBackendStore> {
+        let path = std::env::temp_dir().join(format!(
+            "heramind-deleg-{}-{}.redb",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        LlmBackendStore::open(&path).expect("open test store")
+    }
+
+    /// Fake OpenAI-compatible /v1/chat/completions answering with a fixed
+    /// description (raw-socket HTTP — this crate has no axum dependency;
+    /// same pattern as the instance_manager auto-register test). Proves the
+    /// companion runtime is actually queried and its text lands verbatim in
+    /// the combined prompt.
+    #[cfg(feature = "llamacpp")]
+    async fn fake_vlm_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"a red square and a green circle"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"created":0,"model":"fake-vlm","id":"x","object":"chat.completion"}"#;
+        let h = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), h)
+    }
+
+    fn data_url() -> String {
+        use base64::Engine;
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(b"fake-png-bytes")
+        )
+    }
+
+    #[cfg(feature = "llamacpp")]
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn companion_descriptions_are_injected_into_the_prompt() {
+        let (ep, _h) = fake_vlm_server().await;
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("ok")));
+        let mut inst = LlmBackendInstance::new(
+            "builtin-vlm-fake".into(),
+            "FakeVLM".into(),
+            LlmBackendType::LlamaCpp,
+        );
+        inst.endpoint = Some(ep);
+        inst.capabilities.supports_multimodal = true;
+        // Same protection the real spawn stamps: without runtime_api the
+        // name-heuristic in ensure_instance_capabilities flips the flag back
+        // to false on read (model name is not in its vision tables).
+        inst.capabilities.multimodal_source = Some("runtime_api".to_string());
+        manager.upsert_instance(inst).await.unwrap();
+        set_instance_manager(manager);
+
+        let combined = delegate_images_to_companion("what is in this picture?", &[data_url()])
+            .await
+            .expect("delegation must succeed with a healthy companion");
+        assert!(combined.prompt.contains("what is in this picture?"));
+        assert!(
+            combined.prompt.contains("a red square and a green circle"),
+            "companion text must land verbatim: {}",
+            combined.prompt
+        );
+        assert!(combined.prompt.contains("[Image 1"));
+        assert_eq!(combined.captions.len(), 1);
+        assert!(
+            combined.prompt.contains("/api/images/")
+                || combined.prompt.contains("Pass the /api/images"),
+            "delegated turns must expose durable paths for tools: {}",
+            combined.prompt
+        );
+        assert!(
+            !combined.prompt.contains("Do NOT call the vision tool"),
+            "must not forbid vision/OCR when paths are available: {}",
+            combined.prompt
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn no_companion_or_text_only_companion_means_no_delegation() {
+        // No companion at all.
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("none")));
+        set_instance_manager(manager.clone());
+        assert!(delegate_images_to_companion("hi", &[data_url()])
+            .await
+            .is_none());
+
+        // A companion-lookalike WITHOUT the multimodal flag is skipped —
+        // the flag is the vision contract, the id alone is not.
+        let mut inst = LlmBackendInstance::new(
+            "builtin-vlm-blind".into(),
+            "Blind".into(),
+            LlmBackendType::LlamaCpp,
+        );
+        inst.endpoint = Some("http://127.0.0.1:1".into());
+        inst.capabilities.supports_multimodal = false;
+        manager.upsert_instance(inst).await.unwrap();
+        assert!(delegate_images_to_companion("hi", &[data_url()])
+            .await
+            .is_none());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn env_off_restores_legacy_rejection() {
+        std::env::set_var("HERAMIND_BUILTIN_VLM_DELEGATE", "off");
+        let manager = Arc::new(LlmBackendInstanceManager::new(test_store("off")));
+        set_instance_manager(manager);
+        let r = delegate_images_to_companion("hi", &[data_url()]).await;
+        std::env::remove_var("HERAMIND_BUILTIN_VLM_DELEGATE");
+        assert!(
+            r.is_none(),
+            "kill switch must short-circuit before any call"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "llamacpp"))]
+#[path = "session_backend_request_tests.rs"]
+mod backend_request_tests;
+
+#[cfg(test)]
+mod on_demand_memory_tests {
+    use super::*;
+    use crate::toolkit::{MemoryTool, ToolRegistry};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn memory_toggle_is_session_local_and_survives_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = heramind_storage::MarkdownMemoryStore::new(dir.path());
+        store.init().unwrap();
+        store
+            .write_file("user", "prefers Chinese responses")
+            .await
+            .unwrap();
+        let store = Arc::new(RwLock::new(store));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(MemoryTool::new(store.clone())));
+        let registry = Arc::new(registry);
+        let manager = SessionManager::memory();
+        manager.set_tool_registry(registry.clone()).await;
+        let a_id = manager.create_session().await.unwrap();
+        let b_id = manager.create_session().await.unwrap();
+        let a = manager.get_session(&a_id).await.unwrap();
+        let b = manager.get_session(&b_id).await.unwrap();
+        let read = json!({"action":"read", "target":"user"});
+        assert!(a
+            .execute_tool("memory", &read)
+            .await
+            .unwrap()
+            .contains("Chinese"));
+        manager.toggle_memory(&a_id, false).await.unwrap();
+        assert!(
+            a.execute_tool("memory", &read).await.is_err(),
+            "cached read must also be blocked"
+        );
+        assert!(a
+            .execute_tool(
+                "memory",
+                &json!({"action":"add", "target":"user", "content":"bad write"})
+            )
+            .await
+            .is_err());
+        assert!(!a
+            .llm_interface()
+            .get_tool_definitions()
+            .await
+            .iter()
+            .any(|d| d.name == "memory"));
+        assert!(b
+            .execute_tool("memory", &read)
+            .await
+            .unwrap()
+            .contains("Chinese"));
+        assert!(
+            !registry.is_disabled("memory"),
+            "shared registry must not be disabled"
+        );
+        manager
+            .save_history(&a_id, &[AgentMessage::user("current chat task")])
+            .unwrap();
+        manager.sessions.write().await.remove(&a_id);
+        let restored = manager.get_session(&a_id).await.unwrap();
+        assert!(restored.execute_tool("memory", &read).await.is_err());
+        manager.toggle_memory(&a_id, true).await.unwrap();
+        assert!(restored
+            .execute_tool("memory", &read)
+            .await
+            .unwrap()
+            .contains("Chinese"));
+        restored
+            .execute_tool(
+                "memory",
+                &json!({"action":"add", "target":"session", "content":"session A task"}),
+            )
+            .await
+            .unwrap();
+        b.execute_tool(
+            "memory",
+            &json!({"action":"add", "target":"session", "content":"session B task"}),
+        )
+        .await
+        .unwrap();
+        let notes = json!({"action":"read", "target":"session"});
+        let a_notes = restored.execute_tool("memory", &notes).await.unwrap();
+        let b_notes = b.execute_tool("memory", &notes).await.unwrap();
+        assert!(a_notes.contains("session A task") && !a_notes.contains("session B task"));
+        assert!(b_notes.contains("session B task") && !b_notes.contains("session A task"));
+        assert!(!store
+            .read()
+            .await
+            .read_file("user")
+            .await
+            .unwrap()
+            .contains("bad write"));
+        registry.disable("memory");
+        assert!(
+            restored.execute_tool("memory", &read).await.is_err(),
+            "global policy still applies"
+        );
+    }
+
+    /// Count and preview come from the store without loading the history.
+    /// The listing used to deserialize every session's whole history twice
+    /// for them; on T4 that meant 81 sessions, 300KB tool results included,
+    /// on every chat-input suggestion request.
+    #[tokio::test]
+    async fn listing_counts_and_previews_a_stored_history_without_loading_it() {
+        use heramind_storage::SessionMessage;
+
+        let manager = SessionManager::memory();
+        // Registered and written straight to the store, so the manager holds
+        // no in-memory copy of either session (as after a restart).
+        let with_tool_output = "listing-with-tool-output".to_string();
+        manager.store.save_session_id(&with_tool_output).unwrap();
+        let history = vec![
+            SessionMessage::user("把 200366 的照片发到墨水屏"),
+            SessionMessage::assistant(""),
+            SessionMessage::tool("call-1", "x".repeat(300_000)),
+            SessionMessage::assistant("done"),
+        ];
+        manager
+            .store
+            .save_history(&with_tool_output, &history)
+            .unwrap();
+        let brief = "listing-brief".to_string();
+        manager.store.save_session_id(&brief).unwrap();
+        manager
+            .store
+            .save_history(&brief, &[SessionMessage::user("你好")])
+            .unwrap();
+
+        let infos = manager.list_sessions_with_info().await;
+        let tool_session = infos
+            .iter()
+            .find(|i| i.session_id == with_tool_output)
+            .expect("listed");
+        assert_eq!(tool_session.message_count, 4);
+        assert_eq!(
+            tool_session.preview.as_deref(),
+            Some("把 200366 的照片发到墨水屏")
+        );
+        let brief_info = infos
+            .iter()
+            .find(|i| i.session_id == brief)
+            .expect("listed");
+        assert_eq!(brief_info.message_count, 1);
+        assert_eq!(brief_info.preview.as_deref(), Some("你好"));
+    }
+
+    /// A session that does not open with a user message (restored, imported)
+    /// still gets its preview from further in.
+    #[tokio::test]
+    async fn listing_preview_finds_a_user_message_past_the_opening() {
+        use heramind_storage::SessionMessage;
+
+        let manager = SessionManager::memory();
+        let session_id = "listing-late-user-message".to_string();
+        manager.store.save_session_id(&session_id).unwrap();
+        let mut history: Vec<SessionMessage> = (0..8)
+            .map(|i| SessionMessage::assistant(format!("a{i}")))
+            .collect();
+        history.push(SessionMessage::user("第九条才是用户的话"));
+        manager.store.save_history(&session_id, &history).unwrap();
+
+        let infos = manager.list_sessions_with_info().await;
+        assert_eq!(infos[0].message_count, 9);
+        assert_eq!(infos[0].preview.as_deref(), Some("第九条才是用户的话"));
     }
 }

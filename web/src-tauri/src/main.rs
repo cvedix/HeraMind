@@ -67,12 +67,9 @@ fn cleanup_old_logs(log_dir: &std::path::Path) {
                     continue;
                 }
                 if let Some(date_str) = filename.strip_prefix("heramind.log.") {
-                    if let Ok(file_date) =
-                        chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                    {
-                        let file_datetime = file_date
-                            .and_time(chrono::NaiveTime::default())
-                            .and_utc();
+                    if let Ok(file_date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                        let file_datetime =
+                            file_date.and_time(chrono::NaiveTime::default()).and_utc();
                         if (now - file_datetime).num_seconds() > max_age_secs {
                             let _ = fs::remove_file(&path);
                             removed += 1;
@@ -202,14 +199,14 @@ fn create_tray_menu(app: &tauri::App) -> Result<tauri::tray::TrayIcon, Box<dyn s
             // Only handle left-click events - right-click shows the context menu automatically
             TrayIconEvent::Click { button, .. } => {
                 // Only show window on left-click (right-click shows menu automatically)
-                if button == tauri::tray:: MouseButton::Left {
+                if button == tauri::tray::MouseButton::Left {
                     show_main_window(&app_handle_for_tray);
                 }
                 // Right-click is handled automatically by Tauri to show the menu
             }
             TrayIconEvent::DoubleClick { button, .. } => {
                 // Only show window on left-double-click
-                if button == tauri::tray:: MouseButton::Left {
+                if button == tauri::tray::MouseButton::Left {
                     show_main_window(&app_handle_for_tray);
                 }
             }
@@ -410,7 +407,7 @@ pub fn run() {
         });
 }
 
-/// Application setup function
+// Application setup function
 // ============================================================================
 // LAN access policy (desktop hardening, server deployments unaffected)
 // ============================================================================
@@ -483,7 +480,11 @@ fn apply_lan_binding(enabled: bool) {
     env::set_var("HERAMIND_HOST", bind);
     env::set_var("HERAMIND_BIND_OVERRIDE", bind);
     env::set_var("HERAMIND_MQTT_BIND", bind);
-    info!(bind, lan = enabled, "LAN access policy applied to embedded server");
+    info!(
+        bind,
+        lan = enabled,
+        "LAN access policy applied to embedded server"
+    );
 }
 
 #[tauri::command]
@@ -669,19 +670,28 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         rt.block_on(async {
             for _ in 0..50 {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                if tokio::net::TcpStream::connect("127.0.0.1:9375").await.is_ok() {
-                    let _ = handle_for_ready.emit("backend-ready", serde_json::json!({
-                        "status": "ready",
-                        "port": 9375
-                    }));
+                if tokio::net::TcpStream::connect("127.0.0.1:9375")
+                    .await
+                    .is_ok()
+                {
+                    let _ = handle_for_ready.emit(
+                        "backend-ready",
+                        serde_json::json!({
+                            "status": "ready",
+                            "port": 9375
+                        }),
+                    );
                     return;
                 }
             }
             // Timeout — emit anyway so the frontend doesn't hang
-            let _ = handle_for_ready.emit("backend-ready", serde_json::json!({
-                "status": "timeout",
-                "port": 9375
-            }));
+            let _ = handle_for_ready.emit(
+                "backend-ready",
+                serde_json::json!({
+                    "status": "timeout",
+                    "port": 9375
+                }),
+            );
         });
     });
 
@@ -689,5 +699,191 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    // CLI pre-dispatch: the desktop binary carries the full heramind-cli-ops
+    // dispatch surface (linked for the agent's shell tool), but main() never
+    // looked at argv — every `heramind-tauri dashboard list` was swallowed as
+    // a GUI launch argument and exited 0 with NO output (the silent-exit
+    // trap; the same binary IS the desktop's `heramind` CLI entry). When
+    // argv names a known data subcommand, run it in-process against the
+    // desktop data dir and exit with the CLI's exit-code contract (0 ok /
+    // 3 operation-failed / 2 parse). Serve and unknown/empty argv fall
+    // through to the normal GUI boot.
+    if let Some(code) = cli_dispatch::maybe_run_cli(std::env::args().collect()) {
+        std::process::exit(code);
+    }
     run()
+}
+
+/// One-shot CLI dispatch for `main`. `None` = no CLI subcommand (or one the
+/// GUI must own, like `serve` / `chat`) — fall through to the app.
+mod cli_dispatch {
+    /// Subcommands that must NOT run in-process (side-effecting, interactive,
+    /// or local-only per dispatch()); when argv[1] is one of these, the
+    /// desktop app behaves as before (GUI boot — `serve` is a legit way to
+    /// start the bundled server).
+    ///
+    /// api-key/user are NOT here anymore: dispatch() serves them in-process
+    /// (HTTP endpoint / auth redb). When they were GUI_OWNED, the desktop
+    /// `heramind` alias made every agent shell call land here → GUI boot →
+    /// single-instance swallow → exit 0 with NO output — a fake success.
+    const GUI_OWNED: &[&str] = &[
+        "serve",
+        "prompt",
+        "chat",
+        "list-models",
+        "health",
+        "logs",
+        "check-update",
+        "upgrade",
+        "uninstall",
+    ];
+
+    pub fn maybe_run_cli(argv: Vec<String>) -> Option<i32> {
+        // argv[0] = program path; a bare launch (no args) is the GUI.
+        if argv.len() < 2 {
+            return None;
+        }
+        let sub = argv[1].as_str();
+        // Top-level version/help: without this they'd fall to a GUI boot
+        // that the single-instance lock silently swallows — exit 0, no
+        // output, the exact silent-exit trap this dispatcher exists to fix.
+        match sub {
+            "--version" | "-V" => {
+                println!("heramind {} (desktop)", env!("CARGO_PKG_VERSION"));
+                return Some(0);
+            }
+            "--help" | "-h" => {
+                println!(
+                    "HeraMind {} — desktop app + CLI.\n\
+                     No arguments launches the app. Data subcommands run in-process:\n\
+                       heramind dashboard|device|agent|rule|transform|widget|extension|message|data ...\n\
+                     serve/chat/logs are handled by the app or a full CLI install; \
+                     extension-local and reset-password subcommands need the full CLI.",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return Some(0);
+            }
+            _ => {}
+        }
+        if GUI_OWNED.contains(&sub) {
+            return None;
+        }
+        // Only dispatch argv that names a plausible subcommand (first token
+        // looks like a CLI word, not a file path / flag — the OS may hand us
+        // document paths or tauri dev flags on normal launches). Backslash
+        // matters on Windows paths specifically; on Unix it's legal in
+        // filenames but never starts a subcommand we know.
+        if sub.starts_with('-') || sub.contains('/') || sub.contains('.') || sub.contains('\\') {
+            return None;
+        }
+
+        // Windows GUI-subsystem builds have NO console: stdout/stderr are
+        // detached from the parent even when launched from a terminal, so a
+        // data subcommand would run and print into the void (exit 0, no
+        // output — the fake-success shape). Attach to the PARENT's console
+        // and reopen the standard handles over CONOUT$ before dispatch.
+        // Not runtime-verifiable on macOS — the pattern is the documented
+        // AttachConsole dance; no-op attaches (launched from Explorer)
+        // simply leave output detached as before.
+        #[cfg(target_os = "windows")]
+        {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn AttachConsole(dw_process_id: usize) -> i32;
+                fn CreateFileW(
+                    lpfilename: *const u16,
+                    dwdesiredaccess: u32,
+                    dwsharemode: u32,
+                    lpsecurityattributes: *const core::ffi::c_void,
+                    dwcreationdisposition: u32,
+                    dwflagsandattributes: u32,
+                    htemplatefile: *mut core::ffi::c_void,
+                ) -> *mut core::ffi::c_void;
+            }
+            #[link(name = "msvcrt")]
+            unsafe extern "system" {
+                fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32;
+                fn _dup2(fd1: i32, fd2: i32) -> i32;
+            }
+            const ATTACH_PARENT_PROCESS: usize = usize::MAX;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const FILE_SHARE_WRITE: u32 = 0x2;
+            const OPEN_EXISTING: u32 = 3;
+            unsafe {
+                if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+                    // Reopen 1/2 onto CONOUT$: the inherited handles point at
+                    // the (nonexistent) creating console, not the parent's.
+                    let path: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+                    let handle = CreateFileW(
+                        path.as_ptr(),
+                        GENERIC_WRITE,
+                        FILE_SHARE_WRITE,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    );
+                    // INVALID_HANDLE_VALUE (-1), not null, is the failure sentry.
+                    if handle as isize != -1 {
+                        let dup = _open_osfhandle(handle as isize, 0);
+                        if dup >= 0 {
+                            let _ = _dup2(dup, 1);
+                            let _ = _dup2(dup, 2);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Minimal async runtime for the dispatch call.
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("cli dispatch runtime: {e}");
+                return None;
+            }
+        };
+        let tokenized: Vec<String> = argv[1..].to_vec();
+        let argv_full = std::iter::once("heramind".to_string())
+            .chain(tokenized)
+            .collect::<Vec<_>>();
+        match rt.block_on(heramind_cli_ops::dispatch::dispatch(&argv_full)) {
+            Ok(resp) => {
+                // Honor global `--json` / `--format` the same as the CLI binary
+                // (env `HERAMIND_JSON=1` remains a fallback inside the helper).
+                let fmt = heramind_cli_ops::dispatch::output_format_for_argv(&argv_full);
+                // format_output is pure — printing is the caller's job (the
+                // old print-inside-format double-printed for callers that
+                // print the return, like this one).
+                print!("{}", heramind_cli_ops::output::format_output(&resp, fmt));
+                Some(if resp.success { 0 } else { 3 })
+            }
+            Err(heramind_cli_ops::dispatch::DispatchError::Parse(msg)) => {
+                eprintln!("{msg}");
+                Some(2)
+            }
+            Err(heramind_cli_ops::dispatch::DispatchError::NotInProcess) => {
+                // Local-only subcommands (extension create/build/validate,
+                // user reset-password) have no in-process implementation and
+                // no subprocess fallback here — the desktop `heramind` alias
+                // points at THIS binary, so "fall back to a subprocess"
+                // would recurse into another GUI boot. Say so explicitly:
+                // the agent reads this stderr and can pick another route.
+                eprintln!(
+                    "error: this subcommand needs the full heramind CLI install \
+                     (it manages local files/processes the desktop in-process \
+                     dispatch cannot reach). For extension scaffolding use the \
+                     HeraMind-Extensions toolchain, or run against a server install."
+                );
+                Some(1)
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                Some(1)
+            }
+        }
+    }
 }

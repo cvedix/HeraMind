@@ -30,7 +30,7 @@ import { DataMapper, type TimeSeriesMappingConfig } from '@/lib/dataMapping'
 import { dashboardCardBase, dashboardComponentSize } from '@/design-system/tokens/size'
 import { indicatorFontWeight } from '@/design-system/tokens/indicator'
 import { chartColors as designChartColors, chartColorsHex } from '@/design-system/tokens/color'
-import type { DataSource, DataSourceOrList, TelemetryAggregate } from '@/types/dashboard'
+import type { DataSourceOrList, TelemetryAggregate } from '@/types/dashboard'
 import { ChartContainer, ChartTooltip, EmptyState, ErrorState, useChartDimensions, useStaggeredData, createMemoRenderer, useChartPipeline } from '../shared'
 import { isSeriesDataArray, isNumberArray, isMultiSourceData, alignMultiSource, extractNumericValue, type SeriesData } from '../shared'
 import {
@@ -38,7 +38,7 @@ import {
 } from '@/lib/telemetryTransform'
 
 // Use design system chart colors
-const chartColors = designChartColors
+const _chartColors = designChartColors
 
 // Use design system hex colors for SVG rendering
 const fallbackColors = chartColorsHex
@@ -99,7 +99,7 @@ function transformTelemetryToChartData(
 /**
  * Format timestamp to readable time
  */
-function formatTimestamp(timestamp: string | number | undefined): string {
+function _formatTimestamp(timestamp: string | number | undefined): string {
   if (!timestamp) return ''
 
   const date = new Date(typeof timestamp === 'number' ? timestamp * 1000 : timestamp)
@@ -151,7 +151,7 @@ const LineChartInner = function LineChart({
   series: propSeries,
   labels: propLabels,
   title,
-  height = 'auto',
+  height: _height = 'auto',
   showGrid = false,
   showLegend = false,
   showTooltip = true,
@@ -171,7 +171,7 @@ const LineChartInner = function LineChart({
   // Shared data pipeline
   const {
     sources, data, loading, error,
-    hasData, showLoading, getSeriesName,
+    hasData: _hasData, showLoading, getSeriesName,
   } = useChartPipeline<any>({
     dataSource,
     aggregate,
@@ -222,7 +222,7 @@ const LineChartInner = function LineChart({
     if (dataSource && Array.isArray(data) && data.length > 0 && !isSeriesDataArray(data)) {
 
       // Single source - transform telemetry points
-      const { labels, values } = transformTelemetryToChartData(data, dataMapping)
+      const { labels: _labels, values } = transformTelemetryToChartData(data, dataMapping)
       if (values.length > 0) {
         const singleSource = sources[0]
         const seriesName = singleSource ? getSeriesName(singleSource, 0) : 'Value'
@@ -329,11 +329,11 @@ const LineChartInner = function LineChart({
   // so series will have sample data. Only show empty state when we have a dataSource but
   // the single-source case produced nothing.
   if (dataSource && !loading && series.length === 0) {
-    return <EmptyState size={size} className={className} message={title ? `${title} - No Data Available` : undefined} />
+    return <EmptyState size={size} className={className} message={title ? `${title} - ${t('defaultStates.noData')}` : undefined} />
   }
 
   if (!loading && chartData.length === 0) {
-    return <EmptyState size={size} className={className} message={title ? `${title} - No Data Available` : undefined} />
+    return <EmptyState size={size} className={className} message={title ? `${title} - ${t('defaultStates.noData')}` : undefined} />
   }
 
   return (
@@ -548,7 +548,7 @@ export const AreaChart = memo(function AreaChart({
   // Shared data pipeline — same pattern as LineChart
   const {
     sources, data, loading, error,
-    hasData, showLoading, getSeriesName,
+    hasData: _hasData, showLoading, getSeriesName,
   } = useChartPipeline<any>({
     dataSource,
     aggregate,
@@ -599,7 +599,7 @@ export const AreaChart = memo(function AreaChart({
     if (dataSource && Array.isArray(data) && data.length > 0 && !isSeriesDataArray(data)) {
 
       // Single source - transform telemetry points
-      const { labels: telemetryLabels, values } = transformTelemetryToChartData(data, dataMapping)
+      const { labels: _telemetryLabels, values } = transformTelemetryToChartData(data, dataMapping)
       if (values.length > 0) {
         const singleSource = sources[0]
         const seriesName = singleSource ? getSeriesName(singleSource, 0) : 'Value'
@@ -699,11 +699,11 @@ export const AreaChart = memo(function AreaChart({
 
   // Empty state - only when dataSource is configured, data finished loading, and no data at all
   if (dataSource && !loading && series.length === 0) {
-    return <EmptyState size={size} className={className} message={title ? `${title} - No Data Available` : undefined} />
+    return <EmptyState size={size} className={className} message={title ? `${title} - ${t('defaultStates.noData')}` : undefined} />
   }
 
   if (!loading && chartData.length === 0) {
-    return <EmptyState size={size} className={className} message={title ? `${title} - No Data Available` : undefined} />
+    return <EmptyState size={size} className={className} message={title ? `${title} - ${t('defaultStates.noData')}` : undefined} />
   }
 
   return (

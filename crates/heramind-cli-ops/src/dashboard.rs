@@ -1,4 +1,4 @@
-use crate::types::{BuildMeta, CliResponse};
+use crate::types::CliResponse;
 use crate::ApiClient;
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -57,15 +57,16 @@ fn grid_summary(components: &[serde_json::Value]) -> (String, u64) {
     )
 }
 
-/// Extract the components array from a GET / add-components API response
-/// (handles the double-nested `data.data` the API wraps).
+/// Extract the components array from a GET / add-components API response.
+/// Handles unwrapped payloads directly and falls back to legacy nested `data`.
 fn response_components(data: &serde_json::Value) -> Vec<serde_json::Value> {
-    data.get("data")
-        .and_then(|d| {
-            d.get("components")
-                .or_else(|| d.get("data").and_then(|dd| dd.get("components")))
+    data.get("components")
+        .or_else(|| {
+            data.get("data").and_then(|d| {
+                d.get("components")
+                    .or_else(|| d.get("data").and_then(|dd| dd.get("components")))
+            })
         })
-        .or_else(|| data.get("components"))
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default()
@@ -144,17 +145,26 @@ pub async fn list_dashboards(client: &ApiClient) -> Result<CliResponse> {
 
 /// Get dashboard by ID (or name — server resolves both).
 pub async fn get_dashboard(client: &ApiClient, id: &str) -> Result<CliResponse> {
-    let data = client.get(&format!("/dashboards/{}", id)).await?;
+    let mut data = client.get(&format!("/dashboards/{}", id)).await?;
     let comps = response_components(&data);
     let (occupied, next_free_y) = grid_summary(&comps);
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            "grid".to_string(),
+            json!({
+                "columns": 12,
+                "unit": "grid_cells",
+                "occupied_rows": occupied,
+                "next_free_y": next_free_y,
+                "component_count": comps.len(),
+            }),
+        );
+    }
     Ok(CliResponse::success(
         data,
         format!(
-            "Dashboard retrieved — {} components, 12-col grid, occupied rows: {}, next free row: y={} (place new widgets at y={} to avoid overlap)",
-            comps.len(),
-            occupied,
-            next_free_y,
-            next_free_y
+            "Dashboard retrieved — {} component(s); see data.grid for layout facts",
+            comps.len()
         ),
     ))
 }
@@ -243,26 +253,8 @@ pub async fn create_dashboard(
     }
 
     let data = client.post("/dashboards", &body).await?;
-    let dashboard_id = data
-        .get("data")
-        .and_then(|d| d.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
 
-    let meta = BuildMeta {
-        r#type: "dashboard".to_string(),
-        action: "create".to_string(),
-        entity_id: dashboard_id.clone(),
-        entity_name: Some(name.to_string()),
-        undo_command: format!("heramind dashboard delete {}", dashboard_id),
-    };
-
-    Ok(CliResponse::success_with_meta(
-        data,
-        "Dashboard created",
-        meta,
-    ))
+    Ok(CliResponse::success(data, "Dashboard created"))
 }
 
 /// Update dashboard
@@ -316,8 +308,8 @@ pub async fn update_component(
         )
         .await?;
     let updated_id = data
-        .get("data")
-        .and_then(|d| d.get("component_id"))
+        .get("component_id")
+        .or_else(|| data.get("data").and_then(|d| d.get("component_id")))
         .and_then(|v| v.as_str())
         .unwrap_or(component_id)
         .to_string();
@@ -368,7 +360,11 @@ pub async fn remove_components(
     let data = client
         .delete_with_body(&format!("/dashboards/{}/components", id), &body)
         .await?;
-    let inner = data.get("data").unwrap_or(&data);
+    let inner = if data.get("removed").is_some() || data.get("remaining").is_some() {
+        &data
+    } else {
+        data.get("data").unwrap_or(&data)
+    };
     let removed = inner["removed"].as_u64().unwrap_or(0);
     let remaining = inner["remaining"].as_u64().unwrap_or(0);
     Ok(CliResponse::success(
@@ -395,4 +391,21 @@ pub async fn share_dashboard(
         .post(&format!("/dashboards/{}/share", id), &body)
         .await?;
     Ok(CliResponse::success(data, "Dashboard shared"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn grid_summary_reports_occupied_and_next_free_y() {
+        let comps = vec![
+            json!({"position":{"x":0,"y":0,"w":4,"h":2}}),
+            json!({"position":{"x":4,"y":2,"w":4,"h":1}}),
+        ];
+        let (occupied, next) = grid_summary(&comps);
+        assert_eq!(occupied, "0-2");
+        assert_eq!(next, 3);
+    }
 }

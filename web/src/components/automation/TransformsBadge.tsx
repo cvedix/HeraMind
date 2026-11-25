@@ -85,7 +85,7 @@ export function TransformsBadge({ deviceId, deviceTypeId, count: countProp, onRe
   // visual noise in the table.
   if (count === 0) {
     return (
-      <span className="inline-flex items-center h-7 px-2 text-xs leading-none text-muted-foreground/60 tabular-nums">
+      <span className="inline-flex items-center h-7 px-2 text-xs leading-none text-muted-foreground opacity-60 tabular-nums">
         <Database className="h-3.5 w-3.5 mr-1 opacity-50" />0
       </span>
     )
@@ -96,13 +96,13 @@ export function TransformsBadge({ deviceId, deviceTypeId, count: countProp, onRe
       <Button
         variant="ghost"
         size="sm"
-        className="h-7 px-2"
+        className="h-7 px-2 sm:h-7"
         onClick={(e) => { e.stopPropagation(); setDialogOpen(true) }}
       >
         <Database className="h-4 w-4 mr-1 text-accent-purple" />
-        <Badge variant="outline" className="text-xs">
-          {count}
-        </Badge>
+        {/* Plain count — the ghost button already carries the affordance;
+            an outlined chip inside it doubles the chrome. */}
+        <span className="text-xs tabular-nums">{count}</span>
       </Button>
 
       {/* Only mount the dialog when open to avoid N×3 API calls on page load */}

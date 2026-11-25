@@ -14,32 +14,93 @@
 use crate::toolkit::error::{Result, ToolError};
 use crate::toolkit::timeouts;
 use crate::toolkit::tool::{Tool, ToolOutput};
+use ab_glyph::Font as _;
 use heramind_core::tools::ToolCategory;
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-/// Color newtype with hex deserialization support.
+/// Color newtype with hex/CSS deserialization support.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Color(#[serde(deserialize_with = "deserialize_color")] pub image::Rgba<u8>);
 
-/// Deserialize hex color `#RRGGBB` or `#RRGGBBAA` (prefix `#` optional).
+/// Parse a color: `#RRGGBB` / `#RRGGBBAA` hex (prefix `#` optional) or CSS
+/// `rgb(r,g,b)` / `rgba(r,g,b,a)` (alpha 0-1 or 0-255; components 0-255).
+///
+/// Small models routinely send the CSS form (observed: `rgba(0,0,0,0.7)`
+/// for a text background); rejecting it with serde's raw
+/// "invalid digit found in string" left the model nothing to act on and it
+/// flailed through four more calls. Returns `None` for anything else so the
+/// pre-parse validator can name the offending value and the accepted forms.
+fn parse_color(s: &str) -> Option<image::Rgba<u8>> {
+    let s = s.trim();
+    let as_hex = |hex: &str| -> Option<image::Rgba<u8>> {
+        if hex.len() != 6 && hex.len() != 8 {
+            return None;
+        }
+        if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        let a = if hex.len() == 8 {
+            u8::from_str_radix(&hex[6..8], 16).ok()?
+        } else {
+            255
+        };
+        Some(image::Rgba([r, g, b, a]))
+    };
+    // Bare hex (no '#') stays valid — the original parser accepted it.
+    if let Some(hex) = s.strip_prefix('#') {
+        return as_hex(hex);
+    }
+    if !(s.starts_with("rgb(") || s.starts_with("rgba(")) {
+        return as_hex(s);
+    }
+    let inner = s
+        .strip_prefix("rgba(")
+        .and_then(|x| x.strip_suffix(')'))
+        .or_else(|| s.strip_prefix("rgb(").and_then(|x| x.strip_suffix(')')))?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if parts.len() != 3 && parts.len() != 4 {
+        return None;
+    }
+    let num = |v: &str| v.parse::<u32>().ok().filter(|n| *n <= 255);
+    let r = num(parts[0])? as u8;
+    let g = num(parts[1])? as u8;
+    let b = num(parts[2])? as u8;
+    let a = if parts.len() == 4 {
+        // Accept both CSS alpha (0.0-1.0) and raw 0-255.
+        if let Ok(f) = parts[3].parse::<f32>() {
+            if (0.0..=1.0).contains(&f) {
+                (f * 255.0).round() as u8
+            } else if (0.0..=255.0).contains(&f) {
+                f.round() as u8
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    } else {
+        255
+    };
+    Some(image::Rgba([r, g, b, a]))
+}
+
+/// Deserialize via [`parse_color`]; the error names the value and the forms.
 fn deserialize_color<'de, D>(deserializer: D) -> std::result::Result<image::Rgba<u8>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Error;
     let s = String::deserialize(deserializer)?;
-    let hex = s.strip_prefix('#').unwrap_or(&s);
-    let r = u8::from_str_radix(&hex[0..2], 16).map_err(D::Error::custom)?;
-    let g = u8::from_str_radix(&hex[2..4], 16).map_err(D::Error::custom)?;
-    let b = u8::from_str_radix(&hex[4..6], 16).map_err(D::Error::custom)?;
-    let a = if hex.len() == 8 {
-        u8::from_str_radix(&hex[6..8], 16).map_err(D::Error::custom)?
-    } else {
-        255
-    };
-    Ok(image::Rgba([r, g, b, a]))
+    parse_color(&s).ok_or_else(|| {
+        D::Error::custom(format!(
+            "invalid color '{s}': use #RRGGBB, #RRGGBBAA, rgb(r,g,b) or rgba(r,g,b,a)"
+        ))
+    })
 }
 
 /// Individual image editing operation (crop, draw, blur, etc.).
@@ -135,8 +196,14 @@ pub enum Operation {
     },
     #[serde(rename = "draw_text")]
     DrawText {
-        x: i32,
-        y: i32,
+        // Position is optional: the watermark case ("draw the current time")
+        // routinely arrives without coordinates, and a hard failure on a
+        // missing `x` aborts the whole pipeline. Missing x/y default to
+        // centering — see `default_text_position`.
+        #[serde(default)]
+        x: Option<i32>,
+        #[serde(default)]
+        y: Option<i32>,
         text: String,
         #[serde(default = "default_rect_color")]
         color: Color,
@@ -281,8 +348,6 @@ pub enum OpError {
     NoFont,
     #[error("invalid text (empty or too long)")]
     InvalidText,
-    #[error("font parse failed")]
-    FontParse,
 }
 
 /// Image editing tool entry point. Owns the data directory (where outputs land)
@@ -315,11 +380,7 @@ impl Tool for ImageEditTool {
     }
 
     fn description(&self) -> &str {
-        "Crop, draw on, or blur images in ONE pipeline call. Returns a file path /api/images/... that can be passed to `vision` or shown via `![desc](url)`.\n\n\
- IMPORTANT — ONE CALL = WHOLE PIPELINE: pass all operations for an image as a single `operations` array (applied in order). Do NOT chain multiple image_edit calls for one task. Example: crop + draw label in one call, not three.\n\n\
- IMAGE ARGUMENT: use `\"image\": \"$cached:user_image\"` for an image the user uploaded to chat ($cached:user_image_1, _2, ... for additional); otherwise data URL, http(s) URL, base64, or a local path from a prior call.\n\n\
- Use `vision` (not image_edit) to ANALYZE image content. If you need to verify the edit, call `vision` with the returned path once.\n\n\
- Operation types and per-op fields are defined in the `operations` schema below (crop, draw_rect/circle/line/arrow/polygon/text, blur_rect)."
+        "Edit image via ordered operations. Source: $cached:user_image[_N], URL, path, or /api/images/…. Type fields: crop/draw_rect/blur_rect: x,y,width,height; draw_circle: cx,cy,radius; draw_line/draw_arrow: x1,y1,x2,y2; draw_polygon: points; draw_text: text. #RRGGBB[AA]."
     }
 
     fn parameters(&self) -> Value {
@@ -327,27 +388,54 @@ impl Tool for ImageEditTool {
             "type": "object",
             "required": ["image", "operations"],
             "properties": {
-                "image": {
-                    "type": "string",
-                    "description": "Source image. Use \"$cached:user_image\" to reference the most recent image uploaded to chat by the user (the runtime auto-resolves this). Other accepted forms: data URL (data:image/...;base64,...), http(s) URL, raw base64, or absolute local file path returned by a previous image_edit call."
-                },
+                "image": { "type": "string" },
                 "operations": {
                     "type": "array",
                     "maxItems": 50,
                     "items": {
                         "type": "object",
+                        "required": ["type"],
                         "properties": {
                             "type": {
                                 "type": "string",
                                 "enum": ["crop", "draw_rect", "draw_circle", "draw_line", "draw_arrow", "draw_polygon", "draw_text", "blur_rect"]
-                            }
+                            },
+                            "x": { "type": "integer" },
+                            "y": { "type": "integer" },
+                            "width": { "type": "integer" },
+                            "height": { "type": "integer" },
+                            "cx": { "type": "integer" },
+                            "cy": { "type": "integer" },
+                            "radius": { "type": "integer" },
+                            "x1": { "type": "integer" },
+                            "y1": { "type": "integer" },
+                            "x2": { "type": "integer" },
+                            "y2": { "type": "integer" },
+                            "points": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": { "x": { "type": "integer" }, "y": { "type": "integer" } },
+                                    "required": ["x", "y"]
+                                }
+                            },
+                            "text": { "type": "string" },
+                            "color": { "type": "string" },
+                            "fill": { "type": "string" },
+                            "background": { "type": "string" },
+                            "stroke_width": { "type": "integer" },
+                            "head_length": { "type": "integer" },
+                            "font_size": { "type": "integer" },
+                            "padding": { "type": "integer" },
+                            "closed": { "type": "boolean" },
+                            "mode": { "type": "string", "enum": ["pixelate", "gaussian"] },
+                            "intensity": { "type": "integer" }
                         }
-                    },
-                    "description": "Each operation must have a `type` field. Common fields: x/y/width/height (pixel coords, origin top-left, Y-axis down). Colors are #RRGGBB or #RRGGBBAA hex strings. See tool description for per-operation fields."
+                    }
                 },
-                "output_format": { "type": "string", "enum": ["png", "jpeg", "webp"], "default": "png" },
-                "output_filename": { "type": "string", "description": "Optional filename (no path). If omitted, a UUID-based name is generated." },
-                "include_base64": { "type": "boolean", "default": false }
+                "output_format": { "type": "string", "enum": ["png", "jpeg", "webp"] },
+                "output_filename": { "type": "string" },
+                "include_base64": { "type": "boolean" }
             }
         })
     }
@@ -357,6 +445,7 @@ impl Tool for ImageEditTool {
     }
 
     async fn execute(&self, args: Value) -> Result<ToolOutput> {
+        validate_operations(&args)?;
         let params: ImageEditParams = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("invalid image_edit args: {}", e)))?;
 
@@ -391,9 +480,38 @@ impl Tool for ImageEditTool {
         }
 
         // 3. Apply operations atomically (fail -> no file written).
-        for op in &params.operations {
-            apply_operation(&mut img, op)
+        // Each op reports `pixels_changed` — the "watermark was never visible"
+        // failure mode (text drawn off-canvas / behind other ops) otherwise
+        // surfaces only when the user complains.
+        let mut warnings: Vec<String> = Vec::new();
+        let mut operations_detail: Vec<Value> = Vec::new();
+        for (idx, op) in params.operations.iter().enumerate() {
+            let before: Option<(Vec<u8>, usize)> = {
+                let bytes = img.as_bytes();
+                (bytes.len() <= PIXEL_DIFF_MAX_BUFFER)
+                    .then(|| (bytes.to_vec(), img.color().channel_count() as usize))
+            };
+            apply_operation(&mut img, op, &mut warnings, idx)
                 .map_err(|e| ToolError::Execution(format!("operation failed: {:?}", e)))?;
+            let pixels_changed =
+                before.and_then(|(buf, ch)| count_changed_pixels(&buf, img.as_bytes(), ch));
+            if let Some(0) = pixels_changed {
+                // Not an error — blur on a uniform region legitimately changes
+                // nothing — but for draw ops it almost always means the edit
+                // landed outside the canvas or was fully occluded.
+                warnings.push(format!(
+                    "operations[{}] ({}): changed 0 pixels — verify coordinates land inside the {}x{} canvas",
+                    idx,
+                    operation_type_name(op),
+                    img.width(),
+                    img.height()
+                ));
+            }
+            operations_detail.push(serde_json::json!({
+                "index": idx,
+                "type": operation_type_name(op),
+                "pixels_changed": pixels_changed,
+            }));
         }
 
         // 4. Encode result.
@@ -412,8 +530,12 @@ impl Tool for ImageEditTool {
             "size_bytes": out_bytes.len(),
             "image_type": mime,
             "operations_applied": params.operations.len(),
+            "operations_detail": Value::Array(operations_detail),
             "status": "success",
         });
+        if !warnings.is_empty() {
+            resp["warnings"] = Value::Array(warnings.into_iter().map(Value::String).collect());
+        }
         if params.include_base64 {
             let b64 =
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &out_bytes);
@@ -506,10 +628,139 @@ fn sanitize_filename(name: &str, expected_ext: &str) -> Result<String> {
     Ok(format!("{}.{}", stem, expected_ext))
 }
 
+/// Required fields per operation type, beyond the `type` tag itself.
+/// `draw_text` position (x/y) is intentionally absent — it defaults to centered.
+fn required_fields_for(op_type: &str) -> &'static [&'static str] {
+    match op_type {
+        "crop" | "draw_rect" | "blur_rect" => &["x", "y", "width", "height"],
+        "draw_circle" => &["cx", "cy", "radius"],
+        "draw_line" | "draw_arrow" => &["x1", "y1", "x2", "y2"],
+        "draw_polygon" => &["points"],
+        "draw_text" => &["text"],
+        _ => &[],
+    }
+}
+
+/// Compact per-type required-fields table, embedded in actionable errors (and
+/// mirrored in the tool schema description) so the LLM can self-correct on the
+/// next round instead of staring at a bare serde "missing field `x`".
+const OPERATIONS_CHEAT_SHEET: &str = "crop/draw_rect/blur_rect: x,y,width,height | draw_circle: cx,cy,radius | draw_line/draw_arrow: x1,y1,x2,y2 | draw_polygon: points:[{x,y},...] | draw_text: text (x,y optional, defaults to centered)";
+
+/// Operation type tag for `operations_detail` reporting.
+fn operation_type_name(op: &Operation) -> &'static str {
+    match op {
+        Operation::Crop { .. } => "crop",
+        Operation::DrawRect { .. } => "draw_rect",
+        Operation::DrawCircle { .. } => "draw_circle",
+        Operation::DrawLine { .. } => "draw_line",
+        Operation::DrawArrow { .. } => "draw_arrow",
+        Operation::DrawPolygon { .. } => "draw_polygon",
+        Operation::DrawText { .. } => "draw_text",
+        Operation::BlurRect { .. } => "blur_rect",
+    }
+}
+
+/// Skip per-op pixel diffing above this buffer size — a full-frame clone per
+/// operation would double memory for huge images for a purely informational stat.
+const PIXEL_DIFF_MAX_BUFFER: usize = 64 * 1024 * 1024;
+
+/// Count pixels whose bytes differ between two same-layout frame buffers.
+/// `None` when lengths differ (layout/dimension change, e.g. crop) or the
+/// channel count is invalid.
+fn count_changed_pixels(before: &[u8], after: &[u8], channels: usize) -> Option<u64> {
+    if channels == 0 || before.len() != after.len() {
+        return None;
+    }
+    Some(
+        before
+            .chunks_exact(channels)
+            .zip(after.chunks_exact(channels))
+            .filter(|(b, a)| b != a)
+            .count() as u64,
+    )
+}
+
+/// Pre-scan raw `operations` JSON for missing required fields before serde
+/// rejects the whole call with an opaque "missing field `x`". Emits an error
+/// that names the failing operation index and exactly what to add.
+fn validate_operations(args: &Value) -> Result<()> {
+    let Some(ops) = args.get("operations").and_then(|v| v.as_array()) else {
+        return Ok(()); // absent / wrong shape — let serde report it
+    };
+    for (i, op) in ops.iter().enumerate() {
+        let Some(obj) = op.as_object() else {
+            continue;
+        };
+        let Some(op_type) = obj.get("type").and_then(|t| t.as_str()) else {
+            return Err(ToolError::InvalidArguments(format!(
+                "operations[{}] has no `type` field. Valid types: crop, draw_rect, draw_circle, draw_line, draw_arrow, draw_polygon, draw_text, blur_rect. Required fields per type: {}",
+                i, OPERATIONS_CHEAT_SHEET
+            )));
+        };
+        let missing: Vec<&str> = required_fields_for(op_type)
+            .iter()
+            .filter(|f| !obj.contains_key(**f))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            return Err(ToolError::InvalidArguments(format!(
+                "operations[{}] (type \"{}\") is missing required field(s): {}. Required fields per type: {}",
+                i,
+                op_type,
+                missing.join(", "),
+                OPERATIONS_CHEAT_SHEET
+            )));
+        }
+        // Color-format pre-check: serde's raw failure ("invalid digit found
+        // in string") names neither the field nor the accepted forms — the
+        // model gets nothing to act on (observed: an `rgba(...)` background
+        // produced four flailing retries after it).
+        for field in ["color", "fill", "background"] {
+            if let Some(Value::String(raw)) = obj.get(field) {
+                if parse_color(raw).is_none() {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "operations[{}] (type \"{}\") field \"{}\": invalid color '{}'. Use #RRGGBB, #RRGGBBAA, rgb(r,g,b) or rgba(r,g,b,a).",
+                        i, op_type, field, raw
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve draw_text position. When the LLM omits x/y, center the text block
+/// (using the same width estimate as `apply_draw_text`) instead of failing.
+/// Returns `(x, y, defaulted)`.
+fn default_text_position(
+    img: &image::DynamicImage,
+    x: Option<i32>,
+    y: Option<i32>,
+    text: &str,
+    font_size: u32,
+    padding: u32,
+) -> (i32, i32, bool) {
+    let text_w = (text.len() as u32 * font_size * 3 / 5).max(1) + 2 * padding;
+    let text_h = font_size + 2 * padding;
+    let default_x = ((img.width() as i32 - text_w as i32) / 2).max(0);
+    let default_y = ((img.height() as i32 - text_h as i32) / 2).max(0);
+    match (x, y) {
+        (Some(x), Some(y)) => (x, y, false),
+        (None, Some(y)) => (default_x, y, true),
+        (Some(x), None) => (x, default_y, true),
+        (None, None) => (default_x, default_y, true),
+    }
+}
+
 /// Dispatch a single operation against `img`.
+///
+/// `warnings` collects non-fatal fallback notices (e.g. defaulted draw_text
+/// position) surfaced in the tool response so the LLM can adjust next round.
 fn apply_operation(
     img: &mut image::DynamicImage,
     op: &Operation,
+    warnings: &mut Vec<String>,
+    op_index: usize,
 ) -> std::result::Result<(), OpError> {
     match op {
         Operation::Crop {
@@ -613,17 +864,39 @@ fn apply_operation(
             background,
             padding,
         } => {
-            let font_bytes = probe_font().ok_or(OpError::NoFont)?;
+            let Some((font, covered, total)) = select_font_for(text) else {
+                return Err(OpError::NoFont);
+            };
+            if covered < total {
+                // Missing glyphs rasterize as tofu boxes — surface it instead
+                // of letting the model relay a bare "success" for a garbled
+                // watermark.
+                warnings.push(format!(
+                    "operations[{}]: draw_text — best probed font ({}) still lacks glyphs for {}/{} char(s) (e.g. CJK); they will render as boxes. Install a CJK font (Linux: `apt install fonts-noto-cjk` / `dnf install google-noto-sans-cjk-ttc-fonts`)",
+                    op_index,
+                    font.source,
+                    total - covered,
+                    total
+                ));
+            }
+            let (rx, ry, defaulted) =
+                default_text_position(img, *x, *y, text, *font_size, *padding);
+            if defaulted {
+                warnings.push(format!(
+                    "operations[{}]: draw_text x/y omitted — defaulted to centered ({}, {})",
+                    op_index, rx, ry
+                ));
+            }
             apply_draw_text(
                 img,
-                *x,
-                *y,
+                rx,
+                ry,
                 text,
                 color.0,
                 *font_size,
                 background.clone().map(|c| c.0),
                 *padding,
-                font_bytes,
+                &font.font,
             )
         }
         Operation::BlurRect {
@@ -721,46 +994,355 @@ fn apply_crop(
     Ok(())
 }
 
-/// Font loader with OnceLock caching.
-static FONT_BYTES: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+/// A parsed system font kept alive for the process lifetime. Only SELECTED
+/// winners are ever materialized (see [`FONT_WINNERS`]) — ab_glyph's owned
+/// faces each carry a full copy of the source file, so caching every face of
+/// every TTC parked ~200MB of fonts on macOS (Hiragino 24.7MB x4 faces +
+/// STHeiti 53.2MB x2).
+struct FontCandidate {
+    font: ab_glyph::FontArc,
+    source: &'static str,
+}
 
-/// Probe system fonts and return bytes (cached).
-fn probe_font() -> Option<&'static [u8]> {
-    FONT_BYTES
-        .get_or_init(|| {
-            let candidates: &[&str] = if cfg!(target_os = "macos") {
-                &[
-                    "/System/Library/Fonts/PingFang.ttc",
-                    "/System/Library/Fonts/Helvetica.ttc",
-                    "/Library/Fonts/Arial.ttf",
-                ]
-            } else if cfg!(target_os = "windows") {
-                &[
-                    "C:\\Windows\\Fonts\\msyh.ttc",
-                    "C:\\Windows\\Fonts\\msyh.ttf",
-                    "C:\\Windows\\Fonts\\arial.ttf",
-                ]
-            } else {
-                &[
-                    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                ]
-            };
-            for path in candidates {
-                if let Ok(bytes) = std::fs::read(path) {
-                    tracing::debug!(
-                        font_path = %path,
-                        "image_edit: font loaded ({} bytes)",
-                        bytes.len()
-                    );
-                    return Some(bytes);
-                }
+/// What [`select_font_for`] hands the caller: an Arc HANDLE to the winning
+/// face (clone-cheap, shares the cached tables) plus where it came from for
+/// diagnostics.
+struct FontSelection {
+    font: ab_glyph::FontArc,
+    source: &'static str,
+}
+
+/// A face ADDRESS — path + TTC index, no font data held. The scan reads only
+/// file headers, so listing every candidate face is effectively free.
+struct FaceAddr {
+    path: &'static str,
+    index: u32,
+}
+
+/// All probed face addresses (scanned once). CJK-capable paths are listed
+/// FIRST in [`system_font_paths`] so they win coverage ties.
+static FACE_ADDRS: OnceLock<Vec<FaceAddr>> = OnceLock::new();
+
+/// Parsed WINNERS, one per dominant script class (CJK / everything else).
+/// draw_text traffic resolves to one of at most two faces in practice, which
+/// bounds the font-resident set to two file copies however many TTCs exist.
+static FONT_WINNERS: std::sync::Mutex<[Option<FontCandidate>; 2]> =
+    std::sync::Mutex::new([None, None]);
+
+#[derive(Clone, Copy, PartialEq)]
+enum ScriptClass {
+    Cjk,
+    Other,
+}
+
+fn script_class(text: &str) -> ScriptClass {
+    // Any CJK char makes the text CJK-class: mixed watermark strings
+    // ("有人 NE302 …") must resolve to the CJK face, never the Latin one.
+    let cjk = text.chars().any(|c| {
+        matches!(c as u32,
+            0x3000..=0x303F   // CJK punctuation
+            | 0x3040..=0x30FF // kana
+            | 0x3400..=0x4DBF // ext A
+            | 0x4E00..=0x9FFF // unified
+            | 0xF900..=0xFAFF // compat
+            | 0xFF00..=0xFFEF // fullwidth
+        )
+    });
+    if cjk {
+        ScriptClass::Cjk
+    } else {
+        ScriptClass::Other
+    }
+}
+
+/// Candidate system font files, CJK-capable first. Order matters: for text
+/// every font covers equally (pure Latin), the earliest candidate is chosen.
+fn system_font_paths() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &[
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ]
+    } else if cfg!(target_os = "windows") {
+        &[
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttf",
+            "C:\\Windows\\Fonts\\simhei.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+        ]
+    } else {
+        &[
+            // Noto CJK — the standard answer on Ubuntu/Debian (fonts-noto-cjk)
+            // and Arch-style layouts.
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            // WenQuanYi and Droid fallbacks — common on minimal/headless boxes.
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            // Latin-only last resort (no CJK glyphs — coverage check will
+            // surface a warning instead of silently drawing tofu).
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    }
+}
+
+/// Enumerate candidate faces (headers only, no font data retained). TTC
+/// collections contribute one address per face: `try_from_vec` alone would
+/// only ever get face 0 (for NotoSansCJK-*.ttc that is the JP variant —
+/// legible for Chinese, but the other faces are kept as candidates too).
+/// ab_glyph exposes no name table, so faces are distinguished only by glyph
+/// coverage downstream.
+fn parse_face_addrs(bytes: &[u8], path: &'static str, out: &mut Vec<FaceAddr>) {
+    const MAX_CACHED_FACES: usize = 8;
+    if out.len() >= MAX_CACHED_FACES {
+        return;
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"ttcf" {
+        // TTC header: tag(4) version(4) numFonts(4 BE) offsets[...]
+        let num_faces = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        for index in 0..num_faces.min(8) {
+            out.push(FaceAddr { path, index });
+            if out.len() >= MAX_CACHED_FACES {
+                break;
             }
+        }
+    } else {
+        out.push(FaceAddr { path, index: 0 });
+    }
+}
+
+/// Scan system font paths and enumerate faces. Reads only the first 12
+/// bytes of each existing file — cheap, and nothing is retained.
+fn probe_faces() -> &'static [FaceAddr] {
+    FACE_ADDRS.get_or_init(|| {
+        let mut out = Vec::new();
+        for path in system_font_paths() {
+            // Header-only read: face enumeration must not load font tables.
+            let mut header = [0u8; 12];
+            match std::fs::File::open(path)
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut header))
+            {
+                Ok(()) => {
+                    let before = out.len();
+                    parse_face_addrs(&header, path, &mut out);
+                    if out.len() > before {
+                        tracing::debug!(
+                            font_path = %path,
+                            faces = out.len() - before,
+                            "image_edit: font discovered"
+                        );
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        if out.is_empty() {
             tracing::debug!("image_edit: no system font found");
-            None
-        })
-        .as_deref()
+        }
+        out
+    })
+}
+
+/// Parse ONE face into an owned FontArc (one file copy — the unit of memory
+/// this module budgets).
+fn load_face(addr: &FaceAddr, bytes: Vec<u8>) -> Option<FontCandidate> {
+    if addr.index == 0 && !(bytes.len() >= 12 && &bytes[0..4] == b"ttcf") {
+        ab_glyph::FontArc::try_from_vec(bytes).ok()
+    } else {
+        ab_glyph::FontVec::try_from_vec_and_index(bytes, addr.index)
+            .ok()
+            .map(ab_glyph::FontArc::new)
+    }
+    .map(|font| FontCandidate {
+        font,
+        source: addr.path,
+    })
+}
+
+/// Glyph coverage of `text` in a ZERO-COPY borrowed face (probe without
+/// paying the owned-copy). Same counting rules as [`coverage`].
+fn coverage_of_ref(font: &ab_glyph::FontRef, text: &str) -> (usize, usize) {
+    let mut covered = 0usize;
+    let mut total = 0usize;
+    for ch in text.chars().filter(|c| !c.is_whitespace()) {
+        total += 1;
+        if font.glyph_id(ch).0 != 0 {
+            covered += 1;
+        }
+    }
+    (covered, total.max(1))
+}
+
+/// Available-face predicate for tests (warning paths probe inline).
+#[cfg(test)]
+fn probe_fonts_available() -> bool {
+    !probe_faces().is_empty()
+}
+
+/// Glyph coverage of `text` in `font`: (covered, total) over non-whitespace
+/// chars. `glyph_id == 0` is .notdef — the tofu box the rasterizer draws for
+/// unsupported scripts.
+fn coverage(font: &ab_glyph::FontArc, text: &str) -> (usize, usize) {
+    let mut covered = 0usize;
+    let mut total = 0usize;
+    for ch in text.chars().filter(|c| !c.is_whitespace()) {
+        total += 1;
+        if font.glyph_id(ch).0 != 0 {
+            covered += 1;
+        }
+    }
+    (covered, total.max(1))
+}
+
+/// Pick the font that covers the most of `text`; ties go to the earlier
+/// candidate (CJK-capable paths are ordered first in [`system_font_paths`]).
+/// Returns the candidate with its (covered, total) so the caller can warn on
+/// partial coverage.
+/// Byte-bounded cache of raw font-file bytes for the SLOW probe path (text
+/// the cached winners don't fully cover — emoji, rare scripts). Without it
+/// every such call re-reads every candidate file from disk (~80MB of
+/// transient reads on a stock macOS font set, worse on edge-device SD
+/// cards); with it, repeat probes are CPU-only. FIFO eviction, budget well
+/// under the two owned winner copies the module already holds.
+struct FontBytesCache {
+    entries: Vec<(&'static str, Arc<Vec<u8>>)>,
+    bytes: usize,
+}
+
+impl FontBytesCache {
+    const BUDGET: usize = 32 * 1024 * 1024;
+
+    fn get(&self, path: &str) -> Option<Arc<Vec<u8>>> {
+        self.entries
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, b)| Arc::clone(b))
+    }
+
+    fn put(&mut self, path: &'static str, bytes: Arc<Vec<u8>>) {
+        // A single file over budget would evict everything else for one
+        // entry — skip caching it (it still gets read this call).
+        if bytes.len() > Self::BUDGET {
+            return;
+        }
+        if self.get(path).is_some() {
+            return;
+        }
+        self.bytes += bytes.len();
+        self.entries.push((path, bytes));
+        while self.bytes > Self::BUDGET {
+            let Some((_, evicted)) = self.entries.first() else {
+                break;
+            };
+            self.bytes -= evicted.len();
+            self.entries.remove(0);
+        }
+    }
+}
+
+static FONT_BYTES_CACHE: std::sync::Mutex<FontBytesCache> = std::sync::Mutex::new(FontBytesCache {
+    entries: Vec::new(),
+    bytes: 0,
+});
+
+/// Read a font file through [`FONT_BYTES_CACHE`] — hit: Arc clone, miss:
+/// disk read + insert. Lock failures degrade to an uncached read.
+fn read_font_bytes(path: &'static str) -> Option<Arc<Vec<u8>>> {
+    if let Ok(cache) = FONT_BYTES_CACHE.lock() {
+        if let Some(hit) = cache.get(path) {
+            return Some(hit);
+        }
+    }
+    let bytes = Arc::new(std::fs::read(path).ok()?);
+    if let Ok(mut cache) = FONT_BYTES_CACHE.lock() {
+        cache.put(path, Arc::clone(&bytes));
+    }
+    Some(bytes)
+}
+
+fn select_font_for(text: &str) -> Option<(FontSelection, usize, usize)> {
+    let class = script_class(text) as usize;
+    // Fast path: the cached winner for this script class still fully covers
+    // the text (re-checked — coverage is per-text, and a mixed follow-up
+    // string can outrun a Latin winner).
+    if let Ok(winners) = FONT_WINNERS.lock() {
+        if let Some(cand) = &winners[class] {
+            let (covered, total) = coverage(&cand.font, text);
+            if covered == total {
+                return Some((
+                    FontSelection {
+                        font: ab_glyph::FontArc::clone(&cand.font),
+                        source: cand.source,
+                    },
+                    covered,
+                    total,
+                ));
+            }
+        }
+    }
+
+    // Slow path: transient zero-copy probing of every candidate face, then
+    // materialize ONLY the winner (one owned copy) into the class slot.
+    let mut best: Option<(FaceAddr, usize, usize)> = None;
+    for addr in probe_faces() {
+        let Some(bytes) = read_font_bytes(addr.path) else {
+            continue;
+        };
+        let face = if addr.index == 0 && !(bytes.len() >= 12 && &bytes[0..4] == b"ttcf") {
+            ab_glyph::FontRef::try_from_slice(&bytes)
+        } else {
+            ab_glyph::FontRef::try_from_slice_and_index(&bytes, addr.index)
+        };
+        let Ok(face) = face else { continue };
+        let (covered, total) = coverage_of_ref(&face, text);
+        let take = match best {
+            None => true,
+            Some((_, best_covered, _)) => covered > best_covered,
+        };
+        if take {
+            best = Some((
+                FaceAddr {
+                    path: addr.path,
+                    index: addr.index,
+                },
+                covered,
+                total,
+            ));
+        }
+    }
+    let (addr, covered, total) = best?;
+
+    // Prefer an already-cached face that ties (memory budget beats re-read).
+    if let Ok(winners) = FONT_WINNERS.lock() {
+        if let Some(existing) = &winners[class] {
+            let (ecov, etot) = coverage(&existing.font, text);
+            if ecov >= covered {
+                return Some((
+                    FontSelection {
+                        font: ab_glyph::FontArc::clone(&existing.font),
+                        source: existing.source,
+                    },
+                    ecov,
+                    etot,
+                ));
+            }
+        }
+    }
+
+    let bytes = read_font_bytes(addr.path)?;
+    let cand = load_face(&addr, (*bytes).clone())?;
+    let selection = FontSelection {
+        font: ab_glyph::FontArc::clone(&cand.font),
+        source: cand.source,
+    };
+    if let Ok(mut winners) = FONT_WINNERS.lock() {
+        winners[class] = Some(cand);
+    }
+    Some((selection, covered, total))
 }
 
 /// Note: `stroke_width` is accepted for API uniformity with other draw operations
@@ -985,19 +1567,11 @@ fn apply_draw_text(
     font_size: u32,
     background: Option<image::Rgba<u8>>,
     padding: u32,
-    font_bytes: &[u8],
+    font: &ab_glyph::FontArc,
 ) -> std::result::Result<(), OpError> {
-    if font_bytes.is_empty() {
-        return Err(OpError::NoFont);
-    }
     if text.is_empty() || text.len() > 200 {
         return Err(OpError::InvalidText);
     }
-
-    let font = ab_glyph::FontRef::try_from_slice(font_bytes).map_err(|_| OpError::FontParse)?;
-
-    // Layout text to get bounding box
-    let scale = ab_glyph::PxScale::from(font_size as f32);
 
     // Calculate text bounds using font metrics - simplified approach
     // Just estimate width based on character count and font size
@@ -1020,9 +1594,10 @@ fn apply_draw_text(
 
     // Draw text at (x + padding, y + padding)
     use imageproc::drawing::draw_text_mut;
+    let scale = ab_glyph::PxScale::from(font_size as f32);
     let draw_x = x + padding as i32;
     let draw_y = y + padding as i32;
-    draw_text_mut(img, color, draw_x, draw_y, scale, &font, text);
+    draw_text_mut(img, color, draw_x, draw_y, scale, font, text);
 
     Ok(())
 }
@@ -1148,6 +1723,31 @@ mod tests {
         assert!(sanitize_filename("!!!", "png").is_err());
     }
 
+    /// A throwaway directory for the writer, outside the working tree.
+    ///
+    /// `std::env::temp_dir()` is not usable here: on macOS it resolves under
+    /// `/var/folders/…`, and `image_utils::read_local_image` blocklists `/var/`
+    /// (and `/tmp/`), which breaks the read-back these tests exercise. `target/`
+    /// is the next best thing — git ignores it, so a run leaves nothing behind
+    /// for `git status` to show, and the name carries the pid so two copies of
+    /// the suite running at once cannot share a directory.
+    ///
+    /// `parent()` twice rather than `join("../../target")`: the latter leaves a
+    /// literal `..` in the string, and `resolve_image` rejects any path that
+    /// contains one.
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/<crate> sits two levels under the workspace root");
+        let dir = workspace
+            .join("target")
+            .join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn sanitize_preserves_dashes_and_underscores() {
         let n = sanitize_filename("my-snapshot_01", "png").unwrap();
@@ -1156,10 +1756,7 @@ mod tests {
 
     #[test]
     fn write_output_returns_absolute_path() {
-        // Construct data_dir under current_dir() to keep the test hermetic
-        // and avoid macOS /var/folders prefix (which vision.rs blocklists).
-        let test_root = std::env::current_dir().unwrap().join("test-tmp-image-edit");
-        std::fs::create_dir_all(&test_root).unwrap();
+        let test_root = scratch_dir("test-tmp-image-edit");
         let tool = ImageEditTool::new(&test_root);
         // 8-byte PNG header is enough for the writer — we don't decode it back.
         let png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -1172,10 +1769,7 @@ mod tests {
 
     #[test]
     fn write_output_honors_custom_filename() {
-        let test_root = std::env::current_dir()
-            .unwrap()
-            .join("test-tmp-image-edit-named");
-        std::fs::create_dir_all(&test_root).unwrap();
+        let test_root = scratch_dir("test-tmp-image-edit-named");
         let tool = ImageEditTool::new(&test_root);
         let png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         let path = tool
@@ -1230,13 +1824,7 @@ mod tests {
 
     #[tokio::test]
     async fn chain_image_edit_to_resolve_image_works() {
-        // Use current_dir()-rooted path (NOT tempfile::tempdir) — on macOS,
-        // tempdir() returns paths under /var/folders/... which image_utils's
-        // read_local_image blocklist rejects, breaking the chain.
-        let test_root = std::env::current_dir()
-            .unwrap()
-            .join("test-tmp-image-edit-chain");
-        std::fs::create_dir_all(&test_root).unwrap();
+        let test_root = scratch_dir("test-tmp-image-edit-chain");
         let tool = ImageEditTool::new(&test_root);
 
         // 1. Build a base64 PNG data URL input.
@@ -1279,6 +1867,210 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    /// Regression for the "missing field `x`" failure: a draw_text without
+    /// coordinates must succeed (centered) instead of aborting the whole call.
+    #[tokio::test]
+    async fn draw_text_without_position_defaults_centered() {
+        if !probe_fonts_available() {
+            eprintln!("skipping: no system font available");
+            return;
+        }
+        let test_root = scratch_dir("test-tmp-image-edit-center");
+        let tool = ImageEditTool::new(&test_root);
+        let args = serde_json::json!({
+            "image": make_test_png_data_url(200, 100),
+            "operations": [{ "type": "draw_text", "text": "2026-09-29 11:37" }]
+        });
+        let out = tool
+            .execute(args)
+            .await
+            .expect("draw_text without x/y must succeed");
+        assert_eq!(out.data["status"].as_str(), Some("success"));
+        let warnings = out.data["warnings"].as_array().expect("warnings surfaced");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("centered")),
+            "expected a centered-default warning, got: {:?}",
+            warnings
+        );
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    /// Missing required fields must yield an actionable error naming the
+    /// operation index and the per-type cheat sheet — not a bare serde
+    /// "missing field `x`" the model cannot recover from.
+    #[tokio::test]
+    async fn missing_required_field_gives_actionable_error() {
+        let tool = ImageEditTool::new("/tmp");
+        let args = serde_json::json!({
+            "image": make_test_png_data_url(20, 20),
+            "operations": [{ "type": "draw_text" }]
+        });
+        let err = tool.execute(args).await.expect_err("must fail");
+        let msg = match err {
+            ToolError::InvalidArguments(m) => m,
+            _ => panic!("expected InvalidArguments"),
+        };
+        assert!(
+            msg.contains("operations[0]"),
+            "error must name the failing index: {}",
+            msg
+        );
+        assert!(
+            msg.contains("text"),
+            "error must name the missing field: {}",
+            msg
+        );
+        assert!(
+            msg.contains("crop/draw_rect/blur_rect"),
+            "error must carry the cheat sheet: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_without_type_gives_actionable_error() {
+        let tool = ImageEditTool::new("/tmp");
+        let args = serde_json::json!({
+            "image": make_test_png_data_url(20, 20),
+            "operations": [{}]
+        });
+        let err = tool.execute(args).await.expect_err("must fail");
+        match err {
+            ToolError::InvalidArguments(m) => {
+                assert!(
+                    m.contains("operations[0]") && m.contains("no `type`"),
+                    "got: {}",
+                    m
+                );
+            }
+            _ => panic!("expected InvalidArguments"),
+        }
+    }
+
+    /// The "watermark was never visible" failure mode: text drawn far
+    /// off-canvas must report `pixels_changed: 0` + a warning instead of a
+    /// bare success the model relays as "done".
+    #[tokio::test]
+    async fn pixels_changed_flags_off_canvas_text() {
+        if !probe_fonts_available() {
+            eprintln!("skipping: no system font available");
+            return;
+        }
+        let test_root = scratch_dir("test-tmp-image-edit-offcanvas");
+        let tool = ImageEditTool::new(&test_root);
+        let args = serde_json::json!({
+            "image": make_test_png_data_url(100, 100),
+            "operations": [
+                { "type": "draw_text", "text": "invisible", "x": -5000, "y": -5000 }
+            ]
+        });
+        let out = tool.execute(args).await.expect("execute succeeds");
+        let detail = out.data["operations_detail"][0].clone();
+        assert_eq!(detail["pixels_changed"].as_u64(), Some(0));
+        let warnings = out.data["warnings"].as_array().expect("warnings surfaced");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("changed 0 pixels")),
+            "expected a 0-pixel warning, got: {:?}",
+            warnings
+        );
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    /// A visible edit must report a positive pixel count and no 0-pixel warning.
+    #[tokio::test]
+    async fn pixels_changed_positive_for_visible_edit() {
+        let test_root = scratch_dir("test-tmp-image-edit-visible");
+        let tool = ImageEditTool::new(&test_root);
+        let args = serde_json::json!({
+            "image": make_test_png_data_url(100, 100),
+            "operations": [
+                { "type": "draw_rect", "x": 10, "y": 10, "width": 20, "height": 20 }
+            ]
+        });
+        let out = tool.execute(args).await.expect("execute succeeds");
+        let detail = out.data["operations_detail"][0].clone();
+        assert!(
+            detail["pixels_changed"].as_u64().unwrap_or(0) > 0,
+            "visible rect must change pixels, got: {}",
+            detail["pixels_changed"]
+        );
+        assert!(
+            out.data["warnings"]
+                .as_array()
+                .map(|w| w.is_empty())
+                .unwrap_or(true),
+            "no 0-pixel warning expected"
+        );
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn count_changed_pixels_handles_layout_change() {
+        assert_eq!(
+            count_changed_pixels(&[1, 2, 3, 4], &[1, 2, 3, 4], 4),
+            Some(0)
+        );
+        assert_eq!(
+            count_changed_pixels(&[1, 2, 3, 4], &[1, 2, 9, 4], 4),
+            Some(1)
+        );
+        // Dimension/layout change (e.g. crop) → lengths differ → None.
+        assert_eq!(count_changed_pixels(&[1, 2, 3, 4], &[1, 2], 4), None);
+        assert_eq!(count_changed_pixels(&[1], &[1], 0), None);
+    }
+
+    /// The compact flat schema must enumerate all 8 operation types, document
+    /// per-type required fields in the description, and stay small enough not
+    /// to crowd out 8K-window models; runtime `validate_operations` enforces
+    /// per-type required fields.
+    #[test]
+    fn schema_declares_per_type_required_fields() {
+        let t = ImageEditTool::new("/tmp");
+        let schema = t.parameters();
+        let types = schema["properties"]["operations"]["items"]["properties"]["type"]["enum"]
+            .as_array()
+            .expect("8-value enum in flat operations items schema");
+        assert_eq!(types.len(), 8, "all 8 operation types declared");
+        for expected in [
+            "crop",
+            "draw_rect",
+            "draw_circle",
+            "draw_line",
+            "draw_arrow",
+            "draw_polygon",
+            "draw_text",
+            "blur_rect",
+        ] {
+            assert!(
+                types.iter().any(|v| v == expected),
+                "missing operation type {expected}"
+            );
+        }
+        let desc = t.description();
+        assert!(desc.contains("crop/draw_rect/blur_rect: x,y,width,height"));
+        assert!(desc.contains("draw_text: text"));
+        // Runtime validation enforces per-type requirements while keeping draw_text x/y optional.
+        assert!(validate_operations(&serde_json::json!({
+            "image": "$cached:user_image",
+            "operations": [{"type": "crop", "x": 0, "y": 0}]
+        }))
+        .is_err());
+        assert!(validate_operations(&serde_json::json!({
+            "image": "$cached:user_image",
+            "operations": [{"type": "draw_text"}]
+        }))
+        .is_err());
+        assert!(validate_operations(&serde_json::json!({
+            "image": "$cached:user_image",
+            "operations": [{"type": "draw_text", "text": "ok"}]
+        }))
+        .is_ok());
     }
 }
 
@@ -1471,12 +2263,9 @@ mod op_tests {
     #[test]
     fn draw_text_renders_glyphs_with_background() {
         // System-font dependent: skip cleanly on systems without any of the probed fonts
-        let font_bytes = match probe_font() {
-            Some(b) => b.to_vec(),
-            None => {
-                eprintln!("skipping: no system font available");
-                return;
-            }
+        let Some((sel, _, _)) = select_font_for("Hi") else {
+            eprintln!("skipping: no system font available");
+            return;
         };
         let mut img = solid(200, 100, [0, 0, 0, 255]);
         apply_draw_text(
@@ -1488,7 +2277,7 @@ mod op_tests {
             24,
             Some(image::Rgba([0, 0, 0, 255])),
             4,
-            &font_bytes,
+            &sel.font,
         )
         .unwrap();
         // (x,y) is the top-left of the background rect — still pure black bg
@@ -1496,21 +2285,110 @@ mod op_tests {
     }
 
     #[test]
-    fn draw_text_empty_font_bytes_returns_error() {
-        let mut img = solid(100, 50, [0, 0, 0, 255]);
-        let res = apply_draw_text(
+    fn select_font_covers_drawn_text_when_cjk_font_present() {
+        // The field bug: watermark "有人 … 厦门" rendered as tofu because the
+        // probe fell back to a Latin-only font. If ANY probed font covers the
+        // drawn CJK text, selection must report full coverage.
+        let text = "有人 NE302 2026-09-30 厦门市公安局";
+        if !probe_fonts_available() {
+            eprintln!("skipping: no system font available");
+            return;
+        }
+        let Some((_, covered, total)) = select_font_for(text) else {
+            panic!("fonts probed but select_font_for returned None");
+        };
+        // Transient zero-copy scan: does ANY candidate face cover CJK?
+        let any_cjk = probe_faces().iter().any(|addr| {
+            let Ok(b) = std::fs::read(addr.path) else {
+                return false;
+            };
+            let face = if addr.index == 0 && !(b.len() >= 12 && &b[0..4] == b"ttcf") {
+                ab_glyph::FontRef::try_from_slice(&b)
+            } else {
+                ab_glyph::FontRef::try_from_slice_and_index(&b, addr.index)
+            };
+            face.map(|f| coverage_of_ref(&f, "厦门") == (2, 2))
+                .unwrap_or(false)
+        });
+        if !any_cjk {
+            eprintln!("skipping: no CJK-capable font probed (expected on bare CI)");
+            return;
+        }
+        assert_eq!(
+            covered, total,
+            "CJK-capable font present but selection lacks glyphs"
+        );
+    }
+
+    #[test]
+    fn cjk_draw_text_changes_pixels() {
+        if !probe_fonts_available() {
+            eprintln!("skipping: no system font available");
+            return;
+        }
+        let any_cjk = probe_faces().iter().any(|addr| {
+            let Ok(b) = std::fs::read(addr.path) else {
+                return false;
+            };
+            let face = if addr.index == 0 && !(b.len() >= 12 && &b[0..4] == b"ttcf") {
+                ab_glyph::FontRef::try_from_slice(&b)
+            } else {
+                ab_glyph::FontRef::try_from_slice_and_index(&b, addr.index)
+            };
+            face.map(|f| coverage_of_ref(&f, "厦门") == (2, 2))
+                .unwrap_or(false)
+        });
+        if !any_cjk {
+            eprintln!("skipping: no CJK-capable font probed");
+            return;
+        }
+        let mut img = solid(200, 60, [0, 0, 0, 255]);
+        let before = img.as_bytes().to_vec();
+        apply_draw_text(
             &mut img,
             10,
             10,
-            "x",
+            "厦门市公安局",
             image::Rgba([255, 255, 255, 255]),
-            16,
+            24,
             None,
             0,
-            &[], // empty font bytes
+            &select_font_for("厦门市公安局").unwrap().0.font,
+        )
+        .unwrap();
+        assert_ne!(img.as_bytes(), before.as_slice(), "CJK text drew no pixels");
+    }
+
+    /// Parses the exact font the server deployment uses. Opt-in via
+    /// HERAMIND_TEST_CJK_TTC=/path/to/NotoSansCJK-Regular.ttc (CI has no CJK
+    /// fonts); run locally after `apt install fonts-noto-cjk`.
+    #[test]
+    fn noto_cjk_ttc_exposes_all_faces_with_full_hanzi_coverage() {
+        let Ok(path) = std::env::var("HERAMIND_TEST_CJK_TTC") else {
+            eprintln!("skipping: HERAMIND_TEST_CJK_TTC not set");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read HERAMIND_TEST_CJK_TTC");
+        let mut addrs = Vec::new();
+        parse_face_addrs(&bytes, "env", &mut addrs);
+        assert!(
+            addrs.len() >= 2,
+            "ttc must expose multiple faces, got {}",
+            addrs.len()
         );
-        assert!(res.is_err());
-        assert!(matches!(res.unwrap_err(), OpError::NoFont));
+        // Every face of NotoSansCJK covers the full pan-CJK charset — the
+        // field bug (tofu) must be impossible once this font is probed.
+        for addr in &addrs {
+            let face =
+                load_face(addr, std::fs::read(&path).expect("re-read face")).expect("face parses");
+            assert_eq!(
+                coverage(&face.font, "厦门有人公安"),
+                (6, 6),
+                "face {}[{}] lacks hanzi coverage",
+                face.source,
+                addr.index
+            );
+        }
     }
 
     #[test]
@@ -1544,5 +2422,105 @@ mod op_tests {
         );
         // CRITICAL regression guard: gaussian mode MUST NOT shrink the image.
         assert_eq!(img.dimensions(), (100, 100));
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    fn make_test_png_data_url(w: u32, h: u32) -> String {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buf.into_inner());
+        format!("data:image/png;base64,{}", b64)
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        let dir = workspace
+            .join("target")
+            .join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_color_accepts_all_documented_forms() {
+        assert_eq!(parse_color("#FF0000"), Some(image::Rgba([255, 0, 0, 255])));
+        assert_eq!(parse_color("00ff00"), Some(image::Rgba([0, 255, 0, 255])));
+        assert_eq!(parse_color("#00000080"), Some(image::Rgba([0, 0, 0, 128])));
+        // The exact field failure: CSS rgba with fractional alpha.
+        assert_eq!(
+            parse_color("rgba(0, 0, 0, 0.7)"),
+            Some(image::Rgba([0, 0, 0, 179]))
+        );
+        // rgb() = opaque; alpha 0-255 also accepted.
+        assert_eq!(
+            parse_color("rgb(10, 20, 30)"),
+            Some(image::Rgba([10, 20, 30, 255]))
+        );
+        assert_eq!(
+            parse_color("rgba(1, 2, 3, 128)"),
+            Some(image::Rgba([1, 2, 3, 128]))
+        );
+        assert!(parse_color("red").is_none());
+        assert!(parse_color("rgba(300, 0, 0, 1)").is_none());
+        assert!(parse_color("#GGGGGG").is_none());
+        assert!(parse_color("").is_none());
+    }
+
+    /// The flail-prevention contract: a bad color names the field, the value,
+    /// and the accepted forms — not serde's "invalid digit found in string".
+    #[tokio::test]
+    async fn bad_color_error_names_field_and_forms() {
+        let tool = ImageEditTool::new("/tmp");
+        let args = serde_json::json!({
+            "image": make_test_png_data_url(20, 20),
+            "operations": [
+                { "type": "draw_text", "text": "x", "background": "notacolor" }
+            ]
+        });
+        let err = tool.execute(args).await.expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("background"), "{msg}");
+        assert!(msg.contains("notacolor"), "{msg}");
+        assert!(msg.contains("#RRGGBB"), "{msg}");
+    }
+
+    /// End-to-end: the CSS rgba form that used to hard-fail now renders.
+    #[tokio::test]
+    async fn rgba_background_text_renders() {
+        if !probe_fonts_available() {
+            eprintln!("skipping: no system font available");
+            return;
+        }
+        let test_root = scratch_dir("test-tmp-image-edit-rgba");
+        let tool = ImageEditTool::new(&test_root);
+        let args = serde_json::json!({
+            "image": make_test_png_data_url(100, 100),
+            "operations": [
+                { "type": "draw_text", "text": "CamThink", "background": "rgba(0,0,0,0.7)", "font_size": 24 }
+            ]
+        });
+        let out = tool
+            .execute(args)
+            .await
+            .expect("rgba background must succeed");
+        assert_eq!(out.data["status"].as_str(), Some("success"));
+        assert!(
+            out.data["operations_detail"][0]["pixels_changed"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+            "text+background must change pixels"
+        );
+        let _ = std::fs::remove_dir_all(&test_root);
     }
 }

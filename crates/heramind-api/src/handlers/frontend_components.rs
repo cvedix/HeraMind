@@ -36,26 +36,21 @@ fn market_base_url() -> String {
 const MARKET_BRANCH: &str = "main";
 
 /// Component IDs reserved for built-in components — cannot be overwritten.
-const RESERVED_IDS: &[&str] = &[
-    "value-card",
-    "led-indicator",
-    "sparkline",
-    "progress-bar",
-    "line-chart",
-    "area-chart",
-    "bar-chart",
-    "pie-chart",
-    "toggle-switch",
-    "image-display",
-    "image-history",
-    "web-display",
-    "markdown-display",
-    "map-display",
-    "video-display",
-    "custom-layer",
-    "agent-monitor-widget",
-    "ai-analyst",
-];
+/// Component IDs reserved for built-in components — cannot be overwritten
+/// by installs. Derived from `BUILTIN_WIDGET_TYPES` (the single source of
+/// truth shared with the frontend's Renderers builtInTypes) so a new builtin
+/// can never be forgotten here — `counter` and `metric-card` were missing
+/// from the old hand-maintained list, i.e. installable over their builtins.
+/// LEGACY ids stay reserved for downgrade safety.
+fn reserved_component_ids() -> Vec<&'static str> {
+    const LEGACY_RESERVED: &[&str] = &["agent-monitor-widget", "ai-analyst"];
+    let mut ids: Vec<&'static str> = heramind_core::dashboard::BUILTIN_WIDGET_TYPES
+        .iter()
+        .map(|t| t.type_id)
+        .collect();
+    ids.extend_from_slice(LEGACY_RESERVED);
+    ids
+}
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -69,7 +64,7 @@ fn validate_component_id(id: &str) -> Result<(), ErrorResponse> {
     if id.is_empty() {
         return Err(ErrorResponse::bad_request("Component ID cannot be empty"));
     }
-    if RESERVED_IDS.contains(&id) {
+    if reserved_component_ids().contains(&id) {
         return Err(ErrorResponse::bad_request(format!(
             "Component ID '{}' is reserved for built-in components",
             id
@@ -222,12 +217,11 @@ pub async fn market_list_handler(
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create HTTP client: {:?}", e);
-            return ok(json!({
-                "components": [],
-                "total": 0,
-                "error": "network_error",
-                "message": "Unable to create HTTP client"
-            }));
+            return Err(ErrorResponse::new(
+                "BAD_GATEWAY",
+                "Unable to create HTTP client for component marketplace",
+                axum::http::StatusCode::BAD_GATEWAY,
+            ));
         }
     };
 
@@ -237,12 +231,14 @@ pub async fn market_list_handler(
             "total": index.components.len(),
             "market_version": index.version,
         })),
-        Err(_) => ok(json!({
-            "components": [],
-            "total": 0,
-            "error": "network_error",
-            "message": "Unable to connect to component marketplace. Please check your internet connection."
-        })),
+        Err(e) => {
+            tracing::warn!("Marketplace network error: {e}");
+            Err(ErrorResponse::new(
+                "BAD_GATEWAY",
+                "Unable to connect to component marketplace. Please check your internet connection.",
+                axum::http::StatusCode::BAD_GATEWAY,
+            ))
+        }
     }
 }
 
@@ -252,8 +248,9 @@ pub async fn market_list_handler(
 /// and return those with a newer version available.
 ///
 /// Protected endpoint — requires authentication.
-/// Tolerates network failures: returns `{ updates: [], count: 0, error: "network_error" }`
-/// rather than an HTTP error so the UI can degrade gracefully.
+/// Unlike `/market/list` (which returns HTTP 502 on marketplace failures),
+/// `/updates` intentionally returns HTTP 200 `{ updates: [], count: 0, error: "network_error" }`
+/// so background update-badge checks degrade silently in the UI.
 #[utoipa::path(
     get,
     path = "/api/frontend-components/updates",
@@ -667,6 +664,68 @@ pub async fn install_component_from_path_handler(
 /// Shared install tail for every manual install entry point (multipart
 /// upload, server path): parse + validate the manifest, persist via the
 /// store, publish the lifecycle event.
+/// Static bundle/manifest coherence check at install time.
+///
+/// Neither install nor `dashboard add-components` executes JavaScript, so a
+/// malformed IIFE sailed through every gate and only exploded in the
+/// browser as "component unavailable" (live rounds 9-11: a bundle whose
+/// IIFE took `(function(global){...})` but was invoked WITHOUT `(window)`
+/// and only `return`ed its exports — the return value is discarded and
+/// the manifest's global never exists; another manifest carried a
+/// display title `"Tomato Clock"` as `global_name` — a space is not a
+/// legal JS identifier). The check is textual and conservative: it
+/// verifies the global NAME is a legal identifier and that the bundle
+/// ASSIGNS it somewhere (any of the documented formats count).
+fn validate_component_bundle(
+    manifest: &ComponentManifest,
+    bundle_bytes: &[u8],
+) -> Result<(), ErrorResponse> {
+    let name = manifest.global_name.trim();
+    let legal = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    if !legal {
+        return Err(ErrorResponse::bad_request(format!(
+            "manifest global_name {:?} is not a legal JavaScript identifier — it is the \
+             VARIABLE the bundle registers on window, not a display title (no spaces; \
+             e.g. \"TomatoClock\")",
+            manifest.global_name
+        ))
+        .with_hint("Fix manifest.json's global_name to match the variable the bundle assigns."));
+    }
+
+    let bundle = String::from_utf8_lossy(bundle_bytes);
+    let exposes = [
+        format!("global['{name}']"),
+        format!("global[\"{name}\"]"),
+        format!("global.{name}"),
+        format!("window['{name}']"),
+        format!("window[\"{name}\"]"),
+        format!("window.{name}"),
+        format!("var {name}"),
+        format!("let {name}"),
+        format!("const {name}"),
+    ];
+    if !exposes.iter().any(|p| bundle.contains(p.as_str())) {
+        return Err(ErrorResponse::bad_request(format!(
+            "bundle.js never assigns the manifest's global_name '{name}' — after the script \
+             loads, window.{name} must exist. A bare `return` from the IIFE is DISCARDED. Use \
+             Format A: `var {name} = (function() {{ ...; return {{ default: Component }}; }})();` \
+             or Format B: `(function(global) {{ ...; global['{name}'] = {{ default: Component }}; }})(window);` \
+             — note the (window) argument and the global assignment.",
+        ))
+        .with_hint(
+            "Assign the global; do not just return exports from an anonymous IIFE.",
+        ));
+    }
+    Ok(())
+}
+
 async fn install_from_parts(
     state: &ServerState,
     manifest_text: String,
@@ -678,6 +737,7 @@ async fn install_from_parts(
         .map_err(|e| ErrorResponse::bad_request(format!("Invalid manifest JSON: {}", e)))?;
 
     validate_component_id(&manifest.id)?;
+    validate_component_bundle(&manifest, &bundle_bytes)?;
 
     // Set install timestamp
     manifest.installed_at = chrono::Utc::now().timestamp();
@@ -720,8 +780,10 @@ fn extract_zip_contents(zip_data: &[u8]) -> Result<(String, Vec<u8>), ErrorRespo
             .by_index(i)
             .map_err(|e| ErrorResponse::bad_request(format!("Failed to read ZIP entry: {}", e)))?;
 
-        // Normalize path: strip directory prefixes
-        let name = file.name().to_string();
+        // Normalize path: strip directory prefixes.
+        // zip 9: name() validates UTF-8 — an invalid name matches no
+        // expected component file, so it degrades to "".
+        let name = file.name().map(|n| n.to_string()).unwrap_or_default();
         let filename = name.rsplit('/').next().unwrap_or(&name).to_string();
 
         match filename.as_str() {
@@ -838,7 +900,7 @@ pub async fn get_component_handler(
 ) -> HandlerResult<serde_json::Value> {
     // Check built-in components first
     if let Some(builtin) = builtin_component_list().into_iter().find(|c| c.id == id) {
-        return ok(json!({ "component": builtin }));
+        return ok(json!({ "component": builtin, "builtin": true, "registered": true }));
     }
 
     // Check installed community components
@@ -850,7 +912,13 @@ pub async fn get_component_handler(
         .map_err(|e| ErrorResponse::internal(format!("Failed to load component: {}", e)))?;
 
     match manifest {
-        Some(m) => ok(json!({ "component": m })),
+        // `registered` tells the store-manifest provenance apart: scaffolds
+        // written directly into the store directory (e.g. `widget create`
+        // without --install) answer `get` like installed ones but carry no
+        // install stamp (installed_at is a unix timestamp, 0 = never
+        // installed) — callers used that to conclude "created ==
+        // installed" and skip the install step.
+        Some(m) => ok(json!({ "component": m, "registered": m.installed_at != 0 })),
         None => Err(ErrorResponse::not_found(format!(
             "Component '{}' not found",
             id
@@ -1689,8 +1757,93 @@ pub async fn uninstall_component_handler(
     );
 
     ok(json!({
-        "success": true,
         "component_id": id_for_event,
         "state": "uninstalled"
     }))
+}
+
+#[cfg(test)]
+mod bundle_validation_tests {
+    use super::*;
+
+    fn manifest(global_name: &str) -> ComponentManifest {
+        serde_json::from_str(&format!(
+            r#"{{"id":"w","name":"W","description":"w","global_name":"{global_name}"}}"#
+        ))
+        .expect("minimal manifest parses")
+    }
+
+    /// The live round-9/11 failure shapes must be REJECTED at install:
+    /// a space in global_name, and a bundle whose IIFE only `return`s
+    /// (discarded) without assigning the manifest's global.
+    #[test]
+    fn rejects_illegal_global_name() {
+        let err = validate_component_bundle(&manifest("Tomato Clock"), b"var x = 1;")
+            .expect_err("space is not a legal identifier");
+        assert!(
+            err.message.contains("legal JavaScript identifier"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_discarded_return_bundle() {
+        // Round-11 shape: (function(global){ ... return {...}; })() — the
+        // return value is discarded and (window) was never passed.
+        let bundle = b"(function(global) { return { default: X }; })();";
+        let err = validate_component_bundle(&manifest("HeraMindChart"), bundle)
+            .expect_err("no global assignment");
+        assert!(err.message.contains("never assigns"), "{err:?}");
+        assert!(err.message.contains("DISCARDED"), "{err:?}");
+    }
+
+    #[test]
+    fn accepts_both_documented_formats() {
+        // Format A: top-level var (becomes window.Name in a classic script).
+        let a = b"var TomatoClock = (function() { return { default: F }; })();";
+        assert!(validate_component_bundle(&manifest("TomatoClock"), a).is_ok());
+        // Format B: global['Name'] assignment with (window) passed.
+        let b = b"(function(global) { global['HeraMindChart'] = { default: F }; })(window);";
+        assert!(validate_component_bundle(&manifest("HeraMindChart"), b).is_ok());
+        // window.Name direct assignment also counts.
+        let c = b"window.Custom = { default: F };";
+        assert!(validate_component_bundle(&manifest("Custom"), c).is_ok());
+    }
+
+    #[tokio::test]
+    async fn market_list_handler_returns_502_on_upstream_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        struct EnvRestore(Option<String>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("HERAMIND_MARKET_URL", v),
+                    None => std::env::remove_var("HERAMIND_MARKET_URL"),
+                }
+            }
+        }
+        let _restore = EnvRestore(std::env::var("HERAMIND_MARKET_URL").ok());
+        std::env::set_var("HERAMIND_MARKET_URL", format!("http://{}", addr));
+
+        let state = ServerState::new_for_testing().await;
+        let err = market_list_handler(State(state))
+            .await
+            .expect_err("upstream marketplace failure must return HTTP 502");
+        assert_eq!(err.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(err.code, "BAD_GATEWAY");
+
+        let _ = server.await;
+    }
 }

@@ -456,6 +456,18 @@ pub struct SdkCommandDefinition {
     /// Parameter groups
     #[serde(default)]
     pub parameter_groups: Vec<SdkParameterGroup>,
+    /// Whether this command is exposed to the LLM as a tool (default true).
+    #[serde(default = "default_true")]
+    pub ai_exposed: bool,
+    /// Side-effect class (`None` = undeclared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<crate::CommandEffect>,
+    /// Replay safety (`None` = undeclared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_safety: Option<crate::CommandReplaySafety>,
+    /// Immediate vs async (`None` = undeclared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<crate::CommandExecutionKind>,
 }
 
 /// Parameter group for organizing command parameters
@@ -486,6 +498,10 @@ impl SdkCommandDefinition {
             fixed_values: std::collections::HashMap::new(),
             samples: Vec::new(),
             parameter_groups: Vec::new(),
+            ai_exposed: true,
+            effect: None,
+            replay_safety: None,
+            execution: None,
         }
     }
 
@@ -512,6 +528,10 @@ impl From<SdkCommandDefinition> for CommandDescriptor {
             parameters: c.parameters.into_iter().map(|p| p.into()).collect(),
             fixed_values: c.fixed_values,
             samples: c.samples,
+            ai_exposed: c.ai_exposed,
+            effect: c.effect,
+            replay_safety: c.replay_safety,
+            execution: c.execution,
             parameter_groups: c
                 .parameter_groups
                 .into_iter()

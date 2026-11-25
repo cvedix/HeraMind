@@ -19,7 +19,9 @@ all = ["ollama", "cloud", "llamacpp", "openai", "anthropic", "google", "xai"]
 # Exposes test doubles (MockLlmRuntime) for use in this crate's integration
 # tests and downstream test crates. Off by default so it never ships in a
 # release binary. Enable via `--features test-utils`.
-test-utils = []
+# Also enables `heramind-storage/test-utils` for cross-crate storage test seams
+# (e.g. op-ledger corrupt-table helper).
+test-utils = ["heramind-storage/test-utils"]
 
 [dependencies]
 heramind-core = { path = "../heramind-core" }
@@ -35,6 +37,7 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 glob = "0.3"
 regex = { workspace = true }
+sha2 = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
@@ -88,3 +91,7 @@ serial_test = "3"
 [dependencies.utoipa]
 version = "4"
 features = ["chrono", "uuid"]
+
+[[test]]
+name = "scheduler_cancellation_test"
+required-features = ["test-utils"]

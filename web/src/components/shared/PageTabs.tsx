@@ -34,6 +34,7 @@ import {
 import { cn } from '@/lib/utils'
 import { textMini } from "@/design-system/tokens/typography"
 import { useMobileHeaderActionsRegistrar } from '@/components/layout/MobileHeaderActionsContext'
+import { UnderlineTabs } from '@/components/shared/UnderlineTabs'
 
 export interface TabAction {
   label: string
@@ -102,81 +103,101 @@ export function PageTabsBar({
   const isMobile = useIsMobile()
 
 
-  // On mobile, lift all actions into the MobilePageHeader via context.
-  // secondaryActions are appended so MobileTabActionsCompact naturally
-  // tucks them into the MoreHorizontal overflow alongside any extra
-  // primary actions.
+  // Mobile keeps business-local tabs directly below the page title. Global
+  // destinations live in MobilePrimaryNav; putting these tabs at the bottom
+  // would create two competing navigation bars.
   if (isMobile) {
     return (
-      <MobilePageTabsActionsLift
-        actions={[...actions, ...secondaryActions]}
-        actionsExtra={actionsExtra}
-      />
+      <>
+        <MobilePageActionsLift
+          actions={[...actions, ...secondaryActions]}
+          actionsExtra={actionsExtra}
+        />
+        <div
+          role="tablist"
+          className={cn("flex min-w-0 gap-1 overflow-x-auto px-4 pb-2 scrollbar-none", tabsClassName)}
+        >
+          {tabs.map((tab) => {
+            const selected = tab.value === activeTab
+            return (
+              <button
+                key={tab.value}
+                id={`page-tab-${tab.value}`}
+                role="tab"
+                aria-selected={selected}
+                aria-controls={`page-tabpanel-${tab.value}`}
+                disabled={tab.disabled}
+                onClick={() => onTabChange(tab.value)}
+                className={cn(
+                  "relative h-11 shrink-0 px-3 text-sm font-medium transition-colors",
+                  "after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full",
+                  selected
+                    ? "text-foreground after:bg-foreground"
+                    : "text-muted-foreground after:bg-transparent active:text-foreground",
+                )}
+              >
+                {tab.label}
+              </button>
+            )
+          })}
+        </div>
+      </>
     )
   }
 
-  // Desktop: page toolbar — the SAME shape as the dashboard toolbar
-  // (h-11 chrome row with bottom border): tabs capsule left, page actions
-  // center-right, global entry points at the far right. The tab strip is a
-  // SINGLE scrollable row (no wrapping): overflowing tabs scroll
-  // horizontally at natural size instead of squeezing labels together.
+  // Desktop: page toolbar — underline tabs left, page actions right. Both
+  // bottom edges align on the same baseline (the tabs' sliding indicator and
+  // the action buttons end at the row's bottom edge), and the actions' right
+  // edge lines up with the content below. No full-width divider under the
+  // row — the active tab's own underline is the only line. Tab strip
+  // rendering (geometry, sliding indicator, keyboard nav, overflow fades)
+  // lives in the shared UnderlineTabs primitive.
   return (
-    // py-2 + border-b: the row keeps its bottom divider (tab capsule's edge
-    // line) AND breathing room above the content area. px matches the title
-    // row (md:px-8) so tabs left-align with the title above them.
-    <div className="flex shrink-0 items-center gap-3 bg-background px-4 py-2 sm:px-6 md:px-8">
-      <div
-        className={cn(
-          'flex min-w-0 max-w-full items-center overflow-x-auto scrollbar-none rounded-lg border border-border bg-card p-1 gap-1',
-          tabsClassName
-        )}
-      >
-            {tabs.map((tab) => {
-              const isActive = activeTab === tab.value
-              return (
-                <button
-                  key={tab.value}
-                  disabled={tab.disabled}
-                  onClick={() => onTabChange(tab.value)}
-                  className={cn(
-                    'inline-flex shrink-0 items-center justify-start gap-2 rounded-sm px-3 py-1.5 h-9 text-sm font-medium whitespace-nowrap transition-all',
-                    isActive
-                      ? 'bg-foreground text-background shadow-sm'
-                      : 'text-muted-foreground hover:text-foreground'
-                  )}
-                >
-                  {tab.icon && <span className="shrink-0 h-4 w-4">{tab.icon}</span>}
-                  <span>{tab.label}</span>
-                </button>
-              )
-            })}
-          </div>
+    // No top padding — the title row above carries the whole title→tabs gap
+    // (PageLayout pb-2/3/3, matching the dashboard page's title row); an
+    // extra pt here read as detached. pb-2 gives the row's bottom edge (the
+    // scroll-shadow anchor in PageLayout) clearance below the indicator and
+    // the bottom-aligned action buttons/inputs, so the shadow reads as the
+    // header's edge instead of painted onto the controls. px matches the
+    // title row (md:px-8) so tabs left-align with the title above them.
+    <div className="flex shrink-0 items-end gap-3 bg-background px-4 pb-2 sm:px-6 md:px-8">
+      <UnderlineTabs
+        tabs={tabs}
+        activeTab={activeTab}
+        onTabChange={onTabChange}
+        className={tabsClassName}
+      />
 
-          {(actions.length > 0 || secondaryActions.length > 0 || actionsExtra) && (
-            <div className="ml-auto flex shrink-0 flex-wrap items-center gap-2">
-              {actions.map((action) => (
-                <Button
-                  key={action.label}
-                  variant={action.variant || 'default'}
-                  size="sm"
-                  onClick={action.onClick}
-                  disabled={action.disabled || action.loading}
-                >
-                  {action.loading ? (
-                    <span className="mr-2 shrink-0 h-4 w-4 flex items-center justify-center">{action.icon || '⟳'}</span>
-                  ) : (
-                    action.icon && <span className="mr-2 shrink-0 h-4 w-4">{action.icon}</span>
-                  )}
-                  <span className="whitespace-nowrap">{action.label}</span>
-                </Button>
-              ))}
-              {secondaryActions.length > 0 && (
-                <TabActionsOverflow actions={secondaryActions} trigger="more" />
-              )}
-              {actionsExtra}
-            </div>
+      {(actions.length > 0 || secondaryActions.length > 0 || actionsExtra) && (
+        <div className="ml-auto flex shrink-0 flex-wrap items-end gap-2">
+          {/* Order within the group: search/filter utilities FIRST, then the
+              secondary overflow, primary actions LAST — the row's trailing
+              edge is the strongest position and belongs to the page's
+              primary CTA (GitHub/Linear toolbar convention). If the row
+              wraps, the search input takes its own full-width line under
+              the buttons, which reads intentional. */}
+          {actionsExtra}
+          {secondaryActions.length > 0 && (
+            <TabActionsOverflow actions={secondaryActions} trigger="more" />
           )}
-
+          {actions.map((action) => (
+            <Button
+              key={action.label}
+              variant={action.variant || 'default'}
+              size="sm"
+              onClick={action.onClick}
+              disabled={action.disabled || action.loading}
+            >
+              {action.loading ? (
+                <span className="mr-2 shrink-0 h-4 w-4 flex items-center justify-center">{action.icon || '⟳'}</span>
+              ) : (
+                action.icon && <span className="mr-2 shrink-0 h-4 w-4">{action.icon}</span>
+              )}
+              <span className="whitespace-nowrap">{action.label}</span>
+            </Button>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -258,36 +279,16 @@ export function PageTabs({
         {/* Desktop: Top tabs bar */}
         {!isMobile && (
           <div className="mb-4">
-            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-              <div
-                className={cn(
-                  'inline-flex w-auto flex-wrap overflow-visible rounded-lg border border-border bg-card p-1',
-                  tabsClassName
-                )}
-              >
-                {tabs.map((tab) => {
-                  const isActive = activeTab === tab.value
-                  return (
-                    <button
-                      key={tab.value}
-                      disabled={tab.disabled}
-                      onClick={() => onTabChange(tab.value)}
-                      className={cn(
-                        'inline-flex items-center justify-start gap-2 rounded-sm px-3 py-1.5 h-9 text-sm font-medium whitespace-nowrap transition-all',
-                        isActive
-                          ? 'bg-foreground text-background shadow-sm'
-                          : 'text-muted-foreground hover:text-foreground'
-                      )}
-                    >
-                      {tab.icon && <span className="shrink-0 h-4 w-4">{tab.icon}</span>}
-                      <span>{tab.label}</span>
-                    </button>
-                  )
-                })}
-              </div>
+            <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+              <UnderlineTabs
+                tabs={tabs}
+                activeTab={activeTab}
+                onTabChange={onTabChange}
+                className={tabsClassName}
+              />
 
               {actions.length > 0 && (
-                <div className="flex shrink-0 flex-wrap gap-2">
+                <div className="flex shrink-0 flex-wrap items-end gap-2">
                   {actions.map((action) => (
                     <Button
                       key={action.label}
@@ -300,7 +301,7 @@ export function PageTabs({
                       {action.loading ? (
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       ) : (
-                        action.icon && <span className="mr-2 shrink-0 h-4 w-4">{action.icon}</span>
+                        action.icon && <span className="mr-2 h-4 w-4">{action.icon}</span>
                       )}
                       <span className="whitespace-nowrap">{action.label}</span>
                     </Button>
@@ -353,44 +354,44 @@ export function PageTabs({
   // Original inline tabs variant (non-bottom-nav)
   return (
     <div className={className}>
-      {/* Tabs + Actions Bar - mobile: segmented control, desktop: inline tabs */}
+      {/* Tabs + Actions Bar - mobile: segmented control, desktop: underline tabs */}
       <div className="mb-4">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <div
-            className={cn(
-              /* mobile: full-width segmented control, horizontal scroll */
-              'flex w-full flex-nowrap overflow-x-auto rounded-lg border border-border bg-card p-1',
-              '[-webkit-overflow-scrolling:touch]',
-              /* desktop: inline tabs with full text */
-              'md:inline-flex md:w-auto md:flex-wrap md:overflow-visible md:rounded-md md:border-0 md:bg-card md:p-0.5',
-              tabsClassName
-            )}
-          >
-            {tabs.map((tab) => {
-              const isActive = activeTab === tab.value
-              return (
-                <button
-                  key={tab.value}
-                  disabled={tab.disabled}
-                  onClick={() => onTabChange(tab.value)}
-                  className={cn(
-                    /* mobile: large touch targets, segmented active style */
-                    'flex min-h-11 min-w-[5rem] shrink-0 items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-all',
-                    isActive
-                      ? 'bg-foreground text-background'
-                      : 'text-muted-foreground',
-                    /* desktop: full text display, centered, fixed height */
-                    'md:inline-flex md:h-9 md:min-w-max md:shrink-0 md:rounded-sm md:px-4 md:py-1.5 md:whitespace-nowrap',
-                    !isActive && 'md:hover:text-foreground',
-                    isActive && 'md:bg-foreground md:text-background md:shadow-sm'
-                  )}
-                >
-                  {tab.icon && <span className="shrink-0 h-4 w-4">{tab.icon}</span>}
-                  <span>{tab.label}</span>
-                </button>
-              )
-            })}
-          </div>
+          {isMobile ? (
+            /* mobile: full-width segmented control, horizontal scroll.
+               Track = muted, active chip = raised card — the same active
+               language as ui/tabs, instead of a solid inverted chip. */
+            <div className="flex w-full flex-nowrap overflow-x-auto scrollbar-none rounded-lg bg-muted p-1 [-webkit-overflow-scrolling:touch]">
+              {tabs.map((tab) => {
+                const isActive = activeTab === tab.value
+                return (
+                  <button
+                    key={tab.value}
+                    disabled={tab.disabled}
+                    onClick={() => onTabChange(tab.value)}
+                    className={cn(
+                      'flex min-h-11 min-w-[5rem] shrink-0 items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium transition-all',
+                      isActive
+                        ? 'bg-card text-foreground shadow-sm'
+                        : 'text-muted-foreground',
+                      !isActive && 'hover:text-foreground',
+                      tab.disabled && 'pointer-events-none opacity-50',
+                    )}
+                  >
+                    {tab.icon && <span className="shrink-0 h-4 w-4">{tab.icon}</span>}
+                    <span>{tab.label}</span>
+                  </button>
+                )
+              })}
+            </div>
+          ) : (
+            <UnderlineTabs
+              tabs={tabs}
+              activeTab={activeTab}
+              onTabChange={onTabChange}
+              className={tabsClassName}
+            />
+          )}
 
           {actions.length > 0 && (
             <div className="flex shrink-0 flex-wrap gap-2">
@@ -436,16 +437,27 @@ export function PageTabsContent({ value, activeTab, children, className }: PageT
   if (value !== activeTab) return null
 
   return (
-    <div className={cn('md:mt-3', className)}>
+    // mt-4 (16px) on desktop — the tab indicator and the content card's top
+    // border are both structural lines; 12px read cramped. Grouping: the
+    // title→tabs gap (PageLayout's title pb, 12px on desktop) is the SMALLER
+    // gap — title + tabs intentionally fuse into one header block (the
+    // dashboard page's look), while this 16px separates the block from the
+    // content it controls.
+    // Mobile relies on the scroll container's own pt-2 instead.
+    // APG tabpanel wiring — pairs with UnderlineTabs' `page-tab-*` tab ids.
+    <div
+      role="tabpanel"
+      id={`page-tabpanel-${value}`}
+      aria-labelledby={`page-tab-${value}`}
+      className={cn('md:mt-4', className)}
+    >
       {children}
     </div>
   )
 }
 
 // Tabs with grid layout (for icon-based tabs like automation page)
-export interface PageTabsGridProps extends Omit<PageTabsProps, 'tabsClassName'> {
-  gridCols?: 2 | 3 | 4 | 5 | 6
-}
+export interface PageTabsGridProps extends Omit<PageTabsProps, 'tabsClassName'> {}
 
 export function PageTabsGrid({
   tabs,
@@ -454,61 +466,48 @@ export function PageTabsGrid({
   actions = [],
   actionsExtra,
   className,
-  gridCols = 3,
   children,
 }: PageTabsGridProps) {
-  // Map gridCols to Tailwind classes - md: for desktop layout
-  const gridColsClass: Record<2 | 3 | 4 | 5 | 6, string> = {
-    2: '@md:grid-cols-2',
-    3: '@md:grid-cols-3',
-    4: '@md:grid-cols-4',
-    5: '@md:grid-cols-5',
-    6: '@md:grid-cols-6',
-  }
-
-  // Adjust max-width based on number of columns (desktop only)
-  const maxWidthClass = gridCols >= 5 ? 'md:max-w-2xl' : gridCols === 4 ? 'md:max-w-xl' : 'md:max-w-md'
+  const isMobile = useIsMobile()
 
   return (
     <div className={className}>
-      {/* mobile: segmented control grid, desktop: compact grid */}
+      {/* mobile: segmented control grid, desktop: underline tabs */}
       <div className="mb-4">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <div
-            className={cn(
-              /* mobile: 2-col grid, segmented style */
-              'grid w-full shrink-0 grid-cols-2 overflow-x-auto rounded-lg border border-border bg-card p-1',
-              '[-webkit-overflow-scrolling:touch]',
-              /* desktop: compact inline grid */
-              'md:w-auto md:overflow-visible md:rounded-md md:border-0 md:bg-card',
-              gridColsClass[gridCols],
-              maxWidthClass
-            )}
-          >
-            {tabs.map((tab) => {
-              const isActive = activeTab === tab.value
-              return (
-                <button
-                  key={tab.value}
-                  disabled={tab.disabled}
-                  onClick={() => onTabChange(tab.value)}
-                  className={cn(
-                    /* mobile: large touch targets, segmented active style */
-                    'flex min-h-11 items-center justify-center gap-1.5 rounded-lg px-4 py-2.5 text-sm font-medium transition-all',
-                    isActive
-                      ? 'bg-foreground text-background'
-                      : 'text-muted-foreground',
-                    /* desktop: compact, Radix-style active */
-                    'md:min-h-0 md:rounded-sm md:px-3 md:py-1.5',
-                    isActive && 'md:bg-foreground md:text-background md:shadow-sm'
-                  )}
-                >
-                  {tab.icon && <span className="shrink-0">{tab.icon}</span>}
-                  <span className="truncate">{tab.label}</span>
-                </button>
-              )
-            })}
-          </div>
+          {isMobile ? (
+            /* mobile: 2-col grid, segmented style — muted track + raised
+               card chip, matching ui/tabs and the PageTabs segmented rows. */
+            <div className="grid w-full shrink-0 grid-cols-2 overflow-x-auto rounded-lg bg-muted p-1 [-webkit-overflow-scrolling:touch]">
+              {tabs.map((tab) => {
+                const isActive = activeTab === tab.value
+                return (
+                  <button
+                    key={tab.value}
+                    disabled={tab.disabled}
+                    onClick={() => onTabChange(tab.value)}
+                    className={cn(
+                      'flex min-h-11 items-center justify-center gap-1.5 rounded-md px-4 py-2.5 text-sm font-medium transition-all',
+                      isActive
+                        ? 'bg-card text-foreground shadow-sm'
+                        : 'text-muted-foreground',
+                      !isActive && 'hover:text-foreground',
+                      tab.disabled && 'pointer-events-none opacity-50',
+                    )}
+                  >
+                    {tab.icon && <span className="shrink-0">{tab.icon}</span>}
+                    <span className="truncate">{tab.label}</span>
+                  </button>
+                )
+              })}
+            </div>
+          ) : (
+            <UnderlineTabs
+              tabs={tabs}
+              activeTab={activeTab}
+              onTabChange={onTabChange}
+            />
+          )}
 
           {actions.length > 0 && (
             <div className="flex shrink-0 flex-wrap gap-2">
@@ -541,7 +540,7 @@ export function PageTabsGrid({
 }
 
 /**
- * MobilePageTabsActionsLift - renders nothing on its own. Instead, it
+ * MobilePageActionsLift - renders nothing on its own. Instead, it
  * registers the tab actions into two host slots via MobileHeaderActionsContext:
  *
  *   - primary actions (Add/Refresh/…) → MobilePageHeader's actions slot
@@ -551,9 +550,10 @@ export function PageTabsGrid({
  *     These controls don't fit in an icon-only header slot, so they stay
  *     with the content.
  *
- * Used internally by PageTabsBar's mobile branch.
+ * Used by PageTabsBar and no-tab pages that follow the same mobile header
+ * action + content-toolbar pattern.
  */
-function MobilePageTabsActionsLift({
+export function MobilePageActionsLift({
   actions,
   actionsExtra,
 }: {
@@ -654,7 +654,7 @@ function TabActionsOverflow({
           <Button
             variant="ghost"
             size="icon"
-            className="h-9 w-9 shrink-0"
+            className="h-10 w-10 shrink-0 sm:h-9 sm:w-9"
             aria-label={moreText}
           >
             <MoreHorizontal className="h-5 w-5" />
@@ -701,8 +701,8 @@ function TabActionsOverflow({
 
 /**
  * MobileTabActionsCompact - compact rendering for the MobilePageHeader's
- * actions slot. The first action is an icon button (h-9 w-9, matching the
- * hamburger tap target); the rest collapse into a MoreHorizontal dropdown.
+ * actions slot. The first action is a compact icon button; the rest collapse
+ * into a MoreHorizontal dropdown.
  *
  * Note: `actionsExtra` (search/filter/wide controls) is NOT handled here —
  * those are routed to the sticky content toolbar via the "content" slot of
@@ -732,7 +732,7 @@ function MobileTabActionsCompact({
           size={primaryIcon ? 'icon' : 'sm'}
           onClick={primary.onClick}
           disabled={primary.disabled || primary.loading}
-          className={primaryIcon ? 'h-9 w-9 shrink-0' : 'h-9 shrink-0 px-2 text-xs'}
+          className={primaryIcon ? 'h-10 w-10 shrink-0 sm:h-9 sm:w-9' : 'h-10 shrink-0 px-2 text-xs sm:h-9'}
           aria-label={primary.label}
           title={primary.label}
         >

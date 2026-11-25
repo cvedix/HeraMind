@@ -194,6 +194,15 @@ pub struct DeviceTypeTemplate {
     /// cameras) whose structured metrics already cover all fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_raw: Option<bool>,
+    /// Origin marker: `Some(version)` for templates seeded from the built-in
+    /// bundle (NE101/NE301/NE302…), `None` for user-created / imported ones.
+    /// Informational — seeding is insert-only either way; user edits to a
+    /// builtin type are preserved (and keep this marker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin_version: Option<String>,
+    /// Optional CamThink CT-Prov discovery/provision metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ct_prov: Option<heramind_storage::device_registry::CtProvMetadata>,
 }
 
 impl DeviceTypeTemplate {
@@ -210,6 +219,8 @@ impl DeviceTypeTemplate {
             commands: Vec::new(),
             default_offline_timeout_secs: None,
             store_raw: None,
+            builtin_version: None,
+            ct_prov: None,
         }
     }
 
@@ -407,8 +418,8 @@ pub struct DeviceRegistry {
     devices: DashMap<String, DeviceConfig>,
     /// Index: device_type -> set of device_ids
     type_index: DashMap<String, Vec<String>>,
-    /// Reverse index: telemetry_topic → device_id (O(1) lookup for MQTT routing).
-    topic_index: DashMap<String, String>,
+    /// Reverse index: telemetry_topic → registered device ids (shared-topic safe).
+    topic_index: DashMap<String, Vec<String>>,
     /// Optional persistent storage backend
     storage: Option<Arc<DeviceRegistryStore>>,
     /// Whether to auto-save after modifications
@@ -584,6 +595,8 @@ impl DeviceRegistry {
                     .collect(),
                 default_offline_timeout_secs: storage_template.default_offline_timeout_secs,
                 store_raw: storage_template.store_raw,
+                builtin_version: storage_template.builtin_version,
+                ct_prov: storage_template.ct_prov,
             };
 
             self.templates
@@ -622,13 +635,18 @@ impl DeviceRegistry {
 
             let device_id = config.device_id.clone();
             let device_type = config.device_type.clone();
+            let telemetry_topic = config.connection_config.telemetry_topic.clone();
 
             self.devices.insert(device_id.clone(), config);
 
             self.type_index
                 .entry(device_type)
                 .or_default()
-                .push(device_id);
+                .push(device_id.clone());
+
+            if let Some(topic) = telemetry_topic {
+                self.topic_index_insert(&topic, &device_id);
+            }
         }
 
         // Persist last_seen migration for old devices
@@ -738,7 +756,8 @@ impl DeviceRegistry {
                     .collect(),
                 default_offline_timeout_secs: template.default_offline_timeout_secs,
                 store_raw: template.store_raw,
-                builtin_version: None,
+                builtin_version: template.builtin_version.clone(),
+                ct_prov: template.ct_prov.clone(),
             };
             store
                 .save_template(&storage_template)
@@ -875,7 +894,8 @@ impl DeviceRegistry {
                 .collect(),
             default_offline_timeout_secs: template.default_offline_timeout_secs,
             store_raw: template.store_raw,
-            builtin_version: None,
+            builtin_version: template.builtin_version.clone(),
+            ct_prov: template.ct_prov.clone(),
         };
 
         self.templates.insert(device_type, template);
@@ -990,48 +1010,18 @@ impl DeviceRegistry {
 
         let device_id = config.device_id.clone();
         let device_type = config.device_type.clone();
+        let telemetry_topic = config.connection_config.telemetry_topic.clone();
 
-        // Check if device already exists — update in place for idempotent re-registration
+        // Idempotent re-registration (e.g. ordinary approve retry after
+        // BindIncomplete): apply the full landed config — including device_type
+        // and connection_config — via update_device. The old partial patch kept
+        // the first type/topic and made retry returns lie about what was saved.
         if self.devices.contains_key(&device_id) {
-            // Update existing device with new config
-            if let Some(mut entry) = self.devices.get_mut(&device_id) {
-                entry.name = config.name;
-                if config.adapter_id.is_some() {
-                    entry.adapter_id.clone_from(&config.adapter_id);
-                }
-                if config.last_seen > 0 {
-                    entry.last_seen = config.last_seen;
-                }
-            }
-            // Persist update if auto-save is enabled
-            if self.is_auto_save() {
-                if let Some(storage) = &self.storage {
-                    if let Some(updated) = self.devices.get(&device_id) {
-                        let sc = StorageConfig {
-                            device_id: updated.device_id.clone(),
-                            name: updated.name.clone(),
-                            device_type: updated.device_type.clone(),
-                            adapter_type: updated.adapter_type.clone(),
-                            connection_config: convert_connection_config_to_storage(
-                                updated.connection_config.clone(),
-                            ),
-                            adapter_id: updated.adapter_id.clone(),
-                            last_seen: updated.last_seen,
-                            offline_timeout_secs: updated.offline_timeout_secs,
-                        };
-                        if let Err(e) = storage.save_device(&sc) {
-                            tracing::error!(
-                                device_id = %device_id,
-                                error = %e,
-                                "Failed to persist device re-registration — \
-                                 in-memory updated but change will be lost on restart"
-                            );
-                        }
-                    }
-                }
-            }
-            tracing::debug!("Device '{}' re-registered (updated in place)", device_id);
-            return Ok(());
+            tracing::debug!(
+                "Device '{}' re-registered — updating type+config in place",
+                device_id
+            );
+            return self.update_device(&device_id, config).await;
         }
 
         // Prepare storage config (cloned before moving config)
@@ -1069,7 +1059,12 @@ impl DeviceRegistry {
         self.type_index
             .entry(device_type)
             .or_default()
-            .push(device_id);
+            .push(device_id.clone());
+
+        // Shared-topic reverse index (topic → many device ids).
+        if let Some(topic) = telemetry_topic {
+            self.topic_index_insert(&topic, &device_id);
+        }
 
         Ok(())
     }
@@ -1116,41 +1111,72 @@ impl DeviceRegistry {
         self.devices.iter().map(|e| e.value().clone()).collect()
     }
 
-    /// Find a device by its telemetry topic
-    /// This is used by MQTT adapters to route messages from custom topics
-    pub fn find_device_by_telemetry_topic(&self, topic: &str) -> Option<(String, DeviceConfig)> {
-        // Fast path: reverse index (O(1))
-        if let Some(device_id) = self.topic_index.get(topic) {
-            let device_id_owned = device_id.value().clone();
-            drop(device_id); // release the DashMap read guard before any write
-            if let Some(config) = self.devices.get(&device_id_owned) {
-                // Verify the device's CURRENT telemetry_topic still matches. The
-                // index is NOT invalidated when update_device changes a device's
-                // telemetry_topic, so without this check a stale entry would
-                // route messages for an old topic to a device that no longer
-                // subscribes to it (silent data corruption + bogus rule fires).
-                if config.connection_config.telemetry_topic.as_deref() == Some(topic) {
-                    return Some((device_id_owned, config.clone()));
-                }
-                drop(config);
-            }
-            // Stale entry — device gone, or its topic changed. Clean up and fall
-            // through to the scan, which returns None (no device owns this topic
-            // anymore) or repairs the index for the new owner if one exists.
+    fn topic_index_insert(&self, topic: &str, device_id: &str) {
+        let mut entry = self.topic_index.entry(topic.to_string()).or_default();
+        if !entry.iter().any(|id| id == device_id) {
+            entry.push(device_id.to_string());
+        }
+    }
+
+    fn topic_index_remove_device(&self, topic: &str, device_id: &str) {
+        let empty = if let Some(mut entry) = self.topic_index.get_mut(topic) {
+            entry.retain(|id| id != device_id);
+            entry.is_empty()
+        } else {
+            false
+        };
+        if empty {
             self.topic_index.remove(topic);
         }
-        // Fallback: linear scan (auto-repairs the index on hit)
-        for entry in self.devices.iter() {
-            if let Some(ref telemetry_topic) = entry.value().connection_config.telemetry_topic {
-                if telemetry_topic == topic {
-                    // Repair the index for future lookups
-                    self.topic_index
-                        .insert(topic.to_string(), entry.key().clone());
-                    return Some((entry.key().clone(), entry.value().clone()));
+    }
+
+    /// All devices registered on a telemetry topic (shared-topic safe).
+    pub fn find_devices_by_telemetry_topic(&self, topic: &str) -> Vec<(String, DeviceConfig)> {
+        let mut out = Vec::new();
+        if let Some(ids_ref) = self.topic_index.get(topic) {
+            let ids = ids_ref.value().clone();
+            drop(ids_ref);
+            let mut still_valid = Vec::new();
+            for id in ids {
+                if let Some(config) = self.devices.get(&id) {
+                    if config.connection_config.telemetry_topic.as_deref() == Some(topic) {
+                        still_valid.push(id.clone());
+                        out.push((id, config.clone()));
+                    }
                 }
             }
+            if still_valid.is_empty() {
+                self.topic_index.remove(topic);
+            } else {
+                self.topic_index.insert(topic.to_string(), still_valid);
+            }
+            if !out.is_empty() {
+                return out;
+            }
         }
-        None
+        // Fallback linear scan — rebuilds the multi-device index.
+        let mut rebuilt = Vec::new();
+        for entry in self.devices.iter() {
+            if entry.value().connection_config.telemetry_topic.as_deref() == Some(topic) {
+                rebuilt.push(entry.key().clone());
+                out.push((entry.key().clone(), entry.value().clone()));
+            }
+        }
+        if !rebuilt.is_empty() {
+            self.topic_index.insert(topic.to_string(), rebuilt);
+        }
+        out
+    }
+
+    /// Find a device by its telemetry topic.
+    ///
+    /// For shared topics this returns **one** registrant (first id) — suitable
+    /// for transport presence client_id learning. Telemetry routing must use
+    /// identity resolution + the multi-device topic map instead.
+    pub fn find_device_by_telemetry_topic(&self, topic: &str) -> Option<(String, DeviceConfig)> {
+        self.find_devices_by_telemetry_topic(topic)
+            .into_iter()
+            .next()
     }
 
     /// List devices by type
@@ -1181,9 +1207,9 @@ impl DeviceRegistry {
         // Remove device
         self.devices.remove(device_id);
 
-        // Clean up topic index
+        // Drop only this device's topic association (shared topics keep others).
         if let Some(topic) = telemetry_topic {
-            self.topic_index.remove(&topic);
+            self.topic_index_remove_device(&topic, device_id);
         }
 
         // Update type index
@@ -1253,28 +1279,50 @@ impl DeviceRegistry {
             ))
         })?;
 
-        // Get old device type for index update
-        let old_device_type = self.devices.get(device_id).map(|d| d.device_type.clone());
+        // Get old device type / topic for index update
+        let (old_device_type, old_topic) = self
+            .devices
+            .get(device_id)
+            .map(|d| {
+                (
+                    d.device_type.clone(),
+                    d.connection_config.telemetry_topic.clone(),
+                )
+            })
+            .unwrap_or((String::new(), None));
+        let new_topic = config.connection_config.telemetry_topic.clone();
 
         // Update device
         self.devices.insert(device_id.to_string(), config);
 
         // Update type index if type changed
-        if let Some(old_type) = old_device_type {
-            if old_type != new_device_type {
-                // Remove from old type index
-                if let Some(mut type_entry) = self.type_index.get_mut(&old_type) {
-                    type_entry.retain(|id| id != device_id);
-                }
-                if self.type_index.get(&old_type).is_some_and(|e| e.is_empty()) {
-                    self.type_index.remove(&old_type);
-                }
+        if !old_device_type.is_empty() && old_device_type != new_device_type {
+            // Remove from old type index
+            if let Some(mut type_entry) = self.type_index.get_mut(&old_device_type) {
+                type_entry.retain(|id| id != device_id);
+            }
+            if self
+                .type_index
+                .get(&old_device_type)
+                .is_some_and(|e| e.is_empty())
+            {
+                self.type_index.remove(&old_device_type);
+            }
 
-                // Add to new type index
-                self.type_index
-                    .entry(new_device_type)
-                    .or_default()
-                    .push(device_id.to_string());
+            // Add to new type index
+            self.type_index
+                .entry(new_device_type)
+                .or_default()
+                .push(device_id.to_string());
+        }
+
+        // Maintain multi-device topic index when telemetry_topic changes.
+        if old_topic.as_deref() != new_topic.as_deref() {
+            if let Some(old) = old_topic {
+                self.topic_index_remove_device(&old, device_id);
+            }
+            if let Some(new) = new_topic {
+                self.topic_index_insert(&new, device_id);
             }
         }
 
@@ -1377,6 +1425,65 @@ mod tests {
 
         let result = registry.register_device(config).await;
         assert!(result.is_err());
+    }
+
+    /// NM-206: ordinary approve retry after BindIncomplete with a changed
+    /// device_type must land the new type+config (not the old partial upsert).
+    #[tokio::test]
+    async fn register_device_retry_updates_type_and_config() {
+        let registry = DeviceRegistry::new();
+        registry
+            .register_template(DeviceTypeTemplate::new("old", "Old"))
+            .await
+            .unwrap();
+        registry
+            .register_template(DeviceTypeTemplate::new("new", "New"))
+            .await
+            .unwrap();
+
+        let mut first = DeviceConfig {
+            device_id: "retry-device".into(),
+            name: "Retry".into(),
+            device_type: "old".into(),
+            adapter_type: "mqtt".into(),
+            connection_config: ConnectionConfig {
+                telemetry_topic: Some("sensors/old".into()),
+                ..Default::default()
+            },
+            adapter_id: Some("test".into()),
+            last_seen: 1,
+            offline_timeout_secs: None,
+        };
+        registry.register_device(first.clone()).await.unwrap();
+        assert_eq!(
+            registry.get_device("retry-device").unwrap().device_type,
+            "old"
+        );
+
+        first.device_type = "new".into();
+        first.connection_config.telemetry_topic = Some("sensors/retry-device".into());
+        first.name = "Retry renamed".into();
+        registry.register_device(first).await.unwrap();
+
+        let landed = registry.get_device("retry-device").unwrap();
+        assert_eq!(landed.device_type, "new", "retry must update device_type");
+        assert_eq!(landed.name, "Retry renamed");
+        assert_eq!(
+            landed.connection_config.telemetry_topic.as_deref(),
+            Some("sensors/retry-device"),
+            "retry must update connection_config"
+        );
+        assert!(registry
+            .list_devices_by_type("new")
+            .iter()
+            .any(|d| d.device_id == "retry-device"));
+        assert!(
+            !registry
+                .list_devices_by_type("old")
+                .iter()
+                .any(|d| d.device_id == "retry-device"),
+            "type index must move off old type"
+        );
     }
 
     #[tokio::test]
@@ -1527,5 +1634,41 @@ mod tests {
             !enable_ai_param.unwrap().required,
             "enable_ai should not be required"
         );
+    }
+
+    #[tokio::test]
+    async fn shared_topic_index_keeps_both_devices() {
+        let registry = DeviceRegistry::new();
+        registry
+            .register_template(DeviceTypeTemplate::new("gw_sensor", "Gateway Sensor"))
+            .await
+            .unwrap();
+
+        for id in ["A", "B"] {
+            registry
+                .register_device(DeviceConfig {
+                    device_id: id.to_string(),
+                    name: format!("Device {id}"),
+                    device_type: "gw_sensor".to_string(),
+                    adapter_type: "mqtt".to_string(),
+                    connection_config: ConnectionConfig::mqtt("gateway/data", None::<String>),
+                    adapter_id: None,
+                    last_seen: 0,
+                    offline_timeout_secs: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let found = registry.find_devices_by_telemetry_topic("gateway/data");
+        let ids: Vec<_> = found.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"A"));
+        assert!(ids.contains(&"B"));
+        assert_eq!(found.len(), 2);
+
+        registry.unregister_device("A").unwrap();
+        let found = registry.find_devices_by_telemetry_topic("gateway/data");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "B");
     }
 }

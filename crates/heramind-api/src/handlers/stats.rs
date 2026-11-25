@@ -77,6 +77,54 @@ pub struct GpuInfo {
     pub driver_version: Option<String>,
 }
 
+/// What this process costs the machine.
+///
+/// Everything else in `SystemInfo` describes the box; this describes what
+/// HeraMind is taking of it. On a small edge device that is the number an
+/// operator actually needs, and nothing reported it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProcessInfo {
+    /// OS process id.
+    pub pid: u32,
+    /// Resident set size in bytes — what the process is actually holding.
+    pub memory_bytes: u64,
+    /// Virtual memory in bytes. Large and mostly uninteresting, but it is what
+    /// makes a surprising RSS explicable.
+    pub virtual_memory_bytes: u64,
+    /// CPU usage as a percentage of **one** core, the way `top` reports it — a
+    /// process saturating two cores reads 200. `SystemInfo::cpu_usage` is the
+    /// machine-wide average across cores and is capped at 100; the two are
+    /// deliberately not the same scale, and the UI says which is which.
+    ///
+    /// `None` on the first call after boot: there is no previous sample to
+    /// difference against, and a zero there would read like a measurement.
+    pub cpu_usage: Option<f32>,
+    /// Threads in this process, when the OS will say.
+    ///
+    /// `None` on every platform but Linux and Android: `sysinfo::Process::tasks`
+    /// is Linux-only and returns `None` elsewhere, so there is nothing to count.
+    /// It is optional rather than defaulted because the first version of this
+    /// field fell back to `1`, and the About page then reported "Threads: 1" for
+    /// a Tokio server on macOS — a fabricated number that reads exactly like a
+    /// measurement. Unknown has to look unknown.
+    pub threads: Option<usize>,
+    /// Seconds since this process started, from the OS — not the same as
+    /// `SystemInfo::uptime`, which is when the in-app server started.
+    pub uptime_secs: u64,
+}
+
+/// Disk footprint of HeraMind's own data directory (databases, telemetry,
+/// images, keys). Walking the tree is expensive on big dirs, so the value is
+/// computed once, cached, and only recomputed when a client explicitly asks
+/// (`POST /api/stats/data-dir/refresh`) — never on the stats polling path.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DataDirInfo {
+    /// Path of the data directory (honors `HERAMIND_DATA_DIR`).
+    pub path: String,
+    /// Sum of regular-file sizes under the data directory.
+    pub bytes: u64,
+}
+
 /// System information.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SystemInfo {
@@ -106,6 +154,13 @@ pub struct SystemInfo {
     pub disks: Vec<DiskInfo>,
     /// Network interfaces (traffic)
     pub networks: Vec<NetInfo>,
+    /// What this process itself is using. `None` when the OS will not report it
+    /// (a sandbox without process visibility), which is why consumers handle
+    /// absence rather than reading zeroes.
+    pub process: Option<ProcessInfo>,
+    /// Disk footprint of HeraMind's own data directory. `None` until the first
+    /// walk completes (it runs in the background, never inline).
+    pub data_dir: Option<DataDirInfo>,
 }
 
 /// One mounted filesystem.
@@ -136,6 +191,54 @@ pub struct NetInfo {
     pub rx_bytes: u64,
     /// Total bytes transmitted (cumulative)
     pub tx_bytes: u64,
+}
+
+/// Cached data-directory footprint. `Err` poison is treated as "no cache" —
+/// the next caller recomputes.
+static DATA_DIR_USAGE: std::sync::Mutex<Option<DataDirInfo>> = std::sync::Mutex::new(None);
+
+/// One-shot latch: the stats handler kicks the background walk at most once
+/// per process. Without it, every poll before a (slow) walk lands would spawn
+/// another concurrent full scan of the tree.
+static DATA_DIR_KICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn cached_data_dir_usage() -> Option<DataDirInfo> {
+    DATA_DIR_USAGE.lock().ok()?.clone()
+}
+
+/// Sum regular-file sizes under the data directory. Deliberately dumb DFS:
+/// `read_dir`'s `file_type` never follows symlinks, so symlinked dirs can't
+/// cause cycles or double counting. Runs on the blocking pool (caller's job).
+fn compute_data_dir_usage() -> std::io::Result<DataDirInfo> {
+    let root = heramind_core::paths::data_dir();
+    let mut total = 0u64;
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                total += entry.metadata()?.len();
+            }
+        }
+    }
+    Ok(DataDirInfo {
+        path: root.to_string_lossy().to_string(),
+        bytes: total,
+    })
+}
+
+/// Recompute on the blocking pool and store into the cache.
+async fn refresh_data_dir_usage() -> std::io::Result<DataDirInfo> {
+    let info = tokio::task::spawn_blocking(compute_data_dir_usage)
+        .await
+        .map_err(|e| std::io::Error::other(format!("walk task panicked: {e}")))??;
+    if let Ok(mut guard) = DATA_DIR_USAGE.lock() {
+        *guard = Some(info.clone());
+    }
+    Ok(info)
 }
 
 /// Get overall system statistics.
@@ -193,19 +296,22 @@ pub async fn get_system_stats_handler(
                 .filter(|r| r.as_ref().is_ok_and(|m| !m.is_empty()))
                 .count();
 
-            use heramind_devices::adapter::ConnectionStatus;
-            let online = state
-                .devices
-                .service
-                .get_devices_by_status(ConnectionStatus::Connected)
-                .await
-                .len();
-            let offline = state
-                .devices
-                .service
-                .get_devices_by_status(ConnectionStatus::Disconnected)
-                .await
-                .len();
+            let mut online = 0usize;
+            for cfg in &configs {
+                let status = state
+                    .devices
+                    .service
+                    .get_device_status(&cfg.device_id)
+                    .await;
+                let timeout = state
+                    .devices
+                    .service
+                    .effective_offline_timeout(&cfg.device_id);
+                if status.is_connected_within(timeout) {
+                    online += 1;
+                }
+            }
+            let offline = configs.len().saturating_sub(online);
 
             DeviceStats {
                 total_devices: configs.len(),
@@ -294,6 +400,13 @@ pub async fn get_system_stats_handler(
         )
     };
 
+    // Our own process, from a sampler that outlives this call — see
+    // `ProcessSampler` for why one that does not cannot work.
+    let process = PROCESS_SAMPLER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sample();
+
     // Mounted filesystems (storage usage)
     let disks: Vec<DiskInfo> = {
         let dl = sysinfo::Disks::new_with_refreshed_list();
@@ -358,6 +471,18 @@ pub async fn get_system_stats_handler(
         }
     };
 
+    // Data-directory footprint. Never walked inline here: if it has never
+    // been computed, kick ONE background walk and let this response report
+    // None — the value lands in the cache and shows up on the next poll.
+    // Recompute (including retry after failure) happens only via the manual
+    // refresh endpoint.
+    if cached_data_dir_usage().is_none()
+        && !DATA_DIR_KICKED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tokio::spawn(refresh_data_dir_usage());
+    }
+    let data_dir = cached_data_dir_usage();
+
     // Version from env or default
     let version = env!("CARGO_PKG_VERSION");
 
@@ -375,6 +500,8 @@ pub async fn get_system_stats_handler(
         gpus,
         disks,
         networks,
+        process,
+        data_dir,
     };
 
     let stats = SystemStats {
@@ -399,6 +526,8 @@ pub async fn get_system_stats_handler(
         "gpus": system_info.gpus,
         "disks": system_info.disks,
         "networks": system_info.networks,
+        "process": system_info.process,
+        "data_dir": system_info.data_dir,
     }))?;
 
     // Cache the response for 5 seconds
@@ -412,6 +541,86 @@ pub async fn get_system_stats_handler(
     );
 
     Ok(response)
+}
+
+/// A `System` kept alive between calls, because a process's CPU usage is a
+/// delta and a fresh one has nothing to subtract from.
+///
+/// Two refreshes inside one call — all the machine-wide figure needs — leave a
+/// process reading 0.0% forever. Three happen to work on macOS and not on
+/// Linux, which is how the first version of this shipped and then failed on CI
+/// the moment it ran anywhere else. Keeping the sampler alive makes the delta
+/// span the gap between calls, which is the same on every platform: the first
+/// call after boot has no previous sample and says so, every call after that is
+/// real, and the About tab polls on a five-second cache so the second call is
+/// never far off.
+static PROCESS_SAMPLER: std::sync::LazyLock<std::sync::Mutex<ProcessSampler>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(ProcessSampler::new()));
+
+struct ProcessSampler {
+    sys: sysinfo::System,
+    me: sysinfo::Pid,
+    /// False until one sample has been taken. The first has no previous CPU
+    /// time to difference against.
+    baseline: bool,
+}
+
+impl ProcessSampler {
+    fn new() -> Self {
+        let mut sys = sysinfo::System::new();
+        let me = sysinfo::Pid::from_u32(std::process::id());
+        sys.refresh_memory();
+        sys.refresh_cpu_usage();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[me]), true);
+        Self {
+            sys,
+            me,
+            baseline: false,
+        }
+    }
+
+    /// One sample. `None` only when the OS will not report the process at all.
+    fn sample(&mut self) -> Option<ProcessInfo> {
+        self.sys.refresh_cpu_usage();
+        self.sys
+            .refresh_processes(sysinfo::ProcessesToUpdate::Some(&[self.me]), true);
+        let had_baseline = self.baseline;
+        self.baseline = true;
+
+        let p = self.sys.process(self.me)?;
+        Some(ProcessInfo {
+            pid: self.me.as_u32(),
+            memory_bytes: p.memory(),
+            virtual_memory_bytes: p.virtual_memory(),
+            cpu_usage: had_baseline.then(|| p.cpu_usage()),
+            // Linux-only in sysinfo; `None` everywhere else rather than a
+            // made-up 1.
+            threads: p.tasks().map(|t| t.len()),
+            uptime_secs: p.run_time(),
+        })
+    }
+}
+
+/// Recompute the data-directory footprint on demand and return it.
+///
+/// POST /api/stats/data-dir/refresh
+///
+/// The walk never runs on the polling path — the About tab's manual refresh
+/// button is the only caller. A few seconds of blocking walk is acceptable
+/// here because the user explicitly asked for a fresh number.
+#[utoipa::path(
+    post,
+    path = "/api/stats/data-dir/refresh",
+    tag = "stats",
+    responses(
+        (status = 200, description = "Recomputed data-directory usage"),
+    )
+)]
+pub async fn refresh_data_dir_usage_handler() -> HandlerResult<serde_json::Value> {
+    let info = refresh_data_dir_usage()
+        .await
+        .map_err(|e| ErrorResponse::internal(format!("Failed to measure data directory: {e}")))?;
+    ok(json!({ "data_dir": info }))
 }
 
 /// Detect GPUs on the system.
@@ -677,11 +886,99 @@ mod tests {
                 cpu_usage: 42.0,
                 disks: vec![],
                 networks: vec![],
+                process: None,
+                data_dir: None,
             },
         };
 
         let json_str = serde_json::to_string(&stats).unwrap();
         assert!(json_str.contains("total_devices"));
         assert!(json_str.contains("total_rules"));
+    }
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::*;
+
+    /// The property the whole design rests on: the first sample has no previous
+    /// CPU time to difference against and says so, and the second — after any
+    /// real interval — carries a figure.
+    ///
+    /// This is what CI caught the hard way. The first version refreshed twice
+    /// inside one call and read 0.0% forever on Linux; three refreshes happened
+    /// to work on macOS, which is where it was checked. A sampler that outlives
+    /// the call makes the delta span the gap between calls, and this asserts
+    /// that on whatever platform it runs.
+    #[test]
+    fn the_first_sample_has_no_baseline_and_the_second_has_a_figure() {
+        let mut sampler = ProcessSampler::new();
+
+        let first = sampler.sample().expect("the OS reports this process");
+        assert!(
+            first.cpu_usage.is_none(),
+            "with no previous sample there is nothing to difference against, and a \
+             zero here would read like a measurement: {first:?}"
+        );
+        assert!(first.pid > 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let second = sampler.sample().expect("the OS reports this process");
+        assert!(
+            second.cpu_usage.is_some_and(|v| v.is_finite() && v >= 0.0),
+            "the second sample has a delta to report: {second:?}"
+        );
+        assert_eq!(second.pid, first.pid);
+    }
+}
+
+#[cfg(test)]
+mod s1_3_system_stats_tests {
+    use super::*;
+    use heramind_devices::{ConnectionConfig, DeviceConfig, DeviceTypeTemplate};
+
+    #[tokio::test]
+    async fn ten_offline_webhook_devices_yield_zero_online_in_system_stats() {
+        let state = ServerState::new_for_testing().await;
+        state
+            .devices
+            .service
+            .register_template(DeviceTypeTemplate::new("webhook_sensor", "Webhook Sensor"))
+            .await
+            .expect("register template");
+
+        for i in 0..10 {
+            let cfg = DeviceConfig {
+                device_id: format!("stats-wh-{i}"),
+                name: format!("Stats Webhook {i}"),
+                device_type: "webhook_sensor".to_string(),
+                adapter_type: "webhook".to_string(),
+                connection_config: ConnectionConfig::default(),
+                adapter_id: None,
+                last_seen: 0,
+                offline_timeout_secs: None,
+            };
+            state
+                .devices
+                .service
+                .register_device(cfg)
+                .await
+                .expect("register webhook device");
+        }
+
+        let resp = get_system_stats_handler(State(state))
+            .await
+            .expect("stats/system succeeds")
+            .0
+            .data
+            .expect("data payload");
+        let devices = &resp["stats"]["devices"];
+        assert_eq!(devices["total_devices"], json!(10));
+        assert_eq!(devices["online_devices"], json!(0));
+        assert_eq!(devices["offline_devices"], json!(10));
+        assert!(
+            resp["stats"].get("alerts").is_some(),
+            "SystemStats must serialize `alerts` field"
+        );
     }
 }

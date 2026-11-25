@@ -260,8 +260,49 @@ pub struct ParameterGroup {
 // Command Definition
 // ============================================================================
 
+fn default_true() -> bool {
+    true
+}
+
+/// Business side-effect class for an extension command.
+///
+/// Missing metadata MUST be treated as [`CommandEffect::Mutating`] — never
+/// infer privilege from command names alone. Host may override at install /
+/// resolve time (see HeraMind `command_contract`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandEffect {
+    /// Does not mutate business state or the outside world.
+    ReadOnly,
+    /// May create, update, delete, or otherwise change state.
+    #[default]
+    Mutating,
+}
+
+/// Whether re-issuing the same request is known-safe after interruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandReplaySafety {
+    /// Re-run after timeout/cancel cannot double-apply an effect.
+    Safe,
+    /// Outcome may already have landed — verify before retry.
+    #[default]
+    Unsafe,
+}
+
+/// How the command returns a result to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandExecutionKind {
+    /// Result is available when the call returns.
+    #[default]
+    Immediate,
+    /// Long-running: accept + `operation_id`, then query (Phase 2).
+    Async,
+}
+
 /// Command definition/descriptor.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandDescriptor {
     /// Command name (used as identifier)
     pub name: String,
@@ -286,6 +327,43 @@ pub struct CommandDescriptor {
     /// Parameter groups
     #[serde(default)]
     pub parameter_groups: Vec<ParameterGroup>,
+    /// Whether this command is exposed to the LLM as a tool.
+    /// Extensions declare `false` for UI-/automation-only commands; the
+    /// platform then hides them from `definitions_for_llm()` regardless of
+    /// admin toggles (the author's decision wins).
+    #[serde(default = "default_true")]
+    pub ai_exposed: bool,
+    /// Side-effect class. `None` = **undeclared** (old packages / missing IPC
+    /// fields) — distinct from `Some(Mutating)` which is an explicit claim.
+    /// Host compat overrides may apply only when undeclared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<CommandEffect>,
+    /// Replay safety. `None` = undeclared (see `effect`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_safety: Option<CommandReplaySafety>,
+    /// Immediate vs async. `None` = undeclared (see `effect`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<CommandExecutionKind>,
+}
+
+impl Default for CommandDescriptor {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            display_name: String::new(),
+            description: String::new(),
+            payload_template: String::new(),
+            parameters: Vec::new(),
+            fixed_values: HashMap::new(),
+            samples: Vec::new(),
+            parameter_groups: Vec::new(),
+            ai_exposed: true,
+            // Undeclared — not "explicit Mutating". Serde omit + Default agree.
+            effect: None,
+            replay_safety: None,
+            execution: None,
+        }
+    }
 }
 
 impl CommandDescriptor {
@@ -306,6 +384,33 @@ impl CommandDescriptor {
     /// Add description.
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
+        self
+    }
+
+    /// Mark this command as not exposed to the LLM tool registry.
+    pub fn ai_exposed_false(mut self) -> Self {
+        self.ai_exposed = false;
+        self
+    }
+
+    /// Declare side-effect / replay / execution metadata (explicit claim).
+    pub fn with_capability(
+        mut self,
+        effect: CommandEffect,
+        replay_safety: CommandReplaySafety,
+        execution: CommandExecutionKind,
+    ) -> Self {
+        self.effect = Some(effect);
+        self.replay_safety = Some(replay_safety);
+        self.execution = Some(execution);
+        self
+    }
+
+    /// Convenience: read-only, replay-safe, immediate.
+    pub fn read_only(mut self) -> Self {
+        self.effect = Some(CommandEffect::ReadOnly);
+        self.replay_safety = Some(CommandReplaySafety::Safe);
+        self.execution = Some(CommandExecutionKind::Immediate);
         self
     }
 
@@ -936,27 +1041,13 @@ pub struct CExtensionMetadata {
 // ============================================================================
 
 /// Get current timestamp in milliseconds.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn current_timestamp_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// Get current timestamp in milliseconds (WASM stub).
-#[cfg(target_arch = "wasm32")]
-pub fn current_timestamp_ms() -> i64 {
-    0
-}
-
 /// Get current timestamp in seconds.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn current_timestamp_secs() -> i64 {
     chrono::Utc::now().timestamp()
-}
-
-/// Get current timestamp in seconds (WASM stub).
-#[cfg(target_arch = "wasm32")]
-pub fn current_timestamp_secs() -> i64 {
-    0
 }
 
 // ============================================================================
@@ -1239,9 +1330,9 @@ pub enum IpcMessage {
     },
 
     // =========================================================================
-    // Capability Invocation (for WASM extensions)
+    // Capability Invocation (host round-trip from the runner)
     // =========================================================================
-    /// Invoke a capability from WASM extension
+    /// Invoke a host capability from the runner process
     InvokeCapability {
         /// Request ID for tracking
         request_id: u64,
@@ -1251,7 +1342,7 @@ pub enum IpcMessage {
         params: serde_json::Value,
     },
 
-    /// Subscribe to events from WASM extension
+    /// Subscribe to extension events
     SubscribeEvents {
         /// Request ID for tracking
         request_id: u64,
@@ -1551,7 +1642,7 @@ pub enum IpcResponse {
     },
 
     // =========================================================================
-    // Capability Invocation Responses (for WASM extensions)
+    // Capability Invocation Responses
     // =========================================================================
     /// Capability invocation result
     CapabilityResult {
@@ -1899,6 +1990,25 @@ mod segmented_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_descriptor_legacy_json_defaults_ai_exposed_true() {
+        // Descriptors emitted by pre-0.8.1 extensions have no ai_exposed key.
+        // They must deserialize as AI-exposed (previous behavior, no regression).
+        let legacy = r#"{"name":"turn_on","display_name":"Turn On","description":"d"}"#;
+        let cmd: CommandDescriptor = serde_json::from_str(legacy).unwrap();
+        assert!(cmd.ai_exposed);
+        assert_eq!(cmd.name, "turn_on");
+    }
+
+    #[test]
+    fn command_descriptor_explicit_false_roundtrip() {
+        let cmd = CommandDescriptor::new("wizard").ai_exposed_false();
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"ai_exposed\":false"));
+        let back: CommandDescriptor = serde_json::from_str(&json).unwrap();
+        assert!(!back.ai_exposed);
+    }
 
     #[test]
     fn test_metric_data_type_serialization() {

@@ -107,9 +107,10 @@ pub async fn list_all_data_sources_handler(
     let need_device = filter_type.is_none() || filter_type == Some("device");
     let need_extension = filter_type.is_none() || filter_type == Some("extension");
     let need_transform = filter_type.is_none() || filter_type == Some("transform");
+    let need_ai = filter_type.is_none() || filter_type == Some("ai");
 
     // Collect sources from all needed types in parallel
-    let (mut device_sources, mut extension_sources, mut transform_sources) = tokio::join!(
+    let (mut device_sources, mut extension_sources, mut transform_sources, mut ai_sources) = tokio::join!(
         async {
             if need_device {
                 collect_device_sources_parallel(&state).await
@@ -131,10 +132,18 @@ pub async fn list_all_data_sources_handler(
                 vec![]
             }
         },
+        async {
+            if need_ai {
+                collect_ai_sources_parallel(&state).await
+            } else {
+                vec![]
+            }
+        },
     );
     sources.append(&mut device_sources);
     sources.append(&mut extension_sources);
     sources.append(&mut transform_sources);
+    sources.append(&mut ai_sources);
 
     // Sort by id for consistent ordering
     sources.sort_by(|a, b| a.id.cmp(&b.id));
@@ -283,6 +292,57 @@ async fn collect_extension_sources_parallel(state: &ServerState) -> Vec<UnifiedD
 }
 
 /// Collect data sources from all registered transforms (returns new Vec for parallel use).
+/// Collect data sources from agents that declare an output contract: one entry
+/// per field, id `ai:{agent_id}:{field}` — exactly how the executor publishes
+/// them, so the dashboard picker binds to the live namespace.
+async fn collect_ai_sources(state: &ServerState, sources: &mut Vec<UnifiedDataSourceInfo>) {
+    let agents = state
+        .agents
+        .agent_store
+        .query_agents(heramind_storage::AgentFilter::default())
+        .await
+        .unwrap_or_default();
+
+    for agent in agents {
+        // Any agent with an output contract, not just the L0 ones: since M2-2 a
+        // reasoning agent publishes its fields too, and a field the picker
+        // refuses to list is a field nothing can bind to.
+        let Some(schema) = agent.output_schema else {
+            continue;
+        };
+        for field in schema {
+            sources.push(UnifiedDataSourceInfo {
+                id: format!("ai:{}:{}", agent.id, field.name),
+                source_type: "ai".to_string(),
+                source_name: agent.id.clone(),
+                source_display_name: agent.name.clone(),
+                field: field.name.clone(),
+                // The field NAME is the identity — it is the ai:{id}:{field}
+                // key a dashboard or rule binds to. The description is prompt
+                // semantics, often a sentence: it rides in `description`
+                // (picker tooltips) instead of masquerading as a label.
+                field_display_name: field.name.clone(),
+                data_type: match field.field_type {
+                    heramind_storage::OperatorFieldType::Number => "number".to_string(),
+                    heramind_storage::OperatorFieldType::Boolean => "boolean".to_string(),
+                    _ => "string".to_string(),
+                },
+                unit: field.unit.clone(),
+                description: field.description.clone(),
+                current_value: None,
+                last_update: None,
+                quality: None,
+            });
+        }
+    }
+}
+
+async fn collect_ai_sources_parallel(state: &ServerState) -> Vec<UnifiedDataSourceInfo> {
+    let mut sources = Vec::new();
+    collect_ai_sources(state, &mut sources).await;
+    sources
+}
+
 async fn collect_transform_sources_parallel(state: &ServerState) -> Vec<UnifiedDataSourceInfo> {
     let mut sources = Vec::new();
     collect_transform_sources(state, &mut sources).await;
@@ -590,6 +650,7 @@ pub async fn query_telemetry_handler(
                 "device" => Some(DataSourceId::device(parts[1], metric)),
                 "extension" => Some(DataSourceId::extension(parts[1], metric)),
                 "transform" => Some(DataSourceId::transform(parts[1], metric)),
+                "ai" => Some(DataSourceId::ai(parts[1], metric)),
                 _ => None,
             }
         } else {
@@ -671,6 +732,11 @@ pub async fn query_telemetry_handler(
                 "timestamp": p.timestamp,
                 "value": p.value.to_json_value(),
                 "quality": p.quality,
+                // A published AI field points back at the run that produced it
+                // via this. Without it the pointer exists in redb and reaches
+                // nobody: every other field on a point was already forwarded,
+                // metadata was simply never written out.
+                "metadata": p.metadata,
             })
         })
         .collect();

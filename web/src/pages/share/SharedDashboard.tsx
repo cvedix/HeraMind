@@ -7,14 +7,15 @@
  * extension UMD bundle fetch calls alike.
  */
 
-import { useEffect, useState, useMemo, useRef, useCallback, Component } from 'react'
+import { useEffect, useState, useMemo, useRef, Component } from 'react'
 import type { ReactNode, ErrorInfo } from 'react'
 import { useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n/config'
 import { fetchAPI } from '@/lib/api'
-import { Loader2, AlertTriangle, Eye, Zap, EyeOff } from 'lucide-react'
+import { AlertTriangle, Eye, Zap, EyeOff } from 'lucide-react'
 import { LoadingState } from '@/components/shared/LoadingState'
+import { EmptyStateCompact } from '@/components/shared/EmptyState'
 import { ThemeToggle } from '@/components/layout/ThemeToggle'
 import { DashboardGrid } from '@/components/dashboard/DashboardGrid'
 import { renderDashboardComponent } from '@/pages/dashboard-components/Renderers'
@@ -46,7 +47,7 @@ class ComponentErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundary
     return { hasError: true }
   }
 
-  componentDidCatch(error: Error, info: ErrorInfo) {
+  componentDidCatch(error: Error, _info: ErrorInfo) {
     console.warn('[SharedDashboard] Component failed to render:', error.message)
   }
 
@@ -161,9 +162,9 @@ export function SharedDashboard() {
           // Install global fetch proxy AFTER dashboard data is loaded
           proxyCleanupRef.current = installShareProxy(token)
         }
-      } catch (e: any) {
+      } catch (e) {
         if (mounted) {
-          const msg = e.message || ''
+          const msg = e instanceof Error ? e.message : ''
           if (msg.includes('doctype') || msg.includes('Unexpected token')) {
             setError(t('sharedDashboard.serverError'))
           } else {
@@ -212,7 +213,7 @@ export function SharedDashboard() {
   return (
     <div className="flex h-screen flex-col bg-background">
       {/* Header */}
-      <header className="shrink-0 flex items-center justify-between px-4 py-2.5  bg-background z-10">
+      <header className="shrink-0 flex items-center justify-between px-4 py-2.5 safe-top bg-background z-10">
         <div className="flex items-center gap-2">
           <h1 className="text-sm font-semibold">{data.dashboard.name}</h1>
           <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded ${textNano} font-medium bg-muted text-muted-foreground`}>
@@ -230,13 +231,11 @@ export function SharedDashboard() {
       </header>
 
       {/* Dashboard Content - reuse same rendering pipeline */}
-      <div className="flex-1 overflow-auto p-4 relative">
+      <div className="flex-1 overflow-auto p-4 pb-safe relative">
         {data.dashboard.components && data.dashboard.components.length > 0 ? (
           <SharedDashboardContent dashboard={data.dashboard} />
         ) : (
-          <div className="flex items-center justify-center h-64 text-muted-foreground text-sm">
-            {t('sharedDashboard.noComponents')}
-          </div>
+          <EmptyStateCompact title={t('sharedDashboard.noComponents')} />
         )}
       </div>
     </div>

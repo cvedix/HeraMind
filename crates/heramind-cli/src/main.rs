@@ -40,6 +40,19 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Build an explicit DispatchContext without mutating process env vars.
+    let dispatch_ctx = heramind_cli_ops::dispatch::DispatchContext {
+        api_base: std::env::var("HERAMIND_API_BASE").ok(),
+        api_key: std::env::var("HERAMIND_API_KEY").ok(),
+        output_format: if args.json || args.format.as_deref() == Some("json") {
+            Some(heramind_cli_ops::types::OutputFormat::Json)
+        } else if args.format.as_deref() == Some("text") {
+            Some(heramind_cli_ops::types::OutputFormat::Human)
+        } else {
+            None
+        },
+    };
+
     // Initialize logging
     let json_logging = std::env::var("HERAMIND_LOG_JSON")
         .ok()
@@ -133,14 +146,23 @@ async fn main() -> Result<()> {
         } => run_prompt(&prompt).await,
         Command::Chat { session } => run_chat(session).await,
         Command::ListModels { endpoint } => list_models(endpoint).await,
-        Command::Health => run_health().await,
+        Command::Health => print_result(
+            async {
+                let client = dispatch_ctx.api_client();
+                let resp = heramind_cli_ops::system::health_check(&client).await?;
+                Ok((resp, dispatch_ctx.output_format()))
+            }
+            .await,
+        ),
         Command::Logs {
             tail,
             follow,
             level,
             since,
         } => run_logs(tail, follow, level, since).await,
-        Command::Extension { extension_cmd } => run_extension_cmd(extension_cmd).await,
+        Command::Extension { extension_cmd } => {
+            run_extension_cmd(extension_cmd, &dispatch_ctx).await
+        }
         Command::CheckUpdate => run_check_update().await,
         Command::Upgrade {
             version,
@@ -155,60 +177,129 @@ async fn main() -> Result<()> {
         }
         Command::Uninstall { purge, yes } => self_update::run_uninstall(purge, yes).await,
         Command::ApiKey { key_cmd } => run_api_key_cmd(key_cmd).await,
-        Command::Llm { llm_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_llm_cmd(llm_cmd).await)
-        }
-        Command::Device { device_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_device_cmd(device_cmd).await)
-        }
+        Command::Llm { llm_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_llm_cmd_with_context(llm_cmd, &dispatch_ctx)
+                .await,
+        ),
+        Command::Device { device_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_device_cmd_with_context(
+                device_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
         Command::Dashboard { dashboard_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_dashboard_cmd(dashboard_cmd).await,
+            heramind_cli_ops::dispatch::handlers::run_dashboard_cmd_with_context(
+                dashboard_cmd,
+                &dispatch_ctx,
+            )
+            .await,
         ),
-        Command::Rule { rule_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_rule_cmd(rule_cmd).await)
-        }
+        Command::Rule { rule_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_rule_cmd_with_context(
+                rule_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
         Command::Transform { transform_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_transform_cmd(transform_cmd).await,
+            heramind_cli_ops::dispatch::handlers::run_transform_cmd_with_context(
+                transform_cmd,
+                &dispatch_ctx,
+            )
+            .await,
         ),
-        Command::Agent { agent_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_agent_cmd(agent_cmd).await)
-        }
-        Command::Message { message_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_message_cmd(message_cmd).await)
-        }
-        Command::Push { push_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_push_cmd(push_cmd).await)
-        }
-        Command::Widget { widget_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_widget_cmd(widget_cmd).await)
-        }
-        Command::System { system_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_system_cmd(system_cmd).await)
-        }
-        Command::Config { config_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_config_cmd(config_cmd).await)
-        }
-        Command::Data { data_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_data_cmd(data_cmd).await)
-        }
+        Command::Agent { agent_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_agent_cmd_with_context(
+                agent_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
+        Command::Message { message_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_message_cmd_with_context(
+                message_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
+        Command::Push { push_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_push_cmd_with_context(
+                push_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
+        Command::Widget { widget_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_widget_cmd_with_context(
+                widget_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
+        Command::System { system_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_system_cmd_with_context(
+                system_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
+        Command::Config { config_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_config_cmd_with_context(
+                config_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
+        Command::Data { data_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_data_cmd_with_context(
+                data_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
         Command::Connector { connector_cmd } => print_result(
-            heramind_cli_ops::dispatch::handlers::run_connector_cmd(connector_cmd).await,
+            heramind_cli_ops::dispatch::handlers::run_connector_cmd_with_context(
+                connector_cmd,
+                &dispatch_ctx,
+            )
+            .await,
         ),
-        Command::Settings { settings_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_settings_cmd(settings_cmd).await)
-        }
-        Command::Login { data_dir, force } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_login_cmd(data_dir, force).await)
-        }
-        Command::Logout => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_logout_cmd().await)
-        }
-        Command::Whoami => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_whoami_cmd().await)
-        }
-        Command::User { user_cmd } => {
-            print_result(heramind_cli_ops::dispatch::handlers::run_user_cmd(user_cmd).await)
-        }
+        Command::Settings { settings_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_settings_cmd_with_context(
+                settings_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
+        Command::Operation { operation_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_operation_cmd_with_context(
+                operation_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
+        Command::Login { data_dir, force } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_login_cmd_with_context(
+                data_dir,
+                force,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
+        Command::Logout => print_result(
+            heramind_cli_ops::dispatch::handlers::run_logout_cmd_with_context(&dispatch_ctx).await,
+        ),
+        Command::Whoami => print_result(
+            heramind_cli_ops::dispatch::handlers::run_whoami_cmd_with_context(&dispatch_ctx).await,
+        ),
+        Command::User { user_cmd } => print_result(
+            heramind_cli_ops::dispatch::handlers::run_user_cmd_with_context(
+                user_cmd,
+                &dispatch_ctx,
+            )
+            .await,
+        ),
     }
 }
 
@@ -220,7 +311,7 @@ fn print_result(
     )>,
 ) -> Result<()> {
     let (resp, fmt) = result?;
-    heramind_cli_ops::output::format_output(&resp, fmt);
+    print!("{}", heramind_cli_ops::output::format_output(&resp, fmt));
     // [exit-code contract] A CliResponse that reports failure IS a failure:
     // scripts and the agent's shell tool key on the process exit status, and
     // every error path used to print "❌ …" and exit 0 — indistinguishable
@@ -437,10 +528,21 @@ async fn run_chat(session_id: Option<String>) -> Result<()> {
                         heramind_agent::AgentEvent::Warning { message } => {
                             eprintln!("[Warning] {}", message);
                         }
+                        heramind_agent::AgentEvent::SystemNote { note } => {
+                            // Guard note (incomplete action, budget spent) —
+                            // the chat UI renders these as callouts; the
+                            // terminal gets a clear labeled line instead.
+                            println!("\n[system] {}", note);
+                        }
                         heramind_agent::AgentEvent::IntermediateEnd => {
                             // Intermediate end - more content coming, don't break
                             println!("[Continuing...]");
                         }
+                        heramind_agent::AgentEvent::ContextUsage { .. } => {}
+                        // Host/UI confirm chips — no interactive surface in
+                        // the terminal chat path; ignore so the stream continues.
+                        heramind_agent::AgentEvent::AuthorizeConfirmRequest { .. }
+                        | heramind_agent::AgentEvent::AuthorizeConfirmRemoved { .. } => {}
                         heramind_agent::AgentEvent::End { .. } => {
                             break;
                         }
@@ -717,120 +819,12 @@ fn is_file_older_than(path: &Path, max_age_secs: i64) -> bool {
         .unwrap_or(false)
 }
 
-/// Run health check command.
-async fn run_health() -> Result<()> {
-    println!("HeraMind System Health Check");
-    println!("==========================\n");
-
-    // Check if server is running
-    println!("🔍 Checking server status...");
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
-    let check_url = format!("{}/health", api_base);
-    match reqwest::get(&check_url).await {
-        Ok(resp) if resp.status().is_success() => {
-            println!("  ✅ Server is running");
-
-            // Get detailed health status
-            if let Ok(health_json) = resp.json::<serde_json::Value>().await {
-                if let Some(status) = health_json.get("status").and_then(|v| v.as_str()) {
-                    println!("  Status: {}", status);
-                }
-            }
-        }
-        Ok(resp) => {
-            println!("  ⚠️  Server returned status: {}", resp.status());
-        }
-        Err(e) => {
-            println!("  ❌ Server is not responding: {}", e);
-            println!("  Hint: Start the server with 'heramind serve'");
-        }
-    }
-
-    println!();
-
-    // Check database files — resolved, not CWD-relative: running `heramind
-    // health` from any other directory used to report "Data directory not
-    // found" for a perfectly healthy install.
-    println!("🔍 Checking databases...");
-    let data_dir = heramind_cli_ops::data_dir::resolve(None)
-        .unwrap_or_else(|_| std::path::PathBuf::from("./data"));
-    println!("  (data dir: {})", data_dir.display());
-    if data_dir.exists() {
-        let db_files = [
-            "telemetry.redb",
-            "sessions.redb",
-            "devices.redb",
-            "extensions.redb",
-        ];
-        for db in &db_files {
-            let db_path = data_dir.join(db);
-            if db_path.exists() {
-                let metadata = std::fs::metadata(&db_path)?;
-                let size_kb = metadata.len() / 1024;
-                println!("  ✅ {} ({} KB)", db, size_kb);
-            } else {
-                println!("  ⚠️  {} not found (will be created on first use)", db);
-            }
-        }
-    } else {
-        println!("  ℹ️  Data directory not found (will be created on first use)");
-    }
-
-    println!();
-
-    // Check LLM backend (use authenticated API client)
-    println!("🔍 Checking LLM backend...");
-    let api_client = heramind_cli_ops::ApiClient::new();
-    match heramind_cli_ops::llm::list_backends(&api_client).await {
-        Ok(response) => {
-            if response.success {
-                if let Some(data) = &response.data {
-                    // Navigate past the CliResponse -> API response double-wrap
-                    let inner = data.get("data").unwrap_or(data);
-                    let count = inner.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let active_id = inner.get("active_id").and_then(|v| v.as_str());
-                    if count > 0 {
-                        println!("  ✅ {} LLM backend(s) configured", count);
-                        if let Some(id) = active_id {
-                            println!("  ✅ Active backend: {}", id);
-                        } else {
-                            println!("  ⚠️  No active backend selected");
-                            println!(
-                                "  Hint: Use 'heramind llm activate <id>' to activate a backend"
-                            );
-                        }
-                    } else {
-                        println!("  ⚠️  No LLM backend configured");
-                        println!("  Hint: Use 'heramind llm add' to add an LLM backend");
-                    }
-                }
-            } else {
-                println!("  ⚠️  Could not query LLM backends");
-            }
-        }
-        Err(e) => {
-            println!("  ⚠️  Could not query LLM backends: {}", e);
-        }
-    }
-
-    println!();
-
-    // Check extensions directory
-    println!("🔍 Checking extensions...");
-    let extensions_dir = std::path::PathBuf::from("./extensions");
-    if extensions_dir.exists() {
-        let entries = std::fs::read_dir(&extensions_dir)?;
-        let count = entries.filter_map(|e| e.ok()).count();
-        println!("  ✅ Extensions directory found ({} items)", count);
-    } else {
-        println!("  ℹ️  Extensions directory not found");
-    }
-
-    println!();
-    println!("Health check complete.");
-
-    Ok(())
+/// Legacy human-text health path removed (S2-3): `Command::Health` now
+/// goes through `heramind_cli_ops::system::health_check` for JSON parity
+/// with in-process Chat dispatch. Kept as a no-op marker for grep history.
+#[allow(dead_code)]
+async fn run_health_legacy_removed() -> Result<()> {
+    anyhow::bail!("use heramind_cli_ops::system::health_check")
 }
 
 /// Run logs command.
@@ -838,7 +832,7 @@ async fn run_logs(
     tail: usize,
     follow: bool,
     level: Option<String>,
-    _since: Option<String>,
+    since: Option<String>,
 ) -> Result<()> {
     use std::fs::File;
     use std::io::{BufRead, BufReader, Seek};
@@ -887,6 +881,8 @@ async fn run_logs(
     // Find the newest log file
     let log_path = find_newest_log(log_dir)?;
 
+    let since_cutoff = parse_since_cutoff(since.as_deref())?;
+
     if follow {
         // Follow mode (like tail -f)
         println!(
@@ -906,7 +902,7 @@ async fn run_logs(
                     continue;
                 }
                 Ok(_) => {
-                    if matches_level(&line, &level) {
+                    if matches_level(&line, &level) && matches_since(&line, since_cutoff) {
                         print!("{}", line);
                     }
                     line.clear();
@@ -926,6 +922,7 @@ async fn run_logs(
             .lines()
             .map_while(Result::ok)
             .filter(|l| matches_level(l, &level))
+            .filter(|l| matches_since(l, since_cutoff))
             .collect();
 
         let start = if lines.len() > tail {
@@ -985,59 +982,123 @@ fn matches_level(line: &str, level: &Option<String>) -> bool {
     }
 }
 
+/// Parse `--since 1h` / `30m` into a UTC cutoff. None means no filter.
+fn parse_since_cutoff(since: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let Some(raw) = since.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now().timestamp();
+    let start = parse_relative_duration_to_cutoff(raw, now);
+    let Some(start_ts) = start else {
+        anyhow::bail!(
+            "Invalid --since '{raw}'. Use a positive duration with unit: s/m|min/h|hr/d|day/w|wk/mo|month (e.g. --since 1h)."
+        );
+    };
+    Ok(chrono::DateTime::from_timestamp(start_ts, 0))
+}
+
+fn parse_relative_duration_to_cutoff(raw: &str, now: i64) -> Option<i64> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let split = raw.find(|c: char| c.is_ascii_alphabetic())?;
+    let (num, unit) = raw.split_at(split);
+    let n: i64 = num.parse().ok()?;
+    if n <= 0 {
+        return None;
+    }
+    let secs = match unit {
+        "s" | "sec" | "secs" | "second" | "seconds" => n,
+        "m" | "min" | "mins" | "minute" | "minutes" => n * 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => n * 3600,
+        "d" | "day" | "days" => n * 86400,
+        "w" | "wk" | "week" | "weeks" => n * 7 * 86400,
+        "mo" | "month" | "months" => n * 30 * 86400,
+        _ => return None,
+    };
+    Some(now - secs)
+}
+
+/// Keep lines at/after cutoff. Lines without a leading RFC3339 timestamp pass
+/// through so rotated/partial files are not silently emptied.
+fn matches_since(line: &str, cutoff: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+    let Some(cutoff) = cutoff else {
+        return true;
+    };
+    let ts_str = line.split_whitespace().next().unwrap_or("");
+    match chrono::DateTime::parse_from_rfc3339(ts_str) {
+        Ok(ts) => ts.with_timezone(&chrono::Utc) >= cutoff,
+        Err(_) => true,
+    }
+}
+
 /// Run extension management commands.
-async fn run_extension_cmd(cmd: ExtensionCommand) -> Result<()> {
-    // Local-only subcommands (validate/install/uninstall/create/build/info) are
-    // handled here in the binary — they touch the local filesystem and print
-    // directly to stdout. API subcommands are delegated to the cli-ops handler
-    // (which is the same code path used by the in-process dispatcher).
-    match &cmd {
-        ExtensionCommand::Validate { .. } => {
-            if let ExtensionCommand::Validate { path, verbose } = cmd {
-                return validate_nep_package(&path, verbose).await;
-            }
-            unreachable!()
+async fn run_extension_cmd(
+    cmd: ExtensionCommand,
+    ctx: &heramind_cli_ops::dispatch::DispatchContext,
+) -> Result<()> {
+    // Only true local developer commands (`validate`, `create`, `build`) and
+    // explicit `--offline` operations touch the local filesystem directly.
+    // All online extension operations (`install`, `uninstall`, `get`, `list`,
+    // `status`, `logs`, `config`, `commands`, `invoke`, marketplace) converge
+    // on the same `heramind-cli-ops` HTTP handler used by in-process dispatch.
+    match cmd {
+        ExtensionCommand::Validate { path, verbose } => validate_nep_package(&path, verbose).await,
+        ExtensionCommand::Create {
+            name,
+            extension_type,
+            output,
+        } => {
+            create_extension_scaffold(&name, &extension_type, output)?;
+            Ok(())
         }
-        ExtensionCommand::Install { .. } => {
-            if let ExtensionCommand::Install { package } = cmd {
-                return install_extension(&package).await;
-            }
-            unreachable!()
+        ExtensionCommand::Build { path } => {
+            build_extension(&path)?;
+            Ok(())
         }
-        ExtensionCommand::Uninstall { .. } => {
-            if let ExtensionCommand::Uninstall { id, yes, .. } = cmd {
-                return uninstall_extension(&id, yes).await;
-            }
-            unreachable!()
+        ExtensionCommand::Install {
+            package,
+            offline: true,
+        } => install_extension_offline(&package).await,
+        ExtensionCommand::Uninstall {
+            id,
+            yes,
+            offline: true,
+        } => uninstall_extension_offline(&id, yes).await,
+        ExtensionCommand::Get {
+            id_or_path,
+            offline: true,
+        } => show_extension_info_offline(&id_or_path).await,
+        ExtensionCommand::Get {
+            ref id_or_path,
+            offline: false,
+        } if std::path::Path::new(id_or_path)
+            .extension()
+            .is_some_and(|e| e == "nep") =>
+        {
+            validate_nep_package(&std::path::PathBuf::from(id_or_path), true).await
         }
-        ExtensionCommand::Create { .. } => {
-            if let ExtensionCommand::Create {
-                name,
-                extension_type,
-                output,
-            } = cmd
-            {
-                create_extension_scaffold(&name, &extension_type, output)?;
-                return Ok(());
-            }
-            unreachable!()
+        ExtensionCommand::Uninstall {
+            id,
+            yes,
+            offline: false,
+        } => {
+            confirm_or_abort(&format!("Uninstall extension '{}'?", id), yes)?;
+            print_result(
+                heramind_cli_ops::dispatch::handlers::run_extension_cmd_with_context(
+                    ExtensionCommand::Uninstall {
+                        id,
+                        yes: true,
+                        offline: false,
+                    },
+                    ctx,
+                )
+                .await,
+            )
         }
-        ExtensionCommand::Build { .. } => {
-            if let ExtensionCommand::Build { path } = cmd {
-                build_extension(&path)?;
-                return Ok(());
-            }
-            unreachable!()
-        }
-        ExtensionCommand::Get { .. } => {
-            // Get has local fallback logic, handled separately
-            if let ExtensionCommand::Get { id_or_path } = cmd {
-                return show_extension_info(&id_or_path).await;
-            }
-            unreachable!()
-        }
-        // API commands — delegate to cli-ops handler (shared with in-process dispatch).
-        _ => print_result(heramind_cli_ops::dispatch::handlers::run_extension_cmd(cmd).await),
+        // Online API commands (including `install`, `get`, and all runtime ops)
+        // share the exact same `heramind-cli-ops` HTTP handler as in-process dispatch.
+        other => print_result(
+            heramind_cli_ops::dispatch::handlers::run_extension_cmd_with_context(other, ctx).await,
+        ),
     }
 }
 
@@ -1065,10 +1126,12 @@ async fn validate_nep_package(path: &std::path::PathBuf, verbose: bool) -> Resul
     let mut archive = ZipArchive::new(file)?;
 
     // Check for manifest.json - collect names first to avoid borrow issues
+    // zip 9: file_names() yields Results (UTF-8 validation); an invalid
+    // name is never the manifest.
     let manifest_names: Vec<String> = archive
         .file_names()
+        .filter_map(|n| n.ok().map(|s| s.to_string()))
         .filter(|n| n.ends_with("manifest.json"))
-        .map(|s| s.to_string())
         .collect();
 
     if manifest_names.is_empty() {
@@ -1153,19 +1216,20 @@ async fn validate_nep_package(path: &std::path::PathBuf, verbose: bool) -> Resul
         println!("Package contents:");
         for i in 0..archive.len() {
             let file = archive.by_index(i)?;
-            println!("  {}", file.name());
+            // zip 9: name() may fail UTF-8 validation — show a placeholder.
+            let shown = file
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|e| format!("<invalid name: {e}>"));
+            println!("  {}", shown);
         }
     }
 
     Ok(())
 }
 
-/// List installed extensions.
-/// Show extension information.
-async fn show_extension_info(id_or_path: &str) -> Result<()> {
-    use heramind_cli_ops::output::format_output;
-    use heramind_cli_ops::types::OutputFormat;
-
+/// Show extension information from local `.nep` files (`--offline`).
+async fn show_extension_info_offline(id_or_path: &str) -> Result<()> {
     let path = std::path::PathBuf::from(id_or_path);
 
     if path.exists() {
@@ -1174,29 +1238,7 @@ async fn show_extension_info(id_or_path: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Try API first (shows runtime info: status, commands, metrics). A 2xx
-    // whose body isn't JSON (the web SPA fallback for an unrouted path)
-    // parses to Null in the client — treat anything but a non-empty JSON
-    // object as "no answer" and fall through, never as success.
-    let client = heramind_cli_ops::ApiClient::new();
-    if let Ok(response) = heramind_cli_ops::extension::get_extension(&client, id_or_path).await {
-        let looks_like_extension = response
-            .data
-            .as_ref()
-            .and_then(|d| d.as_object())
-            .is_some_and(|o| !o.is_empty());
-        if looks_like_extension {
-            let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-                OutputFormat::Json
-            } else {
-                OutputFormat::Human
-            };
-            format_output(&response, output_format);
-            return Ok(());
-        }
-    }
-
-    // Fallback: search local filesystem for .nep files
+    // Search local filesystem for .nep files
     use std::fs;
 
     let search_dirs = [
@@ -1225,12 +1267,12 @@ async fn show_extension_info(id_or_path: &str) -> Result<()> {
         validate_nep_package(&found_path, true).await?;
         Ok(())
     } else {
-        anyhow::bail!("Extension not found: {}", id_or_path);
+        anyhow::bail!("Extension not found locally: {}", id_or_path);
     }
 }
 
-/// Install an extension from .nep package.
-async fn install_extension(package: &str) -> Result<()> {
+/// Install an extension from a `.nep` package into the local directory (`--offline`).
+async fn install_extension_offline(package: &str) -> Result<()> {
     let source_path = std::path::PathBuf::from(package);
 
     if !source_path.exists() {
@@ -1290,7 +1332,7 @@ fn confirm_or_abort(prompt: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-async fn uninstall_extension(id: &str, yes: bool) -> Result<()> {
+async fn uninstall_extension_offline(id: &str, yes: bool) -> Result<()> {
     use std::fs;
 
     let search_dirs = [
@@ -1386,8 +1428,10 @@ fn create_extension_scaffold(
         anyhow::bail!("Output directory already exists: {}", out_dir.display());
     }
 
-    // SDK version — use the version of this binary's SDK dependency
-    let sdk_version = "0.6.3";
+    // SDK version — single-sourced from the SDK crate (the hardcoded
+    // "0.6.3" here had drifted while the SDK moved on, and ^0.6 semver
+    // locked fresh scaffolds to the stale line).
+    let sdk_version = heramind_extension_sdk::VERSION;
 
     // Create directory structure
     let src_dir = out_dir.join("src");
@@ -1468,6 +1512,10 @@ impl Extension for {struct_name} {{
             fixed_values: std::collections::HashMap::new(),
             samples: vec![json!({{"name": "world"}})],
             parameter_groups: Vec::new(),
+            ai_exposed: true,
+            effect: Default::default(),
+            replay_safety: Default::default(),
+            execution: Default::default(),
         }}]
     }}
 
@@ -1554,6 +1602,22 @@ heramind_export!({struct_name});
 /// manifest.json into a `.nep` zip archive. On success, prints a structured
 /// marker line `NEP_PATH=<path>` so downstream tools (and the agent) can
 /// extract the package path deterministically.
+/// Last `max` lines of captured cargo output, with a truncation marker.
+fn tail_lines(bytes: &[u8], max: usize) -> String {
+    let text = String::from_utf8_lossy(bytes).trim().to_string();
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() > max {
+        let start = lines.len() - max;
+        format!(
+            "... ({} earlier lines truncated)\n{}",
+            start,
+            lines[start..].join("\n")
+        )
+    } else {
+        text
+    }
+}
+
 fn build_extension(path: &std::path::PathBuf) -> Result<()> {
     use std::fs;
     use std::process::Command;
@@ -1598,17 +1662,37 @@ fn build_extension(path: &std::path::PathBuf) -> Result<()> {
         .unwrap_or("0.1.0")
         .to_string();
 
-    // 2. cargo build --release
-    let status = Command::new("cargo")
+    // 2. cargo build --release — CAPTURED, not inherited: the compiler's
+    //    diagnostics belong in THIS command's output/error, labeled and
+    //    bounded. They previously leaked through only via inherited stderr
+    //    (unlabeled, ANSI-colored, unbounded) and the error message itself
+    //    carried none of them — a caller reading just the error saw
+    //    "non-zero status" with zero compile errors.
+    let output = Command::new("cargo")
         .args(["build", "--release"])
         .current_dir(path)
-        .status()?;
+        .env("CARGO_TERM_COLOR", "never")
+        .output()?;
 
-    if !status.success() {
-        anyhow::bail!("Extension build failed (cargo build returned non-zero status)");
+    if !output.status.success() {
+        anyhow::bail!(
+            "Extension build FAILED — cargo exited {}. Fix the compile errors below and rebuild:\n--- cargo stderr ---\n{}\n--- cargo stdout ---\n{}",
+            output
+                .status
+                .code()
+                .map_or("by signal".to_string(), |c| c.to_string()),
+            tail_lines(&output.stderr, 40),
+            tail_lines(&output.stdout, 20),
+        );
     }
 
     println!("✅ Cargo build succeeded");
+    let cargo_stdout = tail_lines(&output.stdout, 20);
+    if !cargo_stdout.is_empty() {
+        println!();
+        println!("--- cargo output ---");
+        println!("{cargo_stdout}");
+    }
     println!();
 
     // 3. Locate the compiled cdylib in target/release/.
@@ -1826,4 +1910,95 @@ async fn run_api_key_cmd(cmd: ApiKeyCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod since_tests {
+    use super::*;
+
+    #[test]
+    fn parse_relative_duration_supports_all_units_including_months() {
+        let now = 1_700_000_000i64;
+        assert_eq!(
+            parse_relative_duration_to_cutoff("30s", now),
+            Some(now - 30)
+        );
+        assert_eq!(
+            parse_relative_duration_to_cutoff("15min", now),
+            Some(now - 15 * 60)
+        );
+        assert_eq!(
+            parse_relative_duration_to_cutoff("2hr", now),
+            Some(now - 2 * 3600)
+        );
+        assert_eq!(
+            parse_relative_duration_to_cutoff("3days", now),
+            Some(now - 3 * 86400)
+        );
+        assert_eq!(
+            parse_relative_duration_to_cutoff("1wk", now),
+            Some(now - 7 * 86400)
+        );
+        assert_eq!(
+            parse_relative_duration_to_cutoff("2mo", now),
+            Some(now - 2 * 30 * 86400)
+        );
+        assert_eq!(
+            parse_relative_duration_to_cutoff("1month", now),
+            Some(now - 30 * 86400)
+        );
+        assert_eq!(
+            parse_relative_duration_to_cutoff("3months", now),
+            Some(now - 3 * 30 * 86400)
+        );
+        assert_eq!(parse_relative_duration_to_cutoff("0h", now), None);
+        assert_eq!(parse_relative_duration_to_cutoff("-5m", now), None);
+        assert_eq!(parse_relative_duration_to_cutoff("bogus", now), None);
+        assert_eq!(parse_relative_duration_to_cutoff("10y", now), None);
+    }
+
+    #[test]
+    fn parse_since_cutoff_handles_empty_valid_and_invalid() {
+        assert!(parse_since_cutoff(None).unwrap().is_none());
+        assert!(parse_since_cutoff(Some("   ")).unwrap().is_none());
+
+        let cutoff = parse_since_cutoff(Some("1h")).unwrap().expect("valid 1h");
+        let diff = (chrono::Utc::now() - cutoff).num_seconds();
+        assert!((3590..=3610).contains(&diff), "unexpected diff {diff}");
+
+        let mo_cutoff = parse_since_cutoff(Some("1mo")).unwrap().expect("valid 1mo");
+        let mo_diff = (chrono::Utc::now() - mo_cutoff).num_seconds();
+        assert!(
+            (30 * 86400 - 10..=30 * 86400 + 10).contains(&mo_diff),
+            "unexpected month diff {mo_diff}"
+        );
+
+        assert!(parse_since_cutoff(Some("0m")).is_err());
+        assert!(parse_since_cutoff(Some("not-a-duration")).is_err());
+    }
+
+    #[test]
+    fn matches_since_filters_rfc3339_and_preserves_continuation_lines() {
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-11-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert!(matches_since("2026-11-20T11:59:59Z INFO old", None));
+        assert!(!matches_since(
+            "2026-11-20T11:59:59Z INFO before cutoff",
+            Some(cutoff)
+        ));
+        assert!(matches_since(
+            "2026-11-20T12:00:00Z INFO exact cutoff",
+            Some(cutoff)
+        ));
+        assert!(matches_since(
+            "2026-11-20T12:05:00+00:00 WARN after cutoff",
+            Some(cutoff)
+        ));
+        assert!(matches_since(
+            "  at crate::module::func (no leading timestamp)",
+            Some(cutoff)
+        ));
+    }
 }

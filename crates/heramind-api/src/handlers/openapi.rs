@@ -82,6 +82,7 @@ route index (including not-yet-schematized endpoints): /api/docs/routes.json."
         crate::handlers::devices::auto_onboard::get_draft_device,
         crate::handlers::devices::auto_onboard::update_draft_device,
         crate::handlers::devices::auto_onboard::approve_draft_device,
+        crate::handlers::devices::auto_onboard::confirm_association_draft,
         crate::handlers::devices::auto_onboard::reject_draft_device,
         crate::handlers::devices::auto_onboard::trigger_draft_analysis,
         crate::handlers::devices::auto_onboard::enhance_draft_with_llm,
@@ -171,6 +172,8 @@ route index (including not-yet-schematized endpoints): /api/docs/routes.json."
         crate::handlers::agents::delete_agent,
         crate::handlers::agents::execute_agent,
         crate::handlers::agents::invoke_agent,
+        crate::handlers::agents::test_agent,
+        crate::handlers::agents::test_agent_preview,
         crate::handlers::agents::set_agent_status,
         crate::handlers::agents::get_agent_executions,
         crate::handlers::agents::get_execution,
@@ -221,6 +224,8 @@ route index (including not-yet-schematized endpoints): /api/docs/routes.json."
         crate::handlers::sessions::update_session_handler,
         crate::handlers::sessions::toggle_memory_handler,
         crate::handlers::sessions::delete_session_handler,
+        crate::handlers::sessions::compact_session_handler,
+        crate::handlers::sessions::clear_session_history_handler,
         crate::handlers::sessions::chat_handler,
         crate::handlers::sessions::get_pending_stream_handler,
         crate::handlers::sessions::clear_pending_stream_handler,
@@ -248,7 +253,13 @@ route index (including not-yet-schematized endpoints): /api/docs/routes.json."
         crate::builtin_llm::handlers::upload_model_handler,
         crate::builtin_llm::handlers::delete_model_handler,
         crate::builtin_llm::handlers::restart_handler,
+        crate::builtin_llm::handlers::stop_handler,
         crate::builtin_llm::handlers::activate_handler,
+        crate::builtin_llm::handlers::runtime_status_handler,
+        crate::builtin_llm::handlers::runtime_check_handler,
+        crate::builtin_llm::handlers::runtime_variant_handler,
+        crate::builtin_llm::handlers::runtime_upgrade_handler,
+        crate::builtin_llm::handlers::runtime_revert_handler,
         // ---- instances ----
         crate::handlers::instances::list_instances_handler,
         crate::handlers::instances::create_instance_handler,
@@ -265,6 +276,8 @@ route index (including not-yet-schematized endpoints): /api/docs/routes.json."
         crate::handlers::messages::bulk_resolve_handler,
         crate::handlers::messages::bulk_delete_handler,
         crate::handlers::messages::get_message_handler,
+        crate::handlers::messages::get_message_chain_handler,
+        crate::handlers::messages::mark_message_false_positive_handler,
         crate::handlers::messages::delete_message_handler,
         crate::handlers::messages::acknowledge_message_handler,
         crate::handlers::messages::resolve_message_handler,
@@ -314,11 +327,13 @@ route index (including not-yet-schematized endpoints): /api/docs/routes.json."
         crate::handlers::extensions::list_extension_capabilities_handler,
         crate::handlers::extensions::get_extension_handler,
         crate::handlers::extensions::extension_health_handler,
+        crate::handlers::extensions::search_extension_commands_handler,
         crate::handlers::extensions::list_extension_commands_handler,
         crate::handlers::extensions::get_extension_components_handler,
         crate::handlers::extensions::get_event_subscriptions_handler,
         crate::handlers::extensions::unregister_extension_handler,
         crate::handlers::extensions::set_extension_enabled_handler,
+        crate::handlers::extensions::set_extension_ai_enabled_handler,
         crate::handlers::extensions::set_extension_command_enabled_handler,
         crate::handlers::extensions::get_extension_logs_handler,
         crate::handlers::extensions::clear_extension_logs_handler,
@@ -406,6 +421,8 @@ route index (including not-yet-schematized endpoints): /api/docs/routes.json."
         crate::handlers::settings::update_device_defaults,
         crate::handlers::settings::get_market_source_handler,
         crate::handlers::settings::update_market_source_handler,
+        crate::handlers::settings::get_llm_sources_handler,
+        crate::handlers::settings::update_llm_sources_handler,
         // ---- backups ----
         crate::handlers::settings::create_backup_handler,
         crate::handlers::settings::list_backups_handler,
@@ -474,6 +491,7 @@ crate::handlers::dashboards::AddComponentsRequest,
     crate::handlers::settings::AgentDefaultsRequest,
     crate::handlers::automations::AnalyzeIntentRequest,
     crate::handlers::devices::auto_onboard::ApproveDraftDeviceRequest,
+    crate::handlers::devices::auto_onboard::ConfirmAssociationRequest,
     crate::automation::discovery::auto_onboard::AutoOnboardConfig,
     crate::handlers::settings::BackupConfigRequest,
     crate::handlers::devices::models::BatchCurrentValuesRequest,
@@ -481,7 +499,11 @@ crate::handlers::dashboards::AddComponentsRequest,
     crate::handlers::devices::ble_provision::BleProvisionRequest,
     crate::handlers::messages::BulkAcknowledgeRequest,
     crate::auth_users::ChangePasswordRequest,
+    crate::handlers::devices::ble_provision::CustomMqttRequest,
+    crate::models::AuthorizeNewOperationRequest,
     crate::models::ChatRequest,
+    crate::models::ChatReference,
+    crate::models::ChatContentNode,
     crate::handlers::messages::CleanupRequest,
     crate::handlers::devices::types::CloudImportRequest,
     crate::handlers::config::ConfigExport,
@@ -510,6 +532,7 @@ crate::handlers::dashboards::AddComponentsRequest,
     crate::handlers::extensions::InvokeExtensionRequest,
     crate::handlers::setup::LlmConfigRequest,
     crate::handlers::settings::LlmGenerateRequest,
+    crate::handlers::settings::LlmSourceRequest,
     crate::auth_users::LoginRequest,
     crate::auth_users::LoginResponse,
     crate::handlers::frontend_components::MarketInstallRequest,
@@ -529,6 +552,8 @@ crate::handlers::dashboards::AddComponentsRequest,
     crate::handlers::automations::SetAutomationStatusRequest,
     crate::handlers::rules::SetRuleStatusRequest,
     crate::handlers::extensions::SetToolEnabledRequest,
+    crate::handlers::extensions::SetAiEnabledRequest,
+    crate::handlers::agents::TestPreviewRequest,
     crate::handlers::automations::TestTransformCodeRequest,
     crate::handlers::settings::TimezoneRequest,
     crate::handlers::message_channels::ToggleEnabledRequest,
@@ -580,9 +605,17 @@ crate::handlers::dashboards::AddComponentsRequest,
     heramind_data_push::CreateTargetRequest,
     heramind_data_push::UpdateTargetRequest,
     heramind_storage::device_registry::DeviceTypeTemplate,
+    heramind_storage::device_registry::CtProvMetadata,
     heramind_storage::memory_config::MemoryConfig,
     crate::models::ThinkingEffortMirror,
     crate::models::AgentToolConfigMirror,
+    heramind_storage::OperatorField,
+    heramind_storage::OperatorFieldType,
+    heramind_storage::OperatorConfig,
+    heramind_storage::MemoryMode,
+    heramind_storage::AgentToolConfig,
+    heramind_storage::AgentNotify,
+    heramind_storage::NotifyOn,
     crate::handlers::config::AlertRuleExport,
     heramind_data_push::types::BatchConfig,
     heramind_storage::device_registry::CommandDefinition,
@@ -613,4 +646,39 @@ pub struct ApiDoc;
 /// GET /api/docs/openapi.json — the machine-readable OpenAPI 3 document.
 pub async fn openapi_json_handler() -> axum::Json<utoipa::openapi::OpenApi> {
     axum::Json(ApiDoc::openapi())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_local_openapi_reference_resolves() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let mut pending = vec![&spec];
+        let mut missing = std::collections::BTreeSet::new();
+
+        while let Some(value) = pending.pop() {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    if let Some(reference) = fields.get("$ref").and_then(serde_json::Value::as_str)
+                    {
+                        if let Some(pointer) = reference.strip_prefix('#') {
+                            if spec.pointer(pointer).is_none() {
+                                missing.insert(reference);
+                            }
+                        }
+                    }
+                    pending.extend(fields.values());
+                }
+                serde_json::Value::Array(values) => pending.extend(values),
+                _ => {}
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "Unresolved OpenAPI references: {missing:?}"
+        );
+    }
 }

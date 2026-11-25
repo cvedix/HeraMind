@@ -1,13 +1,7 @@
-use crate::types::{BuildMeta, CliResponse};
+use crate::types::CliResponse;
 use crate::ApiClient;
 use anyhow::Result;
 use serde_json::json;
-
-/// Extract the inner `data` field from an API response.
-/// API returns `{"success":true,"data":{...},"meta":{...}}` — this returns the inner data.
-fn extract_inner_data(resp: serde_json::Value) -> serde_json::Value {
-    resp.get("data").cloned().unwrap_or(resp)
-}
 
 /// List messages with optional filters
 pub async fn list_messages(
@@ -39,20 +33,17 @@ pub async fn list_messages(
     }
 
     let data = client.get(&path).await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Messages listed",
-    ))
+    Ok(CliResponse::success(data, "Messages listed"))
 }
 
 /// Get message by ID
 pub async fn get_message(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client.get(&format!("/messages/{}", id)).await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Message retrieved",
-    ))
+    Ok(CliResponse::success(data, "Message retrieved"))
 }
+
+/// Success copy for `message send` — platform message center, not device delivery.
+const SEND_SUCCESS_MESSAGE: &str = "Platform message created";
 
 /// Send/create a new message
 pub async fn send_message(
@@ -73,18 +64,8 @@ pub async fn send_message(
     }
 
     let data = client.post("/messages", &body).await?;
-    let data = extract_inner_data(data);
-    let msg_id = data["id"].as_str().unwrap_or("unknown").to_string();
 
-    let meta = BuildMeta {
-        r#type: "message".to_string(),
-        action: "send".to_string(),
-        entity_id: msg_id.clone(),
-        entity_name: Some(title.to_string()),
-        undo_command: format!("heramind message delete {}", msg_id),
-    };
-
-    Ok(CliResponse::success_with_meta(data, "Message sent", meta))
+    Ok(CliResponse::success(data, SEND_SUCCESS_MESSAGE))
 }
 
 /// Acknowledge/read a message
@@ -109,25 +90,18 @@ pub async fn delete_message(client: &ApiClient, id: &str) -> Result<CliResponse>
 /// List all message channels
 pub async fn list_channels(client: &ApiClient) -> Result<CliResponse> {
     let data = client.get("/messages/channels").await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Channels listed",
-    ))
+    Ok(CliResponse::success(data, "Channels listed"))
 }
 
 /// Get channel by name
 pub async fn get_channel(client: &ApiClient, name: &str) -> Result<CliResponse> {
     let data = client.get(&format!("/messages/channels/{}", name)).await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Channel retrieved",
-    ))
+    Ok(CliResponse::success(data, "Channel retrieved"))
 }
 
 /// List available channel types
 pub async fn list_channel_types(client: &ApiClient) -> Result<CliResponse> {
-    let resp = client.get("/messages/channels/types").await?;
-    let data = extract_inner_data(resp);
+    let data = client.get("/messages/channels/types").await?;
     Ok(CliResponse::success(data, "Channel types listed"))
 }
 
@@ -136,10 +110,9 @@ pub async fn get_channel_type_schema(
     client: &ApiClient,
     channel_type: &str,
 ) -> Result<CliResponse> {
-    let resp = client
+    let data = client
         .get(&format!("/messages/channels/types/{}/schema", channel_type))
         .await?;
-    let data = extract_inner_data(resp);
     Ok(CliResponse::success(data, "Channel type schema retrieved"))
 }
 
@@ -150,7 +123,7 @@ pub async fn get_channel_type_schema(
 /// string for [`create_channel`].
 pub fn merge_channel_config(config: Option<&str>, param: &[String]) -> Result<String> {
     let mut value: serde_json::Value = match config {
-        Some(c) => serde_json::from_str(c)?,
+        Some(c) => crate::json_arg::parse_json_arg(c)?,
         None => serde_json::json!({}),
     };
     if !param.is_empty() {
@@ -163,7 +136,11 @@ pub fn merge_channel_config(config: Option<&str>, param: &[String]) -> Result<St
     Ok(value.to_string())
 }
 
-/// Create a message channel
+/// Create a message channel with a single `POST /messages/channels` request.
+///
+/// Channel type validity and required config fields are validated server-side,
+/// returning a 400/422 `ErrorResponse` with a `.hint` listing valid types or
+/// missing fields.
 pub async fn create_channel(
     client: &ApiClient,
     name: &str,
@@ -171,16 +148,15 @@ pub async fn create_channel(
     config: &str,
     enabled: bool,
 ) -> Result<CliResponse> {
-    // 1. Validate name is non-empty
-    if name.is_empty() {
+    // Lightweight client-side syntax checks only (no preflight HTTP round-trips).
+    if name.trim().is_empty() {
         return Ok(CliResponse::error(
             "Channel name is required. Use --name <NAME>",
             "MISSING_NAME",
         ));
     }
 
-    // 2. Validate channel_type is non-empty
-    if channel_type.is_empty() {
+    if channel_type.trim().is_empty() {
         return Ok(CliResponse::error_with_suggestion(
             "Channel type is required. Use --type <TYPE>.",
             "MISSING_TYPE",
@@ -188,9 +164,18 @@ pub async fn create_channel(
         ));
     }
 
-    // 3. Validate config is valid JSON
-    let config_value: serde_json::Value = match serde_json::from_str(config) {
-        Ok(v) => v,
+    let config_value: serde_json::Value = match crate::json_arg::parse_json_arg(config) {
+        Ok(v) if v.is_object() => v,
+        Ok(_) => {
+            return Ok(CliResponse::error_with_suggestion(
+                "Channel config must be a JSON object.",
+                "INVALID_JSON",
+                format!(
+                    "Run `heramind message channel-type-schema {}` for field details.",
+                    channel_type
+                ),
+            ));
+        }
         Err(e) => {
             return Ok(CliResponse::error_with_suggestion(
                 format!("Invalid config JSON: {}", e),
@@ -203,70 +188,11 @@ pub async fn create_channel(
         }
     };
 
-    // 4. Validate channel type exists (call channel-types API)
-    match client.get("/messages/channels/types").await {
-        Ok(types_data) => {
-            // API returns {"success":true,"data":{"types":[...]},...}
-            let types_list = types_data
-                .get("data")
-                .and_then(|d| d.get("types"))
-                .or_else(|| types_data.get("types"));
-            let valid_types: Vec<&str> = types_list
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|t| t["id"].as_str()).collect())
-                .unwrap_or_default();
-            if !valid_types.is_empty() && !valid_types.contains(&channel_type) {
-                return Ok(CliResponse::error_with_suggestion(
-                    format!("Unknown channel type '{}'.", channel_type),
-                    "UNKNOWN_TYPE",
-                    format!(
-                        "Available types: {}. Run `heramind message channel-types` for details.",
-                        valid_types.join(", ")
-                    ),
-                ));
-            }
-        }
-        Err(_) => {
-            // If types API is unavailable, skip this validation and let the server handle it
-        }
-    }
-
-    // 5. Validate required config fields via schema API
-    if let Ok(schema_resp) = client
-        .get(&format!("/messages/channels/types/{}/schema", channel_type))
-        .await
-    {
-        let schema_data = schema_resp.get("data").and_then(|d| d.get("config_schema"));
-        if let Some(required_fields) = schema_data
-            .and_then(|s| s.get("required"))
-            .and_then(|r| r.as_array())
-        {
-            if let Some(config_obj) = config_value.as_object() {
-                let missing: Vec<&str> = required_fields
-                    .iter()
-                    .filter_map(|f| f.as_str())
-                    .filter(|f| !config_obj.contains_key(*f))
-                    .collect();
-                if !missing.is_empty() {
-                    return Ok(CliResponse::error_with_suggestion(
-                        format!("Missing required config field(s): {}.", missing.join(", ")),
-                        "MISSING_FIELDS",
-                        format!(
-                            "Pass each one as --param <field>=<value>, or run `heramind message channel-type-schema {}` for field details.",
-                            channel_type
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-
-    let body = json!({
+    let mut body = json!({
         "name": name,
         "channel_type": channel_type,
     });
     // Merge config into body (flattened)
-    let mut body = body;
     if let serde_json::Value::Object(mut map) = config_value {
         body.as_object_mut().unwrap().append(&mut map);
     }
@@ -276,32 +202,26 @@ pub async fn create_channel(
         .unwrap()
         .insert("enabled".to_string(), json!(enabled));
     let data = client.post("/messages/channels", &body).await?;
-    let data = extract_inner_data(data);
-    let meta = BuildMeta {
-        r#type: "channel".to_string(),
-        action: "create".to_string(),
-        entity_id: name.to_string(),
-        entity_name: Some(name.to_string()),
-        undo_command: format!("heramind message channel-delete {}", name),
-    };
-    Ok(CliResponse::success_with_meta(
-        data,
-        "Channel created",
-        meta,
-    ))
+    Ok(CliResponse::success(data, "Channel created"))
 }
 
 /// Update a channel's configuration
 pub async fn update_channel(client: &ApiClient, name: &str, config: &str) -> Result<CliResponse> {
-    let config_value = serde_json::from_str(config).unwrap_or(json!(config));
+    let config_value = match crate::json_arg::parse_json_arg(config) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(CliResponse::error_with_suggestion(
+                format!("Invalid channel config JSON: {}", e),
+                "INVALID_JSON",
+                r#"Pass a JSON object for --config, e.g. --config {"url":"https://example.com/hook"}."#,
+            ));
+        }
+    };
     let body = json!({ "config": config_value });
     let data = client
         .put(&format!("/messages/channels/{}", name), &body)
         .await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Channel updated",
-    ))
+    Ok(CliResponse::success(data, "Channel updated"))
 }
 
 /// Delete a message channel
@@ -309,10 +229,7 @@ pub async fn delete_channel(client: &ApiClient, name: &str) -> Result<CliRespons
     let data = client
         .delete(&format!("/messages/channels/{}", name))
         .await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Channel deleted",
-    ))
+    Ok(CliResponse::success(data, "Channel deleted"))
 }
 
 /// Test a channel
@@ -320,15 +237,24 @@ pub async fn test_channel(client: &ApiClient, name: &str) -> Result<CliResponse>
     let data = client
         .post(&format!("/messages/channels/{}/test", name), &json!({}))
         .await?;
-    Ok(CliResponse::success(
-        extract_inner_data(data),
-        "Channel test completed",
-    ))
+    Ok(CliResponse::success(data, "Channel test completed"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::merge_channel_config;
+    use super::{merge_channel_config, SEND_SUCCESS_MESSAGE};
+    use crate::types::CliResponse;
+    use serde_json::json;
+
+    #[test]
+    fn send_success_copy_names_platform_message() {
+        let response = CliResponse::success(json!({ "id": "msg-1" }), SEND_SUCCESS_MESSAGE);
+        assert_eq!(
+            response.message.as_deref(),
+            Some("Platform message created")
+        );
+        assert_eq!(response.data.unwrap()["id"], "msg-1");
+    }
 
     #[test]
     fn param_only_builds_config() {
@@ -358,5 +284,67 @@ mod tests {
     #[test]
     fn bad_kv_entry_errors() {
         assert!(merge_channel_config(None, &["noequals".into()]).is_err());
+    }
+
+    /// P1-5: `create_channel` must issue a single `POST /messages/channels`
+    /// without preflight `GET /types` or `GET /types/:t/schema` requests, and
+    /// must surface the server's 422 error + hint directly.
+    #[tokio::test]
+    async fn create_channel_issues_single_post_and_surfaces_server_hint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            // Accept at most 2 connections with a short timeout so any spurious
+            // preflight GET would be caught and counted.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+            requests.push(req_text);
+
+            let body = r#"{"success":false,"error":{"code":"VALIDATION_ERROR","message":"Missing required config field(s) for 'webhook' channel: url","hint":"Required fields for 'webhook': url. Run `heramind message channel-type-schema webhook`."}}"#;
+            let reply = format!(
+                "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.shutdown().await;
+            requests
+        });
+
+        let client = crate::ApiClient::with_base_url_and_key(
+            &format!("http://{addr}/api"),
+            Some("nmk_test".to_string()),
+        );
+        let err = super::create_channel(&client, "ops-hook", "webhook", "{}", true)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "create_channel must issue exactly 1 HTTP request, saw: {requests:?}"
+        );
+        assert!(
+            requests[0].starts_with("POST /api/messages/channels "),
+            "expected single POST /api/messages/channels, got: {}",
+            requests[0]
+        );
+        assert!(err.contains("422"), "expected 422 status: {err}");
+        assert!(
+            err.contains("url"),
+            "expected missing field in error: {err}"
+        );
+        assert!(
+            err.contains("Hint: Required fields for 'webhook': url"),
+            "expected server hint preserved: {err}"
+        );
     }
 }

@@ -1,6 +1,9 @@
 ---
 id: settings-management
+summary: Read and change system settings.
+not_for: [LLM backend configuration (llm-management)]
 name: System Settings (Timezone & Data Retention)
+aliases: [settings]
 description: Use when the user wants to change system settings — timezone, data retention, cleanup policies. Covers settings timezone/retention/cleanup even without saying 'settings' (e.g. '把时区改成上海', '数据保留30天'). Includes 设置/时区/数据保留/清理.
 category: settings
 origin: builtin
@@ -14,6 +17,18 @@ triggers:
 anti_triggers:
   keywords: [device create, 创建设备, rule create, 创建规则, dashboard, 仪表盘, system info, broker 地址]
 ---
+
+# settings-management
+
+Read the relevant current settings before changing them. Update only requested fields; preserve unrelated settings and secrets.
+Validate units, ranges and timezone requirements using CLI help/schema. Read back the persisted value and distinguish settings requiring restart from immediately effective ones.
+Do not expose credentials in replies or generated files. Load the relevant settings reference section for exact flags.
+
+## Detailed reference
+Use skill(action="load", id="settings-management", section="<exact returned title>") only for the needed detail. Section titles are returned with this overview.
+
+<!-- SKILL_REFERENCE -->
+
 
 # System Settings: Timezone & Data Retention
 
@@ -33,7 +48,7 @@ anti_triggers:
 | `heramind settings set-timezone <IANA>` | Set the timezone, e.g. `heramind settings set-timezone Asia/Shanghai` |
 | `heramind settings timezones` | List available timezones |
 | `heramind settings retention` | Get data retention configuration |
-| `heramind settings set-retention <days>` | Update retention (in days), e.g. `heramind settings set-retention 30` |
+| `heramind settings set-retention --enabled --interval-hours <h> --default-retention <days>` | Update retention (⚠️ all flags — there is NO positional `<days>`; `--default-retention` is the days knob) |
 | `heramind settings cleanup` | Trigger a manual data cleanup now |
 
 ### Examples
@@ -42,6 +57,6 @@ anti_triggers:
 heramind settings set-timezone Asia/Shanghai
 heramind settings timezones
 heramind settings retention
-heramind settings set-retention 30
+heramind settings set-retention --enabled --interval-hours 1 --default-retention 30
 heramind settings cleanup
 ```

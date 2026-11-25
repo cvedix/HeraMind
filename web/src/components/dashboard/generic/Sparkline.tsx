@@ -7,6 +7,7 @@
  */
 
 import { useRef, useMemo, memo } from 'react'
+import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 import { toNumberArray } from '@/design-system/utils/format'
 import { dashboardComponentSize, dashboardCardBase } from '@/design-system/tokens/size'
@@ -82,8 +83,8 @@ const DEFAULT_SAMPLE_DATA = [12, 15, 13, 18, 14, 16, 19, 17, 20, 18, 22, 19, 21,
 // Memoized to prevent re-renders when props haven't changed
 const ResponsiveSparkline = memo(function ResponsiveSparkline({
   data: chartData,
-  width: initialWidth,
-  height,
+  width: _initialWidth,
+  height: _height,
   color,
   fill,
   strokeWidth,
@@ -360,7 +361,7 @@ function SparklineComponent({
   data: propData,
   width = 100,
   height,
-  responsive = false,
+  responsive: _responsive = false,
   showCard = true,
   color,
   colorMode = 'fixed',
@@ -380,6 +381,7 @@ function SparklineComponent({
   editMode = false,
   className,
 }: SparklineProps) {
+  const { t } = useTranslation('dashboardComponents')
   // Compute default time range from props (preserves 'last_24hours' default).
   // useChartPipeline's sourceTransform prefers each source's own timeWindow
   // when present, falling back to this value.
@@ -403,7 +405,7 @@ function SparklineComponent({
   // Prevent loading flash: only show skeleton when loading AND no data exists yet
   // Treat empty arrays as "no data" — the pipeline uses [] for empty fetches
   const hasData = data !== null && data !== undefined && !(Array.isArray(data) && data.length === 0)
-  const showLoading = loading && !hasData
+  const _showLoading = loading && !hasData
 
   // Check if dataSource is configured
   const hasDataSource = dataSource !== undefined
@@ -496,7 +498,7 @@ function SparklineComponent({
 
   // Empty state - only show when loading is fully complete (not retrying/polling)
   if (!editMode && !loading && hasDataSource && chartData.length < 2) {
-    return <EmptyState size={size} className={className} message={title ? `${title} - No Data Available` : undefined} />
+    return <EmptyState size={size} className={className} message={title ? `${title} - ${t('defaultStates.noData')}` : undefined} />
   }
 
   // Card wrapper mode (default for dashboard use)

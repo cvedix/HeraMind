@@ -1,0 +1,422 @@
+//! MQTT device adapter for HeraMind event-driven architecture.
+//!
+//! This adapter connects to an MQTT broker, subscribes to device topics,
+//! and publishes device events to the event bus.
+//!
+//! ## Topic Format
+//!
+//! Uplink telemetry: `device/{device_type}/{device_id}/uplink`
+//! Downlink commands: `device/{device_type}/{device_id}/downlink`
+//! Discovery: `{discovery_prefix}/announce`
+//!
+//! ## Protocol Mapping Integration
+//!
+//! The adapter can use a `ProtocolMapping` for flexible topic and payload handling:
+//! ```text
+//! Device Type Definition       MQTT Mapping
+//! ├─ temperature capability  ──→ sensor/${id}/temperature
+//! ├─ humidity capability     ──→ sensor/${id}/humidity
+//! └─ set_interval command    ──→ sensor/${id}/command
+//! ```
+
+use crate::adapter::{ConnectionStatus, DeviceAdapter, DeviceEvent};
+use crate::mdl::MetricValue;
+use crate::protocol::ProtocolMapping;
+use crate::registry::DeviceRegistry;
+use crate::telemetry::TimeSeriesStorage;
+use crate::unified_extractor::UnifiedExtractor;
+use base64::Engine as _;
+use futures::StreamExt;
+use heramind_core::EventBus;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
+// TLS support
+
+/// Default wait for broker SUBACK after queueing a Subscribe (production).
+pub(crate) const DEFAULT_SUBACK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Monotonic id for Subscribe requests — cancel matches this, not topic alone.
+static SUBSCRIBE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_subscribe_request_id() -> u64 {
+    SUBSCRIBE_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// One waiter bound to a specific subscribe request id.
+pub(crate) struct PendingSubscribeWaiter {
+    pub(crate) request_id: u64,
+    pub(crate) tx: oneshot::Sender<Result<(), String>>,
+}
+
+/// One in-flight Subscribe awaiting SubAck correlation (pkid + waiters).
+pub(crate) struct PendingSubscribeSlot {
+    pub(crate) topic: String,
+    /// Request id of the caller that issued `client.subscribe` for this slot
+    /// (bootstrap may have no waiter; cancel / enqueued marking still needs it).
+    pub(crate) owner_request_id: u64,
+    /// Set when the event loop sees `Outgoing::Subscribe(pkid)`.
+    pub(crate) pkid: Option<u16>,
+    /// True only after `client.subscribe` returned Ok (packet accepted by the
+    /// client request channel). Pre-enqueue cancel must not leave Absorb.
+    pub(crate) enqueued: bool,
+    pub(crate) waiters: Vec<PendingSubscribeWaiter>,
+}
+
+/// Queue entry: live waiter, or a cancelled request that must still absorb its
+/// Outgoing/SubAck so a timed-out Subscribe cannot complete a later request.
+pub(crate) enum PendingQueueEntry {
+    Active(PendingSubscribeSlot),
+    /// Timed-out / cancelled **after** enqueue. If `pkid` is None, the next
+    /// Outgoing Subscribe is claimed here; once pkid is known (or was known at
+    /// cancel), SubAck is discarded without touching confirmed or other waiters.
+    /// Never created for pre-enqueue cancel (no protocol event will arrive).
+    Absorb {
+        topic: String,
+        pkid: Option<u16>,
+    },
+}
+
+/// Pending (queued, not yet SubAck'd) subscription waiters for one broker.
+#[derive(Default)]
+pub(crate) struct PendingSubscribeState {
+    pub(crate) queue: VecDeque<PendingQueueEntry>,
+}
+
+impl PendingSubscribeState {
+    pub(crate) fn find_active_mut(&mut self, topic: &str) -> Option<&mut PendingSubscribeSlot> {
+        for entry in self.queue.iter_mut() {
+            if let PendingQueueEntry::Active(slot) = entry {
+                if slot.topic == topic {
+                    return Some(slot);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn find_active_by_request_mut(
+        &mut self,
+        request_id: u64,
+    ) -> Option<&mut PendingSubscribeSlot> {
+        for entry in self.queue.iter_mut() {
+            if let PendingQueueEntry::Active(slot) = entry {
+                if slot.owner_request_id == request_id
+                    || slot.waiters.iter().any(|w| w.request_id == request_id)
+                {
+                    return Some(slot);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn active_topics(&self) -> Vec<String> {
+        self.queue
+            .iter()
+            .filter_map(|e| match e {
+                PendingQueueEntry::Active(s) => Some(s.topic.clone()),
+                PendingQueueEntry::Absorb { .. } => None,
+            })
+            .collect()
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn absorb_count(&self) -> usize {
+        self.queue
+            .iter()
+            .filter(|e| matches!(e, PendingQueueEntry::Absorb { .. }))
+            .count()
+    }
+}
+
+/// Arc handles for one broker subscribe so callers drop `mqtt_clients`
+/// before awaiting SubAck (poll / settler / reconnect worker must progress).
+pub(crate) struct BrokerSubscribeHandles {
+    pub(crate) client: rumqttc::AsyncClient,
+    pub(crate) subscribed_topics: Arc<RwLock<std::collections::HashSet<String>>>,
+    pub(crate) desired_topics: Arc<RwLock<std::collections::HashSet<String>>>,
+    pub(crate) pending_subscribes: Arc<Mutex<PendingSubscribeState>>,
+    pub(crate) subscribe_send: Arc<Mutex<()>>,
+    pub(crate) await_suback: bool,
+    pub(crate) suback_timeout: Duration,
+}
+
+impl BrokerSubscribeHandles {
+    pub(crate) fn from_inner(inner: &MqttClientInner) -> Self {
+        Self {
+            client: inner.client.clone(),
+            subscribed_topics: inner.subscribed_topics.clone(),
+            desired_topics: inner.desired_topics.clone(),
+            pending_subscribes: inner.pending_subscribes.clone(),
+            subscribe_send: inner.subscribe_send.clone(),
+            await_suback: inner.await_suback,
+            suback_timeout: inner.suback_timeout,
+        }
+    }
+}
+
+/// Single MQTT broker connection
+pub(crate) struct MqttClientInner {
+    /// Unique broker identifier
+    pub(crate) _broker_id: String,
+    /// Broker address (host:port)
+    pub(crate) _broker_addr: String,
+    /// MQTT client
+    pub(crate) client: rumqttc::AsyncClient,
+    /// Running flag for the event loop task
+    pub(crate) running: Arc<RwLock<bool>>,
+    /// **Confirmed** subscriptions only (successful SUBACK). Pending queue-Ok,
+    /// rejected startup wildcards, and reconnect intent must NOT land here —
+    /// cover checks and `subscription_ready` read this set only.
+    pub(crate) subscribed_topics: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Restore / reconnect intent. Survives disconnect (which clears confirmed).
+    /// Startup, device restore, dynamic subscribe, and reconnect all register
+    /// here; only successful SUBACK promotes into `subscribed_topics`.
+    pub(crate) desired_topics: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// In-flight Subscribe requests waiting for SubAck (or disconnect/timeout).
+    pub(crate) pending_subscribes: Arc<Mutex<PendingSubscribeState>>,
+    /// Serializes pending-register + `client.subscribe` so Outgoing pkid order
+    /// matches queue order (fixes register-vs-send races across callers).
+    pub(crate) subscribe_send: Arc<Mutex<()>>,
+    /// Notifies the out-of-poll reconnect worker (never subscribe from poll).
+    pub(crate) reconnect_tx: tokio::sync::mpsc::Sender<()>,
+    /// When false (test broker slots without a polled event loop), queue-Ok
+    /// is treated as an immediate successful SubAck so existing unit tests
+    /// keep working. Production brokers always leave this true.
+    pub(crate) await_suback: bool,
+    /// How long `subscribe_topic` waits outside the MQTT callback for SubAck.
+    /// Covers enqueue + wait (not wait alone).
+    pub(crate) suback_timeout: Duration,
+    /// True only after ConnAck Success; false while created/queued or reconnecting.
+    /// `client.subscribe` may queue before this flips — do not treat queue-Ok as ready.
+    pub(crate) session_ready: AtomicBool,
+}
+
+impl MqttClientInner {
+    pub(crate) fn is_session_ready(&self) -> bool {
+        self.session_ready.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_session_ready(&self, ready: bool) {
+        self.session_ready.store(ready, Ordering::SeqCst);
+    }
+}
+
+/// MQTT device adapter.
+///
+/// Manages multiple MQTT broker connections and automatically subscribes
+/// to device topics on all connected brokers.
+pub struct MqttAdapter {
+    /// Adapter configuration
+    pub(crate) config: MqttAdapterConfig,
+    /// Event channel sender
+    pub(crate) event_tx: broadcast::Sender<DeviceEvent>,
+    /// Running state
+    pub(crate) running: Arc<std::sync::atomic::AtomicBool>,
+    /// Connected devices
+    pub(crate) devices: Arc<RwLock<Vec<String>>>,
+    /// Optional protocol mapping for flexible topic/payload handling
+    pub(crate) protocol_mapping: Option<Arc<dyn ProtocolMapping>>,
+    /// Device ID to device type mapping (used with protocol mapping)
+    pub(crate) device_types: Arc<RwLock<HashMap<String, String>>>,
+    /// Multiple MQTT broker connections (broker_id -> client)
+    pub(crate) mqtt_clients: Arc<RwLock<HashMap<String, MqttClientInner>>>,
+    /// Connection status (overall - true if at least one broker is connected)
+    pub(crate) connection_status: Arc<RwLock<ConnectionStatus>>,
+    /// Event bus for publishing system events
+    pub(crate) event_bus: Option<Arc<EventBus>>,
+    /// Device registry for template management (wrapped for interior mutability)
+    pub(crate) device_registry: Arc<RwLock<Arc<DeviceRegistry>>>,
+    /// Time series storage for telemetry
+    pub(crate) telemetry_storage: Arc<RwLock<Option<Arc<TimeSeriesStorage>>>>,
+    /// Metric cache (device_id -> metric_name -> (value, timestamp))
+    pub(crate) metric_cache:
+        Arc<RwLock<HashMap<String, HashMap<String, (MetricValue, chrono::DateTime<chrono::Utc>)>>>>,
+    /// Topic → set of registered device identities (shared-topic safe).
+    pub(crate) topic_to_device: Arc<RwLock<identity::TopicDeviceMap>>,
+    /// Recent outbound command publishes for short-TTL echo suppression
+    /// (match topic + payload + time — not "topic ever used for outbound").
+    pub(crate) outbound_echoes: Arc<RwLock<identity::OutboundEchoBuffer>>,
+    /// Device ids in teardown: uncollectable / unlearnable until cleared on
+    /// re-subscribe. Marked at the start of delete so a late uplink cannot
+    /// re-learn a topic while the registry still lists the device.
+    pub(crate) uncollectable: Arc<RwLock<HashSet<String>>>,
+    /// Unified data extractor
+    pub(crate) extractor: Arc<UnifiedExtractor>,
+    /// Data directory for image storage (runtime, not config)
+    pub(crate) data_dir: Arc<RwLock<Option<PathBuf>>>,
+}
+
+/// Create an MQTT adapter connected to an event bus.
+pub fn create_mqtt_adapter(
+    config: MqttAdapterConfig,
+    event_bus: &EventBus,
+    device_registry: Arc<DeviceRegistry>,
+) -> Arc<MqttAdapter> {
+    // Convert &EventBus to Arc<EventBus> by creating a new Arc
+    // Note: This assumes EventBus can be cloned safely
+    let event_bus_arc = Arc::new(event_bus.clone());
+
+    let adapter = Arc::new(
+        MqttAdapter::new(config)
+            .with_event_bus(event_bus_arc)
+            .with_device_registry(device_registry),
+    );
+
+    let adapter_clone = adapter.clone();
+    let event_bus = event_bus.clone();
+
+    // Spawn event forwarding task
+    tokio::spawn(async move {
+        let mut rx = adapter_clone.subscribe();
+        while let Some(event) = rx.next().await {
+            if let Some(device_id) = event.device_id() {
+                let source = format!("adapter:mqtt:{}", device_id);
+                let heramind_event = event.clone().to_heramind_event();
+                event_bus.publish_with_source(heramind_event, source).await;
+            }
+        }
+    });
+
+    adapter
+}
+
+/// Create an MQTT adapter with protocol mapping.
+pub fn create_mqtt_adapter_with_mapping(
+    config: MqttAdapterConfig,
+    mapping: Arc<dyn ProtocolMapping>,
+    event_bus: &EventBus,
+    device_registry: Arc<DeviceRegistry>,
+) -> Arc<MqttAdapter> {
+    let event_bus_arc = Arc::new(event_bus.clone());
+
+    let adapter = Arc::new(
+        MqttAdapter::with_mapping(config, mapping, Some(event_bus_arc))
+            .with_device_registry(device_registry),
+    );
+
+    let adapter_clone = adapter.clone();
+    let event_bus = event_bus.clone();
+
+    // Spawn event forwarding task
+    tokio::spawn(async move {
+        let mut rx = adapter_clone.subscribe();
+        while let Some(event) = rx.next().await {
+            if let Some(device_id) = event.device_id() {
+                let source = format!("adapter:mqtt:{}", device_id);
+                let heramind_event = event.clone().to_heramind_event();
+                event_bus.publish_with_source(heramind_event, source).await;
+            }
+        }
+    });
+
+    adapter
+}
+
+/// Result of an MQTT connection test.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MqttTestResult {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Test MQTT connectivity by performing a real CONNECT/CONNACK handshake.
+///
+/// This creates a temporary MQTT client, connects to the broker, and waits
+/// for CONNACK. Returns success if the broker accepts the connection.
+pub async fn test_mqtt_connection(
+    host: &str,
+    port: u16,
+    username: Option<&str>,
+    password: Option<&str>,
+    tls: bool,
+    ca_cert: Option<&str>,
+    client_cert: Option<&str>,
+    client_key: Option<&str>,
+) -> MqttTestResult {
+    let client_id = format!("heramind-test-{}", uuid::Uuid::new_v4());
+    let mut mqttoptions = rumqttc::MqttOptions::new(&client_id, host, port);
+    mqttoptions.set_max_packet_size(1024, 1024);
+    mqttoptions.set_keep_alive(Duration::from_secs(5));
+
+    if let (Some(user), Some(pass)) = (username, password) {
+        mqttoptions.set_credentials(user, pass);
+    }
+
+    if tls {
+        match MqttAdapter::build_tls_transport(ca_cert, client_cert, client_key) {
+            Ok(transport) => {
+                mqttoptions.set_transport(transport);
+            }
+            Err(e) => {
+                return MqttTestResult {
+                    success: false,
+                    message: format!("TLS configuration error: {}", e),
+                };
+            }
+        }
+    }
+
+    let (_client, mut eventloop) = rumqttc::AsyncClient::new(mqttoptions, 5);
+
+    // Poll for CONNACK with a 10-second timeout
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match eventloop.poll().await {
+                Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(ack))) => {
+                    if ack.code == rumqttc::ConnectReturnCode::Success {
+                        return Ok("MQTT CONNECT successful".to_string());
+                    } else {
+                        return Err(format!("CONNACK rejected: {:?}", ack.code));
+                    }
+                }
+                Ok(_) => continue,
+                Err(e) => return Err(format!("{}", e)),
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(msg)) => MqttTestResult {
+            success: true,
+            message: msg,
+        },
+        Ok(Err(msg)) => MqttTestResult {
+            success: false,
+            message: msg,
+        },
+        Err(_) => MqttTestResult {
+            success: false,
+            message: "Connection timeout after 10 seconds".to_string(),
+        },
+    }
+}
+
+pub use config::MqttAdapterConfig;
+pub use identity::{
+    is_pending_association_candidate_id, normalize_confirm_device_id,
+    pending_association_candidate_id, verify_confirm_identity_against_raw,
+    verify_confirm_identity_against_sample, AssociationExceptionKind, MqttIdentitySource,
+    MQTT_ASSOCIATION_EXCEPTION_KEY, MQTT_ASSOCIATION_KIND_KEY, MQTT_BLOCKED_DEVICE_IDS_KEY,
+    MQTT_CLAIMED_IDENTITY_KEY, MQTT_IDENTITY_FIELD_KEY, MQTT_IDENTITY_SOURCE_KEY,
+    MQTT_PENDING_CANDIDATE_ID_KEY, PENDING_ASSOCIATION_ID_PREFIX,
+};
+
+// Domain submodules — impl blocks live across these files.
+mod adapter;
+pub(crate) mod config;
+mod connection;
+mod handling;
+pub(crate) mod identity;
+pub(crate) mod topics;
+pub(crate) use identity::*;
+pub(crate) use topics::*;
+
+#[cfg(test)]
+mod tests;

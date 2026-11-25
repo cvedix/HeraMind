@@ -1,4 +1,4 @@
-use crate::types::{BuildMeta, CliResponse};
+use crate::types::CliResponse;
 use crate::ApiClient;
 use anyhow::Result;
 use serde_json::json;
@@ -111,27 +111,31 @@ pub fn create_widget(
     fs::write(&bundle_path, bundle_template)?;
 
     let dir_str = dir_path.display().to_string();
-    let meta = BuildMeta {
-        r#type: "widget".to_string(),
-        action: "create".to_string(),
-        entity_id: widget_id.clone(),
-        entity_name: Some(name.to_string()),
-        undo_command: format!("rm -rf {}", dir_str),
-    };
-
-    Ok(CliResponse::success_with_meta(
+    Ok(CliResponse::success(
         json!({
             "id": widget_id,
             "name": name,
             "type": widget_type,
             "directory": dir_str,
+            "registered": false,
             "files": [
                 { "name": "manifest.json", "path": manifest_path.display().to_string() },
                 { "name": "bundle.js", "path": bundle_path.display().to_string() }
             ]
         }),
-        format!("Widget scaffold created in {}", dir_str),
-        meta,
+        // Scaffold ≠ deliverable: bundle.js is a TYPE TEMPLATE, and the
+        // scaffold is not registered until `widget install`. Both facts
+        // were missed live (round 7): the model treated the gauge template
+        // as the finished component and moved straight to adding it to a
+        // dashboard. State the whole pipeline in the success message.
+        format!(
+            "Widget scaffold created (TEMPLATE code, not yet registered): {dir_str}. \
+             Next: 1) edit bundle.js to implement the component, \
+             2) `heramind widget install {widget_id}` to register, \
+             3) shell {{command:\"heramind dashboard add-components <dashboard-id>\", \
+             params:[{{id:\"c1\",type:\"{widget_id}\",position:{{x:0,y:0,w:4,h:3}}}}]}}. \
+             Shortcut: re-run create with --install to scaffold AND register in one step."
+        ),
     ))
 }
 
@@ -146,20 +150,97 @@ fn generate_bundle_template(widget_id: &str, global_name: &str, widget_type: &st
     // Different templates based on widget type
     let component_body = match widget_type {
         "chart" => format!(
-            r#"  // Chart widget — receives data via props.dataSource
+            r#"  // Chart widget — line chart over props.dataSource (array of {{value, timestamp}})
   const {{ useEffect, useRef }} = React;
-  const canvasRef = useRef(null);
+  const containerRef = useRef(null);
 
   useEffect(() => {{
-    // TODO: Implement chart rendering using props.dataSource
-    // props.dataSource contains the time-series data array
+    const container = containerRef.current;
+    if (!container) return;
+    const data = Array.isArray(props.dataSource) ? props.dataSource : [];
+
+    // Canvas can't use var(--*) directly — resolve design tokens per draw
+    const draw = () => {{
+      const canvas = container.querySelector('canvas');
+      if (!canvas || container.clientWidth === 0) return;
+      const css = getComputedStyle(container);
+      const lineColor = css.getPropertyValue('--color-primary').trim() || '#3b82f6';
+      const textColor = css.getPropertyValue('--color-text-muted').trim() || '#94a3b8';
+      const gridColor = css.getPropertyValue('--color-border').trim() || '#e2e8f0';
+
+      const dpr = window.devicePixelRatio || 1;
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      canvas.width = w * dpr;
+      canvas.height = h * dpr;
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+      if (data.length === 0) return;
+
+      const pts = data.map(d => Number(d && d.value)).filter(v => Number.isFinite(v));
+      if (pts.length === 0) return;
+      const min = Math.min.apply(null, pts);
+      const max = Math.max.apply(null, pts);
+      const span = (max - min) || 1;
+
+      const pad = {{ top: 10, right: 12, bottom: 20, left: 40 }};
+      const iw = Math.max(w - pad.left - pad.right, 10);
+      const ih = Math.max(h - pad.top - pad.bottom, 10);
+      const xAt = i => pad.left + (pts.length === 1 ? iw / 2 : (i / (pts.length - 1)) * iw);
+      const yAt = v => pad.top + ih - ((v - min) / span) * ih;
+
+      // Gridlines + value labels
+      ctx.strokeStyle = gridColor;
+      ctx.fillStyle = textColor;
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.lineWidth = 1;
+      for (let g = 0; g <= 3; g++) {{
+        const gy = pad.top + (ih / 3) * g;
+        const val = max - (span / 3) * g;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, gy);
+        ctx.lineTo(w - pad.right, gy);
+        ctx.stroke();
+        ctx.fillText(String(Math.round(val * 100) / 100), pad.left - 6, gy + 3);
+      }}
+
+      // Data line
+      ctx.strokeStyle = lineColor;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i = 0; i < pts.length; i++) {{
+        if (i === 0) ctx.moveTo(xAt(i), yAt(pts[i]));
+        else ctx.lineTo(xAt(i), yAt(pts[i]));
+      }}
+      ctx.stroke();
+
+      // Latest value: dot on the line + label in the top-right corner
+      const lx = xAt(pts.length - 1);
+      const ly = yAt(pts[pts.length - 1]);
+      ctx.fillStyle = lineColor;
+      ctx.beginPath();
+      ctx.arc(lx, ly, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = textColor;
+      ctx.fillText(String(pts[pts.length - 1]), w - pad.right, pad.top + 8);
+    }};
+
+    draw();
+    // Redraw on container resize (dashboard grid drag/resize)
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(draw) : null;
+    if (ro) ro.observe(container);
+    return () => {{ if (ro) ro.disconnect(); }};
   }}, [props.dataSource]);
 
   return React.createElement('div', {{
-    style: {{ {card_style}, display: 'flex', alignItems: 'center', justifyContent: 'center' }},
-    ref: canvasRef,
+    style: {{ {card_style}, position: 'relative' }},
+    ref: containerRef,
   }},
-    React.createElement('span', {{ style: {{ color: 'var(--color-text-muted)' }} }}, '{component_name} Chart')
+    React.createElement('canvas', {{ style: {{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' }} }}),
+    (!Array.isArray(props.dataSource) || props.dataSource.length === 0) &&
+      React.createElement('span', {{ style: {{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-muted)' }} }}, '{component_name} Chart')
   );"#
         ),
         "gauge" => format!(
@@ -294,6 +375,31 @@ fn get_icon_for_type(widget_type: &str) -> &'static str {
     }
 }
 
+/// Resolve a widget `name` that may be a plain string or an i18n object
+/// (`{"en":"...","zh":"..."}`). Prefer `en`, then `zh`, then any string value.
+fn display_i18n_name(name: &serde_json::Value) -> String {
+    if let Some(s) = name.as_str() {
+        return s.to_string();
+    }
+    if let Some(obj) = name.as_object() {
+        for key in ["en", "zh", "zh-CN", "zh_CN"] {
+            if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+        for v in obj.values() {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+    "(unnamed)".to_string()
+}
+
 /// List all installed widgets with compact summary.
 ///
 /// Returns id, name, type, and version per installed widget, plus the
@@ -316,8 +422,8 @@ pub async fn list_widgets(client: &ApiClient) -> Result<CliResponse> {
         .map(|w| {
             json!({
                 "id": w.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
-                "name": w.get("name").and_then(|v| v.as_str()).unwrap_or("(unnamed)"),
-                "widget_type": w.get("widget_type").or_else(|| w.get("type")).and_then(|v| v.as_str()).unwrap_or("unknown"),
+                "name": w.get("name").map(display_i18n_name).unwrap_or_else(|| "(unnamed)".to_string()),
+                "category": w.get("category").and_then(|v| v.as_str()).unwrap_or("unknown"),
                 "version": w.get("version").and_then(|v| v.as_str()).unwrap_or("?"),
             })
         })
@@ -327,16 +433,18 @@ pub async fn list_widgets(client: &ApiClient) -> Result<CliResponse> {
     // `heramind_core::dashboard::BUILTIN_WIDGET_TYPES` on the server) — the
     // CLI never hardcodes widget type names itself.
     let builtin_raw = data
-        .get("data")
-        .and_then(|d| d.get("builtin_types"))
-        .or_else(|| data.get("builtin_types"))
+        .get("builtin_types")
+        .or_else(|| data.get("data").and_then(|d| d.get("builtin_types")))
         .cloned()
         .unwrap_or_else(|| json!([]));
     let builtin_count = data
-        .get("data")
-        .and_then(|d| d.get("builtin_count"))
+        .get("builtin_count")
         .and_then(|v| v.as_u64())
-        .or_else(|| data.get("builtin_count").and_then(|v| v.as_u64()))
+        .or_else(|| {
+            data.get("data")
+                .and_then(|d| d.get("builtin_count"))
+                .and_then(|v| v.as_u64())
+        })
         .unwrap_or(0);
 
     Ok(CliResponse::success(
@@ -370,7 +478,25 @@ fn extract_list_array(data: &serde_json::Value, key: &str) -> Option<Vec<serde_j
 /// Get widget by ID
 pub async fn get_widget(client: &ApiClient, id: &str) -> Result<CliResponse> {
     let data = client.get(&format!("/frontend-components/{}", id)).await?;
-    Ok(CliResponse::success(data, "Widget retrieved"))
+    // Scaffolds land in the same directory the store serves, so a bare
+    // `widget create` output answers `get` BEFORE registration — surface
+    // the difference instead of letting "get succeeded" read as
+    // "installed" (live: round 7 concluded created == installed and
+    // skipped the install step). Only act on the server's EXPLICIT
+    // provenance flag: a server that predates it stays silent rather than
+    // mislabeling registered widgets.
+    let msg = match data.get("registered").and_then(|v| v.as_bool()) {
+        Some(true) if data.get("builtin").and_then(|v| v.as_bool()) == Some(true) => {
+            "Widget retrieved (built-in component, always available)"
+        }
+        Some(true) => "Widget retrieved (registered)",
+        Some(false) => {
+            "Widget retrieved — SCAFFOLD ONLY, not registered: run \
+             `heramind widget install <id>` to register it before adding it to a dashboard"
+        }
+        None => "Widget retrieved",
+    };
+    Ok(CliResponse::success(data, msg))
 }
 
 /// Get widget bundle by ID
@@ -386,11 +512,56 @@ pub async fn get_widget_bundle(client: &ApiClient, id: &str) -> Result<CliRespon
 /// - If `path` is a directory: reads manifest.json + bundle.js and uploads as separate fields.
 /// - If `path` is a .zip file: uploads as a `package` field for server-side extraction.
 pub async fn install_widget_file(client: &ApiClient, path: &str) -> Result<CliResponse> {
-    let p = Path::new(path);
+    // Data-relative paths resolve against the server DATA DIR — the model's
+    // space-free form. Absolute paths under the macOS data root
+    // ("~/Library/Application Support/...") must be shell-QUOTED (the
+    // in-process tokenizer splits at unquoted whitespace); relative paths
+    // sidestep the trap entirely. A bare WIDGET ID (what `widget list` /
+    // `widget get` report) additionally resolves into the store directory —
+    // callers should not need to know the layout (live: round 7 ran
+    // `widget install gauge-3832` right after `widget get gauge-3832`
+    // succeeded and hit PATH_NOT_FOUND).
+    //
+    // The dir comes from the FULL resolver (env → desktop app dir → ./data),
+    // not `heramind_core::paths::data_dir()` (env or literal "data"): that
+    // one is right inside the server process (env set) but a standalone
+    // `heramind` terminal invocation falls back to cwd-relative "data" and
+    // misses the desktop store entirely — `widget create` (which uses the
+    // full resolver) then writes where `widget install` cannot find (live
+    // smoke test caught exactly this split).
+    let resolved;
+    let p: &Path = if Path::new(path).is_absolute() || Path::new(path).exists() {
+        Path::new(path)
+    } else {
+        let data_dir = std::path::PathBuf::from(crate::auto_auth::data_dir_for_paths());
+        let by_data = data_dir.join(path);
+        let by_id = data_dir.join("frontend-components").join(path);
+        resolved = if by_data.exists() {
+            by_data
+        } else if by_id.exists() {
+            by_id
+        } else {
+            return Ok(CliResponse::error(
+                format!(
+                    "Path not found: {}. Tried: as given, data-relative ({}), widget id ({}). \
+                     Usage: heramind widget install <directory | widget-id | file.zip>",
+                    path,
+                    by_data.display(),
+                    by_id.display()
+                ),
+                "PATH_NOT_FOUND",
+            ));
+        };
+        resolved.as_path()
+    };
 
+    // Absolute paths skip the resolution branches above, so a mistyped
+    // absolute path still needs its own existence check — without this it
+    // fell through to the zip-extension check and reported a misleading
+    // INVALID_PATH_TYPE instead of PATH_NOT_FOUND.
     if !p.exists() {
         return Ok(CliResponse::error(
-            format!("Path not found: {}", path),
+            format!("Path not found: {}", p.display()),
             "PATH_NOT_FOUND",
         ));
     }
@@ -464,27 +635,8 @@ pub async fn install_widget_file(client: &ApiClient, path: &str) -> Result<CliRe
 
     // API returns {"component": {...}} — extract from wrapper
     let component = data.get("component").cloned().unwrap_or(data.clone());
-    let widget_id = component["id"].as_str().unwrap_or("unknown").to_string();
 
-    let widget_name = component["name"]
-        .as_str()
-        .or_else(|| component["name"].get("en").and_then(|v| v.as_str()))
-        .unwrap_or("unknown")
-        .to_string();
-
-    let meta = BuildMeta {
-        r#type: "widget".to_string(),
-        action: "install".to_string(),
-        entity_id: widget_id.clone(),
-        entity_name: Some(widget_name),
-        undo_command: format!("heramind widget uninstall {}", widget_id),
-    };
-
-    Ok(CliResponse::success_with_meta(
-        component,
-        "Widget installed",
-        meta,
-    ))
+    Ok(CliResponse::success(component, "Widget installed"))
 }
 
 /// Uninstall widget
@@ -511,7 +663,7 @@ pub async fn install_widget_market(
     version: Option<&str>,
 ) -> Result<CliResponse> {
     let mut body = json!({
-        "id": widget_id,
+        "component_id": widget_id,
     });
     if let Some(v) = version {
         body["version"] = json!(v);
@@ -520,21 +672,9 @@ pub async fn install_widget_market(
     let data = client
         .post("/frontend-components/market/install", &body)
         .await?;
-    let installed_id = data["id"].as_str().unwrap_or(widget_id).to_string();
 
-    let widget_name = data["name"].as_str().unwrap_or("unknown").to_string();
-
-    let meta = BuildMeta {
-        r#type: "widget".to_string(),
-        action: "install".to_string(),
-        entity_id: installed_id.clone(),
-        entity_name: Some(widget_name),
-        undo_command: format!("heramind widget uninstall {}", installed_id),
-    };
-
-    Ok(CliResponse::success_with_meta(
+    Ok(CliResponse::success(
         data,
         "Widget installed from marketplace",
-        meta,
     ))
 }

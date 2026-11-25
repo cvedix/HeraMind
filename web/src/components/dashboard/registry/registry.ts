@@ -33,9 +33,9 @@ import {
   // Controls
   Send,
   Layers as LayersIcon,
-  Sliders as SliderIcon,
-  List,
-  Type,
+  Sliders as
+
+
   // Display & Content
   Image,
   Play,
@@ -48,7 +48,7 @@ import {
   Webcam,
   Square as SquareIcon,
   // Business
-  Camera,
+
   ScanEye,
   // Community
   Store,
@@ -89,13 +89,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'title', 'unit', 'prefix', 'suffix', 'size', 'variant',
-      'showTrend',
-      'icon', 'iconType', 'iconColor', 'valueColor',
-      'description',
-      'dataMapping', 'className'
-    ].includes(prop),
     defaultProps: {
       size: 'md',
       variant: 'default',
@@ -114,11 +107,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'title', 'color', 'size', 'variant', 'className',
-      'valueMap', 'defaultState', 'showGlow', 'showAnimation',
-      'dataMapping', 'showCard', 'rules',
-    ].includes(prop),
     defaultProps: {
       size: 'md',
       variant: 'default',
@@ -140,12 +128,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'data', 'color', 'colorMode', 'fill', 'fillColor', 'showPoints', 'strokeWidth', 'curved',
-      'showThreshold', 'threshold', 'thresholdColor', 'maxValue',
-      'showValue', 'title', 'size', 'responsive', 'showCard',
-      'dataMapping', 'className'
-    ].includes(prop),
     defaultProps: {
       fill: true,
       showPoints: false,
@@ -163,11 +145,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'value', 'max', 'color', 'showCard', 'variant', 'title', 'size',
-      'warningThreshold', 'dangerThreshold',
-      'dataMapping', 'dataSource', 'className'
-    ].includes(prop),
     defaultProps: {
       max: 100,
       variant: 'default',
@@ -192,11 +169,6 @@ export const componentRegistry: ComponentRegistry = {
     maxDataSources: 5,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'data', 'labels', 'colors', 'smooth', 'showGrid',
-      'showLegend', 'showTooltip', 'fillArea', 'className',
-      'limit', 'timeRange', 'aggregate', 'dataMapping'
-    ].includes(prop),
     defaultProps: {
       smooth: true,
       showGrid: true,
@@ -217,11 +189,6 @@ export const componentRegistry: ComponentRegistry = {
     maxDataSources: 5,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'data', 'labels', 'colors', 'smooth', 'showGrid',
-      'showLegend', 'showTooltip', 'opacity', 'className',
-      'limit', 'timeRange', 'aggregate', 'dataMapping'
-    ].includes(prop),
     defaultProps: {
       smooth: true,
       showGrid: true,
@@ -242,10 +209,6 @@ export const componentRegistry: ComponentRegistry = {
     maxDataSources: 3,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'data', 'labels', 'colors', 'horizontal', 'showGrid',
-      'showLegend', 'showTooltip', 'className'
-    ].includes(prop),
     defaultProps: {
       horizontal: false,
       showGrid: true,
@@ -266,9 +229,6 @@ export const componentRegistry: ComponentRegistry = {
     maxDataSources: 1,  // Pie chart shows part-to-whole, single source makes more sense
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'data', 'colors', 'showLabels', 'showLegend', 'showTooltip', 'innerRadius', 'variant', 'className'
-    ].includes(prop),
     defaultProps: {
       variant: 'donut',
       showLabels: false,
@@ -291,10 +251,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: false,
     hasActions: true,
-    acceptsProp: (prop) => [
-      'dataSource', 'title', 'label', 'size',
-      'initialState', 'editMode', 'disabled', 'className'
-    ].includes(prop),
     defaultProps: {
       size: 'md',
       initialState: false,
@@ -317,10 +273,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'src', 'alt', 'caption', 'fit', 'objectPosition', 'rounded',
-      'showShadow', 'zoomable', 'downloadable', 'size', 'className'
-    ].includes(prop),
     defaultProps: {
       fit: 'contain',
       rounded: true,
@@ -339,12 +291,8 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'images', 'title', 'fit', 'rounded', 'showTimestamp', 'showLabel',
-      'showIndex', 'size', 'className'
-    ].includes(prop),
     defaultProps: {
-      fit: 'cover',
+      fit: 'contain',
       rounded: false,
       showIndex: true,
       showTimestamp: true,
@@ -362,10 +310,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'title', 'limit', 'timeRange', 'pageSize', 'showSearch',
-      'showFilters', 'showImage', 'className',
-    ].includes(prop),
     defaultProps: {
       limit: 200,
       timeRange: 48,
@@ -386,11 +330,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'src', 'title', 'sandbox', 'allowFullscreen', 'allowScripts',
-      'allowSameOrigin', 'allowForms', 'allowPopups', 'showHeader',
-      'showUrlBar', 'transparent', 'borderless', 'size', 'className'
-    ].includes(prop),
     defaultProps: {
       sandbox: true,
       allowFullscreen: true,
@@ -408,10 +347,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'content', 'variant', 'showCodeSyntax', 'allowHtml',
-      'lineBreaks', 'maxLines', 'size', 'className'
-    ].includes(prop),
     defaultProps: {
       variant: 'default',
       lineBreaks: true,
@@ -434,11 +369,6 @@ export const componentRegistry: ComponentRegistry = {
     maxDataSources: 10,
     hasDisplayConfig: true,
     hasActions: true,
-    acceptsProp: (prop) => [
-      'markers', 'center', 'zoom', 'minZoom', 'maxZoom',
-      'showControls', 'showFullscreen', 'interactive',
-      'tileLayer', 'markerColor', 'size', 'className'
-    ].includes(prop),
     defaultProps: {
       center: { lat: 39.9042, lng: 116.4074 },
       zoom: 10,
@@ -458,11 +388,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: true,
     hasActions: false,
-    acceptsProp: (prop) => [
-      'src', 'type', 'autoplay', 'muted', 'controls', 'loop', 'fit',
-      'refreshInterval', 'reconnectAttempts', 'rounded', 'showFullscreen',
-      'size', 'className'
-    ].includes(prop),
     defaultProps: {
       type: 'file',
       autoplay: false,
@@ -484,11 +409,6 @@ export const componentRegistry: ComponentRegistry = {
     maxDataSources: 20,
     hasDisplayConfig: true,
     hasActions: true,
-    acceptsProp: (prop) => [
-      'items', 'backgroundType', 'backgroundColor', 'backgroundImage', 'gridSize',
-      'interactive', 'showControls', 'editable', 'showFullscreen',
-      'maintainAspectRatio', 'aspectRatio', 'size', 'className'
-    ].includes(prop),
     defaultProps: {
       backgroundType: 'grid',
       interactive: true,
@@ -516,9 +436,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,  // For balanced two-panel layout
     hasDisplayConfig: true,  // Agent selector in Display tab
     hasActions: true,
-    acceptsProp: (prop) => [
-      'agentId', 'className', 'editMode'
-    ].includes(prop),
     defaultProps: {
       agentId: undefined,
     },
@@ -535,7 +452,6 @@ export const componentRegistry: ComponentRegistry = {
     hasDataSource: true,
     hasDisplayConfig: false,
     hasActions: true,
-    acceptsProp: (prop) => ['agentId', 'sessionId', 'className', 'editMode', 'modelId', 'modelName', 'systemPrompt', 'contextWindowSize', 'title'].includes(prop),
     defaultProps: { agentId: undefined },
     variants: ['default'],
   },

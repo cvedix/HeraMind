@@ -400,6 +400,13 @@ pub struct RetentionConfig {
     /// Retention period in hours for image/binary data (None = forever).
     #[serde(default = "default_retention_image")]
     pub image_retention: Option<u64>,
+
+    /// Retention period in hours for chat sessions (None = forever).
+    /// Prunes whole sessions (history + metadata) whose last update is older
+    /// than the window — sessions.redb otherwise grows without bound on
+    /// long-lived edge boxes. Default OFF: never surprise-delete history.
+    #[serde(default)]
+    pub session_retention_hours: Option<u64>,
 }
 
 /// Agent execution defaults (configurable via /api/settings/agent).
@@ -435,6 +442,14 @@ pub struct AgentDefaults {
     /// per-stream duration cap. Default 1800s.
     #[serde(default = "default_agent_chat_turn_timeout")]
     pub chat_turn_timeout_secs: u64,
+    /// LLM instance id used for background conversation summarization
+    /// (compaction). None (default) = use each session's own model. Point this
+    /// at a smaller/faster instance (e.g. a 0.5-2B model) so compaction stops
+    /// competing with the main model for capacity; if the instance cannot be
+    /// resolved the session model is used, and if that fails too a
+    /// deterministic no-LLM digest is written instead.
+    #[serde(default)]
+    pub summary_instance_id: Option<String>,
 }
 
 fn default_agent_max_rounds() -> u32 {
@@ -470,6 +485,7 @@ impl Default for AgentDefaults {
             default_thinking_enabled: None,
             chat_history_depth: default_agent_chat_history_depth(),
             chat_turn_timeout_secs: default_agent_chat_turn_timeout(),
+            summary_instance_id: None,
         }
     }
 }
@@ -544,6 +560,7 @@ impl Default for RetentionConfig {
             interval_hours: default_retention_interval(),
             default_retention: default_retention_default(),
             image_retention: default_retention_image(),
+            session_retention_hours: None, // sessions keep forever unless opted in
         }
     }
 }
@@ -864,7 +881,12 @@ impl SettingsStore {
             }
         }
 
-        // Create a new store
+        // Create a new store. NOTE on lock errors: redb's file lock is
+        // EXCLUSIVE ACROSS PROCESSES — a second server on the same data dir
+        // (desktop app + headless CLI) fails here by design. Do NOT "fix"
+        // this by falling back to a cached handle: with the legacy↔canonical
+        // path split the cache can point at a DIFFERENT FILE, silently
+        // writing config where no one reads it. Fail loudly instead.
         let db = if path_ref.exists() {
             Database::open(path_ref)?
         } else {

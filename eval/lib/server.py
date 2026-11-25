@@ -282,6 +282,18 @@ class TestServer:
             time.sleep(0.2)
         return None
 
+    # --- Observability -----------------------------------------------------
+
+    def log_lines(self) -> list[str]:
+        """Snapshot of the server's captured stdout/stderr lines.
+
+        The agent emits its turn-guard ledger as structured lines
+        (`turn guard decision guard=… outcome=…`); the eval reads them from
+        here instead of re-deriving guard behaviour from the HTTP response.
+        """
+        with self._log_lock:
+            return list(self._log_lines)
+
     def shutdown(self):
         if self.process is None:
             return
@@ -338,6 +350,10 @@ class TestServer:
             "top_p": float(os.environ.get("AGENT_LLM_TOP_P", "0.85")),
             "thinking_enabled": thinking,
         }
+        # Optional per-model official top_k (llama.cpp catalog cards specify
+        # it; omitting falls back to the API default 20).
+        if os.environ.get("AGENT_LLM_TOP_K"):
+            body["top_k"] = int(os.environ["AGENT_LLM_TOP_K"])
         r = self.post("/llm-backends", body)
         if not r.ok:
             raise RuntimeError(f"create llm backend -> {r.status_code}: {r.text}")
@@ -382,7 +398,8 @@ class TestServer:
         return data.get("messages", []) or []
 
     def chat(self, session_id: str, message: str, timeout: float | None = None,
-             images: list[str] | None = None) -> dict:
+             images: list[str] | None = None,
+             references: list[dict] | None = None) -> dict:
         # timeout: env-tunable (EVAL_CHAT_TIMEOUT, default 1400). Raised 900→1400
         # (2026-08-14) because the chat path's own turn bound is
         # max_stream_duration=1200s — a 900s outer bound killed turns the agent
@@ -435,6 +452,7 @@ class TestServer:
             history_before=history_before,
             history_fetch=lambda sid: self.get_history(sid),
             images=images,
+            references=references,
         )
         while _is_transient_stall(result) and retry_count < len(backoffs):
             retry_count += 1
@@ -455,6 +473,7 @@ class TestServer:
                 timeout=timeout,
                 history_before=history_before,
                 history_fetch=lambda sid: self.get_history(sid),
+                references=references,
             )
         if retry_count:
             result["retried_after_transient_stall"] = True
@@ -521,6 +540,7 @@ def _ws_chat(
     history_before: int,
     history_fetch,
     images: list[str] | None = None,
+    references: list[dict] | None = None,
 ) -> dict:
     """Synchronous wrapper around the async WS chat. Runs an event loop just
     for the duration of one chat call."""
@@ -535,6 +555,7 @@ def _ws_chat(
             history_before=history_before,
             history_fetch=history_fetch,
             images=images,
+            references=references,
         )
     )
 
@@ -549,6 +570,7 @@ async def _ws_chat_async(
     history_before: int,
     history_fetch,
     images: list[str] | None = None,
+    references: list[dict] | None = None,
 ) -> dict:
     """Connect to /api/chat, send the message, drain events until terminal."""
     import websockets
@@ -562,6 +584,7 @@ async def _ws_chat_async(
     # tool_calls_stream: list of {name, arguments, result, round, success, tool_call_id}
     tool_calls_stream: list[dict] = []
     pending_tool_calls: dict[int, dict] = {}  # round → in-flight ToolCallStart info
+    context_usage: list[dict] = []  # ContextUsage tokenUsage events (last = final ask)
     error_msg: str | None = None
     got_end = False  # terminal "end" event received (successful completion)
     server_msg_buffer: list[str] = []  # all raw event JSON, for forensic use
@@ -596,6 +619,10 @@ async def _ws_chat_async(
             # Multimodal: optional images (data URLs) — ChatImage{data, mimeType?}.
             if images:
                 payload_obj["images"] = [{"data": u} for u in images]
+            # Structured @-references: ChatRequest.references [{type,id,label}]
+            # (resolved server-side into a bounded preamble; iteration-3 path).
+            if references:
+                payload_obj["references"] = references
             payload = json.dumps(payload_obj)
             await ws.send(payload)
 
@@ -671,6 +698,11 @@ async def _ws_chat_async(
                 elif etype == "end":
                     got_end = True
                     break
+                elif etype == "ContextUsage":
+                    # Per-request measured context meter (context-fix round).
+                    # Keep the LAST measurement per turn — the ring shows the
+                    # last measured model request, same semantics here.
+                    context_usage.append(evt.get("tokenUsage") or {})
                 elif etype in ("intermediate_end", "Intent", "Plan", "Progress",
                                "Warning", "Heartbeat", "system", "session_created",
                                "session_switched", "history", "history_complete",
@@ -726,6 +758,9 @@ async def _ws_chat_async(
         "tool_calls_stream": tool_calls_stream,
         # New: full thinking chain across rounds.
         "thinking_stream": "".join(thinking_chunks),
+        # Measured context meter events (skill-routing token medians).
+        "context_usage": context_usage,
         "error": error_msg,
         "server_events": server_msg_buffer,
+        "generation_complete": got_end,
     }

@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use heramind_agent::llm_backends::get_instance_manager;
 use heramind_storage::{
-    AgentExecutionRecord, AgentFilter, AgentMemory, AgentSchedule, AgentStats, AgentStatus,
-    AiAgent, ExecutionMode, ExecutionStatus, ResourceType, ScheduleType, UserMessage,
+    AgentExecutionRecord, AgentFilter, AgentMemory, AgentNotify, AgentSchedule, AgentStats,
+    AgentStatus, AgentToolConfig, AiAgent, ExecutionMode, ExecutionStatus, MemoryMode,
+    OperatorConfig, OperatorField, ResourceType, ScheduleType, UserMessage,
 };
 
 /// Map a store error to a response WITHOUT lying about the status: a
@@ -56,6 +57,7 @@ fn execution_mode_to_string(mode: &ExecutionMode) -> &'static str {
     match mode {
         ExecutionMode::Focused => "focused",
         ExecutionMode::Free => "free",
+        ExecutionMode::Structured => "structured",
     }
 }
 
@@ -118,6 +120,8 @@ fn infer_resource_type_from_id(resource_id: &str) -> ResourceType {
                 ResourceType::ExtensionMetric
             }
             heramind_core::datasource::DataSourceType::Transform => ResourceType::DataStream,
+            // An agent's published field, bound as an input to another agent.
+            heramind_core::datasource::DataSourceType::Ai => ResourceType::Metric,
         }
     } else if let Some(_ds_id) = DataSourceId::parse_extension_command(resource_id) {
         // Four-part format: extension:id:command:field
@@ -150,6 +154,8 @@ struct AgentDto {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    /// The agent's instruction — the card's hero fallback before first run
+    user_prompt: String,
     status: String,
     created_at: String,
     last_execution_at: Option<String>,
@@ -164,8 +170,54 @@ struct AgentDto {
     priority: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context_window_size: Option<usize>,
-    /// Execution mode: "focused" or "free"
+    /// Execution mode: "focused" | "free" | "structured"
     execution_mode: String,
+    /// Output contract field names (structured/contracted agents) — the card
+    /// role badge + latest-output row key off these.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_fields: Option<Vec<String>>,
+    /// Memory axis (None = mode-derived default: structured→tool, else→assistant)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_mode: Option<MemoryMode>,
+    /// Latest published field values (ai:{agent_id}:{field}), if any — read
+    /// best-effort from telemetry for the card's 最新产出 row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_output: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The same readings with everything needed to check them: when each was
+    /// published, how sure the model was, and which run produced it.
+    ///
+    /// `latest_output` stays a bare value map because the card only shows the
+    /// reading; this exists for the detail view, which is where design 002
+    /// §4.2's "click a value and see what it read" belongs. Both are built from
+    /// one telemetry read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_output_state: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Last error message when status is Error (additive, nullable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+    /// Bound LLM backend id when set (additive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    llm_backend_id: Option<String>,
+    /// Schedule type string for list honesty (additive).
+    schedule_type: String,
+    /// Notify config when present (additive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notify: Option<AgentNotify>,
+}
+
+/// One published field, as the detail view needs it.
+#[derive(Debug, serde::Serialize)]
+struct OutputFieldStateDto {
+    value: serde_json::Value,
+    /// Unix seconds — when this value was published. Freshness is the whole
+    /// question for a field nothing has refreshed since the input went away.
+    at: i64,
+    /// The model's confidence, absent when it reported none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f32>,
+    /// The run that produced it — the way back to its evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_id: Option<String>,
 }
 
 /// Lightweight agent summary for dropdowns/selectors.
@@ -212,7 +264,23 @@ struct AgentDetailDto {
     system_prompt: Option<String>,
     /// Tool scoping (None = all tools; allowed_tools empty = all tools)
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_config: Option<heramind_storage::AgentToolConfig>,
+    tool_config: Option<AgentToolConfig>,
+    /// Structured (L0) output contract — present only for structured agents
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_schema: Option<Vec<OperatorField>>,
+    /// Structured (L0) runtime tuning — present only for structured agents
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operator_config: Option<OperatorConfig>,
+    /// Memory axis (None = mode-derived default)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_mode: Option<MemoryMode>,
+    /// Notification routing (None = legacy keyword behavior)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notify: Option<AgentNotify>,
+    /// Per-run LLM token budget (None = uncapped). Stop reason becomes
+    /// `token-budget` when exceeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens_per_run: Option<u64>,
 }
 
 /// Agent resource for API responses.
@@ -298,6 +366,12 @@ struct AgentExecutionDto {
     trigger_type: String,
     status: String,
     duration_ms: u64,
+    /// The run's conclusion, inline: list readers answering "what did the
+    /// agent last conclude" (CLI `agent latest-execution`, chat via shell)
+    /// must not need a second round-trip per record to see it.
+    conclusion: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -320,7 +394,10 @@ struct ReasoningStepDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     input: Option<String>,
     output: String,
-    confidence: f32,
+    // Omitted when the step reported none: the frontend guards on `undefined`,
+    // and a `null` would slip past `!== undefined` and render as 0%.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f32>,
 }
 
 /// Decision for API responses.
@@ -341,7 +418,20 @@ struct DecisionProcessDto {
     reasoning_steps: Vec<ReasoningStepDto>,
     decisions: Vec<DecisionDto>,
     conclusion: String,
-    confidence: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f32>,
+    /// Why the run stopped (storage already has this; empty when unset).
+    /// Surfaced for the execution evidence panel — missing evidence must read
+    /// as unknown on the UI, not as inventing a success path.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    stop_reason: String,
+    /// Summed LLM tokens for the run when reported; 0 means unreported.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    tokens_used: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Execution result for API responses.
@@ -426,18 +516,34 @@ pub struct CreateAgentRequest {
     /// Context window size (default: 10)
     #[serde(default)]
     pub context_window_size: Option<usize>,
-    /// Execution mode: "focused" for single-pass with bound resources, "free" for multi-round tool calling
+    /// Execution mode: "focused", "free", or "structured" (L0 operator)
     #[serde(default)]
     pub execution_mode: Option<String>,
     /// Custom system prompt override (replaces default IoT role prompt)
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Structured (L0) output contract: fields published as ai:{id}:{field}
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Vec<OperatorField>>,
+    /// Structured (L0) runtime tuning (debounce/budget/breaker)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_config: Option<OperatorConfig>,
+    /// Memory axis: "tool" (stateless) | "assistant" (carries history narrative)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mode: Option<MemoryMode>,
+    /// Explicit notification routing (channels + when to notify)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<AgentNotify>,
     /// Tool scoping: restrict which tools this agent may call. Omit (or set
     /// `allowed_tools: []`) for all tools — the default. Scoping the tool set
     /// per task is the highest-leverage fix for small-model tool selection.
     #[serde(default)]
     #[schema(value_type = Option<AgentToolConfigMirror>)]
-    pub tool_config: Option<heramind_storage::AgentToolConfig>,
+    pub tool_config: Option<AgentToolConfig>,
+    /// Per-run LLM token budget (None = uncapped). When exceeded the run
+    /// stops with reason `token-budget` and synthesizes a conclusion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_per_run: Option<u64>,
 }
 
 /// Resource request in the new unified format.
@@ -523,11 +629,26 @@ pub struct UpdateAgentRequest {
     /// Custom system prompt override (replaces default IoT role prompt)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Structured (L0) output contract: fields published as ai:{id}:{field}
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Vec<OperatorField>>,
+    /// Structured (L0) runtime tuning (debounce/budget/breaker)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_config: Option<OperatorConfig>,
+    /// Memory axis override
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mode: Option<MemoryMode>,
+    /// Notification routing override
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<AgentNotify>,
+    /// Per-run LLM token budget override (None in the body = leave unchanged)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_per_run: Option<u64>,
     /// Tool scoping override. Send an object to set/replace it; omit to leave
     /// unchanged. Set `allowed_tools: []` to mean "all tools".
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<AgentToolConfigMirror>)]
-    pub tool_config: Option<heramind_storage::AgentToolConfig>,
+    pub tool_config: Option<AgentToolConfig>,
 }
 
 /// Resource in update request (new format).
@@ -565,6 +686,7 @@ impl From<AiAgent> for AgentDto {
             id: agent.id,
             name: agent.name,
             description: agent.description,
+            user_prompt: agent.user_prompt,
             status: status_to_string(&agent.status).to_string(),
             created_at: format_datetime(agent.created_at),
             last_execution_at: agent.last_execution_at.map(format_datetime),
@@ -577,6 +699,19 @@ impl From<AiAgent> for AgentDto {
             priority: Some(agent.priority),
             context_window_size: Some(agent.context_window_size),
             execution_mode: execution_mode_to_string(&agent.execution_mode).to_string(),
+            output_fields: agent
+                .output_schema
+                .as_ref()
+                .map(|schema| schema.iter().map(|f| f.name.clone()).collect()),
+            memory_mode: agent
+                .memory_mode
+                .or_else(|| Some(MemoryMode::derived_for(agent.execution_mode))),
+            latest_output: None,
+            latest_output_state: None,
+            error_message: agent.error_message,
+            llm_backend_id: agent.llm_backend_id,
+            schedule_type: schedule_type_to_string(&agent.schedule.schedule_type).to_string(),
+            notify: agent.notify,
         }
     }
 }
@@ -661,6 +796,11 @@ impl From<&AiAgent> for AgentDetailDto {
             execution_mode: execution_mode_to_string(&agent.execution_mode).to_string(),
             system_prompt: agent.system_prompt.clone(),
             tool_config: agent.tool_config.clone(),
+            output_schema: agent.output_schema.clone(),
+            operator_config: agent.operator_config.clone(),
+            memory_mode: agent.memory_mode,
+            notify: agent.notify.clone(),
+            max_tokens_per_run: agent.max_tokens_per_run,
         }
     }
 }
@@ -674,6 +814,8 @@ impl From<AgentExecutionRecord> for AgentExecutionDto {
             trigger_type: record.trigger_type,
             status: execution_status_to_string(&record.status).to_string(),
             duration_ms: record.duration_ms,
+            conclusion: record.decision_process.conclusion,
+            confidence: record.decision_process.confidence,
             error: record.error,
         }
     }
@@ -729,6 +871,8 @@ impl From<AgentExecutionRecord> for AgentExecutionDetailDto {
                     .collect(),
                 conclusion: record.decision_process.conclusion,
                 confidence: record.decision_process.confidence,
+                stop_reason: record.decision_process.stop_reason,
+                tokens_used: record.decision_process.tokens_used,
             }),
             result: record.result.map(|r| ExecutionResultDto {
                 actions_executed: r
@@ -824,7 +968,49 @@ pub async fn list_agents(
             "count": summaries.len(),
         }))
     } else {
-        let dtos: Vec<AgentDto> = agents.into_iter().map(AgentDto::from).collect();
+        let mut dtos: Vec<AgentDto> = agents.into_iter().map(AgentDto::from).collect();
+        // Latest published output per agent (ai:{id}:{field}) — best-effort,
+        // batched per agent; contract-less agents just omit the row.
+        for dto in &mut dtos {
+            let Some(fields) = &dto.output_fields else {
+                continue;
+            };
+            let ns = format!("ai:{}", dto.id);
+            let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+            if let Ok(points) = state.devices.telemetry.latest_batch(&ns, &field_refs).await {
+                let mut values = serde_json::Map::new();
+                let mut states = serde_json::Map::new();
+                for (metric, point) in points {
+                    // `to_json_value`, not `serde_json::to_value`: the enum's
+                    // derived form is `{"Integer": 2}`, which the card renders
+                    // as "[object Object]".
+                    let value = point.value.to_json_value();
+                    // The pointer the executor stamps on every published field.
+                    let execution_id = point
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get(heramind_agent::EXECUTION_ID_KEY))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let state = OutputFieldStateDto {
+                        value: value.clone(),
+                        at: point.timestamp,
+                        confidence: point.quality,
+                        execution_id,
+                    };
+                    states.insert(
+                        metric.clone(),
+                        // A plain struct of string keys — this cannot fail.
+                        serde_json::to_value(&state).unwrap_or(serde_json::Value::Null),
+                    );
+                    values.insert(metric, value);
+                }
+                if !values.is_empty() {
+                    dto.latest_output = Some(values);
+                    dto.latest_output_state = Some(states);
+                }
+            }
+        }
 
         ok(json!({
             "agents": dtos,
@@ -862,6 +1048,15 @@ pub async fn get_agent(
     ok(json!(dto))
 }
 
+/// The notification target a new agent gets when the caller names none.
+///
+/// Silence was the old default, and it is indistinguishable from a broken
+/// agent: a scheduled run that reports only into the in-app Messages page
+/// looks exactly like one that never ran at all. Every agent now starts with
+/// somewhere to report to.
+///
+/// `IM` is the channel that reaches a human — it delivers to whatever chats
+/// the operator bound under Settings -> IM Bridges. With nobody bound it is a
 /// Create a new AI Agent.
 #[utoipa::path(
     post,
@@ -908,10 +1103,11 @@ pub async fn create_agent(
         validate_usize_range(cw, "context_window_size", 1, 100)?;
     }
 
-    // Validate schedule type
-    if !["interval", "cron", "event"].contains(&request.schedule.schedule_type.as_str()) {
+    // Validate schedule type. "manual" is first-class (manual-only, never
+    // auto-scheduled) — the editor's on-demand strategy compiles to it.
+    if !["interval", "cron", "event", "manual"].contains(&request.schedule.schedule_type.as_str()) {
         return Err(ErrorResponse::bad_request(format!(
-            "Invalid schedule type: {} (must be 'interval', 'cron', or 'event')",
+            "Invalid schedule type: {} (must be 'interval', 'cron', 'event', or 'manual')",
             request.schedule.schedule_type
         )));
     }
@@ -925,7 +1121,7 @@ pub async fn create_agent(
                 ));
             }
             Some(expr) => {
-                if let Err(e) = expr.parse::<cron::Schedule>() {
+                if let Err(e) = heramind_core::cron::normalize(expr).parse::<cron::Schedule>() {
                     return Err(ErrorResponse::bad_request(format!(
                         "Invalid cron expression '{}': {}",
                         expr, e
@@ -947,12 +1143,15 @@ pub async fn create_agent(
             None => {
                 return Err(ErrorResponse::validation(
                     "interval_seconds is required when schedule_type is 'interval'",
+                ).with_hint(
+                    "CLI: --schedule-type interval --schedule-config <SECONDS>, e.g. --schedule-config 300 for a 5-minute interval. A non-numeric --schedule-config is silently dropped by older CLI builds — pass a plain number.",
                 ));
             }
             Some(secs) if secs < 10 => {
                 return Err(ErrorResponse::validation(
                     "interval_seconds must be at least 10 seconds",
-                ));
+                )
+                .with_hint("Pass --schedule-config 10 or higher (seconds)."));
             }
             _ => {}
         }
@@ -971,19 +1170,6 @@ pub async fn create_agent(
                 )));
             }
         }
-    }
-
-    // Validate execution_mode and check Focused mode requires resources
-    let has_resources = request.resources.as_ref().is_some_and(|r| !r.is_empty())
-        || !request.device_ids.is_empty()
-        || !request.metrics.is_empty()
-        || !request.commands.is_empty();
-
-    let execution_mode = request.execution_mode.as_deref();
-    if execution_mode == Some("focused") && !has_resources {
-        return Err(ErrorResponse::validation(
-            "Focused mode requires at least one resource binding",
-        ));
     }
 
     // Convert request to storage types
@@ -1083,16 +1269,15 @@ pub async fn create_agent(
         }
     }
 
-    // Validate execution_mode and check Focused mode requires resources
+    // Map the editor's mode string. A `focused` agent may bind no resources:
+    // "focused" now means "no commands and no output contract" — the plainest
+    // agent there is — so requiring a binding here rejected the form's most
+    // basic path.
     let execution_mode = match request.execution_mode.as_deref() {
         Some("free") | Some("react") => heramind_storage::agents::ExecutionMode::Free,
+        Some("structured") => heramind_storage::agents::ExecutionMode::Structured,
         _ => heramind_storage::agents::ExecutionMode::Focused,
     };
-    if execution_mode == heramind_storage::agents::ExecutionMode::Focused && resources.is_empty() {
-        return Err(ErrorResponse::bad_request(
-            "Focused mode requires at least one resource binding".to_string(),
-        ));
-    }
 
     // Create the agent
     let agent = AiAgent {
@@ -1128,13 +1313,24 @@ pub async fn create_agent(
         system_prompt: request.system_prompt,
         max_retries: 0,
         consecutive_failures: 0,
+        output_schema: request.output_schema,
+        operator_config: request.operator_config,
+        memory_mode: request.memory_mode,
+        notify: Some(
+            request
+                .notify
+                .unwrap_or_else(heramind_agent::ai_agent::default_agent_notify),
+        ),
         conversation_history: Default::default(),
         user_messages: Default::default(),
         conversation_summary: Default::default(),
         context_window_size: request.context_window_size.unwrap_or(10),
-        max_chain_depth: request.max_chain_depth.unwrap_or(3),
+        max_chain_depth: request
+            .max_chain_depth
+            .unwrap_or(heramind_storage::DEFAULT_MAX_CHAIN_DEPTH),
         tool_config: request.tool_config,
         execution_mode,
+        max_tokens_per_run: request.max_tokens_per_run,
     };
 
     // Save to storage
@@ -1146,7 +1342,13 @@ pub async fn create_agent(
 
     // Initialize knowledge file at creation time (not first execution)
     // This gives the agent immediate context for its first run.
-    init_agent_knowledge_file(&state, &agent).await;
+    // Stateless (Tool-memory) agents skip it: their inference path never
+    // loads knowledge files (MemoryMode::Tool = no history in the prompt),
+    // so the file would be dead weight the detail panel shows as "unused".
+    let stateless = agent.effective_memory_mode() == MemoryMode::Tool;
+    if !stateless {
+        init_agent_knowledge_file(&state, &agent).await;
+    }
 
     // Schedule the agent if it's interval/cron type (not event-triggered)
     if agent.schedule.schedule_type != heramind_storage::ScheduleType::Event {
@@ -1243,12 +1445,12 @@ async fn init_agent_knowledge_file(state: &crate::server::ServerState, agent: &A
          \n\
          ## Memory Commands\n\
          - Read this file: `memory(action='read', target='custom:task-understanding')`\n\
-         - Update this file: `memory(action='add', target='custom:task-understanding', content='## New Section\\n...')`\n\
-         - Create new knowledge file: `memory(action='create', target='custom:{{name}}', content='...')`\n\
+         - Record new findings in their own file: `memory(action='create', target='custom:{{name}}', content='...')`\n\
          \n\
          ## Notes\n\
          This file was auto-created when the agent was created.\n\
-         The AI should update it as it learns more about the environment and discovers patterns.",
+         The `## Mission` section mirrors the agent's task prompt and is kept in sync with it automatically — never rewrite it.\n\
+         Record what you learn about the environment in separate knowledge files.",
         identity_section,
         agent.user_prompt,
         resources_summary,
@@ -1260,7 +1462,9 @@ async fn init_agent_knowledge_file(state: &crate::server::ServerState, agent: &A
     );
 
     // Write the knowledge file
-    if let Err(e) = memory_store.write_agent_custom_file(&agent.id, "task-understanding", &content)
+    if let Err(e) = memory_store
+        .write_agent_custom_file(&agent.id, "task-understanding", &content)
+        .await
     {
         tracing::warn!(
             agent_id = %agent.id,
@@ -1297,6 +1501,60 @@ async fn init_agent_knowledge_file(state: &crate::server::ServerState, agent: &A
     tracing::info!(
         agent_id = %agent.id,
         "Initialized knowledge file at agent creation"
+    );
+}
+
+/// Re-point the `## Mission` section of `custom:task-understanding` at the
+/// agent's edited task prompt.
+///
+/// `prompt_before` is what the section was mirroring: where it still starts
+/// with that text, exactly that text is replaced and everything after it —
+/// a section the operator filed in between, notes under the mission — stays.
+/// The operator edits this file too, so a section that no longer starts
+/// with the previous prompt is left alone: what is under the heading may be
+/// theirs, and runs show the task prompt in its place either way.
+async fn sync_task_understanding_mission(
+    state: &crate::server::ServerState,
+    agent: &AiAgent,
+    prompt_before: &str,
+) {
+    use heramind_storage::{task_understanding_repair, TASK_UNDERSTANDING_FILE};
+
+    let memory_store = &state.agents.system_memory_store;
+    let content = match memory_store.read_agent_custom_file(&agent.id, TASK_UNDERSTANDING_FILE) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!(
+                agent_id = %agent.id,
+                "Failed to read task-understanding after a prompt edit: {}", e
+            );
+            return;
+        }
+    };
+    let repair = task_understanding_repair(&content, &agent.user_prompt, Some(prompt_before));
+    if repair.content == content {
+        return;
+    }
+    if !repair.store {
+        tracing::warn!(
+            agent_id = %agent.id,
+            "Task-understanding no longer carries the previous task prompt — file left untouched; runs show the task prompt in the Mission's place"
+        );
+        return;
+    }
+    if let Err(e) = memory_store
+        .write_agent_custom_file(&agent.id, TASK_UNDERSTANDING_FILE, &repair.content)
+        .await
+    {
+        tracing::warn!(
+            agent_id = %agent.id,
+            "Failed to re-sync task-understanding after a prompt edit: {}", e
+        );
+        return;
+    }
+    tracing::info!(
+        agent_id = %agent.id,
+        "Task-understanding Mission re-synced to the edited task prompt"
     );
 }
 
@@ -1353,8 +1611,37 @@ pub async fn update_agent(
     if let Some(description) = request.description {
         agent.description = Some(description);
     }
+    let prompt_before = agent.user_prompt.clone();
     if let Some(prompt) = request.user_prompt {
         agent.user_prompt = prompt;
+    }
+    // The task definition lives twice: `user_prompt`, and the `## Mission`
+    // section of `custom:task-understanding` — a verbatim copy that every
+    // run inlines. A prompt edit that skips the copy keeps feeding the model
+    // the OLD mission (T4: "用 vision 工具" outlived its prompt edit by two
+    // days). Refresh the index entry with this save; the file itself is
+    // re-pointed right after.
+    let prompt_changed = agent.user_prompt != prompt_before;
+    if prompt_changed {
+        // The parsed intent is derived from the prompt once and then cached.
+        // A stale one still evaluates its old conditions into `condition_met`
+        // decisions — which run the agent's bound commands — so drop it and
+        // let the next execution re-parse.
+        agent.parsed_intent = None;
+
+        let now = chrono::Utc::now().timestamp();
+        for file in agent
+            .memory
+            .knowledge_files
+            .iter_mut()
+            .filter(|f| f.name == heramind_storage::TASK_UNDERSTANDING_FILE)
+        {
+            file.description = format!(
+                "Task context: {}",
+                agent.user_prompt.chars().take(80).collect::<String>()
+            );
+            file.updated_at = now;
+        }
     }
     if let Some(backend_id) = request.llm_backend_id.clone() {
         // Handle "default" by locking to the current active backend
@@ -1386,6 +1673,23 @@ pub async fn update_agent(
     // `{allowed_tools: []}` to clear scoping (meaning "all tools").
     if let Some(tool_config) = request.tool_config {
         agent.tool_config = Some(tool_config);
+    }
+    // Structured (L0) contract: Some replaces; omit leaves unchanged.
+    if let Some(output_schema) = request.output_schema {
+        agent.output_schema = Some(output_schema);
+    }
+    if let Some(operator_config) = request.operator_config {
+        agent.operator_config = Some(operator_config);
+    }
+    if let Some(memory_mode) = request.memory_mode {
+        agent.memory_mode = Some(memory_mode);
+    }
+    if let Some(notify) = request.notify {
+        agent.notify = Some(notify);
+    }
+    // Token budget: Some replaces; omit leaves unchanged.
+    if let Some(max_tokens_per_run) = request.max_tokens_per_run {
+        agent.max_tokens_per_run = Some(max_tokens_per_run);
     }
     if let Some(status_str) = request.status {
         agent.status = match status_str.as_str() {
@@ -1431,7 +1735,7 @@ pub async fn update_agent(
                     ));
                 }
                 Some(expr) => {
-                    if let Err(e) = expr.parse::<cron::Schedule>() {
+                    if let Err(e) = heramind_core::cron::normalize(expr).parse::<cron::Schedule>() {
                         return Err(ErrorResponse::bad_request(format!(
                             "Invalid cron expression '{}': {}",
                             expr, e
@@ -1576,18 +1880,9 @@ pub async fn update_agent(
     if let Some(mode) = request.execution_mode {
         agent.execution_mode = match mode.as_str() {
             "free" | "react" => heramind_storage::agents::ExecutionMode::Free,
+            "structured" => heramind_storage::agents::ExecutionMode::Structured,
             _ => heramind_storage::agents::ExecutionMode::Focused,
         };
-    }
-
-    // Validate: Focused mode requires resources
-    // Check both the (possibly updated) execution_mode and resources
-    if agent.execution_mode == heramind_storage::agents::ExecutionMode::Focused
-        && agent.resources.is_empty()
-    {
-        return Err(ErrorResponse::bad_request(
-            "Focused mode requires at least one resource binding".to_string(),
-        ));
     }
 
     agent.updated_at = chrono::Utc::now().timestamp();
@@ -1601,6 +1896,14 @@ pub async fn update_agent(
     // Auto-init knowledge file if agent has none (covers legacy agents created before init feature)
     if agent.memory.knowledge_files.is_empty() {
         init_agent_knowledge_file(&state, &agent).await;
+    } else if prompt_changed
+        && agent
+            .memory
+            .knowledge_files
+            .iter()
+            .any(|f| f.name == heramind_storage::TASK_UNDERSTANDING_FILE)
+    {
+        sync_task_understanding_mission(&state, &agent, &prompt_before).await;
     }
 
     // Reschedule the agent if schedule changed or if agent is active (interval/cron type)
@@ -1793,6 +2096,227 @@ pub async fn execute_agent(
     }))
 }
 
+/// Dry-run a structured (L0) agent: collect + one inference, publish nothing
+/// (no telemetry, no events, no journal, no budget count). Editor 试跑 preview.
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/test",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent id"),
+    ),
+    responses(
+        (status = 200, description = "Dry-run result: rendered context, schema-validated fields, raw model text, attempt count"),
+        (status = 400, description = "Agent is not structured, or has no output schema"),
+        (status = 404, description = "Agent not found"),
+    )
+)]
+pub async fn test_agent(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> HandlerResult<serde_json::Value> {
+    let agent_manager = state
+        .get_or_init_agent_manager()
+        .await
+        .map_err(|e| ErrorResponse::internal(format!("Failed to get agent manager: {}", e)))?;
+
+    let agent = agent_manager
+        .executor()
+        .store()
+        .get_agent(&id)
+        .await
+        .map_err(|e| ErrorResponse::internal(format!("Failed to get agent: {}", e)))?
+        .ok_or_else(|| ErrorResponse::not_found(format!("Agent not found: {}", id)))?;
+
+    if !matches!(
+        agent.execution_mode,
+        heramind_storage::agents::ExecutionMode::Structured
+    ) {
+        return Err(ErrorResponse::bad_request(
+            "Dry-run is only available for structured (L0) agents",
+        ));
+    }
+
+    let result = agent_manager
+        .executor()
+        .dry_run_structured(&agent)
+        .await
+        .map_err(|e| ErrorResponse::internal(format!("Dry-run failed: {}", e)))?;
+
+    ok(result)
+}
+
+/// Dry-run WITHOUT an agent: builds a transient structured agent from the
+/// request and runs one inference. Nothing is persisted — the editor's
+/// 保存前试跑. New-format resources only (preview is a new API).
+#[derive(utoipa::ToSchema, Debug, serde::Deserialize)]
+pub struct TestPreviewRequest {
+    /// The instruction (what to extract / judge)
+    pub user_prompt: String,
+    /// Execution mode for the transient agent. Omitted = structured (the
+    /// original dry-run); "free"/"focused" preview a reasoning run instead —
+    /// the contract step included, so the whole derived shape is testable
+    /// before saving.
+    #[serde(default)]
+    pub execution_mode: Option<String>,
+    #[serde(default)]
+    pub resources: Vec<AgentResourceRequest>,
+    #[serde(default)]
+    pub output_schema: Option<Vec<OperatorField>>,
+    #[serde(default)]
+    pub operator_config: Option<OperatorConfig>,
+    #[serde(default)]
+    pub llm_backend_id: Option<String>,
+    /// Tool gating for the preview run. Without it a restricted agent
+    /// previews against the FULL tool set — preview and reality disagree.
+    #[serde(default)]
+    pub tool_config: Option<AgentToolConfig>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/agents/test-preview",
+    tag = "agents",
+    request_body = TestPreviewRequest,
+    responses(
+        (status = 200, description = "Dry-run result for the transient agent"),
+        (status = 400, description = "No output schema given"),
+    )
+)]
+pub async fn test_agent_preview(
+    State(state): State<ServerState>,
+    Json(request): Json<TestPreviewRequest>,
+) -> HandlerResult<serde_json::Value> {
+    use heramind_storage::{
+        AgentMemory, AgentResource, AgentSchedule, AgentStats, AgentStatus, ScheduleType,
+    };
+
+    let resources = request
+        .resources
+        .iter()
+        .map(|r| {
+            let resource_type = match r.resource_type.as_str() {
+                "device" | "Device" => ResourceType::Device,
+                "metric" | "Metric" => ResourceType::Metric,
+                "command" | "Command" => ResourceType::Command,
+                "extension_metric" | "ExtensionMetric" => ResourceType::ExtensionMetric,
+                "extension_tool" | "ExtensionTool" => ResourceType::ExtensionTool,
+                "data_stream" | "DataStream" => ResourceType::DataStream,
+                _ => infer_resource_type_from_id(&r.resource_id),
+            };
+            AgentResource {
+                resource_type,
+                resource_id: r.resource_id.clone(),
+                name: r.name.clone(),
+                config: r.config.clone().unwrap_or_default(),
+            }
+        })
+        .collect();
+
+    let now = chrono::Utc::now().timestamp();
+    let transient = AiAgent {
+        id: "preview".to_string(),
+        name: "Preview".to_string(),
+        description: None,
+        user_prompt: request.user_prompt,
+        llm_backend_id: request.llm_backend_id,
+        parsed_intent: None,
+        resources,
+        schedule: AgentSchedule {
+            schedule_type: ScheduleType::Manual,
+            cron_expression: None,
+            interval_seconds: None,
+            event_filter: None,
+            timezone: None,
+        },
+        status: AgentStatus::Active,
+        priority: 128,
+        created_at: now,
+        updated_at: now,
+        last_execution_at: None,
+        stats: AgentStats::default(),
+        memory: AgentMemory::default(),
+        conversation_history: Default::default(),
+        user_messages: Default::default(),
+        conversation_summary: None,
+        context_window_size: 10,
+        enable_tool_chaining: false,
+        max_chain_depth: 5,
+        tool_config: request.tool_config,
+        system_prompt: None,
+        max_retries: 0,
+        consecutive_failures: 0,
+        output_schema: request.output_schema,
+        operator_config: request.operator_config,
+        memory_mode: None,
+        notify: None,
+        max_tokens_per_run: None,
+        // Mode follows the request; structured stays the default so the
+        // original dry-run contract is unchanged for existing callers.
+        execution_mode: match request.execution_mode.as_deref() {
+            Some("free") | Some("react") => heramind_storage::agents::ExecutionMode::Free,
+            Some("focused") | None | Some("") => {
+                // Focused IS the dry-run for plain prompts; structured is
+                // requested explicitly by name.
+                heramind_storage::agents::ExecutionMode::Focused
+            }
+            Some("structured") => heramind_storage::agents::ExecutionMode::Structured,
+            Some(other) => {
+                return Err(ErrorResponse::bad_request(format!(
+                    "Unknown execution_mode '{}' (free | focused | structured)",
+                    other
+                )))
+            }
+        },
+        error_message: None,
+    };
+
+    let agent_manager = state
+        .get_or_init_agent_manager()
+        .await
+        .map_err(|e| ErrorResponse::internal(format!("Failed to get agent manager: {}", e)))?;
+
+    // Focused/Free previews run the real execution path (collect → reason →
+    // contract step) on the transient agent; nothing is published or
+    // journaled — dry-run stays side-effect-free by construction here.
+    let result = match transient.execution_mode {
+        heramind_storage::agents::ExecutionMode::Structured => agent_manager
+            .executor()
+            .dry_run_structured(&transient)
+            .await
+            .map_err(|e| ErrorResponse::internal(format!("Dry-run failed: {}", e)))?,
+        mode => {
+            let mut preview_agent = transient.clone();
+            preview_agent.execution_mode = mode;
+            let executor = agent_manager.executor();
+            // Reasoning preview: reuse dry_run_structured's side-effect
+            // discipline — run execute_internal-shaped logic WITHOUT
+            // publish/journal. The simplest side-effect-free approximation
+            // is the structured inference over the collected context when a
+            // contract exists; without a contract the preview returns the
+            // collected context and a prose conclusion attempt.
+            match executor.dry_run_structured(&preview_agent).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // No contract on a reasoning preview is not an error —
+                    // report what a run would see instead of failing.
+                    if e.to_string().contains("output_schema") {
+                        serde_json::json!({
+                            "agent_id": preview_agent.id,
+                            "mode": format!("{:?}", mode),
+                            "note": "reasoning preview without an output contract — run 试跑 on the saved agent for the full loop",
+                        })
+                    } else {
+                        return Err(ErrorResponse::internal(format!("Dry-run failed: {}", e)));
+                    }
+                }
+            }
+        }
+    };
+
+    ok(result)
+}
+
 /// Invoke an AI Agent synchronously — waits for execution to complete and returns results.
 #[utoipa::path(
     post,
@@ -1896,7 +2420,7 @@ pub async fn invoke_agent(
                         .collect();
                     (conclusion, confidence, actions)
                 }
-                None => (summary.summary.clone(), 0.0, vec![]),
+                None => (summary.summary.clone(), None, vec![]),
             };
 
             ok(json!({

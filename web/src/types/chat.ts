@@ -1,5 +1,17 @@
 // ========== Chat Types ==========
 
+/** Ordered content node for the v1 inline-@ protocol (plan 1.3 iter C). */
+export type ChatContentNode =
+  | { kind: 'text'; text: string }
+  | {
+      kind: 'reference'
+      type: 'device' | 'rule' | 'transform' | 'agent'
+      id: string
+      labelSnapshot: string
+    }
+
+export const CHAT_CONTENT_VERSION_V1 = 1 as const
+
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system' | 'tool'
@@ -16,7 +28,61 @@ export interface Message {
   round_contents?: Record<number, string>
   // Per-round thinking content for grouped rendering
   round_thinking?: Record<number, string>
+  // Runtime guard notes for the user (incomplete action, guard budget
+  // spent, …) — rendered as a system callout below the content, never
+  // merged into it.
+  systemNotes?: string[]
+  /** System-judged goal status from End.goalStatus (not model NL). */
+  goalStatus?: SystemGoalStatus
+  /** Why the stream ended (normal / interrupted / …). */
+  endReason?: StreamEndReason
+  /** Inline-@ nodes for history display (client optimistic + future server). */
+  contentNodes?: ChatContentNode[]
 }
+
+/** Evidence ladder from the backend (snake_case wire tags). */
+export type GoalEvidenceLevel =
+  | 'none'
+  | 'config_success'
+  | 'command_dispatched'
+  | 'device_acknowledged'
+  | 'physical_effect_verified'
+
+/**
+ * System-judged goal status on End — never derived by scanning reply text.
+ * `not_applicable` is NOT verified success.
+ */
+export type SystemGoalStatus =
+  | { status: 'not_applicable' }
+  | {
+      status: 'incomplete'
+      reason: string
+      level: GoalEvidenceLevel
+      operation_id?: string
+      task_complete_ok: boolean
+      physical_ok: boolean
+    }
+  | {
+      status: 'complete_eligible'
+      level: GoalEvidenceLevel
+      operation_id?: string
+      device_id?: string
+      command?: string
+      delivery?: string
+      task_complete_ok: boolean
+      physical_ok: boolean
+    }
+  | { status: 'completed'; evidence_id: string }
+  | { status: 'halted'; reason: string }
+  | { status: 'cancelled' }
+
+export type StreamEndReason =
+  | 'normal'
+  | 'interrupted'
+  | 'timeout'
+  | 'error'
+  | 'cancelled'
+  | 'cannot_continue'
 
 /**
  * All possible message roles including internal tool messages
@@ -37,28 +103,11 @@ export interface ToolCall {
   arguments: Record<string, unknown>
   result?: unknown
   round?: number // 1-based round number for multi-round tool calling
-}
-
-// Build Meta types for AI Build Mode rich cards
-export type BuildEntityType = 'device' | 'dashboard' | 'rule' | 'extension' | 'widget' | 'transform' | 'agent' | 'message'
-export type BuildAction = 'create' | 'update' | 'delete' | 'install'
-
-export interface BuildMeta {
-  type: BuildEntityType
-  action: BuildAction
-  entity_id: string
-  entity_name?: string
-  undo_command: string
-}
-
-/** CLI JSON response structure with optional build_meta */
-export interface CliBuildResponse {
-  success: boolean
-  data?: Record<string, unknown>
-  message?: string
-  error?: string
-  code?: string
-  build_meta?: BuildMeta
+  /** Live WS ToolCallEnd carries success; persisted history does not. */
+  success?: boolean
+  /** Client-measured wall time for this turn only (absent after reload). */
+  startedAt?: number
+  durationMs?: number
 }
 
 // Session Types
@@ -89,6 +138,10 @@ export interface SessionListResponse {
 export interface SessionHistoryResponse {
   messages: Message[]
   count: number
+  /** Full-history length in raw records; equals count when unpaginated. */
+  total?: number
+  /** Older records exist beyond the loaded window (paginated request only). */
+  has_more?: boolean
 }
 
 // Server WebSocket message types (matching backend)
@@ -114,6 +167,38 @@ export type ServerMessage =
   | { type: 'Progress'; elapsed: number; stage?: string; message?: string; remainingTime?: number; sessionId: string }
   // Warning event when approaching timeout
   | { type: 'Warning'; message: string; elapsed?: number; remainingTime?: number; sessionId: string }
+  // Runtime guard note for the user (incomplete action, guard budget
+  // spent) — rendered as a callout, never part of the content stream.
+  | { type: 'SystemNote'; note: string; sessionId: string }
+  // Structured Unknown re-run confirm (JSON fields; fingerprints may contain spaces)
+  | {
+      type: 'AuthorizeConfirmRequest'
+      requestId: string
+      priorOperationId: string
+      writeFingerprint: string
+      toolName?: string
+      /** Backend `Option<String>` — JSON null when absent. */
+      target?: string | null
+      validUntilMs: number
+      sessionId: string
+    }
+  | { type: 'AuthorizeConfirmRemoved'; requestId: string; reason: string; sessionId: string }
+  /** Server receive-ack for a clientRequestId — NOT the same as local ws.send/queue. */
+  | {
+      type: 'MessageReceived'
+      requestId: string
+      status: 'accepted' | 'rejected'
+      sessionId?: string
+      reason?: string
+      /** Server resolve status for @ references on this accepted turn. */
+      refResolutions?: Array<{
+        index: number
+        type: string
+        id: string
+        ok: boolean
+        detail: string
+      }>
+    }
   // Execution plan step (informational, not displayed in current UI)
   | { type: 'Plan'; step: string; stage: string; sessionId: string }
   // Heartbeat to keep connection alive (not displayed)
@@ -123,11 +208,24 @@ export type ServerMessage =
   // Error occurred - sessionId is always included when sent from backend
   | { type: 'Error'; message: string; sessionId: string }
   // Stream ended
-  | { type: 'end'; sessionId: string; tokenUsage?: {
+  | { type: 'ContextCompacted'; sessionId: string; summarizedMessages: number; fallbackUsed?: boolean; tokenUsage?: {
       promptTokens: number
       systemPromptTokens?: number
       toolTokens?: number
+      maxContextTokens?: number
     } }
+  | { type: 'ContextUsage'; sessionId: string; tokenUsage: { promptTokens: number; systemPromptTokens?: number; toolTokens?: number; maxContextTokens?: number } }
+  | { type: 'end'; sessionId: string; historyTruncated?: boolean; tokenUsage?: {
+      promptTokens: number
+      systemPromptTokens?: number
+      toolTokens?: number
+      maxContextTokens?: number
+      usageRatio?: number
+    }
+    /** System-judged goal status — `not_applicable` ≠ verified success. */
+    goalStatus?: SystemGoalStatus
+    endReason?: StreamEndReason
+  }
   // Cancel acknowledged (server-side reply to __CANCEL__); no trailing
   // 'end' is guaranteed on this path, so stream state must reset HERE.
   | { type: 'cancelled'; message?: string; sessionId?: string }
@@ -160,6 +258,21 @@ export interface ChatImage {
   mimeType?: string  // e.g., "image/png", "image/jpeg"
 }
 
+/// A structured object reference attached by the composer (@-mention).
+/// The id is authoritative; the label is display-only and may go stale.
+export interface ChatReference {
+  type: 'device' | 'rule' | 'transform' | 'agent'
+  id: string
+  label?: string
+}
+
+/** Explicit Unknown re-run authorization submit (request-id keyed). */
+export interface AuthorizeNewOperationRequest {
+  requestId: string
+  priorOperationId: string
+  writeFingerprint: string
+}
+
 // Client WebSocket message types
 export interface ClientChatMessage {
   message: string
@@ -168,6 +281,15 @@ export interface ClientChatMessage {
   backendId?: string  // Optional LLM backend ID to use for this message
   selectedSkills?: string[]  // Skill IDs pinned by user for this session
   pageContext?: string  // Short neutral page context, sent only on first message
+  references?: ChatReference[]  // Legacy chip path — preamble on the server
+  /** Protocol version for contentNodes (currently 1). */
+  contentVersion?: typeof CHAT_CONTENT_VERSION_V1
+  /** Ordered text/reference nodes — preferred over references when present. */
+  contentNodes?: ChatContentNode[]
+  /** Host/UI confirm target for Unknown re-run (required when multiple Unknowns). */
+  authorizeNewOperation?: AuthorizeNewOperationRequest
+  /** Correlation id echoed by MessageReceived (draft clears only on accepted). */
+  clientRequestId?: string
 }
 
 // ========== Chat Input Types ==========

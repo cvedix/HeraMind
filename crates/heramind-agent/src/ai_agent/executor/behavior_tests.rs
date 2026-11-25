@@ -55,6 +55,15 @@ impl Tool for EchoTool {
 }
 
 async fn build_harness() -> (AgentExecutor, AiAgent, Arc<ToolRegistry>) {
+    build_harness_with_memory(None).await
+}
+
+/// [`build_harness`] with a knowledge-file store, so a test can exercise
+/// what gets inlined from `memory/agents/<id>/custom/` — and what gets
+/// written back.
+async fn build_harness_with_memory(
+    memory_store: Option<Arc<heramind_storage::MarkdownMemoryStore>>,
+) -> (AgentExecutor, AiAgent, Arc<ToolRegistry>) {
     let store = AgentStore::memory().expect("memory store");
     let config = AgentExecutorConfig {
         store,
@@ -66,7 +75,7 @@ async fn build_harness() -> (AgentExecutor, AiAgent, Arc<ToolRegistry>) {
         llm_backend_store: None,
         extension_registry: None,
         tool_registry: None,
-        memory_store: None,
+        memory_store,
         backend_semaphores: None,
         skill_registry: None,
         execution_semaphore: None,
@@ -79,7 +88,10 @@ async fn build_harness() -> (AgentExecutor, AiAgent, Arc<ToolRegistry>) {
 
     let now: i64 = 0;
     let agent = AiAgent {
-        id: "test-agent".into(),
+        // Unique per harness: the in-flight re-entrancy guard and the daily
+        // run counters are PROCESS-global, so parallel tests sharing a
+        // literal "test-agent" id would reject each other's runs.
+        id: format!("test-agent-{}", uuid::Uuid::new_v4().simple()),
         name: "Test".into(),
         description: None,
         user_prompt: "test".into(),
@@ -120,8 +132,13 @@ async fn build_harness() -> (AgentExecutor, AiAgent, Arc<ToolRegistry>) {
         system_prompt: None,
         max_retries: 0,
         consecutive_failures: 0,
+        output_schema: None,
+        operator_config: None,
+        memory_mode: None,
+        notify: None,
         enable_tool_chaining: false,
         max_chain_depth: 3,
+        max_tokens_per_run: None,
     };
 
     (executor, agent, registry)
@@ -165,7 +182,7 @@ async fn normal_completion_returns_final_text() {
         MockResponse::tool_call("echo", serde_json::json!({ "msg": "hi" })),
         MockResponse::text("all done"),
     ]);
-    let rt_dyn: Arc<dyn LlmRuntime + Send + Sync> = Arc::new(rt.clone());
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt.clone());
     let (executor, agent, registry) = build_harness().await;
     let (filtered_tools, tool_name_map) =
         AgentExecutor::filter_tools(&registry, &agent.tool_config);
@@ -199,7 +216,7 @@ async fn all_duplicate_breaks_to_phase2() {
         MockResponse::tool_call("echo", serde_json::json!({ "msg": "x" })), // duplicate
         MockResponse::text("summary from results so far"),
     ]);
-    let rt_dyn: Arc<dyn LlmRuntime + Send + Sync> = Arc::new(rt.clone());
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt.clone());
     let (executor, agent, registry) = build_harness().await;
     let (filtered_tools, tool_name_map) =
         AgentExecutor::filter_tools(&registry, &agent.tool_config);
@@ -241,7 +258,7 @@ async fn max_rounds_graceful_exit_runs_phase2() {
         MockResponse::tool_call("echo", serde_json::json!({ "msg": "r2" })),
         MockResponse::text("synthesized conclusion"),
     ]);
-    let rt_dyn: Arc<dyn LlmRuntime + Send + Sync> = Arc::new(rt.clone());
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt.clone());
     let (executor, agent, registry) = build_harness().await;
     let (filtered_tools, tool_name_map) =
         AgentExecutor::filter_tools(&registry, &agent.tool_config);
@@ -268,4 +285,4263 @@ async fn max_rounds_graceful_exit_runs_phase2() {
     );
     assert_eq!(out.final_text, "synthesized conclusion");
     assert_eq!(out.stop_reason, StopReason::MaxRounds);
+}
+
+#[tokio::test]
+async fn structured_mode_publishes_schema_fields_on_first_pass() {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    agent.execution_mode = heramind_storage::agents::ExecutionMode::Structured;
+    agent.output_schema = Some(vec![
+        heramind_storage::OperatorField {
+            name: "missing_count".into(),
+            field_type: heramind_storage::OperatorFieldType::Number,
+            unit: Some("件".into()),
+            description: Some("漏装数量".into()),
+        },
+        heramind_storage::OperatorField {
+            name: "batch_status".into(),
+            field_type: heramind_storage::OperatorFieldType::Enum(vec![
+                "正常".into(),
+                "待检".into(),
+            ]),
+            unit: None,
+            description: None,
+        },
+    ]);
+    // Route resolution through the executor default runtime (harness has no
+    // instance manager) — the mock scripts the one inference call.
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"missing_count": 1, "batch_status": "待检"}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+
+    let (dp, er) = executor
+        .execute_structured(
+            "exec-structured-1",
+            &agent,
+            vec![heramind_storage::DataCollected {
+                source: "cam-01".into(),
+                data_type: "image".into(),
+                values: serde_json::json!({"描述": "conveyor 有 1 件空位"}),
+                timestamp: 0,
+            }],
+        )
+        .await
+        .expect("structured execution succeeds");
+
+    assert_eq!(er.success_rate, 1.0);
+    assert!(er.summary.contains("2 field(s)"), "summary: {}", er.summary);
+    assert!(dp.conclusion.contains("待检"));
+    assert_eq!(dp.stop_reason, "structured");
+    assert_eq!(dp.decisions.len(), 1);
+    assert!(dp.decisions[0].action.contains(&format!("ai:{}", agent.id)));
+}
+
+/// A structured agent is inference over its bound sources. When none of them
+/// produced anything inside the window there is nothing to infer from — and the
+/// memory summary it would otherwise fall back on is its *own previous
+/// conclusion*. Publishing that is reasoning in a circle.
+///
+/// This is the 2026-09-23 report: a camera went idle for three hours while the
+/// agent kept stamping out a confident "正常" every 15 minutes, each one feeding
+/// the next, with downstream dashboards reading it as fresh data.
+#[tokio::test]
+async fn structured_mode_refuses_to_publish_without_input() {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    agent.execution_mode = heramind_storage::agents::ExecutionMode::Structured;
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "anomaly_count".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+    // What the branch would answer if it were allowed to run at all.
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"anomaly_count": 0}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+
+    // Exactly what the collector hands over when every bound source missed the
+    // window: the memory summary, and nothing else.
+    let outcome = executor
+        .execute_structured(
+            "exec-no-input",
+            &agent,
+            vec![heramind_storage::DataCollected {
+                source: "memory".into(),
+                data_type: "summary".into(),
+                values: serde_json::json!({
+                    "last_conclusion": "{\"anomaly_count\":0}",
+                    "total_executions": 20,
+                }),
+                timestamp: 0,
+            }],
+        )
+        .await;
+
+    assert!(
+        outcome.is_err(),
+        "an inference with no observation behind it must not be published as a conclusion"
+    );
+    let message = outcome.expect_err("checked above").to_string();
+    assert!(
+        message.contains("No time-series storage"),
+        "the failure must say what was missing, not just that it failed: {message}"
+    );
+}
+
+/// Design 002 §4.2, "every output carries its evidence": click an AI field and
+/// see what it actually read. The execution record already holds that — the
+/// collected sources, the rendered context, the conclusion. What a published
+/// value lacks is the way *back* to it, so a dashboard showing `ai:x:status`
+/// has no route to the run behind it.
+#[tokio::test]
+async fn published_fields_point_back_at_the_execution_that_produced_them() {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    let ts = heramind_storage::TimeSeriesStore::memory().expect("memory timeseries");
+    executor.set_time_series_storage(ts.clone());
+    agent.execution_mode = heramind_storage::agents::ExecutionMode::Structured;
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "anomaly_count".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"anomaly_count": 2}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+
+    executor
+        .execute_structured(
+            "exec-pointer-1",
+            &agent,
+            vec![heramind_storage::DataCollected {
+                source: "cam-01".into(),
+                data_type: "values.parts".into(),
+                values: serde_json::json!({"parts": 3}),
+                timestamp: 0,
+            }],
+        )
+        .await
+        .expect("structured execution succeeds");
+
+    ts.flush().expect("flush buffer");
+    let point = ts
+        .query_latest(&format!("ai:{}", agent.id), "anomaly_count")
+        .await
+        .expect("query succeeds")
+        .expect("the field was published");
+
+    assert_eq!(
+        point
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("execution_id"))
+            .and_then(|v| v.as_str()),
+        Some("exec-pointer-1"),
+        "a published AI field must say which run produced it: {:?}",
+        point.metadata
+    );
+    // The mock answered without a confidence, and the published value says so
+    // rather than filling in a default.
+    assert_eq!(
+        point.quality, None,
+        "no reported confidence means no quality claim, not a made-up one"
+    );
+}
+
+/// The number the model reports is the number everything downstream sees —
+/// the record and the published value both. A fabricated constant made every
+/// threshold compare against the same figure forever; this is the assertion
+/// that there is nothing left to fabricate.
+#[tokio::test]
+async fn the_reported_confidence_reaches_the_record_and_the_published_value() {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    let ts = heramind_storage::TimeSeriesStore::memory().expect("memory timeseries");
+    executor.set_time_series_storage(ts.clone());
+    agent.execution_mode = heramind_storage::agents::ExecutionMode::Structured;
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "anomaly_count".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"anomaly_count": 2, "confidence": 0.42}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+
+    let (dp, _record) = executor
+        .execute_structured(
+            "exec-confidence-1",
+            &agent,
+            vec![heramind_storage::DataCollected {
+                source: "cam-01".into(),
+                data_type: "values.parts".into(),
+                values: serde_json::json!({"parts": 3}),
+                timestamp: 0,
+            }],
+        )
+        .await
+        .expect("structured execution succeeds");
+
+    assert_eq!(
+        dp.confidence,
+        Some(0.42),
+        "the record keeps the model's own number"
+    );
+
+    ts.flush().expect("flush buffer");
+    let point = ts
+        .query_latest(&format!("ai:{}", agent.id), "anomaly_count")
+        .await
+        .expect("query succeeds")
+        .expect("the field was published");
+    assert_eq!(
+        point.quality,
+        Some(0.42),
+        "and the value downstream reads carries it too"
+    );
+    assert!(
+        !point.value.to_string().contains("0.42"),
+        "confidence is not one of the user's fields: {:?}",
+        point.value
+    );
+}
+
+/// The error has to say *why*, not just that. "No data" sends the operator
+/// looking at the agent; "device:cam-01/occupied last reported 3h ago" sends
+/// them to the camera, which is where the problem actually is.
+#[tokio::test]
+async fn a_starved_run_names_the_source_that_went_quiet_and_when() {
+    use heramind_storage::timeseries::DataPoint as TsPoint;
+
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    let ts = heramind_storage::TimeSeriesStore::memory().expect("memory timeseries");
+    ts.write(
+        "device:cam-01",
+        "occupied",
+        TsPoint {
+            timestamp: chrono::Utc::now().timestamp() - 3 * 3600,
+            value: serde_json::json!(true),
+            quality: None,
+            metadata: None,
+        },
+    )
+    .await
+    .expect("seed an old reading");
+    ts.flush().expect("flush");
+    executor.set_time_series_storage(ts);
+
+    agent.execution_mode = heramind_storage::agents::ExecutionMode::Structured;
+    agent.resources = vec![heramind_storage::AgentResource {
+        resource_type: heramind_storage::ResourceType::Metric,
+        resource_id: "cam-01:occupied".to_string(),
+        name: "occupied".to_string(),
+        config: serde_json::json!({}),
+    }];
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "status".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+
+    let message = executor
+        .execute_structured("exec-silent", &agent, vec![])
+        .await
+        .expect_err("a run with nothing to read must fail")
+        .to_string();
+
+    assert!(
+        message.contains("device:cam-01"),
+        "the source has to be named: {message}"
+    );
+    assert!(
+        message.contains("3h"),
+        "and how long it has been quiet: {message}"
+    );
+    assert!(
+        !message.contains("Configuration"),
+        "the camera being offline is not a configuration mistake: {message}"
+    );
+}
+
+/// The dispatch in `execute_internal` must route a structured agent to the L0
+/// branch. Its sibling above calls `execute_structured` directly, so it cannot
+/// catch a dispatch that routes elsewhere — this one enters through the same
+/// production entry point the scheduler uses.
+#[tokio::test]
+async fn structured_mode_is_dispatched_from_the_production_entry_point() {
+    use heramind_storage::timeseries::DataPoint as TsPoint;
+    use heramind_storage::TimeSeriesStore;
+
+    // This test is about routing, not about data — but since 2026-09-23 a
+    // structured agent with nothing to read is refused before the branch, so
+    // reaching it now means giving the agent something to read.
+    let storage = TimeSeriesStore::memory().expect("memory timeseries");
+    storage
+        .write(
+            "device:dev-1",
+            "temperature",
+            TsPoint {
+                timestamp: chrono::Utc::now().timestamp(),
+                value: serde_json::json!(23.5),
+                quality: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("seed telemetry");
+    storage.flush().expect("flush to storage");
+
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    executor.set_time_series_storage(storage);
+    agent.execution_mode = heramind_storage::agents::ExecutionMode::Structured;
+    agent.resources = vec![heramind_storage::AgentResource {
+        resource_type: heramind_storage::ResourceType::Metric,
+        resource_id: "dev-1:temperature".to_string(),
+        name: "temperature".to_string(),
+        config: serde_json::json!({}),
+    }];
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "missing_count".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"missing_count": 1}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+    // `execute_agent` persists an execution record, so the agent must exist.
+    executor
+        .store()
+        .save_agent(&agent)
+        .await
+        .expect("seed store");
+
+    let record = executor
+        .execute_agent(agent, None, None)
+        .await
+        .expect("structured execution through the production entry point");
+
+    assert_eq!(
+        record.decision_process.stop_reason, "structured",
+        "a structured agent must reach the L0 branch, not the tool loop"
+    );
+}
+
+/// Build an event-triggered agent whose filter matches every device source,
+/// seed it, and hand back the executor. `debounce_secs` of `None` omits the
+/// operator config entirely (no L0 guardrails).
+async fn build_event_agent(
+    mode: ExecutionMode,
+    debounce_secs: Option<u32>,
+) -> (AgentExecutor, AiAgent) {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    agent.schedule = AgentSchedule {
+        schedule_type: ScheduleType::Event,
+        interval_seconds: None,
+        cron_expression: None,
+        timezone: None,
+        event_filter: Some(r#"{"sources":[{"type":"device","id":"all"}]}"#.to_string()),
+    };
+    agent.execution_mode = mode;
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "missing_count".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+    agent.operator_config = debounce_secs.map(|debounce_secs| heramind_storage::OperatorConfig {
+        debounce_secs,
+        max_calls_per_day: None,
+        timeout_secs: 60,
+        consecutive_failure_threshold: 3,
+        event_cooldown_secs: None,
+    });
+    executor
+        .store()
+        .save_agent(&agent)
+        .await
+        .expect("seed store");
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"missing_count": 1}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+    (executor, agent)
+}
+
+/// Wait for every execution the event trigger has spawned to finish.
+///
+/// `refresh_event_agents` only caches agents whose status is `Active`, and a run
+/// in flight has set it to `Executing`. So an event that arrives while the
+/// previous one is still running finds an *empty* cache and is dropped before
+/// the cooldown is ever consulted. That is the production behaviour — an agent
+/// does not re-enter itself — and it is a race in any test that fires twice
+/// back to back: under load the second event loses, and the assertion then reads
+/// a map the first run never touched.
+///
+/// Draining between fires makes the trigger actually reach the code under test.
+async fn drain_event_tasks(executor: &AgentExecutor) -> usize {
+    let mut total = 0usize;
+    loop {
+        let handles: Vec<_> = executor.event_task_handles.lock().drain(..).collect();
+        if handles.is_empty() {
+            return total;
+        }
+        total += handles.len();
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// One physical event can match several of a structured agent's sources. The
+/// debounce window must merge them so the agent pays for one inference, not
+/// one per match — that is what the editor's "防抖" field promises.
+#[tokio::test]
+async fn structured_event_agent_debounces_across_sources() {
+    let (executor, agent) = build_event_agent(ExecutionMode::Structured, Some(300)).await;
+
+    let mut runs = 0usize;
+    for source in ["dev-a", "dev-b"] {
+        executor
+            .check_and_trigger_data_event(
+                "device",
+                source.to_string(),
+                "temp".to_string(),
+                &heramind_core::event::MetricValue::Float(1.0),
+            )
+            .await
+            .expect("trigger must not error");
+        // Let the run this just spawned finish, so the next source meets an
+        // agent that is Active again instead of an empty cache.
+        runs += drain_event_tasks(&executor).await;
+    }
+
+    assert_eq!(
+        runs, 1,
+        "a second source inside the debounce window must be merged away, \
+         not run as its own inference"
+    );
+    let recent = executor.recent_executions.read().await;
+    assert!(
+        recent.contains_key(&agent.id),
+        "the cooldown is AGENT-scoped (bare agent id key: {:?})",
+        recent.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Free/Focused event agents merge bursts too (30s fixed window): the old
+/// design keyed cooldown per (agent, source) and skipped debounce entirely
+/// for non-structured modes, so N sources reporting in the same instant
+/// fired N concurrent runs of one agent — racing each other's journal
+/// read-modify-write and burning the concurrency budget.
+#[tokio::test]
+async fn free_event_agent_merges_same_instant_sources() {
+    let (executor, _agent) = build_event_agent(ExecutionMode::Free, None).await;
+
+    let mut runs = 0usize;
+    for source in ["dev-a", "dev-b", "dev-c"] {
+        executor
+            .check_and_trigger_data_event(
+                "device",
+                source.to_string(),
+                "temp".to_string(),
+                &heramind_core::event::MetricValue::Float(1.0),
+            )
+            .await
+            .expect("trigger must not error");
+        runs += drain_event_tasks(&executor).await;
+    }
+
+    assert_eq!(
+        runs, 1,
+        "three sources in the same instant must produce ONE run, not three \
+         concurrent executions of the same agent"
+    );
+}
+
+/// Re-save an event agent with a full operator config, so a test can pin the
+/// cooldown/debounce pair precisely (the `build_event_agent` helper only
+/// takes a debounce).
+async fn with_operator_config(
+    executor: &AgentExecutor,
+    agent: &mut AiAgent,
+    config: heramind_storage::OperatorConfig,
+) {
+    agent.operator_config = Some(config);
+    executor.store().save_agent(agent).await.expect("re-seed");
+}
+
+/// `event_cooldown_secs: 0` (on-demand): an idle agent must admit the very
+/// next event. The hard-coded 60s floor used to idle fast agents — a 5s run
+/// spent 55s dropping events that had arrived after it finished. Structured
+/// mode with `debounce_secs: 0` leaves every pacing gate open, so this is
+/// the purest form of the regression.
+#[tokio::test]
+async fn on_demand_cooldown_admits_next_event_once_idle() {
+    let (executor, mut agent) = build_event_agent(ExecutionMode::Structured, Some(0)).await;
+    let mut op = crate::ai_agent::executor::structured::default_operator_config();
+    op.debounce_secs = 0;
+    op.event_cooldown_secs = Some(0);
+    with_operator_config(&executor, &mut agent, op).await;
+
+    fire_event(&executor, "device", "dev-a", "temp").await;
+    let runs = drain_event_tasks(&executor).await;
+    fire_event(&executor, "device", "dev-a", "temp").await;
+    let runs = runs + drain_event_tasks(&executor).await;
+
+    assert_eq!(
+        runs, 2,
+        "with cooldown 0 an idle agent must admit the next event immediately — \
+         no fixed one-minute lockout between runs"
+    );
+}
+
+/// Free/Focused keep a 1s burst-merge floor even at cooldown 0 (one physical
+/// report fans out to N per-metric events), but the floor must not become a
+/// pacing gate: an event after the floor has elapsed admits.
+#[tokio::test]
+async fn on_demand_free_agent_admits_after_the_burst_floor() {
+    let (executor, mut agent) = build_event_agent(ExecutionMode::Free, None).await;
+    let mut op = crate::ai_agent::executor::structured::default_operator_config();
+    op.event_cooldown_secs = Some(0);
+    with_operator_config(&executor, &mut agent, op).await;
+
+    fire_event(&executor, "device", "dev-a", "temp").await;
+    let runs = drain_event_tasks(&executor).await;
+    // Free/Focused merge window is clamp(cooldown, 1s..30s) = 1s here.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    fire_event(&executor, "device", "dev-b", "temp").await;
+    let runs = runs + drain_event_tasks(&executor).await;
+
+    assert_eq!(
+        runs, 2,
+        "after the 1s burst floor an idle free agent must admit the next event"
+    );
+}
+
+/// The trap that bit the field deployment: a Structured agent with the
+/// DEFAULT 30s debounce and an explicit cooldown of 0 — the debounce
+/// silently overrode the cooldown, keeping an "on-demand" image agent on a
+/// 30s cadence. An explicit cooldown now caps the debounce (floored at the
+/// 1s burst merge), so the agent's own saved config heals without an edit.
+#[tokio::test]
+async fn explicit_cooldown_caps_the_structured_debounce() {
+    let (executor, mut agent) = build_event_agent(ExecutionMode::Structured, Some(30)).await;
+    let mut op = crate::ai_agent::executor::structured::default_operator_config();
+    op.debounce_secs = 30; // the untouched default that used to win
+    op.event_cooldown_secs = Some(0);
+    with_operator_config(&executor, &mut agent, op).await;
+
+    fire_event(&executor, "device", "dev-a", "temp").await;
+    let runs = drain_event_tasks(&executor).await;
+    // Debounce capped at the 1s burst floor, not the configured 30s.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    fire_event(&executor, "device", "dev-b", "temp").await;
+    let runs = runs + drain_event_tasks(&executor).await;
+
+    assert_eq!(
+        runs, 2,
+        "cooldown 0 + default debounce 30 must behave as on-demand (1s merge \
+         floor), not as a 30s-paced agent"
+    );
+}
+
+/// Without an explicit cooldown the Structured debounce keeps its historical
+/// meaning — long merges set before the cooldown existed still hold.
+#[tokio::test]
+async fn structured_debounce_without_cooldown_is_unchanged() {
+    let (executor, _agent) = build_event_agent(ExecutionMode::Structured, Some(300)).await;
+
+    fire_event(&executor, "device", "dev-a", "temp").await;
+    let runs = drain_event_tasks(&executor).await;
+    // Well inside the 300s window: must merge, exactly as before.
+    fire_event(&executor, "device", "dev-b", "temp").await;
+    let runs = runs + drain_event_tasks(&executor).await;
+
+    assert_eq!(
+        runs, 1,
+        "no explicit cooldown means the debounce semantics are untouched"
+    );
+}
+
+/// A short configured cooldown both paces admissions AND shrinks the
+/// Free/Focused merge window to match — otherwise the fixed 30s merge would
+/// silently override a 2s cooldown and the setting would do nothing.
+#[tokio::test]
+async fn short_cooldown_paces_and_tracks_the_configured_window() {
+    let (executor, mut agent) = build_event_agent(ExecutionMode::Free, None).await;
+    let mut op = crate::ai_agent::executor::structured::default_operator_config();
+    op.event_cooldown_secs = Some(2);
+    with_operator_config(&executor, &mut agent, op).await;
+
+    fire_event(&executor, "device", "dev-a", "temp").await;
+    let runs = drain_event_tasks(&executor).await;
+
+    fire_event(&executor, "device", "dev-b", "temp").await;
+    let after_burst = runs + drain_event_tasks(&executor).await;
+    assert_eq!(
+        after_burst, runs,
+        "an event inside the 2s window must be paced away, not admitted"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    fire_event(&executor, "device", "dev-c", "temp").await;
+    let runs = after_burst + drain_event_tasks(&executor).await;
+    assert_eq!(runs, 2, "once the 2s window elapses the next event admits");
+}
+
+/// Agents without an explicit cooldown keep the historical 60s floor: the
+/// default is unchanged for every existing deployment.
+#[tokio::test]
+async fn default_event_cooldown_still_gates_back_to_back_events() {
+    let (executor, _agent) = build_event_agent(ExecutionMode::Structured, None).await;
+
+    fire_event(&executor, "device", "dev-a", "temp").await;
+    let runs = drain_event_tasks(&executor).await;
+    fire_event(&executor, "device", "dev-b", "temp").await;
+    let runs = runs + drain_event_tasks(&executor).await;
+
+    assert_eq!(
+        runs, 1,
+        "no configured cooldown means the 60s default floor, exactly as before"
+    );
+}
+
+/// A busy admission is a DROP, not a retry: "already executing" means another
+/// run owns the agent, and the old 5s-backoff retry queued a phantom second
+/// run behind it. Must return Ok (busy is not a failure — mirrors the
+/// scheduler's treatment) and must not sit through the backoff.
+#[tokio::test]
+async fn busy_event_admission_drops_without_the_retry_backoff() {
+    let (executor, agent) = build_event_agent(ExecutionMode::Free, None).await;
+    // Occupy the process-global in-flight set without running anything, so
+    // execute_agent rejects with "already executing".
+    super::in_flight_agents()
+        .lock()
+        .unwrap()
+        .insert(agent.id.clone());
+
+    let event = super::context::EventTriggerData {
+        source: super::context::DataSourceRef {
+            source_type: "device".into(),
+            source_id: "dev-a".into(),
+            field: "temp".into(),
+        },
+        value: heramind_core::event::MetricValue::Float(1.0),
+        timestamp: 0,
+    };
+    let started = std::time::Instant::now();
+    let out =
+        AgentExecutor::execute_with_retry(&executor, agent.clone(), event, 1, &agent.id).await;
+    super::in_flight_agents().lock().unwrap().remove(&agent.id);
+
+    assert!(out.is_ok(), "busy is a drop, not an error: {out:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "must return without the 5s retry backoff (took {:?})",
+        started.elapsed()
+    );
+}
+
+/// The breaker threshold is finally REAL: one permanent-classified failure
+/// keeps the agent Active; only `consecutive_failure_threshold` in a row
+/// demotes it. (The field existed in the editor for months while nothing
+/// compared it — a single small-model glitch killed event agents outright.)
+/// Driven by the silence refusal: a structured run with no observable input
+/// produces a permanent-classified Failed record, deterministically.
+#[tokio::test]
+async fn breaker_demotes_only_after_consecutive_threshold() {
+    let (executor, agent) = build_event_agent(ExecutionMode::Structured, None).await;
+
+    for attempt in 1..=3u32 {
+        let record = executor
+            .execute_agent(agent.clone(), None, None)
+            .await
+            .expect("failure must still be recorded as a run");
+        assert_eq!(
+            record.status,
+            heramind_storage::ExecutionStatus::Failed,
+            "silence refusal is a Failed record"
+        );
+        let stored = executor
+            .store()
+            .get_agent(&agent.id)
+            .await
+            .expect("store")
+            .expect("agent exists");
+        if attempt < 3 {
+            assert_eq!(
+                stored.status,
+                heramind_storage::AgentStatus::Active,
+                "permanent failure {}/3 must NOT demote before the threshold",
+                attempt
+            );
+        } else {
+            assert_eq!(
+                stored.status,
+                heramind_storage::AgentStatus::Error,
+                "the third consecutive permanent failure trips the breaker"
+            );
+        }
+    }
+    // Demotion seeds the recovery clock for the event path.
+    assert!(
+        super::global_error_probe_state()
+            .read()
+            .contains_key(&agent.id),
+        "Active→Error must seed the recovery-probe clock"
+    );
+    super::global_error_probe_state().write().remove(&agent.id);
+}
+
+/// A demoted event agent is PROBED by matching events once the backoff has
+/// elapsed, and a successful probe restores Active — full self-healing, the
+/// thing the old design could not do at all (Error event agents were only
+/// reachable by hand).
+#[tokio::test]
+async fn error_agent_probes_on_events_and_recovers() {
+    let (executor, mut agent) = build_event_agent(ExecutionMode::Structured, Some(0)).await;
+    let mut op = crate::ai_agent::executor::structured::default_operator_config();
+    op.debounce_secs = 0;
+    op.event_cooldown_secs = Some(0);
+    with_operator_config(&executor, &mut agent, op).await;
+
+    // Demote by hand and age the probe clock past its backoff.
+    executor
+        .store()
+        .update_agent_status(
+            &agent.id,
+            heramind_storage::AgentStatus::Error,
+            Some("test demotion".into()),
+        )
+        .await
+        .unwrap();
+    let old = chrono::Utc::now().timestamp() - 3600;
+    super::global_error_probe_state().write().insert(
+        agent.id.clone(),
+        super::ErrorProbeEntry {
+            last_attempt: old,
+            consecutive_failures: 2,
+        },
+    );
+
+    fire_event(&executor, "device", "dev-a", "temp").await;
+    let runs = drain_event_tasks(&executor).await;
+
+    assert_eq!(runs, 1, "an aged-backoff Error agent must admit the probe");
+    let stored = executor
+        .store()
+        .get_agent(&agent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.status,
+        heramind_storage::AgentStatus::Active,
+        "a successful probe must restore Active"
+    );
+    assert!(
+        !super::global_error_probe_state()
+            .read()
+            .contains_key(&agent.id),
+        "recovery must clear the backoff ladder"
+    );
+}
+
+/// Inside the backoff window the probe gate holds: matching events are
+/// skipped, no run spawns, the agent stays Error.
+#[tokio::test]
+async fn error_agent_in_backoff_skips_events() {
+    let (executor, mut agent) = build_event_agent(ExecutionMode::Structured, Some(0)).await;
+    let mut op = crate::ai_agent::executor::structured::default_operator_config();
+    op.debounce_secs = 0;
+    op.event_cooldown_secs = Some(0);
+    with_operator_config(&executor, &mut agent, op).await;
+
+    executor
+        .store()
+        .update_agent_status(
+            &agent.id,
+            heramind_storage::AgentStatus::Error,
+            Some("test demotion".into()),
+        )
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    super::global_error_probe_state().write().insert(
+        agent.id.clone(),
+        super::ErrorProbeEntry {
+            last_attempt: now,
+            consecutive_failures: 0,
+        },
+    );
+
+    fire_event(&executor, "device", "dev-a", "temp").await;
+    let runs = drain_event_tasks(&executor).await;
+
+    assert_eq!(runs, 0, "a probe inside its backoff window must not run");
+    super::global_error_probe_state().write().remove(&agent.id);
+}
+
+/// A FAILED probe steps the backoff ladder up instead of restarting it —
+/// the difference between "broken agent costs ~24 attempts/day" and "it
+/// retries every 5 minutes forever".
+#[tokio::test]
+async fn failed_probe_climbs_the_backoff_ladder() {
+    let (mut executor, mut agent) = build_event_agent(ExecutionMode::Structured, Some(0)).await;
+    let mut op = crate::ai_agent::executor::structured::default_operator_config();
+    op.debounce_secs = 0;
+    op.event_cooldown_secs = Some(0);
+    with_operator_config(&executor, &mut agent, op).await;
+    // Every inference fails: empty script → the exhausted sentinel is not
+    // valid JSON for the structured contract.
+    executor
+        .set_llm_runtime(Arc::new(MockLlmRuntime::new(vec![])))
+        .await;
+
+    executor
+        .store()
+        .update_agent_status(
+            &agent.id,
+            heramind_storage::AgentStatus::Error,
+            Some("test demotion".into()),
+        )
+        .await
+        .unwrap();
+    let old = chrono::Utc::now().timestamp() - 3600;
+    super::global_error_probe_state().write().insert(
+        agent.id.clone(),
+        super::ErrorProbeEntry {
+            last_attempt: old,
+            consecutive_failures: 0,
+        },
+    );
+
+    fire_event(&executor, "device", "dev-a", "temp").await;
+    let runs = drain_event_tasks(&executor).await;
+
+    assert_eq!(runs, 1, "aged backoff admits the probe");
+    let stored = executor
+        .store()
+        .get_agent(&agent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.status,
+        heramind_storage::AgentStatus::Error,
+        "a failed probe keeps the agent demoted"
+    );
+    let entry = super::global_error_probe_state()
+        .read()
+        .get(&agent.id)
+        .copied();
+    super::global_error_probe_state().write().remove(&agent.id);
+    let entry = entry.expect("probe outcome must be recorded");
+    assert!(
+        entry.consecutive_failures >= 1,
+        "a failed probe must climb the ladder (got {entry:?})"
+    );
+    assert!(
+        entry.last_attempt > old,
+        "the failed probe re-arms the clock from its own attempt"
+    );
+}
+
+/// The daily run cap must survive across executor INSTANCES: the event
+/// path constructs a fresh `AgentExecutor` per trigger, and a per-instance
+/// counter map meant the cap reset on every event execution — the budget
+/// guardrail was a no-op on the most frequent trigger path.
+#[tokio::test]
+async fn daily_cap_survives_across_executor_instances() {
+    let (executor, mut agent, _registry) = build_harness().await;
+    agent.id = "daily-cap-agent".into(); // unique id: the counters are process-global
+    let mut op_cfg = crate::ai_agent::executor::structured::default_operator_config();
+    op_cfg.max_calls_per_day = Some(1);
+    agent.operator_config = Some(op_cfg);
+    executor.store().save_agent(&agent).await.unwrap();
+
+    let first = executor.execute_agent(agent.clone(), None, None).await;
+    assert!(
+        first.is_ok(),
+        "first run of the day must proceed: {first:?}"
+    );
+
+    // A SECOND executor instance, as the event path builds per trigger.
+    let config = AgentExecutorConfig {
+        store: executor.store().clone(),
+        time_series_storage: None,
+        device_service: None,
+        event_bus: None,
+        message_manager: None,
+        llm_runtime: None,
+        llm_backend_store: None,
+        extension_registry: None,
+        tool_registry: None,
+        memory_store: None,
+        backend_semaphores: None,
+        skill_registry: None,
+        execution_semaphore: None,
+    };
+    let executor2 = AgentExecutor::new(config).await.expect("executor2");
+
+    let second = executor2.execute_agent(agent.clone(), None, None).await;
+    let record = second.expect("a capped run records as a Failed execution, not an Err");
+    let err = record.error.as_deref().unwrap_or_default();
+    assert!(
+        err.contains("daily run cap reached"),
+        "the second instance's run must be refused by the shared cap, got: {err:?}"
+    );
+}
+
+/// Two concurrent executions of the SAME agent must not both run: their
+/// finalize paths read-modify-write the same journal and would silently
+/// erase each other's entries. The process-wide in-flight guard in
+/// `execute_agent` rejects the second with a clear error. (Manual invoke
+/// used to be the unguarded entry point.)
+#[tokio::test]
+async fn concurrent_same_agent_execution_is_rejected() {
+    let (executor, agent, _registry) = build_harness().await;
+    // execute_agent records against the store; the bare harness agent must
+    // be persisted first.
+    executor.store().save_agent(&agent).await.unwrap();
+
+    let a = executor.execute_agent(agent.clone(), None, None);
+    let b = executor.execute_agent(agent.clone(), None, None);
+    let (ra, rb) = tokio::join!(a, b);
+
+    let ok_count = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
+    assert_eq!(
+        ok_count, 1,
+        "exactly one concurrent run of an agent may proceed (got {ra:?} / {rb:?})"
+    );
+    let rejected = if ra.is_err() { &ra } else { &rb };
+    let msg = format!("{}", rejected.as_ref().unwrap_err());
+    assert!(
+        msg.contains("already executing"),
+        "rejection must say why, got: {msg}"
+    );
+
+    // And once the run finished, the agent is runnable again.
+    drain_event_tasks(&executor).await;
+    let again = executor.execute_agent(agent.clone(), None, None).await;
+    assert!(
+        again.is_ok(),
+        "guard must release after completion: {again:?}"
+    );
+}
+
+/// A FAILED run must never publish: the structured executor's promise is
+/// "failure keeps the old value" (design: a scanner whose camera went
+/// offline keeps its last good reading rather than publishing from
+/// memory). Publish used to run BEFORE the journaling step, so a run that
+/// failed after inference still served "fresh" values to dashboards/rules.
+/// The observable contract, whatever stage fails: inference error → no
+/// publish, the previously-published value stands, journal records the
+/// failure.
+#[tokio::test]
+async fn failed_run_publishes_nothing_and_keeps_the_old_value() {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    let ts = heramind_storage::TimeSeriesStore::memory().expect("memory timeseries");
+    executor.set_time_series_storage(ts.clone());
+    agent.execution_mode = heramind_storage::agents::ExecutionMode::Structured;
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "anomaly_count".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+    let data = vec![heramind_storage::DataCollected {
+        source: "cam-01".into(),
+        data_type: "values.parts".into(),
+        values: serde_json::json!({"parts": 3}),
+        timestamp: 0,
+    }];
+
+    // 1) A good run publishes the first value.
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"anomaly_count": 2}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+    executor
+        .execute_structured("exec-ok", &agent, data.clone())
+        .await
+        .expect("first run succeeds");
+    ts.flush().unwrap();
+
+    // 2) A failing run (inference error) must NOT touch the published value.
+    let rt_err: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::error(
+        "backend down",
+    )]));
+    executor.set_llm_runtime(rt_err).await;
+    let failed = executor.execute_structured("exec-fail", &agent, data).await;
+    assert!(failed.is_err(), "an inference error must fail the run");
+    ts.flush().unwrap();
+
+    let latest = ts
+        .query_latest(&format!("ai:{}", agent.id), "anomaly_count")
+        .await
+        .expect("query succeeds")
+        .expect("the old value must still stand");
+    assert_eq!(
+        point_value_as_i64(&latest),
+        Some(2),
+        "the failed run must not publish over the last good value"
+    );
+    assert_eq!(
+        latest
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("execution_id"))
+            .and_then(|v| v.as_str()),
+        Some("exec-ok"),
+        "the standing value must still point at the run that produced it"
+    );
+}
+
+/// Pull a small integer out of a published point value, for assertions.
+fn point_value_as_i64(p: &heramind_storage::DataPoint) -> Option<i64> {
+    p.value
+        .as_i64()
+        .or_else(|| p.value.as_f64().map(|f| f as i64))
+}
+
+/// Seed an event agent whose filter uses the M2 `all` form: the agent runs
+/// only once BOTH sources have reported inside the window.
+async fn build_event_agent_with_filter(filter: String) -> (AgentExecutor, AiAgent) {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    agent.schedule = AgentSchedule {
+        schedule_type: ScheduleType::Event,
+        interval_seconds: None,
+        cron_expression: None,
+        timezone: None,
+        event_filter: Some(filter),
+    };
+    executor
+        .store()
+        .save_agent(&agent)
+        .await
+        .expect("seed store");
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text("ok")]));
+    executor.set_llm_runtime(rt).await;
+    (executor, agent)
+}
+
+async fn build_all_filter_event_agent(within_secs: Option<u64>) -> (AgentExecutor, AiAgent) {
+    let window = within_secs
+        .map(|w| format!(r#","within_secs":{w}"#))
+        .unwrap_or_default();
+    build_event_agent_with_filter(format!(
+        r#"{{"all":[{{"type":"device","id":"cam-01","field":"occupied"}},{{"type":"extension","id":"booking","field":"reserved"}}]{window}}}"#
+    ))
+    .await
+}
+
+/// Drive one data event through the production trigger entry point.
+async fn fire_event(executor: &AgentExecutor, source_type: &str, source_id: &str, field: &str) {
+    executor
+        .check_and_trigger_data_event(
+            source_type,
+            source_id.to_string(),
+            field.to_string(),
+            &heramind_core::event::MetricValue::Boolean(true),
+        )
+        .await
+        .expect("trigger must not error");
+}
+
+/// The reason multi-source triggering exists at all: "occupancy AND not
+/// booked" must not fire on either source alone — firing on one of them is
+/// exactly what today's OR-only filter does.
+#[tokio::test]
+async fn all_filter_waits_for_every_source_before_firing() {
+    let (executor, agent) = build_all_filter_event_agent(Some(1200)).await;
+
+    executor
+        .check_and_trigger_data_event(
+            "device",
+            "cam-01".to_string(),
+            "occupied".to_string(),
+            &heramind_core::event::MetricValue::Boolean(true),
+        )
+        .await
+        .expect("trigger must not error");
+
+    assert!(
+        !executor
+            .recent_executions
+            .read()
+            .await
+            .contains_key(&agent.id),
+        "one of the two sources must NOT fire the agent"
+    );
+
+    executor
+        .check_and_trigger_data_event(
+            "extension",
+            "booking".to_string(),
+            "reserved".to_string(),
+            &heramind_core::event::MetricValue::Boolean(false),
+        )
+        .await
+        .expect("trigger must not error");
+
+    assert!(
+        executor
+            .recent_executions
+            .read()
+            .await
+            .contains_key(&agent.id),
+        "the source that completes the window must fire the agent"
+    );
+}
+
+/// `any` and `all` are two independent groups in one filter, not nested
+/// logic: an `any` match fires immediately and does not wait for the `all`
+/// window (design 001 §5.2.2 — the filter is `any` OR `all`, nothing more).
+#[tokio::test]
+async fn an_any_group_fires_on_its_own_alongside_an_all_group() {
+    let (executor, agent) = build_event_agent_with_filter(
+        r#"{"any":[{"type":"device","id":"door-01","field":"open"}],"all":[{"type":"device","id":"cam-01","field":"occupied"},{"type":"extension","id":"booking","field":"reserved"}],"within_secs":1200}"#
+            .to_string(),
+    )
+    .await;
+
+    fire_event(&executor, "device", "door-01", "open").await;
+
+    assert!(
+        executor
+            .recent_executions
+            .read()
+            .await
+            .contains_key(&agent.id),
+        "an `any` match must fire straight away, without waiting for the `all` window"
+    );
+}
+
+/// The regression that matters most: a saved agent still using the legacy
+/// `sources` shape must keep firing exactly as it did before M2.
+#[tokio::test]
+async fn a_legacy_sources_filter_still_fires_on_a_single_match() {
+    let (executor, agent) = build_event_agent_with_filter(
+        r#"{"sources":[{"type":"device","id":"dev-a","field":"temp"}]}"#.to_string(),
+    )
+    .await;
+
+    fire_event(&executor, "device", "dev-a", "temp").await;
+
+    assert!(
+        executor
+            .recent_executions
+            .read()
+            .await
+            .contains_key(&agent.id),
+        "the legacy sources shape must keep firing on one match"
+    );
+}
+
+/// The contract step must actually run inside a real execution. The helper
+/// tests below would still pass if nothing ever called `apply_output_contract` —
+/// this one drives `execute_agent`, the entry point the scheduler uses.
+#[tokio::test]
+async fn execute_agent_applies_the_output_contract_for_a_reasoning_agent() {
+    let (mut executor, mut agent, registry) = build_harness().await;
+    executor.set_tool_registry(registry);
+    agent.execution_mode = ExecutionMode::Free;
+    // Intent is parsed once and cached on the agent, so a re-run never asks again.
+    agent.parsed_intent = Some(heramind_storage::ParsedIntent {
+        intent_type: heramind_storage::IntentType::Monitoring,
+        target_metrics: vec![],
+        conditions: vec![],
+        actions: vec![],
+        confidence: 0.9,
+    });
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "missing_count".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+    executor
+        .store()
+        .save_agent(&agent)
+        .await
+        .expect("seed store");
+
+    // 1) the tool loop's answer, 2) the contract extraction over it.
+    let rt: Arc<dyn LlmRuntime> = Arc::new(
+        MockLlmRuntime::new(vec![
+            MockResponse::text("画面里有 1 件漏装，批次待检"),
+            MockResponse::text(r#"{"missing_count": 1}"#),
+        ])
+        .with_function_calling(),
+    );
+    executor.set_llm_runtime(rt).await;
+
+    let record = executor
+        .execute_agent(agent, None, None)
+        .await
+        .expect("run completes");
+
+    assert!(
+        record
+            .decision_process
+            .decisions
+            .iter()
+            .any(|d| d.decision_type == "output_contract"),
+        "the contract step must run and be recorded; got {:?}",
+        record.decision_process.decisions
+    );
+}
+
+/// Freshness with an age gate, through the shared windowed-latest helper the
+/// device-level collector uses: a point written milliseconds ago (still in
+/// the write buffer) MUST be visible; a point older than the window MUST
+/// stay excluded — cache-first must not turn into latest-ever.
+#[tokio::test]
+async fn windowed_latest_is_fresh_but_not_stale() {
+    use heramind_storage::timeseries::DataPoint as TsPoint;
+    use heramind_storage::TimeSeriesStore;
+
+    let store = TimeSeriesStore::memory().expect("memory timeseries");
+    let now = chrono::Utc::now().timestamp();
+
+    // Fresh point — written, deliberately NOT flushed.
+    store
+        .write(
+            "device:dev-3",
+            "temperature",
+            TsPoint {
+                timestamp: now,
+                value: serde_json::json!(23.5),
+                quality: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("seed fresh");
+    // Stale point — 2h old, flushed to redb (the durable old world).
+    store
+        .write(
+            "device:dev-3",
+            "humidity",
+            TsPoint {
+                timestamp: now - 7200,
+                value: serde_json::json!(60),
+                quality: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("seed stale");
+    store
+        .flush()
+        .expect("flush (stale point only reaches redb here)");
+
+    let fresh = AgentExecutor::latest_point_in_window(&store, "dev-3", "temperature", now - 3600)
+        .await
+        .expect("fresh metric visible before flush")
+        .expect("Some");
+    assert_eq!(fresh.value, serde_json::json!(23.5));
+
+    let stale = AgentExecutor::latest_point_in_window(&store, "dev-3", "humidity", now - 3600)
+        .await
+        .expect("no error");
+    assert!(
+        stale.is_none(),
+        "a point older than the window must stay excluded"
+    );
+}
+
+/// Telemetry writes are buffered; `query_range` reads only redb. A device
+/// report triggers execution within milliseconds, so collection ran before
+/// the flush and saw none of the just-written values — 12 bound metrics,
+/// 0 collected, every time the freshest report is the interesting one.
+/// The latest-value cache IS updated synchronously on write, so a
+/// no-history collection must read through it.
+#[tokio::test]
+async fn metric_collection_sees_just_written_values_before_flush() {
+    use heramind_storage::timeseries::DataPoint as TsPoint;
+    use heramind_storage::TimeSeriesStore;
+
+    let store = TimeSeriesStore::memory().expect("memory timeseries");
+    store
+        .write(
+            "device:dev-2",
+            "battery",
+            TsPoint {
+                timestamp: chrono::Utc::now().timestamp(),
+                value: serde_json::json!(84),
+                quality: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("seed telemetry");
+    // Deliberately NO flush: the point sits in the write buffer + latest
+    // cache, exactly like a report that triggered this very execution.
+
+    let collected = AgentExecutor::collect_single_metric(
+        store,
+        "dev-2",
+        "battery",
+        "dev-2:battery".to_string(),
+        60,
+        false, // include_history = false — only the latest value matters
+        1000,
+        false,
+        false,
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+    .expect("collection must not error");
+
+    let item = collected.expect("a value written milliseconds ago MUST be visible");
+    assert_eq!(item.values.get("value"), Some(&serde_json::json!(84)));
+}
+
+/// Telemetry is written under `device:{id}` (device service, capability
+/// providers — every write path). Metric collection queried the bare id, so
+/// every bound-metric agent collected nothing: 31 resources → 0 data points,
+/// and a 1-second "successful" run.
+#[tokio::test]
+async fn metric_collection_reads_the_key_telemetry_is_written_under() {
+    use heramind_storage::timeseries::DataPoint as TsPoint;
+    use heramind_storage::TimeSeriesStore;
+
+    let store = TimeSeriesStore::memory().expect("memory timeseries");
+    // The write path: source key `device:{id}` — see DeviceService and the
+    // capability provider.
+    store
+        .write(
+            "device:dev-1",
+            "temperature",
+            TsPoint {
+                timestamp: chrono::Utc::now().timestamp(),
+                value: serde_json::json!(23.5),
+                quality: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("seed telemetry");
+    // Writes are buffered; query_range reads redb, not the cache.
+    store.flush().expect("flush to storage");
+
+    let collected = AgentExecutor::collect_single_metric(
+        store,
+        "dev-1",
+        "temperature",
+        "dev-1:temperature".to_string(),
+        60,
+        false,
+        1000,
+        false,
+        false,
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+    .expect("collection must not error");
+
+    let item = collected.expect("the bound metric MUST be found");
+    assert_eq!(
+        item.values.get("value"),
+        Some(&serde_json::json!(23.5)),
+        "the value read back must be the one written"
+    );
+}
+
+/// The watch-style trigger: on=always notifies on SUCCESS too, at Info
+/// severity, so a 盯-style agent reports every verdict.
+#[tokio::test]
+async fn notify_on_always_reports_successes() {
+    use heramind_storage::timeseries::DataPoint as TsPoint;
+
+    let store = AgentStore::memory().expect("store");
+    let message_manager = Arc::new(heramind_messages::MessageManager::new());
+    // A structured agent is inference over its bound sources; since 2026-09-23
+    // it refuses to run with nothing to read, so this test has to give it a
+    // reading before it can have a success to notify about.
+    let ts = heramind_storage::TimeSeriesStore::memory().expect("ts");
+    ts.write(
+        "device:dev-1",
+        "temperature",
+        TsPoint {
+            timestamp: chrono::Utc::now().timestamp(),
+            value: serde_json::json!(23.5),
+            quality: None,
+            metadata: None,
+        },
+    )
+    .await
+    .expect("seed telemetry");
+    ts.flush().expect("flush");
+    let config = AgentExecutorConfig {
+        store: store.clone(),
+        time_series_storage: Some(ts),
+        device_service: None,
+        event_bus: None,
+        message_manager: Some(message_manager.clone()),
+        llm_runtime: None,
+        llm_backend_store: None,
+        extension_registry: None,
+        tool_registry: None,
+        memory_store: None,
+        backend_semaphores: None,
+        skill_registry: None,
+        execution_semaphore: None,
+    };
+    let mut executor = AgentExecutor::new(config).await.expect("executor");
+    let agent: AiAgent = serde_json::from_value(serde_json::json!({
+        "id": "always-agent",
+        "name": "盯守测试",
+        "user_prompt": "判断状态",
+        "resources": [
+            { "resource_type": "metric", "resource_id": "dev-1:temperature",
+              "name": "temperature", "config": {} }
+        ],
+        "schedule": { "schedule_type": "manual" },
+        "status": "active",
+        "created_at": 0, "updated_at": 0,
+        "execution_mode": "structured",
+        "output_schema": [
+            { "name": "status", "field_type": { "type": "enum", "values": ["正常", "异常"] } }
+        ],
+        "stats": {
+            "total_executions": 0, "successful_executions": 0,
+            "failed_executions": 0, "avg_duration_ms": 0, "last_duration_ms": null
+        },
+        "memory": {},
+        "notify": { "channels": ["webhook:ops"], "on": "always" },
+    }))
+    .expect("fixture");
+    store.save_agent(&agent).await.expect("seed");
+    executor
+        .set_llm_runtime(Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+            r#"{"status": "正常"}"#,
+        )])))
+        .await;
+
+    executor
+        .execute_agent(agent, None, None)
+        .await
+        .expect("run ok");
+
+    let messages = message_manager.list_messages().await;
+    let hit = messages
+        .iter()
+        .find(|m| m.source == "agent:always-agent")
+        .expect("success must notify under on=always");
+    assert!(hit.title.contains("completed"), "title: {}", hit.title);
+    assert!(
+        hit.message.contains("正常"),
+        "body carries the verdict: {}",
+        hit.message
+    );
+}
+
+/// `judgment` hands the decision to the agent: the machinery sends nothing,
+/// and must not fall back to sniffing the conclusion for keywords either.
+///
+/// That second half is the point. A silent run is the expected outcome here,
+/// and a "run completed" message would be a second voice saying something the
+/// operator chose this setting to stop hearing. The agent's own judgement
+/// reaches them through `heramind message send`, which this test does not
+/// exercise — it only asserts the machinery keeps quiet.
+#[tokio::test]
+async fn notify_on_judgment_keeps_the_machinery_silent() {
+    use heramind_storage::timeseries::DataPoint as TsPoint;
+
+    let store = AgentStore::memory().expect("store");
+    let message_manager = Arc::new(heramind_messages::MessageManager::new());
+    let ts = heramind_storage::TimeSeriesStore::memory().expect("ts");
+    ts.write(
+        "device:dev-1",
+        "temperature",
+        TsPoint {
+            timestamp: chrono::Utc::now().timestamp(),
+            value: serde_json::json!(23.5),
+            quality: None,
+            metadata: None,
+        },
+    )
+    .await
+    .expect("seed telemetry");
+    ts.flush().expect("flush");
+
+    let config = AgentExecutorConfig {
+        store: store.clone(),
+        time_series_storage: Some(ts),
+        device_service: None,
+        event_bus: None,
+        message_manager: Some(message_manager.clone()),
+        llm_runtime: None,
+        llm_backend_store: None,
+        extension_registry: None,
+        tool_registry: None,
+        memory_store: None,
+        backend_semaphores: None,
+        skill_registry: None,
+        execution_semaphore: None,
+    };
+    let mut executor = AgentExecutor::new(config).await.expect("executor");
+
+    // The verdict is deliberately alarming: under the old keyword sniffing a
+    // conclusion like this would have been picked up and sent.
+    let agent: AiAgent = serde_json::from_value(serde_json::json!({
+        "id": "judgment-agent",
+        "name": "判断档",
+        "user_prompt": "判断状态",
+        "resources": [
+            { "resource_type": "metric", "resource_id": "dev-1:temperature",
+              "name": "temperature", "config": {} }
+        ],
+        "schedule": { "schedule_type": "manual" },
+        "status": "active",
+        "created_at": 0, "updated_at": 0,
+        "execution_mode": "structured",
+        "output_schema": [
+            { "name": "status", "field_type": { "type": "enum", "values": ["正常", "异常"] } }
+        ],
+        "stats": {
+            "total_executions": 0, "successful_executions": 0,
+            "failed_executions": 0, "avg_duration_ms": 0, "last_duration_ms": null
+        },
+        "memory": {},
+        "notify": { "channels": ["webhook:ops"], "on": "judgment" },
+    }))
+    .expect("fixture");
+    store.save_agent(&agent).await.expect("seed");
+    executor
+        .set_llm_runtime(Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+            r#"{"status": "异常"}"#,
+        )])))
+        .await;
+
+    executor
+        .execute_agent(agent, None, None)
+        .await
+        .expect("run ok");
+
+    let messages = message_manager.list_messages().await;
+    let from_agent: Vec<_> = messages
+        .iter()
+        .filter(|m| m.source == "agent:judgment-agent")
+        .collect();
+    assert!(
+        from_agent.is_empty(),
+        "the machinery must send nothing under on=judgment, got: {:?}",
+        from_agent.iter().map(|m| &m.title).collect::<Vec<_>>()
+    );
+}
+
+/// An alert is the *record* of what happened; channels are only how it
+/// travels. The rule path already works that way — `create_message` stores
+/// unconditionally and fans out best-effort ("don't fail if channels fail -
+/// message is already stored").
+///
+/// This path returned early when no channel was configured, so switching
+/// notifications on with nowhere to push them produced nothing at all: no
+/// external delivery *and* no in-app entry. Turning notifications on should
+/// never mean "tell nobody".
+#[tokio::test]
+async fn an_agent_without_channels_still_records_its_alert_in_app() {
+    let store = AgentStore::memory().expect("store");
+    let message_manager = Arc::new(heramind_messages::MessageManager::new());
+    let config = AgentExecutorConfig {
+        store: store.clone(),
+        time_series_storage: None,
+        device_service: None,
+        event_bus: None,
+        message_manager: Some(message_manager.clone()),
+        llm_runtime: None,
+        llm_backend_store: None,
+        extension_registry: None,
+        tool_registry: None,
+        memory_store: None,
+        backend_semaphores: None,
+        skill_registry: None,
+        execution_semaphore: None,
+    };
+    let executor = AgentExecutor::new(config).await.expect("executor");
+
+    let agent: AiAgent = serde_json::from_value(serde_json::json!({
+        "id": "no-channel-agent",
+        "name": "盯守",
+        "user_prompt": "判断状态",
+        "resources": [],
+        "schedule": { "schedule_type": "manual" },
+        "status": "active",
+        "created_at": 0, "updated_at": 0,
+        "stats": {
+            "total_executions": 0, "successful_executions": 0,
+            "failed_executions": 0, "avg_duration_ms": 0, "last_duration_ms": null
+        },
+        "memory": {},
+        "notify": { "channels": [], "on": "always" },
+    }))
+    .expect("fixture");
+    store.save_agent(&agent).await.expect("seed");
+
+    let record = heramind_storage::AgentExecutionRecord {
+        id: "exec-no-channel".to_string(),
+        agent_id: agent.id.clone(),
+        timestamp: 0,
+        trigger_type: "schedule".to_string(),
+        status: heramind_storage::ExecutionStatus::Completed,
+        decision_process: heramind_storage::DecisionProcess {
+            situation_analysis: String::new(),
+            data_collected: vec![],
+            reasoning_steps: vec![],
+            decisions: vec![],
+            conclusion: "冷库温度正常".to_string(),
+            confidence: None,
+            stop_reason: String::new(),
+            tokens_used: 0,
+        },
+        result: None,
+        duration_ms: 12,
+        error: None,
+    };
+
+    executor
+        .dispatch_agent_notifications(&agent.id, &agent.name, &record, false)
+        .await;
+
+    let sent = message_manager.list_messages().await;
+    assert_eq!(
+        sent.len(),
+        1,
+        "the alert must exist even when there is nowhere to push it"
+    );
+    assert_eq!(sent[0].source, "agent:no-channel-agent");
+    assert!(sent[0].message.contains("冷库温度正常"));
+    assert_eq!(
+        sent[0].target_channels,
+        Some(Vec::new()),
+        "and it must be addressed to nobody externally, not broadcast"
+    );
+}
+
+/// A **failed** run reaches the user even from an agent with no routing.
+///
+/// `notify: null` is the shape every agent created before the create-time floor
+/// has. Its fallback is the keyword path, which is driven by `Decision`s — and a
+/// failure produces none: the record the executor writes for one carries
+/// `decisions: vec![]`. So those agents failed silently, run after run, with
+/// nothing anywhere saying so. Found in a live log: an agent bound to 31 sources
+/// failing every five minutes, no notification.
+///
+/// A failure is a status, not a judgement about the content, so it takes the
+/// floor a new agent would have been given. Success keeps the legacy behaviour.
+#[tokio::test]
+async fn a_failed_run_reports_even_without_routing() {
+    let store = AgentStore::memory().expect("store");
+    let message_manager = Arc::new(heramind_messages::MessageManager::new());
+    let config = AgentExecutorConfig {
+        store: store.clone(),
+        time_series_storage: None,
+        device_service: None,
+        event_bus: None,
+        message_manager: Some(message_manager.clone()),
+        llm_runtime: None,
+        llm_backend_store: None,
+        extension_registry: None,
+        tool_registry: None,
+        memory_store: None,
+        backend_semaphores: None,
+        skill_registry: None,
+        execution_semaphore: None,
+    };
+    let executor = AgentExecutor::new(config).await.expect("executor");
+
+    // No `notify` key at all — the pre-floor shape.
+    let agent: AiAgent = serde_json::from_value(serde_json::json!({
+        "id": "legacy-agent",
+        "name": "数据监控分析",
+        "user_prompt": "判断状态",
+        "resources": [],
+        "schedule": { "schedule_type": "interval", "interval_seconds": 300 },
+        "status": "active",
+        "created_at": 0, "updated_at": 0,
+        "stats": {
+            "total_executions": 0, "successful_executions": 0,
+            "failed_executions": 0, "avg_duration_ms": 0, "last_duration_ms": null
+        },
+        "memory": {},
+    }))
+    .expect("fixture");
+    assert!(agent.notify.is_none(), "the point of the fixture");
+    store.save_agent(&agent).await.expect("seed");
+
+    let record = |status: heramind_storage::ExecutionStatus,
+                  conclusion: &str,
+                  error: Option<&str>| heramind_storage::AgentExecutionRecord {
+        id: format!("exec-{status:?}"),
+        agent_id: agent.id.clone(),
+        timestamp: 0,
+        trigger_type: "schedule".to_string(),
+        status,
+        decision_process: heramind_storage::DecisionProcess {
+            situation_analysis: String::new(),
+            data_collected: vec![],
+            reasoning_steps: vec![],
+            decisions: vec![],
+            conclusion: conclusion.to_string(),
+            confidence: None,
+            stop_reason: String::new(),
+            tokens_used: 0,
+        },
+        result: None,
+        duration_ms: 12,
+        error: error.map(str::to_string),
+    };
+
+    // A failure: one message, and it carries the reason.
+    executor
+        .dispatch_agent_notifications(
+            &agent.id,
+            &agent.name,
+            &record(
+                heramind_storage::ExecutionStatus::Failed,
+                "Failed: nothing to work from",
+                Some("agent '数据监控分析' has nothing to work from. All 5 devices and 31 metrics are silent"),
+            ),
+            false,
+        )
+        .await;
+
+    let sent = message_manager.list_messages().await;
+    assert_eq!(sent.len(), 1, "a failure must not be silent");
+    assert!(
+        sent[0].message.contains("31 metrics are silent"),
+        "the reason is the useful part of a failure notice: {:?}",
+        sent[0].message
+    );
+
+    // A success: the legacy keyword path still decides, and here it says nothing.
+    executor
+        .dispatch_agent_notifications(
+            &agent.id,
+            &agent.name,
+            &record(
+                heramind_storage::ExecutionStatus::Completed,
+                "冷库温度正常",
+                None,
+            ),
+            false,
+        )
+        .await;
+    assert_eq!(
+        message_manager.list_messages().await.len(),
+        1,
+        "a successful run of a legacy agent stays quiet — that behaviour is not ours to change"
+    );
+}
+
+/// Explicit notification routing (2026-09-23): a failed run with
+/// notify={channels, on: failure} must land a message targeted at exactly
+/// those channels; a passing run must stay silent for on: failure.
+#[tokio::test]
+async fn notify_routes_failures_to_configured_channels() {
+    let store = AgentStore::memory().expect("store");
+    let ts = heramind_storage::TimeSeriesStore::memory().expect("ts");
+    let message_manager = Arc::new(heramind_messages::MessageManager::new());
+    let config = AgentExecutorConfig {
+        store: store.clone(),
+        time_series_storage: Some(ts),
+        device_service: None,
+        event_bus: None,
+        message_manager: Some(message_manager.clone()),
+        llm_runtime: None,
+        llm_backend_store: None,
+        extension_registry: None,
+        tool_registry: None,
+        memory_store: None,
+        backend_semaphores: None,
+        skill_registry: None,
+        execution_semaphore: None,
+    };
+    let executor = AgentExecutor::new(config).await.expect("executor");
+
+    // Agent whose runs fail (no output schema → structured rejection).
+    let mut agent: AiAgent = serde_json::from_value(serde_json::json!({
+        "id": "notify-agent",
+        "name": "通知测试",
+        "user_prompt": "p",
+        "resources": [],
+        "schedule": { "schedule_type": "manual" },
+        "status": "active",
+        "created_at": 0,
+        "updated_at": 0,
+        "execution_mode": "structured",
+        "stats": {
+            "total_executions": 0, "successful_executions": 0,
+            "failed_executions": 0, "avg_duration_ms": 0, "last_duration_ms": null
+        },
+        "memory": {},
+        "notify": { "channels": ["webhook:ops", "telegram:main"], "on": "failure" },
+    }))
+    .expect("fixture");
+    agent.output_schema = None; // force the failure
+    store.save_agent(&agent).await.expect("seed");
+
+    executor
+        .execute_agent(agent.clone(), None, None)
+        .await
+        .expect("returns a failed record");
+
+    // The message landed, targeted at exactly the configured channels.
+    let messages = message_manager.list_messages().await;
+    let hit = messages
+        .iter()
+        .find(|m| m.source == "agent:notify-agent")
+        .expect("a notification was sent");
+    assert_eq!(
+        hit.target_channels,
+        Some(vec!["webhook:ops".to_string(), "telegram:main".to_string()]),
+        "routing must be explicit, not broadcast"
+    );
+    assert!(hit.title.contains("failed"), "title: {}", hit.title);
+    assert!(hit.message.contains("output_schema"));
+}
+
+/// Two fields, one inference, one publish — both must land in telemetry.
+/// (A live instance showed the string field stored and the NUMBER field
+/// missing from the listing; this test decides which side drops it.)
+#[tokio::test]
+async fn two_field_contract_publishes_both_metrics() {
+    let ts = heramind_storage::TimeSeriesStore::memory().expect("memory timeseries");
+    let agent_store = AgentStore::memory().expect("memory agent store");
+    let config = AgentExecutorConfig {
+        store: agent_store,
+        time_series_storage: Some(ts.clone()),
+        device_service: None,
+        event_bus: None,
+        message_manager: None,
+        llm_runtime: None,
+        llm_backend_store: None,
+        extension_registry: None,
+        tool_registry: None,
+        memory_store: None,
+        backend_semaphores: None,
+        skill_registry: None,
+        execution_semaphore: None,
+    };
+    let mut executor = AgentExecutor::new(config).await.expect("executor");
+    let agent = AiAgent {
+        id: "two-field-agent".into(),
+        name: "two".into(),
+        description: None,
+        user_prompt: "巡检".into(),
+        llm_backend_id: None,
+        parsed_intent: None,
+        resources: vec![],
+        schedule: AgentSchedule {
+            schedule_type: ScheduleType::Manual,
+            interval_seconds: None,
+            cron_expression: None,
+            timezone: None,
+            event_filter: None,
+        },
+        status: AgentStatus::Active,
+        priority: 128,
+        created_at: 0,
+        updated_at: 0,
+        last_execution_at: None,
+        stats: AgentStats {
+            total_executions: 0,
+            successful_executions: 0,
+            failed_executions: 0,
+            avg_duration_ms: 0,
+            last_duration_ms: Some(0),
+        },
+        memory: AgentMemory {
+            journal: ExecutionJournal::default(),
+            knowledge_files: vec![],
+            updated_at: 0,
+        },
+        conversation_history: vec![],
+        user_messages: vec![],
+        conversation_summary: None,
+        context_window_size: 5,
+        tool_config: None,
+        execution_mode: ExecutionMode::Structured,
+        error_message: None,
+        system_prompt: None,
+        max_retries: 0,
+        consecutive_failures: 0,
+        output_schema: Some(vec![
+            heramind_storage::OperatorField {
+                name: "anomaly_count".into(),
+                field_type: heramind_storage::OperatorFieldType::Number,
+                unit: None,
+                description: None,
+            },
+            heramind_storage::OperatorField {
+                name: "status".into(),
+                field_type: heramind_storage::OperatorFieldType::Enum(vec![
+                    "正常".into(),
+                    "待检".into(),
+                ]),
+                unit: None,
+                description: None,
+            },
+        ]),
+        operator_config: None,
+        memory_mode: None,
+        notify: None,
+        enable_tool_chaining: false,
+        max_chain_depth: 3,
+        max_tokens_per_run: None,
+    };
+    executor.store().save_agent(&agent).await.expect("seed");
+
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"anomaly_count": 0, "status": "待检"}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+
+    // Since 2026-09-23 a structured run with no observation is refused, so the
+    // subject of this test — that BOTH schema fields land in telemetry — needs
+    // something to infer from.
+    let (_dp, record) = executor
+        .execute_structured(
+            "exec-two-field",
+            &agent,
+            vec![heramind_storage::DataCollected {
+                source: "dev-1".into(),
+                data_type: "values.parts".into(),
+                values: serde_json::json!({"parts": 3}),
+                timestamp: 0,
+            }],
+        )
+        .await
+        .expect("run");
+    assert!(record.success_rate >= 1.0);
+
+    ts.flush().expect("flush buffer");
+
+    let ns = "ai:two-field-agent";
+    let num = ts.query_latest(ns, "anomaly_count").await.expect("num");
+    let txt = ts.query_latest(ns, "status").await.expect("txt");
+    assert!(
+        num.is_some(),
+        "the NUMBER field must be stored — live instance showed it missing"
+    );
+    assert_eq!(num.unwrap().value, serde_json::json!(0));
+    assert!(txt.is_some());
+    assert_eq!(txt.unwrap().value, serde_json::json!("待检"));
+}
+
+/// S1 closed: a structured agent with an image input attaches the pixels as a
+/// multimodal part — the base64 never enters the prompt text (where the char
+/// cap truncated it into garbage the model rightly refused to read).
+#[tokio::test]
+async fn structured_inference_sees_the_image_as_a_part() {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    agent.execution_mode = heramind_storage::agents::ExecutionMode::Structured;
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "clutter_level".into(),
+        field_type: heramind_storage::OperatorFieldType::Enum(vec![
+            "整洁".into(),
+            "一般".into(),
+            "混乱".into(),
+        ]),
+        unit: None,
+        description: None,
+    }]);
+    let rt = MockLlmRuntime::new(vec![MockResponse::text(r#"{"clutter_level": "一般"}"#)]);
+    let rt_handle = rt.clone();
+    executor.set_llm_runtime(Arc::new(rt)).await;
+
+    let image_item = heramind_storage::DataCollected {
+        source: "cam-01:values.image".into(),
+        data_type: "values.image".into(),
+        values: serde_json::json!({
+            "_is_image": true,
+            "_is_event_data": true,
+            "image_base64": "aGVsbG8gd29ybGQgaW1hZ2UgYnl0ZXM=",
+            "image_mime_type": "image/jpeg",
+        }),
+        timestamp: 0,
+    };
+    let (decision, record) = executor
+        .execute_structured("exec-s1-image", &agent, vec![image_item])
+        .await
+        .expect("structured run with an image succeeds");
+
+    assert!(record.success_rate >= 1.0, "record: {:?}", record.summary);
+    assert!(decision.conclusion.contains("一般"));
+
+    // The part, not the text: the message the model received must carry the
+    // image, and the text payload must NOT contain the base64.
+    let captured = rt_handle.captured_messages();
+    assert_eq!(captured.len(), 1, "one inference call");
+    let dump = captured[0].to_string();
+    assert!(
+        dump.contains("image_base64"),
+        "the model must receive the image as a part: {dump}"
+    );
+    assert!(
+        !dump.contains("aGVsbG8gd29ybGQgaW1hZ2UgYnl0ZXM=")
+            || dump.matches("aGVsbG8gd29ybGQgaW1hZ2UgYnl0ZXM=").count() == 1,
+        "base64 must appear exactly once (the part), never also as prompt text"
+    );
+    assert!(
+        dump.contains("attached as image part"),
+        "the text says where the image went instead of dumping bytes"
+    );
+}
+
+/// M2-2: a *reasoning* agent (not structured) that declares an output contract
+/// gets its conclusion rendered as schema fields, published as ai:* sources.
+#[tokio::test]
+async fn output_contract_publishes_fields_for_a_reasoning_agent() {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    agent.execution_mode = ExecutionMode::Focused;
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "missing_count".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"missing_count": 1}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+
+    let published = executor
+        .apply_output_contract(&agent, "exec-contract", "画面里有 1 件漏装，批次待检")
+        .await;
+
+    assert_eq!(published, Some(1));
+}
+
+/// The contract is best-effort: the run already succeeded, so an extraction the
+/// model botches costs fields — never the run.
+#[tokio::test]
+async fn output_contract_failure_does_not_propagate() {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    agent.execution_mode = ExecutionMode::Focused;
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "missing_count".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        "画面太模糊了，我判断不出来",
+    )]));
+    executor.set_llm_runtime(rt).await;
+
+    let published = executor
+        .apply_output_contract(&agent, "exec-contract", "画面模糊")
+        .await;
+
+    assert_eq!(
+        published, None,
+        "a botched extraction must not fail the run"
+    );
+}
+
+/// Structured agents already produce their schema directly — running the
+/// contract on them would be a second inference for the same answer.
+#[tokio::test]
+async fn output_contract_is_skipped_for_structured_agents() {
+    let (mut executor, mut agent, _registry) = build_harness().await;
+    agent.execution_mode = ExecutionMode::Structured;
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "missing_count".into(),
+        field_type: heramind_storage::OperatorFieldType::Number,
+        unit: None,
+        description: None,
+    }]);
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"missing_count": 1}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+
+    assert_eq!(
+        executor
+            .apply_output_contract(&agent, "exec-contract", "any conclusion")
+            .await,
+        None
+    );
+}
+
+/// Most agents declare no contract at all — the step must be free for them.
+#[tokio::test]
+async fn output_contract_is_skipped_without_a_schema() {
+    let (mut executor, agent, _registry) = build_harness().await;
+    let rt: Arc<dyn LlmRuntime> = Arc::new(MockLlmRuntime::new(vec![MockResponse::text(
+        r#"{"missing_count": 1}"#,
+    )]));
+    executor.set_llm_runtime(rt).await;
+
+    assert_eq!(
+        executor
+            .apply_output_contract(&agent, "exec-contract", "any conclusion")
+            .await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn structured_mode_without_schema_is_rejected() {
+    let (executor, mut agent, _registry) = build_harness().await;
+    agent.execution_mode = heramind_storage::agents::ExecutionMode::Structured;
+    agent.output_schema = None;
+
+    let err = executor
+        .execute_structured("exec-structured-2", &agent, vec![])
+        .await
+        .expect_err("missing schema must fail");
+    assert!(err.to_string().contains("output_schema"), "err: {}", err);
+}
+
+/// The cap limits how often the agent may RUN, so it has to bite in every mode.
+/// This drives the run entry point for a *focused* agent — the branch that used
+/// to be uncapped — and expects the second run of the day to be refused.
+#[tokio::test]
+async fn daily_run_cap_applies_to_every_mode() {
+    let (mut executor, mut agent, registry) = build_harness().await;
+    executor.set_tool_registry(registry);
+    agent.execution_mode = ExecutionMode::Focused;
+    agent.parsed_intent = Some(heramind_storage::ParsedIntent {
+        intent_type: heramind_storage::IntentType::Monitoring,
+        target_metrics: vec![],
+        conditions: vec![],
+        actions: vec![],
+        confidence: 0.9,
+    });
+    agent.operator_config = Some(heramind_storage::OperatorConfig {
+        debounce_secs: 30,
+        max_calls_per_day: Some(1),
+        timeout_secs: 60,
+        consecutive_failure_threshold: 3,
+        event_cooldown_secs: None,
+    });
+    let rt: Arc<dyn LlmRuntime> = Arc::new(
+        MockLlmRuntime::new(vec![
+            MockResponse::text("nothing unusual"),
+            MockResponse::text("nothing unusual"),
+        ])
+        .with_function_calling(),
+    );
+    executor.set_llm_runtime(rt).await;
+    executor
+        .store()
+        .save_agent(&agent)
+        .await
+        .expect("seed store");
+
+    // First run of the day: allowed.
+    let first = executor.execute_agent(agent.clone(), None, None).await;
+    assert!(first.is_ok(), "first run within cap: {:?}", first.err());
+
+    // Second run the same day: refused at the run entry point. The executor
+    // reports failures as a failed RECORD rather than an Err, so assert there.
+    let second = executor
+        .execute_agent(agent, None, None)
+        .await
+        .expect("returns a record");
+    assert_eq!(second.status, heramind_storage::ExecutionStatus::Failed);
+    assert!(
+        second
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("daily run cap"),
+        "second run must be refused with the cap message; got {:?}",
+        second.error
+    );
+}
+
+/// Narration collapse: round 1 PROMISES a tool action in words ("我现在使用
+/// echo 工具…") without emitting a call. Without the guard the run would end
+/// with that promise as the conclusion (the original field failure); with the
+/// guard, one nudge round recovers the call and the task completes.
+#[tokio::test]
+async fn narration_collapse_nudges_once_and_recovers() {
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::text("好的，我现在使用 echo 工具来处理。"),
+        MockResponse::tool_call("echo", serde_json::json!({ "msg": "recovered" })),
+        MockResponse::text("done after recovery"),
+    ]);
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt.clone());
+    let (executor, agent, registry) = build_harness().await;
+    let (filtered_tools, tool_name_map) =
+        AgentExecutor::filter_tools(&registry, &agent.tool_config);
+    let mut messages = base_messages();
+    let out = executor
+        .run_tool_loop(
+            &agent,
+            &registry,
+            &rt_dyn,
+            &filtered_tools,
+            &mut messages,
+            "exec-narration",
+            30,
+            &tool_name_map,
+            None,
+        )
+        .await;
+
+    assert_eq!(
+        out.final_text, "done after recovery",
+        "the narration promise must NOT be the run's conclusion"
+    );
+    assert_eq!(rt.call_count(), 3, "nudge round + tool round + final round");
+    assert_eq!(out.stop_reason, StopReason::NaturalCompletion);
+}
+
+/// The guard fires AT MOST ONCE: if the model narrates again after the
+/// nudge, the second narration is accepted as the final answer — no loop.
+#[tokio::test]
+async fn repeated_narration_is_accepted_as_final() {
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::text("好的，我现在使用 echo 工具来处理。"),
+        MockResponse::text("我将使用 echo 工具处理这件事。"),
+    ]);
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt.clone());
+    let (executor, agent, registry) = build_harness().await;
+    let (filtered_tools, tool_name_map) =
+        AgentExecutor::filter_tools(&registry, &agent.tool_config);
+    let mut messages = base_messages();
+    let out = executor
+        .run_tool_loop(
+            &agent,
+            &registry,
+            &rt_dyn,
+            &filtered_tools,
+            &mut messages,
+            "exec-narration-2",
+            30,
+            &tool_name_map,
+            None,
+        )
+        .await;
+
+    assert_eq!(
+        out.final_text, "我将使用 echo 工具处理这件事。",
+        "second narration is the accepted final answer"
+    );
+    assert_eq!(rt.call_count(), 2, "exactly one nudge — no loop");
+}
+
+// ── Multimodal vision false-success (NM-331 / T4 Dongpingshan) ─────────────
+
+struct StubVisionTool;
+
+#[async_trait]
+impl Tool for StubVisionTool {
+    fn name(&self) -> &str {
+        "vision"
+    }
+    fn description(&self) -> &str {
+        "analyze an image"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "image": { "type": "string" },
+                "prompt": { "type": "string" }
+            }
+        })
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::success("vision ok"))
+    }
+}
+
+fn embeddable_image_data() -> heramind_storage::DataCollected {
+    heramind_storage::DataCollected {
+        source: "device:NE301PIR-200366:image_data".into(),
+        data_type: "image".into(),
+        values: serde_json::json!({
+            "_is_image": true,
+            "_is_event_data": true,
+            "image_base64": "aGVsbG8gd29ybGQ=",
+            "image_mime_type": "image/jpeg",
+        }),
+        timestamp: 0,
+    }
+}
+
+/// Positive: multimodal primary + image → strip vision tool, inject inline
+/// guidance, Completes when the model analyzes the attached image honestly.
+#[tokio::test]
+async fn multimodal_inline_vision_succeeds_without_vision_tool() {
+    let rt = MockLlmRuntime::new(vec![MockResponse::text(
+        "Attached frame shows an empty corridor; no gambling activity.",
+    )])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_handle = rt.clone();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "用 vision 工具分析图像，疑似赌博再告警".into();
+    agent.execution_mode = ExecutionMode::Free;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool));
+    registry.register(Arc::new(StubVisionTool));
+    let registry = Arc::new(registry);
+    executor.set_tool_registry(registry);
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[embeddable_image_data()],
+            rt_dyn,
+            "exec-inline-vision-ok",
+            None,
+        )
+        .await
+        .expect("inline multimodal run must succeed");
+
+    assert!(er.success_rate >= 1.0);
+    assert!(dp.conclusion.contains("empty corridor"));
+
+    let captured = rt_handle.captured_messages();
+    assert!(!captured.is_empty(), "LLM must be called");
+    let dump = captured[0].to_string();
+    assert!(
+        dump.contains("Do NOT call a `vision` tool"),
+        "system prompt must rewrite vision guidance: {dump}"
+    );
+    assert!(
+        dump.contains("attached as multimodal content") || dump.contains("analyze directly"),
+        "must advertise inline multimodal path: {dump}"
+    );
+}
+
+/// Negative: multimodal strip + conclusion admits "Vision tool not available"
+/// → must NOT return Completed/false-success.
+#[tokio::test]
+async fn multimodal_conclusion_admitting_vision_failure_is_rejected() {
+    let rt = MockLlmRuntime::new(vec![MockResponse::text(
+        "Vision tool not available for NE301PIR-200366; cannot analyze image.",
+    )])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "用 vision 工具分析图像".into();
+    agent.execution_mode = ExecutionMode::Free;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(StubVisionTool));
+    let registry = Arc::new(registry);
+    executor.set_tool_registry(registry);
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let err = executor
+        .execute_with_tools(
+            &agent,
+            &[embeddable_image_data()],
+            rt_dyn,
+            "exec-inline-vision-fail",
+            None,
+        )
+        .await
+        .expect_err("must refuse false-success when conclusion admits vision failure");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Vision analysis failed")
+            || msg.to_lowercase().contains("vision tool not available"),
+        "error must name vision failure: {msg}"
+    );
+}
+
+/// Negative: images present, text-only LLM, no vision tool → Unavailable.
+#[tokio::test]
+async fn vision_unavailable_refuses_completed() {
+    let rt =
+        MockLlmRuntime::new(vec![MockResponse::text("should not run")]).with_function_calling();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "analyze camera image".into();
+    agent.execution_mode = ExecutionMode::Free;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool));
+    let registry = Arc::new(registry);
+    executor.set_tool_registry(registry);
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let err = executor
+        .execute_with_tools(
+            &agent,
+            &[embeddable_image_data()],
+            rt_dyn,
+            "exec-vision-unavailable",
+            None,
+        )
+        .await
+        .expect_err("must refuse when vision is required but unavailable");
+    assert!(
+        err.to_string().contains("Vision required but unavailable"),
+        "got: {err}"
+    );
+}
+
+/// Positive: text LLM + vision tool available → keep vision path (no strip).
+#[tokio::test]
+async fn text_llm_keeps_vision_tool_path() {
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "vision",
+            serde_json::json!({
+                "image": "data:image/jpeg;base64,aGVsbG8=",
+                "prompt": "describe"
+            }),
+        ),
+        MockResponse::text("Frame analyzed via vision tool: empty road."),
+    ])
+    .with_function_calling();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "analyze camera image with vision tool".into();
+    agent.execution_mode = ExecutionMode::Free;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(StubVisionTool));
+    let registry = Arc::new(registry);
+    executor.set_tool_registry(registry);
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[embeddable_image_data()],
+            rt_dyn,
+            "exec-via-vision-tool",
+            None,
+        )
+        .await
+        .expect("via-vision-tool path must succeed");
+
+    assert!(er.success_rate >= 1.0, "success_rate={}", er.success_rate);
+    assert!(
+        dp.conclusion.contains("vision tool") || dp.conclusion.contains("empty road"),
+        "conclusion: {}",
+        dp.conclusion
+    );
+    assert!(
+        er.actions_executed.iter().any(|a| a.target == "vision"),
+        "vision tool must have been executed: {:?}",
+        er.actions_executed
+    );
+}
+
+/// T4 Dongpingshan: free-mode ZH gambling prompt still demands vision after
+/// multimodal strip — standing rewrite must follow the Task and forbid the tool.
+#[tokio::test]
+async fn dongpingshan_free_mode_prompt_rewrite_after_vision_strip() {
+    let rt = MockLlmRuntime::new(vec![MockResponse::text(
+        "画面为空旷走廊与灌木，未见人员赌博行为。",
+    )])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_handle = rt.clone();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    // Mirrors operator prompt shape: demand vision tool + judgment notify.
+    agent.name = "东坪山-200366-赌博行为监测".into();
+    agent.user_prompt =
+        "收到设备 image_data 后，用 vision 工具分析图像；仅当有人且疑似赌博时再 heramind message send 告警"
+            .into();
+    agent.execution_mode = ExecutionMode::Free;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool));
+    registry.register(Arc::new(StubVisionTool));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[embeddable_image_data()],
+            rt_dyn,
+            "exec-dongpingshan-rewrite",
+            None,
+        )
+        .await
+        .expect("honest inline analysis must Complete");
+
+    assert!(er.success_rate >= 1.0);
+    assert!(
+        dp.conclusion.contains("未见") || dp.conclusion.contains("走廊"),
+        "conclusion: {}",
+        dp.conclusion
+    );
+
+    let dump = rt_handle.captured_messages()[0].to_string();
+    let task_pos = dump
+        .find("用 vision 工具分析图像")
+        .expect("original task must remain");
+    let rewrite_pos = dump
+        .find("Do NOT call a `vision` tool")
+        .expect("inline rewrite must be injected");
+    assert!(
+        rewrite_pos > task_pos,
+        "rewrite must follow Task so it overrides the agent prompt"
+    );
+    assert!(
+        dump.contains("## Vision Path (IMPORTANT)"),
+        "standing Vision Path section required: {dump}"
+    );
+    assert!(
+        dump.contains("attached as multimodal content"),
+        "Free resource note must say images are inline: {dump}"
+    );
+}
+
+/// T4: ZH honest multimodal analysis → Completed (not false-fail).
+#[tokio::test]
+async fn dongpingshan_honest_zh_image_analysis_completes() {
+    let rt = MockLlmRuntime::new(vec![MockResponse::text(
+        "直接分析了附带图像：帐篷与车辆，无赌博迹象。未调用 vision 工具。",
+    )])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "用 vision 工具分析东坪山摄像头图像".into();
+    agent.execution_mode = ExecutionMode::Free;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(StubVisionTool));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[embeddable_image_data()],
+            rt_dyn,
+            "exec-dongpingshan-honest-zh",
+            None,
+        )
+        .await
+        .expect("honest ZH analysis must Complete");
+
+    assert!(er.success_rate >= 1.0);
+    assert!(
+        !super::vision_path::conclusion_admits_vision_failure(&dp.conclusion),
+        "honest analysis must not trip failure markers: {}",
+        dp.conclusion
+    );
+    assert!(dp.conclusion.contains("无赌博"));
+}
+
+/// T4 table: ZH/EN conclusions that admit vision failure must Fail, not Completed.
+#[tokio::test]
+async fn dongpingshan_vision_failure_conclusions_table_fail() {
+    let cases = [
+        "Vision tool not available for NE301PIR-200366…",
+        "视觉不可用，无法分析图像。",
+        "Vision extension not installed… skill load skill=\"vision\"",
+        "Available domains: device, message, extension; cannot use vision.",
+        "视觉工具不可用，改找 extension 失败。",
+    ];
+
+    for (i, conclusion) in cases.iter().enumerate() {
+        let rt = MockLlmRuntime::new(vec![MockResponse::text((*conclusion).to_string())])
+            .with_function_calling()
+            .with_supports_images();
+        let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+        let (mut executor, mut agent, _) = build_harness().await;
+        agent.user_prompt = "用 vision 工具分析图像，疑似赌博再告警".into();
+        agent.execution_mode = ExecutionMode::Free;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StubVisionTool));
+        executor.set_tool_registry(Arc::new(registry));
+        executor.set_llm_runtime(rt_dyn.clone()).await;
+
+        let err = executor
+            .execute_with_tools(
+                &agent,
+                &[embeddable_image_data()],
+                rt_dyn,
+                &format!("exec-dongpingshan-fail-{i}"),
+                None,
+            )
+            .await
+            .expect_err(&format!(
+                "conclusion must Fail (not Completed): {conclusion}"
+            ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Vision analysis failed"),
+            "case {i} ({conclusion}) → {msg}"
+        );
+    }
+}
+
+/// T4: text-only LLM + bound camera image + no vision tool → Unavailable Err
+/// (ZH gambling agent wording; must not Complete).
+#[tokio::test]
+async fn dongpingshan_text_llm_no_vision_tool_unavailable() {
+    let rt = MockLlmRuntime::new(vec![MockResponse::text(
+        "should never run — vision path unavailable",
+    )])
+    .with_function_calling();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.name = "东坪山-20035E-赌博行为监测".into();
+    agent.user_prompt = "用 vision 工具分析 image_data".into();
+    agent.execution_mode = ExecutionMode::Free;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool)); // deliberately no vision
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let err = executor
+        .execute_with_tools(
+            &agent,
+            &[embeddable_image_data()],
+            rt_dyn,
+            "exec-dongpingshan-unavailable",
+            None,
+        )
+        .await
+        .expect_err("text LLM without vision tool must Unavailable");
+    assert!(
+        err.to_string().contains("Vision required but unavailable"),
+        "got: {err}"
+    );
+}
+
+// ── R2-P0-1: success_rate self-heal / all-fail / empty-event skip ──────────
+
+/// Soft-fail then succeed: ToolOutput{success:false} then success.
+struct ConditionalEchoTool;
+
+#[async_trait]
+impl Tool for ConditionalEchoTool {
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "echo that fails when msg starts with FAIL"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "msg": { "type": "string" } },
+            "required": ["msg"]
+        })
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let msg = args.get("msg").and_then(|v| v.as_str()).unwrap_or("");
+        if msg.starts_with("FAIL") {
+            Ok(ToolOutput::error(format!("echo failed: {msg}")))
+        } else {
+            Ok(ToolOutput::success(format!("echo: {msg}")))
+        }
+    }
+}
+
+/// Round 1 tool fails, Round 2 succeeds → Completed + successful_executions==1.
+#[tokio::test]
+async fn self_heal_partial_success_rate_is_completed() {
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.execution_mode = ExecutionMode::Free;
+    agent.parsed_intent = Some(heramind_storage::ParsedIntent {
+        intent_type: heramind_storage::IntentType::Monitoring,
+        target_metrics: vec![],
+        conditions: vec![],
+        actions: vec![],
+        confidence: 0.9,
+    });
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(ConditionalEchoTool));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.store().save_agent(&agent).await.expect("seed");
+
+    let rt: Arc<dyn LlmRuntime> = Arc::new(
+        MockLlmRuntime::new(vec![
+            MockResponse::tool_call("echo", serde_json::json!({ "msg": "FAIL first" })),
+            MockResponse::tool_call("echo", serde_json::json!({ "msg": "ok second" })),
+            MockResponse::text("recovered after self-heal"),
+        ])
+        .with_function_calling(),
+    );
+    executor.set_llm_runtime(rt).await;
+
+    let record = executor
+        .execute_agent(agent.clone(), None, None)
+        .await
+        .expect("run");
+    assert_eq!(record.status, heramind_storage::ExecutionStatus::Completed);
+    assert!(record.error.is_none());
+    let rate = record
+        .result
+        .as_ref()
+        .map(|r| r.success_rate)
+        .unwrap_or(0.0);
+    assert!(
+        rate > 0.0 && rate < 1.0,
+        "expected partial success_rate, got {rate}"
+    );
+
+    let stored = executor
+        .store()
+        .get_agent(&agent.id)
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(stored.stats.successful_executions, 1);
+    assert_eq!(stored.stats.failed_executions, 0);
+    assert_eq!(stored.consecutive_failures, 0);
+}
+
+/// All tools fail → Failed + failed_executions==1 + no output_contract publish.
+#[tokio::test]
+async fn all_tools_failed_is_business_failure_without_output_contract() {
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.execution_mode = ExecutionMode::Free;
+    agent.parsed_intent = Some(heramind_storage::ParsedIntent {
+        intent_type: heramind_storage::IntentType::Monitoring,
+        target_metrics: vec![],
+        conditions: vec![],
+        actions: vec![],
+        confidence: 0.9,
+    });
+    agent.output_schema = Some(vec![heramind_storage::OperatorField {
+        name: "status".into(),
+        field_type: heramind_storage::OperatorFieldType::Enum(vec!["ok".into(), "bad".into()]),
+        unit: None,
+        description: None,
+    }]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(ConditionalEchoTool));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.store().save_agent(&agent).await.expect("seed");
+
+    let rt: Arc<dyn LlmRuntime> = Arc::new(
+        MockLlmRuntime::new(vec![
+            MockResponse::tool_call("echo", serde_json::json!({ "msg": "FAIL only" })),
+            MockResponse::text(r#"{"status":"ok"}"#),
+        ])
+        .with_function_calling(),
+    );
+    executor.set_llm_runtime(rt).await;
+
+    let record = executor
+        .execute_agent(agent.clone(), None, None)
+        .await
+        .expect("run");
+    assert_eq!(record.status, heramind_storage::ExecutionStatus::Failed);
+    assert!(record.error.is_some());
+    assert!(
+        !record
+            .decision_process
+            .decisions
+            .iter()
+            .any(|d| d.decision_type == "output_contract"),
+        "failed run must not publish output_contract"
+    );
+    let stored = executor
+        .store()
+        .get_agent(&agent.id)
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(stored.stats.failed_executions, 1);
+    assert_eq!(stored.stats.successful_executions, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 1.3.3 Task 1 — Change A (event-image input status) + Change B (judgment gate)
+// ---------------------------------------------------------------------------
+
+/// Minimal JPEG SOI + filler + EOI. `pad_byte` distinguishes fixtures that
+/// share MIME `image/jpeg` but differ in content (byte-compare control).
+fn test_jpeg_bytes(pad_byte: u8) -> Vec<u8> {
+    let mut bytes = vec![0xFFu8, 0xD8, 0xFF, 0xE0]; // JPEG SOI + APP0 start
+    bytes.extend(std::iter::repeat_n(pad_byte, 2048));
+    bytes.extend_from_slice(&[0xFF, 0xD9]); // EOI
+    bytes
+}
+
+fn test_jpeg_base64(pad_byte: u8) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(test_jpeg_bytes(pad_byte))
+}
+
+fn event_jpeg_data(b64: &str) -> heramind_storage::DataCollected {
+    heramind_storage::DataCollected {
+        source: "200366:image_data".into(),
+        data_type: "image_data".into(),
+        values: serde_json::json!({
+            "_is_image": true,
+            "_is_event_data": true,
+            "image_base64": b64,
+            "image_mime_type": "image/jpeg",
+        }),
+        timestamp: chrono::Utc::now().timestamp(),
+    }
+}
+
+/// Walk a MockLlm captured messages JSON value and collect every
+/// `image_base64.data` payload (decoded). MIME alone must not pass tests.
+fn extract_decoded_images_from_captured(messages: &serde_json::Value) -> Vec<(Vec<u8>, String)> {
+    use base64::Engine;
+    let mut out = Vec::new();
+    let Some(arr) = messages.as_array() else {
+        return out;
+    };
+    for msg in arr {
+        let Some(content) = msg.get("content") else {
+            continue;
+        };
+        // Content::Parts serializes as an array of tagged parts, or as an
+        // object with a `Parts` / `parts` wrapper depending on serde shape.
+        let parts = content
+            .as_array()
+            .or_else(|| content.get("Parts").and_then(|v| v.as_array()))
+            .or_else(|| content.get("parts").and_then(|v| v.as_array()));
+        let Some(parts) = parts else {
+            continue;
+        };
+        for part in parts {
+            let is_b64 = part.get("type").and_then(|t| t.as_str()) == Some("image_base64")
+                || part.get("ImageBase64").is_some();
+            if !is_b64 && part.get("data").is_none() {
+                continue;
+            }
+            let data = part
+                .get("data")
+                .or_else(|| part.pointer("/ImageBase64/data"))
+                .and_then(|v| v.as_str());
+            let mime = part
+                .get("mime_type")
+                .or_else(|| part.pointer("/ImageBase64/mime_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let Some(data) = data else {
+                continue;
+            };
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                out.push((bytes, mime));
+            }
+        }
+    }
+    out
+}
+
+fn input_status_row() -> heramind_storage::DataCollected {
+    heramind_storage::DataCollected {
+        source: "system".into(),
+        data_type: "input_status".into(),
+        values: serde_json::json!({
+            "event_image": "provided",
+            "bound_metrics": "none",
+            "message": "Event-carried image provided this turn; no metrics from bound resources."
+        }),
+        timestamp: chrono::Utc::now().timestamp(),
+    }
+}
+
+/// Fake `shell` tool that counts `message send` side effects without hitting
+/// the real message API — isolation sink for judgment-notify acceptance.
+struct FakeNotifySink {
+    sends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for FakeNotifySink {
+    fn name(&self) -> &str {
+        "shell"
+    }
+    fn description(&self) -> &str {
+        "fake shell / notify sink"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        if super::judgment_notify::is_message_send_command(cmd) {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutput::success("Platform message created"))
+        } else {
+            Ok(ToolOutput::success(format!("ok: {cmd}")))
+        }
+    }
+}
+
+/// Change A: known JPEG + resources=[] → model request carries **byte-identical**
+/// image (not MIME-only) and prompt distinguishes event image vs bound metrics.
+#[tokio::test]
+async fn event_image_empty_resources_reaches_model_with_honest_status() {
+    let fixture_bytes = test_jpeg_bytes(0x5A);
+    let jpeg_b64 = test_jpeg_base64(0x5A);
+    let control_bytes = test_jpeg_bytes(0xA5); // same MIME, different content
+    assert_ne!(
+        fixture_bytes, control_bytes,
+        "control fixture must differ in bytes"
+    );
+    assert_eq!(
+        fixture_bytes.len(),
+        control_bytes.len(),
+        "control keeps size; only pad differs"
+    );
+
+    let rt = MockLlmRuntime::new(vec![MockResponse::text(
+        "Attached frame inspected; corridor empty.",
+    )])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_handle = rt.clone();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.resources.clear();
+    agent.user_prompt = "分析事件图像；仅当疑似赌博再告警".into();
+    agent.execution_mode = ExecutionMode::Free;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let data = vec![event_jpeg_data(&jpeg_b64), input_status_row()];
+    let (_dp, er) = executor
+        .execute_with_tools(&agent, &data, rt_dyn, "exec-event-image-status", None)
+        .await
+        .expect("event-image run must succeed");
+    assert!(er.success_rate >= 1.0);
+
+    let captured = rt_handle.captured_messages();
+    assert!(!captured.is_empty(), "LLM must be called");
+    let images = extract_decoded_images_from_captured(&captured[0]);
+    assert!(
+        !images.is_empty(),
+        "must extract image_base64 from multimodal request, not rely on MIME string alone; dump={}",
+        &captured[0].to_string()[..captured[0].to_string().len().min(600)]
+    );
+    let (got_bytes, mime) = &images[0];
+    assert_eq!(mime, "image/jpeg");
+    assert_eq!(
+        got_bytes, &fixture_bytes,
+        "model request image bytes must match fixture (byte-compare)"
+    );
+    assert_ne!(
+        got_bytes, &control_bytes,
+        "same-MIME control image must not match — proves compare is content-based"
+    );
+
+    let dump = captured[0].to_string();
+    assert!(
+        dump.contains("Event image this turn: provided")
+            || dump.contains("event-carried image")
+            || dump.contains("Event-carried image provided"),
+        "prompt must distinguish event image: {}",
+        &dump[..dump.len().min(1200)]
+    );
+    assert!(
+        dump.contains("Bound metrics: none") || dump.contains("no metrics from bound"),
+        "prompt must say bound metrics absent: {}",
+        &dump[..dump.len().min(1200)]
+    );
+    assert!(
+        !dump.contains("NO DATA COLLECTED"),
+        "must not inject NO DATA COLLECTED when event image present"
+    );
+    assert!(
+        !dump.contains("No pre-collected data"),
+        "must not claim no pre-collected data when event image present"
+    );
+}
+
+/// Change B: labeled criteria-not-met → patrol Completes, sink gets 0 sends
+/// even if the model tries `message send`.
+#[tokio::test]
+async fn judgment_gate_blocks_send_when_criteria_not_met() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"告警\" --body \"疑似？\""
+            }),
+        )
+        .with_text("画面为空旷走廊，无赌博行为证据。"),
+        MockResponse::text("巡检完成：无赌博，无需告警。"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "仅当有人且疑似赌博时再 heramind message send".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (_dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-not-met",
+            None,
+        )
+        .await
+        .expect("patrol must Complete");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "criteria not met must deliver 0 notifications"
+    );
+    assert!(
+        er.actions_executed.iter().any(|a| {
+            !a.success
+                && a.result
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Judgment notify gate")
+        }),
+        "blocked send must surface Judgment notify gate in action result; actions={:?}",
+        er.actions_executed
+    );
+}
+
+/// Change B: no independent judgment + self-serving title → sink 0
+/// (title/body must not self-approve).
+#[tokio::test]
+async fn judgment_gate_blocks_title_only_self_approval() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"疑似赌博\" --body \"告警正文\""
+            }),
+        )
+        // Empty / non-judgment assistant text — only the pending title has markers.
+        .with_text(""),
+        MockResponse::text("done"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "赌博监测".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let _ = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-title-only",
+            None,
+        )
+        .await
+        .expect("run completes (send blocked)");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "title-only 疑似赌博 must not self-approve a notification"
+    );
+}
+
+/// Last-line protocol: mid-message backtick example must not authorize
+/// → FakeNotifySink receives 0.
+#[tokio::test]
+async fn judgment_gate_blocks_mid_message_backtick_verdict_example() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"example\" --body \"still analyzing\""
+            }),
+        )
+        .with_text("阳性判定的格式示例如下：\n`Verdict: criteria met`\n本帧还在分析中。"),
+        MockResponse::text("done"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "仅当有人且疑似赌博时再告警".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (_dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-mid-message-example",
+            None,
+        )
+        .await
+        .expect("mid-message example Completes with send blocked");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "mid-message backtick Verdict example must not authorize (sink 0)"
+    );
+    assert!(
+        er.actions_executed.iter().any(|a| {
+            !a.success
+                && a.result
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Judgment notify gate")
+        }),
+        "gate must block mid-message example; actions={:?}",
+        er.actions_executed
+    );
+}
+
+/// Protocol parse: explanatory prose mentioning "criteria met" must not
+/// authorize → FakeNotifySink receives 0.
+#[tokio::test]
+async fn judgment_gate_blocks_explanatory_criteria_met_mention() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"probe\" --body \"explanatory\""
+            }),
+        )
+        .with_text("I have not yet determined whether the criteria met label applies."),
+        MockResponse::text("done"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "仅当有人且疑似赌博时再告警".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (_dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-explanatory-mention",
+            None,
+        )
+        .await
+        .expect("explanatory-mention run Completes with send blocked");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "explanatory 'criteria met' mention must not authorize (sink 0)"
+    );
+    assert!(
+        er.actions_executed.iter().any(|a| {
+            !a.success
+                && a.result
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Judgment notify gate")
+        }),
+        "gate must block explanatory mention; actions={:?}",
+        er.actions_executed
+    );
+}
+
+/// Structural auth: open question ("需要告警吗？") is not a finished judgment
+/// → FakeNotifySink receives 0 (lexicon substring must not authorize).
+#[tokio::test]
+async fn judgment_gate_blocks_question_need_alert_without_verdict() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"疑问\" --body \"question only\""
+            }),
+        )
+        .with_text("需要告警吗？"),
+        MockResponse::text("done"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "仅当有人且疑似赌博时再告警".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (_dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-question-only",
+            None,
+        )
+        .await
+        .expect("question-only run Completes with send blocked");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "question 需要告警吗？ must not authorize (sink 0)"
+    );
+    assert!(
+        er.actions_executed.iter().any(|a| {
+            !a.success
+                && a.result
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Judgment notify gate")
+        }),
+        "gate must block question-only send; actions={:?}",
+        er.actions_executed
+    );
+}
+
+/// Source-review #3: progress / intent ("我先核对画面是否需要告警") is not a
+/// finished this-event judgment → FakeNotifySink receives 0.
+#[tokio::test]
+async fn judgment_gate_blocks_progress_intent_without_verdict() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"核对中\" --body \"progress\""
+            }),
+        )
+        .with_text("我先核对画面是否需要告警"),
+        MockResponse::text("done"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "仅当有人且疑似赌博时再告警".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (_dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-progress-only",
+            None,
+        )
+        .await
+        .expect("progress-only run Completes with send blocked");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "progress intent must not count as finished judgment (sink 0)"
+    );
+    assert!(
+        er.actions_executed.iter().any(|a| {
+            !a.success
+                && a.result
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Judgment notify gate")
+        }),
+        "gate must block progress-only send; actions={:?}",
+        er.actions_executed
+    );
+}
+
+/// Acceptance #4: assistant restates policy ("如果发现赌博，就需要告警") with
+/// no this-event judgment → FakeNotifySink receives 0.
+#[tokio::test]
+async fn judgment_gate_blocks_policy_conditional_without_verdict() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"巡检提醒\" --body \"规则复述\""
+            }),
+        )
+        .with_text("如果发现赌博，就需要告警"),
+        MockResponse::text("done"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "仅当有人且疑似赌博时再告警".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (_dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-policy-only",
+            None,
+        )
+        .await
+        .expect("policy-only run Completes with send blocked");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "policy conditional without this-event judgment must deliver 0"
+    );
+    assert!(
+        er.actions_executed.iter().any(|a| {
+            !a.success
+                && a.result
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Judgment notify gate")
+        }),
+        "gate must block policy-only send; actions={:?}",
+        er.actions_executed
+    );
+}
+
+/// Acceptance #5: prior event inconclusive (dark); this event has a valid
+/// positive judgment → deliver 1; old conclusion must not interfere.
+#[tokio::test]
+async fn judgment_gate_allows_positive_after_prior_inconclusive() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        // Prior-event style conclusion still present in the transcript.
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind device get cam-1"
+            }),
+        )
+        .with_text("画面过暗，证据不足，无法判断。")
+        .with_backend_text_shape(),
+        // This event: clear positive judgment + send.
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"Alert\" --body \"details\""
+            }),
+        )
+        .with_text("有人且疑似赌博。\nVerdict: criteria met")
+        .with_backend_text_shape(),
+        MockResponse::text("已发送告警。"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "仅当有人且疑似赌博时再告警".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let _ = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-prior-dark-this-met",
+            None,
+        )
+        .await
+        .expect("this-event positive after prior dark must Complete");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "prior inconclusive must not interfere with this event's positive judgment"
+    );
+}
+
+/// Change B: non-gambling task + clear positive judgment → sink 1.
+#[tokio::test]
+async fn judgment_gate_allows_non_gambling_positive_judgment() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            // Neutral title/body — markers live only in assistant judgment.
+            serde_json::json!({
+                "command": "heramind message send --title \"Smoke detected\" --body \"Zone B sensor trip\""
+            }),
+        )
+        .with_text("Smoke plume confirmed on camera.\nVerdict: criteria met")
+        .with_backend_text_shape(),
+        MockResponse::text("Alert sent."),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "Fire / smoke patrol: notify only when smoke is confirmed".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let _ = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-smoke",
+            None,
+        )
+        .await
+        .expect("positive non-gambling judgment must Complete");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "clear positive judgment on a non-gambling task must deliver 1 notification"
+    );
+}
+
+/// Finished this-event protocol `Verdict: criteria met` → sink gets exactly 1.
+/// The response carries the text shape every real backend produces (tool-call
+/// array appended to the text) — the gate reads the verdict before it.
+#[tokio::test]
+async fn judgment_gate_allows_send_when_criteria_met() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"Alert\" --body \"details\""
+            }),
+        )
+        .with_text("有人且疑似赌博。\nVerdict: criteria met")
+        .with_backend_text_shape(),
+        MockResponse::text("已发送告警。"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "仅当有人且疑似赌博时再告警".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (_dp, _er) = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-met",
+            None,
+        )
+        .await
+        .expect("criteria-met run must Complete");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "criteria met must deliver exactly 1 notification"
+    );
+}
+
+/// Verdict stated alongside an earlier tool call (backend text shape), then
+/// `message send` with EMPTY content — the latest non-empty assistant prose
+/// is that verdict → sink 1. Before the fix the appended array hid it.
+#[tokio::test]
+async fn judgment_gate_allows_empty_content_send_after_backend_shaped_verdict() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({ "command": "heramind device get cam-1" }),
+        )
+        .with_text("有人且疑似赌博。\nVerdict: criteria met")
+        .with_backend_text_shape(),
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"Alert\" --body \"details\""
+            }),
+        )
+        .with_text(""),
+        MockResponse::text("已发送告警。"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "仅当有人且疑似赌博时再告警".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let _ = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-met-empty-content",
+            None,
+        )
+        .await
+        .expect("criteria-met run must Complete");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "prior-round verdict must authorize the empty-content send"
+    );
+}
+
+/// Backend text shape does not loosen the gate: an explicit `criteria not
+/// met` before the appended array still blocks → sink 0.
+#[tokio::test]
+async fn judgment_gate_blocks_backend_shaped_not_met_verdict() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"告警\" --body \"疑似？\""
+            }),
+        )
+        .with_text("画面为空旷走廊，无赌博行为证据。\nVerdict: criteria not met")
+        .with_backend_text_shape(),
+        MockResponse::text("巡检完成：无赌博，无需告警。"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "仅当有人且疑似赌博时再 heramind message send".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (_dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-not-met-backend-shape",
+            None,
+        )
+        .await
+        .expect("patrol must Complete");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "criteria not met must deliver 0 notifications"
+    );
+    assert!(
+        er.actions_executed.iter().any(|a| {
+            !a.success
+                && a.result
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("alert criteria not met")
+        }),
+        "block reason must cite the not-met verdict; actions={:?}",
+        er.actions_executed
+    );
+}
+
+/// Change B: dark / undecidable → insufficient evidence recorded, 0 alerts.
+#[tokio::test]
+async fn judgment_gate_blocks_insufficient_evidence() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"dark\" --body \"maybe\""
+            }),
+        )
+        .with_text("画面过暗，证据不足，无法判断是否有赌博。"),
+        MockResponse::text("证据不足，本轮不告警。"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "赌博监测".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (dp, _) = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-insufficient",
+            None,
+        )
+        .await
+        .expect("insufficient-evidence patrol Completes");
+    assert!(
+        dp.conclusion.contains("证据不足") || dp.conclusion.contains("不告警"),
+        "must record insufficient evidence: {}",
+        dp.conclusion
+    );
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "insufficient evidence must deliver 0 alerts"
+    );
+}
+
+/// Change B: hallucinated CLI-domain `message` tool is rewritten to shell and
+/// hits the **same** judgment gate (title-only → 0).
+#[tokio::test]
+async fn judgment_gate_blocks_rewritten_message_tool_title_only() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "message",
+            serde_json::json!({
+                "title": "疑似赌博",
+                "content": "self-approve attempt"
+            }),
+        )
+        .with_text(""),
+        MockResponse::text("done"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.user_prompt = "赌博监测".into();
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    });
+
+    let mut registry = ToolRegistry::new();
+    // Only shell is registered — `message` must be rewritten to shell first,
+    // then gated by judgment_deny_for_tool_call (shared entry point).
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (_dp, er) = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-judgment-rewritten-message",
+            None,
+        )
+        .await
+        .expect("rewritten path Completes with send blocked");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "rewritten message→shell must share judgment gate (0 sends)"
+    );
+    assert!(
+        er.actions_executed.iter().any(|a| {
+            a.target == "shell"
+                && !a.success
+                && a.result
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Judgment notify gate")
+        }),
+        "gate must fire on rewritten shell call; actions={:?}",
+        er.actions_executed
+    );
+}
+
+/// Change B: ordinary Always notify keeps old contract (send not gated).
+#[tokio::test]
+async fn always_notify_agent_send_not_gated() {
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "shell",
+            serde_json::json!({
+                "command": "heramind message send --title \"note\" --body \"无赌博但仍通知\""
+            }),
+        )
+        .with_text("无赌博，但 Always 路径仍可发送。"),
+        MockResponse::text("done"),
+    ])
+    .with_function_calling()
+    .with_supports_images();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.execution_mode = ExecutionMode::Free;
+    agent.notify = Some(heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Always,
+    });
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeNotifySink {
+        sends: sends.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let _ = executor
+        .execute_with_tools(
+            &agent,
+            &[event_jpeg_data(&test_jpeg_base64(0x5A))],
+            rt_dyn,
+            "exec-always-ungated",
+            None,
+        )
+        .await
+        .expect("Always notify run");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "Always notify must keep the old send contract"
+    );
+}
+
+/// Empty-event image extraction skip → Completed, no stats bump, no breaker.
+#[tokio::test]
+async fn empty_event_skip_does_not_trip_breaker_or_stats() {
+    let (executor, mut agent, _) = build_harness().await;
+    agent.execution_mode = ExecutionMode::Free;
+    agent.schedule.schedule_type = ScheduleType::Event;
+    agent.consecutive_failures = 1; // pre-existing strike must stay
+    agent.parsed_intent = Some(heramind_storage::ParsedIntent {
+        intent_type: heramind_storage::IntentType::Monitoring,
+        target_metrics: vec![],
+        conditions: vec![],
+        actions: vec![],
+        confidence: 0.9,
+    });
+    executor.store().save_agent(&agent).await.expect("seed");
+
+    // Image-named field with non-image value → extraction fails → empty skip.
+    let event = super::context::EventTriggerData {
+        source: super::context::DataSourceRef {
+            source_type: "device".into(),
+            source_id: "cam-1".into(),
+            field: "image_data".into(),
+        },
+        value: heramind_core::event::MetricValue::Float(1.0),
+        timestamp: 0,
+    };
+
+    let record = executor
+        .execute_agent(agent.clone(), Some(event), None)
+        .await
+        .expect("skip returns Ok record");
+    assert_eq!(record.status, heramind_storage::ExecutionStatus::Completed);
+    assert!(record.error.is_none());
+    assert!(
+        record
+            .result
+            .as_ref()
+            .is_some_and(|r| r.summary.starts_with("Skipped:")),
+        "expected skip summary, got {:?}",
+        record.result.as_ref().map(|r| &r.summary)
+    );
+
+    let stored = executor
+        .store()
+        .get_agent(&agent.id)
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(stored.stats.successful_executions, 0);
+    assert_eq!(stored.stats.failed_executions, 0);
+    assert_eq!(
+        stored.consecutive_failures, 1,
+        "skip must not increment or reset breaker strikes"
+    );
+    assert_eq!(stored.status, AgentStatus::Active);
+}
+
+// ─── What T4's three Dongpingshan camera agents exposed (2026-11-21 .. 11-23) ───
+
+/// A knowledge-file store in a private temp dir; the caller removes the dir.
+fn temp_memory_store() -> (
+    Arc<heramind_storage::MarkdownMemoryStore>,
+    std::path::PathBuf,
+) {
+    let dir = std::env::temp_dir().join(format!(
+        "heramind-behavior-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    (
+        Arc::new(heramind_storage::MarkdownMemoryStore::new(&dir)),
+        dir,
+    )
+}
+
+fn judgment_notify() -> heramind_storage::AgentNotify {
+    heramind_storage::AgentNotify {
+        channels: vec!["webhook:ops".into()],
+        on: heramind_storage::NotifyOn::Judgment,
+    }
+}
+
+fn task_understanding_ref() -> heramind_storage::KnowledgeFileRef {
+    heramind_storage::KnowledgeFileRef {
+        name: heramind_storage::TASK_UNDERSTANDING_FILE.into(),
+        description: String::new(),
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
+/// A `web_search` that only counts calls — the side effect that must never
+/// happen for a judgment-notify agent.
+struct WebSearchProbe {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for WebSearchProbe {
+    fn name(&self) -> &str {
+        "web_search"
+    }
+    fn description(&self) -> &str {
+        "web search probe"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"]
+        })
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolOutput::success("[]"))
+    }
+}
+
+/// The task definition is inlined from `custom:task-understanding` on every
+/// run. A prompt edit that never reached the file kept feeding the model the
+/// old mission — T4's agents read "用 vision 工具分析该图片" for two days
+/// after the operator removed it from the prompt. The executor repairs the
+/// file before inlining it, so the model never sees the stale copy.
+///
+/// This path has no previous prompt to match the old mission by, so the
+/// repair is for the prompt only: what is under the heading may be the
+/// operator's, and the file is theirs to fix.
+#[tokio::test]
+async fn stale_task_understanding_mission_is_resynced_before_it_is_inlined() {
+    const MISSION: &str = "NEW_MISSION 直接看附带的图片";
+    const STALE_FILE: &str = "# Task Understanding\n\n## Mission\nOLD_MISSION 用 vision 工具分析该图片\n\n## Notes\nLEARNED_NOTE\n";
+    let (memory, dir) = temp_memory_store();
+    let (mut executor, mut agent, _) = build_harness_with_memory(Some(memory.clone())).await;
+    agent.user_prompt = MISSION.into();
+    memory
+        .write_agent_custom_file(
+            &agent.id,
+            heramind_storage::TASK_UNDERSTANDING_FILE,
+            STALE_FILE,
+        )
+        .await
+        .expect("seed a stale file");
+    agent.memory.knowledge_files.push(task_understanding_ref());
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool));
+    executor.set_tool_registry(Arc::new(registry));
+    let rt = MockLlmRuntime::new(vec![MockResponse::text("无人，无赌博行为。")])
+        .with_function_calling()
+        .with_supports_images();
+    let handle = rt.clone();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let _ = executor
+        .execute_with_tools(&agent, &[], rt_dyn, "exec-stale-mission", None)
+        .await
+        .expect("run completes");
+
+    let system = handle.captured_messages()[0].to_string();
+    assert!(
+        system.contains("#### custom:task-understanding"),
+        "the knowledge file is inlined: {system}"
+    );
+    assert!(
+        !system.contains("OLD_MISSION"),
+        "a stale mission must not reach the model: {system}"
+    );
+    assert!(
+        system.contains(MISSION),
+        "the current mission reaches the model: {system}"
+    );
+    assert!(
+        system.contains("LEARNED_NOTE"),
+        "the agent's own notes stay inlined: {system}"
+    );
+
+    // The old mission's extent is not known here, so nothing is written.
+    let on_disk = memory
+        .read_agent_custom_file(&agent.id, heramind_storage::TASK_UNDERSTANDING_FILE)
+        .expect("file");
+    assert_eq!(on_disk, STALE_FILE, "the file is left as it was");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The operator writes in this file too. A note they filed under the
+/// mission, with or without a heading of its own, survives every run — the
+/// prompt shows the task prompt in the mission's place, the file stays.
+#[tokio::test]
+async fn an_operators_note_under_a_stale_mission_is_never_written_over() {
+    const MISSION: &str = "NEW_MISSION 直接看附带的图片";
+    for operator_file in [
+        // Their own section, filed between the mission and the template's
+        // next heading.
+        "# Task Understanding\n\n## Mission\nOLD_MISSION\n\n## Operator Notes\nKEEP-ME\n\n## Bound Resources\nNone\n",
+        // A bare note written right under the mission.
+        "# Task Understanding\n\n## Mission\nOLD_MISSION\n\nKEEP-ME, no heading\n\n## Bound Resources\nNone\n",
+    ] {
+        let (memory, dir) = temp_memory_store();
+        let (mut executor, mut agent, _) =
+            build_harness_with_memory(Some(memory.clone())).await;
+        agent.user_prompt = MISSION.into();
+        memory
+            .write_agent_custom_file(
+                &agent.id,
+                heramind_storage::TASK_UNDERSTANDING_FILE,
+                operator_file,
+            )
+            .await
+            .expect("seed the operator's file");
+        agent.memory.knowledge_files.push(task_understanding_ref());
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        executor.set_tool_registry(Arc::new(registry));
+        let rt = MockLlmRuntime::new(vec![MockResponse::text("无人，无赌博行为。")])
+            .with_function_calling()
+            .with_supports_images();
+        let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+        executor.set_llm_runtime(rt_dyn.clone()).await;
+
+        let _ = executor
+            .execute_with_tools(&agent, &[], rt_dyn, "exec-operator-note", None)
+            .await
+            .expect("run completes");
+
+        let on_disk = memory
+            .read_agent_custom_file(&agent.id, heramind_storage::TASK_UNDERSTANDING_FILE)
+            .expect("file");
+        assert_eq!(on_disk, operator_file, "the operator's file is theirs");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// T4's 200366 replaced its task with one per-run observation
+/// ("无图像数据路径，需设备日志搜索") and then reasoned from that note on
+/// every later run. Whatever the agent writes into the file, the end of a run
+/// puts the mission back on top — the note survives below it.
+#[tokio::test]
+async fn a_task_understanding_overwritten_by_the_agent_gets_its_mission_back() {
+    const MISSION: &str = "MISSION_TEXT";
+    let (memory, dir) = temp_memory_store();
+    let (executor, mut agent, _) = build_harness_with_memory(Some(memory.clone())).await;
+    agent.user_prompt = MISSION.into();
+    agent.memory.knowledge_files.push(task_understanding_ref());
+    let note = "# NE301PIR-200366 任务理解\n## 图像数据路径\n- 无图像数据路径，需设备日志搜索\n";
+    memory
+        .write_agent_custom_file(&agent.id, heramind_storage::TASK_UNDERSTANDING_FILE, note)
+        .await
+        .expect("the agent overwrote its own file");
+
+    // What the executor runs at the end of every execution.
+    executor
+        .finalize_execution_memory(
+            &agent,
+            &[],
+            "无人，无赌博行为。",
+            "exec-overwritten-mission",
+            true,
+            "natural-completion",
+            &None,
+        )
+        .await
+        .expect("memory finalization");
+
+    let on_disk = memory
+        .read_agent_custom_file(&agent.id, heramind_storage::TASK_UNDERSTANDING_FILE)
+        .expect("file");
+    assert_eq!(
+        heramind_storage::task_understanding_mission(&on_disk),
+        Some(MISSION),
+        "the mission comes back: {on_disk}"
+    );
+    assert!(
+        on_disk.ends_with(note),
+        "the agent's note is its own to keep: {on_disk}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The tool names the executor advertises to the model for `agent` on its
+/// first LLM call, with an `echo` tool and a `web_search` probe registered.
+async fn offered_tool_names(agent: &AiAgent) -> Vec<String> {
+    let (mut executor, _, _) = build_harness().await;
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool));
+    registry.register(Arc::new(WebSearchProbe {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    let rt = MockLlmRuntime::new(vec![MockResponse::text("done")]).with_function_calling();
+    let handle = rt.clone();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+    let _ = executor
+        .execute_with_tools(agent, &[], rt_dyn, "exec-offered-tools", None)
+        .await
+        .expect("run completes");
+    handle.captured_tool_names()[0].clone()
+}
+
+/// A judgment-notify agent decides from the input attached to this run. Web
+/// tools only send the model hunting for what it believes is missing, and
+/// they leave the site with the query (T4: 233 searches carrying device IDs
+/// and the site name). Not offered unless the allowlist names them.
+#[tokio::test]
+async fn judgment_agent_is_not_offered_web_tools_unless_allowlisted() {
+    // Stock agent: every tool goes out.
+    let mut agent = build_harness().await.1;
+    let names = offered_tool_names(&agent).await;
+    assert!(names.contains(&"echo".to_string()), "{names:?}");
+    assert!(names.contains(&"web_search".to_string()), "{names:?}");
+
+    // Judgment-notify: the web tool stays home.
+    agent.notify = Some(judgment_notify());
+    let names = offered_tool_names(&agent).await;
+    assert!(names.contains(&"echo".to_string()), "{names:?}");
+    assert!(
+        !names.contains(&"web_search".to_string()),
+        "web tools are off for a judgment-notify agent: {names:?}"
+    );
+
+    // …unless the operator's allowlist says otherwise.
+    agent.tool_config = Some(heramind_storage::AgentToolConfig {
+        enabled: true,
+        allowed_tools: vec!["echo".into(), "web_search".into()],
+    });
+    let names = offered_tool_names(&agent).await;
+    assert!(names.contains(&"web_search".to_string()), "{names:?}");
+
+    // Any other notify trigger is untouched.
+    agent.tool_config = None;
+    agent.notify.as_mut().expect("notify").on = heramind_storage::NotifyOn::Always;
+    let names = offered_tool_names(&agent).await;
+    assert!(names.contains(&"web_search".to_string()), "{names:?}");
+}
+
+/// Not offering the tool is not enough — a small model invents tool names.
+/// The call itself is refused, so the registry never runs it.
+#[tokio::test]
+async fn judgment_agent_web_tool_call_is_blocked_even_when_invented() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = MockLlmRuntime::new(vec![
+        MockResponse::tool_call(
+            "web_search",
+            serde_json::json!({ "query": "NE301PIR-200366 image data path" }),
+        ),
+        MockResponse::text("done"),
+    ])
+    .with_function_calling();
+    let rt_dyn: Arc<dyn LlmRuntime> = Arc::new(rt);
+
+    let (mut executor, mut agent, _) = build_harness().await;
+    agent.notify = Some(judgment_notify());
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(WebSearchProbe {
+        calls: calls.clone(),
+    }));
+    executor.set_tool_registry(Arc::new(registry));
+    executor.set_llm_runtime(rt_dyn.clone()).await;
+
+    let (_, er) = executor
+        .execute_with_tools(&agent, &[], rt_dyn, "exec-blocked-web-tool", None)
+        .await
+        .expect("run completes with the call blocked");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a judgment-notify agent must never run a web tool"
+    );
+    assert!(
+        er.actions_executed.iter().any(|a| a.target == "web_search"
+            && !a.success
+            && a.result
+                .as_deref()
+                .unwrap_or("")
+                .contains("Web tools are off")),
+        "the block must be visible to the model and in the record; actions={:?}",
+        er.actions_executed
+    );
 }

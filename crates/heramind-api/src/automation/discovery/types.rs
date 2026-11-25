@@ -1038,6 +1038,28 @@ pub struct DraftDevice {
     /// Whether this device sends binary/hex data (not JSON)
     #[serde(default)]
     pub is_binary: bool,
+    /// How MQTT identity was resolved at discovery (`configured_payload`,
+    /// `auto_payload`, `topic_strong`, …). Persisted so approve/ingest reuse
+    /// the same rule (discover ≠ ingest drift).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mqtt_identity_source: Option<String>,
+    /// JSON field name used when identity came from payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mqtt_identity_field: Option<String>,
+    /// True when this draft is an MQTT association exception (Conflict /
+    /// Unverifiable against an already-registered identity). Customer-visible
+    /// pending confirm — not a silent drop and not an auto-overwrite.
+    #[serde(default)]
+    pub association_exception: bool,
+    /// `conflict` | `unverifiable` when [`Self::association_exception`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association_exception_kind: Option<String>,
+    /// Registered device ids that must not be overwritten by this candidate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_device_ids: Vec<String>,
+    /// Discovery-resolved identity that could not formally associate (e.g. topic A).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_identity: Option<String>,
 }
 
 /// A generated device type from AI analysis
@@ -1154,6 +1176,12 @@ impl DraftDevice {
             auto_approve: false,
             is_binary: false,
             adapter_id: None,
+            mqtt_identity_source: None,
+            mqtt_identity_field: None,
+            association_exception: false,
+            association_exception_kind: None,
+            blocked_device_ids: Vec::new(),
+            claimed_identity: None,
         }
     }
 

@@ -5,31 +5,39 @@
 //! `format_output`) and the in-process dispatcher (which returns the data to
 //! the agent without touching stdout).
 
+use super::DispatchContext;
 use crate::types::{CliResponse, OutputFormat};
 use anyhow::Result;
 // Bring all clap command types into scope.
 #[allow(unused_imports)]
 use super::commands::*;
 
-/// Returns true for extension subcommands that touch the local filesystem
-/// (`validate`, `install`, `uninstall`, `create`, `build`, `info`) and must
-/// run as a subprocess so their stdout is captured by the agent.
+/// Returns true for extension subcommands that operate purely on the local
+/// filesystem (`validate`, `create`, `build`, or explicit `--offline` mode for
+/// `install`/`uninstall`/`get`) and must run out-of-process in the full CLI.
 pub fn is_local_extension_command(cmd: &ExtensionCommand) -> bool {
     matches!(
         cmd,
         ExtensionCommand::Validate { .. }
-            | ExtensionCommand::Install { .. }
-            | ExtensionCommand::Uninstall { .. }
             | ExtensionCommand::Create { .. }
             | ExtensionCommand::Build { .. }
-            | ExtensionCommand::Get { .. }
+            | ExtensionCommand::Install { offline: true, .. }
+            | ExtensionCommand::Uninstall { offline: true, .. }
+            | ExtensionCommand::Get { offline: true, .. }
     )
 }
 
 pub async fn run_extension_cmd(cmd: ExtensionCommand) -> Result<(CliResponse, OutputFormat)> {
-    // Local-only subcommands (validate/install/uninstall/create/build/info) are
-    // handled by the binary directly — they print to stdout and rely on
-    // subprocess capture. The dispatcher pre-filters them via
+    run_extension_cmd_with_context(cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_extension_cmd_with_context(
+    cmd: ExtensionCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    // Local-only subcommands (validate/create/build or explicit --offline) are
+    // handled by the binary directly — they touch the local filesystem and
+    // print to stdout. The dispatcher pre-filters them via
     // `is_local_extension_command`, so reaching this handler with a local
     // command is a programming error.
     if is_local_extension_command(&cmd) {
@@ -38,23 +46,40 @@ pub async fn run_extension_cmd(cmd: ExtensionCommand) -> Result<(CliResponse, Ou
         );
     }
 
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
-    let client = crate::ApiClient::with_base_url(&api_base);
-    let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let output_format = ctx.output_format();
 
     let response = match cmd {
         ExtensionCommand::List { verbose: _ } => crate::extension::list_extensions(&client).await?,
-        ExtensionCommand::Status { id } => {
-            crate::extension::get_extension_status(&client, &id).await?
-        }
-        ExtensionCommand::Logs { id, lines } => {
-            crate::extension::get_extension_logs(&client, &id, lines).await?
-        }
+        ExtensionCommand::Get {
+            id_or_path,
+            offline: false,
+        } => crate::extension::get_extension(&client, &id_or_path).await?,
+        ExtensionCommand::Install {
+            package,
+            offline: false,
+        } => crate::extension::install_extension_file(&client, &package).await?,
+        ExtensionCommand::Uninstall {
+            id,
+            yes: _,
+            offline: false,
+        } => crate::extension::uninstall_extension(&client, &id).await?,
+        ExtensionCommand::Status { id } => match id {
+            Some(id) => crate::extension::get_extension_status(&client, &id).await?,
+            // Bare `extension status` — list with health fields instead of clap
+            // missing_required (Stage-3 overnight: extension-status-diagnose ×3).
+            None => crate::extension::list_extensions(&client).await?,
+        },
+        ExtensionCommand::Logs { id, lines } => match id {
+            Some(id) => crate::extension::get_extension_logs(&client, &id, lines).await?,
+            None => {
+                let mut resp = crate::extension::list_extensions(&client).await?;
+                resp = resp.with_suggestion(
+                    "Pass an extension ID: `heramind extension logs <ID> [--lines N]`. Discover IDs with `heramind extension list` or `heramind extension status`.",
+                );
+                resp
+            }
+        },
         ExtensionCommand::MarketInstall {
             extension_id,
             version,
@@ -62,15 +87,55 @@ pub async fn run_extension_cmd(cmd: ExtensionCommand) -> Result<(CliResponse, Ou
             crate::extension::install_extension_market(&client, &extension_id, version.as_deref())
                 .await?
         }
-        ExtensionCommand::MarketList => crate::extension::list_marketplace(&client).await?,
+        ExtensionCommand::MarketList { filter, verbose } => {
+            crate::extension::list_marketplace(&client, filter.as_deref(), verbose).await?
+        }
         ExtensionCommand::Reload { id } => crate::extension::reload_extension(&client, &id).await?,
         ExtensionCommand::Config { id, set } => match set {
-            Some(json_str) => {
-                let config = serde_json::from_str(&json_str).unwrap_or(serde_json::json!(json_str));
-                crate::extension::update_extension_config(&client, &id, config).await?
-            }
+            Some(json_str) => match crate::json_arg::parse_json_arg(&json_str) {
+                Ok(config) => {
+                    crate::extension::update_extension_config(&client, &id, config).await?
+                }
+                Err(e) => crate::types::CliResponse::error_with_suggestion(
+                    format!("Invalid --set JSON: {}", e),
+                    "INVALID_JSON",
+                    r#"Pass a JSON object, e.g. --set {"key":"value"}."#,
+                ),
+            },
             None => crate::extension::get_extension_config(&client, &id).await?,
         },
+        ExtensionCommand::Commands { id, search } => {
+            if let Some(q) = search {
+                crate::extension::search_extension_commands(&client, &q, id.as_deref()).await?
+            } else {
+                let id = id.expect("clap requires id without --search");
+                crate::extension::list_extension_commands(&client, &id).await?
+            }
+        }
+        ExtensionCommand::Invoke {
+            extension_id,
+            command,
+            params,
+            params_file,
+            prepared_operation_id,
+        } => {
+            // NM-247: host context wins for structured params + ticket
+            // (no re-stringify; model never needs to echo the token).
+            let host = super::host_context::peek_extension_invoke_host_context();
+            let host_ticket = host.as_ref().and_then(|h| h.prepared_operation_id.clone());
+            let ticket = host_ticket.as_deref().or(prepared_operation_id.as_deref());
+            let host_params = host.and_then(|h| h.structured_params);
+            crate::extension::invoke_extension_command(
+                &client,
+                &extension_id,
+                &command,
+                params.as_deref(),
+                params_file.as_deref(),
+                ticket,
+                host_params,
+            )
+            .await?
+        }
         // Local commands are guarded above; any other variant is a bug.
         _ => unreachable!("unhandled extension subcommand reached run_extension_cmd"),
     };
@@ -79,16 +144,17 @@ pub async fn run_extension_cmd(cmd: ExtensionCommand) -> Result<(CliResponse, Ou
 }
 
 pub async fn run_llm_cmd(cmd: LlmCommand) -> Result<(CliResponse, OutputFormat)> {
+    run_llm_cmd_with_context(cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_llm_cmd_with_context(
+    cmd: LlmCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
     use crate::llm::*;
 
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
-    let client = crate::ApiClient::with_base_url(&api_base);
-    let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let output_format = ctx.output_format();
 
     let response = match cmd {
         LlmCommand::List {} => list_backends(&client).await?,
@@ -141,28 +207,25 @@ pub async fn run_llm_cmd(cmd: LlmCommand) -> Result<(CliResponse, OutputFormat)>
 }
 
 pub async fn run_device_cmd(cmd: DeviceCommand) -> Result<(CliResponse, OutputFormat)> {
-    use crate::{device::*, ApiClient};
+    run_device_cmd_with_context(cmd, &DispatchContext::default()).await
+}
 
-    // Get API base URL from environment or use default
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
+pub async fn run_device_cmd_with_context(
+    cmd: DeviceCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    use crate::device::*;
 
-    // Create API client
-    let client = ApiClient::with_base_url(&api_base);
-
-    // Resolve output format: HERAMIND_JSON env var > Human default
-    let base_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let base_format = ctx.output_format();
 
     let (response, output_format) = match cmd {
         DeviceCommand::List {
             device_type,
             status,
+            summary,
         } => (
-            list_devices(&client, device_type.as_deref(), status.as_deref()).await?,
+            list_devices(&client, device_type.as_deref(), status.as_deref(), summary).await?,
             base_format,
         ),
         DeviceCommand::Get { id, metric } => (
@@ -177,7 +240,7 @@ pub async fn run_device_cmd(cmd: DeviceCommand) -> Result<(CliResponse, OutputFo
             config,
         } => {
             let connection_config = if let Some(config_str) = config {
-                Some(serde_json::from_str(&config_str)?)
+                Some(crate::json_arg::parse_json_arg(&config_str)?)
             } else {
                 None
             };
@@ -196,7 +259,7 @@ pub async fn run_device_cmd(cmd: DeviceCommand) -> Result<(CliResponse, OutputFo
         }
         DeviceCommand::Update { id, name, config } => {
             let connection_config = if let Some(config_str) = config {
-                Some(serde_json::from_str(&config_str)?)
+                Some(crate::json_arg::parse_json_arg(&config_str)?)
             } else {
                 None
             };
@@ -236,7 +299,7 @@ pub async fn run_device_cmd(cmd: DeviceCommand) -> Result<(CliResponse, OutputFo
             param,
         } => {
             let mut params_json = if let Some(params_str) = params {
-                serde_json::from_str(&params_str)?
+                crate::json_arg::parse_json_arg(&params_str)?
             } else {
                 serde_json::json!({})
             };
@@ -279,7 +342,7 @@ pub async fn run_device_cmd(cmd: DeviceCommand) -> Result<(CliResponse, OutputFo
         }
         DeviceCommand::WebhookUrl { id } => (get_webhook_url(&client, &id).await?, base_format),
         DeviceCommand::Drafts { draft_cmd } => {
-            return run_draft_cmd(draft_cmd).await;
+            return run_draft_cmd_with_context(draft_cmd, ctx).await;
         }
     };
 
@@ -289,14 +352,17 @@ pub async fn run_device_cmd(cmd: DeviceCommand) -> Result<(CliResponse, OutputFo
 
 /// Run device draft management commands.
 pub async fn run_draft_cmd(cmd: DraftCommand) -> Result<(CliResponse, OutputFormat)> {
+    run_draft_cmd_with_context(cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_draft_cmd_with_context(
+    cmd: DraftCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
     use crate::device::*;
 
-    let client = crate::ApiClient::new();
-    let base_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let base_format = ctx.output_format();
     let response = match cmd {
         DraftCommand::List {} => (list_drafts(&client).await?, base_format),
         DraftCommand::Get { id } => (get_draft(&client, &id).await?, base_format),
@@ -307,12 +373,11 @@ pub async fn run_draft_cmd(cmd: DraftCommand) -> Result<(CliResponse, OutputForm
         DraftCommand::Reject { id } => (reject_draft(&client, &id).await?, base_format),
         DraftCommand::Config {
             enabled,
-            auto_approve,
             max_samples,
         } => {
-            if enabled.is_some() || auto_approve.is_some() || max_samples.is_some() {
+            if enabled.is_some() || max_samples.is_some() {
                 (
-                    update_onboard_config(&client, enabled, max_samples, auto_approve).await?,
+                    update_onboard_config(&client, enabled, max_samples).await?,
                     base_format,
                 )
             } else {
@@ -341,9 +406,9 @@ pub async fn run_device_type_cmd(
             metrics,
             commands,
         } => {
-            let metrics_json = serde_json::from_str(&metrics)?;
+            let metrics_json = crate::json_arg::parse_json_arg(&metrics)?;
             let commands_json = if let Some(cmds_str) = commands {
-                Some(serde_json::from_str(&cmds_str)?)
+                Some(crate::json_arg::parse_json_arg(&cmds_str)?)
             } else {
                 None
             };
@@ -358,21 +423,17 @@ pub async fn run_device_type_cmd(
 
 /// Run dashboard management commands.
 pub async fn run_dashboard_cmd(cmd: DashboardCommand) -> Result<(CliResponse, OutputFormat)> {
-    use crate::{dashboard::*, ApiClient};
+    run_dashboard_cmd_with_context(cmd, &DispatchContext::default()).await
+}
 
-    // Get API base URL from environment or use default
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
+pub async fn run_dashboard_cmd_with_context(
+    cmd: DashboardCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    use crate::dashboard::*;
 
-    // Create API client
-    let client = ApiClient::with_base_url(&api_base);
-
-    // Get output format (controlled by HERAMIND_JSON env var)
-    let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let output_format = ctx.output_format();
 
     let (response, output_format) = match cmd {
         DashboardCommand::List {} => {
@@ -394,12 +455,12 @@ pub async fn run_dashboard_cmd(cmd: DashboardCommand) -> Result<(CliResponse, Ou
             components,
         } => {
             let layout_json = if let Some(layout_str) = layout {
-                Some(serde_json::from_str(&layout_str)?)
+                Some(crate::json_arg::parse_json_arg(&layout_str)?)
             } else {
                 None
             };
             let components_json = if let Some(components_str) = components {
-                Some(serde_json::from_str(&components_str)?)
+                Some(crate::json_arg::parse_json_arg(&components_str)?)
             } else {
                 None
             };
@@ -428,20 +489,20 @@ pub async fn run_dashboard_cmd(cmd: DashboardCommand) -> Result<(CliResponse, Ou
             if components.is_some() && !replace_all {
                 return Err(anyhow::anyhow!(
                     "--components replaces ALL dashboard components and needs an explicit --replace-all confirmation.\n\
-                     Most likely you want one of these instead:\n\
-                     - ADD widgets:    heramind dashboard add-components {id} --components '[...]'\n\
-                     - TWEAK one widget: heramind dashboard update-component {id} --component-id <cid> --set '{...}'\n\
+                     Most likely you want one of these instead (prefer shell {{command, params}}):\n\
+                     - ADD widgets:    {{\"command\":\"heramind dashboard add-components {id}\",\"params\":[<component objects>]}}\n\
+                     - TWEAK one widget: {{\"command\":\"heramind dashboard update-component {id} --component-id <cid>\",\"params\":{{...}}}}\n\
                      - TRULY replace everything: re-run with --replace-all"
                         .replace("{id}", &id)
                 ));
             }
             let layout_json = if let Some(layout_str) = layout {
-                Some(serde_json::from_str(&layout_str)?)
+                Some(crate::json_arg::parse_json_arg(&layout_str)?)
             } else {
                 None
             };
             let components_json = if let Some(components_str) = components {
-                Some(serde_json::from_str(&components_str)?)
+                Some(crate::json_arg::parse_json_arg(&components_str)?)
             } else {
                 None
             };
@@ -461,7 +522,7 @@ pub async fn run_dashboard_cmd(cmd: DashboardCommand) -> Result<(CliResponse, Ou
             // Propagate parse errors — a silent empty-array fallback made
             // malformed JSON "succeed" with zero components added, and the
             // model retried in a confused loop (observed ×5 in evals).
-            let comps = serde_json::from_str(&components)?;
+            let comps = crate::json_arg::parse_json_arg(&components)?;
             let resp = add_components(&client, &id, comps).await?;
             (resp, output_format)
         }
@@ -470,12 +531,12 @@ pub async fn run_dashboard_cmd(cmd: DashboardCommand) -> Result<(CliResponse, Ou
             component_id,
             set,
         } => {
-            let patch = serde_json::from_str(&set)?;
+            let patch = crate::json_arg::parse_json_arg(&set)?;
             let resp = update_component(&client, &id, &component_id, patch).await?;
             (resp, output_format)
         }
         DashboardCommand::RemoveComponents { id, ids } => {
-            let ids_val = serde_json::from_str(&ids)?;
+            let ids_val = crate::json_arg::parse_json_arg(&ids)?;
             let resp = remove_components(&client, &id, ids_val).await?;
             (resp, output_format)
         }
@@ -496,21 +557,17 @@ pub async fn run_dashboard_cmd(cmd: DashboardCommand) -> Result<(CliResponse, Ou
 
 /// Run rule management commands.
 pub async fn run_rule_cmd(cmd: RuleCommand) -> Result<(CliResponse, OutputFormat)> {
-    use crate::{rule::*, ApiClient};
+    run_rule_cmd_with_context(cmd, &DispatchContext::default()).await
+}
 
-    // Get API base URL from environment or use default
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
+pub async fn run_rule_cmd_with_context(
+    cmd: RuleCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    use crate::rule::*;
 
-    // Create API client
-    let client = ApiClient::with_base_url(&api_base);
-
-    // Get output format (controlled by HERAMIND_JSON env var)
-    let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let output_format = ctx.output_format();
 
     let response = match cmd {
         RuleCommand::List => list_rules(&client).await?,
@@ -528,7 +585,7 @@ pub async fn run_rule_cmd(cmd: RuleCommand) -> Result<(CliResponse, OutputFormat
             cooldown,
         } => {
             let json_body = match body {
-                Some(b) => b,
+                Some(b) => crate::rule::merge_rule_create_name_into_body(&b, name.as_deref())?,
                 None => {
                     let Some(name) = name else {
                         anyhow::bail!("--name is required on the flag fast path (or use --body)");
@@ -562,20 +619,67 @@ pub async fn run_rule_cmd(cmd: RuleCommand) -> Result<(CliResponse, OutputFormat
             };
             create_rule(&client, &json_body).await?
         }
-        RuleCommand::Update { id, id_flag, body } => {
+        RuleCommand::Update {
+            id,
+            id_flag,
+            body,
+            name,
+            trigger_device,
+            metric,
+            source,
+            operator,
+            threshold,
+            notify,
+            severity,
+            cooldown,
+        } => {
             let rule_id = id.or(id_flag).ok_or_else(|| {
                 anyhow::anyhow!("rule ID is required: pass it positionally (`rule update <ID> --body ...`) or as --id <ID>.\nHint: list rules with: heramind rule list")
             })?;
-            update_rule(&client, &rule_id, &body).await?
+            match body {
+                Some(b) => update_rule(&client, &rule_id, &b).await?,
+                None => {
+                    let has_any = name.is_some()
+                        || trigger_device.is_some()
+                        || metric.is_some()
+                        || source.is_some()
+                        || operator.is_some()
+                        || threshold.is_some()
+                        || notify.is_some()
+                        || severity.is_some()
+                        || cooldown.is_some();
+                    if !has_any {
+                        anyhow::bail!(
+                            "nothing to update: pass a JSON body via shell params \
+                             ({{command:\"heramind rule update <ID>\", params:{{...}}}}) \
+                             or fast-path flags (--name / --trigger-device + --metric + \
+                             --operator + --threshold / --notify / --cooldown)"
+                        );
+                    }
+                    let patch = crate::rule::RuleFastPatchArgs {
+                        name: name.as_deref(),
+                        trigger_device: trigger_device.as_deref(),
+                        metric: metric.as_deref(),
+                        source: source.as_deref(),
+                        operator: operator.as_deref(),
+                        threshold,
+                        notify: notify.as_deref(),
+                        severity: severity.as_deref(),
+                        cooldown,
+                    };
+                    update_rule_fast(&client, &rule_id, &patch).await?
+                }
+            }
         }
         RuleCommand::Delete { id } => delete_rule(&client, &id).await?,
         RuleCommand::Enable { id } => enable_rule(&client, &id).await?,
         RuleCommand::Disable { id } => disable_rule(&client, &id).await?,
         RuleCommand::Test { id, input } => {
-            let input_json = serde_json::from_str(&input)?;
+            let input_json = crate::json_arg::parse_json_arg(&input)?;
             test_rule(&client, &id, input_json).await?
         }
         RuleCommand::History { id } => get_rule_history(&client, &id).await?,
+        RuleCommand::Explain { id } => explain_rule(&client, &id).await?,
     };
 
     // Format and print output
@@ -584,21 +688,17 @@ pub async fn run_rule_cmd(cmd: RuleCommand) -> Result<(CliResponse, OutputFormat
 
 /// Run transform management commands.
 pub async fn run_transform_cmd(cmd: TransformCommand) -> Result<(CliResponse, OutputFormat)> {
-    use crate::{transform::*, ApiClient};
+    run_transform_cmd_with_context(cmd, &DispatchContext::default()).await
+}
 
-    // Get API base URL from environment or use default
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
+pub async fn run_transform_cmd_with_context(
+    cmd: TransformCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    use crate::transform::*;
 
-    // Create API client
-    let client = ApiClient::with_base_url(&api_base);
-
-    // Get output format (controlled by HERAMIND_JSON env var)
-    let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let output_format = ctx.output_format();
 
     let response = match cmd {
         TransformCommand::List => list_transforms(&client).await?,
@@ -651,7 +751,7 @@ pub async fn run_transform_cmd(cmd: TransformCommand) -> Result<(CliResponse, Ou
         TransformCommand::Disable { id } => disable_transform(&client, &id).await?,
         TransformCommand::Metrics => list_virtual_metrics(&client).await?,
         TransformCommand::TestCode { code, input } => {
-            let input_json = serde_json::from_str(&input)?;
+            let input_json = crate::json_arg::parse_json_arg(&input)?;
             test_transform_code(&client, &code, input_json).await?
         }
         TransformCommand::DataSources => list_transform_data_sources(&client).await?,
@@ -663,21 +763,17 @@ pub async fn run_transform_cmd(cmd: TransformCommand) -> Result<(CliResponse, Ou
 
 /// Run agent management commands.
 pub async fn run_agent_cmd(cmd: AgentCommand) -> Result<(CliResponse, OutputFormat)> {
-    use crate::{agent_cmd::*, ApiClient};
+    run_agent_cmd_with_context(cmd, &DispatchContext::default()).await
+}
 
-    // Get API base URL from environment or use default
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
+pub async fn run_agent_cmd_with_context(
+    cmd: AgentCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    use crate::agent_cmd::*;
 
-    // Create API client
-    let client = ApiClient::with_base_url(&api_base);
-
-    // Get output format (controlled by HERAMIND_JSON env var)
-    let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let output_format = ctx.output_format();
 
     let response = match cmd {
         AgentCommand::List => list_agents(&client).await?,
@@ -694,11 +790,13 @@ pub async fn run_agent_cmd(cmd: AgentCommand) -> Result<(CliResponse, OutputForm
             llm_backend,
             system_prompt,
             execution_mode,
+            output_schema,
+            memory_mode,
+            notify,
             device_ids,
             resources,
             metrics,
             commands,
-            enable_tool_chaining,
             max_chain_depth,
             priority,
             context_window_size,
@@ -722,11 +820,13 @@ pub async fn run_agent_cmd(cmd: AgentCommand) -> Result<(CliResponse, OutputForm
                 llm_backend.as_deref(),
                 system_prompt.as_deref(),
                 execution_mode.as_deref(),
+                output_schema.as_deref(),
+                memory_mode.as_deref(),
+                notify.as_deref(),
                 device_ids.as_deref(),
                 resources.as_deref(),
                 metrics.as_deref(),
                 commands.as_deref(),
-                enable_tool_chaining,
                 max_chain_depth,
                 priority,
                 context_window_size,
@@ -743,11 +843,13 @@ pub async fn run_agent_cmd(cmd: AgentCommand) -> Result<(CliResponse, OutputForm
             schedule_type,
             schedule_config,
             execution_mode,
+            output_schema,
+            memory_mode,
+            notify,
             device_ids,
             resources,
             metrics,
             commands,
-            enable_tool_chaining,
             max_chain_depth,
             priority,
             context_window_size,
@@ -763,11 +865,13 @@ pub async fn run_agent_cmd(cmd: AgentCommand) -> Result<(CliResponse, OutputForm
                 schedule_type.as_deref(),
                 schedule_config.as_deref(),
                 execution_mode.as_deref(),
+                output_schema.as_deref(),
+                memory_mode.as_deref(),
+                notify.as_deref(),
                 device_ids.as_deref(),
                 resources.as_deref(),
                 metrics.as_deref(),
                 commands.as_deref(),
-                enable_tool_chaining,
                 max_chain_depth,
                 priority,
                 context_window_size,
@@ -776,7 +880,7 @@ pub async fn run_agent_cmd(cmd: AgentCommand) -> Result<(CliResponse, OutputForm
         }
         AgentCommand::Delete { id } => delete_agent(&client, &id).await?,
         AgentCommand::Control { id, status } => control_agent(&client, &id, &status).await?,
-        AgentCommand::Invoke { id, input } => invoke_agent(&client, &id, &input).await?,
+        AgentCommand::Invoke { id, input } => invoke_agent(&client, &id, input.as_deref()).await?,
         AgentCommand::Memory { id } => get_agent_memory(&client, &id).await?,
         AgentCommand::ClearMemory { id } => clear_agent_memory(&client, &id).await?,
         AgentCommand::Executions { id, limit, offset } => {
@@ -797,21 +901,17 @@ pub async fn run_agent_cmd(cmd: AgentCommand) -> Result<(CliResponse, OutputForm
 
 /// Run message management commands.
 pub async fn run_message_cmd(cmd: MessageCommand) -> Result<(CliResponse, OutputFormat)> {
-    use crate::{message::*, ApiClient};
+    run_message_cmd_with_context(cmd, &DispatchContext::default()).await
+}
 
-    // Get API base URL from environment or use default
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
+pub async fn run_message_cmd_with_context(
+    cmd: MessageCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    use crate::message::*;
 
-    // Create API client
-    let client = ApiClient::with_base_url(&api_base);
-
-    // Get output format (controlled by HERAMIND_JSON env var)
-    let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let output_format = ctx.output_format();
 
     let response = match cmd {
         MessageCommand::List {
@@ -867,16 +967,17 @@ pub async fn run_message_cmd(cmd: MessageCommand) -> Result<(CliResponse, Output
 
 /// Run push management commands.
 pub async fn run_push_cmd(cmd: PushCommand) -> Result<(CliResponse, OutputFormat)> {
-    use crate::{data_push::*, ApiClient};
+    run_push_cmd_with_context(cmd, &DispatchContext::default()).await
+}
 
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
-    let client = ApiClient::with_base_url(&api_base);
-    let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+pub async fn run_push_cmd_with_context(
+    cmd: PushCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    use crate::data_push::*;
+
+    let client = ctx.api_client();
+    let output_format = ctx.output_format();
 
     let response = match cmd {
         PushCommand::List => list_targets(&client).await?,
@@ -932,21 +1033,17 @@ pub async fn run_push_cmd(cmd: PushCommand) -> Result<(CliResponse, OutputFormat
 
 /// Run widget management commands.
 pub async fn run_widget_cmd(cmd: WidgetCommand) -> Result<(CliResponse, OutputFormat)> {
-    use crate::{widget::*, ApiClient};
+    run_widget_cmd_with_context(cmd, &DispatchContext::default()).await
+}
 
-    // Get API base URL from environment or use default
-    let api_base = std::env::var("HERAMIND_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:9375/api".to_string());
+pub async fn run_widget_cmd_with_context(
+    cmd: WidgetCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    use crate::widget::*;
 
-    // Create API client
-    let client = ApiClient::with_base_url(&api_base);
-
-    // Get output format (controlled by HERAMIND_JSON env var)
-    let output_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let output_format = ctx.output_format();
 
     let (response, output_format) = match cmd {
         WidgetCommand::List {} => {
@@ -1010,16 +1107,27 @@ pub async fn run_widget_cmd(cmd: WidgetCommand) -> Result<(CliResponse, OutputFo
 }
 
 pub async fn run_system_cmd(cmd: SystemCommand) -> Result<(CliResponse, OutputFormat)> {
-    let client = crate::ApiClient::new();
-    let base_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    run_system_cmd_with_context(cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_system_cmd_with_context(
+    cmd: SystemCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    let client = ctx.api_client();
+    let base_format = ctx.output_format();
 
     let result = match cmd {
         SystemCommand::Info {} => {
             let resp = crate::system::system_info(&client).await?;
+            (resp, base_format)
+        }
+        SystemCommand::Health {} => {
+            let resp = crate::system::system_health(&client).await?;
+            (resp, base_format)
+        }
+        SystemCommand::Stats {} => {
+            let resp = crate::system::system_stats(&client).await?;
             (resp, base_format)
         }
     };
@@ -1029,13 +1137,16 @@ pub async fn run_system_cmd(cmd: SystemCommand) -> Result<(CliResponse, OutputFo
 pub async fn run_data_cmd(
     cmd: crate::dispatch::commands::DataCommand,
 ) -> Result<(CliResponse, OutputFormat)> {
+    run_data_cmd_with_context(cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_data_cmd_with_context(
+    cmd: crate::dispatch::commands::DataCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
     use crate::dispatch::commands::DataCommand;
-    let client = crate::ApiClient::new();
-    let base_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let base_format = ctx.output_format();
     let result = match cmd {
         DataCommand::List { source_type } => {
             let path = match &source_type {
@@ -1083,13 +1194,16 @@ pub async fn run_data_cmd(
 pub async fn run_config_cmd(
     cmd: crate::dispatch::commands::ConfigCommand,
 ) -> Result<(CliResponse, OutputFormat)> {
+    run_config_cmd_with_context(cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_config_cmd_with_context(
+    cmd: crate::dispatch::commands::ConfigCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
     use crate::dispatch::commands::ConfigCommand;
-    let client = crate::ApiClient::new();
-    let base_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    let client = ctx.api_client();
+    let base_format = ctx.output_format();
 
     let result = match cmd {
         ConfigCommand::Export {} => (
@@ -1117,12 +1231,15 @@ pub async fn run_config_cmd(
 }
 
 pub async fn run_settings_cmd(cmd: SettingsCommand) -> Result<(CliResponse, OutputFormat)> {
-    let client = crate::ApiClient::new();
-    let base_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    run_settings_cmd_with_context(cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_settings_cmd_with_context(
+    cmd: SettingsCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    let client = ctx.api_client();
+    let base_format = ctx.output_format();
 
     let result = match cmd {
         SettingsCommand::Timezone {} => {
@@ -1166,12 +1283,15 @@ pub async fn run_settings_cmd(cmd: SettingsCommand) -> Result<(CliResponse, Outp
 }
 
 pub async fn run_connector_cmd(cmd: ConnectorCommand) -> Result<(CliResponse, OutputFormat)> {
-    let client = crate::ApiClient::new();
-    let base_format = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    run_connector_cmd_with_context(cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_connector_cmd_with_context(
+    cmd: ConnectorCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    let client = ctx.api_client();
+    let base_format = ctx.output_format();
 
     let result = match cmd {
         ConnectorCommand::List {} => {
@@ -1294,41 +1414,52 @@ pub async fn run_login_cmd(
     data_dir: Option<String>,
     force: bool,
 ) -> Result<(CliResponse, OutputFormat)> {
-    let fmt = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    run_login_cmd_with_context(data_dir, force, &DispatchContext::default()).await
+}
+
+pub async fn run_login_cmd_with_context(
+    data_dir: Option<String>,
+    force: bool,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    let fmt = ctx.output_format();
     let resp = crate::auth_cmd::run_login(data_dir, force).await?;
     Ok((resp, fmt))
 }
 
 pub async fn run_logout_cmd() -> Result<(CliResponse, OutputFormat)> {
-    let fmt = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    run_logout_cmd_with_context(&DispatchContext::default()).await
+}
+
+pub async fn run_logout_cmd_with_context(
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    let fmt = ctx.output_format();
     let resp = crate::auth_cmd::run_logout().await?;
     Ok((resp, fmt))
 }
 
 pub async fn run_whoami_cmd() -> Result<(CliResponse, OutputFormat)> {
-    let fmt = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
-    let resp = crate::auth_cmd::run_whoami().await?;
+    run_whoami_cmd_with_context(&DispatchContext::default()).await
+}
+
+pub async fn run_whoami_cmd_with_context(
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    let fmt = ctx.output_format();
+    let resp = crate::auth_cmd::run_whoami_with_context(ctx).await?;
     Ok((resp, fmt))
 }
 
 pub async fn run_user_cmd(user_cmd: UserCommand) -> Result<(CliResponse, OutputFormat)> {
-    let fmt = if std::env::var("HERAMIND_JSON").is_ok() {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    };
+    run_user_cmd_with_context(user_cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_user_cmd_with_context(
+    user_cmd: UserCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    let fmt = ctx.output_format();
     let resp = match user_cmd {
         UserCommand::List { data_dir } => crate::user_cmd::run_list_users(data_dir).await?,
         UserCommand::ResetPassword { username, data_dir } => {
@@ -1339,6 +1470,118 @@ pub async fn run_user_cmd(user_cmd: UserCommand) -> Result<(CliResponse, OutputF
             role,
             data_dir,
         } => crate::user_cmd::run_set_role(data_dir, &username, &role).await?,
+    };
+    Ok((resp, fmt))
+}
+
+/// Run API key management commands — via the RUNNING SERVER's HTTP endpoints
+/// (`/api/auth/keys`), not by touching `api_keys.redb` directly.
+///
+/// Why HTTP: the key store's write path runs the crypto chain
+/// (hash_api_key + encrypt_str against the install's encryption_key) and
+/// holds the live in-memory key table — a second writer from outside the
+/// server process would race it (the server's DashMap stays authoritative
+/// until its next reload). The endpoints exist, are auth-protected, and
+/// auto_auth already provisions the agent key, so in-process dispatchers
+/// (agent shell, tauri pre-dispatch) reach them with zero setup. The
+/// `--data-dir` flag is therefore about the RUNNING server's store, not a
+/// local path this command opens.
+pub async fn run_api_key_cmd(key_cmd: ApiKeyCommand) -> Result<(CliResponse, OutputFormat)> {
+    run_api_key_cmd_with_context(key_cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_api_key_cmd_with_context(
+    key_cmd: ApiKeyCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    let fmt = ctx.output_format();
+    let client = ctx.api_client();
+    let resp = match key_cmd {
+        ApiKeyCommand::Create { name, .. } => {
+            let out = client
+                .post("/auth/keys", &serde_json::json!({ "name": name }))
+                .await?;
+            CliResponse::success(
+                serde_json::json!({
+                    "api_key": out.get("api_key").cloned().unwrap_or(serde_json::Value::Null),
+                    "info": out.get("info").cloned().unwrap_or(serde_json::Value::Null),
+                }),
+                "API key created. IMPORTANT: save the key now — it will not be shown again."
+                    .to_string(),
+            )
+        }
+        ApiKeyCommand::List { .. } => {
+            let out = client.get("/auth/keys").await?;
+            CliResponse::success(
+                out.get("keys").cloned().unwrap_or_default(),
+                "API keys listed".to_string(),
+            )
+        }
+        ApiKeyCommand::Delete { name, .. } => {
+            let out = client.get("/auth/keys").await?;
+            let matches: Vec<&serde_json::Value> = out
+                .get("keys")
+                .and_then(|k| k.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|k| k.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match matches.as_slice() {
+                [] => CliResponse::error_with_suggestion(
+                    format!("API key '{name}' not found"),
+                    "NOT_FOUND",
+                    "Run 'heramind api-key list' to see existing keys",
+                ),
+                [first, rest @ ..] => {
+                    let id = first.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+                    client.delete(&format!("/auth/keys/{id}")).await?;
+                    let note = if rest.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({} more key(s) share this name — rerun to delete the next)",
+                            rest.len()
+                        )
+                    };
+                    CliResponse::success(
+                        serde_json::json!({ "deleted_id": id, "name": name }),
+                        format!("Deleted API key '{name}' (id {id}){note}"),
+                    )
+                }
+            }
+        }
+    };
+    Ok((resp, fmt))
+}
+
+/// Run operation ledger inspection commands (`operation get` / `operation list`).
+pub async fn run_operation_cmd(cmd: OperationCommand) -> Result<(CliResponse, OutputFormat)> {
+    run_operation_cmd_with_context(cmd, &DispatchContext::default()).await
+}
+
+pub async fn run_operation_cmd_with_context(
+    cmd: OperationCommand,
+    ctx: &DispatchContext,
+) -> Result<(CliResponse, OutputFormat)> {
+    let client = ctx.api_client();
+    let fmt = ctx.output_format();
+    let resp = match cmd {
+        OperationCommand::Get { id } => crate::operation::get_operation(&client, &id).await?,
+        OperationCommand::List {
+            session_id,
+            status,
+            limit,
+        } => {
+            crate::operation::list_operations(
+                &client,
+                session_id.as_deref(),
+                status.as_deref(),
+                limit,
+            )
+            .await?
+        }
     };
     Ok((resp, fmt))
 }

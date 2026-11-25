@@ -70,6 +70,17 @@ export interface DeviceType {
   // Optional counts for display purposes
   metric_count?: number
   command_count?: number
+  // Origin marker: present for built-in seeded types (NE101/NE301/NE302…),
+  // absent for user-created / imported ones
+  builtin_version?: string | null
+  /** CamThink CT-Prov discovery/provision metadata (optional) */
+  ct_prov?: {
+    model_code?: number | null
+    model_name?: string | null
+    ap_ssid_families?: string[]
+    softap_default_host?: string | null
+    supported_discovery?: string[]
+  } | null
 }
 
 export interface MetricDefinition {
@@ -129,7 +140,9 @@ export interface ParameterDefinition {
   validation?: ValidationRule[]
 }
 
-// Parameter data type matching backend MetricDataType
+// Parameter data type matching backend MetricDataType.
+// Enum may arrive as frontend shape `{ enum: string[] }` or backend serde
+// shape `{ enum: { options: string[] } }` — see getEnumOptions().
 export type ParameterDataType =
   | 'integer'
   | 'float'
@@ -138,6 +151,8 @@ export type ParameterDataType =
   | 'binary'
   | 'array'
   | { enum: string[] }
+  | { enum: { options: string[] } }
+  | { array: { element_type?: string | null } }
 
 // Validation rule for parameter values
 export type ValidationRule =
@@ -156,14 +171,12 @@ export interface ParameterGroup {
   order?: number
 }
 
-// MetricValue matches backend Rust enum serialization format
-// The backend MetricValue enum serializes to direct JSON values:
-// - MetricValue::Integer(42) -> 42
-// - MetricValue::Float(3.14) -> 3.14
-// - MetricValue::String("hello") -> "hello"
-// - MetricValue::Boolean(true) -> true
-// - MetricValue::Array([...]) -> [...]
-// - MetricValue::Null -> null
+// MetricValue — two wire shapes exist:
+// 1) ParameterDefinition fields (`default_value`, `allowed_values`) use Rust
+//    derive Serialize → externally tagged: `{ "String": "hello" }`, `{ "Integer": 42 }`.
+//    UI helpers unwrap via `unwrapMetricValue()` in parameterOptions.ts.
+// 2) Telemetry / tool JSON uses `MetricValue::to_json_value()` → plain values
+//    (42, "hello", true, [...], null). Prefer that for new API surfaces.
 export type MetricValue =
   | number    // Integer or Float (backend discriminates via JSON number type)
   | string    // String
@@ -212,7 +225,13 @@ export interface TelemetryDataResponse {
   pagination?: {
     offset: number
     limit: number
+    /**
+     * Points in the window on an offset page. On a cursor page the backend scans
+     * only up to the cursor, so this is the points strictly older than it.
+     */
     total: number
+    /** Oldest timestamp on this page; pass as `cursor` for the next page. Null on the last page. */
+    next_cursor?: number | null
   }
 }
 
@@ -258,12 +277,8 @@ export interface DeviceCurrentStateResponse {
     adapter_id?: string
   }
   metrics: Record<string, DeviceMetricValue>
-  commands: Array<{
-    name: string
-    display_name: string
-    parameters?: ParameterDefinition[]
-    parameter_groups?: ParameterGroup[]
-  }>
+  /** Full command defs from the device-type template (same shape as CommandDefinition). */
+  commands: CommandDefinition[]
 }
 
 export interface DeviceMetricValue {
@@ -360,6 +375,7 @@ export interface DraftDevice {
   id: string
   device_id: string
   source: string
+  original_topic?: string
   status: string
   samples?: DeviceSample[]  // Original raw samples
   sample_count: number
@@ -370,6 +386,19 @@ export interface DraftDevice {
   error_message?: string
   user_name?: string
   user_description?: string
+  /** MQTT association exception — needs confirm-association, not ordinary approve. */
+  association_exception?: boolean
+  association_exception_kind?: string
+  blocked_device_ids?: string[]
+  claimed_identity?: string
+  /** First sample payload preview for conflict UX. */
+  sample_preview?: Record<string, unknown> | null
+  /** Sticky identity source from discovery (confirm prefill). */
+  mqtt_identity_source?: string
+  /** Sticky identity field path (e.g. data.sn) for confirm prefill. */
+  mqtt_identity_field?: string
+  /** Source adapter id (cross-broker confirm). */
+  adapter_id?: string
 }
 
 /**

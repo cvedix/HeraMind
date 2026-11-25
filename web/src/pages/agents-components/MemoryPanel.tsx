@@ -15,7 +15,7 @@ import {
   Pencil,
   Download,
   Loader2,
-  User,
+  SquareUser,
   BookOpen,
   ListChecks,
   Clock,
@@ -26,11 +26,9 @@ import {
   Trash2,
   Plus,
 } from "lucide-react"
-import { Card } from "@/components/ui/card"
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu"
 import { ResponsiveTable, EmptyState, LoadingState } from "@/components/shared"
 import { Button, IconButton } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
 import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
 import {
@@ -75,9 +73,9 @@ const fileConfig = [
     id: "user",
     labelKey: "systemMemory.files.user",
     defaultLabel: "User Profile",
-    icon: User,
+    icon: SquareUser,
     description: "User preferences, habits and personal settings",
-    color: "bg-info-light text-info border-info",
+    color: "bg-info-light text-info",
     charLimitKey: "user_char_limit" as const,
   },
   {
@@ -86,7 +84,7 @@ const fileConfig = [
     defaultLabel: "System Knowledge",
     icon: BookOpen,
     description: "System resources, domain knowledge, and agent experiences",
-    color: "bg-success-light text-success border-success-light",
+    color: "bg-success-light text-success",
     charLimitKey: "knowledge_char_limit" as const,
   },
   {
@@ -95,7 +93,7 @@ const fileConfig = [
     defaultLabel: "Procedures",
     icon: ListChecks,
     description: "SOPs, playbooks, and how-tos learned across sessions",
-    color: "bg-accent-purple-light text-accent-purple border-accent-purple",
+    color: "bg-accent-purple-light text-accent-purple",
     charLimitKey: "procedures_char_limit" as const,
   },
 ]
@@ -103,7 +101,7 @@ const fileConfig = [
 // Custom file display config
 const customFileConfig = {
   icon: FileText,
-  color: "bg-warning-light text-warning border-warning-light",
+  color: "bg-warning-light text-warning",
 }
 
 // File stats from API
@@ -405,21 +403,27 @@ export const MemoryPanel = forwardRef<MemoryPanelRef, MemoryPanelProps>(function
       {isMobile ? (
         <div className="space-y-2">
           {tableData.map((row) => {
-            const Icon = row.icon
             return (
-              <Card
+              <div
                 key={row.id}
-                className="overflow-hidden border-border shadow-sm cursor-pointer active:scale-[0.99] transition-all"
+                role="button"
+                tabIndex={0}
+                className="cursor-pointer overflow-hidden rounded-2xl border border-border bg-card px-4 py-2.5 transition-[background-color,transform] active:scale-[0.99] active:bg-muted"
                 onClick={() => handleViewEdit(row.isCustom ? row.name : row.id, row.isCustom)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" && event.key !== " ") return
+                  event.preventDefault()
+                  handleViewEdit(row.isCustom ? row.name : row.id, row.isCustom)
+                }}
               >
-                <div className="px-3 py-2.5">
-                  <div className="flex items-center gap-2.5">
-                    <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center border shrink-0", row.color)}>
-                      <Icon className="h-4 w-4" />
+                <div className="flex min-h-10 items-center gap-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium">{row.name}</div>
+                    <div className={cn(textMini, "mt-0.5 truncate font-mono text-muted-foreground")}>
+                      {formatCharsUsage(row.chars, row.charLimit)} {t("systemMemory.headers.chars", "chars")}
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="font-medium text-sm truncate">{row.name}</div>
-                    </div>
+                  </div>
+                  {row.isCustom ? (
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
                         <IconButton aria-label={t("systemMemory.actions", "Actions")}>
@@ -427,35 +431,29 @@ export const MemoryPanel = forwardRef<MemoryPanelRef, MemoryPanelProps>(function
                         </IconButton>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleViewEdit(row.isCustom ? row.name : row.id, row.isCustom) }}>
-                          <Eye className="h-4 w-4 mr-2" />
-                          {t("systemMemory.viewEdit", "View/Edit")}
-                        </DropdownMenuItem>
                         <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleExport(row.id) }}>
                           <Download className="h-4 w-4 mr-2" />
                           {t("systemMemory.export", "Export")}
                         </DropdownMenuItem>
-                        {row.isCustom && (
-                          <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleDelete(row.name) }} className="text-error focus:text-error">
-                            <Trash2 className="h-4 w-4 mr-2" />
-                            {t("systemMemory.custom.delete", "Delete")}
-                          </DropdownMenuItem>
-                        )}
+                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleDelete(row.name) }} className="text-error focus:text-error">
+                          <Trash2 className="h-4 w-4 mr-2" />
+                          {t("systemMemory.custom.delete", "Delete")}
+                        </DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
-                  </div>
-                  <div className="flex items-center gap-1.5 mt-1.5 ml-[42px]">
-                    <Badge variant="secondary" className={cn(textMini, "font-mono h-5 px-1.5")}>
-                      {formatCharsUsage(row.chars, row.charLimit)} {t("systemMemory.headers.chars", "chars")}
-                    </Badge>
-                    {!row.isCustom && (
-                      <span className={cn(textMini, "text-muted-foreground ml-auto")}>
-                        {row.modified_at > 0 ? formatTimestamp(row.modified_at, false) : "-"}
-                      </span>
-                    )}
-                  </div>
+                  ) : (
+                    <IconButton
+                      aria-label={t("systemMemory.export", "Export")}
+                      disabled={exporting === row.id}
+                      onClick={(e) => { e.stopPropagation(); handleExport(row.id) }}
+                    >
+                      {exporting === row.id
+                        ? <Loader2 className="h-4 w-4 animate-spin" />
+                        : <Download className="h-4 w-4" />}
+                    </IconButton>
+                  )}
                 </div>
-              </Card>
+              </div>
             )
           })}
         </div>
@@ -495,6 +493,18 @@ export const MemoryPanel = forwardRef<MemoryPanelRef, MemoryPanelProps>(function
           handleViewEdit(r.isCustom ? r.name : r.id, r.isCustom)
         }}
         loading={loading}
+        renderMobileBody={(rowData) => {
+          // Tailored mobile body: usage + modified time as one quiet meta
+          // line under the header (name + description), not a kv dump.
+          const row = rowData as MemoryFileRow
+          return (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span className="font-mono">{formatCharsUsage(row.chars, row.charLimit)}</span>
+              <span>·</span>
+              <span>{row.modified_at > 0 ? formatTimestamp(row.modified_at, false) : "-"}</span>
+            </div>
+          )
+        }}
         renderCell={(columnKey, rowData) => {
           const row = rowData
           const Icon = row.icon
@@ -505,7 +515,7 @@ export const MemoryPanel = forwardRef<MemoryPanelRef, MemoryPanelProps>(function
                 <div className="flex items-center gap-3">
                   <div
                     className={cn(
-                      "w-9 h-9 rounded-lg flex items-center justify-center border",
+                      "w-9 h-9 rounded-lg flex items-center justify-center",
                       row.color
                     )}
                   >
@@ -573,7 +583,6 @@ export const MemoryPanel = forwardRef<MemoryPanelRef, MemoryPanelProps>(function
         ]}
         emptyState={
           <EmptyState
-            icon={<FileText className="h-12 w-12" />}
             title={t('systemMemory.empty.title', 'No memory files')}
             description={t('systemMemory.empty.description', 'Memory files will appear here once configured')}
           />
