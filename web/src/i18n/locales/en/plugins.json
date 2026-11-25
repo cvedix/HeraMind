@@ -229,7 +229,7 @@
     "runtimeReverted": "Reverted (removed {{tag}})",
     "runtimeVariantLabel": "Runtime variant",
     "runtimeVariantAuto": "Auto",
-    "runtimeVariantHint": "Auto-detects the hardware (Jetson / NVIDIA GPU → CUDA, otherwise CPU). Pick explicitly only for troubleshooting; applies on the next engine restart.",
+    "runtimeVariantHint": "Auto uses CUDA on Jetson and compatible NVIDIA GPUs, or Vulkan on NVIDIA Blackwell on Linux x64. Changes apply on the next engine restart.",
     "builtinCatalogFallback": "Online catalog unreachable — showing the built-in model list (configure a mirror in download sources)",
     "builtinImportLocal": "Import a model file on the server",
     "builtinImportUpload": "Upload a model file",

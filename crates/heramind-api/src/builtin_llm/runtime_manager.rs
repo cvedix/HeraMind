@@ -101,23 +101,22 @@ pub fn degrade_to_cpu_for_process() {
 /// persisted setting (`builtin_runtime_variant`, set from the UI) →
 /// process-local degradation → auto-detection.
 pub fn effective_variant() -> RuntimeVariant {
-    if let Ok(raw) = std::env::var(VARIANT_ENV) {
-        let trimmed = raw.trim();
-        if trimmed.eq_ignore_ascii_case("cpu") {
-            return RuntimeVariant::Cpu;
-        }
-        let parsed = RuntimeVariant::parse(trimmed);
-        if parsed != RuntimeVariant::Cpu {
-            return parsed;
-        }
-    }
-    if let Some(v) = persisted_variant_override() {
-        return v;
+    if let Some(variant) = configured_variant() {
+        return variant;
     }
     if VARIANT_DEGRADED_CPU.load(Ordering::SeqCst) {
         return RuntimeVariant::Cpu;
     }
     detected_variant_cached()
+}
+
+pub(super) fn configured_variant() -> Option<RuntimeVariant> {
+    if let Ok(raw) = std::env::var(VARIANT_ENV) {
+        if let Some(variant) = parse_strict(&raw) {
+            return Some(variant);
+        }
+    }
+    persisted_variant_override()
 }
 
 /// Read the persisted variant override. Empty/absent = auto; unknown values
@@ -1473,14 +1472,29 @@ mod tests {
     #[test]
     fn revert_removes_newest_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("llama-server");
-        for tag in ["b90000", "b80000"] {
-            std::fs::create_dir_all(root.join(tag)).unwrap();
+        let variants = [
+            RuntimeVariant::Cpu,
+            RuntimeVariant::Cuda,
+            RuntimeVariant::Vulkan,
+            RuntimeVariant::Jetson,
+        ];
+        for variant in variants {
+            for tag in ["b90000", "b80000"] {
+                let dir = llama_server_cache_dir_for_tag(tmp.path(), tag, variant);
+                std::fs::create_dir_all(dir).unwrap();
+            }
         }
         let removed = revert_runtime(tmp.path()).expect("revert");
         assert_eq!(removed, "b90000");
-        assert!(!root.join("b90000").exists());
-        assert!(root.join("b80000").exists());
+        let entries = cache_entries(tmp.path());
+        assert_eq!(
+            entries.iter().filter(|(tag, _, _)| tag == "b90000").count(),
+            variants.len() - 1
+        );
+        assert_eq!(
+            entries.iter().filter(|(tag, _, _)| tag == "b80000").count(),
+            variants.len()
+        );
         // Nothing left to revert on an empty dir.
         let tmp2 = tempfile::tempdir().unwrap();
         assert!(revert_runtime(tmp2.path()).is_err());

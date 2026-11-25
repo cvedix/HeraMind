@@ -136,12 +136,10 @@ pub enum RuntimeVariant {
     Cpu,
     Cuda,
     /// Vulkan — covers AMD / Intel GPUs (and NVIDIA via its Vulkan ICD).
-    /// Official llama.cpp assets (GNU-11 base, so 22.04-safe). Opt-in via
-    /// `HERAMIND_BUILTIN_RUNTIME_VARIANT=vulkan` — deliberately NOT
-    /// auto-detected: the Vulkan loader/ICD situation varies wildly
-    /// (`libvulkan1` is absent on headless servers, virtio GPUs create
-    /// /dev/dri false positives), while the auto-detectable NVIDIA case is
-    /// better served by CUDA. Hosts need a Vulkan loader + a driver ICD
+    /// Official llama.cpp assets. Auto-selected on Linux x64 for NVIDIA
+    /// Blackwell, which the self-hosted CUDA build cannot run on. Other
+    /// hosts can opt in via `HERAMIND_BUILTIN_RUNTIME_VARIANT=vulkan`.
+    /// Hosts need a Vulkan loader + a driver ICD
     /// (desktop stacks ship both; headless servers: install libvulkan1).
     Vulkan,
     /// NVIDIA Jetson (Orin-family, sm_87). Not an official llama.cpp asset —
@@ -179,12 +177,13 @@ impl RuntimeVariant {
     /// Resolve the runtime to fetch: explicit env override wins (both
     /// directions — `cuda` forces it on, `cpu` opts a GPU host out);
     /// otherwise auto-detect — Jetson via `/etc/nv_tegra_release`, and
-    /// Linux x64 with a qualifying NVIDIA GPU (see `nvidia_probe_prefers_cuda`)
-    /// gets our self-hosted CUDA build. Everything else keeps the CPU build.
+    /// Linux x64 chooses a compatible NVIDIA runtime (CUDA or Vulkan).
     pub fn detect() -> Self {
-        let env = Self::from_env();
-        if env != RuntimeVariant::Cpu {
-            return env;
+        if let Ok(raw) = std::env::var("HERAMIND_BUILTIN_RUNTIME_VARIANT") {
+            let env = Self::parse(&raw);
+            if env != RuntimeVariant::Cpu || raw.trim().eq_ignore_ascii_case("cpu") {
+                return env;
+            }
         }
         if cfg!(target_os = "linux")
             && matches!(std::env::consts::ARCH, "aarch64" | "arm64")
@@ -194,22 +193,22 @@ impl RuntimeVariant {
         }
         if cfg!(target_os = "linux") && matches!(std::env::consts::ARCH, "x86_64" | "x86") {
             if let Some(probe) = NvidiaGpuProbe::probe() {
-                if nvidia_probe_prefers_cuda(&probe) {
+                let variant = nvidia_runtime_variant(&probe);
+                if variant != RuntimeVariant::Cpu {
                     tracing::info!(
                         gpu = %probe.name,
                         compute_cap = ?probe.compute_cap,
                         driver = %probe.driver_version,
-                        "builtin llm: NVIDIA GPU detected — using the CUDA runtime \
-                         (HERAMIND_BUILTIN_RUNTIME_VARIANT=cpu to force the CPU build)"
+                        ?variant,
+                        "builtin llm: selected runtime for NVIDIA GPU"
                     );
-                    return RuntimeVariant::Cuda;
+                    return variant;
                 }
                 tracing::debug!(
                     gpu = %probe.name,
                     compute_cap = ?probe.compute_cap,
                     driver = %probe.driver_version,
-                    "builtin llm: NVIDIA GPU present but outside the CUDA build's \
-                     sm_75..89 / CUDA-12-driver range — keeping the CPU build"
+                    "builtin llm: no compatible automatic runtime for this NVIDIA GPU and driver"
                 );
             }
         }
@@ -292,13 +291,27 @@ impl NvidiaGpuProbe {
 /// (where an operator can still force `cuda` via the env).
 pub fn nvidia_probe_prefers_cuda(probe: &NvidiaGpuProbe) -> bool {
     let cc = probe.compute_cap.0 as u16 * 10 + probe.compute_cap.1 as u16;
-    let driver_ok = probe
+    (75..=89).contains(&cc) && nvidia_driver_major(probe).is_some_and(|major| major >= 525)
+}
+
+fn nvidia_driver_major(probe: &NvidiaGpuProbe) -> Option<u32> {
+    probe
         .driver_version
         .split('.')
         .next()
         .and_then(|m| m.parse::<u32>().ok())
-        .is_some_and(|major| major >= 525);
-    (75..=89).contains(&cc) && driver_ok
+}
+
+fn nvidia_runtime_variant(probe: &NvidiaGpuProbe) -> RuntimeVariant {
+    if nvidia_probe_prefers_cuda(probe) {
+        RuntimeVariant::Cuda
+    } else if matches!(probe.compute_cap, (10, 0 | 3) | (12, 0 | 1))
+        && nvidia_driver_major(probe).is_some_and(|major| major >= 570)
+    {
+        RuntimeVariant::Vulkan
+    } else {
+        RuntimeVariant::Cpu
+    }
 }
 
 /// Our Jetson runtime asset (not an official llama.cpp release). See
@@ -654,7 +667,7 @@ mod tests {
         assert!(nvidia_probe_prefers_cuda(&p("Tesla T4", (7, 5), "550.54")));
         // Pre-CUDA-12 driver → CPU (the bundled 12.4 libs won't load).
         assert!(!nvidia_probe_prefers_cuda(&p("Tesla T4", (7, 5), "470.63")));
-        // GPUs outside sm_75..89 (no SASS in our build) → CPU.
+        // Older GPUs outside the shipped CUDA architectures stay on CPU.
         assert!(!nvidia_probe_prefers_cuda(&p(
             "Tesla V100",
             (7, 0),
@@ -665,12 +678,19 @@ mod tests {
             (6, 0),
             "575.64.03"
         )));
-        // Future arch (Blackwell) → CPU until the build covers it.
-        assert!(!nvidia_probe_prefers_cuda(&p(
-            "RTX 5090",
-            (12, 0),
-            "575.64.03"
-        )));
+        // Blackwell uses Vulkan with a compatible driver.
+        assert_eq!(
+            nvidia_runtime_variant(&p("RTX 5060", (12, 0), "580.178.04")),
+            RuntimeVariant::Vulkan
+        );
+        assert_eq!(
+            nvidia_runtime_variant(&p("RTX 5060", (12, 0), "550.54")),
+            RuntimeVariant::Cpu
+        );
+        assert_eq!(
+            nvidia_runtime_variant(&p("Tesla T4", (7, 5), "580.178.04")),
+            RuntimeVariant::Cuda
+        );
         // Garbage driver string → CPU, never a panic.
         assert!(!nvidia_probe_prefers_cuda(&p(
             "Tesla T4",
@@ -682,8 +702,7 @@ mod tests {
     #[test]
     fn variant_env_overrides_both_directions() {
         // Opt-out on a GPU host and opt-in on a non-GPU host must both win
-        // over any auto-detection (`parse` + `from_env` are the only levers
-        // `detect()` consults before probing).
+        // over any auto-detection. Runtime names are case-insensitive.
         assert_eq!(RuntimeVariant::parse("cuda"), RuntimeVariant::Cuda);
         assert_eq!(RuntimeVariant::parse("CPU"), RuntimeVariant::Cpu);
         assert_eq!(RuntimeVariant::parse("jetson"), RuntimeVariant::Jetson);
@@ -692,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_uses_official_assets_and_never_autodetects() {
+    fn vulkan_uses_official_assets_and_a_separate_cache() {
         let vk = RuntimeVariant::Vulkan;
         // Official llama.cpp assets on the GNU-11 (22.04-safe) base.
         assert_eq!(

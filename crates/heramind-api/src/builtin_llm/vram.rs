@@ -9,17 +9,19 @@
 //! able to notice).
 //!
 //! This module sizes the offload at spawn time instead: probe free VRAM via
-//! `nvidia-smi`, charge the model's weights + projector + (proportional) KV
-//! cache + a fixed CUDA-context/compute reserve against it, and pick a layer
+//! `nvidia-smi` or the selected Vulkan device, charge the model's weights,
+//! projector, KV cache and a compute reserve against it, and pick a layer
 //! count that fits. Every failure mode — no `nvidia-smi` (CPU boxes, Jetson
-//! unified memory), a wedged driver, an unparseable GGUF header — falls back
-//! to the previous behavior exactly. An explicit operator pin
+//! unified memory), a wedged driver, an unparseable GGUF header — leaves the
+//! runtime default for existing paths. Automatic Vulkan disables offload
+//! if it cannot size the model. An explicit operator pin
 //! (`HERAMIND_BUILTIN_MODEL_NGL` / `HERAMIND_BUILTIN_VLM_NGL`) ALWAYS wins and
 //! is never second-guessed.
 
 use std::path::Path;
 
 use super::gguf::parse_gguf;
+use super::runtime::VulkanDevice;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -149,10 +151,11 @@ fn parse_compute_apps_csv(s: &str, pids: &[u32]) -> u64 {
     sum
 }
 
-/// Whether the llama-server binary can act on `-ngl` against an NVIDIA GPU:
+/// Whether to use `nvidia-smi` to size this binary's CUDA offload:
 /// our downloaded CUDA build (cache dir `…-cuda`), or a bundled binary
 /// (variant unknown — the probe itself decides whether a GPU exists).
-/// CPU/Vulkan/Jetson caches and anything unrecognized: skip auto-sizing.
+/// Automatic Vulkan uses its own per-device probe. CPU/Jetson caches and
+/// anything unrecognized skip auto-sizing.
 /// Jetson is the important exclusion — unified memory means the RAM guard
 /// already budgets the same physical bytes, and forcing `-ngl` there would
 /// double-count them.
@@ -161,11 +164,14 @@ pub fn binary_gpu_capable(binary: &Path) -> bool {
     if name.starts_with("heramind-llama-server") {
         return true;
     }
-    binary
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .is_some_and(|d| d.ends_with("-cuda"))
+    binary.ancestors().skip(1).any(|dir| {
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(heramind_core::builtin_llm::runtime::parse_runtime_cache_name)
+            .is_some_and(|(_, variant)| {
+                variant == heramind_core::builtin_llm::runtime::RuntimeVariant::Cuda
+            })
+    })
 }
 
 /// Everything the layer-budget solver needs, gathered by the caller so the
@@ -312,14 +318,15 @@ pub fn last_decision_on(port: u16) -> Option<LastNglDecision> {
 
 /// The spawn-site query: an explicit pin wins; otherwise auto-size when the
 /// binary can honor it, a discrete NVIDIA GPU answers the probe, and the
-/// GGUF header reports its layer count. Any miss → `None` = pass no flag =
-/// llama-server's own default, the exact pre-auto behavior. Every path
-/// records its decision for the status API.
+/// GGUF header reports its layer count. When sizing is unavailable, auto
+/// Vulkan uses zero GPU layers and other runtimes keep their defaults.
+/// Every path records its decision for the status API.
 pub struct NglQuery<'a> {
     /// `HERAMIND_BUILTIN_MODEL_NGL` / `HERAMIND_BUILTIN_VLM_NGL` (after the
     /// companion-override merge in `spawn_companion_server`).
     pub explicit: Option<u16>,
     pub binary: &'a Path,
+    pub nvidia_vulkan: Option<&'a VulkanDevice>,
     pub model_path: &'a Path,
     pub mmproj: Option<&'a Path>,
     pub ctx: usize,
@@ -334,8 +341,12 @@ pub struct NglQuery<'a> {
 }
 
 pub fn resolve_spawn_ngl(q: &NglQuery<'_>) -> Option<u16> {
+    let free_mib = || match q.nvidia_vulkan {
+        Some(device) => Some(device.free_mib),
+        None => probe_gpu_memory().map(|memory| memory.free_bytes / MIB),
+    };
     if let Some(n) = q.explicit {
-        let free_mib = probe_gpu_memory().map(|m| m.free_bytes / MIB);
+        let free_mib = free_mib();
         let model_mib = std::fs::metadata(q.model_path)
             .map(|m| m.len() / MIB)
             .unwrap_or(0);
@@ -371,46 +382,52 @@ pub fn resolve_spawn_ngl(q: &NglQuery<'_>) -> Option<u16> {
         return Some(n);
     }
     let skip = |note: String| {
+        let ngl = q.nvidia_vulkan.map(|_| 0);
         record_decision(
             q.port,
             LastNglDecision {
-                ngl: None,
+                ngl,
                 total_layers: None,
-                free_mib: None,
+                free_mib: q.nvidia_vulkan.map(|device| device.free_mib),
                 reclaim_mib: 0,
                 ctx: q.ctx,
                 note,
             },
         );
+        ngl
     };
-    if !binary_gpu_capable(q.binary) {
-        skip("cpu/vulkan/jetson build — no GPU offload sizing (llama-server default)".into());
-        return None;
+    if q.nvidia_vulkan.is_none() && !binary_gpu_capable(q.binary) {
+        return skip("no eligible discrete NVIDIA device for automatic offload sizing".into());
     }
-    let Some(mem) = probe_gpu_memory() else {
-        skip("no nvidia-smi / probe failed — llama-server default (full offload)".into());
-        return None; // CPU box, Jetson, or a wedged driver
+    let Some(free_mib) = free_mib() else {
+        return skip("no nvidia-smi / probe failed — llama-server default (full offload)".into());
     };
     let Some(total_layers) = parse_gguf(q.model_path)
         .ok()
         .and_then(|m| m.block_count)
         .filter(|l| *l > 0)
     else {
-        skip("GGUF header lacks block_count — auto sizing skipped (llama-server default)".into());
-        return None;
+        return skip("GGUF header lacks block_count for GPU offload sizing".into());
     };
-    let weights = std::fs::metadata(q.model_path).map(|m| m.len()).ok()?;
+    let weights = std::fs::metadata(q.model_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
     if weights == 0 {
-        skip("model file empty — auto sizing skipped".into());
-        return None;
+        return skip("model weights unavailable for GPU offload sizing".into());
     }
     let mmproj_bytes = q
         .mmproj
         .and_then(|p| std::fs::metadata(p).map(|m| m.len()).ok())
         .unwrap_or(0);
-    let reclaim = llama_vram_bytes(&super::server::live_llama_pids_on_port(q.port));
+    // A Vulkan probe reports one device. The existing PID query totals all
+    // GPUs and cannot establish that a replaced server used this device.
+    let reclaim = if q.nvidia_vulkan.is_some() {
+        0
+    } else {
+        llama_vram_bytes(&super::server::live_llama_pids_on_port(q.port))
+    };
     let plan = plan_gpu_layers(&GpuBudgetInputs {
-        free_bytes: mem.free_bytes,
+        free_bytes: free_mib * MIB,
         reclaim_bytes: reclaim,
         weights_bytes: weights,
         mmproj_bytes,
@@ -423,7 +440,7 @@ pub fn resolve_spawn_ngl(q: &NglQuery<'_>) -> Option<u16> {
     tracing::info!(
         ngl = plan.ngl,
         layers = plan.total_layers,
-        free_mib = mem.free_bytes / MIB,
+        free_mib,
         reclaim_mib = reclaim / MIB,
         ctx = q.ctx,
         "builtin llm: auto GPU offload sized ({})",
@@ -434,7 +451,7 @@ pub fn resolve_spawn_ngl(q: &NglQuery<'_>) -> Option<u16> {
         LastNglDecision {
             ngl: Some(plan.ngl),
             total_layers: Some(plan.total_layers),
-            free_mib: Some(mem.free_bytes / MIB),
+            free_mib: Some(free_mib),
             reclaim_mib: reclaim / MIB,
             ctx: q.ctx,
             note: plan.note,
@@ -592,7 +609,7 @@ mod tests {
 
     #[test]
     fn binary_capability_by_cache_layout() {
-        let cuda = Path::new("/var/lib/heramind/data/llama-server/b11609-cuda/llama-server");
+        let cuda = Path::new("/var/lib/heramind/data/llama-server/b11609-cuda/bin/llama-server");
         assert!(binary_gpu_capable(cuda));
         let cpu = Path::new("/var/lib/heramind/data/llama-server/b11609/llama-server");
         assert!(!binary_gpu_capable(cpu), "plain version dir = CPU cache");
@@ -608,5 +625,30 @@ mod tests {
             binary_gpu_capable(bundled),
             "variant unknown — probe decides"
         );
+    }
+
+    #[test]
+    fn automatic_vulkan_disables_offload_when_model_size_is_unknown() {
+        let device = VulkanDevice {
+            id: "Vulkan0".into(),
+            name: "NVIDIA GeForce RTX 5060".into(),
+            free_mib: 7000,
+        };
+        let port = 39931;
+        let model_dir = tempfile::tempdir().unwrap();
+        let ngl = resolve_spawn_ngl(&NglQuery {
+            explicit: None,
+            binary: Path::new("/x/b12359-vulkan/llama-server"),
+            nvidia_vulkan: Some(&device),
+            model_path: &model_dir.path().join("missing.gguf"),
+            mmproj: None,
+            ctx: 8192,
+            port,
+            kv_bytes_per_token_f16: None,
+            kv_const_bytes: None,
+            kv_quant: true,
+        });
+        assert_eq!(ngl, Some(0));
+        assert_eq!(last_decision_on(port).unwrap().free_mib, Some(7000));
     }
 }

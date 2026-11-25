@@ -20,6 +20,8 @@ Các thẻ thống kê là lượt tổng của extension trên mọi thiết b�
 
 ## OCR tài liệu
 
+Để đọc PDF quét nhiều trang và nhận kết quả qua API, mở [OCR Service](ocr-service.vi.md).
+
 Gồm widget **PaddleOCR v6**, trạng thái mô hình, tier và hướng dẫn xử lý.
 Tải/kéo thả/dán ảnh JPG, PNG hoặc WebP, rồi bấm **Recognize**.
 Widget hiển thị các vùng chữ, độ tin cậy và văn bản trích xuất.

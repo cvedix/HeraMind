@@ -53,6 +53,7 @@ const AgentsPage = lazy(() => import('@/pages/agents').then(m => ({ default: m.A
 const MessagesPage = lazy(() => import('@/pages/messages').then(m => ({ default: m.default })))
 const ExtensionsPage = lazy(() => import('@/pages/extensions').then(m => ({ default: m.ExtensionsPage })))
 const SystemPage = lazy(() => import('@/pages/SystemPage'))
+const OcrServicePage = lazy(() => import('@/pages/OcrServicePage'))
 const SharedDashboardPage = lazy(() => import('@/pages/share/SharedDashboard'))
 const NotFound = lazy(() => import('@/pages/NotFound'))
 // Dev-only prototype — gated so production dist never registers the route
@@ -648,9 +649,12 @@ function App() {
                       {/* Session-based routes */}
                       <Route path="/chat/:sessionId" element={<ChatPage />} />
                       <Route path="/visual-dashboard" element={<VisualDashboard />} />
+                      <Route path="/visual-dashboard/ocr" element={<Navigate to="/ocr" replace />} />
                       <Route path="/visual-dashboard/:dashboardId" element={<VisualDashboard />} />
                       {/* Data Explorer */}
                       <Route path="/data" element={<DataExplorerPage />} />
+                      <Route path="/ocr" element={<OcrServicePage />} />
+                      <Route path="/ocr/paddle-vl" element={<OcrServicePage initialEngine="paddle_ocr_vl" />} />
                       {/* Devices with tab routes */}
                       <Route path="/devices" element={<DevicesPage />} />
                       <Route path="/devices/:id" element={<DevicesPage />} />

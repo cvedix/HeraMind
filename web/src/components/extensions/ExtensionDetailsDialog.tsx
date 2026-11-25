@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react"
 import { useTranslation } from "react-i18next"
+import { Link } from "react-router-dom"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -588,6 +589,14 @@ export function ExtensionDetailsDialog({
             <Label className="text-muted-foreground text-xs">{t("extensions:info.author", { defaultValue: "Author" })}</Label>
             <p className="text-sm break-words">{extension.author}</p>
           </div>
+        )}
+        {extension?.id === "paddle-ocr-vl" && (
+          <Button asChild variant="outline" size="sm" className="mt-3">
+            <Link to="/ocr/paddle-vl">
+              <FileText className="mr-2 h-4 w-4" />
+              {t("common:ocr.openPaddleDashboard")}
+            </Link>
+          </Button>
         )}
       </FormSection>
 

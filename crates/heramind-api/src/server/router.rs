@@ -1,7 +1,7 @@
 //! Application router configuration.
 
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Extension},
     http::{header, HeaderValue},
     middleware,
     routing::{any, delete, get, post, put},
@@ -27,8 +27,8 @@ pub fn create_router_with_state(state: ServerState) -> Router {
         agents, auth as auth_handlers, auth_users, automations, basic, capabilities, config,
         dashboards, data, data_push, devices, events, extension_stream, extensions,
         frontend_components, im_bridges, images, instances, llm_backends, logs, memory,
-        message_channels, messages, mqtt, onboarding, operations, rules, sessions, settings, setup,
-        skills, stats, suggestions, system, tools,
+        message_channels, messages, mqtt, ocr, onboarding, operations, rules, sessions, settings,
+        setup, skills, stats, suggestions, system, tools,
     };
 
     // Public routes (no authentication required)
@@ -1413,6 +1413,36 @@ pub fn create_router_with_state(state: ServerState) -> Router {
             rate_limit_middleware,
         ));
 
+    let ocr = Extension(std::sync::Arc::new(ocr::OcrService::new(
+        state.data_dir.join("ocr"),
+        state.extensions.runtime.clone(),
+    )));
+    let ocr_routes = Router::new()
+        .route("/api/ocr/status", get(ocr::status))
+        .route("/api/ocr/jobs", get(ocr::list).post(ocr::submit))
+        .route("/api/ocr/jobs/:id", get(ocr::get))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            ocr::authenticate,
+        ))
+        .layer(DefaultBodyLimit::max(ocr::MAX_PDF_BYTES))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            ocr::MAX_PDF_BYTES,
+        ))
+        .layer(middleware::from_fn(ocr::monitor::record_request))
+        .layer(ocr.clone())
+        .layer(middleware::from_fn(ocr::no_store));
+    let ocr_admin_routes = Router::new()
+        .route("/api/ocr/monitor", get(ocr::monitor::snapshot))
+        .route("/api/ocr/keys", get(ocr::keys).post(ocr::issue))
+        .route("/api/ocr/keys/:id", delete(ocr::revoke))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            jwt_auth_middleware,
+        ))
+        .layer(ocr)
+        .layer(middleware::from_fn(ocr::no_store));
+
     // Combine all routes
     // IMPORTANT: More specific routes must come before catch-all routes.
     // Also, routes with their own middleware must be merged BEFORE routes
@@ -1456,7 +1486,9 @@ pub fn create_router_with_state(state: ServerState) -> Router {
     let router = router
         .merge(limited_routes)
         .merge(extension_upload_routes)
-        .merge(component_upload_routes);
+        .merge(component_upload_routes)
+        .merge(ocr_routes)
+        .merge(ocr_admin_routes);
 
     // Static file routes
     let router = assets::configure_static_file_serving(router);

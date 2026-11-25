@@ -21,7 +21,7 @@ pub struct RouteDoc {
     pub method: &'static str,
     pub path: &'static str,
     /// One of: `public`, `jwt-or-api-key` (hybrid middleware), `jwt-only`
-    /// (admin router — API keys are rejected), `webhook`, `ws`.
+    /// (HeraMind session required), `jwt-or-ocr-key`, `webhook`, `ws`.
     pub auth: &'static str,
 }
 
@@ -29,6 +29,41 @@ pub struct RouteDoc {
 /// Kept hand-maintained next to the router; the router stays the truth and
 /// a CI drift test (tests/api_docs.rs) fails when the two disagree.
 pub static ROUTES: &[RouteDoc] = &[
+    RouteDoc {
+        method: "GET",
+        path: "/api/ocr/status",
+        auth: "jwt-or-ocr-key",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/ocr/jobs",
+        auth: "jwt-or-ocr-key",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/ocr/jobs",
+        auth: "jwt-or-ocr-key",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/ocr/jobs/:id",
+        auth: "jwt-or-ocr-key",
+    },
+    RouteDoc {
+        method: "GET",
+        path: "/api/ocr/keys",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/ocr/keys",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "DELETE",
+        path: "/api/ocr/keys/:id",
+        auth: "jwt-only",
+    },
     RouteDoc {
         method: "GET",
         path: "/api/docs",

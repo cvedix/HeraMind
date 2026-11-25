@@ -128,6 +128,7 @@ export default function SystemPage() {
             <MoreRow title={t("common:nav.devices")} description={t("common:system.cards.devices")} onClick={() => navigate("/devices")} />
             <MoreRow title={t("common:nav.agents")} description={t("common:system.cards.agents")} onClick={() => navigate("/agents")} />
             <MoreRow title={t("common:nav.visual-dashboard")} description={t("common:system.cards.dashboard")} onClick={() => navigate("/visual-dashboard")} />
+            <MoreRow title={t("common:nav.ocr")} description={t("common:ocr.description")} onClick={() => navigate("/ocr")} />
             <MoreRow title={t("common:nav.automation")} description={t("common:system.cards.automation")} onClick={() => navigate("/automation")} />
             <MoreRow title={t("common:nav.data")} description={t("common:system.cards.data")} onClick={() => navigate("/data")} />
             <MoreRow

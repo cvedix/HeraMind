@@ -12,7 +12,34 @@
 //! request body, responses with the shapes from the handler's DTOs), add it
 //! to `paths()` below, and extend the drift test if it's a new router.
 
-use utoipa::OpenApi;
+use utoipa::{
+    openapi::{
+        security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme},
+        OpenApi as OpenApiDocument,
+    },
+    Modify, OpenApi,
+};
+
+struct OcrSecurity;
+
+impl Modify for OcrSecurity {
+    fn modify(&self, openapi: &mut OpenApiDocument) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "ocrKey",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("X-OCR-Key"))),
+        );
+        components.add_security_scheme(
+            "ocrSession",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .build(),
+            ),
+        );
+    }
+}
 
 /// The HeraMind OpenAPI document. `info` describes the service; `paths` is
 /// hand-maintained alongside the handlers it documents — the api_docs drift
@@ -28,6 +55,14 @@ unless a field is documented otherwise. Interactive docs: /api/docs; full \
 route index (including not-yet-schematized endpoints): /api/docs/routes.json."
     ),
     paths(
+        crate::handlers::ocr::status,
+        crate::handlers::ocr::list,
+        crate::handlers::ocr::submit,
+        crate::handlers::ocr::get,
+        crate::handlers::ocr::monitor::snapshot,
+        crate::handlers::ocr::keys,
+        crate::handlers::ocr::issue,
+        crate::handlers::ocr::revoke,
         // ---- Auth ----
         crate::handlers::auth_users::login_handler,
         crate::handlers::auth_users::register_handler,
@@ -442,6 +477,7 @@ route index (including not-yet-schematized endpoints): /api/docs/routes.json."
         crate::handlers::onboarding::reset_onboarding_handler,
     ),
     tags(
+        (name = "OCR", description = "Asynchronous scanned PDF OCR and integration keys"),
         (name = "auth", description = "Login, registration, API keys, user admin"),
         (name = "setup", description = "First-run setup wizard"),
         (name = "health", description = "Liveness, readiness, component health"),
@@ -481,8 +517,25 @@ route index (including not-yet-schematized endpoints): /api/docs/routes.json."
         (name = "logs", description = "Diagnostic log archive"),
         (name = "onboarding", description = "UI onboarding wizard state"),
     ),
+    modifiers(&OcrSecurity),
     components(
         schemas(
+            crate::handlers::ocr::Language,
+            crate::handlers::ocr::Recognizer,
+            crate::handlers::ocr::JobStatus,
+            crate::handlers::ocr::Job,
+            crate::handlers::ocr::Page,
+            crate::handlers::ocr::JobResult,
+            crate::handlers::ocr::Status,
+            crate::handlers::ocr::Key,
+            crate::handlers::ocr::CreateKey,
+            crate::handlers::ocr::IssuedKey,
+            crate::handlers::ocr::monitor::Route,
+            crate::handlers::ocr::monitor::Authentication,
+            crate::handlers::ocr::monitor::RequestSample,
+            crate::handlers::ocr::monitor::JobSummary,
+            crate::handlers::ocr::monitor::OcrMonitorSnapshot,
+            crate::handlers::ocr::Success<crate::handlers::ocr::Status>,
 crate::handlers::dashboards::AddComponentsRequest,
     crate::handlers::mqtt::broker_config::AddCredentialRequest,
     crate::handlers::devices::models::AddDeviceRequest,

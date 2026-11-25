@@ -49,10 +49,10 @@
 | `HERAMIND_BUILTIN_LLM_KV` | `q8_0` | KV 缓存量化 + flash attention 开关。默认 `q8_0`(`-fa on -ctk q8_0 -ctv q8_0`):近无损,KV 内存约减半(实测同模型 32K+q8 的设备内存低于 16K+f16)。设 `f16`/`off`/`0` 关闭(老 runtime 或 FA 不兼容的架构)。 |
 | `HERAMIND_BUILTIN_LLM_PARALLEL` | `1` | 内置引擎的 llama-server 槽位数。默认 1:单槽独占整个 KV 池,平台按整窗预算 prompt,并发请求排队——单用户边缘盒的最优解。多客户端场景可设 2-16。`0` = 不传该参数,交给上游默认(llama.cpp 默认 4 槽;此时平台按"总窗 ÷ 槽数"预算每请求,窗口会缩小)。 |
 | `HERAMIND_BUILTIN_MODEL_NGL` | 未设置 | 传给 llama-server 的 `--n-gpu-layers`(卸载到 GPU 的层数)。**显存充足时必设**(如 `99` 全量卸载);显存紧张时设小值可加速 prefill 但会拖慢解码(层间 PCIe 往返)。 |
-| `HERAMIND_BUILTIN_RUNTIME_VARIANT` | 自动检测 | `cuda`/`vulkan`/`cpu`/`jetson` 手动覆盖。默认自动检测:Jetson 自动选专用构建;Linux x64 检测到 NVIDIA GPU(算力 sm_75–89 且驱动 ≥525,经 `nvidia-smi` 探测)自动选我们自托管的 CUDA 构建(主机只需驱动,无需 CUDA 工具链);其余用 CPU 构建。**AMD/Intel GPU 用 `vulkan`**(官方 Vulkan 构建,需系统 Vulkan loader:桌面自带,无头服务器 `apt install libvulkan1`)。检测到不支持的显卡(如 V100/P100)时保持 CPU;CUDA/Vulkan 下载或执行失败也自动回退 CPU。 |
+| `HERAMIND_BUILTIN_RUNTIME_VARIANT` | 自动检测 | `cuda`/`vulkan`/`cpu`/`jetson` 手动覆盖。默认自动检测:Jetson 自动选专用构建;Linux x64 检测到 NVIDIA GPU(算力 sm_75–89 且驱动 ≥525,经 `nvidia-smi` 探测)自动选自托管 CUDA 构建。NVIDIA Blackwell（如 RTX 50 系列，驱动 ≥570）自动尝试 Vulkan，启动前由 llama-server 确认 NVIDIA 设备与可用显存。其余用 CPU 构建。**AMD/Intel GPU 用 `vulkan`**(官方 Vulkan 构建,需系统 Vulkan loader:桌面自带,无头服务器 `apt install libvulkan1`)。检测到不支持的显卡(如 V100/P100)时保持 CPU;CUDA/Vulkan 下载或执行失败也自动回退 CPU。 |
 | `HERAMIND_BUILTIN_MODEL_PATH` | 未设置 | 覆盖模型 GGUF 路径(指向本地已有文件,跳过下载)。 |
 
-Linux GPU 服务器**零配置**:检测到受支持的 NVIDIA GPU 即自动下载并使用 CUDA runtime(日志会打印 `NVIDIA GPU detected — using the CUDA runtime`)。需要强制时用 `HERAMIND_BUILTIN_RUNTIME_VARIANT`,显存紧张时配合 `HERAMIND_BUILTIN_MODEL_NGL` 控制卸载层数。
+Linux x64 在安装内置模型后自动选择受支持的 NVIDIA 运行时。Blackwell 需要 Vulkan loader 和 NVIDIA Vulkan ICD。自动 Vulkan 模式会将 GGUF 模型分配到可用显存最多的 NVIDIA Vulkan 设备，再按模型大小和上下文预算卸载层数。运行时无法验证时回退到 CPU。可用 `HERAMIND_BUILTIN_RUNTIME_VARIANT` 手动选择运行时。`HERAMIND_BUILTIN_MODEL_NGL` 可覆盖自动计算的卸载层数。
 
 ## 日志
 

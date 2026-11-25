@@ -103,6 +103,8 @@ fn docs_table_matches_router_registrations() {
         ("component_upload_routes", "jwt-or-api-key"),
         ("debug_routes", "debug"),
         ("limited_routes", "jwt-or-api-key"),
+        ("ocr_routes", "jwt-or-ocr-key"),
+        ("ocr_admin_routes", "jwt-only"),
     ];
 
     // Any `let X = Router::new()` not in the map fails loudly.

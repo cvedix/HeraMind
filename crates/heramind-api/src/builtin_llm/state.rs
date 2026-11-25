@@ -275,7 +275,7 @@ pub async fn bootstrap(
         reclaim_legacy_llama_port(8081, data_dir).await;
     }
 
-    let binary = match ensure_llama_server(data_dir).await {
+    let runtime = match ensure_llama_server(data_dir).await {
         Ok(b) => b,
         Err(e) => {
             super::runtime_manager::record_bootstrap_error(Some(format!(
@@ -320,7 +320,8 @@ pub async fn bootstrap(
     // elsewhere preserves the llama-server default exactly.
     let ngl = super::vram::resolve_spawn_ngl(&super::vram::NglQuery {
         explicit: cfg.ngl,
-        binary: &binary,
+        binary: &runtime.binary,
+        nvidia_vulkan: runtime.nvidia_vulkan.as_ref(),
         model_path: &model_path,
         mmproj: mmproj.as_deref(),
         ctx: effective_ctx,
@@ -330,7 +331,8 @@ pub async fn bootstrap(
         kv_quant: cfg.kv_quant,
     });
     let server_cfg = LlamaServerConfig {
-        binary,
+        binary: runtime.binary,
+        device: runtime.nvidia_vulkan.map(|device| device.id),
         model: model_path,
         port: cfg.port,
         ctx: effective_ctx,

@@ -32,6 +32,55 @@ pub(crate) fn runtime_lock() -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+pub struct ResolvedRuntime {
+    pub binary: PathBuf,
+    pub nvidia_vulkan: Option<VulkanDevice>,
+}
+
+pub struct VulkanDevice {
+    pub id: String,
+    pub name: String,
+    pub free_mib: u64,
+}
+
+pub async fn ensure_llama_server(data_dir: &Path) -> Result<ResolvedRuntime, String> {
+    let variant = runtime_manager::effective_variant();
+    let auto_vulkan =
+        variant == RuntimeVariant::Vulkan && runtime_manager::configured_variant().is_none();
+    let result: Result<ResolvedRuntime, String> = async {
+        let binary = resolve_llama_server(data_dir, variant, auto_vulkan).await?;
+        let nvidia_vulkan = if auto_vulkan {
+            let device = probe_nvidia_vulkan(&binary).await?;
+            tracing::info!(
+                device = %device.id,
+                gpu = %device.name,
+                free_mib = device.free_mib,
+                "builtin llm: selected NVIDIA Vulkan device"
+            );
+            Some(device)
+        } else {
+            None
+        };
+        Ok(ResolvedRuntime {
+            binary,
+            nvidia_vulkan,
+        })
+    }
+    .await;
+    match result {
+        Err(error) if matches!(variant, RuntimeVariant::Cuda | RuntimeVariant::Vulkan) => {
+            tracing::warn!(%error, ?variant, "builtin llm: GPU runtime unavailable, using CPU");
+            runtime_manager::degrade_to_cpu_for_process();
+            let binary = ensure_runtime_variant(data_dir, RuntimeVariant::Cpu).await?;
+            Ok(ResolvedRuntime {
+                binary,
+                nvidia_vulkan: None,
+            })
+        }
+        result => result,
+    }
+}
+
 /// Resolve a runnable `heramind-llama-server` (newest-valid-wins matrix —
 /// see the module doc and `runtime_manager::pick_runtime`):
 ///
@@ -46,20 +95,21 @@ pub(crate) fn runtime_lock() -> Arc<tokio::sync::Mutex<()>> {
 /// A cache pick is exec-verified once per process; a failure ejects that
 /// cache dir and resolution retries with the next candidate. Variant
 /// selection: env > persisted setting > auto-detect (Jetson via
-/// `/etc/nv_tegra_release`, Linux x64 + qualifying NVIDIA GPU → our
-/// self-hosted CUDA build). A CUDA/Vulkan download or exec failure degrades
-/// the PROCESS to the CPU build — never persisted, so the user's variant
-/// choice survives a transient driver failure.
-pub async fn ensure_llama_server(data_dir: &Path) -> Result<PathBuf, String> {
+/// `/etc/nv_tegra_release`, Linux x64 + qualifying NVIDIA GPU → CUDA or
+/// Vulkan). The caller handles GPU runtime fallback.
+async fn resolve_llama_server(
+    data_dir: &Path,
+    variant: RuntimeVariant,
+    auto_vulkan: bool,
+) -> Result<PathBuf, String> {
     let mut allow_eject = true;
     loop {
-        let variant = runtime_manager::effective_variant();
-
         // Bundled candidate. On Jetson hosts a PATH/bundled binary may be
         // the OFFICIAL ubuntu-arm64 build, which requires gcc-13 libstdc++
         // (GLIBCXX_3.4.32) — JetPack 6 ships gcc-11, so it fails to exec.
         // Don't trust it; exec-check and drop to the cache/download path.
         let bundled = match find_llama_server() {
+            Ok(b) if auto_vulkan && probe_nvidia_vulkan(&b).await.is_err() => None,
             Ok(b) => {
                 if variant == RuntimeVariant::Jetson && exec_check(&b).await.is_err() {
                     tracing::warn!(
@@ -176,33 +226,48 @@ pub async fn ensure_llama_server(data_dir: &Path) -> Result<PathBuf, String> {
             }
         }
 
-        // Picked::DownloadPin — bare `heramind serve` path.
-        return match ensure_runtime_variant(data_dir, variant).await {
-            Ok(bin) => Ok(bin),
-            // CUDA/Vulkan are opt-in, but a dead backend helps nobody —
-            // degrade this PROCESS to the CPU build instead of failing
-            // the boot. Not persisted (the env/setting overrides stay
-            // untouched), so a restart retries the accelerated path.
-            Err(err) if matches!(variant, RuntimeVariant::Cuda | RuntimeVariant::Vulkan) => {
-                tracing::warn!(
-                    error = %err,
-                    "builtin llm: {} runtime unusable — falling back to the CPU build for \
-                     this process; unset the variant override or fix the driver/loader to \
-                     retry",
-                    if llama_asset_name(std::env::consts::OS, std::env::consts::ARCH, variant)
-                        .is_some()
-                    {
-                        "download or exec failed"
-                    } else {
-                        "no prebuilt for this platform"
-                    }
-                );
-                runtime_manager::degrade_to_cpu_for_process();
-                ensure_runtime_variant(data_dir, RuntimeVariant::Cpu).await
-            }
-            Err(err) => Err(err),
-        };
+        return ensure_runtime_variant(data_dir, variant).await;
     }
+}
+
+async fn probe_nvidia_vulkan(bin: &Path) -> Result<VulkanDevice, String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(bin)
+            .arg("--list-devices")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "Vulkan device probe timed out".to_string())?
+    .map_err(|e| format!("Vulkan device probe failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("Vulkan device probe exited with {}", output.status));
+    }
+    parse_nvidia_vulkan_device(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| "llama-server reports no NVIDIA Vulkan device with a VRAM budget".into())
+}
+
+fn parse_nvidia_vulkan_device(output: &str) -> Option<VulkanDevice> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (id, description) = line.trim().split_once(": ")?;
+            id.strip_prefix("Vulkan")?.parse::<u32>().ok()?;
+            let (name, memory) = description.rsplit_once(" (")?;
+            if !name.starts_with("NVIDIA ") {
+                return None;
+            }
+            let (total, free) = memory.strip_suffix(" MiB free)")?.rsplit_once(", ")?;
+            let total = total.strip_suffix(" MiB")?.parse::<u64>().ok()?;
+            let free_mib = free.parse().ok()?;
+            (total > 0 && free_mib <= total).then(|| VulkanDevice {
+                id: id.into(),
+                name: name.into(),
+                free_mib,
+            })
+        })
+        .max_by_key(|device| device.free_mib)
 }
 
 /// Download (or reuse from cache) the runtime for ONE variant at the
@@ -401,6 +466,7 @@ pub(crate) async fn download_runtime(
 ) -> Result<PathBuf, String> {
     use futures::StreamExt;
     use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     let mut on_progress = on_progress;
     let client = reqwest::Client::new();
@@ -418,13 +484,24 @@ pub(crate) async fn download_runtime(
     let total = resp.content_length();
     let mut stream = resp.bytes_stream();
     let mut hasher = Sha256::new();
-    let mut bytes: Vec<u8> = Vec::with_capacity(32 * 1024 * 1024);
+    let cache_parent = cache_dir.parent().ok_or("runtime cache has no parent")?;
+    tokio::fs::create_dir_all(cache_parent)
+        .await
+        .map_err(|e| format!("create runtime cache parent: {e}"))?;
+    let archive = tempfile::tempfile_in(cache_parent)
+        .map_err(|e| format!("create temporary runtime archive: {e}"))?;
+    let mut archive = tokio::fs::File::from_std(archive);
+    let mut received = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("read llama.cpp runtime: {e}"))?;
         hasher.update(&chunk);
-        bytes.extend_from_slice(&chunk);
+        archive
+            .write_all(&chunk)
+            .await
+            .map_err(|e| format!("write runtime archive: {e}"))?;
+        received += chunk.len() as u64;
         if let Some(cb) = on_progress.as_mut() {
-            cb(bytes.len() as u64, total);
+            cb(received, total);
         }
     }
 
@@ -439,6 +516,15 @@ pub(crate) async fn download_runtime(
         }
     }
 
+    archive
+        .flush()
+        .await
+        .map_err(|e| format!("flush runtime archive: {e}"))?;
+    archive
+        .seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|e| format!("seek runtime archive: {e}"))?;
+    let archive = archive.into_std().await;
     // Extract the WHOLE archive into the cache dir — the llama-server binary
     // is a thin wrapper that dlopens sibling libs (macOS libllama-server-impl
     // .dylib, Windows .dll), so a single-binary extract dies on exec.
@@ -446,7 +532,8 @@ pub(crate) async fn download_runtime(
         let _ = std::fs::remove_dir_all(cache_dir);
     }
     std::fs::create_dir_all(cache_dir).map_err(|e| format!("create cache dir: {e}"))?;
-    extract_archive(&bytes, cache_dir, is_zip).map_err(|e| e.to_string())?;
+    extract_archive(std::io::BufReader::new(archive), cache_dir, is_zip)
+        .map_err(|e| format!("extract runtime archive: {e}"))?;
     let bin = find_runtime_binary(cache_dir)
         .ok_or_else(|| "llama-server not found after extract".to_string())?;
     #[cfg(unix)]
@@ -506,9 +593,13 @@ pub(crate) fn find_runtime_binary(dir: &Path) -> Option<PathBuf> {
 
 /// Extract every entry of the release archive into `out_dir` (paths
 /// preserved, so wrapper binaries find their sibling libs).
-fn extract_archive(bytes: &[u8], out_dir: &Path, is_zip: bool) -> anyhow::Result<()> {
+fn extract_archive(
+    reader: impl std::io::Read + std::io::Seek,
+    out_dir: &Path,
+    is_zip: bool,
+) -> anyhow::Result<()> {
     if is_zip {
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+        let mut zip = zip::ZipArchive::new(reader)?;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i)?;
             // zip 9: name() validates UTF-8; an invalid name has no sane
@@ -531,7 +622,7 @@ fn extract_archive(bytes: &[u8], out_dir: &Path, is_zip: bool) -> anyhow::Result
         Ok(())
     } else {
         use flate2::read::GzDecoder;
-        let gz = GzDecoder::new(bytes);
+        let gz = GzDecoder::new(reader);
         let mut ar = tar::Archive::new(gz);
         ar.unpack(out_dir)?;
         Ok(())
@@ -550,6 +641,15 @@ pub fn runtime_version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selects_nvidia_vulkan_device_with_most_free_vram() {
+        let devices = "Available devices:\n  Vulkan0: Mesa (8192 MiB, 8192 MiB free)\n  Vulkan1: NVIDIA GeForce RTX 5060 (8151 MiB, 7630 MiB free)\n  Vulkan2: NVIDIA GeForce RTX 5090 (32768 MiB, 3000 MiB free)";
+        let choice = parse_nvidia_vulkan_device(devices).unwrap();
+        assert_eq!(choice.id, "Vulkan1");
+        assert_eq!(choice.free_mib, 7630);
+        assert!(parse_nvidia_vulkan_device("  Vulkan0: Mesa (8192 MiB, 8192 MiB free)").is_none());
+    }
 
     #[test]
     fn cache_dir_is_versioned() {
@@ -589,7 +689,7 @@ mod tests {
         let out = std::env::temp_dir().join("llama-extract-test");
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out).unwrap();
-        extract_archive(&tar_gz, &out, false).expect("extract");
+        extract_archive(std::io::Cursor::new(&tar_gz), &out, false).expect("extract");
         let bin = find_runtime_binary(&out).expect("find binary");
         assert_eq!(bin, out.join("bin/llama-server"));
         assert_eq!(std::fs::read_to_string(&bin).unwrap(), "probe");
@@ -614,7 +714,7 @@ mod tests {
         let out = std::env::temp_dir().join("llama-extract-zip-test");
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out).unwrap();
-        extract_archive(zip_buf.get_ref(), &out, true).expect("extract zip");
+        extract_archive(zip_buf, &out, true).expect("extract zip");
         let bin = find_runtime_binary(&out).expect("find binary");
         assert_eq!(bin, out.join(format!("bin/{}", llama_server_bin_name())));
         assert_eq!(std::fs::read_to_string(&bin).unwrap(), "probe-exe");

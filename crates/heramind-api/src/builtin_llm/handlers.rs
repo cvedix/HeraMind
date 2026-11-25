@@ -2282,7 +2282,7 @@ async fn spawn_builtin_server(
         None => installed_model_any(&mdir)
             .ok_or_else(|| anyhow::anyhow!("model not installed (no manifest)"))?,
     };
-    let binary = ensure_llama_server(data_dir)
+    let runtime = ensure_llama_server(data_dir)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
     let model_path = cfg
@@ -2325,7 +2325,8 @@ async fn spawn_builtin_server(
     // auto-size to free VRAM on discrete NVIDIA GPUs, None elsewhere.
     let ngl = super::vram::resolve_spawn_ngl(&super::vram::NglQuery {
         explicit: cfg.ngl,
-        binary: &binary,
+        binary: &runtime.binary,
+        nvidia_vulkan: runtime.nvidia_vulkan.as_ref(),
         model_path: &model_path,
         mmproj: mmproj.as_deref(),
         ctx,
@@ -2335,7 +2336,8 @@ async fn spawn_builtin_server(
         kv_quant: cfg.kv_quant,
     });
     let server_cfg = LlamaServerConfig {
-        binary,
+        binary: runtime.binary,
+        device: runtime.nvidia_vulkan.map(|device| device.id),
         model: model_path,
         port: cfg.port,
         ctx,
@@ -2503,7 +2505,7 @@ async fn spawn_companion_server(
         return Err(CompanionSkip::PortBusy(cfg.vlm_port));
     }
 
-    let binary = match ensure_llama_server(data_dir).await {
+    let runtime = match ensure_llama_server(data_dir).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "builtin llm: vision companion spawn failed (no llama-server)");
@@ -2556,7 +2558,8 @@ async fn spawn_companion_server(
     // the merged cfg (dedicated VLM_NGL/KV overrides applied above).
     let ngl = super::vram::resolve_spawn_ngl(&super::vram::NglQuery {
         explicit: ccfg.ngl,
-        binary: &binary,
+        binary: &runtime.binary,
+        nvidia_vulkan: runtime.nvidia_vulkan.as_ref(),
         model_path: &model_path,
         mmproj: mmproj.as_deref(),
         ctx,
@@ -2567,7 +2570,8 @@ async fn spawn_companion_server(
         kv_quant: ccfg.kv_quant,
     });
     let server_cfg = LlamaServerConfig {
-        binary,
+        binary: runtime.binary,
+        device: runtime.nvidia_vulkan.map(|device| device.id),
         model: model_path,
         port: cfg.vlm_port,
         ctx,

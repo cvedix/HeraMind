@@ -10,6 +10,7 @@ pub struct LlamaServerConfig {
     pub port: u16,
     pub ctx: usize,
     pub ngl: Option<u16>,
+    pub device: Option<String>,
     pub threads: Option<usize>,
     /// Per-model sampling defaults (official/model-card tuned). Passed as
     /// server-side defaults (--temp/--top-p/--top-k): any request that omits
@@ -329,6 +330,14 @@ fn build_llama_args(cfg: &LlamaServerConfig) -> Vec<String> {
         args.push("-ngl".into());
         args.push(n.to_string());
     }
+    if let Some(device) = &cfg.device {
+        args.push("--device".into());
+        args.push(if cfg.ngl == Some(0) {
+            "none".into()
+        } else {
+            device.clone()
+        });
+    }
     if let Some(t) = cfg.threads {
         args.push("-t".into());
         args.push(t.to_string());
@@ -483,6 +492,7 @@ mod tests {
             port: 29375,
             ctx: 32768,
             ngl: None,
+            device: None,
             threads: None,
             temperature: Some(1.0),
             top_p: Some(0.95),
@@ -493,6 +503,21 @@ mod tests {
             parallel: Some(1),
             mmproj,
         }
+    }
+
+    #[test]
+    fn gpu_spawn_can_pin_a_device_or_disable_offload() {
+        let mut cfg = test_server_config(None);
+        cfg.device = Some("Vulkan1".into());
+        cfg.ngl = Some(8);
+        assert!(build_llama_args(&cfg)
+            .windows(2)
+            .any(|pair| pair == ["--device", "Vulkan1"]));
+
+        cfg.ngl = Some(0);
+        assert!(build_llama_args(&cfg)
+            .windows(2)
+            .any(|pair| pair == ["--device", "none"]));
     }
 
     /// The argv surface a spawn actually produces — locked so a refactor

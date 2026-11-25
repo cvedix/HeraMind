@@ -62,6 +62,7 @@ const registry: Record<string, SchemaFactory> = {
   // Business
   'agent-monitor-widget': getAgentMonitorSchema,
   'ai-analyst': getAIAnalystSchema,
+  'ocr-monitor': () => ({}),
 }
 
 // ---------------------------------------------------------------------------

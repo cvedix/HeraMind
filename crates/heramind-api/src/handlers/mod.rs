@@ -28,6 +28,7 @@ pub mod mentions;
 pub mod message_channels;
 pub mod messages;
 pub mod mqtt;
+pub mod ocr;
 pub mod onboarding;
 pub mod openapi;
 pub mod operations;

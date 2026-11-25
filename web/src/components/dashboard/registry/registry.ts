@@ -49,6 +49,7 @@ import {
   Square as SquareIcon,
   // Business
 
+  Activity,
   ScanEye,
   // Community
   Store,
@@ -454,6 +455,17 @@ export const componentRegistry: ComponentRegistry = {
     hasActions: true,
     defaultProps: { agentId: undefined },
     variants: ['default'],
+  },
+  'ocr-monitor': {
+    type: 'ocr-monitor',
+    name: 'OCR Monitor',
+    description: 'Monitor OCR HTTP traffic and processing jobs',
+    category: 'business',
+    icon: Activity,
+    sizeConstraints: getSizeConstraints('ocr-monitor'),
+    hasDataSource: false,
+    hasDisplayConfig: true,
+    hasActions: false,
   },
 } as const
 

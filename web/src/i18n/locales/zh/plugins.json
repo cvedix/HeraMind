@@ -229,7 +229,7 @@
     "runtimeReverted": "已回退（移除 {{tag}}）",
     "runtimeVariantLabel": "运行时变体",
     "runtimeVariantAuto": "自动",
-    "runtimeVariantHint": "自动按硬件检测（Jetson / NVIDIA GPU → CUDA，其余 CPU）。显式选择仅在排障时使用，重启引擎后生效。",
+    "runtimeVariantHint": "自动为 Jetson 和兼容的 NVIDIA GPU 选择 CUDA，为 Linux x64 上的 NVIDIA Blackwell 选择 Vulkan。重启引擎后生效。",
     "builtinCatalogFallback": "在线目录不可达，正在显示内置模型目录（可在下载源设置中配置镜像）",
     "builtinImportLocal": "导入服务器上的模型文件",
     "builtinImportUpload": "上传模型文件",
