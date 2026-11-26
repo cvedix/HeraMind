@@ -99,3 +99,5 @@ curl -fsS http://127.0.0.1:8000/health
 ```
 
 Trình khởi chạy gắn cổng nội bộ `127.0.0.1:8000` và hỗ trợ cả GET lẫn POST cho kiểm tra trạng thái. Với `PADDLE_VL_WARMUP=0`, mô hình được nạp khi nhận yêu cầu OCR đầu tiên nên tác vụ đầu có thể mất thêm thời gian. Dashboard PDF trả văn bản từng trang từ lệnh `recognize` của extension. Widget ảnh gốc của extension có thêm chế độ đọc bảng và trường thông tin.
+
+Trình khởi chạy giữ một pipeline trong bộ nhớ. Khi thay đổi tùy chọn xoay hoặc làm phẳng tài liệu, dịch vụ giải phóng pipeline cũ trước khi nạp pipeline mới. Nếu dashboard báo **Bộ máy OCR chưa sẵn sàng**, kiểm tra `/health` từ máy chạy HeraMind. Nếu request hết thời gian chờ khi log đang nạp pipeline, kiểm tra mức sử dụng RAM và giới hạn bộ nhớ của dịch vụ. Trên máy thiếu RAM, có thể tắt `use_doc_orientation_classify` và `use_doc_unwarping` trong cấu hình extension rồi khởi động lại dịch vụ suy luận.
