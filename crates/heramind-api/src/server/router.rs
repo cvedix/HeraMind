@@ -1420,7 +1420,7 @@ pub fn create_router_with_state(state: ServerState) -> Router {
     let ocr_routes = Router::new()
         .route("/api/ocr/status", get(ocr::status))
         .route("/api/ocr/jobs", get(ocr::list).post(ocr::submit))
-        .route("/api/ocr/jobs/:id", get(ocr::get))
+        .route("/api/ocr/jobs/:id", get(ocr::get).delete(ocr::delete_job))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             ocr::authenticate,

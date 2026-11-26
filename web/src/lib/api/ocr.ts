@@ -66,6 +66,7 @@ export const ocrApi = {
   status: (engine: OcrEngine, signal?: AbortSignal) => fetchAPI<OcrStatus>(`/ocr/status?engine=${engine}`, { ...localError, signal }),
   jobs: (signal?: AbortSignal) => fetchAPI<OcrJob[]>('/ocr/jobs', { ...localError, signal }),
   result: (id: string, signal?: AbortSignal) => fetchAPI<OcrResult>(`/ocr/jobs/${id}`, { ...localError, signal }),
+  deleteJob: (id: string) => fetchAPI<boolean>(`/ocr/jobs/${id}`, { ...localError, method: 'DELETE' }),
   submit: (file: File, language: OcrLanguage, engine: OcrEngine) => {
     const query = new URLSearchParams({ filename: file.name, language, engine })
     return fetchAPI<OcrJob>(`/ocr/jobs?${query}`, {

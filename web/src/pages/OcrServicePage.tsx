@@ -1,8 +1,9 @@
-import { useEffect, useId, useState, type FormEvent } from 'react'
-import { Download, FileScan, Loader2 } from 'lucide-react'
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react'
+import { Download, FileScan, Loader2, Trash2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { MobilePageHeader } from '@/components/layout/MobilePageHeader'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { confirm } from '@/components/ui/use-confirm'
 import { getServerOrigin } from '@/lib/api/client'
@@ -29,15 +30,23 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
   const [engineStatus, setEngineStatus] = useState<OcrStatus>()
   const status = engineStatus?.engine === engine ? engineStatus : undefined
   const [jobs, setJobs] = useState<OcrJob[]>([])
+  const historyVersion = useRef(0)
+  const [checkedIds, setCheckedIds] = useState(() => new Set<string>())
+  const deletableJobs = jobs.filter((job) => !active(job))
+  const checkedJobs = deletableJobs.filter((job) => checkedIds.has(job.id))
+  const allChecked = checkedJobs.length === deletableJobs.length
   const [selected, setSelected] = useState<string>()
   const selectedJob = jobs.find((job) => job.id === selected)
   const selectedState = selectedJob?.status
-  const [result, setResult] = useState<OcrResult>()
+  const [loadedResult, setResult] = useState<OcrResult>()
+  const result = loadedResult?.job.id === selected ? loadedResult : undefined
   const [page, setPage] = useState(0)
   const [file, setFile] = useState<File>()
   const [language, setLanguage] = useState<OcrLanguage>('vie_eng')
   const [uploading, setUploading] = useState(false)
   const [loadError, setLoadError] = useState('')
+  const [deletingIds, setDeletingIds] = useState<Set<string>>()
+  const [deleteError, setDeleteError] = useState('')
   const [resultError, setResultError] = useState('')
   const [uploadError, setUploadError] = useState('')
   const [statusError, setStatusError] = useState('')
@@ -52,15 +61,21 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout>
     const refresh = async () => {
+      const version = historyVersion.current
       try {
         const entries = await ocrApi.jobs(controller.signal)
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && version === historyVersion.current) {
           setJobs(entries)
+          setCheckedIds((current) => {
+            if (!current.size) return current
+            const visible = new Set(entries.filter((job) => !active(job) && current.has(job.id)).map((job) => job.id))
+            return visible.size === current.size ? current : visible
+          })
           setLoadError('')
           setLoading(false)
         }
       } catch (error) {
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && version === historyVersion.current) {
           setLoadError(errorMessage(error))
           setLoading(false)
         }
@@ -136,6 +151,7 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
     setUploading(true)
     try {
       const job = await ocrApi.submit(file, language, engine)
+      historyVersion.current += 1
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)])
       selectJob(job.id)
     } catch (error) {
@@ -143,6 +159,51 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
     } finally {
       setUploading(false)
     }
+  }
+
+  function checkJob(id: string, checked: boolean) {
+    setCheckedIds((current) => {
+      const next = new Set(current)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
+
+  async function deleteJobs(entries: OcrJob[]) {
+    const [first] = entries
+    if (deletingIds || !first) return
+    const count = entries.length
+    if (!(await confirm({
+      title: count === 1 ? label('deleteTitle') : t('ocr.deleteManyTitle', { count }),
+      description: count === 1 ? t('ocr.deletePrompt', { name: first.filename }) : label('deleteManyPrompt'),
+      confirmText: label('delete'),
+      cancelText: t('cancel'),
+      variant: 'destructive',
+    }))) return
+
+    setDeletingIds(new Set(entries.map((entry) => entry.id)))
+    setDeleteError('')
+    const outcomes = await Promise.allSettled(entries.map((entry) => ocrApi.deleteJob(entry.id)))
+    const removedIds = new Set<string>()
+    for (const [index, outcome] of outcomes.entries()) {
+      // A document may already have expired or been deleted by another session.
+      if (outcome.status === 'fulfilled' || outcome.reason?.status === 404) {
+        removedIds.add(entries[index].id)
+      }
+    }
+    if (removedIds.size) {
+      historyVersion.current += 1
+      setJobs((current) => current.filter((item) => !removedIds.has(item.id)))
+      setCheckedIds((current) => new Set([...current].filter((id) => !removedIds.has(id))))
+      setSelected((current) => current && removedIds.has(current) ? undefined : current)
+      setResult((current) => current && removedIds.has(current.job.id) ? undefined : current)
+    }
+    const failed = count - removedIds.size
+    if (failed) setDeleteError(count === 1
+      ? t('ocr.deleteError', { name: first.filename })
+      : t('ocr.deleteManyError', { count: failed, total: count }))
+    setDeletingIds(undefined)
   }
 
   async function issueKey(event: FormEvent<HTMLFormElement>) {
@@ -320,12 +381,29 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
         <div className="grid gap-5 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
           <section className={panel}>
             <h2 className="font-semibold">{label('history')}</h2>
+            {deletableJobs.length > 0 && <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Button type="button" size="sm" variant="outline" disabled={Boolean(deletingIds)}
+                onClick={() => setCheckedIds(new Set(allChecked ? [] : deletableJobs.map((job) => job.id)))}>
+                {t(allChecked ? 'deselectAll' : 'selectAll')}
+              </Button>
+              <Button type="button" size="sm" variant="destructive" disabled={!checkedJobs.length || Boolean(deletingIds)}
+                onClick={() => void deleteJobs(checkedJobs)}>
+                {deletingIds && deletingIds.size > 1
+                  ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden="true" />
+                  : <Trash2 className="mr-1.5 h-4 w-4" aria-hidden="true" />}
+                {t('ocr.deleteSelected', { count: checkedJobs.length })}
+              </Button>
+            </div>}
             {loadError && <p role="alert" className="mt-2 text-sm text-destructive">{loadError}</p>}
+            {deleteError && <p role="alert" className="mt-2 text-sm text-destructive">{deleteError}</p>}
             {!jobs.length && !loadError && <p className="mt-3 text-sm text-muted-foreground">{label(loading ? 'loading' : 'noJobs')}</p>}
             <ul className="mt-2 max-h-96 divide-y divide-border overflow-y-auto">
-              {jobs.map((entry) => <li key={entry.id}>
+              {jobs.map((entry) => <li className="flex items-center gap-1" key={entry.id}>
+                <Checkbox className="ml-1 h-6 w-6" aria-label={t('ocr.selectDocument', { name: entry.filename })}
+                  checked={checkedIds.has(entry.id)} disabled={active(entry) || Boolean(deletingIds)}
+                  onCheckedChange={(checked) => checkJob(entry.id, checked === true)} />
                 <button type="button" aria-pressed={selected === entry.id} onClick={() => selectJob(entry.id)}
-                  className={cn('w-full rounded-lg p-3 text-left hover:bg-muted/50', selected === entry.id && 'bg-brand/10')}>
+                  className={cn('min-w-0 flex-1 rounded-lg p-3 text-left hover:bg-muted/50', selected === entry.id && 'bg-brand/10')}>
                   <span className="block truncate text-sm font-medium">{entry.filename}</span>
                   <span className="mt-1 flex flex-wrap gap-x-2 text-xs text-muted-foreground">
                     <span>{label(entry.status)}</span>
@@ -334,6 +412,15 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
                     <span>{new Date(entry.created_at * 1000).toLocaleString(i18n.language)}</span>
                   </span>
                 </button>
+                {!active(entry) && <Button type="button" variant="ghost" size="sm" disabled={Boolean(deletingIds)}
+                  className="shrink-0 text-destructive hover:text-destructive"
+                  aria-label={t('ocr.deleteNamed', { name: entry.filename })}
+                  onClick={() => void deleteJobs([entry])}>
+                  {deletingIds?.size === 1 && deletingIds.has(entry.id)
+                    ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden="true" />
+                    : <Trash2 className="mr-1.5 h-4 w-4" aria-hidden="true" />}
+                  {label('delete')}
+                </Button>}
               </li>)}
             </ul>
           </section>
@@ -343,7 +430,7 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
               <h2 className="font-semibold">{label('result')}</h2>
               {result?.pages.length ? <Button variant="outline" size="sm" onClick={download}><Download className="mr-2 h-4 w-4" />{label('download')}</Button> : null}
             </div>
-            {resultError && <p role="alert" className="text-sm text-destructive">{resultError}</p>}
+            {selected && resultError && <p role="alert" className="text-sm text-destructive">{resultError}</p>}
             {!selected && <p className="text-sm text-muted-foreground">{label('selectJob')}</p>}
             {job && (
               <div className="space-y-3">

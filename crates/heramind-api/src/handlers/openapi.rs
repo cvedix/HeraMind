@@ -59,6 +59,7 @@ route index (including not-yet-schematized endpoints): /api/docs/routes.json."
         crate::handlers::ocr::list,
         crate::handlers::ocr::submit,
         crate::handlers::ocr::get,
+        crate::handlers::ocr::delete_job,
         crate::handlers::ocr::monitor::snapshot,
         crate::handlers::ocr::keys,
         crate::handlers::ocr::issue,

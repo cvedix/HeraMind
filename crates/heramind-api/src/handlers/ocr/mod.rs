@@ -175,6 +175,7 @@ pub struct IssuedKey {
     OcrJobResponse = Success<Job>,
     OcrJobListResponse = Success<Vec<Job>>,
     OcrResultResponse = Success<JobResult>,
+    OcrDeletedJobResponse = Success<bool>,
     OcrMonitorResponse = Success<monitor::OcrMonitorSnapshot>,
     OcrKeyListResponse = Success<Vec<Key>>,
     OcrIssuedKeyResponse = Success<IssuedKey>,
@@ -660,6 +661,32 @@ pub async fn get(
         .await?
         .ok_or_else(|| ErrorResponse::not_found("OCR job"))?;
     ok(JobResult { job, pages })
+}
+
+/// Delete a finished OCR job and its extracted text.
+#[utoipa::path(delete, path = "/api/ocr/jobs/{id}", tag = "OCR",
+    security(("ocrKey" = []), ("ocrSession" = [])),
+    params(("id" = Uuid, Path, description = "OCR job ID")),
+    responses((status = 200, description = "Job and extracted text deleted", body = OcrDeletedJobResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Job missing, expired, or owned by another caller"),
+        (status = 409, description = "Job is queued or running")))]
+pub async fn delete_job(
+    Extension(service): Extension<Arc<OcrService>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<Uuid>,
+) -> HandlerResult<bool> {
+    let owner = caller.owner_filter();
+    match service
+        .with_db(move |db| store::delete_job(db, id, owner.as_deref()))
+        .await?
+    {
+        store::DeleteJobOutcome::Deleted => ok(true),
+        store::DeleteJobOutcome::NotFound => Err(ErrorResponse::not_found("OCR job")),
+        store::DeleteJobOutcome::Active => {
+            Err(ErrorResponse::conflict("OCR job is still processing"))
+        }
+    }
 }
 
 fn require_admin(session: &SessionInfo) -> Result<(), ErrorResponse> {

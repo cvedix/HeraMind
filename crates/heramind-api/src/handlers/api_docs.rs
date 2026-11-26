@@ -50,6 +50,11 @@ pub static ROUTES: &[RouteDoc] = &[
         auth: "jwt-or-ocr-key",
     },
     RouteDoc {
+        method: "DELETE",
+        path: "/api/ocr/jobs/:id",
+        auth: "jwt-or-ocr-key",
+    },
+    RouteDoc {
         method: "GET",
         path: "/api/ocr/keys",
         auth: "jwt-only",

@@ -2,6 +2,10 @@
 
 Mở dịch vụ tại `/ocr`, chọn tệp PDF và ngôn ngữ rồi bấm **Bắt đầu OCR**. Trang hiển thị tiến độ và lịch sử xử lý. Khi hoàn tất, chọn từng trang để đọc hoặc tải toàn bộ văn bản dưới dạng TXT.
 
+Trong **Tài liệu gần đây**, bấm **Xoá** bên cạnh tài liệu đã hoàn tất hoặc bị lỗi rồi xác nhận để xoá mục lịch sử và văn bản nhận dạng khỏi máy chủ.
+
+Để xoá nhiều tài liệu, đánh dấu từng mục hoặc bấm **Chọn tất cả (trang hiện tại)**, sau đó bấm **Xoá đã chọn** và xác nhận một lần. Chỉ tài liệu đã hoàn tất hoặc bị lỗi mới có thể được chọn.
+
 HeraMind dùng Poppler để kết xuất ảnh theo trang. Chọn **Tesseract** hoặc **PaddleOCR-VL** trong trường **Mô hình OCR**. Đường dẫn `/ocr/paddle-vl` mở dashboard với PaddleOCR-VL được chọn sẵn. API trả văn bản UTF-8 theo thứ tự trang. Chất lượng phụ thuộc vào độ nét, góc nghiêng, bố cục và ngôn ngữ của bản quét.
 
 ## Kết nối hệ thống đối tác
@@ -51,6 +55,8 @@ curl -fsS "$HERA_BASE/api/ocr/jobs/$JOB_ID" -H "X-OCR-Key: $OCR_KEY"
 Thăm dò vài giây một lần trong khi `data.job.status` là `queued` hoặc `running`. `data.job.engine` cho biết mô hình đã chọn. Sau khi hoàn tất, đọc `data.pages`, gồm các phần tử có `number` (bắt đầu từ 1) và `text`. Nếu job chuyển sang `failed`, đọc `data.job.error_code`. Ví dụ `UNREADABLE_PDF` với PDF hỏng hoặc được bảo vệ bằng mật khẩu, `TOO_MANY_PAGES` khi vượt giới hạn trang và `PADDLE_INFERENCE_ERROR` khi extension báo lỗi suy luận.
 
 `GET /api/ocr/jobs` liệt kê tối đa 50 job gần nhất mà khóa có quyền xem. `GET /api/ocr/status` trả trạng thái OCR, ngôn ngữ và giới hạn hiện hành. Có thể xem schema tại `/api/docs/openapi.json`.
+
+`DELETE /api/ocr/jobs/{id}` xoá tác vụ đã kết thúc cùng văn bản nhận dạng. Dùng cùng khóa OCR hoặc phiên HeraMind có quyền xem tác vụ. API trả `409` khi tác vụ vẫn đang chờ hoặc đang xử lý.
 
 Khi job đã hoàn tất, dùng `jq` để in văn bản theo thứ tự trang.
 

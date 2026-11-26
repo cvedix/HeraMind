@@ -157,6 +157,34 @@ pub fn get(db: &Database, id: Uuid, owner: Option<&str>) -> Result<Option<(Job, 
     Ok(Some((job, pages)))
 }
 
+pub enum DeleteJobOutcome {
+    Deleted,
+    NotFound,
+    Active,
+}
+
+pub fn delete_job(db: &Database, id: Uuid, owner: Option<&str>) -> Result<DeleteJobOutcome> {
+    let txn = db.begin_write()?;
+    {
+        let id = id.to_string();
+        let mut jobs = txn.open_table(JOBS)?;
+        let job: Job = match jobs.get(id.as_str())? {
+            Some(value) => serde_json::from_str(value.value())?,
+            None => return Ok(DeleteJobOutcome::NotFound),
+        };
+        if job.expired(Utc::now().timestamp()) || owner.is_some_and(|owner| owner != job.owner) {
+            return Ok(DeleteJobOutcome::NotFound);
+        }
+        if job.status.is_active() {
+            return Ok(DeleteJobOutcome::Active);
+        }
+        jobs.remove(id.as_str())?;
+        txn.open_table(RESULTS)?.remove(id.as_str())?;
+    }
+    txn.commit()?;
+    Ok(DeleteJobOutcome::Deleted)
+}
+
 pub fn prune(db: &Database) -> Result<()> {
     let txn = db.begin_write()?;
     {
