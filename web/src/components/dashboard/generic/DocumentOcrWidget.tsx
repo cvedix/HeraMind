@@ -1,7 +1,8 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react'
+import { useMatch } from 'react-router-dom'
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Download, FileScan, Loader2, Trash2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { MobilePageHeader } from '@/components/layout/MobilePageHeader'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -16,17 +17,22 @@ const active = (job?: OcrJob) => job?.status === 'queued' || job?.status === 'ru
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 const engines = { tesseract: 'Tesseract', paddle_ocr_vl: 'PaddleOCR-VL' }
 
-export default function OcrServicePage({ initialEngine = 'tesseract' }: { initialEngine?: OcrEngine }) {
+export function DocumentOcrWidget({ title, className }: { title?: string; className?: string }) {
+  const { t } = useTranslation('dashboardComponents')
   const instanceId = useStore((state) => state.currentInstanceId)
-  return <OcrDashboard key={`${instanceId}:${initialEngine}`} initialEngine={initialEngine} />
+  const isShared = useMatch('/share/:token')
+  if (isShared) return <p className="p-4 text-sm text-muted-foreground">{t('documentOcrPrivate')}</p>
+
+  return <OcrWorkspace key={instanceId} title={title || t('componentLibrary.documentOcr')} className={className} />
 }
 
-function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
+function OcrWorkspace({ title, className }: { title: string; className?: string }) {
+  const [tab, setTab] = useState('upload')
   const { t, i18n } = useTranslation('common')
   const fieldId = useId()
   const label = (key: string) => t(`ocr.${key}`)
   const isAdmin = useStore((state) => state.user?.role === 'admin')
-  const [engine, setEngine] = useState(initialEngine)
+  const [engine, setEngine] = useState<OcrEngine>('tesseract')
   const [engineStatus, setEngineStatus] = useState<OcrStatus>()
   const status = engineStatus?.engine === engine ? engineStatus : undefined
   const [jobs, setJobs] = useState<OcrJob[]>([])
@@ -124,13 +130,13 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
   }, [selected, selectedState])
 
   useEffect(() => {
-    if (!isAdmin) return
+    if (!isAdmin || tab !== 'integration') return
     const controller = new AbortController()
     void ocrApi.keys(controller.signal).then(setKeys).catch((error) => {
       if (!controller.signal.aborted) setKeyError(errorMessage(error))
     })
     return () => controller.abort()
-  }, [isAdmin])
+  }, [isAdmin, tab])
 
   function selectJob(id: string) {
     if (id === selected) return
@@ -154,6 +160,7 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
       historyVersion.current += 1
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)])
       selectJob(job.id)
+      setTab('history')
     } catch (error) {
       setUploadError(errorMessage(error))
     } finally {
@@ -251,7 +258,6 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
 
   const currentPage = result?.pages[page]
   const job = selectedJob ?? result?.job
-  const title = initialEngine === 'paddle_ocr_vl' ? 'OCR Service · PaddleOCR-VL' : label('title')
   const origin = getServerOrigin()
   const keyHeader = '-H "X-OCR-Key: $OCR_KEY"'
   const apiExamples = [
@@ -279,108 +285,101 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
   ]
 
   return (
-    <div className="h-full overflow-y-auto bg-background">
-      <MobilePageHeader title={title} />
-      <div className="mx-auto max-w-7xl space-y-5 px-4 pb-28 pt-5 sm:px-6 md:pb-8 md:pt-16">
-        <header className="flex flex-wrap items-end justify-between gap-4 border-b border-border pb-5">
-          <div className="min-w-0">
-            <h1 className="hidden text-3xl font-bold tracking-tight md:block">{title}</h1>
-            <p className="mt-1 text-sm text-muted-foreground">{label('description')}</p>
-          </div>
-          <span className={cn('rounded-full px-3 py-1 text-xs font-medium', status?.engine_ready ? 'bg-success-light text-success' : 'bg-muted text-muted-foreground')}>
-            {label(status ? status.engine_ready ? 'ready' : 'unavailable' : statusError ? 'unavailable' : 'checking')}
-          </span>
-        </header>
-
-        <div className="grid items-start gap-5 lg:grid-cols-[1fr_1.1fr]">
-          <section className={panel}>
-            <h2 className="mb-4 flex items-center gap-2 font-semibold"><FileScan className="h-4 w-4 text-brand" />{label('upload')}</h2>
-            <form onSubmit={submit} className="space-y-4">
-              <div>
-                <label htmlFor={`${fieldId}-file`} className="mb-1.5 block text-sm font-medium">{label('file')}</label>
-                <Input id={`${fieldId}-file`} type="file" accept=".pdf,application/pdf" onChange={(event) => {
-                  setFile(event.target.files?.[0])
+    <div className={cn('h-full min-w-0 overflow-auto rounded-lg border bg-card p-3 sm:p-4', className)}>
+      <header className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <h3 className="flex items-center gap-2 font-semibold"><FileScan className="size-4" />{title}</h3>
+        <span className="text-xs text-muted-foreground">
+          {label(status ? status.engine_ready ? 'ready' : 'unavailable' : statusError ? 'unavailable' : 'checking')}
+        </span>
+      </header>
+      <Tabs value={tab} onValueChange={setTab}>
+        <TabsList aria-label={title} className="h-auto max-w-full flex-wrap justify-start">
+          {['upload', 'history', 'integration'].map(key => (
+            <TabsTrigger key={key} value={key}>{label(key)}</TabsTrigger>
+          ))}
+        </TabsList>
+        <TabsContent value="upload" forceMount className="data-[state=inactive]:hidden">
+          <form onSubmit={submit} className="space-y-4">
+            <div>
+              <label htmlFor={`${fieldId}-file`} className="mb-1.5 block text-sm font-medium">{label('file')}</label>
+              <Input id={`${fieldId}-file`} type="file" accept=".pdf,application/pdf" onChange={(event) => {
+                setFile(event.target.files?.[0])
+                setUploadError('')
+              }} />
+            </div>
+            <div>
+              <label htmlFor={`${fieldId}-engine`} className="mb-1.5 block text-sm font-medium">{label('engine')}</label>
+              <select id={`${fieldId}-engine`} className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                value={engine} disabled={uploading} onChange={(event) => {
+                  setEngine(event.target.value as OcrEngine)
                   setUploadError('')
-                }} />
-              </div>
-              <div>
-                <label htmlFor={`${fieldId}-engine`} className="mb-1.5 block text-sm font-medium">{label('engine')}</label>
-                <select id={`${fieldId}-engine`} className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                  value={engine} disabled={uploading} onChange={(event) => {
-                    setEngine(event.target.value as OcrEngine)
-                    setUploadError('')
-                  }}>
-                  <option value="tesseract">{engines.tesseract}</option>
-                  <option value="paddle_ocr_vl">{engines.paddle_ocr_vl}</option>
-                </select>
-                {engine === 'paddle_ocr_vl' && status && <p className="mt-1.5 text-xs text-muted-foreground">
-                  {status.engine_ready
-                    ? status.model_loaded ? t('common:ocr.modelLoaded', { version: status.model_version ?? '' }) : label('modelCold')
-                    : label('paddleUnavailable')}
-                </p>}
-              </div>
-              <div>
-                <label htmlFor={`${fieldId}-language`} className="mb-1.5 block text-sm font-medium">{label('language')}</label>
-                <select id={`${fieldId}-language`} className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                  value={language} onChange={(event) => setLanguage(event.target.value as OcrLanguage)}>
-                  {(status?.languages.length ? status.languages : ['vie_eng'] as OcrLanguage[]).map((value) =>
-                    <option value={value} key={value}>{label(`lang_${value}`)}</option>)}
-                </select>
-              </div>
-              {status && <p className="text-xs text-muted-foreground">{t('common:ocr.limits', {
-                mb: status.max_bytes / 1024 / 1024, pages: status.max_pages, hours: status.retention_seconds / 3600,
-              })}</p>}
-              {(uploadError || statusError) && <p role="alert" className="text-sm text-destructive">{uploadError || statusError}</p>}
-              <Button type="submit" disabled={!file || !status?.engine_ready || uploading}>
-                {uploading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{label('submit')}
-              </Button>
-            </form>
-          </section>
-
+                }}>
+                <option value="tesseract">{engines.tesseract}</option>
+                <option value="paddle_ocr_vl">{engines.paddle_ocr_vl}</option>
+              </select>
+              {engine === 'paddle_ocr_vl' && status && <p className="mt-1.5 text-xs text-muted-foreground">
+                {status.engine_ready
+                  ? status.model_loaded ? t('common:ocr.modelLoaded', { version: status.model_version ?? '' }) : label('modelCold')
+                  : label('paddleUnavailable')}
+              </p>}
+            </div>
+            <div>
+              <label htmlFor={`${fieldId}-language`} className="mb-1.5 block text-sm font-medium">{label('language')}</label>
+              <select id={`${fieldId}-language`} className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                value={language} onChange={(event) => setLanguage(event.target.value as OcrLanguage)}>
+                {(status?.languages.length ? status.languages : ['vie_eng'] as OcrLanguage[]).map((value) =>
+                  <option value={value} key={value}>{label(`lang_${value}`)}</option>)}
+              </select>
+            </div>
+            {status && <p className="text-xs text-muted-foreground">{t('common:ocr.limits', {
+              mb: status.max_bytes / 1024 / 1024, pages: status.max_pages, hours: status.retention_seconds / 3600,
+            })}</p>}
+            {(uploadError || statusError) && <p role="alert" className="text-sm text-destructive">{uploadError || statusError}</p>}
+            <Button type="submit" disabled={!file || !status?.engine_ready || uploading}>
+              {uploading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{label('submit')}
+            </Button>
+          </form>
+        </TabsContent>
+        <TabsContent value="integration">
+          <p className="mb-3 text-sm text-muted-foreground">{label('integrationHint')}</p>
+          {isAdmin && (
+            <details className="my-4 rounded-md border border-border p-3">
+              <summary className="cursor-pointer text-sm font-medium">{label('keys')}</summary>
+              <form onSubmit={issueKey} className="mt-3 flex flex-wrap gap-2">
+                <Input className="min-w-32 flex-1" aria-label={label('keyName')} placeholder={label('keyName')}
+                  maxLength={80} value={keyName} onChange={(event) => setKeyName(event.target.value)} />
+                <Button type="submit" variant="outline" disabled={!keyName.trim() || keyBusy}>{label('issue')}</Button>
+              </form>
+              {issuedToken && <div className="mt-3 space-y-2">
+                <p className="text-sm font-medium">{label('keyOnce')}</p>
+                <Input readOnly aria-label={label('token')} value={issuedToken} onFocus={(event) => event.target.select()} />
+                <Button size="sm" variant="ghost" onClick={() => setIssuedToken('')}>{label('dismiss')}</Button>
+              </div>}
+              {keyError && <p role="alert" className="mt-2 text-sm text-destructive">{keyError}</p>}
+              <ul className="mt-3 divide-y divide-border">
+                {keys.map((key) => <li className="flex items-center justify-between gap-2 py-1" key={key.id}>
+                  <span className="truncate text-sm">{key.name}</span>
+                  <Button variant="ghost" size="sm" disabled={keyBusy} onClick={() => void revokeKey(key)}>{label('revoke')}</Button>
+                </li>)}
+              </ul>
+            </details>
+          )}
+          <ol className="list-decimal space-y-4 pl-5 text-sm">
+            {apiExamples.map(({ step, hint, command }) => (
+              <li key={step}>
+                <h3 className="font-medium">{label(step)}</h3>
+                <p className="mb-2 text-muted-foreground">{label(hint)}</p>
+                <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs"><code>{command}</code></pre>
+              </li>
+            ))}
+          </ol>
+          <p className="mt-4 text-sm text-muted-foreground">{label('apiErrors')}</p>
+          <a className="mt-2 inline-block text-sm underline underline-offset-4" href={`${origin}/api/docs/openapi.json`} target="_blank" rel="noreferrer">
+            {label('apiSchema')}
+          </a>
+        </TabsContent>
+        <TabsContent value="history" className="space-y-3">
           <section className={panel}>
-            <h2 className="mb-3 font-semibold">{label('integration')}</h2>
-            <p className="mb-3 text-sm text-muted-foreground">{label('integrationHint')}</p>
-            {isAdmin && (
-              <details className="my-4 rounded-md border border-border p-3">
-                <summary className="cursor-pointer text-sm font-medium">{label('keys')}</summary>
-                <form onSubmit={issueKey} className="mt-3 flex flex-wrap gap-2">
-                  <Input className="min-w-32 flex-1" aria-label={label('keyName')} placeholder={label('keyName')}
-                    maxLength={80} value={keyName} onChange={(event) => setKeyName(event.target.value)} />
-                  <Button type="submit" variant="outline" disabled={!keyName.trim() || keyBusy}>{label('issue')}</Button>
-                </form>
-                {issuedToken && <div className="mt-3 space-y-2">
-                  <p className="text-sm font-medium">{label('keyOnce')}</p>
-                  <Input readOnly aria-label={label('token')} value={issuedToken} onFocus={(event) => event.target.select()} />
-                  <Button size="sm" variant="ghost" onClick={() => setIssuedToken('')}>{label('dismiss')}</Button>
-                </div>}
-                {keyError && <p role="alert" className="mt-2 text-sm text-destructive">{keyError}</p>}
-                <ul className="mt-3 divide-y divide-border">
-                  {keys.map((key) => <li className="flex items-center justify-between gap-2 py-1" key={key.id}>
-                    <span className="truncate text-sm">{key.name}</span>
-                    <Button variant="ghost" size="sm" disabled={keyBusy} onClick={() => void revokeKey(key)}>{label('revoke')}</Button>
-                  </li>)}
-                </ul>
-              </details>
-            )}
-            <ol className="list-decimal space-y-4 pl-5 text-sm">
-              {apiExamples.map(({ step, hint, command }) => (
-                <li key={step}>
-                  <h3 className="font-medium">{label(step)}</h3>
-                  <p className="mb-2 text-muted-foreground">{label(hint)}</p>
-                  <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs"><code>{command}</code></pre>
-                </li>
-              ))}
-            </ol>
-            <p className="mt-4 text-sm text-muted-foreground">{label('apiErrors')}</p>
-            <a className="mt-2 inline-block text-sm underline underline-offset-4" href={`${origin}/api/docs/openapi.json`} target="_blank" rel="noreferrer">
-              {label('apiSchema')}
-            </a>
-          </section>
-        </div>
-
-        <div className="grid gap-5 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
-          <section className={panel}>
-            <h2 className="font-semibold">{label('history')}</h2>
             {deletableJobs.length > 0 && <div className="mt-2 flex flex-wrap items-center gap-2">
               <Button type="button" size="sm" variant="outline" disabled={Boolean(deletingIds)}
                 onClick={() => setCheckedIds(new Set(allChecked ? [] : deletableJobs.map((job) => job.id)))}>
@@ -453,8 +452,8 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
               </div>
             )}
           </section>
-        </div>
-      </div>
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }

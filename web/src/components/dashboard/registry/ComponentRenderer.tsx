@@ -105,11 +105,13 @@ const componentMap: Record<GenericComponentType, React.ComponentType<Record<stri
 
 const AgentMonitorWidget = lazy(() => import('../generic/AgentMonitorWidget').then(m => ({ default: m.AgentMonitorWidget })))
 const AiAnalyst = lazy(() => import('../generic/AiAnalyst').then(m => ({ default: m.AiAnalyst })))
+const DocumentOcrWidget = lazy(() => import('../generic/DocumentOcrWidget').then(m => ({ default: m.DocumentOcrWidget })))
 const OcrMonitorWidget = lazy(() => import('../generic/OcrMonitorWidget').then(m => ({ default: m.OcrMonitorWidget })))
 
 const businessComponentMap: Record<string, React.ComponentType<Record<string, unknown>>> = {
   'agent-monitor-widget': AgentMonitorWidget,
   'ai-analyst': AiAnalyst,
+  'document-ocr': DocumentOcrWidget,
   'ocr-monitor': OcrMonitorWidget,
 } as const
 

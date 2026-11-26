@@ -456,6 +456,17 @@ export const componentRegistry: ComponentRegistry = {
     defaultProps: { agentId: undefined },
     variants: ['default'],
   },
+  'document-ocr': {
+    type: 'document-ocr',
+    name: 'Document OCR',
+    description: 'Extract text from scanned PDFs',
+    category: 'business',
+    icon: FileText,
+    sizeConstraints: getSizeConstraints('document-ocr'),
+    hasDataSource: false,
+    hasDisplayConfig: false,
+    hasActions: false,
+  },
   'ocr-monitor': {
     type: 'ocr-monitor',
     name: 'OCR Monitor',

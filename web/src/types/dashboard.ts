@@ -437,6 +437,7 @@ export type GenericComponentType =
 export type BusinessComponentType =
   | 'agent-monitor-widget'
   | 'ai-analyst'
+  | 'document-ocr'
   | 'ocr-monitor'
 
 /**
@@ -583,6 +584,7 @@ export const COMPONENT_SIZE_CONSTRAINTS: Partial<Record<ImplementedComponentType
   // Business Components
   'agent-monitor-widget': { minW: 4, minH: 4, defaultW: 6, defaultH: 5, maxW: 12, maxH: 8 },
   'ai-analyst': { minW: 3, minH: 3, defaultW: 4, defaultH: 5, maxW: 8, maxH: 8 },
+  'document-ocr': { minW: 3, minH: 4, defaultW: 6, defaultH: 8, maxW: 12, maxH: 24 },
   'ocr-monitor': { minW: 4, minH: 8, defaultW: 12, defaultH: 16, maxW: 12, maxH: 24 },
 }
 

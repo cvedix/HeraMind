@@ -331,7 +331,7 @@
     "wsDisconnected": "WebSocket đã ngắt kết nối"
   },
   "nav": {
-    "ocr": "OCR Service",
+    "ocr": "OCR tài liệu",
     "dashboard": "Trò chuyện",
     "visual-dashboard": "Dashboard trực quan",
     "devices": "Thiết bị",

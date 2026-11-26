@@ -57,7 +57,7 @@ export function MobilePageHeader({
   const setDrawerOpen = useMobileNav((s) => s.setOpen)
   if (!isMobile) return null
 
-  const systemChildRoots = ["/devices", "/agents", "/visual-dashboard", "/ocr", "/automation", "/data", "/messages", "/extensions", "/settings"]
+  const systemChildRoots = ["/devices", "/agents", "/visual-dashboard", "/automation", "/data", "/messages", "/extensions", "/settings"]
   const showSystemBack = systemChildRoots.some(
     (path) => location.pathname === path || location.pathname.startsWith(`${path}/`),
   )

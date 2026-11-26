@@ -45,7 +45,11 @@ import { MapDisplay } from '@/components/dashboard/generic/MapDisplay'
 import { VideoDisplay } from '@/components/dashboard/generic/VideoDisplay'
 import { CustomLayer } from '@/components/dashboard/generic/CustomLayer'
 
+import { DocumentOcrWidget } from '@/components/dashboard/generic/DocumentOcrWidget'
+import { OcrMonitorWidget } from '@/components/dashboard/generic/OcrMonitorWidget'
+
 const builtInTypes = new Set([
+  'document-ocr', 'ocr-monitor',
   'value-card', 'counter', 'metric-card',
   'led-indicator', 'sparkline', 'progress-bar',
   'line-chart', 'area-chart', 'bar-chart', 'pie-chart',
@@ -54,6 +58,8 @@ const builtInTypes = new Set([
 ])
 
 const builtInComponentMap: Record<string, React.ComponentType<any>> = {
+  'document-ocr': DocumentOcrWidget,
+  'ocr-monitor': OcrMonitorWidget,
   'value-card': ValueCard,
   'counter': ValueCard,
   'metric-card': ValueCard,

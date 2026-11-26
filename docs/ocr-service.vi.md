@@ -1,16 +1,16 @@
 # OCR Service cho PDF quét
 
-Mở dịch vụ tại `/ocr`, chọn tệp PDF và ngôn ngữ rồi bấm **Bắt đầu OCR**. Trang hiển thị tiến độ và lịch sử xử lý. Khi hoàn tất, chọn từng trang để đọc hoặc tải toàn bộ văn bản dưới dạng TXT.
+Trong **Dashboard trực quan**, mở dashboard cần dùng, bật chế độ chỉnh sửa rồi chọn **+ → Linh kiện → Thành phần kinh doanh → OCR tài liệu**. Thoát chế độ chỉnh sửa để chọn tệp PDF, ngôn ngữ và bấm **Bắt đầu OCR**. Widget hiển thị tiến độ và lịch sử xử lý. Khi hoàn tất, chọn từng trang để đọc hoặc tải toàn bộ văn bản dưới dạng TXT.
 
 Trong **Tài liệu gần đây**, bấm **Xoá** bên cạnh tài liệu đã hoàn tất hoặc bị lỗi rồi xác nhận để xoá mục lịch sử và văn bản nhận dạng khỏi máy chủ.
 
 Để xoá nhiều tài liệu, đánh dấu từng mục hoặc bấm **Chọn tất cả (trang hiện tại)**, sau đó bấm **Xoá đã chọn** và xác nhận một lần. Chỉ tài liệu đã hoàn tất hoặc bị lỗi mới có thể được chọn.
 
-HeraMind dùng Poppler để kết xuất ảnh theo trang. Chọn **Tesseract** hoặc **PaddleOCR-VL** trong trường **Mô hình OCR**. Đường dẫn `/ocr/paddle-vl` mở dashboard với PaddleOCR-VL được chọn sẵn. API trả văn bản UTF-8 theo thứ tự trang. Chất lượng phụ thuộc vào độ nét, góc nghiêng, bố cục và ngôn ngữ của bản quét.
+HeraMind dùng Poppler để kết xuất ảnh theo trang. Chọn **Tesseract** hoặc **PaddleOCR-VL** trong trường **Mô hình OCR**. API trả văn bản UTF-8 theo thứ tự trang. Chất lượng phụ thuộc vào độ nét, góc nghiêng, bố cục và ngôn ngữ của bản quét.
 
 ## Kết nối hệ thống đối tác
 
-Trong mục **Tích hợp API** tại `/ocr`, quản trị viên mở **Quản lý khóa OCR**, nhập tên đối tác và tạo khóa. Sao chép giá trị khóa ngay khi tạo và lưu vào kho bí mật của hệ thống gọi API. Khi xoay vòng khóa, tạo khóa mới trước, rồi thu hồi khóa cũ khi đối tác đã chuyển đổi. Dùng cùng một khóa để gửi tài liệu và đọc kết quả. Quản trị viên HeraMind có thể xem các job để theo dõi vận hành.
+Trong mục **Tích hợp API** của widget **OCR tài liệu**, quản trị viên mở **Quản lý khóa OCR**, nhập tên đối tác và tạo khóa. Sao chép giá trị khóa ngay khi tạo và lưu vào kho bí mật của hệ thống gọi API. Khi xoay vòng khóa, tạo khóa mới trước, rồi thu hồi khóa cũ khi đối tác đã chuyển đổi. Dùng cùng một khóa để gửi tài liệu và đọc kết quả. Quản trị viên HeraMind có thể xem các job để theo dõi vận hành.
 
 Thay `HERA_BASE` bằng địa chỉ HeraMind mà hệ thống gọi API truy cập được. Chạy ví dụ bằng Bash và nhập khóa OCR khi được hỏi.
 
@@ -73,7 +73,7 @@ curl -fsS "$HERA_BASE/api/ocr/jobs/$JOB_ID" -H "X-OCR-Key: $OCR_KEY" |
 
 ## Giám sát request
 
-Quản trị viên mở **OCR Monitor** trong **Dashboard trực quan** để xem lưu lượng, mã HTTP, thời gian phản hồi và mã tác vụ. Bộ lọc thời gian, endpoint và nhóm mã HTTP áp dụng cho các thẻ thống kê, biểu đồ và bảng request. Thời gian phản hồi P95 được tính trên các request khớp bộ lọc.
+Quản trị viên thêm widget **Giám sát OCR** từ cùng nhóm **Thành phần kinh doanh** để xem lưu lượng, mã HTTP, thời gian phản hồi và mã tác vụ. Bộ lọc thời gian, endpoint và nhóm mã HTTP áp dụng cho các thẻ thống kê, biểu đồ và bảng request. Thời gian phản hồi P95 được tính trên các request khớp bộ lọc.
 
 Monitor ghi các request `POST /api/ocr/jobs`, `GET /api/ocr/status`, `GET /api/ocr/jobs` và `GET /api/ocr/jobs/{id}`. Máy chủ giữ tối đa 1.000 request gần nhất trong 24 giờ. Bộ nhớ request bắt đầu lại khi khởi động lại HeraMind. Monitor hiển thị loại header xác thực và mã tác vụ. Giá trị khóa, tên tệp, PDF và văn bản trích xuất không có trong dữ liệu monitor.
 

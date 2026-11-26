@@ -1634,6 +1634,35 @@ fn builtin_component_list() -> Vec<ComponentManifest> {
         source: None,
     };
 
+    let ocr_widget = |id: &str,
+                      name: &str,
+                      description: &str,
+                      icon: &str,
+                      size_constraints,
+                      has_display_config| ComponentManifest {
+        id: id.into(),
+        name: json!(name),
+        description: json!(description),
+        icon: icon.into(),
+        category: "business".into(),
+        version: "1.0.0".into(),
+        author: Some("HeraMind".into()),
+        size_constraints,
+        has_data_source: false,
+        max_data_sources: None,
+        has_display_config,
+        has_actions: false,
+        has_device_binding: false,
+        device_type_filter: vec![],
+        config_schema: None,
+        default_config: None,
+        variants: None,
+        global_name: id.replace('-', "_"),
+        export_name: None,
+        installed_at: 0,
+        source: None,
+    };
+
     vec![
         value_card,
         led_indicator,
@@ -1654,6 +1683,22 @@ fn builtin_component_list() -> Vec<ComponentManifest> {
         custom_layer,
         agent_monitor_widget,
         ai_analyst,
+        ocr_widget(
+            "document-ocr",
+            "Document OCR",
+            "Extract text from scanned PDFs",
+            "file-text",
+            sc(3, 4, 6, 8, 12, 24),
+            false,
+        ),
+        ocr_widget(
+            "ocr-monitor",
+            "OCR Monitor",
+            "Monitor OCR requests and processing jobs",
+            "activity",
+            sc(4, 8, 12, 16, 12, 24),
+            true,
+        ),
     ]
 }
 

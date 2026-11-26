@@ -592,9 +592,9 @@ export function ExtensionDetailsDialog({
         )}
         {extension?.id === "paddle-ocr-vl" && (
           <Button asChild variant="outline" size="sm" className="mt-3">
-            <Link to="/ocr/paddle-vl">
+            <Link to="/visual-dashboard">
               <FileText className="mr-2 h-4 w-4" />
-              {t("common:ocr.openPaddleDashboard")}
+              {t("common:nav.visual-dashboard")}
             </Link>
           </Button>
         )}

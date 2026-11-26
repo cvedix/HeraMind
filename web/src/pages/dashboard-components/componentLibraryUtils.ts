@@ -37,6 +37,8 @@ export interface ComponentCategory {
 
 /** Component type → translation key for the component name */
 const nameKeys: Record<string, string> = {
+  'document-ocr': 'documentOcr',
+  'ocr-monitor': 'ocrMonitor',
   'value-card': 'valueCard',
   'led-indicator': 'ledIndicator',
   'sparkline': 'sparkline',
@@ -61,6 +63,8 @@ const nameKeys: Record<string, string> = {
 
 /** Component type → translation key for the component description */
 const descKeys: Record<string, string> = {
+  'document-ocr': 'documentOcrDesc',
+  'ocr-monitor': 'ocrMonitorDesc',
   'value-card': 'valueCardDesc',
   'led-indicator': 'ledIndicatorDesc',
   'sparkline': 'sparklineDesc',

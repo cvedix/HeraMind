@@ -785,7 +785,12 @@
     "warning": "Warning",
     "unknown": "Unknown"
   },
+  "documentOcrPrivate": "Document OCR is available in signed-in dashboards.",
   "componentLibrary": {
+    "documentOcr": "Document OCR",
+    "documentOcrDesc": "Extract text from scanned PDFs and download the results.",
+    "ocrMonitor": "OCR Monitor",
+    "ocrMonitorDesc": "Track OCR requests, processing times and job status.",
     "searchPlaceholder": "Search components...",
     "noResults": "No components found",
     "noResultsHint": "Try a different search term",

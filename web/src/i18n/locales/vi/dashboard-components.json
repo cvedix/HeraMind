@@ -888,7 +888,12 @@
     "warning": "Cảnh báo",
     "unknown": "Không xác định"
   },
+  "documentOcrPrivate": "OCR tài liệu chỉ dùng trong dashboard đã đăng nhập.",
   "componentLibrary": {
+    "documentOcr": "OCR tài liệu",
+    "documentOcrDesc": "Trích xuất văn bản từ PDF quét và tải kết quả theo tài liệu.",
+    "ocrMonitor": "Giám sát OCR",
+    "ocrMonitorDesc": "Theo dõi yêu cầu, thời gian xử lý và trạng thái tác vụ OCR.",
     "searchPlaceholder": "Tìm kiếm thành phần...",
     "noResults": "Không tìm thấy thành phần nào",
     "noResultsHint": "Hãy thử một cụm từ tìm kiếm khác",

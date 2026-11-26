@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Activity, RefreshCw } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { Link, useMatch } from 'react-router-dom'
+import { useMatch } from 'react-router-dom'
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { Button } from '@/components/ui/button'
 import { chartColorsHex } from '@/design-system/tokens/color'
@@ -255,7 +255,6 @@ function JobView({ jobs, label, date }: {
       <Metrics items={JOB_STATES.map(state => ({ label: t(`ocr.${state}`), value: jobs.filter(job => job.status === state).length }))} />
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs text-muted-foreground">{t('common:ocr.monitor.jobRows', { count: jobs.length })}</p>
-        <Link className="text-sm underline underline-offset-4" to="/ocr">{label('openOcr')}</Link>
       </div>
       {jobs.length === 0 ? <p className="text-sm text-muted-foreground">{t('common:ocr.noJobs')}</p> : (
         <div className="overflow-x-auto rounded-lg border border-border">

@@ -785,7 +785,12 @@
     "warning": "警告",
     "unknown": "未知"
   },
+  "documentOcrPrivate": "请在已登录的仪表板中使用文档 OCR。",
   "componentLibrary": {
+    "documentOcr": "文档 OCR",
+    "documentOcrDesc": "从扫描 PDF 中提取文本并下载结果。",
+    "ocrMonitor": "OCR 监控",
+    "ocrMonitorDesc": "跟踪 OCR 请求、处理时间和任务状态。",
     "searchPlaceholder": "搜索组件...",
     "noResults": "未找到组件",
     "noResultsHint": "尝试不同的搜索关键词",

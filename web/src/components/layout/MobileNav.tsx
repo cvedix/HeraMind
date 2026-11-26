@@ -25,7 +25,6 @@ import {
   Bot,
   Cpu,
   LayoutDashboard,
-  FileScan,
   Workflow,
   Database,
   Puzzle,
@@ -75,7 +74,6 @@ const BASE_PRIMARY: NavEntry[] = [
   { id: "agents", path: "/agents", icon: Bot, labelKey: "nav.agents" },
   { id: "devices", path: "/devices", icon: Cpu, labelKey: "nav.devices" },
   { id: "dashboard", path: "/visual-dashboard", icon: LayoutDashboard, labelKey: "nav.visual-dashboard" },
-  { id: "ocr", path: "/ocr", icon: FileScan, labelKey: "nav.ocr" },
 ]
 
 const SYSTEM_ENTRIES: NavEntry[] = [

@@ -124,6 +124,16 @@ pub const BUILTIN_WIDGET_TYPES: &[BuiltinWidgetType] = &[
         display_name: "Video Display",
         category: "spatial",
     },
+    BuiltinWidgetType {
+        type_id: "document-ocr",
+        display_name: "Document OCR",
+        category: "business",
+    },
+    BuiltinWidgetType {
+        type_id: "ocr-monitor",
+        display_name: "OCR Monitor",
+        category: "business",
+    },
     // Layout — escape hatch
     BuiltinWidgetType {
         type_id: "custom-layer",
