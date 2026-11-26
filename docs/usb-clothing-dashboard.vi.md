@@ -1,5 +1,8 @@
 # Dashboard camera USB: màu áo/quần và sự kiện
 
+Xem [REST API Clothing Colors](../extensions/clothing-colors/API.vi.md) để
+phân tích ảnh và lấy snapshot/events từ ứng dụng bên ngoài.
+
 Tab **Camera USB - Màu áo và quần** dùng webcam USB đang cấp ảnh vào thiết bị
 `cam2-rtsp`. Bên trái là ảnh đã phân tích, khung người và nhãn màu; bên phải
 là danh sách tối đa 100 sự kiện, mới nhất trước, giờ Việt Nam.

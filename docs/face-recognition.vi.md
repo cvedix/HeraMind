@@ -1,5 +1,11 @@
 # Nhận diện khuôn mặt trong dashboard RTSP
 
+Ứng dụng bên ngoài có thể dùng [REST API Face Recognition](../extensions/face-recognition/API.vi.md)
+để quản lý binding, gửi ảnh qua telemetry và đăng ký/xóa khuôn mặt.
+
+Hướng tích hợp lõi C++ và SeetaFace trên AIRbox Q900 được phân tích trong
+[báo cáo engine và Qualcomm NPU](engine-seetaface-qualcomm.vi.md).
+
 Tích hợp dùng extension và widget `face-recognition-card` có sẵn, ngay trong dashboard
 **Giám sát RTSP - Cam2**. Không thêm trang riêng. Camera RTSP được lấy mẫu JPEG, gửi
 vào metric `image` của thiết bị `cam2-rtsp`; Face Recognition tự nhận ảnh qua binding thiết bị.

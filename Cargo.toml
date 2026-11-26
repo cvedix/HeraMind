@@ -12,6 +12,7 @@ members = [
     "crates/heramind-extension-sdk",
     "crates/heramind-extension-runner",
     "crates/heramind-data-push",
+    "extensions/engine-bridge",
     # Testing utilities (not part of main release)
     "crates/heramind-core/tests/fixtures/smoke-extension",
 ]

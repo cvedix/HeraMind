@@ -6,11 +6,30 @@
 target/
 # Cross-compile output (CARGO_TARGET_DIR=target-aarch64). Never commit.
 /target-*/
+__pycache__/
+*.py[cod]
 # Cargo.lock committed for reproducible builds (binary crates should track lockfile)
 docs/superpowers/.superpowers/
 # Extension binaries (compiled libraries)
-# Extensions are loaded at runtime, not part of source code
-/extensions/
+# Runtime packages are ignored; engine-bridge is workspace-owned source.
+/extensions/*
+!/extensions/engine-bridge/
+# Keep API guides for installed extensions without tracking runtime packages.
+!/extensions/clothing-colors/
+/extensions/clothing-colors/*
+!/extensions/clothing-colors/API.vi.md
+!/extensions/face-recognition/
+/extensions/face-recognition/*
+!/extensions/face-recognition/API.vi.md
+!/extensions/onvif-bridge/
+/extensions/onvif-bridge/*
+!/extensions/onvif-bridge/API.vi.md
+!/extensions/paddle-ocr-v6/
+/extensions/paddle-ocr-v6/*
+!/extensions/paddle-ocr-v6/API.vi.md
+!/extensions/yolo-video/
+/extensions/yolo-video/*
+!/extensions/yolo-video/API.vi.md
 # Runtime-installed extensions (binaries loaded at runtime, not source).
 # Scoped: bare `extensions/` also matched src/components/extensions/ (source),
 # silently hiding new files there (ExtensionGrid.tsx needed `git add -f`).

@@ -2366,6 +2366,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "heramind-engine-bridge"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "heramind-extension-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "heramind-extension-runner"
 version = "1.3.3"
 dependencies = [
