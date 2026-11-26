@@ -29,6 +29,7 @@ use crate::{
     server::ServerState,
 };
 use engine::Engine;
+use monitor::OcrMonitorSnapshot;
 use paddle::Paddle;
 pub use store::Key;
 
@@ -176,7 +177,7 @@ pub struct IssuedKey {
     OcrJobListResponse = Success<Vec<Job>>,
     OcrResultResponse = Success<JobResult>,
     OcrDeletedJobResponse = Success<bool>,
-    OcrMonitorResponse = Success<monitor::OcrMonitorSnapshot>,
+    OcrMonitorResponse = Success<OcrMonitorSnapshot>,
     OcrKeyListResponse = Success<Vec<Key>>,
     OcrIssuedKeyResponse = Success<IssuedKey>,
     OcrRevokedKeyResponse = Success<bool>

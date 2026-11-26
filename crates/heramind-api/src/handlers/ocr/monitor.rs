@@ -201,7 +201,7 @@ pub async fn record_request(
 
 #[utoipa::path(get, path = "/api/ocr/monitor", tag = "OCR",
     security(("ocrSession" = [])),
-    responses((status = 200, description = "Recent OCR HTTP requests and job metadata", body = super::OcrMonitorResponse),
+    responses((status = 200, description = "Recent OCR HTTP requests and job metadata", body = OcrMonitorResponse),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Administrator required")))]
 pub async fn snapshot(
