@@ -1,0 +1,133 @@
+{
+  "name": "OCR tài liệu",
+  "description": "PaddleOCR-VL: tải ảnh, nhận dạng văn bản và bảng, theo dõi kết quả xử lý.",
+  "layout": {
+    "columns": 12,
+    "rows": "auto",
+    "breakpoints": {
+      "lg": 1200,
+      "md": 996,
+      "sm": 768,
+      "xs": 480
+    }
+  },
+  "components": [
+    {
+      "id": "ocr-requests",
+      "type": "value-card",
+      "title": "Lượt nhận dạng",
+      "position": {
+        "x": 0,
+        "y": 0,
+        "w": 3,
+        "h": 2
+      },
+      "data_source": {
+        "type": "extension",
+        "extensionId": "paddle-ocr-vl",
+        "extensionMetric": "request_count"
+      },
+      "config": {
+        "unit": "lượt",
+        "size": "md",
+        "showTrend": false
+      }
+    },
+    {
+      "id": "ocr-success",
+      "type": "value-card",
+      "title": "Thành công",
+      "position": {
+        "x": 3,
+        "y": 0,
+        "w": 3,
+        "h": 2
+      },
+      "data_source": {
+        "type": "extension",
+        "extensionId": "paddle-ocr-vl",
+        "extensionMetric": "success_count"
+      },
+      "config": {
+        "unit": "lượt",
+        "size": "md",
+        "showTrend": false
+      }
+    },
+    {
+      "id": "ocr-failure",
+      "type": "value-card",
+      "title": "Lỗi xử lý",
+      "position": {
+        "x": 6,
+        "y": 0,
+        "w": 3,
+        "h": 2
+      },
+      "data_source": {
+        "type": "extension",
+        "extensionId": "paddle-ocr-vl",
+        "extensionMetric": "failure_count"
+      },
+      "config": {
+        "unit": "lượt",
+        "size": "md",
+        "showTrend": false
+      }
+    },
+    {
+      "id": "ocr-latency",
+      "type": "value-card",
+      "title": "Thời gian xử lý gần nhất",
+      "position": {
+        "x": 9,
+        "y": 0,
+        "w": 3,
+        "h": 2
+      },
+      "data_source": {
+        "type": "extension",
+        "extensionId": "paddle-ocr-vl",
+        "extensionMetric": "last_latency_ms"
+      },
+      "config": {
+        "unit": "ms",
+        "size": "md",
+        "showTrend": false
+      }
+    },
+    {
+      "id": "ocr-upload",
+      "type": "paddle-ocr-vl-card",
+      "title": "Nhận dạng tài liệu từ ảnh",
+      "position": {
+        "x": 0,
+        "y": 2,
+        "w": 8,
+        "h": 10
+      },
+      "data_source": {
+        "type": "extension",
+        "extensionId": "paddle-ocr-vl"
+      },
+      "config": {}
+    },
+    {
+      "id": "ocr-guide",
+      "type": "markdown-display",
+      "title": "Hướng dẫn OCR",
+      "position": {
+        "x": 8,
+        "y": 2,
+        "w": 4,
+        "h": 10
+      },
+      "config": {
+        "content": "## OCR tài liệu\n\n**Nguồn ảnh:** tải lên thủ công.\n\n1. Chọn ảnh PNG, JPG hoặc WebP rõ nét.\n2. Chọn nhận dạng văn bản hoặc trích xuất bảng.\n3. Chạy OCR và xem văn bản, vị trí các khối chữ hoặc bảng kết quả.\n4. Sao chép nội dung cần sử dụng.\n\n### Để nhận dạng tốt hơn\n- Chụp thẳng tài liệu, đủ sáng và tránh bóng đổ.\n- Cắt gọn phần tài liệu cần đọc.\n- Ảnh dài hoặc nhiều chữ cần thêm thời gian xử lý.\n\n### Xử lý cục bộ\nPaddleOCR-VL chạy trên CPU của máy này. Các thẻ phía trên lấy số liệu thật từ extension sau mỗi lần xử lý.",
+        "variant": "default",
+        "size": "md",
+        "allowHtml": false
+      }
+    }
+  ]
+}
