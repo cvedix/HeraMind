@@ -821,6 +821,7 @@ pub(super) fn drive_react_stream(
                 // breaker / round budget (below), the 30-round hard cap, and
                 // the stream timeout.
             // (The scheduled-agent path brakes via cross-round dedup → AllDuplicate.)
+            let mut stream_failed = false;
             'multi_round_loop: loop {
                 let missing_data = requires_data_tool && !no_execution_requested && !guards_disabled
                     && !data_query_was_satisfied(
@@ -1602,6 +1603,7 @@ pub(super) fn drive_react_stream(
                             }
                         }
                         Err(e) => {
+                            stream_failed = true;
                             tracing::error!("Stream error: {}", e);
                             yield AgentEvent::error(format!("Stream error: {}", e));
                             // Save partial response on error to maintain conversation context
@@ -3699,6 +3701,7 @@ pub(super) fn drive_react_stream(
                                             // Don't yield yet — check for stray tool JSON first.
                                         }
                                         Err(e) => {
+                                            stream_failed = true;
                                             tracing::error!("Retry stream error: {}", e);
                                             yield AgentEvent::error(format!("Stream error: {}", e));
                                             break 'multi_round_loop;
@@ -3826,6 +3829,7 @@ pub(super) fn drive_react_stream(
             let end = {
                 let mut state = internal_state.write().await;
                 let reason = match &state.task_state.status {
+                    _ if stream_failed => crate::agent::task_continuity::StreamEndReason::Error,
                     crate::agent::task_continuity::TaskStatus::Halted { .. } => {
                         crate::agent::task_continuity::StreamEndReason::CannotContinue
                     }

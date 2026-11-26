@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
+use heramind_agent::agent::task_continuity::StreamEndReason;
 use heramind_agent::agent::{
     process_stream_events_with_safeguards, AgentEvent, AgentInternalState, AgentMessage,
     StreamSafeguards,
@@ -134,16 +135,24 @@ async fn gateway_error_is_surfaced_without_empty_content_retry() {
         assert!(errors[0].contains("content-blocked"));
         assert!(errors[0].contains("test-id"));
         assert_eq!(requests, 1, "a failed stream must not trigger recovery");
-        assert!(matches!(events.last(), Some(AgentEvent::End { .. })));
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::End {
+                end_reason: Some(StreamEndReason::Error),
+                ..
+            })
+        ));
         assert!(!events.iter().any(|event| matches!(event,
             AgentEvent::Content { content } if content.contains("Sorry, the model"))));
         let assistant: Vec<_> = memory.iter().filter(|m| m.role == "assistant").collect();
-        if prefix.is_empty() {
-            assert!(assistant.is_empty(), "do not persist a fabricated response");
+        assert_eq!(assistant.len(), 1);
+        assert_eq!(assistant[0].end_reason, Some(StreamEndReason::Error));
+        let expected = if prefix.is_empty() {
+            "[Error]"
         } else {
-            assert_eq!(assistant.len(), 1);
-            assert_eq!(assistant[0].content.as_ref(), "Hello");
-        }
+            "Hello"
+        };
+        assert_eq!(assistant[0].content.as_ref(), expected);
     }
 }
 
@@ -155,7 +164,13 @@ async fn gateway_error_during_empty_content_retry_is_preserved() {
         AgentEvent::Error { message } if message.contains("content-blocked"))));
     assert!(!events.iter().any(|event| matches!(event,
         AgentEvent::Content { content } if content.contains("Sorry, the model"))));
-    assert!(matches!(events.last(), Some(AgentEvent::End { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::End {
+            end_reason: Some(StreamEndReason::Error),
+            ..
+        })
+    ));
 }
 
 #[tokio::test]
