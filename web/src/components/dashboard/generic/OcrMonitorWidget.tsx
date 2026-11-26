@@ -33,7 +33,7 @@ export function OcrMonitorWidget({ title, className }: { title?: string; classNa
   const isShared = useMatch('/share/:token') !== null
 
   if (!isAdmin || isShared) {
-    return <p className="p-4 text-sm text-muted-foreground">{t('ocr.monitor.adminOnly')}</p>
+    return <p className="p-4 text-sm text-muted-foreground">{t('common:ocr.monitor.adminOnly')}</p>
   }
 
   return <OcrMonitor key={instanceId} title={title || 'OCR Monitor'} className={className} />
@@ -86,13 +86,13 @@ function OcrMonitor({ title, className }: { title: string; className?: string })
       <header className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="flex items-center gap-2 text-lg font-semibold"><Activity className="h-5 w-5 text-primary" aria-hidden="true" />{title}</h2>
         <div className="flex flex-wrap items-center gap-3">
-          {snapshot && <span className="text-xs text-muted-foreground">{t('ocr.monitor.updated', { time: date.format(snapshot.generated_at_ms) })}</span>}
+          {snapshot && <span className="text-xs text-muted-foreground">{t('common:ocr.monitor.updated', { time: date.format(snapshot.generated_at_ms) })}</span>}
           <Button size="sm" variant="outline" className="gap-2" onClick={() => setRefresh(current => current + 1)}>
             <RefreshCw className="h-4 w-4" aria-hidden="true" />{label('refresh')}
           </Button>
         </div>
       </header>
-      {error && <p role="alert" className="mt-3 text-sm text-destructive">{t('ocr.monitor.fetchError', { error })}</p>}
+      {error && <p role="alert" className="mt-3 text-sm text-destructive">{t('common:ocr.monitor.fetchError', { error })}</p>}
       {!snapshot && loading && <p role="status" className="mt-3 text-sm text-muted-foreground">{label('loading')}</p>}
       {snapshot && (
         <>
@@ -193,7 +193,7 @@ function RequestView({ data, filters, setFilters, label, date, time, number }: {
         { label: label('latency'), value: p95 == null ? '—' : `${number.format(p95)} ms`, hint: label('latencyHint') },
       ]} />
       <p className="text-xs text-muted-foreground">
-        {t('ocr.monitor.coverage', { time: date.format(Math.max(start, data.observed_since_ms)), count: number.format(data.max_requests) })}
+        {t('common:ocr.monitor.coverage', { time: date.format(Math.max(start, data.observed_since_ms)), count: number.format(data.max_requests) })}
       </p>
       {rows.length === 0 ? <p className="text-sm text-muted-foreground">{label('emptyRequests')}</p> : (
         <>
@@ -217,7 +217,7 @@ function RequestView({ data, filters, setFilters, label, date, time, number }: {
           </figure>
           <div className="overflow-x-auto rounded-lg border border-border">
             <table className="w-full text-sm">
-              <caption className="px-3 py-2 text-left text-xs text-muted-foreground">{t('ocr.monitor.requestRows', { count: Math.min(rows.length, REQUESTS_SHOWN) })}</caption>
+              <caption className="px-3 py-2 text-left text-xs text-muted-foreground">{t('common:ocr.monitor.requestRows', { count: Math.min(rows.length, REQUESTS_SHOWN) })}</caption>
               <thead className="bg-muted/40 text-xs text-muted-foreground">
                 <tr>{[label('time'), label('endpoint'), 'HTTP', label('duration'), label('authHeader'), label('jobId')].map(column => (
                   <th key={column} scope="col" className={CELL}>{column}</th>
@@ -254,14 +254,14 @@ function JobView({ jobs, label, date }: {
     <section className="space-y-4">
       <Metrics items={JOB_STATES.map(state => ({ label: t(`ocr.${state}`), value: jobs.filter(job => job.status === state).length }))} />
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="text-xs text-muted-foreground">{t('ocr.monitor.jobRows', { count: jobs.length })}</p>
+        <p className="text-xs text-muted-foreground">{t('common:ocr.monitor.jobRows', { count: jobs.length })}</p>
         <Link className="text-sm underline underline-offset-4" to="/ocr">{label('openOcr')}</Link>
       </div>
-      {jobs.length === 0 ? <p className="text-sm text-muted-foreground">{t('ocr.noJobs')}</p> : (
+      {jobs.length === 0 ? <p className="text-sm text-muted-foreground">{t('common:ocr.noJobs')}</p> : (
         <div className="overflow-x-auto rounded-lg border border-border">
           <table className="w-full text-sm">
             <thead className="bg-muted/40 text-xs text-muted-foreground">
-              <tr>{[label('received'), label('jobId'), t('ocr.engine'), label('jobStatus'), label('pages'), label('processingTime'), label('errorCode')].map(column => (
+              <tr>{[label('received'), label('jobId'), t('common:ocr.engine'), label('jobStatus'), label('pages'), label('processingTime'), label('errorCode')].map(column => (
                 <th key={column} scope="col" className={CELL}>{column}</th>
               ))}</tr>
             </thead>

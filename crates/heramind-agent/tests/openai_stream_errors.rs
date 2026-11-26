@@ -104,6 +104,7 @@ async fn run_chat_with_history(
         StreamSafeguards::default(),
         None,
         None,
+        1,
     )
     .await
     .unwrap();
@@ -182,10 +183,8 @@ async fn empty_content_retry_targets_current_turn_instead_of_first_greeting() {
     .await;
     assert_eq!(requests.len(), 2);
     let retry_messages = requests[1]["messages"].as_array().unwrap();
-    assert_eq!(
-        retry_messages.last().unwrap()["content"],
-        format!("Please respond to the user's message directly and concisely.\n\nUser: {current_message}")
-    );
+    let retry = retry_messages.last().unwrap()["content"].as_str().unwrap();
+    assert!(retry.starts_with(&format!("Original user request:\n{current_message}\n")));
     assert!(events.iter().any(|event| matches!(event,
         AgentEvent::Content { content } if content == "Hello")));
     assert!(!events

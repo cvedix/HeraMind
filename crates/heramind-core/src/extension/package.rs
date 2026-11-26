@@ -2044,16 +2044,14 @@ mod tests {
     #[test]
     fn test_neomind_packages_keep_abi_and_id_validation() {
         for abi_version in [MIN_ABI_VERSION - 1, CURRENT_ABI_VERSION + 1] {
-            let data =
-                build_test_nep_with_manifest(LEGACY_PACKAGE_FORMAT, abi_version, "test-abi");
+            let data = build_test_nep_with_manifest(LEGACY_PACKAGE_FORMAT, abi_version, "test-abi");
             assert!(matches!(
                 ExtensionPackage::from_bytes(data),
                 Err(PackageError::IncompatibleVersion { .. })
             ));
         }
         for id in ["", "../escape", "/absolute", "nested/name", "nested\\name"] {
-            let data =
-                build_test_nep_with_manifest(LEGACY_PACKAGE_FORMAT, CURRENT_ABI_VERSION, id);
+            let data = build_test_nep_with_manifest(LEGACY_PACKAGE_FORMAT, CURRENT_ABI_VERSION, id);
             assert!(matches!(
                 ExtensionPackage::from_bytes(data),
                 Err(PackageError::InvalidManifest(_))

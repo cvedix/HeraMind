@@ -44,6 +44,7 @@ import { CloudAiAddDialog, type CloudAiEditTarget } from '@/components/llm/Cloud
 import { BackendConnectionTest } from '@/components/llm/BackendConnectionTest'
 import type {
   LlmBackendInstance,
+  LlmBackendType,
   BackendTypeDefinition,
   BackendTestResult,
   CreateLlmBackendRequest,
@@ -576,7 +577,7 @@ export function UnifiedLLMBackendsTab({
     const type = selectedType!
     const data: CreateLlmBackendRequest = {
       name,
-      backend_type: type.id as any,
+      backend_type: type.id as LlmBackendType,
       endpoint: config.endpoint as string || type.default_endpoint,
       model: config.model as string,
       api_key: config.api_key as string,

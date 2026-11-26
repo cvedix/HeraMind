@@ -340,7 +340,8 @@ impl AgentRouterService {
             .append(true)
             .open(self.root.join("service.log"))?;
         let mut command = Command::new(self.node());
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::process::CommandExt;
             command.as_std_mut().process_group(0);
         }
@@ -387,15 +388,22 @@ impl AgentRouterService {
             #[cfg(windows)]
             {
                 if let Some(id) = child.id() {
-                    let _ = Command::new("taskkill").args(["/PID", &id.to_string(), "/T", "/F"]).status().await;
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &id.to_string(), "/T", "/F"])
+                        .status()
+                        .await;
                 }
             }
             if tokio::time::timeout(Duration::from_secs(12), child.wait())
                 .await
                 .is_err()
             {
-                #[cfg(unix)] if let Some(id) = child.id() {
-                    let _ = Command::new("/bin/kill").args(["-KILL", "--", &format!("-{id}")]).status().await;
+                #[cfg(unix)]
+                if let Some(id) = child.id() {
+                    let _ = Command::new("/bin/kill")
+                        .args(["-KILL", "--", &format!("-{id}")])
+                        .status()
+                        .await;
                 }
                 child.kill().await?;
             }

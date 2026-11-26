@@ -1944,11 +1944,31 @@ pub static ROUTES: &[RouteDoc] = &[
         path: "/api/settings/registration",
         auth: "jwt-only",
     },
-    RouteDoc { method: "GET", path: "/api/agentrouter-service", auth: "jwt-only" },
-    RouteDoc { method: "POST", path: "/api/agentrouter-service/install", auth: "jwt-only" },
-    RouteDoc { method: "POST", path: "/api/agentrouter-service/configure", auth: "jwt-only" },
-    RouteDoc { method: "POST", path: "/api/agentrouter-service/start", auth: "jwt-only" },
-    RouteDoc { method: "POST", path: "/api/agentrouter-service/stop", auth: "jwt-only" },
+    RouteDoc {
+        method: "GET",
+        path: "/api/agentrouter-service",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/agentrouter-service/install",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/agentrouter-service/configure",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/agentrouter-service/start",
+        auth: "jwt-only",
+    },
+    RouteDoc {
+        method: "POST",
+        path: "/api/agentrouter-service/stop",
+        auth: "jwt-only",
+    },
     RouteDoc {
         method: "PUT",
         path: "/api/settings/registration",

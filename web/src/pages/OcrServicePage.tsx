@@ -175,8 +175,8 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
     if (deletingIds || !first) return
     const count = entries.length
     if (!(await confirm({
-      title: count === 1 ? label('deleteTitle') : t('ocr.deleteManyTitle', { count }),
-      description: count === 1 ? t('ocr.deletePrompt', { name: first.filename }) : label('deleteManyPrompt'),
+      title: count === 1 ? label('deleteTitle') : t('common:ocr.deleteManyTitle', { count }),
+      description: count === 1 ? t('common:ocr.deletePrompt', { name: first.filename }) : label('deleteManyPrompt'),
       confirmText: label('delete'),
       cancelText: t('cancel'),
       variant: 'destructive',
@@ -201,8 +201,8 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
     }
     const failed = count - removedIds.size
     if (failed) setDeleteError(count === 1
-      ? t('ocr.deleteError', { name: first.filename })
-      : t('ocr.deleteManyError', { count: failed, total: count }))
+      ? t('common:ocr.deleteError', { name: first.filename })
+      : t('common:ocr.deleteManyError', { count: failed, total: count }))
     setDeletingIds(undefined)
   }
 
@@ -225,7 +225,7 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
   }
 
   async function revokeKey(key: OcrKey) {
-    if (keyBusy || !(await confirm({ title: label('revoke'), description: t('ocr.revokePrompt', { name: key.name }) }))) return
+    if (keyBusy || !(await confirm({ title: label('revoke'), description: t('common:ocr.revokePrompt', { name: key.name }) }))) return
     setKeyBusy(true)
     setKeyError('')
     setIssuedToken('')
@@ -315,7 +315,7 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
                 </select>
                 {engine === 'paddle_ocr_vl' && status && <p className="mt-1.5 text-xs text-muted-foreground">
                   {status.engine_ready
-                    ? status.model_loaded ? t('ocr.modelLoaded', { version: status.model_version ?? '' }) : label('modelCold')
+                    ? status.model_loaded ? t('common:ocr.modelLoaded', { version: status.model_version ?? '' }) : label('modelCold')
                     : label('paddleUnavailable')}
                 </p>}
               </div>
@@ -327,7 +327,7 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
                     <option value={value} key={value}>{label(`lang_${value}`)}</option>)}
                 </select>
               </div>
-              {status && <p className="text-xs text-muted-foreground">{t('ocr.limits', {
+              {status && <p className="text-xs text-muted-foreground">{t('common:ocr.limits', {
                 mb: status.max_bytes / 1024 / 1024, pages: status.max_pages, hours: status.retention_seconds / 3600,
               })}</p>}
               {(uploadError || statusError) && <p role="alert" className="text-sm text-destructive">{uploadError || statusError}</p>}
@@ -391,7 +391,7 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
                 {deletingIds && deletingIds.size > 1
                   ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden="true" />
                   : <Trash2 className="mr-1.5 h-4 w-4" aria-hidden="true" />}
-                {t('ocr.deleteSelected', { count: checkedJobs.length })}
+                {t('common:ocr.deleteSelected', { count: checkedJobs.length })}
               </Button>
             </div>}
             {loadError && <p role="alert" className="mt-2 text-sm text-destructive">{loadError}</p>}
@@ -399,7 +399,7 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
             {!jobs.length && !loadError && <p className="mt-3 text-sm text-muted-foreground">{label(loading ? 'loading' : 'noJobs')}</p>}
             <ul className="mt-2 max-h-96 divide-y divide-border overflow-y-auto">
               {jobs.map((entry) => <li className="flex items-center gap-1" key={entry.id}>
-                <Checkbox className="ml-1 h-6 w-6" aria-label={t('ocr.selectDocument', { name: entry.filename })}
+                <Checkbox className="ml-1 h-6 w-6" aria-label={t('common:ocr.selectDocument', { name: entry.filename })}
                   checked={checkedIds.has(entry.id)} disabled={active(entry) || Boolean(deletingIds)}
                   onCheckedChange={(checked) => checkJob(entry.id, checked === true)} />
                 <button type="button" aria-pressed={selected === entry.id} onClick={() => selectJob(entry.id)}
@@ -414,7 +414,7 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
                 </button>
                 {!active(entry) && <Button type="button" variant="ghost" size="sm" disabled={Boolean(deletingIds)}
                   className="shrink-0 text-destructive hover:text-destructive"
-                  aria-label={t('ocr.deleteNamed', { name: entry.filename })}
+                  aria-label={t('common:ocr.deleteNamed', { name: entry.filename })}
                   onClick={() => void deleteJobs([entry])}>
                   {deletingIds?.size === 1 && deletingIds.has(entry.id)
                     ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" aria-hidden="true" />
@@ -445,7 +445,7 @@ function OcrDashboard({ initialEngine }: { initialEngine: OcrEngine }) {
                   <>
                     <select aria-label={label('page')} className="h-9 rounded-md border border-input bg-background px-2 text-sm"
                       value={page} onChange={(event) => setPage(Number(event.target.value))}>
-                      {result.pages.map((item, index) => <option key={item.number} value={index}>{t('ocr.pageNumber', { number: item.number })}</option>)}
+                      {result.pages.map((item, index) => <option key={item.number} value={index}>{t('common:ocr.pageNumber', { number: item.number })}</option>)}
                     </select>
                     <pre className="max-h-96 overflow-y-auto whitespace-pre-wrap break-words rounded-md bg-muted p-3 text-sm">{currentPage.text || label('emptyPage')}</pre>
                   </>

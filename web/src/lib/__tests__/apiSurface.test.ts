@@ -25,7 +25,9 @@ describe('api surface (post-split composition)', () => {
       'getDevices', // devices
       'getDraftDevices', 'getMessageChain', 'markMessageFalsePositive', // onboarding (the message API lives here)
       'listMessageChannels', // channels
-      'listLlmBackends', // llm
+      'listLlmBackends', 'listAgentRouterModels', 'agentRouterServiceStatus',
+      'installAgentRouterService', 'configureAgentRouterService',
+      'startAgentRouterService', 'stopAgentRouterService', // llm
       'listImBridges', // imBridges
       'getMqttStatus', // brokers
       'listSessions', // sessions
@@ -78,8 +80,9 @@ describe('api surface (post-split composition)', () => {
   // (`confirmAssociationDraft`, POST .../confirm-association).
   // 285 -> 286 when AI enable split from run enable
   // (`setExtensionAiEnabled`, PATCH /extensions/:id/ai-enabled).
-  it('member count grows only by deliberate additions (286)', () => {
+  // 286 -> 292 for the six AgentRouter model and service operations above.
+  it('member count grows only by deliberate additions (292)', () => {
     const keys = Object.keys(api)
-    expect(keys.length).toBe(286)
+    expect(keys.length).toBe(292)
   })
 })
