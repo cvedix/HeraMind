@@ -1642,7 +1642,7 @@ pub(super) fn drive_react_stream(
                                         partial_content.len(), thinking_content.len());
                                 }
                             }
-                            break;
+                            break 'multi_round_loop;
                         }
                     }
                 }
@@ -3700,7 +3700,8 @@ pub(super) fn drive_react_stream(
                                         }
                                         Err(e) => {
                                             tracing::error!("Retry stream error: {}", e);
-                                            break;
+                                            yield AgentEvent::error(format!("Stream error: {}", e));
+                                            break 'multi_round_loop;
                                         }
                                     }
                                 }

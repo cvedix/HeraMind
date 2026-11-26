@@ -211,6 +211,8 @@ pub(crate) struct AccumulatedToolCall {
 #[derive(Debug, Deserialize)]
 pub(crate) struct StreamChunkEvent {
     #[serde(default)]
+    pub(crate) error: Option<serde_json::Value>,
+    #[serde(default)]
     pub(crate) choices: Vec<StreamChoice>,
     /// Usage data - only present in the final chunk when stream_options.include_usage=true
     #[serde(default)]

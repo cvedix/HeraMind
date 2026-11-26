@@ -1153,6 +1153,14 @@ impl CloudRuntime {
                                         if let Ok(evt) =
                                             serde_json::from_str::<StreamChunkEvent>(json)
                                         {
+                                            if let Some(error) = evt.error {
+                                                let _ = tx
+                                                    .send(Err(LlmError::Generation(format!(
+                                                        "Streaming API error: {error}"
+                                                    ))))
+                                                    .await;
+                                                return;
+                                            }
                                             // Emit usage even when 0/MAX so End can
                                             // distinguish invalid meters from missing usage.
                                             if let Some(ref usage) = evt.usage {

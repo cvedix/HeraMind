@@ -8,6 +8,7 @@ pub mod automations;
 pub mod basic;
 pub mod capabilities;
 pub mod chat_refs;
+pub mod cloud_models;
 pub mod common;
 pub mod config;
 pub mod dashboards;

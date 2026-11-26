@@ -100,6 +100,8 @@ RUN if [ "$TARGETARCH" = "arm64" ] || [ "$TARGETARCH" = "aarch64" ]; then export
 
 # Copy real source code and build.
 COPY crates/ crates/
+COPY scripts/agentrouter-openclaw.mjs scripts/agentrouter-openclaw.mjs
+COPY deploy/agentrouter-openclaw.config.json deploy/agentrouter-openclaw.config.json
 # COPY preserves the context's (git-checkout) mtimes, which can be OLDER than
 # the dummy-source artifacts from the dependency-cache layer above — cargo's
 # mtime fingerprints then consider the real sources unchanged and silently

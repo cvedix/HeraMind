@@ -1,10 +1,21 @@
 /** llm api — split from api.ts 2026-09. */
 import type { LlmBackendInstance, CreateLlmBackendRequest, UpdateLlmBackendRequest, LlmBackendListResponse, BuiltinLlmStatus, BuiltinModelDef, BackendTypeDefinition, BackendTestResult } from '@/types'
-import type { ReasoningCapabilities, BuiltinRuntimeInfo} from '@/types/llm-backend'
+import type { AgentRouterServiceStatus, ReasoningCapabilities, BuiltinRuntimeInfo} from '@/types/llm-backend'
 import { fetchAPI } from "./client"
 
 export const llmApi = {
   // ========== LLM Backends API ==========
+  agentRouterServiceStatus: () => fetchAPI<AgentRouterServiceStatus>('/agentrouter-service', { skipErrorToast: true }),
+  installAgentRouterService: () => fetchAPI<{ accepted: boolean }>('/agentrouter-service/install', { method: 'POST', skipErrorToast: true }),
+  configureAgentRouterService: (request: { name: string; model: string; protocol: string; api_key?: string; backend_id?: string }) =>
+    fetchAPI<{ backend_id: string }>('/agentrouter-service/configure', { method: 'POST', body: JSON.stringify(request), skipErrorToast: true }),
+  startAgentRouterService: () => fetchAPI<{ started: boolean }>('/agentrouter-service/start', { method: 'POST', skipErrorToast: true }),
+  stopAgentRouterService: () => fetchAPI<{ stopped: boolean }>('/agentrouter-service/stop', { method: 'POST', skipErrorToast: true }),
+  listAgentRouterModels: (request: { api_key?: string; backend_id?: string }) =>
+    fetchAPI<{ models: Array<{ id: string; name: string }> }>('/llm-backends/providers/agentrouter/models', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    }),
   listLlmBackends: (params?: { type?: string; active_only?: boolean; include_vlm?: boolean }) =>
     fetchAPI<LlmBackendListResponse>(
       `/llm-backends${params ? `?${new URLSearchParams(
